@@ -1,0 +1,30 @@
+[package]
+name = "csilgen-common"
+version = "0.1.0"
+edition = "2024"
+description = "Shared utilities, types, and error handling for csilgen"
+license = "Apache-2.0"
+
+[features]
+default = []
+testing = ["dep:tempfile", "dep:assert_fs", "dep:predicates", "dep:pretty_assertions", "dep:insta"]
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+
+# Optional testing dependencies
+tempfile = { version = "3.0", optional = true }
+assert_fs = { version = "1.0", optional = true }
+predicates = { version = "3.0", optional = true }
+pretty_assertions = { version = "1.0", optional = true }
+insta = { version = "1.0", optional = true }
+
+[dev-dependencies]
+tempfile = "3.0"
+assert_fs = "1.0"
+predicates = "3.0"
+pretty_assertions = "1.0"
+insta = "1.0"

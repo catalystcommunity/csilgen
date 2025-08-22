@@ -1,0 +1,14 @@
+{
+  "description": "Version 2 of service API with multiple breaking changes",
+  "should_parse": true,
+  "expected_validation_errors": [],
+  "expected_ast": null,
+  "breaking_changes": [
+    "Field renamed: name -> full_name",
+    "Field renamed: id -> user_id", 
+    "Field required: age changed from optional to required",
+    "Operation removed: get-user",
+    "Operation added: delete-user (required)"
+  ],
+  "tags": ["valid", "breaking-changes", "v2", "services", "breaking"]
+}

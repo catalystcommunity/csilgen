@@ -1,0 +1,42 @@
+# Generated files and build artifacts
+*.wasm
+generated/
+output/
+/tmp/
+build/
+dist/
+target/
+
+# Language-specific generated files
+*.rs
+*.py
+*.ts
+*.js
+*.json
+*.d.ts
+__pycache__/
+*.pyc
+*.pyo
+node_modules/
+package-lock.json
+yarn.lock
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Local configuration
+.env
+.env.local
+config.local.*
+
+# Test outputs
+test-output/
+snapshots/

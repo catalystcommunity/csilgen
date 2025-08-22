@@ -1,0 +1,22 @@
+[package]
+name = "csilgen-wasm-core"
+version = "0.1.0"
+edition = "2024"
+description = "Core csilgen functionality as WASM module"
+license = "Apache-2.0"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wasm-bindgen.workspace = true
+csilgen-core.workspace = true
+csilgen-common.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dependencies.web-sys]
+version = "0.3"
+features = [
+  "console",
+]

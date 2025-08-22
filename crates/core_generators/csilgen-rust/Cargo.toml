@@ -1,0 +1,12 @@
+[package]
+name = "csilgen-rust"
+version = "0.1.0"
+edition = "2024"
+description = "Rust code generator for csilgen"
+license = "Apache-2.0"
+
+[dependencies]
+serde.workspace = true
+csilgen-core.workspace = true
+csilgen-common.workspace = true
+anyhow.workspace = true

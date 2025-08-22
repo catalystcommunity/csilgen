@@ -1,0 +1,539 @@
+; E-commerce API - Real-world online store interface
+
+; Product catalog types
+Product = {
+  id: text,
+  sku: text,
+  @min-length(1)
+  @max-length(200)
+  name: text,
+  @min-length(10)
+  @max-length(5000)
+  description: text,
+  @min(0.01)
+  price: float,
+  @min(0.00)
+  compare_at_price?: float,
+  currency: text,
+  @min(0)
+  inventory_quantity: int,
+  track_inventory: bool,
+  allow_backorder: bool,
+  category_id: text,
+  brand_id?: text,
+  tags: [* text],
+  images: [1* ProductImage],
+  variants: [* ProductVariant],
+  attributes: ProductAttributes,
+  @receive-only
+  rating_average?: float,
+  @receive-only
+  rating_count: int,
+  @receive-only
+  sales_count: int,
+  status: "draft" / "active" / "archived",
+  @receive-only
+  created_at: text,
+  @receive-only
+  updated_at: text,
+}
+
+ProductImage = {
+  id: text,
+  url: text,
+  alt_text?: text,
+  width: int,
+  height: int,
+  position: int,
+  is_primary: bool,
+}
+
+ProductVariant = {
+  id: text,
+  sku: text,
+  @min(0.01)
+  price: float,
+  @min(0.00)
+  compare_at_price?: float,
+  @min(0)
+  inventory_quantity: int,
+  option1?: text,
+  option2?: text,
+  option3?: text,
+  weight?: float,
+  requires_shipping: bool,
+  available: bool,
+}
+
+ProductAttributes = {
+  dimensions?: {
+    length: float,
+    width: float,
+    height: float,
+    weight: float,
+    unit: "cm" / "in",
+    weight_unit: "kg" / "lb",
+  },
+  materials?: [* text],
+  colors?: [* text],
+  sizes?: [* text],
+  care_instructions?: text,
+  warranty?: {
+    duration: int,
+    unit: "days" / "months" / "years",
+    terms: text,
+  },
+  certifications?: [* text],
+  country_of_origin?: text,
+  custom: {* text => any},
+}
+
+Category = {
+  id: text,
+  name: text,
+  description?: text,
+  parent_id?: text,
+  slug: text,
+  image_url?: text,
+  level: int,
+  product_count: int,
+  status: "active" / "inactive",
+  sort_order: int,
+}
+
+Brand = {
+  id: text,
+  name: text,
+  description?: text,
+  logo_url?: text,
+  website_url?: text,
+  product_count: int,
+  status: "active" / "inactive",
+}
+
+; Customer and order types
+Customer = {
+  id: text,
+  @regexp("^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$")
+  email: text,
+  @min-length(1)
+  @max-length(100)
+  first_name: text,
+  @min-length(1)
+  @max-length(100)
+  last_name: text,
+  phone?: text,
+  addresses: [* Address],
+  default_address_id?: text,
+  @receive-only
+  orders_count: int,
+  @receive-only
+  total_spent: float,
+  @receive-only
+  created_at: text,
+  @receive-only
+  last_order_at?: text,
+  marketing_consent: bool,
+  tags: [* text],
+}
+
+Address = {
+  id: text,
+  @min-length(1)
+  @max-length(100)
+  first_name: text,
+  @min-length(1)
+  @max-length(100)
+  last_name: text,
+  company?: text,
+  @min-length(1)
+  @max-length(200)
+  address1: text,
+  address2?: text,
+  @min-length(1)
+  @max-length(100)
+  city: text,
+  province?: text,
+  @depends-on(country = "US" | country = "CA")
+  province_code?: text,
+  @min-length(1)
+  @max-length(20)
+  zip: text,
+  @min-length(2)
+  @max-length(3)
+  country: text,
+  country_code: text,
+  phone?: text,
+  is_default: bool,
+}
+
+Order = {
+  id: text,
+  order_number: text,
+  customer_id: text,
+  email: text,
+  status: "pending" / "confirmed" / "processing" / "shipped" / "delivered" / "cancelled" / "refunded",
+  fulfillment_status?: "pending" / "partial" / "fulfilled",
+  payment_status: "pending" / "paid" / "partially_paid" / "refunded",
+  line_items: [1* LineItem],
+  subtotal_price: float,
+  tax_lines: [* TaxLine],
+  total_tax: float,
+  shipping_lines: [* ShippingLine],
+  total_shipping: float,
+  discount_codes: [* DiscountCode],
+  total_discounts: float,
+  total_price: float,
+  currency: text,
+  billing_address: Address,
+  shipping_address: Address,
+  @receive-only
+  created_at: text,
+  @receive-only
+  updated_at: text,
+  @receive-only
+  processed_at?: text,
+  notes?: text,
+  tags: [* text],
+  fulfillments: [* Fulfillment],
+  refunds: [* Refund],
+}
+
+LineItem = {
+  id: text,
+  product_id: text,
+  variant_id?: text,
+  name: text,
+  sku?: text,
+  quantity: int,
+  price: float,
+  total_price: float,
+  product_image?: ProductImage,
+  properties?: [* {
+    name: text,
+    value: text,
+  }],
+}
+
+TaxLine = {
+  title: text,
+  rate: float,
+  price: float,
+}
+
+ShippingLine = {
+  id: text,
+  title: text,
+  price: float,
+  code?: text,
+  carrier?: text,
+  delivery_category?: text,
+}
+
+DiscountCode = {
+  code: text,
+  type: "percentage" / "fixed_amount" / "free_shipping",
+  value: float,
+  amount: float,
+}
+
+Fulfillment = {
+  id: text,
+  status: "pending" / "processing" / "shipped" / "delivered",
+  line_items: [* {
+    line_item_id: text,
+    quantity: int,
+  }],
+  tracking_company?: text,
+  tracking_number?: text,
+  tracking_url?: text,
+  @receive-only
+  created_at: text,
+  @receive-only
+  updated_at: text,
+}
+
+Refund = {
+  id: text,
+  amount: float,
+  reason: text,
+  line_items: [* {
+    line_item_id: text,
+    quantity: int,
+    amount: float,
+  }],
+  @receive-only
+  processed_at: text,
+}
+
+; Cart and checkout types
+Cart = {
+  id: text,
+  customer_id?: text,
+  line_items: [* CartLineItem],
+  subtotal_price: float,
+  total_price: float,
+  currency: text,
+  @receive-only
+  created_at: text,
+  @receive-only
+  updated_at: text,
+  checkout_url?: text,
+}
+
+CartLineItem = {
+  id: text,
+  product_id: text,
+  variant_id?: text,
+  quantity: int,
+  price: float,
+  total_price: float,
+  properties?: [* {
+    name: text,
+    value: text,
+  }],
+}
+
+; Services
+service ProductService {
+  list-products: {
+    category_id?: text,
+    brand_id?: text,
+    tags?: [* text],
+    price_min?: float,
+    price_max?: float,
+    available?: bool,
+    sort_by?: "name" / "price" / "created_at" / "rating" / "sales",
+    sort_order?: "asc" / "desc",
+    page?: int,
+    per_page?: int,
+  } -> {
+    products: [* Product],
+    total_count: int,
+    page: int,
+    per_page: int,
+    has_more: bool,
+  },
+  
+  get-product: {product_id: text} -> Product,
+  
+  search-products: {
+    query: text,
+    category_id?: text,
+    brand_id?: text,
+    price_min?: float,
+    price_max?: float,
+    page?: int,
+    per_page?: int,
+  } -> {
+    products: [* Product],
+    total_count: int,
+    suggestions?: [* text],
+  },
+  
+  get-product-recommendations: {
+    product_id: text,
+    limit?: int,
+  } -> {
+    products: [* Product],
+  },
+  
+  add-product-review: {
+    product_id: text,
+    rating: int,
+    title?: text,
+    content?: text,
+  } -> {
+    review_id: text,
+    success: bool,
+  },
+}
+
+service CategoryService {
+  list-categories: {
+    parent_id?: text,
+    level?: int,
+    include_product_count?: bool,
+  } -> {
+    categories: [* Category],
+  },
+  
+  get-category: {category_id: text} -> Category,
+  
+  get-category-tree: {} -> {
+    categories: [* Category],
+  },
+}
+
+service CartService {
+  get-cart: {cart_id: text} -> Cart,
+  
+  create-cart: {
+    customer_id?: text,
+  } -> Cart,
+  
+  add-to-cart: {
+    cart_id: text,
+    product_id: text,
+    variant_id?: text,
+    quantity: int,
+    properties?: [* {
+      name: text,
+      value: text,
+    }],
+  } -> Cart,
+  
+  update-cart-item: {
+    cart_id: text,
+    line_item_id: text,
+    quantity: int,
+  } -> Cart,
+  
+  remove-from-cart: {
+    cart_id: text,
+    line_item_id: text,
+  } -> Cart,
+  
+  clear-cart: {cart_id: text} -> Cart,
+  
+  apply-discount: {
+    cart_id: text,
+    discount_code: text,
+  } -> {
+    cart: Cart,
+    success: bool,
+    message?: text,
+  },
+}
+
+service CheckoutService {
+  calculate-shipping: {
+    cart_id: text,
+    shipping_address: Address,
+  } -> {
+    shipping_rates: [* {
+      id: text,
+      name: text,
+      price: float,
+      delivery_range?: text,
+    }],
+  },
+  
+  calculate-taxes: {
+    cart_id: text,
+    shipping_address: Address,
+  } -> {
+    tax_lines: [* TaxLine],
+    total_tax: float,
+  },
+  
+  create-order: {
+    cart_id: text,
+    billing_address: Address,
+    shipping_address: Address,
+    shipping_rate_id: text,
+    payment_method: {
+      type: "card" / "paypal" / "apple_pay" / "google_pay",
+      @depends-on(type = "card")
+      @send-only
+      card_number?: text,
+      @depends-on(type = "card")
+      @send-only
+      card_expiry?: text,
+      @depends-on(type = "card")
+      @send-only
+      card_cvc?: text,
+      @depends-on(type = "paypal")
+      paypal_token?: text,
+    },
+    notes?: text,
+  } -> Order,
+}
+
+service OrderService {
+  get-order: {order_id: text} -> Order,
+  
+  list-orders: {
+    customer_id?: text,
+    status?: text,
+    fulfillment_status?: text,
+    payment_status?: text,
+    from_date?: text,
+    to_date?: text,
+    page?: int,
+    per_page?: int,
+  } -> {
+    orders: [* Order],
+    total_count: int,
+    page: int,
+    per_page: int,
+  },
+  
+  cancel-order: {
+    order_id: text,
+    reason?: text,
+    notify_customer?: bool,
+  } -> Order,
+  
+  track-order: {order_id: text} -> {
+    order: Order,
+    tracking_events: [* {
+      status: text,
+      location?: text,
+      description: text,
+      timestamp: text,
+    }],
+  },
+}
+
+service CustomerService {
+  register: {
+    email: text,
+    @send-only
+    password: text,
+    first_name: text,
+    last_name: text,
+    phone?: text,
+    marketing_consent?: bool,
+  } -> {
+    customer: Customer,
+    @receive-only
+    access_token: text,
+  },
+  
+  login: {
+    email: text,
+    @send-only
+    password: text,
+  } -> {
+    customer: Customer,
+    @receive-only
+    access_token: text,
+  },
+  
+  get-profile: {} -> Customer,
+  
+  update-profile: {
+    first_name?: text,
+    last_name?: text,
+    phone?: text,
+    marketing_consent?: bool,
+  } -> Customer,
+  
+  add-address: {
+    address: Address,
+  } -> Customer,
+  
+  update-address: {
+    address_id: text,
+    address: Address,
+  } -> Customer,
+  
+  delete-address: {
+    address_id: text,
+  } -> Customer,
+  
+  set-default-address: {
+    address_id: text,
+  } -> Customer,
+}

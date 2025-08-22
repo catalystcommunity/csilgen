@@ -1,0 +1,15 @@
+; Field metadata test case
+CreateUserRequest = {
+  name: text,
+  email: text,
+  @send-only
+  password: text,
+}
+
+UserProfile = {
+  id: int,
+  name: text,
+  email: text,
+  @receive-only
+  created_at: text,
+}

@@ -1,0 +1,7 @@
+{
+  "description": "Version 1 of user schema - baseline for breaking change detection",
+  "should_parse": true,
+  "expected_validation_errors": [],
+  "expected_ast": null,
+  "tags": ["valid", "breaking-changes", "baseline", "v1"]
+}

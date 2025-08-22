@@ -1,0 +1,12 @@
+[package]
+name = "csilgen-simple-test"
+version = "0.1.0"
+edition = "2024"
+description = "Simple test WASM module for basic validation"
+license = "Apache-2.0"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# No dependencies - just basic WASM

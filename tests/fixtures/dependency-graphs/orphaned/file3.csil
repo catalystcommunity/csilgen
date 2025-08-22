@@ -1,0 +1,4 @@
+OrphanedType3 = {
+    value: bool,
+    timestamp: int
+}

@@ -1,0 +1,19 @@
+include "common.csil"
+
+UserRequest = {
+    @send-only
+    username: text,
+    @send-only
+    password: text,
+    metadata: CommonMetadata
+}
+
+UserResponse = {
+    @receive-only
+    id: int,
+    @bidirectional 
+    name: text,
+    @receive-only
+    created_at: int,
+    metadata: CommonMetadata
+}

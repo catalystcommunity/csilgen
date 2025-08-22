@@ -1,0 +1,7 @@
+{
+  "description": "Very large API with multiple services, complex types, and extensive metadata for performance testing",
+  "should_parse": true,
+  "expected_validation_errors": [],
+  "expected_ast": null,
+  "tags": ["valid", "performance", "large", "services", "metadata", "complex"]
+}

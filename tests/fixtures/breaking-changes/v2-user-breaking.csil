@@ -1,0 +1,7 @@
+; Version 2 of user schema - with breaking changes
+User = {
+  id: int,
+  full_name: text,  ; BREAKING: renamed from 'name'
+  ; BREAKING: removed 'email' field
+  phone: text,      ; Non-breaking: added new field
+}

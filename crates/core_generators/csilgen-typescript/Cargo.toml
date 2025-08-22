@@ -1,0 +1,12 @@
+[package]
+name = "csilgen-typescript"
+version = "0.1.0"
+edition = "2024"
+description = "TypeScript code generator for csilgen"
+license = "Apache-2.0"
+
+[dependencies]
+serde.workspace = true
+csilgen-core.workspace = true
+csilgen-common.workspace = true
+anyhow.workspace = true

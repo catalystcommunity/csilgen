@@ -1,0 +1,11 @@
+CommonMetadata = {
+    timestamp: int,
+    version: text,
+    trace_id?: text
+}
+
+BaseProfile = {
+    first_name: text,
+    last_name: text,
+    bio?: text
+}

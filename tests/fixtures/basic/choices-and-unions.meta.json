@@ -1,0 +1,7 @@
+{
+  "description": "Choice types, unions, and tagged unions in CDDL",
+  "should_parse": true,
+  "expected_validation_errors": [],
+  "expected_ast": null,
+  "tags": ["valid", "choices", "unions", "cddl", "tagged-unions"]
+}

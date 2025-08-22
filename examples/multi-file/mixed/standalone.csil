@@ -1,0 +1,13 @@
+StandaloneType = {
+    @bidirectional
+    value: text,
+    @bidirectional
+    metadata: {
+        created: int,
+        version: text
+    }
+}
+
+service StandaloneService {
+    process: StandaloneType -> { success: bool }
+}

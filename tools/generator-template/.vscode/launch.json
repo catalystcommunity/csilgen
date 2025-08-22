@@ -1,0 +1,34 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Debug Unit Tests",
+            "type": "lldb",
+            "request": "launch",
+            "program": "${workspaceFolder}/target/debug/deps/${workspaceFolderBasename}-*",
+            "args": [],
+            "cwd": "${workspaceFolder}",
+            "stopOnEntry": false,
+            "environment": [],
+            "preLaunchTask": "Run Unit Tests"
+        },
+        {
+            "name": "Debug Specific Test",
+            "type": "lldb",
+            "request": "launch",
+            "program": "${workspaceFolder}/target/debug/deps/${workspaceFolderBasename}-*",
+            "args": ["--nocapture", "${input:testName}"],
+            "cwd": "${workspaceFolder}",
+            "stopOnEntry": false,
+            "environment": []
+        }
+    ],
+    "inputs": [
+        {
+            "id": "testName",
+            "description": "Test name to debug",
+            "default": "test_generate_code",
+            "type": "promptString"
+        }
+    ]
+}

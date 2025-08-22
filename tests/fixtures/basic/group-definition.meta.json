@@ -1,0 +1,7 @@
+{
+  "description": "Group definition with required and optional fields",
+  "should_parse": true,
+  "expected_validation_errors": [],
+  "expected_ast": null,
+  "tags": ["valid", "group", "optional-fields", "cddl"]
+}

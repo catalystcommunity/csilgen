@@ -1,0 +1,9 @@
+include "../shared/types.csil"
+include "../shared/errors.csil"
+
+service UserAPI {
+    register: UserRegistration -> UserProfile / ErrorResponse,
+    login: UserCredentials -> UserSession / ErrorResponse,
+    get-profile: { user_id: int } -> UserProfile / ErrorResponse,
+    update-profile: UserProfileUpdate -> UserProfile / ErrorResponse
+}

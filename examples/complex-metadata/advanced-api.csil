@@ -1,0 +1,308 @@
+;; Complex CSIL example demonstrating rich field metadata and nested structures
+;; This example shows advanced CSIL features including field dependencies, 
+;; visibility controls, validation constraints, cross-structure dependencies,
+;; and complex service patterns
+
+;; Basic type definitions with validation constraints
+DocumentID = text .size (16..32) .regex "^[a-zA-Z0-9_-]+$"
+Timestamp = int .ge 0  ;; Unix timestamp
+Version = int .ge 1
+
+;; Nested structure with rich metadata
+DocumentMetadata = {
+    @description("Unique identifier for the document")
+    id: DocumentID,
+    
+    @description("Document version for optimistic locking")
+    @send-only
+    version: Version,
+    
+    @description("When the document was created")
+    @receive-only
+    created_at: Timestamp,
+    
+    @description("When the document was last modified") 
+    @receive-only
+    modified_at: Timestamp,
+    
+    @description("User who last modified the document")
+    @receive-only
+    modified_by: Username,
+    
+    @description("Document size in bytes")
+    @receive-only
+    @min-value(0)
+    @max-value(104857600) ;; 100MB limit
+    size_bytes: int
+}
+
+;; Complex nested document structure
+Document = {
+    metadata: DocumentMetadata,
+    
+    @description("Document title")
+    @min-length(1)
+    @max-length(200)
+    title: text,
+    
+    @description("Document content")
+    @depends-on(content_type = "text/plain")
+    ? text_content: text,
+    
+    @description("Binary document content")
+    @depends-on(content_type = "application/octet-stream")
+    ? binary_content: bytes,
+    
+    @description("Content MIME type")
+    content_type: text .regex "^[a-zA-Z0-9][a-zA-Z0-9!#$&\-\^_]*\/[a-zA-Z0-9][a-zA-Z0-9!#$&\-\^_.]*$",
+    
+    @description("Access control permissions")
+    permissions: DocumentPermissions,
+    
+    @description("Document tags for categorization")
+    @max-items(20)
+    ? tags: [* text .size (1..50)],
+    
+    @description("Custom metadata key-value pairs")
+    @max-items(10)
+    ? custom_metadata: {* text => any}
+}
+
+;; Conditional structure based on user permissions
+DocumentPermissions = {
+    @description("Can the current user read this document")
+    @receive-only
+    can_read: bool,
+    
+    @description("Can the current user modify this document")
+    @receive-only
+    can_write: bool,
+    
+    @description("Can the current user delete this document")
+    @receive-only  
+    can_delete: bool,
+    
+    @description("Can the current user share this document")
+    @receive-only
+    can_share: bool,
+    
+    @description("List of users with explicit access")
+    @depends-on(can_share = true)
+    @send-only
+    ? shared_with: [* Username]
+}
+
+;; User identification
+Username = text .size (3..50) .regex "^[a-zA-Z0-9_-]+$"
+
+;; Service with complex operations and conditional logic
+service DocumentService {
+    ;; Get document with visibility-controlled fields
+    get-document: GetDocumentRequest -> Document / DocumentError,
+    
+    ;; Create document with conditional content requirements
+    create-document: CreateDocumentRequest -> Document / DocumentError,
+    
+    ;; Update with optimistic locking and partial updates
+    update-document: UpdateDocumentRequest -> Document / DocumentError,
+    
+    ;; Delete with permission checking
+    delete-document: DeleteDocumentRequest -> DeleteResponse / DocumentError,
+    
+    ;; Search with complex filtering and pagination
+    search-documents: SearchRequest -> SearchResponse / DocumentError,
+    
+    ;; Real-time document updates (bidirectional)
+    watch-document: WatchRequest <-> DocumentUpdate / DocumentError
+}
+
+;; Request types with conditional requirements
+GetDocumentRequest = {
+    @description("Document to retrieve")
+    id: DocumentID,
+    
+    @description("Include binary content in response")
+    ;; Cross-structure dependency: references permissions.can_read field from related structures
+    @depends-on(permissions.can_read = true)
+    ? include_content: bool .default false
+}
+
+CreateDocumentRequest = {
+    @description("Document title")
+    @send-only
+    title: text .size (1..200),
+    
+    @description("Content type determines which content field is required")
+    @send-only
+    content_type: text,
+    
+    @description("Text content for text documents")
+    @send-only
+    @depends-on(content_type = "text/plain")
+    ? text_content: text,
+    
+    @description("Binary content for binary documents")
+    @send-only
+    @depends-on(content_type = "application/octet-stream")
+    ? binary_content: bytes,
+    
+    @description("Initial tags")
+    @send-only
+    @max-items(20)
+    ? tags: [* text .size (1..50)],
+    
+    @description("Users to share with immediately")
+    @send-only
+    @max-items(50)
+    ? share_with: [* Username]
+}
+
+UpdateDocumentRequest = {
+    @description("Document to update")
+    @send-only
+    id: DocumentID,
+    
+    @description("Expected version for optimistic locking")
+    @send-only
+    expected_version: Version,
+    
+    @description("New title")
+    @send-only
+    ? title: text .size (1..200),
+    
+    @description("New content type")
+    @send-only
+    ? content_type: text,
+    
+    @description("New text content")
+    @send-only
+    @depends-on(content_type = "text/plain")
+    ? text_content: text,
+    
+    @description("New binary content")
+    @send-only  
+    @depends-on(content_type = "application/octet-stream")
+    ? binary_content: bytes,
+    
+    @description("Tags to add")
+    @send-only
+    @max-items(20)
+    ? add_tags: [* text .size (1..50)],
+    
+    @description("Tags to remove")
+    @send-only
+    @max-items(20)
+    ? remove_tags: [* text .size (1..50)]
+}
+
+DeleteDocumentRequest = {
+    @send-only
+    id: DocumentID,
+    
+    @description("Confirm deletion to prevent accidents")
+    @send-only
+    confirm: bool .eq true
+}
+
+DeleteResponse = {
+    @receive-only
+    success: bool,
+    
+    @receive-only
+    message: text
+}
+
+;; Search with complex filtering
+SearchRequest = {
+    @description("Text query string")
+    @send-only
+    ? query: text .size (0..500),
+    
+    @description("Filter by tags")
+    @send-only
+    @max-items(10)
+    ? tags: [* text],
+    
+    @description("Filter by content type")
+    @send-only
+    ? content_type: text,
+    
+    @description("Filter by creation date range")
+    @send-only
+    ? created_after: Timestamp,
+    
+    @send-only
+    ? created_before: Timestamp,
+    
+    @description("Pagination offset")
+    @send-only
+    @min-value(0)
+    ? offset: int .default 0,
+    
+    @description("Page size")
+    @send-only
+    @min-value(1)
+    @max-value(100)
+    ? limit: int .default 20
+}
+
+SearchResponse = {
+    @description("Matching documents")
+    @receive-only
+    documents: [* Document],
+    
+    @description("Total number of matches")
+    @receive-only
+    total_count: int .ge 0,
+    
+    @description("Next page offset")
+    @receive-only
+    ? next_offset: int .ge 0
+}
+
+;; Real-time update notifications
+WatchRequest = {
+    @send-only
+    document_id: DocumentID
+}
+
+DocumentUpdate = {
+    @receive-only
+    document_id: DocumentID,
+    
+    @receive-only
+    update_type: text / "created" / "updated" / "deleted" / "permissions_changed",
+    
+    @receive-only
+    timestamp: Timestamp,
+    
+    @description("Updated document data")
+    @receive-only
+    @depends-on(update_type = "updated")
+    ? document: Document,
+    
+    @description("Updated permissions")
+    @receive-only
+    @depends-on(update_type = "permissions_changed")
+    ? permissions: DocumentPermissions
+}
+
+;; Error handling
+DocumentError = {
+    @receive-only
+    code: int .ge 400 .le 599,
+    
+    @receive-only
+    message: text,
+    
+    @receive-only
+    ? error_type: text / "not_found" / "permission_denied" / "invalid_input" / "version_conflict" / "quota_exceeded",
+    
+    @receive-only
+    ? details: any,
+    
+    @description("Retry-after header for rate limiting")
+    @receive-only
+    @depends-on(code = 429)
+    ? retry_after_seconds: int .ge 1
+}

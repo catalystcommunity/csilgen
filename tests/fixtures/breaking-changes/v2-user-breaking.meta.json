@@ -1,0 +1,7 @@
+{
+  "description": "Version 2 of user schema with breaking changes (field rename and removal)",
+  "should_parse": true,
+  "expected_validation_errors": [],
+  "expected_ast": null,
+  "tags": ["valid", "breaking-changes", "breaking", "v2"]
+}

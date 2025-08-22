@@ -1,0 +1,39 @@
+; Version 2 of service API - with breaking changes
+CreateUserRequest = {
+  full_name: text,    ; BREAKING: renamed from 'name'
+  email: text,
+  age: int,           ; BREAKING: changed from optional to required
+  phone: text,        ; Non-breaking: added new required field (but clients won't provide it)
+}
+
+CreateUserResponse = {
+  user_id: int,       ; BREAKING: renamed from 'id' 
+  full_name: text,
+  email: text,
+  phone: text,
+  created_at: text,
+  ; BREAKING: removed some implicit fields
+}
+
+UpdateUserRequest = {
+  user_id: int,       ; BREAKING: renamed from 'id'
+  full_name?: text,   ; BREAKING: renamed from 'name'
+  email?: text,
+  phone?: text,       ; Non-breaking: added optional field
+}
+
+UpdateUserResponse = {
+  user_id: int,       ; BREAKING: renamed from 'id'
+  full_name: text,
+  email: text,
+  phone: text,
+  updated_at: text,
+}
+
+; BREAKING: Removed get-user operation
+; BREAKING: Added new required operation
+service UserService {
+  create-user: CreateUserRequest -> CreateUserResponse,
+  update-user: UpdateUserRequest -> UpdateUserResponse,
+  delete-user: {user_id: int} -> {success: bool},  ; BREAKING: new required operation
+}

@@ -1,0 +1,7 @@
+{
+  "description": "Large CSIL schema with many type definitions for performance testing",
+  "should_parse": true,
+  "expected_validation_errors": [],
+  "expected_ast": null,
+  "tags": ["valid", "performance", "large-schema", "cddl"]
+}

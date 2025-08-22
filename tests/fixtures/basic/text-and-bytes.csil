@@ -1,0 +1,24 @@
+; Text and bytes variations test case
+text_type = text
+tstr_type = tstr
+bstr_type = bstr
+bytes_type = bytes
+
+; Text with size constraints
+short_text = text .size (1..50)
+long_text = text .size (100..)
+exact_text = text .size 10
+
+; Bytes with size constraints
+small_bytes = bytes .size (1..1024)
+large_bytes = bytes .size (1024..)
+exact_bytes = bytes .size 32
+
+; Specific text values
+hello = "hello"
+empty_text = ""
+unicode_text = "Hello, 世界! 🌍"
+
+; Specific byte values  
+empty_bytes = h''
+magic_bytes = h'89504E47'

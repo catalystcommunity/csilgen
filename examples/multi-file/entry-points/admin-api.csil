@@ -1,0 +1,11 @@
+include "../dependencies/user-types.csil"
+
+AdminRequest = {
+    admin_action: text,
+    target_user: UserData
+}
+
+AdminResponse = {
+    success: bool,
+    affected_users: [UserData]
+}

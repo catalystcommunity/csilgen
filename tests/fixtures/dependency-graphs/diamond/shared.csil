@@ -1,0 +1,4 @@
+SharedType = {
+    id: text,
+    created_at: int
+}

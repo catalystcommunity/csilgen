@@ -1,0 +1,34 @@
+; Invalid CSIL service syntax test cases
+
+; Invalid service syntax - missing braces
+service UserService
+  create-user: Request -> Response
+
+; Invalid operation syntax - missing arrow
+service InvalidService {
+  create-user: Request Response
+}
+
+; Invalid operation syntax - malformed arrow
+service AnotherInvalid {
+  create-user: Request => Response
+}
+
+; Invalid bidirectional syntax
+service BadBidirectional {
+  ping: Request <-> Response ->
+}
+
+; Invalid service name - contains spaces
+service User Service {
+  test: {} -> {}
+}
+
+; Missing operation definition
+service EmptyService {
+}
+
+; Invalid operation name - starts with number
+service BadOperations {
+  1create-user: {} -> {}
+}

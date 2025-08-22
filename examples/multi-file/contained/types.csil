@@ -1,0 +1,7 @@
+include "common.csil"
+
+SharedType = {
+    id: text,
+    value: text,
+    metadata: CommonData
+}

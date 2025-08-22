@@ -1,0 +1,5 @@
+SharedData = {
+    id: text,
+    value: text,
+    ? metadata: { text => text }
+}

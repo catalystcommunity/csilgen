@@ -1,0 +1,8 @@
+; Version 2 of user schema - backwards compatible
+User = {
+  id: int,
+  name: text,
+  email: text,
+  phone?: text,     ; Non-breaking: added optional field
+  created_at?: text, ; Non-breaking: added optional field
+}

@@ -1,0 +1,10 @@
+[package]
+name = "xtask"
+version = "0.1.0"
+edition = "2024"
+description = "Development automation tasks for csilgen"
+license = "Apache-2.0"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true

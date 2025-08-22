@@ -1,0 +1,368 @@
+;; Real-world E-commerce API demonstrating field visibility patterns
+;; This example shows how CSIL metadata guides practical API design
+
+;; Core identifiers
+ProductID = text .size (10..20) .regex "^PRD-[A-Z0-9]+$"
+OrderID = text .size (10..20) .regex "^ORD-[A-Z0-9]+$"  
+UserID = text .size (10..20) .regex "^USR-[A-Z0-9]+$"
+PaymentMethodID = text .size (10..20) .regex "^PAY-[A-Z0-9]+$"
+
+;; Money representation
+Money = {
+    @description("Amount in smallest currency unit (cents)")
+    @min-value(0)
+    amount: int,
+    
+    @description("ISO 4217 currency code")
+    currency: text .size (3..3)
+}
+
+;; Product with different visibility for internal vs external APIs
+Product = {
+    @description("Unique product identifier")
+    @receive-only
+    id: ProductID,
+    
+    @description("Product name visible to customers")
+    name: text .size (1..200),
+    
+    @description("Product description") 
+    description: text .size (0..2000),
+    
+    @description("Customer-facing price")
+    price: Money,
+    
+    @description("Internal cost - never exposed to customers")
+    @admin-only
+    ? cost: Money,
+    
+    @description("Current inventory count")
+    @admin-only
+    @receive-only
+    ? inventory_count: int .ge 0,
+    
+    @description("Product availability")
+    @receive-only
+    available: bool,
+    
+    @description("Product images")
+    @max-items(10)
+    ? images: [* text], ;; URLs
+    
+    @description("Product categories")
+    @max-items(5)
+    ? categories: [* text .size (1..50)],
+    
+    @description("Internal product metrics")
+    @admin-only
+    @receive-only
+    ? metrics: ProductMetrics
+}
+
+ProductMetrics = {
+    @admin-only
+    @receive-only
+    views_last_30d: int .ge 0,
+    
+    @admin-only
+    @receive-only
+    purchases_last_30d: int .ge 0,
+    
+    @admin-only
+    @receive-only
+    conversion_rate: float .ge 0.0 .le 1.0
+}
+
+;; Order with different field visibility based on user role
+Order = {
+    @receive-only
+    id: OrderID,
+    
+    @description("User who placed the order")
+    @receive-only
+    user_id: UserID,
+    
+    @description("Order items")
+    items: [* OrderItem],
+    
+    @description("Order total")
+    @receive-only
+    total: Money,
+    
+    @description("Order status")
+    @receive-only
+    status: OrderStatus,
+    
+    @description("When order was placed")
+    @receive-only
+    created_at: int,
+    
+    @description("Shipping address")
+    shipping_address: Address,
+    
+    @description("Payment information - sensitive data")
+    @admin-only
+    ? payment_info: PaymentInfo,
+    
+    @description("Internal fulfillment notes")
+    @admin-only
+    ? fulfillment_notes: text .size (0..1000),
+    
+    @description("Customer service notes")
+    @admin-only
+    ? cs_notes: text .size (0..2000)
+}
+
+OrderItem = {
+    product_id: ProductID,
+    
+    @description("Quantity ordered")
+    @min-value(1)
+    @max-value(100)
+    quantity: int,
+    
+    @description("Price at time of order")
+    @receive-only
+    unit_price: Money,
+    
+    @description("Total for this line item")
+    @receive-only
+    total_price: Money,
+    
+    @description("Internal cost at time of order")
+    @admin-only
+    @receive-only
+    ? unit_cost: Money
+}
+
+OrderStatus = text / "pending" / "confirmed" / "processing" / "shipped" / "delivered" / "cancelled" / "refunded"
+
+Address = {
+    @send-only
+    street: text .size (1..200),
+    
+    @send-only
+    city: text .size (1..100),
+    
+    @send-only
+    state: text .size (2..100),
+    
+    @send-only
+    postal_code: text .size (3..20),
+    
+    @send-only
+    country: text .size (2..3)
+}
+
+;; Payment info - highly sensitive, admin-only
+PaymentInfo = {
+    @admin-only
+    @receive-only
+    payment_method_id: PaymentMethodID,
+    
+    @admin-only
+    @receive-only
+    last_four_digits: text .size (4..4),
+    
+    @admin-only
+    @receive-only
+    payment_processor: text,
+    
+    @admin-only
+    @receive-only
+    transaction_id: text .size (10..100),
+    
+    @admin-only
+    @receive-only
+    ? processor_fee: Money
+}
+
+;; Service with role-based operations
+service ECommerceAPI {
+    ;; Customer operations - field visibility controls what they see
+    get-product: ProductID -> Product / APIError,
+    search-products: SearchProductsRequest -> SearchProductsResponse / APIError,
+    
+    ;; Customer order management
+    create-order: CreateOrderRequest -> Order / APIError,
+    get-order: GetOrderRequest -> Order / APIError,
+    cancel-order: CancelOrderRequest -> Order / APIError,
+    
+    ;; Admin operations - see all fields including sensitive data
+    get-product-admin: ProductID -> Product / APIError,
+    update-product: UpdateProductRequest -> Product / APIError,
+    get-order-admin: OrderID -> Order / APIError,
+    update-order-status: UpdateOrderStatusRequest -> Order / APIError,
+    
+    ;; Real-time order tracking
+    track-order: OrderID <-> OrderUpdate / APIError
+}
+
+SearchProductsRequest = {
+    @description("Text search query")
+    @send-only
+    ? query: text .size (0..200),
+    
+    @description("Filter by category")
+    @send-only
+    @max-items(5)
+    ? categories: [* text],
+    
+    @description("Minimum price filter")
+    @send-only
+    ? min_price: Money,
+    
+    @description("Maximum price filter")
+    @send-only
+    ? max_price: Money,
+    
+    @description("Only show available products")
+    @send-only
+    ? available_only: bool .default true,
+    
+    @description("Pagination offset")
+    @send-only
+    @min-value(0)
+    ? offset: int .default 0,
+    
+    @description("Page size")
+    @send-only
+    @min-value(1)
+    @max-value(100)
+    ? limit: int .default 20
+}
+
+SearchProductsResponse = {
+    @receive-only
+    products: [* Product],
+    
+    @receive-only
+    total_count: int .ge 0,
+    
+    @receive-only
+    ? next_offset: int .ge 0
+}
+
+CreateOrderRequest = {
+    @send-only
+    items: [* CreateOrderItem] .size (1..50),
+    
+    @send-only
+    shipping_address: Address,
+    
+    @send-only
+    payment_method_id: PaymentMethodID
+}
+
+CreateOrderItem = {
+    @send-only
+    product_id: ProductID,
+    
+    @send-only
+    @min-value(1)
+    @max-value(100)
+    quantity: int
+}
+
+GetOrderRequest = {
+    @send-only
+    id: OrderID
+}
+
+CancelOrderRequest = {
+    @send-only
+    id: OrderID,
+    
+    @description("Reason for cancellation")
+    @send-only
+    ? reason: text .size (0..500)
+}
+
+;; Admin-only operations
+UpdateProductRequest = {
+    @admin-only
+    @send-only
+    id: ProductID,
+    
+    @admin-only
+    @send-only
+    ? name: text .size (1..200),
+    
+    @admin-only
+    @send-only
+    ? description: text .size (0..2000),
+    
+    @admin-only
+    @send-only
+    ? price: Money,
+    
+    @admin-only
+    @send-only
+    ? cost: Money,
+    
+    @admin-only
+    @send-only
+    ? inventory_count: int .ge 0,
+    
+    @admin-only
+    @send-only
+    ? available: bool
+}
+
+UpdateOrderStatusRequest = {
+    @admin-only
+    @send-only
+    id: OrderID,
+    
+    @admin-only
+    @send-only
+    status: OrderStatus,
+    
+    @admin-only
+    @send-only
+    ? fulfillment_notes: text .size (0..1000),
+    
+    @admin-only
+    @send-only
+    ? cs_notes: text .size (0..2000)
+}
+
+;; Real-time updates
+OrderUpdate = {
+    @receive-only
+    order_id: OrderID,
+    
+    @receive-only
+    status: OrderStatus,
+    
+    @receive-only
+    timestamp: int,
+    
+    @description("Tracking information for shipped orders")
+    @receive-only
+    @depends-on(status = "shipped")
+    ? tracking_number: text,
+    
+    @description("Estimated delivery for shipped orders")
+    @receive-only
+    @depends-on(status = "shipped")
+    ? estimated_delivery: int
+}
+
+APIError = {
+    @receive-only
+    code: int .size (400..599),
+    
+    @receive-only
+    message: text,
+    
+    @receive-only
+    ? error_type: text / "not_found" / "permission_denied" / "invalid_input" / "payment_failed" / "inventory_insufficient",
+    
+    @receive-only
+    ? details: any,
+    
+    @receive-only
+    @depends-on(code = 429)
+    ? retry_after_seconds: int .ge 1
+}

@@ -1,0 +1,8 @@
+include "../shared/types.csil"
+include "../models/product.csil"
+
+service ProductAPI {
+    list-products: ProductFilter -> { products: [Product], pagination: PaginationInfo },
+    get-product: { product_id: int } -> Product / ErrorResponse,
+    create-product: ProductRequest -> Product / ErrorResponse
+}

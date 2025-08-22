@@ -1,0 +1,12 @@
+include "common.csil"
+
+ErrorResponse = {
+    @receive-only
+    code: int,
+    @receive-only
+    message: text,
+    @receive-only
+    details?: CommonMetadata,
+    @receive-only
+    timestamp: int
+}

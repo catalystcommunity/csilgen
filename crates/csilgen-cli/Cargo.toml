@@ -1,0 +1,24 @@
+[package]
+name = "csilgen"
+version = "0.1.0"
+edition = "2024"
+description = "CLI tool for generating code from CBOR Service Interface Language (CSIL) interface definitions"
+license = "Apache-2.0"
+
+[[bin]]
+name = "csilgen"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+csilgen-core.workspace = true
+csilgen-common.workspace = true
+csilgen-wasm-generators.workspace = true
+anyhow.workspace = true
+glob.workspace = true
+console.workspace = true
+indicatif.workspace = true
+atty.workspace = true
+
+[dev-dependencies]
+tempfile = "3.0"

@@ -1,0 +1,7 @@
+{
+  "description": "Group definition with missing closing brace",
+  "should_parse": false,
+  "expected_validation_errors": [],
+  "expected_ast": null,
+  "tags": ["invalid", "parse-error", "syntax", "group"]
+}

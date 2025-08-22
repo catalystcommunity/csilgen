@@ -1,0 +1,17 @@
+[package]
+name = "csil-integration-example"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+[build-dependencies]
+# In a real project, this would be a published crate
+# For now, we reference the local workspace crate
+csilgen-core = { path = "../../../crates/csilgen-core" }
+
+[[bin]]
+name = "generate-types"
+path = "build/generate.rs"

@@ -1,0 +1,48 @@
+;; Basic CSIL example demonstrating simple service definition
+;; This example shows fundamental CDDL types + CSIL service syntax
+
+;; Basic data types using CDDL syntax
+UserID = int
+Username = text .size (3..50)
+Email = text .regex "^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$"
+
+;; Group definition using CDDL syntax
+User = {
+    id: UserID,
+    username: Username,
+    email: Email,
+    ? active: bool .default true
+}
+
+;; CSIL service definition - extends CDDL with services
+service UserService {
+    ;; Simple operation: input -> output
+    get-user: UserID -> User,
+    
+    ;; Operation with error handling
+    create-user: CreateUserRequest -> User / UserError,
+    
+    ;; Bidirectional operation (for real-time services)
+    subscribe-user-updates: UserID <-> UserUpdate
+}
+
+;; Request/response types for service operations
+CreateUserRequest = {
+    username: Username,
+    email: Email,
+    ? active: bool .default true
+}
+
+UserUpdate = {
+    id: UserID,
+    ? username: Username,
+    ? email: Email,
+    ? active: bool,
+    timestamp: int ;; Unix timestamp
+}
+
+UserError = {
+    code: int,
+    message: text,
+    ? details: any
+}

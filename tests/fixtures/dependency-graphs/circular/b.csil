@@ -1,0 +1,6 @@
+include "c.csil"
+
+TypeB = {
+    field: text,
+    c_ref: TypeC
+}

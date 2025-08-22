@@ -1,0 +1,15 @@
+{
+  "description": "Invalid CSIL service syntax that should fail parsing",
+  "should_parse": false,
+  "expected_validation_errors": [
+    "Missing service braces",
+    "Missing operation arrow", 
+    "Invalid arrow syntax",
+    "Malformed bidirectional syntax",
+    "Invalid service name",
+    "Empty service definition",
+    "Invalid operation name"
+  ],
+  "expected_ast": null,
+  "tags": ["invalid", "csil", "services", "syntax-error", "parsing"]
+}

@@ -1,0 +1,7 @@
+{
+  "description": "Complete e-commerce API with products, cart, checkout, orders, and customer management",
+  "should_parse": true,
+  "expected_validation_errors": [],
+  "expected_ast": null,
+  "tags": ["valid", "real-world", "ecommerce", "services", "metadata", "complex", "complete"]
+}

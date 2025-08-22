@@ -1,0 +1,22 @@
+[package]
+name = "csilgen-json-generator"
+version = "0.1.0"
+edition = "2024"
+description = "JSON Schema generator for CSIL specifications (WASM module)"
+authors = ["CSIL Team <team@csilgen.org>"]
+license = "Apache-2.0"
+homepage = "https://github.com/catalystcommunity/csilgen/json-generator"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+csilgen-common = { path = "../../crates/csilgen-common" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = "0.2"
+
+[dev-dependencies]
+serde_json = "1.0"

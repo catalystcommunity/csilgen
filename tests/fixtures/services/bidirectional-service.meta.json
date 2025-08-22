@@ -1,0 +1,7 @@
+{
+  "description": "Bidirectional service with client-to-server, server-to-client, and bidirectional operations",
+  "should_parse": true,
+  "expected_validation_errors": [],
+  "expected_ast": null,
+  "tags": ["valid", "services", "csil", "bidirectional", "events", "real-time"]
+}

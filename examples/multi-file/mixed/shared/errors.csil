@@ -1,0 +1,8 @@
+ErrorResponse = {
+    @receive-only
+    code: int,
+    @receive-only
+    message: text,
+    @receive-only
+    timestamp: int
+}

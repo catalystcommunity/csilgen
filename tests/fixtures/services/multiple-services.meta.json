@@ -1,0 +1,7 @@
+{
+  "description": "Multiple service definitions with shared types in a single file",
+  "should_parse": true,
+  "expected_validation_errors": [],
+  "expected_ast": null,
+  "tags": ["valid", "services", "csil", "multiple", "shared-types"]
+}

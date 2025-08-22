@@ -1,0 +1,4 @@
+StandaloneType = {
+    value: text,
+    timestamp: int
+}

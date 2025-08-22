@@ -1,0 +1,6 @@
+include "shared.csil"
+
+RightType = {
+    value: int,
+    shared: SharedType
+}

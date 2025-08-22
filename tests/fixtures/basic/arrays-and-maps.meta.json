@@ -1,0 +1,7 @@
+{
+  "description": "Arrays with various cardinality and maps with different key-value types",
+  "should_parse": true,
+  "expected_validation_errors": [],
+  "expected_ast": null,
+  "tags": ["valid", "arrays", "maps", "cardinality", "cddl"]
+}

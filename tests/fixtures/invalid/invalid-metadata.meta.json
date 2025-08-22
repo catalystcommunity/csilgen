@@ -1,0 +1,14 @@
+{
+  "description": "Invalid CSIL metadata syntax that should fail parsing",  
+  "should_parse": false,
+  "expected_validation_errors": [
+    "Missing @ symbol in metadata",
+    "Invalid metadata placement",
+    "Missing dependency parentheses", 
+    "Malformed dependency condition",
+    "Unknown metadata annotation",
+    "Invalid validation syntax"
+  ],
+  "expected_ast": null,
+  "tags": ["invalid", "csil", "metadata", "syntax-error", "parsing"]
+}

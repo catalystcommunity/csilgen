@@ -1,0 +1,8 @@
+OrphanedType2 = {
+    id: int,
+    name: text
+}
+
+service OrphanedService2 {
+    process: OrphanedType2 -> { success: bool }
+}

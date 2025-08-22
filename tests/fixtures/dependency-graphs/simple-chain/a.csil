@@ -1,0 +1,10 @@
+include "b.csil"
+
+TypeA = {
+    field: int,
+    b_ref: TypeB
+}
+
+service MainService {
+    process: TypeA -> TypeB
+}

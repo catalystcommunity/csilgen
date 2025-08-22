@@ -1,0 +1,7 @@
+{
+  "description": "Complex array and map structures with various cardinalities and nested types",
+  "should_parse": true,
+  "expected_validation_errors": [],
+  "expected_ast": null,
+  "tags": ["valid", "arrays", "maps", "cardinality", "cddl", "nested", "complex"]
+}

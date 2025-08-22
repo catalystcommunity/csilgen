@@ -1,0 +1,7 @@
+{
+  "description": "Complex service with multiple CRUD operations and shared types",
+  "should_parse": true,
+  "expected_validation_errors": [],
+  "expected_ast": null,
+  "tags": ["valid", "services", "csil", "crud", "complex"]
+}

@@ -1,0 +1,14 @@
+{
+  "description": "Version 2 of API with metadata changes - breaking changes",
+  "should_parse": true,
+  "expected_validation_errors": [],
+  "expected_ast": null,
+  "breaking_changes": [
+    "Field added (required): captcha_token",
+    "Field renamed: token -> access_token",
+    "Field renamed: id -> user_id",
+    "Field visibility changed: name from bidirectional to send-only",
+    "Field visibility changed: email from bidirectional to receive-only"
+  ],
+  "tags": ["valid", "breaking-changes", "v2", "metadata", "breaking", "visibility"]
+}

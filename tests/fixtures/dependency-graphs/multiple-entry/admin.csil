@@ -1,0 +1,6 @@
+include "shared/types.csil"
+
+service AdminAPI {
+    list-users: {} -> { users: [UserResponse] },
+    delete-user: { id: int } -> { deleted: bool }
+}

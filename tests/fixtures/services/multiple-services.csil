@@ -1,0 +1,67 @@
+; Multiple service definitions in a single file
+
+; Shared types
+ApiKey = {
+  id: text,
+  key: text,
+  permissions: [* text],
+  expires_at?: text,
+}
+
+Project = {
+  id: text,
+  name: text,
+  description?: text,
+  owner_id: text,
+  created_at: text,
+}
+
+; Authentication service
+service AuthService {
+  login: {email: text, password: text} -> {token: text, user_id: text},
+  logout: {token: text} -> {success: bool},
+  refresh-token: {refresh_token: text} -> {token: text},
+  verify-token: {token: text} -> {valid: bool, user_id?: text},
+}
+
+; Project management service  
+service ProjectService {
+  create-project: {name: text, description?: text} -> Project,
+  get-project: {project_id: text} -> Project,
+  list-projects: {user_id: text} -> {projects: [* Project]},
+  update-project: {project_id: text, updates: {name?: text, description?: text}} -> Project,
+  delete-project: {project_id: text} -> {success: bool},
+}
+
+; API key management service
+service ApiKeyService {
+  create-api-key: {project_id: text, permissions: [* text]} -> ApiKey,
+  list-api-keys: {project_id: text} -> {keys: [* ApiKey]},
+  revoke-api-key: {key_id: text} -> {success: bool},
+  rotate-api-key: {key_id: text} -> ApiKey,
+}
+
+; Notification service
+service NotificationService {
+  send-notification: {
+    user_id: text,
+    title: text,
+    message: text,
+    type: "info" / "warning" / "error",
+  } -> {success: bool, notification_id: text},
+  
+  get-notifications: {
+    user_id: text,
+    limit?: int,
+    offset?: int,
+  } -> {
+    notifications: [* {
+      id: text,
+      title: text,
+      message: text,
+      type: text,
+      read: bool,
+      created_at: text,
+    }],
+  },
+}

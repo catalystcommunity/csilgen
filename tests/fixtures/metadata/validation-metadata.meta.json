@@ -1,0 +1,7 @@
+{
+  "description": "Validation constraints and metadata including min/max lengths, regex patterns, ranges, and descriptions",
+  "should_parse": true,
+  "expected_validation_errors": [],
+  "expected_ast": null,
+  "tags": ["valid", "metadata", "csil", "validation", "constraints", "descriptions"]
+}

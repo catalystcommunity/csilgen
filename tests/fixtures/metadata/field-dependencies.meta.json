@@ -1,0 +1,7 @@
+{
+  "description": "Field dependencies and conditional requirements with complex logic",
+  "should_parse": true,
+  "expected_validation_errors": [],
+  "expected_ast": null,
+  "tags": ["valid", "metadata", "csil", "dependencies", "conditional", "complex"]
+}

@@ -1,0 +1,7 @@
+{
+  "description": "Field visibility metadata annotations (send-only, receive-only)",
+  "should_parse": true,
+  "expected_validation_errors": [],
+  "expected_ast": null,
+  "tags": ["valid", "metadata", "visibility", "csil-extension"]
+}

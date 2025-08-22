@@ -1,0 +1,72 @@
+; Complex service definitions with multiple operations
+
+; Request/Response types
+ListUsersRequest = {
+  page?: int,
+  limit?: int,
+  sort_by?: text,
+  filter?: {* text => any},
+}
+
+ListUsersResponse = {
+  users: [* User],
+  total_count: int,
+  has_more: bool,
+}
+
+GetUserRequest = {
+  user_id: int,
+}
+
+GetUserResponse = User
+
+User = {
+  id: int,
+  name: text,
+  email: text,
+  created_at: text,
+  updated_at: text,
+  active: bool,
+}
+
+UpdateUserRequest = {
+  user_id: int,
+  updates: {
+    name?: text,
+    email?: text,
+    active?: bool,
+  },
+}
+
+UpdateUserResponse = User
+
+DeleteUserRequest = {
+  user_id: int,
+}
+
+DeleteUserResponse = {
+  success: bool,
+  message?: text,
+}
+
+; Service definition with multiple operations
+service UserService {
+  ; Basic CRUD operations
+  list-users: ListUsersRequest -> ListUsersResponse,
+  get-user: GetUserRequest -> GetUserResponse,
+  create-user: CreateUserRequest -> CreateUserResponse,
+  update-user: UpdateUserRequest -> UpdateUserResponse,
+  delete-user: DeleteUserRequest -> DeleteUserResponse,
+  
+  ; Additional operations
+  activate-user: GetUserRequest -> UpdateUserResponse,
+  deactivate-user: GetUserRequest -> UpdateUserResponse,
+}
+
+; Reuse types from simple-service.csil
+CreateUserRequest = {
+  name: text,
+  email: text,
+}
+
+CreateUserResponse = User

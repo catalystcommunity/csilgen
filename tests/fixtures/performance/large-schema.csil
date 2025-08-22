@@ -1,0 +1,140 @@
+; Large CSIL schema for performance testing
+
+; Basic types
+UserId = int
+UserName = text
+Email = text
+Timestamp = text
+
+; User management types
+User = {
+  id: UserId,
+  name: UserName,
+  email: Email,
+  created_at: Timestamp,
+  updated_at?: Timestamp,
+  active: bool,
+}
+
+UserProfile = {
+  user: User,
+  bio?: text,
+  avatar_url?: text,
+  settings: UserSettings,
+}
+
+UserSettings = {
+  notifications: NotificationSettings,
+  privacy: PrivacySettings,
+  preferences: UserPreferences,
+}
+
+NotificationSettings = {
+  email_notifications: bool,
+  push_notifications: bool,
+  sms_notifications: bool,
+  frequency: text,
+}
+
+PrivacySettings = {
+  profile_visibility: text,
+  contact_visibility: text,
+  search_visibility: bool,
+}
+
+UserPreferences = {
+  language: text,
+  timezone: text,
+  theme: text,
+  date_format: text,
+}
+
+; Product types
+ProductId = int
+ProductName = text
+Price = float
+
+Product = {
+  id: ProductId,
+  name: ProductName,
+  description: text,
+  price: Price,
+  category: ProductCategory,
+  inventory: ProductInventory,
+  images: [* text],
+  tags: [* text],
+  created_at: Timestamp,
+  updated_at?: Timestamp,
+}
+
+ProductCategory = {
+  id: int,
+  name: text,
+  parent_id?: int,
+}
+
+ProductInventory = {
+  quantity: int,
+  reserved: int,
+  available: int,
+  restocking_date?: Timestamp,
+}
+
+; Order types
+OrderId = int
+OrderStatus = text
+
+Order = {
+  id: OrderId,
+  user_id: UserId,
+  status: OrderStatus,
+  items: [* OrderItem],
+  total_amount: Price,
+  shipping_address: Address,
+  billing_address?: Address,
+  payment_info: PaymentInfo,
+  created_at: Timestamp,
+  updated_at?: Timestamp,
+}
+
+OrderItem = {
+  product_id: ProductId,
+  quantity: int,
+  unit_price: Price,
+  total_price: Price,
+}
+
+Address = {
+  street: text,
+  city: text,
+  state: text,
+  country: text,
+  postal_code: text,
+}
+
+PaymentInfo = {
+  method: text,
+  transaction_id: text,
+  amount: Price,
+  currency: text,
+  processed_at: Timestamp,
+}
+
+; Analytics types
+AnalyticsEvent = {
+  event_type: text,
+  user_id?: UserId,
+  session_id: text,
+  timestamp: Timestamp,
+  properties: {* text => any},
+}
+
+AnalyticsMetrics = {
+  period: text,
+  total_users: int,
+  active_users: int,
+  new_users: int,
+  total_orders: int,
+  revenue: Price,
+  conversion_rate: float,
+}

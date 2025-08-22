@@ -1,0 +1,14 @@
+{
+  "description": "Invalid CDDL syntax that should fail parsing",
+  "should_parse": false,
+  "expected_validation_errors": [
+    "Missing assignment operator",
+    "Missing comma in group",
+    "Invalid array brackets",
+    "Incomplete choice",
+    "Invalid range syntax",
+    "Missing map arrow"
+  ],
+  "expected_ast": null,
+  "tags": ["invalid", "cddl", "syntax-error", "parsing"]
+}

@@ -1,0 +1,13 @@
+include "../dependencies/user-types.csil"
+include "../dependencies/common-types.csil"
+
+UserApiRequest = {
+    action: text,
+    user_data: UserData
+}
+
+UserApiResponse = {
+    success: bool,
+    user: UserData,
+    metadata: CommonData
+}

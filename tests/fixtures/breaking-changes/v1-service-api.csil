@@ -1,0 +1,32 @@
+; Version 1 of service API
+CreateUserRequest = {
+  name: text,
+  email: text,
+  age?: int,
+}
+
+CreateUserResponse = {
+  id: int,
+  name: text,
+  email: text,
+  created_at: text,
+}
+
+UpdateUserRequest = {
+  id: int,
+  name?: text,
+  email?: text,
+}
+
+UpdateUserResponse = {
+  id: int,
+  name: text,
+  email: text,
+  updated_at: text,
+}
+
+service UserService {
+  create-user: CreateUserRequest -> CreateUserResponse,
+  update-user: UpdateUserRequest -> UpdateUserResponse,
+  get-user: {id: int} -> CreateUserResponse,
+}

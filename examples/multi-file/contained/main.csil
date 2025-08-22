@@ -1,0 +1,6 @@
+include "types.csil"
+
+MainType = {
+    data: SharedType,
+    timestamp: int
+}

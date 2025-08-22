@@ -1,0 +1,7 @@
+OrphanedType1 = {
+    value: text,
+    metadata: {
+        created: int,
+        updated: int
+    }
+}

@@ -1,0 +1,15 @@
+; Simple service definition
+CreateUserRequest = {
+  name: text,
+  email: text,
+}
+
+CreateUserResponse = {
+  id: int,
+  name: text,
+  email: text,
+}
+
+service UserService {
+  create-user: CreateUserRequest -> CreateUserResponse
+}

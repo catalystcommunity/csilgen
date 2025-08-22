@@ -1,0 +1,11 @@
+include "left.csil"
+include "right.csil"
+
+MainType = {
+    left: LeftType,
+    right: RightType
+}
+
+service DiamondService {
+    combine: { left: LeftType, right: RightType } -> MainType
+}

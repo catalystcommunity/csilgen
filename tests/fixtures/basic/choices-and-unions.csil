@@ -1,0 +1,35 @@
+; Choice types and unions test case
+status = "active" / "inactive" / "pending"
+number_or_text = int / text
+optional_value = nil / text
+
+; Complex choices
+shape = circle / rectangle / triangle
+
+circle = {
+  type: "circle",
+  radius: float,
+}
+
+rectangle = {
+  type: "rectangle", 
+  width: float,
+  height: float,
+}
+
+triangle = {
+  type: "triangle",
+  base: float,
+  height: float,
+}
+
+; Multi-level choices
+value = simple_value / complex_value
+simple_value = int / text / bool
+complex_value = [* any] / {* text => any}
+
+; Tagged unions
+tagged_value = [tag: text, value: any]
+result = success / error
+success = [tag: "success", data: any]
+error = [tag: "error", message: text]

@@ -1,0 +1,74 @@
+;; API Version 2.0 - Evolution with breaking and non-breaking changes
+;; This version shows various types of changes for breaking change detection
+
+UserID = int
+Username = text .size (3..50)
+Email = text .regex "^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$"  ;; BREAKING: Added validation
+
+;; BREAKING: Changed User structure
+User = {
+    id: UserID,
+    username: Username,
+    email: Email,  ;; BREAKING: Now uses Email type with validation
+    active: bool,
+    created_at: int,  ;; NON-BREAKING: Added new field
+    ? profile: UserProfile  ;; NON-BREAKING: Added optional field
+}
+
+;; NON-BREAKING: Added new type
+UserProfile = {
+    ? display_name: text .size (1..100),
+    ? bio: text .size (0..500),
+    ? avatar_url: text
+}
+
+;; BREAKING: Changed service interface
+service UserAPI {
+    ;; NON-BREAKING: Same signature
+    get-user: UserID -> User / UserError,
+    
+    ;; BREAKING: Changed request structure
+    create-user: CreateUserRequestV2 -> User / UserError,
+    
+    ;; BREAKING: Changed response structure (removed update-user operation)
+    ;; update-user: UpdateUserRequest -> User / UserError,  ;; REMOVED
+    
+    ;; NON-BREAKING: Same signature  
+    delete-user: UserID -> DeleteResponse / UserError,
+    
+    ;; NON-BREAKING: Added new operation
+    update-profile: UpdateProfileRequest -> User / UserError,
+    
+    ;; NON-BREAKING: Added new operation
+    get-user-profile: UserID -> UserProfile / UserError
+}
+
+;; BREAKING: Changed required fields
+CreateUserRequestV2 = {
+    username: Username,
+    email: Email,  ;; BREAKING: Now uses validated Email type
+    password: text .size (8..100),  ;; BREAKING: Added required field
+    ? active: bool .default true,
+    ? profile: UserProfile  ;; NON-BREAKING: Added optional field
+}
+
+;; NON-BREAKING: New request type
+UpdateProfileRequest = {
+    id: UserID,
+    ? display_name: text .size (1..100),
+    ? bio: text .size (0..500),
+    ? avatar_url: text
+}
+
+DeleteResponse = {
+    success: bool,
+    message: text
+}
+
+;; BREAKING: Changed error structure
+UserError = {
+    code: int,
+    message: text,
+    error_type: text,  ;; BREAKING: Added required field
+    ? details: any  ;; NON-BREAKING: Added optional field
+}

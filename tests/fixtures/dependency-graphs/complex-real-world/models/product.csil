@@ -1,0 +1,35 @@
+include "../shared/common.csil"
+
+Product = {
+    @receive-only
+    id: int,
+    @bidirectional
+    name: text,
+    @bidirectional
+    description: text,
+    @bidirectional
+    price: float,
+    @receive-only
+    created_at: int,
+    metadata: CommonMetadata
+}
+
+ProductRequest = {
+    @send-only
+    name: text,
+    @send-only
+    description: text,
+    @send-only
+    price: float
+}
+
+ProductFilter = {
+    @send-only
+    category?: text,
+    @send-only
+    min_price?: float,
+    @send-only
+    max_price?: float,
+    @send-only
+    search?: text
+}

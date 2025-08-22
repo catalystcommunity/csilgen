@@ -1,0 +1,5 @@
+CommonMetadata = {
+    timestamp: int,
+    version: text,
+    trace_id?: text
+}

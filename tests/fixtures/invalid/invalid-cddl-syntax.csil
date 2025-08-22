@@ -1,0 +1,23 @@
+; Invalid CDDL syntax test cases
+
+; Invalid type assignment - missing equals
+user text
+
+; Invalid group syntax - missing comma
+person = {
+  name: text
+  age: int
+}
+
+; Invalid array syntax - wrong brackets
+scores = (1*10 int)
+
+; Invalid choice syntax - missing alternatives
+status = "active" /
+
+; Invalid range syntax
+invalid_range = 1..
+another_invalid = ..100..200
+
+; Invalid map syntax - missing arrow
+mapping = {text int}

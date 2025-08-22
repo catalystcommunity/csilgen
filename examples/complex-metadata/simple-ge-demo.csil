@@ -1,0 +1,14 @@
+;; Simple demonstration of .ge constraints working
+;; This shows the newly implemented CDDL comparison operators
+
+UserID = int .ge 1
+Version = int .ge 1  
+Timestamp = int .ge 0
+Priority = int .ge 1 .le 10
+
+User = {
+    id: UserID,
+    version: Version,
+    created_at: Timestamp,
+    priority: Priority
+}

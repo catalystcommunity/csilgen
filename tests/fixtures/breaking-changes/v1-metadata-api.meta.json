@@ -1,0 +1,7 @@
+{
+  "description": "Version 1 of API with field metadata for breaking change testing",
+  "should_parse": true,
+  "expected_validation_errors": [],
+  "expected_ast": null,
+  "tags": ["valid", "breaking-changes", "v1", "metadata", "baseline"]
+}

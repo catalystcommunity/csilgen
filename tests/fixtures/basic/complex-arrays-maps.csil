@@ -1,0 +1,51 @@
+; Complex array and map structures test case
+
+; Arrays with complex cardinality
+empty_array = [0 any]
+one_to_five = [1*5 int]
+at_least_two = [2* text]
+exactly_three = [3 bool]
+up_to_ten = [*10 float]
+
+; Arrays with different value types
+mixed_array = [text, int, bool]
+optional_array = [text, ?int, ?bool]
+choice_array = [* (int / text / bool)]
+
+; Maps with various key types
+string_map = {text => int}
+int_map = {int => text}
+bool_map = {bool => any}
+mixed_key_map = {(text / int) => any}
+
+; Maps with cardinality
+optional_fields = {? text => int}
+required_at_least_one = {+ text => int}
+unlimited_fields = {* text => int}
+limited_fields = {1*5 text => int}
+
+; Nested structures
+user_preferences = {
+  theme: text,
+  notifications: {
+    email: bool,
+    push: bool,
+    sms?: bool,
+  },
+  features: [* text],
+  metadata: {* text => any},
+}
+
+; Complex nested arrays and maps
+data_structure = {
+  arrays: {
+    numbers: [* int],
+    texts: [1* text],
+    mixed: [* (int / text)],
+  },
+  maps: {
+    simple: {text => int},
+    nested: {text => {text => bool}},
+    arrays_in_maps: {text => [* int]},
+  },
+}

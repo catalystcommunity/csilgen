@@ -1,0 +1,88 @@
+;; Example CSIL file for testing the custom Go generator
+
+UserID = text .size (8..16)
+Username = text .size (3..50)
+
+User = {
+    @receive-only
+    id: UserID,
+    
+    @description("User's display name")
+    username: Username,
+    
+    @description("User's email address")
+    email: text,
+    
+    @description("Whether the user account is active")
+    @receive-only
+    active: bool,
+    
+    @description("When the user was created")
+    @receive-only
+    created_at: int,
+    
+    @description("User's role in the system")
+    @admin-only
+    @receive-only
+    ? role: text / "user" / "admin" / "moderator"
+}
+
+service UserAPI {
+    get-user: UserID -> User / UserError,
+    create-user: CreateUserRequest -> User / UserError,
+    list-users: ListUsersRequest -> ListUsersResponse / UserError,
+    watch-user-events: UserID <-> UserEvent / UserError
+}
+
+CreateUserRequest = {
+    @send-only
+    username: Username,
+    
+    @send-only
+    email: text,
+    
+    @send-only
+    ? active: bool .default true
+}
+
+ListUsersRequest = {
+    @send-only
+    @min-value(0)
+    ? offset: int .default 0,
+    
+    @send-only
+    @min-value(1)
+    @max-value(100)
+    ? limit: int .default 20
+}
+
+ListUsersResponse = {
+    @receive-only
+    users: [* User],
+    
+    @receive-only
+    total_count: int .ge 0
+}
+
+UserEvent = {
+    @receive-only
+    user_id: UserID,
+    
+    @receive-only
+    event_type: text / "created" / "updated" / "deleted",
+    
+    @receive-only
+    timestamp: int,
+    
+    @receive-only
+    @depends-on(event_type = "updated")
+    ? updated_user: User
+}
+
+UserError = {
+    @receive-only
+    code: int .ge 400 .le 599,
+    
+    @receive-only
+    message: text
+}

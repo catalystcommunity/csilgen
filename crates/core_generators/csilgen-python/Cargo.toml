@@ -1,0 +1,14 @@
+[package]
+name = "csilgen-python"
+version = "0.1.0"
+edition = "2024"
+description = "Python code generator for csilgen"
+license = "Apache-2.0"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+csilgen-core.workspace = true
+csilgen-common.workspace = true
+anyhow.workspace = true
+convert_case = "0.6"

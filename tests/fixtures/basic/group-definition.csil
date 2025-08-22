@@ -1,0 +1,6 @@
+; Group definition test case
+person = {
+  name: text,
+  age: int,
+  email?: text,
+}

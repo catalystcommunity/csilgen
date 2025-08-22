@@ -1,0 +1,40 @@
+; Invalid CSIL metadata syntax test cases
+
+; Invalid metadata syntax - missing @ symbol
+User = {
+  send-only
+  password: text,
+  name: text,
+}
+
+; Invalid metadata placement - after field type
+Invalid = {
+  password: text @send-only,
+}
+
+; Invalid dependency syntax - missing parentheses
+Broken = {
+  @depends-on field = value
+  conditional: text,
+}
+
+; Invalid dependency syntax - malformed condition
+AnotherBroken = {
+  @depends-on(field ==== value)
+  conditional: text,
+}
+
+; Unknown metadata annotation
+Unknown = {
+  @unknown-annotation
+  field: text,
+}
+
+; Invalid validation metadata - wrong syntax
+BadValidation = {
+  @min-length
+  name: text,
+  
+  @max(value1, value2)
+  age: int,
+}

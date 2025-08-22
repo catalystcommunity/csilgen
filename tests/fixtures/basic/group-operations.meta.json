@@ -1,0 +1,7 @@
+{
+  "description": "Group operations, membership, and nested group structures",
+  "should_parse": true,
+  "expected_validation_errors": [],
+  "expected_ast": null,
+  "tags": ["valid", "groups", "membership", "cddl", "nested"]
+}

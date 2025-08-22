@@ -1,0 +1,141 @@
+; Field dependencies and conditional requirements test case
+
+; Payment form with conditional fields
+PaymentForm = {
+  amount: float,
+  currency: text,
+  
+  payment_method: "card" / "paypal" / "bank_transfer",
+  
+  ; Card fields only required when payment_method = "card"
+  @depends-on(payment_method = "card")
+  card_number?: text,
+  
+  @depends-on(payment_method = "card")
+  expiry_month?: int,
+  
+  @depends-on(payment_method = "card")
+  expiry_year?: int,
+  
+  @depends-on(payment_method = "card")
+  cvv?: text,
+  
+  ; PayPal fields only required when payment_method = "paypal"
+  @depends-on(payment_method = "paypal")
+  paypal_email?: text,
+  
+  ; Bank transfer fields only required when payment_method = "bank_transfer"
+  @depends-on(payment_method = "bank_transfer")
+  bank_account?: text,
+  
+  @depends-on(payment_method = "bank_transfer")
+  routing_number?: text,
+}
+
+; Shipping form with address dependencies
+ShippingForm = {
+  recipient_name: text,
+  shipping_method: "standard" / "express" / "overnight",
+  
+  ; Address fields
+  street: text,
+  city: text,
+  country: text,
+  
+  ; State/province required for certain countries
+  @depends-on(country = "US" | country = "CA")
+  state?: text,
+  
+  ; Postal code format depends on country
+  @depends-on(country = "US")
+  @regexp("^[0-9]{5}(-[0-9]{4})?$")
+  postal_code_us?: text,
+  
+  @depends-on(country = "CA")
+  @regexp("^[A-Z][0-9][A-Z] [0-9][A-Z][0-9]$")
+  postal_code_ca?: text,
+  
+  @depends-on(country != "US" & country != "CA")
+  postal_code_other?: text,
+  
+  ; Express and overnight shipping require phone number
+  @depends-on(shipping_method = "express" | shipping_method = "overnight")
+  phone_number?: text,
+  
+  ; Overnight shipping requires signature
+  @depends-on(shipping_method = "overnight")
+  signature_required?: bool,
+}
+
+; User account with feature flags
+UserAccount = {
+  id: int,
+  email: text,
+  account_type: "free" / "premium" / "enterprise",
+  
+  ; Premium features only available for premium/enterprise
+  @depends-on(account_type = "premium" | account_type = "enterprise")
+  max_projects?: int,
+  
+  @depends-on(account_type = "premium" | account_type = "enterprise")
+  advanced_analytics?: bool,
+  
+  ; Enterprise-only features
+  @depends-on(account_type = "enterprise")
+  sso_enabled?: bool,
+  
+  @depends-on(account_type = "enterprise")
+  custom_domain?: text,
+  
+  @depends-on(account_type = "enterprise")
+  dedicated_support?: bool,
+  
+  ; SSO settings only relevant when SSO is enabled
+  @depends-on(sso_enabled = true)
+  sso_provider?: "okta" / "azure_ad" / "google",
+  
+  @depends-on(sso_enabled = true)
+  sso_domain?: text,
+}
+
+; Complex conditional form
+EventRegistration = {
+  event_id: text,
+  attendee_name: text,
+  attendee_email: text,
+  
+  registration_type: "individual" / "group" / "corporate",
+  
+  ; Group registration fields
+  @depends-on(registration_type = "group")
+  group_size?: int,
+  
+  @depends-on(registration_type = "group" & group_size > 5)
+  group_discount_code?: text,
+  
+  ; Corporate registration fields
+  @depends-on(registration_type = "corporate")
+  company_name?: text,
+  
+  @depends-on(registration_type = "corporate")
+  billing_contact?: {
+    name: text,
+    email: text,
+    phone: text,
+  },
+  
+  ; Dietary restrictions (optional for all)
+  has_dietary_restrictions: bool,
+  
+  @depends-on(has_dietary_restrictions = true)
+  dietary_notes?: text,
+  
+  ; Accommodation needed
+  needs_accommodation: bool,
+  
+  @depends-on(needs_accommodation = true)
+  accommodation_type?: "wheelchair" / "hearing" / "visual" / "other",
+  
+  @depends-on(needs_accommodation = true & accommodation_type = "other")
+  accommodation_details?: text,
+}

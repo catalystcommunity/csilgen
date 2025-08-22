@@ -1,0 +1,17 @@
+[package]
+name = "csilgen-wasm-generators"
+version = "0.1.0"
+edition = "2024"
+description = "WASM module loader and runtime for csilgen generators"
+license = "Apache-2.0"
+
+[dependencies]
+csilgen-core.workspace = true
+csilgen-common.workspace = true
+serde.workspace = true
+wasmtime = "24.0"
+serde_json = "1.0"
+dirs = "5.0"
+
+[dev-dependencies]
+tempfile = "3.0"

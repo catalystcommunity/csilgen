@@ -1,0 +1,101 @@
+; Validation and constraint metadata test case
+
+UserRegistration = {
+  @min-length(2)
+  @max-length(50)
+  @description("User's display name")
+  name: text,
+  
+  @regexp("^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$")
+  @description("Valid email address")
+  email: text,
+  
+  @min-length(8)
+  @max-length(128)
+  @description("Strong password with at least 8 characters")
+  @send-only
+  password: text,
+  
+  @min(13)
+  @max(120)
+  @description("Age in years")
+  age?: int,
+  
+  @description("User preferences")
+  preferences?: {
+    @enum("light", "dark", "auto")
+    theme: text,
+    
+    @default(true)
+    @description("Receive email notifications")
+    email_notifications: bool,
+    
+    @default(false)
+    @description("Receive SMS notifications")
+    sms_notifications: bool,
+    
+    @min-items(0)
+    @max-items(10)
+    @description("List of interests")
+    interests: [* text],
+    
+    @description("Custom settings")
+    custom: {* text => any},
+  },
+}
+
+ProductInfo = {
+  @required
+  @description("Product identifier")
+  id: text,
+  
+  @min-length(1)
+  @max-length(200)
+  @description("Product name")
+  name: text,
+  
+  @min-length(10)
+  @max-length(2000)
+  @description("Product description")
+  description: text,
+  
+  @min(0.01)
+  @precision(2)
+  @description("Price in dollars")
+  price: float,
+  
+  @min(0)
+  @description("Available quantity")
+  stock: int,
+  
+  @description("Product category")
+  category: text,
+  
+  @min-items(1)
+  @max-items(20)
+  @description("Product tags for search")
+  tags: [1*20 text],
+  
+  @description("Product dimensions")
+  dimensions?: {
+    @min(0.1)
+    @unit("cm")
+    @description("Length in centimeters")
+    length: float,
+    
+    @min(0.1)
+    @unit("cm")
+    @description("Width in centimeters") 
+    width: float,
+    
+    @min(0.1)
+    @unit("cm")
+    @description("Height in centimeters")
+    height: float,
+    
+    @min(0.001)
+    @unit("kg")
+    @description("Weight in kilograms")
+    weight: float,
+  },
+}

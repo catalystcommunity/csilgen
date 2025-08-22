@@ -1,0 +1,7 @@
+include "shared/types.csil"
+include "shared/errors.csil"
+
+service UserAPI {
+    create-user: UserRequest -> UserResponse / ErrorResponse,
+    get-user: { id: int } -> UserResponse / ErrorResponse
+}

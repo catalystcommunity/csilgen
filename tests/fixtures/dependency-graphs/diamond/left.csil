@@ -1,0 +1,6 @@
+include "shared.csil"
+
+LeftType = {
+    value: text,
+    shared: SharedType
+}

@@ -1,0 +1,374 @@
+; Social Media API - Real-world inspired interface
+
+; Core entity types
+User = {
+  id: text,
+  @min-length(3)
+  @max-length(30)
+  @regexp("^[a-zA-Z0-9_]+$")
+  username: text,
+  @min-length(1)
+  @max-length(100)
+  display_name: text,
+  @regexp("^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$")
+  email: text,
+  @max-length(500)
+  bio?: text,
+  avatar_url?: text,
+  @receive-only
+  follower_count: int,
+  @receive-only
+  following_count: int,
+  @receive-only
+  post_count: int,
+  verified: bool,
+  @receive-only
+  created_at: text,
+  @receive-only
+  last_active: text,
+}
+
+Post = {
+  id: text,
+  author_id: text,
+  @min-length(1)
+  @max-length(2000)
+  content: text,
+  media?: [* Media],
+  @receive-only
+  like_count: int,
+  @receive-only
+  repost_count: int,
+  @receive-only
+  comment_count: int,
+  @receive-only
+  created_at: text,
+  @receive-only
+  updated_at?: text,
+  visibility: "public" / "followers" / "private",
+  reply_to?: text,
+  tags: [* text],
+}
+
+Media = {
+  id: text,
+  type: "image" / "video" / "gif",
+  url: text,
+  thumbnail_url?: text,
+  width: int,
+  height: int,
+  size_bytes: int,
+  alt_text?: text,
+  @receive-only
+  uploaded_at: text,
+}
+
+Comment = {
+  id: text,
+  post_id: text,
+  author_id: text,
+  @min-length(1)
+  @max-length(1000)
+  content: text,
+  @receive-only
+  like_count: int,
+  @receive-only
+  created_at: text,
+  @receive-only
+  updated_at?: text,
+  reply_to?: text,
+}
+
+; Real-time event types for WebSocket connections
+NewPostEvent = {
+  type: "new_post",
+  post: Post,
+  author: User,
+}
+
+PostLikedEvent = {
+  type: "post_liked",
+  post_id: text,
+  user_id: text,
+  like_count: int,
+}
+
+NewFollowerEvent = {
+  type: "new_follower",
+  follower: User,
+  followed_user_id: text,
+}
+
+DirectMessage = {
+  id: text,
+  sender_id: text,
+  recipient_id: text,
+  @max-length(1000)
+  content: text,
+  media?: Media,
+  @receive-only
+  sent_at: text,
+  @receive-only
+  read_at?: text,
+}
+
+; Services
+service AuthService {
+  register: {
+    username: text,
+    display_name: text,  
+    email: text,
+    @send-only
+    @min-length(8)
+    password: text,
+  } -> {
+    @receive-only
+    access_token: text,
+    @receive-only
+    refresh_token: text,
+    user: User,
+  },
+  
+  login: {
+    email: text,
+    @send-only
+    password: text,
+  } -> {
+    @receive-only
+    access_token: text,
+    @receive-only
+    refresh_token: text,
+    user: User,
+  },
+  
+  refresh-token: {
+    @send-only
+    refresh_token: text,
+  } -> {
+    @receive-only
+    access_token: text,
+  },
+  
+  logout: {
+    @send-only
+    refresh_token: text,
+  } -> {success: bool},
+}
+
+service UserService {
+  get-profile: {user_id: text} -> User,
+  
+  update-profile: {
+    display_name?: text,
+    bio?: text,
+    avatar_url?: text,
+  } -> User,
+  
+  follow-user: {user_id: text} -> {success: bool},
+  unfollow-user: {user_id: text} -> {success: bool},
+  
+  get-followers: {
+    user_id: text,
+    cursor?: text,
+    limit?: int,
+  } -> {
+    users: [* User],
+    next_cursor?: text,
+    has_more: bool,
+  },
+  
+  get-following: {
+    user_id: text,
+    cursor?: text,
+    limit?: int,
+  } -> {
+    users: [* User],
+    next_cursor?: text,
+    has_more: bool,
+  },
+  
+  search-users: {
+    query: text,
+    limit?: int,
+    offset?: int,
+  } -> {
+    users: [* User],
+    total_count: int,
+  },
+}
+
+service PostService {
+  create-post: {
+    content: text,
+    media_ids?: [* text],
+    visibility: "public" / "followers" / "private",
+    reply_to?: text,
+    tags?: [* text],
+  } -> Post,
+  
+  get-post: {post_id: text} -> Post,
+  
+  delete-post: {post_id: text} -> {success: bool},
+  
+  like-post: {post_id: text} -> {
+    success: bool,
+    like_count: int,
+  },
+  
+  unlike-post: {post_id: text} -> {
+    success: bool,
+    like_count: int,
+  },
+  
+  repost: {post_id: text, comment?: text} -> Post,
+  
+  get-timeline: {
+    cursor?: text,
+    limit?: int,
+  } -> {
+    posts: [* Post],
+    next_cursor?: text,
+    has_more: bool,
+  },
+  
+  get-user-posts: {
+    user_id: text,
+    cursor?: text,
+    limit?: int,
+  } -> {
+    posts: [* Post],
+    next_cursor?: text,
+    has_more: bool,
+  },
+  
+  search-posts: {
+    query: text,
+    hashtag?: text,
+    from_user?: text,
+    limit?: int,
+    offset?: int,
+  } -> {
+    posts: [* Post],
+    total_count: int,
+  },
+}
+
+service CommentService {
+  add-comment: {
+    post_id: text,
+    content: text,
+    reply_to?: text,
+  } -> Comment,
+  
+  get-comments: {
+    post_id: text,
+    cursor?: text,
+    limit?: int,
+  } -> {
+    comments: [* Comment],
+    next_cursor?: text,
+    has_more: bool,
+  },
+  
+  like-comment: {comment_id: text} -> {
+    success: bool,
+    like_count: int,
+  },
+  
+  delete-comment: {comment_id: text} -> {success: bool},
+}
+
+service MediaService {
+  upload-media: {
+    @send-only
+    file_data: bytes,
+    filename: text,
+    content_type: text,
+    alt_text?: text,
+  } -> Media,
+  
+  get-media: {media_id: text} -> Media,
+  
+  delete-media: {media_id: text} -> {success: bool},
+}
+
+service DirectMessageService {
+  send-message: {
+    recipient_id: text,
+    content: text,
+    media_id?: text,
+  } -> DirectMessage,
+  
+  get-conversation: {
+    user_id: text,
+    cursor?: text,
+    limit?: int,
+  } -> {
+    messages: [* DirectMessage],
+    next_cursor?: text,
+    has_more: bool,
+  },
+  
+  get-conversations: {
+    cursor?: text,
+    limit?: int,
+  } -> {
+    conversations: [* {
+      user: User,
+      last_message: DirectMessage,
+      unread_count: int,
+    }],
+    next_cursor?: text,
+    has_more: bool,
+  },
+  
+  mark-as-read: {
+    message_ids: [1* text],
+  } -> {success: bool},
+}
+
+service NotificationService {
+  get-notifications: {
+    cursor?: text,
+    limit?: int,
+    type?: "like" / "comment" / "follow" / "mention" / "repost",
+  } -> {
+    notifications: [* {
+      id: text,
+      type: text,
+      title: text,
+      message: text,
+      data: {* text => any},
+      read: bool,
+      @receive-only
+      created_at: text,
+    }],
+    next_cursor?: text,
+    has_more: bool,
+    unread_count: int,
+  },
+  
+  mark-as-read: {
+    notification_ids: [1* text],
+  } -> {success: bool},
+}
+
+; Real-time WebSocket service for live updates
+service RealtimeService {
+  ; Client sends these to server
+  subscribe-to-user: {user_id: text} -> {success: bool},
+  unsubscribe-from-user: {user_id: text} -> {success: bool},
+  
+  ; Server sends these to client
+  new-post: <- NewPostEvent,
+  post-liked: <- PostLikedEvent,
+  new-follower: <- NewFollowerEvent,
+  new-message: <- {
+    type: "new_message",
+    message: DirectMessage,
+    sender: User,
+  },
+  
+  ; Bidirectional ping/pong for connection health
+  ping: {timestamp: text} <-> {timestamp: text, server_time: text},
+}

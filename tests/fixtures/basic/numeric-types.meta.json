@@ -1,0 +1,7 @@
+{
+  "description": "Comprehensive numeric types including uint, nint, int, floats, and ranges",
+  "should_parse": true,
+  "expected_validation_errors": [],
+  "expected_ast": null,
+  "tags": ["valid", "numeric-types", "cddl", "ranges"]
+}

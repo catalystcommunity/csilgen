@@ -1,0 +1,34 @@
+[package]
+name = "csilgen-core"
+version = "0.1.0"
+edition = "2024"
+description = "Core CSIL parsing, validation, and AST functionality for CBOR Service Interface Language"
+license = "Apache-2.0"
+
+[dependencies]
+serde.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+csilgen-common.workspace = true
+regex = "1.10"
+
+[dev-dependencies]
+csilgen-common = { workspace = true, features = ["testing"] }
+csilgen-wasm-generators = { path = "../../wasm/csilgen-wasm-generators" }
+tempfile = "3.0"
+pretty_assertions = "1.0"
+insta = "1.0"
+criterion.workspace = true
+serde_json.workspace = true
+
+[[bench]]
+name = "parsing_benchmarks"
+harness = false
+
+[[bench]]
+name = "dependency_analysis"
+harness = false
+
+[[bench]]
+name = "performance_benchmarks"
+harness = false

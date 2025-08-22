@@ -1,0 +1,5 @@
+CommonData = {
+    created_at: int,
+    updated_at: int,
+    version: text
+}

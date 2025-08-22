@@ -1,0 +1,41 @@
+; Version 2 of API with metadata - breaking changes
+LoginRequest = {
+  email: text,
+  @send-only
+  password: text,
+  @send-only          ; BREAKING: Added new required send-only field
+  captcha_token: text,
+}
+
+LoginResponse = {
+  @receive-only
+  access_token: text,   ; BREAKING: renamed from 'token'
+  @receive-only         ; BREAKING: added new receive-only field
+  refresh_token: text,
+  user: {
+    user_id: int,       ; BREAKING: renamed from 'id'
+    name: text,
+    @receive-only
+    created_at: text,
+    @receive-only       ; BREAKING: added new receive-only field
+    account_type: text,
+  },
+}
+
+UserProfile = {
+  user_id: int,         ; BREAKING: renamed from 'id'
+  @send-only            ; BREAKING: changed from bidirectional to send-only  
+  name: text,
+  @receive-only         ; BREAKING: changed from bidirectional to receive-only
+  email: text,
+  @receive-only
+  last_login: text,
+  @receive-only         ; Non-breaking: added new receive-only field
+  profile_picture?: text,
+}
+
+service AuthService {
+  login: LoginRequest -> LoginResponse,
+  get-profile: {user_id: int} -> UserProfile,  ; BREAKING: field name changed
+  refresh-token: {refresh_token: text} -> {access_token: text},  ; Non-breaking: new operation
+}

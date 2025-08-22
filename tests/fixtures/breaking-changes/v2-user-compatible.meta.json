@@ -1,0 +1,7 @@
+{
+  "description": "Version 2 of user schema with backwards compatible changes only",
+  "should_parse": true,
+  "expected_validation_errors": [],
+  "expected_ast": null,
+  "tags": ["valid", "breaking-changes", "compatible", "v2"]
+}

@@ -1,0 +1,4 @@
+TypeC = {
+    field: bool,
+    timestamp: int
+}

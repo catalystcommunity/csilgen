@@ -1,0 +1,32 @@
+; Version 1 of API with metadata
+LoginRequest = {
+  email: text,
+  @send-only
+  password: text,
+}
+
+LoginResponse = {
+  @receive-only
+  token: text,
+  user: {
+    id: int,
+    name: text,
+    @receive-only
+    created_at: text,
+  },
+}
+
+UserProfile = {
+  id: int,
+  @bidirectional
+  name: text,
+  @bidirectional
+  email: text,
+  @receive-only
+  last_login: text,
+}
+
+service AuthService {
+  login: LoginRequest -> LoginResponse,
+  get-profile: {user_id: int} -> UserProfile,
+}

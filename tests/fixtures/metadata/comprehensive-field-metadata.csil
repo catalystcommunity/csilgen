@@ -1,0 +1,101 @@
+; Comprehensive field metadata test case
+
+; Authentication request with mixed visibility
+LoginRequest = {
+  email: text,
+  @send-only
+  password: text,
+  @send-only  
+  remember_me?: bool,
+}
+
+; Response with receive-only fields
+LoginResponse = {
+  @receive-only
+  token: text,
+  @receive-only
+  expires_at: text,
+  user: {
+    id: int,
+    name: text,
+    email: text,
+    @receive-only
+    last_login: text,
+    @receive-only
+    created_at: text,
+  },
+}
+
+; User profile with bidirectional fields
+UserProfile = {
+  id: int,
+  @bidirectional
+  name: text,
+  @bidirectional
+  email: text,
+  @receive-only
+  verified: bool,
+  @receive-only
+  created_at: text,
+  @receive-only
+  updated_at: text,
+  @send-only
+  current_password?: text,
+  @send-only
+  new_password?: text,
+}
+
+; Payment information with security considerations
+PaymentRequest = {
+  amount: float,
+  currency: text,
+  @send-only
+  card_number: text,
+  @send-only
+  cvv: text,
+  @send-only
+  expiry_month: int,
+  @send-only
+  expiry_year: int,
+  billing_address: {
+    street: text,
+    city: text,
+    country: text,
+    postal_code: text,
+  },
+}
+
+PaymentResponse = {
+  @receive-only
+  transaction_id: text,
+  @receive-only
+  status: "pending" / "completed" / "failed",
+  amount: float,
+  currency: text,
+  @receive-only
+  created_at: text,
+  @receive-only
+  last_four_digits: text,
+}
+
+; Audit log entry - mostly receive-only
+AuditLogEntry = {
+  @receive-only
+  id: text,
+  @receive-only
+  timestamp: text,
+  @receive-only
+  user_id: text,
+  @receive-only
+  action: text,
+  @receive-only
+  resource_type: text,
+  @receive-only
+  resource_id: text,
+  @receive-only
+  changes: {* text => any},
+  @receive-only
+  ip_address: text,
+  @receive-only
+  user_agent: text,
+}

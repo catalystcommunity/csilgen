@@ -1,0 +1,7 @@
+{
+  "description": "Comprehensive field metadata including send-only, receive-only, and bidirectional fields",
+  "should_parse": true,
+  "expected_validation_errors": [],
+  "expected_ast": null,
+  "tags": ["valid", "metadata", "csil", "visibility", "send-only", "receive-only", "bidirectional"]
+}

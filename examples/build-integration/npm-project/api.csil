@@ -1,0 +1,89 @@
+;; API definition for NPM build integration example
+
+NotificationID = text .size (8..16)
+UserID = text .size (8..16)
+
+Notification = {
+    @receive-only
+    id: NotificationID,
+    
+    title: text .size (1..100),
+    
+    message: text .size (1..500),
+    
+    @receive-only
+    created_at: int,
+    
+    @receive-only
+    read: bool .default false,
+    
+    priority: text / "low" / "normal" / "high" / "urgent",
+    
+    @description("Notification type affects client rendering")
+    type: text / "info" / "warning" / "error" / "success"
+}
+
+service NotificationAPI {
+    create-notification: CreateNotificationRequest -> Notification / NotificationError,
+    get-notifications: GetNotificationsRequest -> GetNotificationsResponse / NotificationError,
+    mark-read: NotificationID -> Notification / NotificationError,
+    delete-notification: NotificationID -> DeleteResponse / NotificationError
+}
+
+CreateNotificationRequest = {
+    @send-only
+    user_id: UserID,
+    
+    @send-only
+    title: text .size (1..100),
+    
+    @send-only
+    message: text .size (1..500),
+    
+    @send-only
+    ? priority: text / "low" / "normal" / "high" / "urgent" .default "normal",
+    
+    @send-only
+    ? type: text / "info" / "warning" / "error" / "success" .default "info"
+}
+
+GetNotificationsRequest = {
+    @send-only
+    user_id: UserID,
+    
+    @send-only
+    ? unread_only: bool .default false,
+    
+    @send-only
+    @min-value(0)
+    ? offset: int .default 0,
+    
+    @send-only
+    @min-value(1)
+    @max-value(100)
+    ? limit: int .default 20
+}
+
+GetNotificationsResponse = {
+    @receive-only
+    notifications: [* Notification],
+    
+    @receive-only
+    total_count: int .ge 0,
+    
+    @receive-only
+    unread_count: int .ge 0
+}
+
+DeleteResponse = {
+    @receive-only
+    success: bool
+}
+
+NotificationError = {
+    @receive-only
+    code: int .ge 400 .le 599,
+    
+    @receive-only
+    message: text
+}

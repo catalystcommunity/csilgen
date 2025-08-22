@@ -1,0 +1,43 @@
+;; API Version 1.0 - Initial service definition
+;; This represents the original API before any changes
+
+UserID = int
+Username = text .size (3..50)
+
+User = {
+    id: UserID,
+    username: Username,
+    email: text,
+    active: bool
+}
+
+service UserAPI {
+    ;; Simple CRUD operations
+    get-user: UserID -> User / UserError,
+    create-user: CreateUserRequest -> User / UserError,
+    update-user: UpdateUserRequest -> User / UserError,
+    delete-user: UserID -> DeleteResponse / UserError
+}
+
+CreateUserRequest = {
+    username: Username,
+    email: text,
+    ? active: bool .default true
+}
+
+UpdateUserRequest = {
+    id: UserID,
+    ? username: Username,
+    ? email: text,
+    ? active: bool
+}
+
+DeleteResponse = {
+    success: bool,
+    message: text
+}
+
+UserError = {
+    code: int,
+    message: text
+}

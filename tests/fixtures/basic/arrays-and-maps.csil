@@ -1,0 +1,5 @@
+; Arrays and maps test case
+names = [* text]
+ages = [1*10 int]
+scores = {text => int}
+metadata = {* text => any}

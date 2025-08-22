@@ -1,0 +1,7 @@
+{
+  "description": "Text and bytes types with size constraints and specific values",
+  "should_parse": true,
+  "expected_validation_errors": [],
+  "expected_ast": null,
+  "tags": ["valid", "text-types", "bytes-types", "cddl", "constraints"]
+}

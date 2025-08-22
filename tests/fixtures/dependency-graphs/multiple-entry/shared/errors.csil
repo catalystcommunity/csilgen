@@ -1,0 +1,7 @@
+include "common.csil"
+
+ErrorResponse = {
+    code: int,
+    message: text,
+    details?: CommonMetadata
+}

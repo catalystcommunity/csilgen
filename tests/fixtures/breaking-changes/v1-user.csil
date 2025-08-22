@@ -1,0 +1,6 @@
+; Version 1 of user schema
+User = {
+  id: int,
+  name: text,
+  email: text,
+}

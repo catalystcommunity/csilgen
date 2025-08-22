@@ -1,0 +1,7 @@
+{
+  "description": "Complete social media API with authentication, posts, comments, messages, and real-time features",
+  "should_parse": true,
+  "expected_validation_errors": [],
+  "expected_ast": null,
+  "tags": ["valid", "real-world", "social-media", "services", "metadata", "websocket", "complete"]
+}

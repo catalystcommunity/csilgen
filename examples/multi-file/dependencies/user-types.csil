@@ -1,0 +1,8 @@
+include "common-types.csil"
+
+UserData = {
+    id: int,
+    username: text,
+    email: text,
+    metadata: CommonData
+}

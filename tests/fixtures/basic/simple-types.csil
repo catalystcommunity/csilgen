@@ -1,0 +1,5 @@
+; Basic CDDL types test case
+name = text
+age = int
+active = bool
+data = bytes

@@ -1,0 +1,6 @@
+include "a.csil"
+
+TypeC = {
+    field: bool,
+    a_ref: TypeA
+}

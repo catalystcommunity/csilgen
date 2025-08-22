@@ -1,0 +1,55 @@
+; Group operations and membership test case
+
+; Basic group definitions
+person_group = (
+  name: text,
+  age: int,
+)
+
+address_group = (
+  street: text,
+  city: text,
+  country: text,
+)
+
+; Group membership operators
+person = {
+  person_group,
+  active: bool,
+}
+
+contact = {
+  person_group,
+  address_group,
+  phone?: text,
+}
+
+; Group choices
+identification = ssn_group // passport_group // license_group
+
+ssn_group = (
+  type: "ssn",
+  number: text .regexp "[0-9]{3}-[0-9]{2}-[0-9]{4}",
+)
+
+passport_group = (
+  type: "passport", 
+  country: text,
+  number: text,
+)
+
+license_group = (
+  type: "license",
+  state: text,
+  number: text,
+)
+
+; Nested groups
+user = {
+  basic_info: { person_group },
+  contact_info: { address_group },
+  preferences?: { 
+    language: text,
+    timezone: text,
+  },
+}

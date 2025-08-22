@@ -1,0 +1,11 @@
+StandaloneType = {
+    value: text,
+    metadata: {
+        created: int,
+        version: text
+    }
+}
+
+service StandaloneService {
+    process: StandaloneType -> { success: bool }
+}

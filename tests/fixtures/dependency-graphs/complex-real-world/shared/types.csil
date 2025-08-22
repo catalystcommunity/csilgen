@@ -1,0 +1,54 @@
+include "common.csil"
+
+UserRegistration = {
+    @send-only
+    username: text,
+    @send-only  
+    password: text,
+    @send-only
+    email: text,
+    profile: BaseProfile
+}
+
+UserCredentials = {
+    @send-only
+    username: text,
+    @send-only
+    password: text
+}
+
+UserProfile = {
+    @receive-only
+    id: int,
+    @bidirectional
+    username: text,
+    @receive-only
+    email: text,
+    profile: BaseProfile,
+    metadata: CommonMetadata
+}
+
+UserProfileUpdate = {
+    @bidirectional
+    username: text ?,
+    @send-only
+    email: text ?,
+    profile: BaseProfile ?
+}
+
+UserSession = {
+    @receive-only
+    token: text,
+    @receive-only
+    expires_at: int,
+    user: UserProfile
+}
+
+PaginationInfo = {
+    @receive-only
+    page: int,
+    @receive-only
+    per_page: int,
+    @receive-only
+    total: int
+}

@@ -1,0 +1,20 @@
+; Comprehensive numeric types test case
+uint_type = uint
+nint_type = nint
+int_type = int
+float16_type = float16
+float32_type = float32
+float64_type = float64
+decimal_type = decimal
+
+; Specific numeric ranges
+positive_int = 1..
+negative_int = ..-1
+bounded_int = 1..100
+float_range = 0.0..1.0
+
+; Specific values
+zero = 0
+one = 1
+minus_one = -1
+pi_approx = 3.14159

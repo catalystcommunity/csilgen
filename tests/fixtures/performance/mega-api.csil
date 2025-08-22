@@ -1,0 +1,473 @@
+; Mega API - Large CSIL file for performance testing with many services
+
+; Common types
+Id = int
+UUID = text
+Timestamp = text
+Email = text
+Phone = text
+Url = text
+
+; User types
+User = {
+  id: Id,
+  uuid: UUID,
+  @min-length(2)
+  @max-length(100)
+  name: text,
+  @regexp("^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$")
+  email: Email,
+  phone?: Phone,
+  @receive-only
+  created_at: Timestamp,
+  @receive-only
+  updated_at: Timestamp,
+  active: bool,
+  profile: UserProfile,
+}
+
+UserProfile = {
+  @bidirectional
+  display_name: text,
+  @bidirectional
+  bio?: text,
+  @bidirectional
+  avatar_url?: Url,
+  @receive-only
+  follower_count: int,
+  @receive-only
+  following_count: int,
+  preferences: UserPreferences,
+}
+
+UserPreferences = {
+  @bidirectional
+  language: text,
+  @bidirectional
+  timezone: text,
+  @bidirectional
+  theme: "light" / "dark" / "auto",
+  @bidirectional
+  notifications: NotificationSettings,
+  @bidirectional
+  privacy: PrivacySettings,
+}
+
+NotificationSettings = {
+  @bidirectional
+  email_enabled: bool,
+  @bidirectional
+  push_enabled: bool,
+  @bidirectional
+  sms_enabled: bool,
+  @bidirectional
+  marketing_enabled: bool,
+}
+
+PrivacySettings = {
+  @bidirectional
+  profile_public: bool,
+  @bidirectional
+  show_email: bool,
+  @bidirectional
+  show_phone: bool,
+  @bidirectional
+  allow_messages: bool,
+}
+
+; Product types
+Product = {
+  id: Id,
+  uuid: UUID,
+  @min-length(1)
+  @max-length(200)
+  name: text,
+  @min-length(10)
+  @max-length(5000)
+  description: text,
+  @min(0.01)
+  price: float,
+  currency: text,
+  @min(0)
+  stock_quantity: int,
+  category: ProductCategory,
+  tags: [* text],
+  images: [* ProductImage],
+  specifications: ProductSpecifications,
+  @receive-only
+  created_at: Timestamp,
+  @receive-only
+  updated_at: Timestamp,
+  active: bool,
+}
+
+ProductCategory = {
+  id: Id,
+  name: text,
+  description?: text,
+  parent_id?: Id,
+  level: int,
+  path: [* text],
+}
+
+ProductImage = {
+  id: Id,
+  url: Url,
+  alt_text?: text,
+  width: int,
+  height: int,
+  size_bytes: int,
+  is_primary: bool,
+}
+
+ProductSpecifications = {
+  dimensions?: {
+    length: float,
+    width: float,
+    height: float,
+    weight: float,
+    unit: text,
+  },
+  materials?: [* text],
+  colors?: [* text],
+  sizes?: [* text],
+  warranty?: {
+    duration: int,
+    unit: "days" / "months" / "years",
+    description: text,
+  },
+  custom: {* text => any},
+}
+
+; Order types
+Order = {
+  id: Id,
+  uuid: UUID,
+  user_id: Id,
+  status: "pending" / "confirmed" / "processing" / "shipped" / "delivered" / "cancelled",
+  items: [1* OrderItem],
+  subtotal: float,
+  tax_amount: float,
+  shipping_amount: float,
+  discount_amount: float,
+  total_amount: float,
+  currency: text,
+  shipping_address: Address,
+  billing_address: Address,
+  payment_info: PaymentInfo,
+  @receive-only
+  created_at: Timestamp,
+  @receive-only
+  updated_at: Timestamp,
+  tracking?: TrackingInfo,
+}
+
+OrderItem = {
+  id: Id,
+  product_id: Id,
+  product_name: text,
+  quantity: int,
+  unit_price: float,
+  total_price: float,
+  specifications?: {* text => any},
+}
+
+Address = {
+  id?: Id,
+  @min-length(1)
+  @max-length(100)
+  recipient_name: text,
+  @min-length(1)
+  @max-length(200)
+  street: text,
+  @min-length(1)
+  @max-length(100)
+  city: text,
+  state?: text,
+  @min-length(1)
+  @max-length(20)
+  postal_code: text,
+  @min-length(2)
+  @max-length(3)
+  country: text,
+  phone?: Phone,
+  is_default?: bool,
+}
+
+PaymentInfo = {
+  method: "card" / "paypal" / "bank_transfer" / "wallet",
+  @depends-on(method = "card")
+  @send-only
+  card_number?: text,
+  @depends-on(method = "card")
+  @send-only
+  card_expiry?: text,
+  @depends-on(method = "card")
+  @send-only
+  card_cvv?: text,
+  @depends-on(method = "paypal")
+  paypal_email?: text,
+  @depends-on(method = "bank_transfer")
+  bank_account?: text,
+  @depends-on(method = "wallet")
+  wallet_id?: text,
+  @receive-only
+  transaction_id?: text,
+  @receive-only
+  processed_at?: Timestamp,
+}
+
+TrackingInfo = {
+  tracking_number: text,
+  carrier: text,
+  status: text,
+  estimated_delivery?: Timestamp,
+  @receive-only
+  last_updated: Timestamp,
+  events: [* TrackingEvent],
+}
+
+TrackingEvent = {
+  @receive-only
+  timestamp: Timestamp,
+  status: text,
+  location?: text,
+  description: text,
+}
+
+; Services
+service UserService {
+  create-user: {
+    name: text,
+    email: Email,
+    @send-only
+    password: text,
+  } -> User,
+  
+  get-user: {user_id: Id} -> User,
+  
+  update-user: {
+    user_id: Id,
+    updates: {
+      name?: text,
+      email?: Email,
+      phone?: Phone,
+      profile?: {
+        display_name?: text,
+        bio?: text,
+        avatar_url?: Url,
+      },
+    },
+  } -> User,
+  
+  delete-user: {user_id: Id} -> {success: bool},
+  
+  list-users: {
+    page?: int,
+    per_page?: int,
+    search?: text,
+    active?: bool,
+  } -> {
+    users: [* User],
+    total_count: int,
+    page: int,
+    per_page: int,
+  },
+  
+  update-preferences: {
+    user_id: Id,
+    preferences: UserPreferences,
+  } -> UserPreferences,
+  
+  follow-user: {
+    follower_id: Id,
+    following_id: Id,
+  } -> {success: bool},
+  
+  unfollow-user: {
+    follower_id: Id,
+    following_id: Id,
+  } -> {success: bool},
+}
+
+service ProductService {
+  create-product: {
+    name: text,
+    description: text,
+    price: float,
+    currency: text,
+    stock_quantity: int,
+    category_id: Id,
+    tags?: [* text],
+    specifications?: ProductSpecifications,
+  } -> Product,
+  
+  get-product: {product_id: Id} -> Product,
+  
+  update-product: {
+    product_id: Id,
+    updates: {
+      name?: text,
+      description?: text,
+      price?: float,
+      stock_quantity?: int,
+      category_id?: Id,
+      tags?: [* text],
+      specifications?: ProductSpecifications,
+      active?: bool,
+    },
+  } -> Product,
+  
+  delete-product: {product_id: Id} -> {success: bool},
+  
+  list-products: {
+    page?: int,
+    per_page?: int,
+    category_id?: Id,
+    search?: text,
+    min_price?: float,
+    max_price?: float,
+    in_stock?: bool,
+    tags?: [* text],
+  } -> {
+    products: [* Product],
+    total_count: int,
+    page: int,
+    per_page: int,
+  },
+  
+  add-product-image: {
+    product_id: Id,
+    image: ProductImage,
+  } -> Product,
+  
+  remove-product-image: {
+    product_id: Id,
+    image_id: Id,
+  } -> Product,
+  
+  update-stock: {
+    product_id: Id,
+    quantity: int,
+    operation: "set" / "add" / "subtract",
+  } -> {
+    product_id: Id,
+    new_quantity: int,
+  },
+}
+
+service OrderService {
+  create-order: {
+    user_id: Id,
+    items: [1* {
+      product_id: Id,
+      quantity: int,
+      specifications?: {* text => any},
+    }],
+    shipping_address: Address,
+    billing_address?: Address,
+    payment_info: PaymentInfo,
+  } -> Order,
+  
+  get-order: {order_id: Id} -> Order,
+  
+  update-order-status: {
+    order_id: Id,
+    status: "confirmed" / "processing" / "shipped" / "delivered" / "cancelled",
+    tracking_info?: TrackingInfo,
+  } -> Order,
+  
+  cancel-order: {
+    order_id: Id,
+    reason?: text,
+  } -> Order,
+  
+  list-orders: {
+    user_id?: Id,
+    status?: text,
+    from_date?: Timestamp,
+    to_date?: Timestamp,
+    page?: int,
+    per_page?: int,
+  } -> {
+    orders: [* Order],
+    total_count: int,
+    page: int,
+    per_page: int,
+  },
+  
+  add-tracking: {
+    order_id: Id,
+    tracking_info: TrackingInfo,
+  } -> Order,
+  
+  update-tracking: {
+    order_id: Id,
+    event: TrackingEvent,
+  } -> Order,
+}
+
+service CategoryService {
+  create-category: {
+    name: text,
+    description?: text,
+    parent_id?: Id,
+  } -> ProductCategory,
+  
+  get-category: {category_id: Id} -> ProductCategory,
+  
+  update-category: {
+    category_id: Id,
+    updates: {
+      name?: text,
+      description?: text,
+      parent_id?: Id,
+    },
+  } -> ProductCategory,
+  
+  delete-category: {category_id: Id} -> {success: bool},
+  
+  list-categories: {
+    parent_id?: Id,
+    level?: int,
+    include_products?: bool,
+  } -> {
+    categories: [* ProductCategory],
+  },
+}
+
+service NotificationService {
+  send-notification: {
+    user_id: Id,
+    type: "email" / "push" / "sms",
+    title: text,
+    message: text,
+    data?: {* text => any},
+  } -> {
+    notification_id: Id,
+    success: bool,
+  },
+  
+  get-notifications: {
+    user_id: Id,
+    unread_only?: bool,
+    page?: int,
+    per_page?: int,
+  } -> {
+    notifications: [* {
+      id: Id,
+      type: text,
+      title: text,
+      message: text,
+      read: bool,
+      @receive-only
+      created_at: Timestamp,
+    }],
+    unread_count: int,
+  },
+  
+  mark-as-read: {
+    user_id: Id,
+    notification_ids: [1* Id],
+  } -> {success: bool},
+}

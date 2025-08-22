@@ -1,0 +1,7 @@
+{
+  "description": "Basic CDDL types (text, int, bool, bytes)",
+  "should_parse": true,
+  "expected_validation_errors": [],
+  "expected_ast": null,
+  "tags": ["valid", "basic-types", "cddl"]
+}

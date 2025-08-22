@@ -1,0 +1,20 @@
+include "shared/types.csil"
+include "shared/errors.csil"
+
+service MainService {
+    process: MainRequest -> MainResponse / ErrorResponse
+}
+
+MainRequest = {
+    @send-only
+    action: text,
+    @send-only
+    data: SharedData
+}
+
+MainResponse = {
+    @receive-only
+    success: bool,
+    @receive-only
+    result: SharedData
+}

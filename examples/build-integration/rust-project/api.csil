@@ -1,0 +1,66 @@
+;; API definition for Rust build integration example
+
+TaskID = text .size (8..16)
+Priority = int .ge 1 .le 5
+
+Task = {
+    @receive-only
+    id: TaskID,
+    
+    title: text .size (1..200),
+    
+    ? description: text .size (0..1000),
+    
+    priority: Priority,
+    
+    @receive-only
+    created_at: int,
+    
+    @receive-only
+    ? completed_at: int
+}
+
+service TaskAPI {
+    create-task: CreateTaskRequest -> Task / TaskError,
+    get-task: TaskID -> Task / TaskError,
+    list-tasks: ListTasksRequest -> ListTasksResponse / TaskError,
+    complete-task: TaskID -> Task / TaskError
+}
+
+CreateTaskRequest = {
+    @send-only
+    title: text .size (1..200),
+    
+    @send-only
+    ? description: text .size (0..1000),
+    
+    @send-only
+    ? priority: Priority .default 3
+}
+
+ListTasksRequest = {
+    @send-only
+    @min-value(0)
+    ? offset: int .default 0,
+    
+    @send-only
+    @min-value(1)
+    @max-value(100)
+    ? limit: int .default 20
+}
+
+ListTasksResponse = {
+    @receive-only
+    tasks: [* Task],
+    
+    @receive-only
+    total_count: int .ge 0
+}
+
+TaskError = {
+    @receive-only
+    code: int .ge 400 .le 599,
+    
+    @receive-only
+    message: text
+}

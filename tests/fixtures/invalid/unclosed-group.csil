@@ -1,0 +1,4 @@
+; Invalid: unclosed group
+person = {
+  name: text,
+  age: int

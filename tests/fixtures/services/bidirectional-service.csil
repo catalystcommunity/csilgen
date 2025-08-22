@@ -1,0 +1,69 @@
+; Bidirectional service definitions for real-time communication
+
+; Chat message types
+ChatMessage = {
+  id: text,
+  user_id: text,
+  content: text,
+  timestamp: text,
+  message_type: "text" / "image" / "file",
+}
+
+JoinRoomRequest = {
+  room_id: text,
+  user_id: text,
+}
+
+JoinRoomResponse = {
+  success: bool,
+  room_info: {
+    id: text,
+    name: text,
+    member_count: int,
+  },
+}
+
+SendMessageRequest = {
+  room_id: text,
+  message: ChatMessage,
+}
+
+SendMessageResponse = {
+  message_id: text,
+  success: bool,
+}
+
+; Events that can be sent from server to client
+UserJoinedEvent = {
+  room_id: text,
+  user: {
+    id: text,
+    name: text,
+  },
+}
+
+UserLeftEvent = {
+  room_id: text,
+  user_id: text,
+}
+
+MessageReceivedEvent = {
+  room_id: text,
+  message: ChatMessage,
+}
+
+; Service with bidirectional operations
+service ChatService {
+  ; Client to server
+  join-room: JoinRoomRequest -> JoinRoomResponse,
+  leave-room: {room_id: text, user_id: text} -> {success: bool},
+  send-message: SendMessageRequest -> SendMessageResponse,
+  
+  ; Server to client (events)
+  user-joined: <- UserJoinedEvent,
+  user-left: <- UserLeftEvent,
+  message-received: <- MessageReceivedEvent,
+  
+  ; Bidirectional ping/pong
+  ping: {timestamp: text} <-> {timestamp: text, server_time: text},
+}
