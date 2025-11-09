@@ -552,6 +552,7 @@ dependencies = [
  "csilgen-wasm-generators",
  "glob",
  "indicatif",
+ "serde_json",
  "tempfile",
 ]
 
@@ -585,6 +586,15 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror 1.0.69",
+]
+
+[[package]]
+name = "csilgen-go"
+version = "0.1.0"
+dependencies = [
+ "csilgen-common",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

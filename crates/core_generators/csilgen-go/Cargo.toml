@@ -1,0 +1,17 @@
+[package]
+name = "csilgen-go"
+version = "0.1.0"
+edition = "2024"
+authors = ["CSIL Team"]
+license = "Apache-2.0"
+description = "Go code generator for CSIL specifications"
+homepage = "https://github.com/catalystcommunity/csilgen"
+repository = "https://github.com/catalystcommunity/csilgen"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+csilgen-common = { path = "../../csilgen-common", version = "0.1.0" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"

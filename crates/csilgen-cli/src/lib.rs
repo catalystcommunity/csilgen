@@ -5,7 +5,7 @@
 pub mod dependency_report;
 
 use csilgen_common::GeneratorConfig;
-use csilgen_core::{CsilSpec, FileDependencyGraph, ImportResolver, parse_csil_file};
+use csilgen_core::{CsilSpec, FileDependencyGraph, ImportResolver, LiteralValue, parse_csil_file};
 use csilgen_wasm_generators::WasmGeneratorRuntime;
 use dependency_report::{
     report_circular_dependency_error, report_dependency_strategy, report_generation_summary,
@@ -182,11 +182,14 @@ fn process_single_file(
         pb.set_position(1);
     }
 
+    // Extract options from CSIL file
+    let options = extract_options_from_spec(&spec);
+
     // Create generator configuration
     let config = GeneratorConfig {
         target: target.to_string(),
         output_dir: output_dir.to_string_lossy().to_string(),
-        options: HashMap::new(),
+        options,
     };
 
     // Execute the generator
@@ -318,11 +321,14 @@ fn process_entry_points(
             pb.set_position((i * 3 + 1) as u64);
         }
 
+        // Extract options from CSIL file
+        let options = extract_options_from_spec(&spec);
+
         // Create generator configuration for this file
         let config = GeneratorConfig {
             target: target.to_string(),
             output_dir: output_dir.to_string_lossy().to_string(),
-            options: HashMap::new(),
+            options,
         };
 
         // Execute the generator for this file
@@ -402,9 +408,10 @@ fn initialize_wasm_runtime(target: &str) -> CliResult<(WasmGeneratorRuntime, &'s
         "python" => "csilgen-python-generator",
         "typescript" => "csilgen-typescript-generator",
         "openapi" => "csilgen-openapi-generator",
+        "go" => "csilgen-go",
         "noop" | "test" => "csilgen-noop-generator",
         _ => {
-            return Err(format!("Unknown target '{target}'. Available targets: json, rust, python, typescript, openapi").into());
+            return Err(format!("Unknown target '{target}'. Available targets: json, rust, python, typescript, openapi, go").into());
         }
     };
 
@@ -448,6 +455,34 @@ fn write_generated_files(
     }
 
     Ok((files_written, total_size))
+}
+
+/// Extract options from CSIL spec and convert to HashMap for generator
+fn extract_options_from_spec(spec: &CsilSpec) -> HashMap<String, serde_json::Value> {
+    let mut options = HashMap::new();
+
+    if let Some(file_options) = &spec.options {
+        for entry in &file_options.entries {
+            let value = match &entry.value {
+                LiteralValue::Text(s) => serde_json::Value::String(s.clone()),
+                LiteralValue::Integer(i) => serde_json::Value::Number((*i).into()),
+                LiteralValue::Float(f) => {
+                    serde_json::Value::Number(
+                        serde_json::Number::from_f64(*f).unwrap_or_else(|| serde_json::Number::from(0))
+                    )
+                }
+                LiteralValue::Bool(b) => serde_json::Value::Bool(*b),
+                LiteralValue::Null => serde_json::Value::Null,
+                LiteralValue::Bytes(_) => {
+                    // Bytes values are rare in options, skip for now
+                    continue;
+                }
+            };
+            options.insert(entry.key.clone(), value);
+        }
+    }
+
+    options
 }
 
 #[cfg(test)]

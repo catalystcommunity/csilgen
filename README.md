@@ -26,7 +26,7 @@ This is a newly created project with the core architecture in place but key comp
 ### ✅ Complete Implementation
 - CSIL parser and lexer
 - CSIL validator with comprehensive error checking
-- Full code generation for JSON Schema, Rust, Python, TypeScript, and OpenAPI
+- Full code generation for JSON Schema, Rust, Go, Python, TypeScript, and OpenAPI
 - CSIL formatter for canonical code style
 - WASM plugin system for extensible generators
 - Breaking change detection and dependency analysis
@@ -45,10 +45,11 @@ cd csilgen
 cargo build --workspace --release
 
 # Build core WASM generators (required for generation)
-cargo build --target wasm32-unknown-unknown --release -p csilgen-noop-generator -p csilgen-json-generator -p csilgen-rust-generator -p csilgen-typescript-generator -p csilgen-python-generator -p csilgen-openapi-generator
+cargo build --target wasm32-unknown-unknown --release -p csilgen-noop-generator -p csilgen-json-generator -p csilgen-rust-generator -p csilgen-typescript-generator -p csilgen-python -p csilgen-openapi -p csilgen-go
 
 # Generate code from CSIL files
 cargo run -p csilgen -- generate --input your-file.csil --target rust --output ./generated/
+cargo run -p csilgen -- generate --input your-file.csil --target go --output ./generated/
 cargo run -p csilgen -- generate --input your-file.csil --target json --output ./generated/
 cargo run -p csilgen -- generate --input your-file.csil --target typescript --output ./generated/
 cargo run -p csilgen -- generate --input your-file.csil --target python --output ./generated/
@@ -110,11 +111,11 @@ See the examples directory for sample CSIL files to experiment with.
 
 ### ✅ Fully Implemented
 - **Parser**: Complete CDDL parsing with CSIL extensions
-- **Validator**: Comprehensive validation with constraint checking  
-- **Generators**: JSON Schema, Rust, Python, TypeScript, OpenAPI
+- **Validator**: Comprehensive validation with constraint checking
+- **Generators**: JSON Schema, Rust, Go, Python, TypeScript, OpenAPI
 - **CLI Tools**: validate, generate, format, lint, breaking change detection
 - **WASM System**: Plugin architecture for extensible generators
-- **Testing**: 270+ tests across all components
+- **Testing**: 430+ tests across all components
 
 ### 🔄 Under Development  
 - Additional CBOR constraint types (`.eq`, `.ne`, `.bits`, etc.)
@@ -139,6 +140,7 @@ This is a Rust workspace containing multiple crates:
 - **Core Generators**:
   - **csilgen-json**: JSON Schema generator
   - **csilgen-rust**: Rust code generator
+  - **csilgen-go**: Go code generator
   - **csilgen-python**: Python code generator
   - **csilgen-typescript**: TypeScript generator
   - **csilgen-openapi**: OpenAPI specification generator
@@ -160,7 +162,7 @@ cargo build --workspace
 cargo build --target wasm32-unknown-unknown --release -p csilgen-noop-generator -p csilgen-simple-test
 
 # Option 2: Build all WASM generators (required for full CLI functionality)
-cargo build --target wasm32-unknown-unknown --release -p csilgen-noop-generator -p csilgen-simple-test -p csilgen-json-generator -p csilgen-rust-generator -p csilgen-typescript-generator
+cargo build --target wasm32-unknown-unknown --release -p csilgen-noop-generator -p csilgen-simple-test -p csilgen-json-generator -p csilgen-rust-generator -p csilgen-typescript-generator -p csilgen-python -p csilgen-openapi -p csilgen-go
 
 # Run tests (requires Option 1 minimum)
 cargo test --workspace
@@ -299,3 +301,81 @@ your CSIL files to remove the circular reference. Consider:
    - Use dependency analysis to verify no duplicates are generated
 
 See `examples/multi-file/` for concrete examples of these patterns.
+
+## Custom Generator Development
+
+csilgen supports custom code generators via WASM modules. This allows you to create generators for any target language or use case.
+
+### Generator Discovery
+
+The CLI discovers generators in two ways:
+
+1. **Built-in Generators**: Packaged with the CLI installation
+2. **User Generators**: Located in `~/.csilgen/generators/`
+
+Generator filenames must use the format: `csilgen-<target>.wasm` where `<target>` is the name you'll use with `--target <target>`.
+
+**Example**: `csilgen-go.wasm` is used with `--target go`
+
+### Creating a Custom Generator
+
+1. **Create a new Rust crate** in `crates/core_generators/`:
+   ```bash
+   cd crates/core_generators
+   cargo new --lib csilgen-go
+   ```
+
+2. **Configure for WASM** in `Cargo.toml`:
+   ```toml
+   [lib]
+   crate-type = ["cdylib"]
+
+   [dependencies]
+   csilgen-common = { path = "../../csilgen-common" }
+   # Add other dependencies as needed
+   ```
+
+3. **Implement the generator** in `src/lib.rs`:
+   ```rust
+   use csilgen_common::*;
+
+   #[no_mangle]
+   pub extern "C" fn generate(/* ... */) -> String {
+       // Your generation logic here
+       // Return JSON with filename/content pairs
+   }
+   ```
+
+### Building and Installing
+
+1. **Build the WASM module**:
+   ```bash
+   cargo build --target wasm32-unknown-unknown --release -p csilgen-go
+   ```
+
+   Output location: `target/wasm32-unknown-unknown/release/csilgen_go.wasm`
+
+2. **Install for CLI use**:
+   ```bash
+   # Create user generators directory if it doesn't exist
+   mkdir -p ~/.csilgen/generators/
+
+   # Copy with correct naming (hyphen not underscore!)
+   cp target/wasm32-unknown-unknown/release/csilgen_go.wasm ~/.csilgen/generators/csilgen-go.wasm
+   ```
+
+3. **Use your generator**:
+   ```bash
+   csilgen generate --input your-file.csil --target go --output ./generated/
+   ```
+
+### Important Notes
+
+- **Naming Convention**: Build outputs use underscores (`csilgen_go.wasm`), but runtime discovery expects hyphens (`csilgen-go.wasm`)
+- **WASM Limitations**: Generators cannot print to stdout/stderr - all output must be returned via the function result
+- **Testing**: Generators run in a sandbox with no filesystem access for security
+- **Development**: After making changes, rebuild and recopy the WASM file to `~/.csilgen/generators/`
+
+### Example: Go Generator
+
+See `crates/core_generators/csilgen-go/` for a complete example of a custom generator that produces Go structs from CSIL definitions.
