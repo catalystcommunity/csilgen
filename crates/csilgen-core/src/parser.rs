@@ -265,13 +265,13 @@ impl Parser {
             TokenType::LeftBrace => {
                 // Need to peek ahead to see if this is a map or group
                 if self.check_for_map_syntax() {
-                    return self.parse_map_type();
+                    self.parse_map_type()?
                 } else {
                     let group = self.parse_group_expression()?;
                     TypeExpression::Group(group)
                 }
             }
-            TokenType::LeftBracket => return self.parse_array_type(),
+            TokenType::LeftBracket => self.parse_array_type()?,
             TokenType::Socket => {
                 let name = token
                     .lexeme
@@ -481,11 +481,27 @@ impl Parser {
         self.skip_whitespace_and_comments();
         let value_type = self.parse_type_expression()?;
 
+        // Parse postfix optional marker and inline annotations
+        self.skip_whitespace_and_comments();
+
+        // Check for postfix ? operator
+        if self.match_token(&TokenType::Optional) {
+            occurrence = Some(Occurrence::Optional);
+            self.skip_whitespace_and_comments();
+        }
+
+        // Parse inline metadata annotations (after the type)
+        let postfix_metadata = self.parse_metadata_annotations()?;
+
+        // Merge prefix and postfix metadata
+        let mut all_metadata = metadata;
+        all_metadata.extend(postfix_metadata);
+
         Ok(GroupEntry {
             key,
             value_type,
             occurrence,
-            metadata,
+            metadata: all_metadata,
         })
     }
 
@@ -1513,7 +1529,7 @@ impl Parser {
         };
 
         self.skip_whitespace_and_comments();
-        self.consume_token(&TokenType::Assign)?;
+        self.consume_token(&TokenType::Colon)?;
         self.skip_whitespace_and_comments();
 
         let value = self.parse_literal_value()?;
@@ -2438,8 +2454,8 @@ mod tests {
     fn test_parse_options_block() {
         let input = r#"
         options {
-          version = "1.0.0",
-          namespace = "com.example"
+          version: "1.0.0",
+          namespace: "com.example"
         }
         User = { name: text }
         "#;
@@ -2594,10 +2610,10 @@ mod tests {
     fn test_parse_options_with_different_types() {
         let input = r#"
         options {
-          version = "1.0.0",
-          port = 8080,
-          debug = true,
-          timeout = 30.5
+          version: "1.0.0",
+          port: 8080,
+          debug: true,
+          timeout: 30.5
         }
         "#;
 
@@ -2628,7 +2644,7 @@ mod tests {
     }
 
     #[test]
-    fn test_options_parse_error_missing_assign() {
+    fn test_options_parse_error_missing_colon() {
         let input = r#"
         options {
           version "1.0.0"
@@ -2642,7 +2658,7 @@ mod tests {
     fn test_options_parse_error_missing_value() {
         let input = r#"
         options {
-          version =
+          version:
         }
         "#;
         let result = parse_csil(input);
@@ -2669,8 +2685,8 @@ mod tests {
     fn test_options_trailing_comma() {
         let input = r#"
         options {
-          version = "1.0.0",
-          namespace = "com.example",
+          version: "1.0.0",
+          namespace: "com.example",
         }
         User = { name: text }
         "#;
