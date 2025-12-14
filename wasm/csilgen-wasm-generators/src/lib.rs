@@ -646,6 +646,9 @@ fn convert_literal_value(literal: &LiteralValue) -> CsilLiteralValue {
         LiteralValue::Bytes(bytes) => CsilLiteralValue::Bytes(bytes.clone()),
         LiteralValue::Bool(b) => CsilLiteralValue::Bool(*b),
         LiteralValue::Null => CsilLiteralValue::Null,
+        LiteralValue::Array(elements) => CsilLiteralValue::Array(
+            elements.iter().map(convert_literal_value).collect()
+        ),
     }
 }
 

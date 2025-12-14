@@ -787,6 +787,10 @@ fn literal_value_to_go_string(value: &CsilLiteralValue) -> String {
         CsilLiteralValue::Bool(b) => b.to_string(),
         CsilLiteralValue::Null => "nil".to_string(),
         CsilLiteralValue::Bytes(_) => "[]byte{}".to_string(),
+        CsilLiteralValue::Array(elements) => {
+            let formatted: Vec<String> = elements.iter().map(literal_value_to_go_string).collect();
+            format!("[{}]", formatted.join(", "))
+        }
     }
 }
 
@@ -798,6 +802,10 @@ fn literal_value_to_go_value(value: &CsilLiteralValue, _value_type: &CsilTypeExp
         CsilLiteralValue::Bool(b) => b.to_string(),
         CsilLiteralValue::Null => "nil".to_string(),
         CsilLiteralValue::Bytes(_) => "[]byte{}".to_string(),
+        CsilLiteralValue::Array(elements) => {
+            let formatted: Vec<String> = elements.iter().map(literal_value_to_go_string).collect();
+            format!("[]interface{{}}{{{}}}", formatted.join(", "))
+        }
     };
 
     // For optional fields, we need to create a pointer to the value

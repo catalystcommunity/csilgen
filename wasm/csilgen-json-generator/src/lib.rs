@@ -475,6 +475,10 @@ impl<'a> JsonSchemaGenerator<'a> {
                 CsilLiteralValue::Bool(b) => Value::Bool(*b),
                 CsilLiteralValue::Null => Value::Null,
                 CsilLiteralValue::Bytes(_) => Value::String("binary".to_string()),
+                CsilLiteralValue::Array(elements) => {
+                    let json_elements: Vec<Value> = elements.iter().map(literal_to_json).collect();
+                    Value::Array(json_elements)
+                }
             }),
             CsilTypeExpression::Range { start, end, .. } => {
                 let mut schema = Map::new();
@@ -697,6 +701,10 @@ fn literal_to_json(literal: &CsilLiteralValue) -> Value {
         CsilLiteralValue::Bool(b) => Value::Bool(*b),
         CsilLiteralValue::Null => Value::Null,
         CsilLiteralValue::Bytes(_) => Value::String("binary".to_string()),
+        CsilLiteralValue::Array(elements) => {
+            let json_elements: Vec<Value> = elements.iter().map(literal_to_json).collect();
+            Value::Array(json_elements)
+        }
     }
 }
 

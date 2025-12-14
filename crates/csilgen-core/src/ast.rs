@@ -164,6 +164,7 @@ pub enum LiteralValue {
     Bytes(Vec<u8>),
     Bool(bool),
     Null,
+    Array(Vec<LiteralValue>),
 }
 
 /// CDDL occurrence indicators

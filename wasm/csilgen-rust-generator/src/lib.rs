@@ -428,6 +428,7 @@ impl<'a> RustCodeGenerator<'a> {
                 CsilLiteralValue::Bool(_) => "bool".to_string(),
                 CsilLiteralValue::Bytes(_) => "Vec<u8>".to_string(),
                 CsilLiteralValue::Null => "()".to_string(),
+                CsilLiteralValue::Array(_) => "Vec<serde_json::Value>".to_string(),
             },
             _ => {
                 self.warnings.push(GeneratorWarning {

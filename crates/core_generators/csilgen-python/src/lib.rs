@@ -312,6 +312,9 @@ fn convert_literal_value(literal: &csilgen_core::ast::LiteralValue) -> CsilLiter
         csilgen_core::ast::LiteralValue::Bytes(val) => CsilLiteralValue::Bytes(val.clone()),
         csilgen_core::ast::LiteralValue::Bool(val) => CsilLiteralValue::Bool(*val),
         csilgen_core::ast::LiteralValue::Null => CsilLiteralValue::Null,
+        csilgen_core::ast::LiteralValue::Array(elements) => {
+            CsilLiteralValue::Array(elements.iter().map(convert_literal_value).collect())
+        }
     }
 }
 
@@ -320,6 +323,23 @@ fn convert_position(position: &csilgen_core::lexer::Position) -> csilgen_common:
         line: position.line,
         column: position.column,
         offset: position.offset,
+    }
+}
+
+fn csil_literal_to_python_str(value: &CsilLiteralValue) -> String {
+    match value {
+        CsilLiteralValue::Text(text) => format!("\"{text}\""),
+        CsilLiteralValue::Integer(num) => num.to_string(),
+        CsilLiteralValue::Bool(b) => b.to_string(),
+        CsilLiteralValue::Float(f) => f.to_string(),
+        CsilLiteralValue::Null => "None".to_string(),
+        CsilLiteralValue::Bytes(bytes) => {
+            format!("b\"{}\"", String::from_utf8_lossy(bytes))
+        }
+        CsilLiteralValue::Array(elements) => {
+            let formatted: Vec<String> = elements.iter().map(csil_literal_to_python_str).collect();
+            format!("[{}]", formatted.join(", "))
+        }
     }
 }
 
@@ -676,16 +696,7 @@ impl PythonGenerator {
 
                 match depends_on_value {
                     Some(value) => {
-                        let value_str = match value {
-                            CsilLiteralValue::Text(text) => format!("\"{text}\""),
-                            CsilLiteralValue::Integer(num) => num.to_string(),
-                            CsilLiteralValue::Bool(b) => b.to_string(),
-                            CsilLiteralValue::Float(f) => f.to_string(),
-                            CsilLiteralValue::Null => "None".to_string(),
-                            CsilLiteralValue::Bytes(bytes) => {
-                                format!("b\"{}\"", String::from_utf8_lossy(bytes))
-                            }
-                        };
+                        let value_str = csil_literal_to_python_str(value);
 
                         code.push_str(&format!(
                             "        if hasattr(self, '{field_name}') and self.{field_name} is not None:\n"
@@ -758,16 +769,7 @@ impl PythonGenerator {
 
             match depends_on_value {
                 Some(value) => {
-                    let value_str = match value {
-                        CsilLiteralValue::Text(text) => format!("\"{text}\""),
-                        CsilLiteralValue::Integer(num) => num.to_string(),
-                        CsilLiteralValue::Bool(b) => b.to_string(),
-                        CsilLiteralValue::Float(f) => f.to_string(),
-                        CsilLiteralValue::Null => "None".to_string(),
-                        CsilLiteralValue::Bytes(bytes) => {
-                            format!("b\"{}\"", String::from_utf8_lossy(bytes))
-                        }
-                    };
+                    let value_str = csil_literal_to_python_str(value);
 
                     code.push_str("        if v is not None:\n");
                     code.push_str(&format!(
@@ -1120,6 +1122,7 @@ impl PythonGenerator {
                 CsilLiteralValue::Bytes(_) => Ok("bytes".to_string()),
                 CsilLiteralValue::Bool(_) => Ok("bool".to_string()),
                 CsilLiteralValue::Null => Ok("None".to_string()),
+                CsilLiteralValue::Array(_) => Ok("List[Any]".to_string()),
             },
             CsilTypeExpression::Range { .. } => Ok("int".to_string()),
             CsilTypeExpression::Socket(_) => Ok("Any".to_string()),

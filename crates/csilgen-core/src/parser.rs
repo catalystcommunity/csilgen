@@ -1577,6 +1577,32 @@ impl Parser {
                 self.advance();
                 Ok(LiteralValue::Null)
             }
+            TokenType::LeftBracket => {
+                self.advance(); // consume '['
+                self.skip_whitespace_and_comments();
+
+                let mut elements = Vec::new();
+
+                while !self.check(&TokenType::RightBracket) && !self.is_at_end() {
+                    self.skip_whitespace_and_comments();
+
+                    if self.check(&TokenType::RightBracket) {
+                        break;
+                    }
+
+                    elements.push(self.parse_literal_value()?);
+
+                    self.skip_whitespace_and_comments();
+                    if self.match_token(&TokenType::Comma) {
+                        self.skip_whitespace_and_comments();
+                        continue;
+                    }
+                    break;
+                }
+
+                self.consume_token(&TokenType::RightBracket)?;
+                Ok(LiteralValue::Array(elements))
+            }
             _ => Err(ParseError::ExpectedToken {
                 expected: "literal value".to_string(),
                 found: token,

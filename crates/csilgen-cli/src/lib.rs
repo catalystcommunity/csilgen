@@ -463,26 +463,35 @@ fn extract_options_from_spec(spec: &CsilSpec) -> HashMap<String, serde_json::Val
 
     if let Some(file_options) = &spec.options {
         for entry in &file_options.entries {
-            let value = match &entry.value {
-                LiteralValue::Text(s) => serde_json::Value::String(s.clone()),
-                LiteralValue::Integer(i) => serde_json::Value::Number((*i).into()),
-                LiteralValue::Float(f) => {
-                    serde_json::Value::Number(
-                        serde_json::Number::from_f64(*f).unwrap_or_else(|| serde_json::Number::from(0))
-                    )
-                }
-                LiteralValue::Bool(b) => serde_json::Value::Bool(*b),
-                LiteralValue::Null => serde_json::Value::Null,
-                LiteralValue::Bytes(_) => {
-                    // Bytes values are rare in options, skip for now
-                    continue;
-                }
-            };
-            options.insert(entry.key.clone(), value);
+            let value = literal_value_to_json(&entry.value);
+            if let Some(v) = value {
+                options.insert(entry.key.clone(), v);
+            }
         }
     }
 
     options
+}
+
+/// Convert a LiteralValue to serde_json::Value
+fn literal_value_to_json(literal: &LiteralValue) -> Option<serde_json::Value> {
+    match literal {
+        LiteralValue::Text(s) => Some(serde_json::Value::String(s.clone())),
+        LiteralValue::Integer(i) => Some(serde_json::Value::Number((*i).into())),
+        LiteralValue::Float(f) => Some(serde_json::Value::Number(
+            serde_json::Number::from_f64(*f).unwrap_or_else(|| serde_json::Number::from(0))
+        )),
+        LiteralValue::Bool(b) => Some(serde_json::Value::Bool(*b)),
+        LiteralValue::Null => Some(serde_json::Value::Null),
+        LiteralValue::Bytes(_) => None,
+        LiteralValue::Array(elements) => {
+            let json_elements: Vec<serde_json::Value> = elements
+                .iter()
+                .filter_map(literal_value_to_json)
+                .collect();
+            Some(serde_json::Value::Array(json_elements))
+        }
+    }
 }
 
 #[cfg(test)]
