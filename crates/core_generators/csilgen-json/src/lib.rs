@@ -153,14 +153,7 @@ fn generate_type_schema(type_expr: &TypeExpression, _type_name: &str) -> Result<
                         }
                     }
                     csilgen_core::ast::ControlOperator::Default(value) => {
-                        schema["default"] = match value {
-                            csilgen_core::ast::LiteralValue::Bool(b) => json!(b),
-                            csilgen_core::ast::LiteralValue::Integer(i) => json!(i),
-                            csilgen_core::ast::LiteralValue::Float(f) => json!(f),
-                            csilgen_core::ast::LiteralValue::Text(s) => json!(s),
-                            csilgen_core::ast::LiteralValue::Bytes(b) => json!(b),
-                            csilgen_core::ast::LiteralValue::Null => json!(null),
-                        };
+                        schema["default"] = literal_value_to_json(value);
                     }
                     csilgen_core::ast::ControlOperator::GreaterEqual(value) => {
                         if let csilgen_core::ast::LiteralValue::Integer(i) = value {
@@ -191,14 +184,7 @@ fn generate_type_schema(type_expr: &TypeExpression, _type_name: &str) -> Result<
                         }
                     }
                     csilgen_core::ast::ControlOperator::Equal(value) => {
-                        schema["const"] = match value {
-                            csilgen_core::ast::LiteralValue::Bool(b) => json!(b),
-                            csilgen_core::ast::LiteralValue::Integer(i) => json!(i),
-                            csilgen_core::ast::LiteralValue::Float(f) => json!(f),
-                            csilgen_core::ast::LiteralValue::Text(s) => json!(s),
-                            csilgen_core::ast::LiteralValue::Bytes(b) => json!(b),
-                            csilgen_core::ast::LiteralValue::Null => json!(null),
-                        };
+                        schema["const"] = literal_value_to_json(value);
                     }
                     csilgen_core::ast::ControlOperator::Json => {
                         // For .json constraint, we mark the string as requiring valid JSON
@@ -287,6 +273,21 @@ fn generate_service_schemas(
     Ok(schemas)
 }
 
+fn literal_value_to_json(value: &LiteralValue) -> Value {
+    match value {
+        LiteralValue::Bool(b) => json!(b),
+        LiteralValue::Integer(i) => json!(i),
+        LiteralValue::Float(f) => json!(f),
+        LiteralValue::Text(s) => json!(s),
+        LiteralValue::Bytes(b) => json!(b),
+        LiteralValue::Null => json!(null),
+        LiteralValue::Array(elements) => {
+            let json_elements: Vec<Value> = elements.iter().map(literal_value_to_json).collect();
+            Value::Array(json_elements)
+        }
+    }
+}
+
 fn generate_group_choice_schema(groups: &[GroupExpression]) -> Result<Value> {
     let schemas: Result<Vec<_>> = groups.iter().map(generate_group_schema).collect();
     Ok(json!({ "anyOf": schemas? }))
@@ -321,6 +322,10 @@ fn generate_literal_schema(literal: &LiteralValue) -> Value {
         LiteralValue::Bool(val) => json!({ "const": val }),
         LiteralValue::Null => json!({ "const": null }),
         LiteralValue::Bytes(_) => json!({ "type": "string", "format": "binary" }),
+        LiteralValue::Array(elements) => {
+            let json_elements: Vec<Value> = elements.iter().map(literal_value_to_json).collect();
+            json!({ "const": json_elements })
+        }
     }
 }
 
@@ -387,14 +392,7 @@ fn apply_field_metadata(schema: &mut Value, metadata: &[FieldMetadata]) {
                     if schema.get("x-constraints").is_none() {
                         schema["x-constraints"] = json!({});
                     }
-                    schema["x-constraints"][name] = match value {
-                        LiteralValue::Integer(v) => json!(v),
-                        LiteralValue::Float(v) => json!(v),
-                        LiteralValue::Text(v) => json!(v),
-                        LiteralValue::Bool(v) => json!(v),
-                        LiteralValue::Null => json!(null),
-                        LiteralValue::Bytes(_) => json!("<binary>"),
-                    };
+                    schema["x-constraints"][name] = literal_value_to_json(value);
                 }
             },
             FieldMetadata::Visibility(visibility) => {
@@ -407,14 +405,7 @@ fn apply_field_metadata(schema: &mut Value, metadata: &[FieldMetadata]) {
             FieldMetadata::DependsOn { field, value } => {
                 let mut depends_on = json!({ "field": field });
                 if let Some(val) = value {
-                    depends_on["value"] = match val {
-                        LiteralValue::Integer(v) => json!(v),
-                        LiteralValue::Float(v) => json!(v),
-                        LiteralValue::Text(v) => json!(v),
-                        LiteralValue::Bool(v) => json!(v),
-                        LiteralValue::Null => json!(null),
-                        LiteralValue::Bytes(_) => json!("<binary>"),
-                    };
+                    depends_on["value"] = literal_value_to_json(val);
                 }
                 schema["x-depends-on"] = depends_on;
             }
@@ -426,14 +417,7 @@ fn apply_field_metadata(schema: &mut Value, metadata: &[FieldMetadata]) {
                     .iter()
                     .map(|param| {
                         let key = param.name.as_ref().unwrap_or(&"value".to_string()).clone();
-                        let value = match &param.value {
-                            LiteralValue::Integer(v) => json!(v),
-                            LiteralValue::Float(v) => json!(v),
-                            LiteralValue::Text(v) => json!(v),
-                            LiteralValue::Bool(v) => json!(v),
-                            LiteralValue::Null => json!(null),
-                            LiteralValue::Bytes(_) => json!("<binary>"),
-                        };
+                        let value = literal_value_to_json(&param.value);
                         (key, value)
                     })
                     .collect();

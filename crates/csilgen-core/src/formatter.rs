@@ -192,6 +192,16 @@ fn format_type_expression(
             }
             crate::ast::LiteralValue::Bool(b) => output.push_str(&b.to_string()),
             crate::ast::LiteralValue::Null => output.push_str("null"),
+            crate::ast::LiteralValue::Array(elements) => {
+                output.push('[');
+                for (i, elem) in elements.iter().enumerate() {
+                    if i > 0 {
+                        output.push_str(", ");
+                    }
+                    format_literal_value(elem, output);
+                }
+                output.push(']');
+            }
         },
         crate::ast::TypeExpression::Constrained {
             base_type,
@@ -321,6 +331,16 @@ fn format_group_expression(
                         }
                         crate::ast::LiteralValue::Bool(b) => output.push_str(&b.to_string()),
                         crate::ast::LiteralValue::Null => output.push_str("null"),
+                        crate::ast::LiteralValue::Array(elements) => {
+                            output.push('[');
+                            for (i, elem) in elements.iter().enumerate() {
+                                if i > 0 {
+                                    output.push_str(", ");
+                                }
+                                format_literal_value(elem, output);
+                            }
+                            output.push(']');
+                        }
                     },
                     crate::ast::GroupKey::Type(type_expr) => {
                         output.push('(');
@@ -468,6 +488,16 @@ fn format_literal_value(value: &crate::ast::LiteralValue, output: &mut String) {
         }
         crate::ast::LiteralValue::Bool(b) => output.push_str(&b.to_string()),
         crate::ast::LiteralValue::Null => output.push_str("null"),
+        crate::ast::LiteralValue::Array(elements) => {
+            output.push('[');
+            for (i, elem) in elements.iter().enumerate() {
+                if i > 0 {
+                    output.push_str(", ");
+                }
+                format_literal_value(elem, output);
+            }
+            output.push(']');
+        }
     }
 }
 

@@ -341,14 +341,7 @@ impl OpenApiGenerator {
                             }
                         }
                         csilgen_core::ast::ControlOperator::Default(value) => {
-                            schema["default"] = match value {
-                                csilgen_core::ast::LiteralValue::Bool(b) => json!(b),
-                                csilgen_core::ast::LiteralValue::Integer(i) => json!(i),
-                                csilgen_core::ast::LiteralValue::Float(f) => json!(f),
-                                csilgen_core::ast::LiteralValue::Text(s) => json!(s),
-                                csilgen_core::ast::LiteralValue::Bytes(b) => json!(b),
-                                csilgen_core::ast::LiteralValue::Null => json!(null),
-                            };
+                            schema["default"] = self.literal_to_json_value(value);
                         }
                         csilgen_core::ast::ControlOperator::GreaterEqual(value) => {
                             if let csilgen_core::ast::LiteralValue::Integer(i) = value {
@@ -536,6 +529,28 @@ impl OpenApiGenerator {
                 "format": "byte",
                 "description": format!("Byte array of length {}", val.len())
             }),
+            LiteralValue::Array(elements) => {
+                let json_elements: Vec<Value> = elements.iter().map(|e| self.literal_to_json_value(e)).collect();
+                json!({
+                    "type": "array",
+                    "enum": [json_elements]
+                })
+            }
+        }
+    }
+
+    fn literal_to_json_value(&self, literal: &LiteralValue) -> Value {
+        match literal {
+            LiteralValue::Integer(val) => json!(val),
+            LiteralValue::Float(val) => json!(val),
+            LiteralValue::Text(val) => json!(val),
+            LiteralValue::Bool(val) => json!(val),
+            LiteralValue::Null => json!(null),
+            LiteralValue::Bytes(val) => json!(val),
+            LiteralValue::Array(elements) => {
+                let json_elements: Vec<Value> = elements.iter().map(|e| self.literal_to_json_value(e)).collect();
+                Value::Array(json_elements)
+            }
         }
     }
 

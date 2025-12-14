@@ -229,6 +229,7 @@ pub enum CsilLiteralValue {
     Bytes(Vec<u8>),
     Bool(bool),
     Null,
+    Array(Vec<CsilLiteralValue>),
 }
 
 /// CSIL occurrence indicators for WASM boundary

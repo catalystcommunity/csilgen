@@ -230,6 +230,10 @@ fn map_literal_to_typescript(literal: &LiteralValue) -> String {
         LiteralValue::Bool(val) => val.to_string(),
         LiteralValue::Null => "null".to_string(),
         LiteralValue::Bytes(_) => "Uint8Array".to_string(),
+        LiteralValue::Array(elements) => {
+            let formatted: Vec<String> = elements.iter().map(map_literal_to_typescript).collect();
+            format!("[{}]", formatted.join(", "))
+        }
     }
 }
 

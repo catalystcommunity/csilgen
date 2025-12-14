@@ -278,6 +278,7 @@ fn map_literal_to_rust(literal: &LiteralValue) -> String {
         LiteralValue::Bool(_) => "bool".to_string(),
         LiteralValue::Null => "()".to_string(),
         LiteralValue::Bytes(_) => "Vec<u8>".to_string(),
+        LiteralValue::Array(_) => "Vec<serde_json::Value>".to_string(),
     }
 }
 

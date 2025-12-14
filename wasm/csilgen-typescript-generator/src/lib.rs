@@ -713,6 +713,10 @@ impl<'a> TypeScriptGenerator<'a> {
             CsilLiteralValue::Bool(b) => b.to_string(),
             CsilLiteralValue::Null => "null".to_string(),
             CsilLiteralValue::Bytes(_) => "new Uint8Array()".to_string(),
+            CsilLiteralValue::Array(elements) => {
+                let formatted: Vec<String> = elements.iter().map(|e| self.literal_to_typescript(e)).collect();
+                format!("[{}]", formatted.join(", "))
+            }
         }
     }
 

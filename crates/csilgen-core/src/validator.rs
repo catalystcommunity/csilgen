@@ -987,6 +987,10 @@ fn format_literal_value(literal: &LiteralValue) -> String {
         LiteralValue::Bool(val) => val.to_string(),
         LiteralValue::Null => "null".to_string(),
         LiteralValue::Bytes(val) => format!("bytes({})", val.len()),
+        LiteralValue::Array(elements) => {
+            let formatted: Vec<String> = elements.iter().map(format_literal_value).collect();
+            format!("[{}]", formatted.join(", "))
+        }
     }
 }
 
