@@ -156,15 +156,13 @@ This is a Rust workspace containing multiple crates:
 # Build the entire workspace
 cargo build --workspace
 
-# Build WASM generators (choose one option below)
+# Build WASM generators (using xtask)
+cargo run -p xtask build-wasm
 
-# Option 1: Build only test WASM modules (minimum for running tests)
-cargo build --target wasm32-unknown-unknown --release -p csilgen-noop-generator -p csilgen-simple-test
+# Install WASM generators to ~/.csilgen/generators/ (for system-wide CLI usage)
+cargo run -p xtask install-wasm
 
-# Option 2: Build all WASM generators (required for full CLI functionality)
-cargo build --target wasm32-unknown-unknown --release -p csilgen-noop-generator -p csilgen-simple-test -p csilgen-json-generator -p csilgen-rust-generator -p csilgen-typescript-generator -p csilgen-python -p csilgen-openapi -p csilgen-go
-
-# Run tests (requires Option 1 minimum)
+# Run tests
 cargo test --workspace
 
 # Install the CLI tool

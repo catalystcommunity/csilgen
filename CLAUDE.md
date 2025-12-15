@@ -59,7 +59,8 @@ csilgen/
 - `cargo run -p xtask test` - Run all tests
 - `cargo run -p xtask clippy` - Run clippy linting
 - `cargo run -p xtask fmt` - Format code
-- `cargo run -p xtask build-wasm` - Build WASM modules (when implemented)
+- `cargo run -p xtask build-wasm` - Build WASM modules
+- `cargo run -p xtask install-wasm` - Build and install WASM modules to ~/.csilgen/generators/
 
 ### CLI Usage
 - `cargo run -p csilgen validate --input interface.csil` - Validate a CSIL file
