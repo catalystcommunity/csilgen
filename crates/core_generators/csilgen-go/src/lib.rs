@@ -88,10 +88,19 @@ fn process_generation(input: WasmGeneratorInput) -> Result<WasmGeneratorOutput, 
     let mut warnings = Vec::new();
     let mut files = Vec::new();
 
+    // Helper to build output path with optional subdirectory
+    let make_path = |filename: &str| -> String {
+        if config.output_subdir.is_empty() {
+            filename.to_string()
+        } else {
+            format!("{}/{}", config.output_subdir, filename)
+        }
+    };
+
     // Generate types file
     if let Some(types_content) = generate_types(&input, &config, &mut warnings)? {
         files.push(GeneratedFile {
-            path: "types.gen.go".to_string(),
+            path: make_path("types.gen.go"),
             content: types_content,
         });
     }
@@ -100,7 +109,7 @@ fn process_generation(input: WasmGeneratorInput) -> Result<WasmGeneratorOutput, 
     if input.csil_spec.service_count > 0 {
         if let Some(services_content) = generate_services(&input, &config, &mut warnings)? {
             files.push(GeneratedFile {
-                path: "services.gen.go".to_string(),
+                path: make_path("services.gen.go"),
                 content: services_content,
             });
         }
@@ -110,7 +119,7 @@ fn process_generation(input: WasmGeneratorInput) -> Result<WasmGeneratorOutput, 
     if input.csil_spec.fields_with_metadata_count > 0 {
         if let Some(validation_content) = generate_validation(&input, &config, &mut warnings)? {
             files.push(GeneratedFile {
-                path: "validation.gen.go".to_string(),
+                path: make_path("validation.gen.go"),
                 content: validation_content,
             });
         }
@@ -120,7 +129,7 @@ fn process_generation(input: WasmGeneratorInput) -> Result<WasmGeneratorOutput, 
     if config.generate_constructors {
         if let Some(constructors_content) = generate_constructors(&input, &config, &mut warnings)? {
             files.push(GeneratedFile {
-                path: "constructors.gen.go".to_string(),
+                path: make_path("constructors.gen.go"),
                 content: constructors_content,
             });
         }
@@ -147,6 +156,7 @@ fn process_generation(input: WasmGeneratorInput) -> Result<WasmGeneratorOutput, 
 #[derive(Debug)]
 struct GoConfig {
     package_name: String,
+    output_subdir: String,
     use_json_tags: bool,
     use_yaml_tags: bool,
     generate_validation: bool,
@@ -157,15 +167,32 @@ struct GoConfig {
 
 impl GoConfig {
     fn from_options(options: &HashMap<String, serde_json::Value>) -> Self {
+        let go_package = options.get("go_package").and_then(|v| v.as_str());
+
         // Extract package name from go_package option (last path component)
-        let package_name = if let Some(go_package) = options.get("go_package").and_then(|v| v.as_str()) {
-            go_package.split('/').last().unwrap_or("api").to_string()
+        let package_name = if let Some(pkg) = go_package {
+            pkg.split('/').last().unwrap_or("api").to_string()
         } else {
             options.get("package_name")
                 .and_then(|v| v.as_str())
                 .unwrap_or("api")
                 .to_string()
         };
+
+        // Optionally derive output subdirectory from go_module and go_package.
+        // If go_module is provided, strip it from go_package to get the relative path.
+        // e.g., go_module="github.com/foo/bar", go_package="github.com/foo/bar/v1/internal/config"
+        // -> output_subdir="v1/internal/config"
+        // If go_module is NOT provided, output_subdir remains empty (files go to --output dir).
+        let output_subdir = options.get("go_module")
+            .and_then(|v| v.as_str())
+            .and_then(|module| {
+                go_package.and_then(|pkg| {
+                    pkg.strip_prefix(module)
+                        .map(|s| s.trim_start_matches('/').to_string())
+                })
+            })
+            .unwrap_or_default();
 
         // Parse go_imports as array of strings
         let go_imports = options.get("go_imports")
@@ -179,6 +206,7 @@ impl GoConfig {
 
         Self {
             package_name,
+            output_subdir,
             use_json_tags: options.get("use_json_tags")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(true),
