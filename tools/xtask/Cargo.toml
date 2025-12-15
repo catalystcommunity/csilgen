@@ -8,3 +8,4 @@ license = "Apache-2.0"
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
+dirs = "5.0"
