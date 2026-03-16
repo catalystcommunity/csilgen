@@ -194,13 +194,13 @@ fn generate_type_schema(type_expr: &TypeExpression, _type_name: &str) -> Result<
                     }
                     csilgen_core::ast::ControlOperator::Cbor => {
                         // For .cbor constraint, we mark bytes as requiring valid CBOR
-                        if schema["type"] == "string" && schema.get("format").map_or(false, |f| f == "byte") {
+                        if schema["type"] == "string" && schema.get("format").is_some_and(|f| f == "byte") {
                             schema["contentMediaType"] = json!("application/cbor");
                         }
                     }
                     csilgen_core::ast::ControlOperator::Cborseq => {
                         // For .cborseq constraint, we mark bytes as requiring CBOR sequence
-                        if schema["type"] == "string" && schema.get("format").map_or(false, |f| f == "byte") {
+                        if schema["type"] == "string" && schema.get("format").is_some_and(|f| f == "byte") {
                             schema["contentMediaType"] = json!("application/cbor-seq");
                         }
                     }

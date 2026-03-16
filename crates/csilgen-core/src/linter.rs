@@ -320,16 +320,16 @@ fn lint_group_entry_with_config(
     config: &LintConfig,
 ) {
     // Check key naming if present
-    if let Some(crate::ast::GroupKey::Bare(key_name)) = &entry.key {
-        if !is_snake_case(key_name) {
-            result.add_issue_with_suggestion(
-                LintSeverity::Warning,
-                rule_name.to_string(),
-                format!("Field '{key_name}' should use snake_case convention"),
-                to_snake_case(key_name),
-                true,
-            );
-        }
+    if let Some(crate::ast::GroupKey::Bare(key_name)) = &entry.key
+        && !is_snake_case(key_name)
+    {
+        result.add_issue_with_suggestion(
+            LintSeverity::Warning,
+            rule_name.to_string(),
+            format!("Field '{key_name}' should use snake_case convention"),
+            to_snake_case(key_name),
+            true,
+        );
     }
 
     // Lint the value type

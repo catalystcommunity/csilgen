@@ -189,14 +189,13 @@ impl FileDependencyGraph {
 
                     if path.is_dir() {
                         visit_dir(&path, files)?;
-                    } else if path.is_file() {
-                        if let Some(extension) = path.extension() {
-                            if extension == "csil" {
-                                files.push(path.canonicalize().with_context(|| {
-                                    format!("Failed to canonicalize path {}", path.display())
-                                })?);
-                            }
-                        }
+                    } else if path.is_file()
+                        && let Some(extension) = path.extension()
+                        && extension == "csil"
+                    {
+                        files.push(path.canonicalize().with_context(|| {
+                            format!("Failed to canonicalize path {}", path.display())
+                        })?);
                     }
                 }
             }

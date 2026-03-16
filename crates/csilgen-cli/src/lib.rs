@@ -45,13 +45,10 @@ fn find_csil_files_in_directory(dir: &Path) -> CliResult<Vec<PathBuf>> {
                 if path.is_dir() {
                     // Recursively visit subdirectories
                     visit_dir(&path, files)?;
-                } else if path.is_file() {
-                    // Check if it's a .csil file
-                    if let Some(extension) = path.extension() {
-                        if extension == "csil" {
-                            files.push(path);
-                        }
-                    }
+                } else if path.is_file()
+                    && path.extension().is_some_and(|ext| ext == "csil")
+                {
+                    files.push(path);
                 }
             }
         }

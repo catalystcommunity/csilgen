@@ -209,51 +209,51 @@ impl GeneratorRegistry {
             let path = entry.path();
 
             // Look for .wasm files
-            if path.extension().and_then(|s| s.to_str()) == Some("wasm") {
-                if let Some(generator_id) = self.extract_generator_id(&path) {
-                    match self.probe_generator_metadata(&path) {
-                        Ok(metadata) => {
-                            let generator_type = if self.is_builtin_path(dir) {
-                                GeneratorType::BuiltIn
-                            } else {
-                                GeneratorType::Custom
-                            };
+            if path.extension().and_then(|s| s.to_str()) == Some("wasm")
+                && let Some(generator_id) = self.extract_generator_id(&path)
+            {
+                match self.probe_generator_metadata(&path) {
+                    Ok(metadata) => {
+                        let generator_type = if self.is_builtin_path(dir) {
+                            GeneratorType::BuiltIn
+                        } else {
+                            GeneratorType::Custom
+                        };
 
-                            let compatibility = self.check_compatibility(&metadata);
+                        let compatibility = self.check_compatibility(&metadata);
 
-                            let discovered = DiscoveredGenerator {
-                                id: generator_id,
-                                metadata,
-                                wasm_path: path,
-                                generator_type,
-                                compatibility,
-                            };
+                        let discovered = DiscoveredGenerator {
+                            id: generator_id,
+                            metadata,
+                            wasm_path: path,
+                            generator_type,
+                            compatibility,
+                        };
 
-                            self.discovered.insert(discovered.id.clone(), discovered);
-                            count += 1;
-                        }
-                        Err(e) => {
-                            // Create a placeholder entry for failed generators
-                            let generator_id = self.extract_generator_id(&path).unwrap();
-                            let placeholder = DiscoveredGenerator {
-                                id: generator_id.clone(),
-                                metadata: GeneratorMetadata {
-                                    name: generator_id.clone(),
-                                    version: "unknown".to_string(),
-                                    description: "Failed to load metadata".to_string(),
-                                    target: "unknown".to_string(),
-                                    capabilities: vec![],
-                                    author: None,
-                                    homepage: None,
-                                },
-                                wasm_path: path,
-                                generator_type: GeneratorType::Custom,
-                                compatibility: CompatibilityStatus::LoadError {
-                                    error: e.to_string(),
-                                },
-                            };
-                            self.discovered.insert(generator_id, placeholder);
-                        }
+                        self.discovered.insert(discovered.id.clone(), discovered);
+                        count += 1;
+                    }
+                    Err(e) => {
+                        // Create a placeholder entry for failed generators
+                        let generator_id = self.extract_generator_id(&path).unwrap();
+                        let placeholder = DiscoveredGenerator {
+                            id: generator_id.clone(),
+                            metadata: GeneratorMetadata {
+                                name: generator_id.clone(),
+                                version: "unknown".to_string(),
+                                description: "Failed to load metadata".to_string(),
+                                target: "unknown".to_string(),
+                                capabilities: vec![],
+                                author: None,
+                                homepage: None,
+                            },
+                            wasm_path: path,
+                            generator_type: GeneratorType::Custom,
+                            compatibility: CompatibilityStatus::LoadError {
+                                error: e.to_string(),
+                            },
+                        };
+                        self.discovered.insert(generator_id, placeholder);
                     }
                 }
             }
@@ -368,23 +368,23 @@ impl GeneratorRegistry {
         const RUNTIME_VERSION: &str = "1.0.0";
 
         // Parse version (simplified - real implementation would use semver crate)
-        if let Some((major_str, _)) = version.split_once('.') {
-            if let Ok(major) = major_str.parse::<u32>() {
-                match major.cmp(&SUPPORTED_MAJOR) {
-                    std::cmp::Ordering::Greater => {
-                        return Err(CompatibilityStatus::VersionTooNew {
-                            required: version.to_string(),
-                            available: RUNTIME_VERSION.to_string(),
-                        });
-                    }
-                    std::cmp::Ordering::Less => {
-                        return Err(CompatibilityStatus::VersionTooOld {
-                            required: version.to_string(),
-                            available: RUNTIME_VERSION.to_string(),
-                        });
-                    }
-                    std::cmp::Ordering::Equal => {} // Compatible
+        if let Some((major_str, _)) = version.split_once('.')
+            && let Ok(major) = major_str.parse::<u32>()
+        {
+            match major.cmp(&SUPPORTED_MAJOR) {
+                std::cmp::Ordering::Greater => {
+                    return Err(CompatibilityStatus::VersionTooNew {
+                        required: version.to_string(),
+                        available: RUNTIME_VERSION.to_string(),
+                    });
                 }
+                std::cmp::Ordering::Less => {
+                    return Err(CompatibilityStatus::VersionTooOld {
+                        required: version.to_string(),
+                        available: RUNTIME_VERSION.to_string(),
+                    });
+                }
+                std::cmp::Ordering::Equal => {} // Compatible
             }
         }
 

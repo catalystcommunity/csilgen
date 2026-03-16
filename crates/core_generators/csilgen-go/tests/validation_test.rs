@@ -359,14 +359,13 @@ fn test_validation_serialization() {
 
     // Verify config options are preserved
     assert!(deserialized.config.options.contains_key("generate_validation"));
-    assert_eq!(
+    assert!(
         deserialized
             .config
             .options
             .get("generate_validation")
             .unwrap()
             .as_bool()
-            .unwrap(),
-        true
+            .unwrap()
     );
 }

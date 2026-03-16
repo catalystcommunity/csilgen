@@ -102,12 +102,10 @@ impl TestFixtureLoader {
 
             if path.is_dir() {
                 self.load_test_cases_recursive(&path, test_cases)?;
-            } else if let Some(ext) = path.extension() {
-                if ext == "csil" {
-                    if let Some(test_case) = self.load_test_case_from_path(&path)? {
-                        test_cases.push(test_case);
-                    }
-                }
+            } else if path.extension().is_some_and(|ext| ext == "csil")
+                && let Some(test_case) = self.load_test_case_from_path(&path)?
+            {
+                test_cases.push(test_case);
             }
         }
         Ok(())
@@ -890,11 +888,11 @@ pub mod ast {
             }
 
             fn visit_group_entry(&mut self, entry: &TestGroupEntry) {
-                if let Some(key) = &entry.key {
-                    if key.is_empty() {
-                        self.errors
-                            .push("Group entry key cannot be empty".to_string());
-                    }
+                if let Some(key) = &entry.key
+                    && key.is_empty()
+                {
+                    self.errors
+                        .push("Group entry key cannot be empty".to_string());
                 }
 
                 self.visit_type_expression(&entry.value_type);
