@@ -405,56 +405,56 @@ fn validate_service_optimized(
         let output_type_name = extract_type_name(&operation.output_type);
 
         // Use fast BTreeSet lookup instead of iterating through all rules
-        if let Some(input_name) = input_type_name {
-            if !validation_context.type_names.contains(&input_name) {
-                // Suggest similar type names for typos
-                let available_names: Vec<String> =
-                    validation_context.type_names.iter().cloned().collect();
-                let suggestions = csilgen_common::CsilgenError::suggest_similar_names(
-                    &input_name,
-                    &available_names,
-                );
+        if let Some(input_name) = input_type_name
+            && !validation_context.type_names.contains(&input_name)
+        {
+            // Suggest similar type names for typos
+            let available_names: Vec<String> =
+                validation_context.type_names.iter().cloned().collect();
+            let suggestions = csilgen_common::CsilgenError::suggest_similar_names(
+                &input_name,
+                &available_names,
+            );
 
-                let suggestion_text = if !suggestions.is_empty() {
-                    format!(" Did you mean: {}?", suggestions.join(", "))
-                } else {
-                    String::new()
-                };
+            let suggestion_text = if !suggestions.is_empty() {
+                format!(" Did you mean: {}?", suggestions.join(", "))
+            } else {
+                String::new()
+            };
 
-                errors.push(ValidationError::UnknownDependencyField {
-                    field_context: format!(
-                        "{}::{} input type{suggestion_text}",
-                        context_name, operation.name
-                    ),
-                    depends_on: input_name,
-                });
-            }
+            errors.push(ValidationError::UnknownDependencyField {
+                field_context: format!(
+                    "{}::{} input type{suggestion_text}",
+                    context_name, operation.name
+                ),
+                depends_on: input_name,
+            });
         }
 
-        if let Some(output_name) = output_type_name {
-            if !validation_context.type_names.contains(&output_name) {
-                // Suggest similar type names for typos
-                let available_names: Vec<String> =
-                    validation_context.type_names.iter().cloned().collect();
-                let suggestions = csilgen_common::CsilgenError::suggest_similar_names(
-                    &output_name,
-                    &available_names,
-                );
+        if let Some(output_name) = output_type_name
+            && !validation_context.type_names.contains(&output_name)
+        {
+            // Suggest similar type names for typos
+            let available_names: Vec<String> =
+                validation_context.type_names.iter().cloned().collect();
+            let suggestions = csilgen_common::CsilgenError::suggest_similar_names(
+                &output_name,
+                &available_names,
+            );
 
-                let suggestion_text = if !suggestions.is_empty() {
-                    format!(" Did you mean: {}?", suggestions.join(", "))
-                } else {
-                    String::new()
-                };
+            let suggestion_text = if !suggestions.is_empty() {
+                format!(" Did you mean: {}?", suggestions.join(", "))
+            } else {
+                String::new()
+            };
 
-                errors.push(ValidationError::UnknownDependencyField {
-                    field_context: format!(
-                        "{}::{} output type{suggestion_text}",
-                        context_name, operation.name
-                    ),
-                    depends_on: output_name,
-                });
-            }
+            errors.push(ValidationError::UnknownDependencyField {
+                field_context: format!(
+                    "{}::{} output type{suggestion_text}",
+                    context_name, operation.name
+                ),
+                depends_on: output_name,
+            });
         }
     }
 
@@ -1199,11 +1199,11 @@ fn validate_field_metadata(
     // Check for conflicting min/max constraints
     if let (Some(min_len), Some(max_len)) =
         (constraints.get("min-length"), constraints.get("max-length"))
+        && *min_len == 1
+        && *max_len == 1
     {
-        if *min_len == 1 && *max_len == 1 {
-            // Need to get actual values to compare - this is a simplified check
-            // In a real implementation, we'd store the values during the loop above
-        }
+        // Need to get actual values to compare - this is a simplified check
+        // In a real implementation, we'd store the values during the loop above
     }
 
     if errors.is_empty() {
@@ -1296,16 +1296,16 @@ fn validate_service_operation(
     // For now, we'll just validate the input/output types if they contain groups
     let mut errors = Vec::new();
 
-    if let TypeExpression::Group(group) = &operation.input_type {
-        if let Err(group_errors) = validate_group(group, &format!("{}[input]", operation.name)) {
-            errors.extend(group_errors);
-        }
+    if let TypeExpression::Group(group) = &operation.input_type
+        && let Err(group_errors) = validate_group(group, &format!("{}[input]", operation.name))
+    {
+        errors.extend(group_errors);
     }
 
-    if let TypeExpression::Group(group) = &operation.output_type {
-        if let Err(group_errors) = validate_group(group, &format!("{}[output]", operation.name)) {
-            errors.extend(group_errors);
-        }
+    if let TypeExpression::Group(group) = &operation.output_type
+        && let Err(group_errors) = validate_group(group, &format!("{}[output]", operation.name))
+    {
+        errors.extend(group_errors);
     }
 
     if errors.is_empty() {

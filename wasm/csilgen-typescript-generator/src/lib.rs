@@ -547,12 +547,10 @@ impl<'a> TypeScriptGenerator<'a> {
 
         // Generate validators for types with field dependencies
         for rule in &self.input.csil_spec.rules {
-            if let CsilRuleType::GroupDef(group) = &rule.rule_type {
-                if self.has_field_dependencies(group) {
-                    let validator = self.generate_dependency_validator(&rule.name, group)?;
-                    content.push_str(&validator);
-                    content.push_str("\n\n");
-                }
+            if let CsilRuleType::GroupDef(group) = &rule.rule_type && self.has_field_dependencies(group) {
+                let validator = self.generate_dependency_validator(&rule.name, group)?;
+                content.push_str(&validator);
+                content.push_str("\n\n");
             }
         }
 

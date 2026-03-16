@@ -62,7 +62,7 @@ fn test_default_package_documentation() {
     let input = create_test_input_with_package_desc(None);
 
     // Verify default package documentation structure
-    assert!(input.config.options.get("package_description").is_none());
+    assert!(!input.config.options.contains_key("package_description"));
     assert_eq!(
         input.config.options.get("package_name")
             .and_then(|v| v.as_str())

@@ -106,33 +106,33 @@ fn process_generation(input: WasmGeneratorInput) -> Result<WasmGeneratorOutput, 
     }
 
     // Generate services file if there are services
-    if input.csil_spec.service_count > 0 {
-        if let Some(services_content) = generate_services(&input, &config, &mut warnings)? {
-            files.push(GeneratedFile {
-                path: make_path("services.gen.go"),
-                content: services_content,
-            });
-        }
+    if input.csil_spec.service_count > 0
+        && let Some(services_content) = generate_services(&input, &config, &mut warnings)?
+    {
+        files.push(GeneratedFile {
+            path: make_path("services.gen.go"),
+            content: services_content,
+        });
     }
 
     // Generate validation file if there are constraints
-    if input.csil_spec.fields_with_metadata_count > 0 {
-        if let Some(validation_content) = generate_validation(&input, &config, &mut warnings)? {
-            files.push(GeneratedFile {
-                path: make_path("validation.gen.go"),
-                content: validation_content,
-            });
-        }
+    if input.csil_spec.fields_with_metadata_count > 0
+        && let Some(validation_content) = generate_validation(&input, &config, &mut warnings)?
+    {
+        files.push(GeneratedFile {
+            path: make_path("validation.gen.go"),
+            content: validation_content,
+        });
     }
 
     // Generate constructors file if there are types with defaults
-    if config.generate_constructors {
-        if let Some(constructors_content) = generate_constructors(&input, &config, &mut warnings)? {
-            files.push(GeneratedFile {
-                path: make_path("constructors.gen.go"),
-                content: constructors_content,
-            });
-        }
+    if config.generate_constructors
+        && let Some(constructors_content) = generate_constructors(&input, &config, &mut warnings)?
+    {
+        files.push(GeneratedFile {
+            path: make_path("constructors.gen.go"),
+            content: constructors_content,
+        });
     }
 
     let total_size: usize = files.iter().map(|f| f.content.len()).sum();
@@ -171,7 +171,7 @@ impl GoConfig {
 
         // Extract package name from go_package option (last path component)
         let package_name = if let Some(pkg) = go_package {
-            pkg.split('/').last().unwrap_or("api").to_string()
+            pkg.split('/').next_back().unwrap_or("api").to_string()
         } else {
             options.get("package_name")
                 .and_then(|v| v.as_str())
@@ -584,15 +584,15 @@ fn generate_validation(
                                         content.push_str(&format!("{}}}\n", config.indent_style));
                                     }
                                     CsilValidationConstraint::Custom { name, value } => {
-                                        if name == "regex" {
-                                            if let CsilLiteralValue::Text(pattern) = value {
-                                                content.push_str(&format!("{}matched, _ := regexp.MatchString(`{}`, v.{})\n",
-                                                    config.indent_style, pattern, field_name));
-                                                content.push_str(&format!("{}if !matched {{\n", config.indent_style));
-                                                content.push_str(&format!("{}{}return fmt.Errorf(\"field '{}' must match pattern '{}'\")\n",
-                                                    config.indent_style, config.indent_style, field_name, pattern));
-                                                content.push_str(&format!("{}}}\n", config.indent_style));
-                                            }
+                                        if name == "regex"
+                                            && let CsilLiteralValue::Text(pattern) = value
+                                        {
+                                            content.push_str(&format!("{}matched, _ := regexp.MatchString(`{}`, v.{})\n",
+                                                config.indent_style, pattern, field_name));
+                                            content.push_str(&format!("{}if !matched {{\n", config.indent_style));
+                                            content.push_str(&format!("{}{}return fmt.Errorf(\"field '{}' must match pattern '{}'\")\n",
+                                                config.indent_style, config.indent_style, field_name, pattern));
+                                            content.push_str(&format!("{}}}\n", config.indent_style));
                                         }
                                     }
                                 }
@@ -635,13 +635,12 @@ fn generate_constructors(
         if let CsilRuleType::GroupDef(group) = &rule.rule_type {
             // Check if this type has any fields with default values
             let fields_with_defaults: Vec<_> = group.entries.iter().filter_map(|entry| {
-                if let Some(key) = &entry.key {
-                    for metadata in &entry.metadata {
-                        if let CsilFieldMetadata::Constraint(CsilValidationConstraint::Custom { name, value }) = metadata {
-                            if name == "default" {
-                                return Some((key, value, &entry.value_type, &entry.occurrence, &entry.metadata));
-                            }
-                        }
+                let key = entry.key.as_ref()?;
+                for metadata in &entry.metadata {
+                    if let CsilFieldMetadata::Constraint(CsilValidationConstraint::Custom { name, value }) = metadata
+                        && name == "default"
+                    {
+                        return Some((key, value, &entry.value_type, &entry.occurrence, &entry.metadata));
                     }
                 }
                 None
@@ -734,14 +733,12 @@ fn go_field_name_from_key(key: &CsilGroupKey) -> String {
 fn go_field_name_from_key_with_metadata(key: &CsilGroupKey, metadata: &[CsilFieldMetadata]) -> String {
     // Check for go_name custom metadata
     for meta in metadata {
-        if let CsilFieldMetadata::Custom { name, parameters } = meta {
-            if name == "go_name" && !parameters.is_empty() {
-                if let Some(param) = parameters.first() {
-                    if let CsilLiteralValue::Text(go_name) = &param.value {
-                        return go_name.clone();
-                    }
-                }
-            }
+        if let CsilFieldMetadata::Custom { name, parameters } = meta
+            && name == "go_name"
+            && let Some(param) = parameters.first()
+            && let CsilLiteralValue::Text(go_name) = &param.value
+        {
+            return go_name.clone();
         }
     }
 
@@ -751,14 +748,12 @@ fn go_field_name_from_key_with_metadata(key: &CsilGroupKey, metadata: &[CsilFiel
 
 fn get_go_type_override(metadata: &[CsilFieldMetadata]) -> Option<String> {
     for meta in metadata {
-        if let CsilFieldMetadata::Custom { name, parameters } = meta {
-            if name == "go_type" && !parameters.is_empty() {
-                if let Some(param) = parameters.first() {
-                    if let CsilLiteralValue::Text(go_type) = &param.value {
-                        return Some(go_type.clone());
-                    }
-                }
-            }
+        if let CsilFieldMetadata::Custom { name, parameters } = meta
+            && name == "go_type"
+            && let Some(param) = parameters.first()
+            && let CsilLiteralValue::Text(go_type) = &param.value
+        {
+            return Some(go_type.clone());
         }
     }
     None

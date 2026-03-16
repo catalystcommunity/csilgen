@@ -306,10 +306,9 @@ fn test_constructor_disabled_via_config() {
     };
 
     // Verify the config has constructors disabled
-    assert_eq!(
-        input.config.options.get("generate_constructors")
+    assert!(
+        !input.config.options.get("generate_constructors")
             .and_then(|v| v.as_bool())
-            .unwrap_or(true),
-        false
+            .unwrap_or(true)
     );
 }

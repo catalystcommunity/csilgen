@@ -529,14 +529,12 @@ impl Lexer {
             let ch = self.advance();
             lexeme.push(ch);
 
-            if ch.is_ascii_hexdigit() {
-                if let Some(next_ch) = self.peek().to_digit(16) {
-                    if ch.is_ascii_hexdigit() {
-                        let byte_val = (ch.to_digit(16).unwrap() * 16 + next_ch) as u8;
-                        bytes.push(byte_val);
-                        lexeme.push(self.advance());
-                    }
-                }
+            if ch.is_ascii_hexdigit()
+                && let Some(next_ch) = self.peek().to_digit(16)
+            {
+                let byte_val = (ch.to_digit(16).unwrap() * 16 + next_ch) as u8;
+                bytes.push(byte_val);
+                lexeme.push(self.advance());
             }
         }
 

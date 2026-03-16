@@ -76,16 +76,16 @@ fn install_wasm() -> Result<()> {
         let entry = entry?;
         let path = entry.path();
 
-        if path.extension().and_then(|s| s.to_str()) == Some("wasm") {
-            if let Some(name) = path.file_name() {
-                let name_str = name.to_string_lossy();
-                if name_str.starts_with("csilgen_") {
-                    let dest = generators_dir.join(name);
-                    fs::copy(&path, &dest).with_context(|| {
-                        format!("Failed to copy {} to {}", path.display(), dest.display())
-                    })?;
-                    installed.push(name_str.to_string());
-                }
+        if path.extension().and_then(|s| s.to_str()) == Some("wasm")
+            && let Some(name) = path.file_name()
+        {
+            let name_str = name.to_string_lossy();
+            if name_str.starts_with("csilgen_") {
+                let dest = generators_dir.join(name);
+                fs::copy(&path, &dest).with_context(|| {
+                    format!("Failed to copy {} to {}", path.display(), dest.display())
+                })?;
+                installed.push(name_str.to_string());
             }
         }
     }

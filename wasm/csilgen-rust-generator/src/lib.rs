@@ -187,10 +187,18 @@ impl<'a> RustCodeGenerator<'a> {
             });
         }
 
-        // Generate lib.rs to tie everything together
+        // Generate module root file to tie everything together
+        let root_filename = self
+            .input
+            .config
+            .options
+            .get("module_root_filename")
+            .and_then(|v| v.as_str())
+            .unwrap_or("mod.rs")
+            .to_string();
         let lib_content = self.generate_lib_file(&files)?;
         files.push(GeneratedFile {
-            path: "lib.rs".to_string(),
+            path: root_filename,
             content: lib_content,
         });
 
@@ -309,8 +317,14 @@ impl<'a> RustCodeGenerator<'a> {
         name: &str,
         type_expr: &CsilTypeExpression,
     ) -> Result<String, String> {
-        let rust_type = self.map_type_to_rust(type_expr, &None)?;
-        Ok(format!("pub type {name} = {rust_type};"))
+        match type_expr {
+            CsilTypeExpression::Group(group) => self.generate_struct(name, group),
+            CsilTypeExpression::Choice(choices) => self.generate_enum(name, choices),
+            _ => {
+                let rust_type = self.map_type_to_rust(type_expr, &None)?;
+                Ok(format!("pub type {name} = {rust_type};"))
+            }
+        }
     }
 
     fn generate_services(&mut self) -> Result<String, String> {
@@ -344,10 +358,10 @@ impl<'a> RustCodeGenerator<'a> {
             let input_type = self.map_type_to_rust(&operation.input_type, &None)?;
             let output_type = self.map_type_to_rust(&operation.output_type, &None)?;
 
+            let op_name = self.to_snake_case(&operation.name);
             content.push_str(&format!("    /// {} operation\n", operation.name));
             content.push_str(&format!(
-                "    fn {}(&self, input: {input_type}) -> {output_type};\n",
-                operation.name
+                "    fn {op_name}(&self, input: {input_type}) -> {output_type};\n",
             ));
         }
 
@@ -495,10 +509,8 @@ impl<'a> RustCodeGenerator<'a> {
                 CsilFieldMetadata::Custom { name, parameters } => {
                     if name == "rust" {
                         for param in parameters {
-                            if let Some(param_name) = &param.name {
-                                if let CsilLiteralValue::Text(value) = &param.value {
-                                    attrs.push(format!("{param_name} = \"{value}\""));
-                                }
+                            if let Some(param_name) = &param.name && let CsilLiteralValue::Text(value) = &param.value {
+                                attrs.push(format!("{param_name} = \"{value}\""));
                             }
                         }
                     }
@@ -522,13 +534,16 @@ impl<'a> RustCodeGenerator<'a> {
 
     fn to_snake_case(&self, s: &str) -> String {
         let mut result = String::new();
-        let chars = s.chars();
 
-        for ch in chars {
-            if ch.is_ascii_uppercase() && !result.is_empty() {
+        for ch in s.chars() {
+            if ch == '-' {
                 result.push('_');
+            } else if ch.is_ascii_uppercase() && !result.is_empty() {
+                result.push('_');
+                result.push(ch.to_ascii_lowercase());
+            } else {
+                result.push(ch.to_ascii_lowercase());
             }
-            result.push(ch.to_ascii_lowercase());
         }
 
         result
@@ -634,6 +649,12 @@ mod tests {
         assert_eq!(generator.to_snake_case("CamelCase"), "camel_case");
         assert_eq!(generator.to_snake_case("HTTPResponse"), "h_t_t_p_response");
         assert_eq!(generator.to_snake_case("simple"), "simple");
+        assert_eq!(generator.to_snake_case("create-entry"), "create_entry");
+        assert_eq!(
+            generator.to_snake_case("MyService-operation"),
+            "my_service_operation"
+        );
+        assert_eq!(generator.to_snake_case("a--b"), "a__b");
     }
 
     #[test]
@@ -674,6 +695,82 @@ mod tests {
     }
 
     #[test]
+    fn test_service_with_hyphenated_operations() {
+        let mut input = create_test_input();
+
+        input.csil_spec.rules.push(CsilRule {
+            name: "Guestbook".to_string(),
+            rule_type: CsilRuleType::ServiceDef(CsilServiceDefinition {
+                operations: vec![
+                    CsilServiceOperation {
+                        name: "create-entry".to_string(),
+                        input_type: CsilTypeExpression::Reference("User".to_string()),
+                        output_type: CsilTypeExpression::Reference("User".to_string()),
+                        direction: CsilServiceDirection::Unidirectional,
+                        position: CsilPosition {
+                            line: 2,
+                            column: 4,
+                            offset: 20,
+                        },
+                    },
+                    CsilServiceOperation {
+                        name: "list-entries".to_string(),
+                        input_type: CsilTypeExpression::Reference("User".to_string()),
+                        output_type: CsilTypeExpression::Reference("User".to_string()),
+                        direction: CsilServiceDirection::Unidirectional,
+                        position: CsilPosition {
+                            line: 3,
+                            column: 4,
+                            offset: 40,
+                        },
+                    },
+                ],
+            }),
+            position: CsilPosition {
+                line: 1,
+                column: 1,
+                offset: 0,
+            },
+        });
+        input.csil_spec.service_count = 1;
+
+        let mut generator = RustCodeGenerator::new(&input);
+        let services_content = generator.generate_services().unwrap();
+
+        assert!(services_content.contains("fn create_entry("));
+        assert!(!services_content.contains("fn create-entry("));
+        assert!(services_content.contains("fn list_entries("));
+        assert!(services_content.contains("/// create-entry operation"));
+        assert!(services_content.contains("/// list-entries operation"));
+    }
+
+    #[test]
+    fn test_module_root_filename_default() {
+        let input = create_test_input();
+        let mut generator = RustCodeGenerator::new(&input);
+        let files = generator.generate().unwrap();
+
+        let root_file = files.iter().find(|f| f.path == "mod.rs");
+        assert!(root_file.is_some());
+    }
+
+    #[test]
+    fn test_module_root_filename_custom() {
+        let mut input = create_test_input();
+        input
+            .config
+            .options
+            .insert("module_root_filename".to_string(), serde_json::Value::String("lib.rs".to_string()));
+
+        let mut generator = RustCodeGenerator::new(&input);
+        let files = generator.generate().unwrap();
+
+        let root_file = files.iter().find(|f| f.path == "lib.rs");
+        assert!(root_file.is_some());
+        assert!(files.iter().all(|f| f.path != "mod.rs"));
+    }
+
+    #[test]
     fn test_full_generation_workflow() {
         let input = create_test_input();
         let input_json = serde_json::to_string(&input).unwrap();
@@ -690,8 +787,8 @@ mod tests {
         let type_file = output.files.iter().find(|f| f.path == "types.rs");
         assert!(type_file.is_some());
 
-        let lib_file = output.files.iter().find(|f| f.path == "lib.rs");
-        assert!(lib_file.is_some());
+        let mod_file = output.files.iter().find(|f| f.path == "mod.rs");
+        assert!(mod_file.is_some());
     }
 
     #[test]
@@ -714,5 +811,329 @@ mod tests {
 
         deallocate(ptr, size);
         // Test passes if no crash occurs
+    }
+
+    #[test]
+    fn test_enum_from_typedef_wrapping_choice() {
+        let mut input = create_test_input();
+        input.csil_spec.rules.push(CsilRule {
+            name: "CheckValue".to_string(),
+            rule_type: CsilRuleType::TypeDef(CsilTypeExpression::Choice(vec![
+                CsilTypeExpression::Builtin("text".to_string()),
+                CsilTypeExpression::Builtin("int".to_string()),
+                CsilTypeExpression::Builtin("float".to_string()),
+            ])),
+            position: CsilPosition {
+                line: 1,
+                column: 1,
+                offset: 0,
+            },
+        });
+
+        let mut generator = RustCodeGenerator::new(&input);
+        let types_content = generator.generate_types().unwrap();
+
+        assert!(
+            types_content.contains("pub enum CheckValue"),
+            "Choice wrapped in TypeDef should generate an enum, not a type alias"
+        );
+        assert!(types_content.contains("Variant0(String)"));
+        assert!(types_content.contains("Variant1(i64)"));
+        assert!(types_content.contains("Variant2(f64)"));
+        assert!(types_content.contains("#[serde(untagged)]"));
+        assert!(
+            !types_content.contains("pub type CheckValue = serde_json::Value"),
+            "Should not fall back to serde_json::Value"
+        );
+    }
+
+    #[test]
+    fn test_struct_from_typedef_wrapping_group() {
+        let mut input = create_test_input();
+        input.csil_spec.rules.push(CsilRule {
+            name: "CheckResult".to_string(),
+            rule_type: CsilRuleType::TypeDef(CsilTypeExpression::Group(CsilGroupExpression {
+                entries: vec![
+                    CsilGroupEntry {
+                        key: Some(CsilGroupKey::Bare("result".to_string())),
+                        value_type: CsilTypeExpression::Builtin("bool".to_string()),
+                        occurrence: None,
+                        metadata: vec![],
+                    },
+                    CsilGroupEntry {
+                        key: Some(CsilGroupKey::Bare("entries".to_string())),
+                        value_type: CsilTypeExpression::Reference("CheckEntries".to_string()),
+                        occurrence: None,
+                        metadata: vec![],
+                    },
+                ],
+            })),
+            position: CsilPosition {
+                line: 1,
+                column: 1,
+                offset: 0,
+            },
+        });
+
+        let mut generator = RustCodeGenerator::new(&input);
+        let types_content = generator.generate_types().unwrap();
+
+        assert!(
+            types_content.contains("pub struct CheckResult"),
+            "Group wrapped in TypeDef should generate a struct, not a type alias"
+        );
+        assert!(types_content.contains("pub result: bool"));
+        assert!(types_content.contains("pub entries: CheckEntries"));
+        assert!(
+            !types_content.contains("pub type CheckResult = serde_json::Value"),
+            "Should not fall back to serde_json::Value"
+        );
+    }
+
+    #[test]
+    fn test_struct_with_optional_fields() {
+        let mut input = create_test_input();
+        input.csil_spec.rules = vec![CsilRule {
+            name: "HelloRequest".to_string(),
+            rule_type: CsilRuleType::TypeDef(CsilTypeExpression::Group(CsilGroupExpression {
+                entries: vec![CsilGroupEntry {
+                    key: Some(CsilGroupKey::Bare("name".to_string())),
+                    value_type: CsilTypeExpression::Builtin("text".to_string()),
+                    occurrence: Some(CsilOccurrence::Optional),
+                    metadata: vec![],
+                }],
+            })),
+            position: CsilPosition {
+                line: 1,
+                column: 1,
+                offset: 0,
+            },
+        }];
+
+        let mut generator = RustCodeGenerator::new(&input);
+        let types_content = generator.generate_types().unwrap();
+
+        assert!(types_content.contains("pub struct HelloRequest"));
+        assert!(types_content.contains("pub name: Option<String>"));
+        assert!(types_content.contains("skip_serializing_if = \"Option::is_none\""));
+    }
+
+    #[test]
+    fn test_struct_with_receive_only_visibility() {
+        let mut input = create_test_input();
+        input.csil_spec.rules = vec![CsilRule {
+            name: "GuestbookEntry".to_string(),
+            rule_type: CsilRuleType::TypeDef(CsilTypeExpression::Group(CsilGroupExpression {
+                entries: vec![
+                    CsilGroupEntry {
+                        key: Some(CsilGroupKey::Bare("id".to_string())),
+                        value_type: CsilTypeExpression::Builtin("text".to_string()),
+                        occurrence: None,
+                        metadata: vec![CsilFieldMetadata::Visibility(
+                            CsilFieldVisibility::ReceiveOnly,
+                        )],
+                    },
+                    CsilGroupEntry {
+                        key: Some(CsilGroupKey::Bare("name".to_string())),
+                        value_type: CsilTypeExpression::Builtin("text".to_string()),
+                        occurrence: None,
+                        metadata: vec![],
+                    },
+                    CsilGroupEntry {
+                        key: Some(CsilGroupKey::Bare("created_at".to_string())),
+                        value_type: CsilTypeExpression::Builtin("text".to_string()),
+                        occurrence: None,
+                        metadata: vec![CsilFieldMetadata::Visibility(
+                            CsilFieldVisibility::ReceiveOnly,
+                        )],
+                    },
+                ],
+            })),
+            position: CsilPosition {
+                line: 1,
+                column: 1,
+                offset: 0,
+            },
+        }];
+
+        let mut generator = RustCodeGenerator::new(&input);
+        let types_content = generator.generate_types().unwrap();
+
+        assert!(types_content.contains("pub struct GuestbookEntry"));
+        assert!(types_content.contains("pub id: String"));
+        assert!(types_content.contains("pub name: String"));
+        assert!(types_content.contains("pub created_at: String"));
+        // id and created_at should have skip_serializing, name should not
+        let id_section = &types_content[types_content.find("pub id:").unwrap() - 80..types_content.find("pub id:").unwrap()];
+        assert!(
+            id_section.contains("skip_serializing"),
+            "receive-only field 'id' should have skip_serializing"
+        );
+    }
+
+    #[test]
+    fn test_map_type_still_works() {
+        let mut input = create_test_input();
+        input.csil_spec.rules.push(CsilRule {
+            name: "CheckEntries".to_string(),
+            rule_type: CsilRuleType::TypeDef(CsilTypeExpression::Map {
+                key: Box::new(CsilTypeExpression::Builtin("text".to_string())),
+                value: Box::new(CsilTypeExpression::Reference("CheckValue".to_string())),
+                occurrence: None,
+            }),
+            position: CsilPosition {
+                line: 1,
+                column: 1,
+                offset: 0,
+            },
+        });
+
+        let mut generator = RustCodeGenerator::new(&input);
+        let types_content = generator.generate_types().unwrap();
+
+        assert!(types_content
+            .contains("pub type CheckEntries = std::collections::HashMap<String, CheckValue>;"));
+    }
+
+    #[test]
+    fn test_linkkeys_end_to_end() {
+        let mut input = create_test_input();
+        input.csil_spec.rules = vec![
+            CsilRule {
+                name: "CheckValue".to_string(),
+                rule_type: CsilRuleType::TypeDef(CsilTypeExpression::Choice(vec![
+                    CsilTypeExpression::Builtin("text".to_string()),
+                    CsilTypeExpression::Builtin("int".to_string()),
+                    CsilTypeExpression::Builtin("float".to_string()),
+                ])),
+                position: CsilPosition { line: 1, column: 1, offset: 0 },
+            },
+            CsilRule {
+                name: "CheckEntries".to_string(),
+                rule_type: CsilRuleType::TypeDef(CsilTypeExpression::Map {
+                    key: Box::new(CsilTypeExpression::Builtin("text".to_string())),
+                    value: Box::new(CsilTypeExpression::Reference("CheckValue".to_string())),
+                    occurrence: None,
+                }),
+                position: CsilPosition { line: 3, column: 1, offset: 30 },
+            },
+            CsilRule {
+                name: "CheckResult".to_string(),
+                rule_type: CsilRuleType::TypeDef(CsilTypeExpression::Group(CsilGroupExpression {
+                    entries: vec![
+                        CsilGroupEntry {
+                            key: Some(CsilGroupKey::Bare("result".to_string())),
+                            value_type: CsilTypeExpression::Builtin("bool".to_string()),
+                            occurrence: None,
+                            metadata: vec![],
+                        },
+                        CsilGroupEntry {
+                            key: Some(CsilGroupKey::Bare("entries".to_string())),
+                            value_type: CsilTypeExpression::Reference("CheckEntries".to_string()),
+                            occurrence: None,
+                            metadata: vec![],
+                        },
+                    ],
+                })),
+                position: CsilPosition { line: 5, column: 1, offset: 60 },
+            },
+            CsilRule {
+                name: "HelloRequest".to_string(),
+                rule_type: CsilRuleType::TypeDef(CsilTypeExpression::Group(CsilGroupExpression {
+                    entries: vec![CsilGroupEntry {
+                        key: Some(CsilGroupKey::Bare("name".to_string())),
+                        value_type: CsilTypeExpression::Builtin("text".to_string()),
+                        occurrence: Some(CsilOccurrence::Optional),
+                        metadata: vec![],
+                    }],
+                })),
+                position: CsilPosition { line: 10, column: 1, offset: 120 },
+            },
+            CsilRule {
+                name: "GuestbookEntry".to_string(),
+                rule_type: CsilRuleType::TypeDef(CsilTypeExpression::Group(CsilGroupExpression {
+                    entries: vec![
+                        CsilGroupEntry {
+                            key: Some(CsilGroupKey::Bare("id".to_string())),
+                            value_type: CsilTypeExpression::Builtin("text".to_string()),
+                            occurrence: None,
+                            metadata: vec![CsilFieldMetadata::Visibility(
+                                CsilFieldVisibility::ReceiveOnly,
+                            )],
+                        },
+                        CsilGroupEntry {
+                            key: Some(CsilGroupKey::Bare("name".to_string())),
+                            value_type: CsilTypeExpression::Builtin("text".to_string()),
+                            occurrence: None,
+                            metadata: vec![],
+                        },
+                        CsilGroupEntry {
+                            key: Some(CsilGroupKey::Bare("created_at".to_string())),
+                            value_type: CsilTypeExpression::Builtin("text".to_string()),
+                            occurrence: None,
+                            metadata: vec![CsilFieldMetadata::Visibility(
+                                CsilFieldVisibility::ReceiveOnly,
+                            )],
+                        },
+                        CsilGroupEntry {
+                            key: Some(CsilGroupKey::Bare("updated_at".to_string())),
+                            value_type: CsilTypeExpression::Builtin("text".to_string()),
+                            occurrence: None,
+                            metadata: vec![CsilFieldMetadata::Visibility(
+                                CsilFieldVisibility::ReceiveOnly,
+                            )],
+                        },
+                    ],
+                })),
+                position: CsilPosition { line: 14, column: 1, offset: 160 },
+            },
+        ];
+
+        let mut generator = RustCodeGenerator::new(&input);
+        let types_content = generator.generate_types().unwrap();
+
+        // CheckValue is an enum with 3 variants
+        assert!(types_content.contains("pub enum CheckValue"));
+        assert!(types_content.contains("Variant0(String)"));
+        assert!(types_content.contains("Variant1(i64)"));
+        assert!(types_content.contains("Variant2(f64)"));
+
+        // CheckEntries is a HashMap
+        assert!(types_content
+            .contains("pub type CheckEntries = std::collections::HashMap<String, CheckValue>"));
+
+        // CheckResult is a struct
+        assert!(types_content.contains("pub struct CheckResult"));
+        assert!(types_content.contains("pub result: bool"));
+        assert!(types_content.contains("pub entries: CheckEntries"));
+
+        // HelloRequest has optional name
+        assert!(types_content.contains("pub struct HelloRequest"));
+        assert!(types_content.contains("pub name: Option<String>"));
+
+        // GuestbookEntry is a struct with 4 fields
+        assert!(types_content.contains("pub struct GuestbookEntry"));
+        assert!(types_content.contains("pub id: String"));
+        assert!(types_content.contains("pub name: String"));
+        assert!(types_content.contains("pub created_at: String"));
+        assert!(types_content.contains("pub updated_at: String"));
+
+        // No serde_json::Value type aliases (except for 'any' typed fields)
+        assert!(
+            !types_content.contains("pub type CheckValue = serde_json::Value"),
+            "CheckValue should be an enum"
+        );
+        assert!(
+            !types_content.contains("pub type CheckResult = serde_json::Value"),
+            "CheckResult should be a struct"
+        );
+        assert!(
+            !types_content.contains("pub type HelloRequest = serde_json::Value"),
+            "HelloRequest should be a struct"
+        );
+        assert!(
+            !types_content.contains("pub type GuestbookEntry = serde_json::Value"),
+            "GuestbookEntry should be a struct"
+        );
     }
 }

@@ -29,7 +29,7 @@ fn test_optional_field_omitempty() {
     let input = create_test_input_with_optional_field();
 
     // Verify we have an optional field in the spec
-    if let Some(CsilRuleType::GroupDef(group)) = input.csil_spec.rules.get(0).map(|r| &r.rule_type) {
+    if let Some(CsilRuleType::GroupDef(group)) = input.csil_spec.rules.first().map(|r| &r.rule_type) {
         let optional_field = group.entries.iter().find(|e| matches!(e.occurrence, Some(CsilOccurrence::Optional)));
         assert!(optional_field.is_some(), "Should have at least one optional field");
     }

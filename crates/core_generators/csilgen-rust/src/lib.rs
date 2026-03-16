@@ -95,10 +95,10 @@ fn generate_struct_field(
             }
             FieldMetadata::Custom { name, parameters } if name == "rust" => {
                 for param in parameters {
-                    if let Some(param_name) = &param.name {
-                        if let LiteralValue::Text(value) = &param.value {
-                            serde_attrs.push(format!("{param_name} = \"{value}\""));
-                        }
+                    if let Some(param_name) = &param.name
+                        && let LiteralValue::Text(value) = &param.value
+                    {
+                        serde_attrs.push(format!("{param_name} = \"{value}\""));
                     }
                 }
             }
