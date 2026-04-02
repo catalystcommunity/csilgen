@@ -9,6 +9,11 @@ pub fn generate_rust_code(spec: &CsilSpec, _config: &GeneratorConfig) -> Result<
     let mut code = String::new();
 
     code.push_str("use serde::{Deserialize, Serialize};\n");
+
+    if spec_has_bytes_fields(spec) {
+        code.push_str("use serde_bytes;\n");
+    }
+
     code.push('\n');
 
     for rule in &spec.rules {
@@ -104,6 +109,10 @@ fn generate_struct_field(
             }
             _ => {}
         }
+    }
+
+    if is_bytes_type(value_type) {
+        serde_attrs.push("with = \"serde_bytes\"".to_string());
     }
 
     if matches!(occurrence, Some(Occurrence::Optional)) {
@@ -262,7 +271,7 @@ fn map_builtin_to_rust(builtin: &str) -> String {
         "uint" => "u64".to_string(),
         "float" | "number" => "f64".to_string(),
         "text" | "string" => "String".to_string(),
-        "bytes" => "Vec<u8>".to_string(),
+        "bytes" | "bstr" => "Vec<u8>".to_string(),
         "bool" | "boolean" => "bool".to_string(),
         "null" => "()".to_string(),
         "any" => "serde_json::Value".to_string(),
@@ -279,6 +288,24 @@ fn map_literal_to_rust(literal: &LiteralValue) -> String {
         LiteralValue::Null => "()".to_string(),
         LiteralValue::Bytes(_) => "Vec<u8>".to_string(),
         LiteralValue::Array(_) => "Vec<serde_json::Value>".to_string(),
+    }
+}
+
+fn spec_has_bytes_fields(spec: &CsilSpec) -> bool {
+    spec.rules.iter().any(|rule| match &rule.rule_type {
+        RuleType::GroupDef(group) => group.entries.iter().any(|e| is_bytes_type(&e.value_type)),
+        RuleType::TypeDef(TypeExpression::Group(group)) => {
+            group.entries.iter().any(|e| is_bytes_type(&e.value_type))
+        }
+        _ => false,
+    })
+}
+
+fn is_bytes_type(type_expr: &TypeExpression) -> bool {
+    match type_expr {
+        TypeExpression::Builtin(name) => matches!(name.as_str(), "bytes" | "bstr"),
+        TypeExpression::Constrained { base_type, .. } => is_bytes_type(base_type),
+        _ => false,
     }
 }
 
