@@ -209,7 +209,13 @@ impl<'a> RustCodeGenerator<'a> {
         let mut content = String::new();
 
         content.push_str("//! Generated types from CSIL specification\n\n");
-        content.push_str("use serde::{Deserialize, Serialize};\n\n");
+        content.push_str("use serde::{Deserialize, Serialize};\n");
+
+        if self.spec_has_bytes_fields() {
+            content.push_str("use serde_bytes;\n");
+        }
+
+        content.push('\n');
 
         for rule in &self.input.csil_spec.rules {
             match &rule.rule_type {
@@ -276,7 +282,7 @@ impl<'a> RustCodeGenerator<'a> {
 
                 // Generate serde attributes based on metadata
                 let serde_attrs =
-                    self.generate_serde_attributes(&entry.metadata, &entry.occurrence);
+                    self.generate_serde_attributes(&entry.metadata, &entry.occurrence, &entry.value_type);
                 if !serde_attrs.is_empty() {
                     content.push_str(&format!("    #[serde({})]\n", serde_attrs.join(", ")));
                 }
@@ -490,6 +496,7 @@ impl<'a> RustCodeGenerator<'a> {
         &self,
         metadata: &[CsilFieldMetadata],
         occurrence: &Option<CsilOccurrence>,
+        value_type: &CsilTypeExpression,
     ) -> Vec<String> {
         let mut attrs = Vec::new();
 
@@ -519,12 +526,37 @@ impl<'a> RustCodeGenerator<'a> {
             }
         }
 
+        if Self::is_bytes_type(value_type) {
+            attrs.push("with = \"serde_bytes\"".to_string());
+        }
+
         // Handle optional fields
         if matches!(occurrence, Some(CsilOccurrence::Optional)) {
             attrs.push("skip_serializing_if = \"Option::is_none\"".to_string());
         }
 
         attrs
+    }
+
+    fn is_bytes_type(type_expr: &CsilTypeExpression) -> bool {
+        match type_expr {
+            CsilTypeExpression::Builtin(name) => matches!(name.as_str(), "bytes" | "bstr"),
+            CsilTypeExpression::Constrained { base_type, .. } => Self::is_bytes_type(base_type),
+            _ => false,
+        }
+    }
+
+    fn spec_has_bytes_fields(&self) -> bool {
+        self.input.csil_spec.rules.iter().any(|rule| {
+            if let CsilRuleType::GroupDef(group) = &rule.rule_type {
+                group
+                    .entries
+                    .iter()
+                    .any(|e| Self::is_bytes_type(&e.value_type))
+            } else {
+                false
+            }
+        })
     }
 
     fn should_derive_partial_eq(&self, _group: &CsilGroupExpression) -> bool {
