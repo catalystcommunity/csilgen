@@ -16,6 +16,11 @@ pub fn generate_rust_code(spec: &CsilSpec, _config: &GeneratorConfig) -> Result<
 
     code.push('\n');
 
+    if spec_has_services(spec) {
+        generate_service_error(&mut code);
+        code.push('\n');
+    }
+
     for rule in &spec.rules {
         match &rule.rule_type {
             RuleType::TypeDef(type_expr) => {
@@ -184,12 +189,29 @@ fn generate_enum_from_types(code: &mut String, name: &str, types: &[TypeExpressi
     Ok(())
 }
 
+fn generate_service_error(code: &mut String) {
+    code.push_str("#[derive(Debug, Clone)]\n");
+    code.push_str("pub struct ServiceError {\n");
+    code.push_str("    pub code: i32,\n");
+    code.push_str("    pub message: String,\n");
+    code.push_str("}\n\n");
+
+    code.push_str("impl std::fmt::Display for ServiceError {\n");
+    code.push_str("    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {\n");
+    code.push_str("        write!(f, \"service error {}: {}\", self.code, self.message)\n");
+    code.push_str("    }\n");
+    code.push_str("}\n\n");
+
+    code.push_str("impl std::error::Error for ServiceError {}\n");
+}
+
 fn generate_service_trait(
     code: &mut String,
     name: &str,
     service: &ServiceDefinition,
 ) -> Result<()> {
     code.push_str(&format!("pub trait {name} {{\n"));
+    code.push_str("    type Context;\n");
 
     for operation in &service.operations {
         let method_name = to_snake_case(&operation.name);
@@ -199,20 +221,20 @@ fn generate_service_trait(
         match operation.direction {
             ServiceDirection::Unidirectional => {
                 code.push_str(&format!(
-                    "    fn {method_name}(&self, input: {input_type}) -> Result<{output_type}>;\n"
+                    "    fn {method_name}(&self, ctx: &Self::Context, input: {input_type}) -> Result<{output_type}, ServiceError>;\n"
                 ));
             }
             ServiceDirection::Bidirectional => {
                 code.push_str(&format!(
-                    "    fn {method_name}(&self, input: {input_type}) -> Result<{output_type}>;\n"
+                    "    fn {method_name}(&self, ctx: &Self::Context, input: {input_type}) -> Result<{output_type}, ServiceError>;\n"
                 ));
                 code.push_str(&format!(
-                    "    fn {method_name}_stream(&self) -> Result<Box<dyn Stream<Item = {output_type}>>>;\n"
+                    "    fn {method_name}_stream(&self, ctx: &Self::Context) -> Result<Box<dyn Stream<Item = {output_type}>>, ServiceError>;\n"
                 ));
             }
             ServiceDirection::Reverse => {
                 code.push_str(&format!(
-                    "    fn {method_name}_callback(&self, output: {output_type}) -> Result<()>;\n"
+                    "    fn {method_name}_callback(&self, ctx: &Self::Context, output: {output_type}) -> Result<(), ServiceError>;\n"
                 ));
             }
         }
@@ -289,6 +311,12 @@ fn map_literal_to_rust(literal: &LiteralValue) -> String {
         LiteralValue::Bytes(_) => "Vec<u8>".to_string(),
         LiteralValue::Array(_) => "Vec<serde_json::Value>".to_string(),
     }
+}
+
+fn spec_has_services(spec: &CsilSpec) -> bool {
+    spec.rules
+        .iter()
+        .any(|rule| matches!(rule.rule_type, RuleType::ServiceDef(_)))
 }
 
 fn spec_has_bytes_fields(spec: &CsilSpec) -> bool {
