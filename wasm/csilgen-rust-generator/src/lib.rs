@@ -339,6 +339,9 @@ impl<'a> RustCodeGenerator<'a> {
         content.push_str("//! Generated service traits from CSIL specification\n\n");
         content.push_str("use super::types::*;\n\n");
 
+        self.generate_service_error(&mut content);
+        content.push('\n');
+
         for rule in &self.input.csil_spec.rules {
             if let CsilRuleType::ServiceDef(service) = &rule.rule_type {
                 let trait_code = self.generate_service_trait(&rule.name, service)?;
@@ -350,6 +353,22 @@ impl<'a> RustCodeGenerator<'a> {
         Ok(content)
     }
 
+    fn generate_service_error(&self, code: &mut String) {
+        code.push_str("#[derive(Debug, Clone)]\n");
+        code.push_str("pub struct ServiceError {\n");
+        code.push_str("    pub code: i32,\n");
+        code.push_str("    pub message: String,\n");
+        code.push_str("}\n\n");
+
+        code.push_str("impl std::fmt::Display for ServiceError {\n");
+        code.push_str("    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {\n");
+        code.push_str("        write!(f, \"service error {}: {}\", self.code, self.message)\n");
+        code.push_str("    }\n");
+        code.push_str("}\n\n");
+
+        code.push_str("impl std::error::Error for ServiceError {}\n");
+    }
+
     fn generate_service_trait(
         &mut self,
         name: &str,
@@ -359,6 +378,7 @@ impl<'a> RustCodeGenerator<'a> {
 
         content.push_str(&format!("/// {name} service trait\n"));
         content.push_str(&format!("pub trait {name} {{\n"));
+        content.push_str("    type Context;\n");
 
         for operation in &service.operations {
             let input_type = self.map_type_to_rust(&operation.input_type, &None)?;
@@ -367,7 +387,7 @@ impl<'a> RustCodeGenerator<'a> {
             let op_name = self.to_snake_case(&operation.name);
             content.push_str(&format!("    /// {} operation\n", operation.name));
             content.push_str(&format!(
-                "    fn {op_name}(&self, input: {input_type}) -> {output_type};\n",
+                "    fn {op_name}(&self, ctx: &Self::Context, input: {input_type}) -> Result<{output_type}, ServiceError>;\n",
             ));
         }
 
@@ -720,10 +740,14 @@ mod tests {
         let mut generator = RustCodeGenerator::new(&input);
         let services_content = generator.generate_services().unwrap();
 
+        assert!(services_content.contains("pub struct ServiceError {"));
+        assert!(services_content.contains("pub code: i32"));
+        assert!(services_content.contains("pub message: String"));
+        assert!(services_content.contains("impl std::fmt::Display for ServiceError"));
+        assert!(services_content.contains("impl std::error::Error for ServiceError"));
         assert!(services_content.contains("pub trait UserService"));
-        assert!(services_content.contains("fn create_user"));
-        assert!(services_content.contains("input: User"));
-        assert!(services_content.contains("-> User"));
+        assert!(services_content.contains("type Context;"));
+        assert!(services_content.contains("fn create_user(&self, ctx: &Self::Context, input: User) -> Result<User, ServiceError>"));
     }
 
     #[test]
@@ -769,9 +793,9 @@ mod tests {
         let mut generator = RustCodeGenerator::new(&input);
         let services_content = generator.generate_services().unwrap();
 
-        assert!(services_content.contains("fn create_entry("));
+        assert!(services_content.contains("fn create_entry(&self, ctx: &Self::Context, input: User) -> Result<User, ServiceError>"));
         assert!(!services_content.contains("fn create-entry("));
-        assert!(services_content.contains("fn list_entries("));
+        assert!(services_content.contains("fn list_entries(&self, ctx: &Self::Context, input: User) -> Result<User, ServiceError>"));
         assert!(services_content.contains("/// create-entry operation"));
         assert!(services_content.contains("/// list-entries operation"));
     }
