@@ -242,12 +242,14 @@ fn create_test_spec(num_rules: usize) -> csilgen_core::ast::CsilSpec {
                             FieldMetadata::Visibility(FieldVisibility::Bidirectional),
                             FieldMetadata::Description(format!("Field {i} description")),
                         ],
+                        doc_comments: Vec::new(),
                     },
                     GroupEntry {
                         key: Some(GroupKey::Bare("value".to_string())),
                         value_type: TypeExpression::Builtin("int".to_string()),
                         occurrence: None,
                         metadata: vec![],
+                        doc_comments: Vec::new(),
                     },
                 ],
             })),
@@ -256,6 +258,7 @@ fn create_test_spec(num_rules: usize) -> csilgen_core::ast::CsilSpec {
                 column: 1,
                 offset: i * 50,
             },
+            doc_comments: Vec::new(),
         };
         rules.push(rule);
     }
@@ -279,6 +282,7 @@ fn create_test_spec(num_rules: usize) -> csilgen_core::ast::CsilSpec {
                             column: 5,
                             offset: (num_rules + i) * 50 + 20,
                         },
+                        doc_comments: Vec::new(),
                     }],
                 }),
                 position: Position {
@@ -286,6 +290,7 @@ fn create_test_spec(num_rules: usize) -> csilgen_core::ast::CsilSpec {
                     column: 1,
                     offset: (num_rules + i) * 50,
                 },
+                doc_comments: Vec::new(),
             };
             rules.push(service_rule);
         }

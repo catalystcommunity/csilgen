@@ -52,7 +52,9 @@ enum Commands {
         ///   Use CSIL_VERBOSE=1 for detailed dependency analysis output
         #[arg(short, long)]
         input: String,
-        /// Target generator (json, rust, python, typescript, openapi)
+        /// Target generator name, resolved from installed generators in ~/.csilgen/generators/
+        /// (e.g. rust, go, typescript, json, python, openapi). TypeScript also accepts the
+        /// sub-targets typescript-typesonly / typescript-client / typescript-server.
         #[arg(short, long)]
         target: String,
         /// Output directory

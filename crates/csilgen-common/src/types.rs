@@ -107,6 +107,9 @@ pub struct CsilRule {
     pub rule_type: CsilRuleType,
     /// Source position
     pub position: CsilPosition,
+    /// Documentation comments (;;;) preceding this rule
+    #[serde(default)]
+    pub doc_comments: Vec<String>,
 }
 
 /// Position in CSIL source file
@@ -261,6 +264,9 @@ pub struct CsilGroupEntry {
     pub occurrence: Option<CsilOccurrence>,
     /// Rich field metadata for code generation
     pub metadata: Vec<CsilFieldMetadata>,
+    /// Documentation comments (;;;) preceding this field
+    #[serde(default)]
+    pub doc_comments: Vec<String>,
 }
 
 /// CSIL group key types for WASM boundary
@@ -288,6 +294,9 @@ pub struct CsilServiceOperation {
     pub output_type: CsilTypeExpression,
     pub direction: CsilServiceDirection,
     pub position: CsilPosition,
+    /// Documentation comments (;;;) preceding this operation
+    #[serde(default)]
+    pub doc_comments: Vec<String>,
 }
 
 /// CSIL service direction for WASM boundary
@@ -584,6 +593,7 @@ mod tests {
                             metadata: vec![CsilFieldMetadata::Visibility(
                                 CsilFieldVisibility::Bidirectional,
                             )],
+                            doc_comments: Vec::new(),
                         }],
                     }),
                     position: CsilPosition {
@@ -591,6 +601,7 @@ mod tests {
                         column: 1,
                         offset: 0,
                     },
+                    doc_comments: Vec::new(),
                 },
                 CsilRule {
                     name: "UserService".to_string(),
@@ -605,6 +616,7 @@ mod tests {
                                 column: 4,
                                 offset: 100,
                             },
+                            doc_comments: Vec::new(),
                         }],
                     }),
                     position: CsilPosition {
@@ -612,6 +624,7 @@ mod tests {
                         column: 1,
                         offset: 80,
                     },
+                    doc_comments: Vec::new(),
                 },
             ],
             source_content: Some("User = { name: text @bidirectional }".to_string()),
@@ -1020,6 +1033,7 @@ mod tests {
                                         "User's display name".to_string(),
                                     ),
                                 ],
+                                doc_comments: Vec::new(),
                             },
                             CsilGroupEntry {
                                 key: Some(CsilGroupKey::Bare("email".to_string())),
@@ -1031,6 +1045,7 @@ mod tests {
                                         CsilValidationConstraint::MinLength(5),
                                     ),
                                 ],
+                                doc_comments: Vec::new(),
                             },
                         ],
                     }),
@@ -1039,6 +1054,7 @@ mod tests {
                         column: 1,
                         offset: 0,
                     },
+                    doc_comments: Vec::new(),
                 },
                 // Service with multiple operations
                 CsilRule {
@@ -1055,6 +1071,7 @@ mod tests {
                                     column: 4,
                                     offset: 100,
                                 },
+                                doc_comments: Vec::new(),
                             },
                             CsilServiceOperation {
                                 name: "get_user".to_string(),
@@ -1066,6 +1083,7 @@ mod tests {
                                     column: 4,
                                     offset: 150,
                                 },
+                                doc_comments: Vec::new(),
                             },
                         ],
                     }),
@@ -1074,6 +1092,7 @@ mod tests {
                         column: 1,
                         offset: 80,
                     },
+                    doc_comments: Vec::new(),
                 },
             ],
             source_content: Some("Complete CSIL spec with services and metadata".to_string()),

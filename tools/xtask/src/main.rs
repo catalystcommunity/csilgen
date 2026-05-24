@@ -47,7 +47,11 @@ fn build_wasm() -> Result<()> {
             "--package",
             "csilgen-typescript-generator",
             "--package",
-            "csilgen-go",
+            "csilgen-go-generator",
+            "--package",
+            "csilgen-python-generator",
+            "--package",
+            "csilgen-openapi-generator",
         ])
         .status()
         .context("Failed to run cargo build")?;
@@ -90,7 +94,11 @@ fn install_wasm() -> Result<()> {
         }
     }
 
-    println!("Installed {} WASM modules to {}:", installed.len(), generators_dir.display());
+    println!(
+        "Installed {} WASM modules to {}:",
+        installed.len(),
+        generators_dir.display()
+    );
     for name in &installed {
         println!("  {name}");
     }

@@ -40,8 +40,13 @@ CSIL files use the `.csil` extension and follow CDDL's syntax with extensions. C
 ;; Single-line comments start with double semicolons
 ; Single semicolon comments are also supported
 
-;; Basic type definition (pure CDDL)
+;;; Triple-semicolon comments are documentation comments. They attach to the
+;;; next definition (rule, field, or service operation) and are carried into
+;;; generated output as doc comments (e.g. JSDoc, Rust doc comments).
 UserID = int
+
+;; Basic type definition (pure CDDL)
+SessionID = int
 
 ;; Type with constraints (CDDL control operators)
 Username = text .size (3..50)
@@ -147,7 +152,7 @@ CSIL uses UTF-8 encoding and follows CDDL's lexical conventions:
 
 - **Identifiers**: Start with letter or underscore, contain letters, digits, underscores, hyphens
 - **Keywords**: Reserved words include CDDL keywords plus CSIL extensions
-- **Comments**: `;` or `;;` to end of line
+- **Comments**: `;` or `;;` to end of line; `;;;` is a documentation comment that attaches to the following definition
 - **Whitespace**: Spaces, tabs, newlines are generally insignificant
 - **String literals**: Double-quoted with escape sequences
 - **Numeric literals**: Integers, floats, hexadecimal, binary
@@ -455,20 +460,39 @@ service ServiceName {
 
 ### Operation Directions
 
-Three types of operation directions, which make it useful for protocols other than HTTPS:
+CSIL describes the *shapes* of messages each direction carries; the implementer's protocol handles framing. Three operation directions:
 
 ```csil
 service ExampleService {
-    ;; Unidirectional (request-response)
+    ;; Unidirectional (request-response): client sends Request, gets Response.
     get-data: Request -> Response,
-    
-    ;; Bidirectional (streaming/real-time)
+
+    ;; Bidirectional: over the one connection (e.g. WebSocket/TCP), the client
+    ;; sends messages of `Topic` and receives messages of `Update`. Either side
+    ;; may send at any time; the union of message kinds lives inside the
+    ;; declared types (typically a `/=` type choice) — there is no separate
+    ;; streaming/subscription primitive, just two message types flowing.
     subscribe: Topic <-> Update,
-    
-    ;; Reverse (rarely used, for callbacks)
+
+    ;; Reverse: server pushes `Acknowledgment` to the client over an already-
+    ;; open connection. Rarely used; only meaningful over a persistent channel.
     notify: Event <- Acknowledgment
 }
 ```
+
+#### What generators emit for each direction
+
+CSIL generators only emit **shapes and routing** — never the wire. The implementer wires the generated handler/router to their connection (WebSocket, TCP, request/response, whatever):
+
+| Direction | Server side | Client side |
+|---|---|---|
+| `->` | Handler returning `Output` | Method calling the transport |
+| `<->` | Inbound handler for `Input` + outbound encoder for `Output` | Inbound handler for `Output` + outbound encoder for `Input` |
+| `<-` | Outbound encoder for `Output` only | Inbound handler for `Output` only |
+
+A *router* function decodes inbound bytes for the channel and dispatches to the right handler. *Encoders* return `(method, bytes)` for the implementer to put on the wire. Generators never open, frame, or close the connection.
+
+The TypeScript generator additionally accepts `ts_bidirectional_transport: "connection"` (default) or `"rpc"` in the CSIL options block. `"connection"` is the handler+router shape above; `"rpc"` is a degraded poll model (`checkOp(): Promise<Output[]>` + `sendOp()`) that rides the unary transport for environments without a persistent channel. `ts_ws_base_url` is a hint constant. These options are TypeScript-specific; other generators ignore them.
 
 ### Error Handling
 
@@ -648,7 +672,11 @@ Generators can produce:
 Current and planned language targets:
 
 - **Rust**: Structs with serde
-- **TypeScript**: Interfaces and types with validation
+- **TypeScript**: Interfaces, a transport-agnostic client, and server handlers. Four targets:
+  - `typescript` — emits everything (types + client + server)
+  - `typescript-typesonly` — interfaces and type aliases only
+  - `typescript-client` — types plus a typed client (`client.gen.ts`)
+  - `typescript-server` — types plus handler interfaces and a `dispatch` helper (`server.gen.ts`)
 - **Python**: Dataclasses with pydantic
 - **Go**: Structs with tags
 - **Java**: POJOs with annotations

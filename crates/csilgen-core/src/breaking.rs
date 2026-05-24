@@ -818,6 +818,7 @@ mod tests {
             name: name.to_string(),
             rule_type,
             position: crate::lexer::Position::new(1, 1, 0),
+            doc_comments: Vec::new(),
         }
     }
 
@@ -832,6 +833,7 @@ mod tests {
             value_type,
             occurrence,
             metadata,
+            doc_comments: Vec::new(),
         }
     }
 
@@ -846,6 +848,7 @@ mod tests {
             output_type,
             direction: ServiceDirection::Unidirectional,
             position: crate::lexer::Position::new(1, 1, 0),
+            doc_comments: Vec::new(),
         }
     }
 

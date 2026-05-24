@@ -63,6 +63,8 @@ pub struct Parser {
     current: usize,
     errors: Vec<ParseError>,
     _source_code: String,
+    /// Documentation comments (;;;) seen but not yet attached to a definition
+    pending_docs: Vec<String>,
 }
 
 impl Parser {
@@ -72,6 +74,7 @@ impl Parser {
             current: 0,
             errors: Vec::new(),
             _source_code: source_code.to_string(),
+            pending_docs: Vec::new(),
         }
     }
 
@@ -139,9 +142,14 @@ impl Parser {
     }
 
     fn parse_rule(&mut self) -> Result<Rule, ParseError> {
+        // Capture docs that precede the rule before inner skips accumulate more
+        let doc_comments = self.take_pending_docs();
+
         // Check for service definitions first
         if self.check(&TokenType::Service) {
-            return self.parse_service_rule();
+            let mut rule = self.parse_service_rule()?;
+            rule.doc_comments = doc_comments;
+            return Ok(rule);
         }
 
         let identifier_token = self.consume_identifier()?;
@@ -207,6 +215,7 @@ impl Parser {
             name,
             rule_type,
             position,
+            doc_comments,
         })
     }
 
@@ -451,6 +460,9 @@ impl Parser {
     fn parse_group_entry(&mut self) -> Result<GroupEntry, ParseError> {
         self.skip_whitespace_and_comments();
 
+        // Capture docs preceding the field before nested groups can consume them
+        let doc_comments = self.take_pending_docs();
+
         // Parse metadata annotations first
         let metadata = self.parse_metadata_annotations()?;
 
@@ -502,6 +514,7 @@ impl Parser {
             value_type,
             occurrence,
             metadata: all_metadata,
+            doc_comments,
         })
     }
 
@@ -649,12 +662,38 @@ impl Parser {
     }
 
     fn skip_whitespace_and_comments(&mut self) {
-        while matches!(
-            self.peek().token_type,
-            TokenType::Whitespace(_) | TokenType::Newline | TokenType::Comment(_)
-        ) {
-            self.advance();
+        // A blank line (two consecutive newlines) separates a doc comment block from
+        // whatever follows, so pending docs are dropped rather than mis-attached.
+        let mut consecutive_newlines = 0;
+        loop {
+            match &self.peek().token_type {
+                TokenType::Whitespace(_) => {
+                    self.advance();
+                }
+                TokenType::Comment(_) => {
+                    consecutive_newlines = 0;
+                    self.advance();
+                }
+                TokenType::Newline => {
+                    consecutive_newlines += 1;
+                    if consecutive_newlines >= 2 {
+                        self.pending_docs.clear();
+                    }
+                    self.advance();
+                }
+                TokenType::DocComment(text) => {
+                    consecutive_newlines = 0;
+                    let text = text.clone();
+                    self.pending_docs.push(text);
+                    self.advance();
+                }
+                _ => break,
+            }
         }
+    }
+
+    fn take_pending_docs(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.pending_docs)
     }
 
     fn synchronize(&mut self) {
@@ -974,10 +1013,13 @@ impl Parser {
             name,
             rule_type,
             position,
+            // Set by parse_rule, which captures docs before the `service` keyword
+            doc_comments: Vec::new(),
         })
     }
 
     fn parse_service_operation(&mut self) -> Result<ServiceOperation, ParseError> {
+        let doc_comments = self.take_pending_docs();
         let name_token = self.consume_identifier()?;
         let name = match &name_token.token_type {
             TokenType::Identifier(name) => name.clone(),
@@ -1039,6 +1081,7 @@ impl Parser {
             output_type,
             direction,
             position,
+            doc_comments,
         })
     }
 
@@ -2837,7 +2880,7 @@ mod tests {
     fn test_parse_ne_constraint() {
         let input = "Status = int .ne 0";
         let ast = parse_csil(input).expect("Failed to parse CSIL with .ne constraint");
-        
+
         let rule = &ast.rules[0];
         if let RuleType::TypeDef(TypeExpression::Constrained {
             base_type,
@@ -2846,9 +2889,10 @@ mod tests {
         {
             assert!(matches!(**base_type, TypeExpression::Builtin(ref name) if name == "int"));
             assert_eq!(constraints.len(), 1);
-            assert!(
-                matches!(constraints[0], ControlOperator::NotEqual(LiteralValue::Integer(0)))
-            );
+            assert!(matches!(
+                constraints[0],
+                ControlOperator::NotEqual(LiteralValue::Integer(0))
+            ));
         } else {
             panic!("Expected Constrained type expression with .ne");
         }
@@ -2858,7 +2902,7 @@ mod tests {
     fn test_parse_bits_constraint() {
         let input = "Flags = int .bits \"0x00FF\"";
         let ast = parse_csil(input).expect("Failed to parse CSIL with .bits constraint");
-        
+
         let rule = &ast.rules[0];
         if let RuleType::TypeDef(TypeExpression::Constrained {
             base_type,
@@ -2867,9 +2911,7 @@ mod tests {
         {
             assert!(matches!(**base_type, TypeExpression::Builtin(ref name) if name == "int"));
             assert_eq!(constraints.len(), 1);
-            assert!(
-                matches!(constraints[0], ControlOperator::Bits(ref expr) if expr == "0x00FF")
-            );
+            assert!(matches!(constraints[0], ControlOperator::Bits(ref expr) if expr == "0x00FF"));
         } else {
             panic!("Expected Constrained type expression with .bits");
         }
@@ -2879,7 +2921,7 @@ mod tests {
     fn test_parse_and_constraint() {
         let input = "Combined = text .and (text .size (3..10))";
         let ast = parse_csil(input).expect("Failed to parse CSIL with .and constraint");
-        
+
         let rule = &ast.rules[0];
         if let RuleType::TypeDef(TypeExpression::Constrained {
             base_type,
@@ -2888,7 +2930,7 @@ mod tests {
         {
             assert!(matches!(**base_type, TypeExpression::Builtin(ref name) if name == "text"));
             assert_eq!(constraints.len(), 1);
-            
+
             if let ControlOperator::And(type_expr) = &constraints[0] {
                 assert!(matches!(**type_expr, TypeExpression::Constrained { .. }));
             } else {
@@ -2903,7 +2945,7 @@ mod tests {
     fn test_parse_within_constraint() {
         let input = "Subset = int .within (1 / 2 / 3)";
         let ast = parse_csil(input).expect("Failed to parse CSIL with .within constraint");
-        
+
         let rule = &ast.rules[0];
         if let RuleType::TypeDef(TypeExpression::Constrained {
             base_type,
@@ -2912,7 +2954,7 @@ mod tests {
         {
             assert!(matches!(**base_type, TypeExpression::Builtin(ref name) if name == "int"));
             assert_eq!(constraints.len(), 1);
-            
+
             if let ControlOperator::Within(type_expr) = &constraints[0] {
                 assert!(matches!(**type_expr, TypeExpression::Choice(_)));
             } else {
@@ -2927,7 +2969,7 @@ mod tests {
     fn test_parse_multiple_new_constraints() {
         let input = "Complex = int .ne 0 .ge 1 .le 100";
         let ast = parse_csil(input).expect("Failed to parse CSIL with multiple constraints");
-        
+
         let rule = &ast.rules[0];
         if let RuleType::TypeDef(TypeExpression::Constrained {
             base_type,
@@ -2948,10 +2990,10 @@ mod tests {
     fn test_parse_json_constraint() {
         let input = "JsonData = text .json";
         let ast = parse_csil(input).expect("Failed to parse CSIL with .json constraint");
-        
+
         let rule = &ast.rules[0];
         assert_eq!(rule.name, "JsonData");
-        
+
         if let RuleType::TypeDef(TypeExpression::Constrained {
             base_type,
             constraints,
@@ -2969,10 +3011,10 @@ mod tests {
     fn test_parse_json_constraint_with_size() {
         let input = "ApiResponse = text .size (10..1000) .json";
         let ast = parse_csil(input).expect("Failed to parse CSIL with .json and .size constraints");
-        
+
         let rule = &ast.rules[0];
         assert_eq!(rule.name, "ApiResponse");
-        
+
         if let RuleType::TypeDef(TypeExpression::Constrained {
             base_type,
             constraints,
@@ -2991,10 +3033,10 @@ mod tests {
     fn test_parse_json_constraint_on_bytes() {
         let input = "BinaryJson = bytes .json";
         let ast = parse_csil(input).expect("Failed to parse CSIL with .json constraint on bytes");
-        
+
         let rule = &ast.rules[0];
         assert_eq!(rule.name, "BinaryJson");
-        
+
         if let RuleType::TypeDef(TypeExpression::Constrained {
             base_type,
             constraints,
@@ -3012,10 +3054,10 @@ mod tests {
     fn test_parse_cbor_constraint() {
         let input = "CborData = bytes .cbor";
         let ast = parse_csil(input).expect("Failed to parse CSIL with .cbor constraint");
-        
+
         let rule = &ast.rules[0];
         assert_eq!(rule.name, "CborData");
-        
+
         if let RuleType::TypeDef(TypeExpression::Constrained {
             base_type,
             constraints,
@@ -3033,10 +3075,10 @@ mod tests {
     fn test_parse_cborseq_constraint() {
         let input = "CborSequence = bytes .cborseq";
         let ast = parse_csil(input).expect("Failed to parse CSIL with .cborseq constraint");
-        
+
         let rule = &ast.rules[0];
         assert_eq!(rule.name, "CborSequence");
-        
+
         if let RuleType::TypeDef(TypeExpression::Constrained {
             base_type,
             constraints,
@@ -3054,10 +3096,10 @@ mod tests {
     fn test_parse_cbor_constraint_with_size() {
         let input = "CompactData = bytes .size (10..1000) .cbor";
         let ast = parse_csil(input).expect("Failed to parse CSIL with .cbor and .size constraints");
-        
+
         let rule = &ast.rules[0];
         assert_eq!(rule.name, "CompactData");
-        
+
         if let RuleType::TypeDef(TypeExpression::Constrained {
             base_type,
             constraints,
@@ -3070,5 +3112,98 @@ mod tests {
         } else {
             panic!("Expected Constrained type expression with .cbor and .size constraints");
         }
+    }
+
+    #[test]
+    fn test_doc_comment_on_type_rule() {
+        let input = ";;; A unique identifier for a house.\nHouseID = text";
+        let spec = parse_csil(input).unwrap();
+
+        assert_eq!(spec.rules.len(), 1);
+        assert_eq!(
+            spec.rules[0].doc_comments,
+            vec!["A unique identifier for a house.".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_multiline_doc_comment_on_rule() {
+        let input = ";;; First line.\n;;; Second line.\nHouse = { id: text }";
+        let spec = parse_csil(input).unwrap();
+
+        assert_eq!(
+            spec.rules[0].doc_comments,
+            vec!["First line.".to_string(), "Second line.".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_doc_comment_on_group_field() {
+        let input = "House = {\n  ;;; Display name shown in UI.\n  name: text,\n  id: text,\n}";
+        let spec = parse_csil(input).unwrap();
+
+        let group = match &spec.rules[0].rule_type {
+            RuleType::TypeDef(TypeExpression::Group(g)) | RuleType::GroupDef(g) => g,
+            other => panic!("expected group, got {other:?}"),
+        };
+        assert_eq!(
+            group.entries[0].doc_comments,
+            vec!["Display name shown in UI.".to_string()]
+        );
+        // The undocumented field carries no docs
+        assert!(group.entries[1].doc_comments.is_empty());
+    }
+
+    #[test]
+    fn test_doc_comment_on_service_operation() {
+        let input = concat!(
+            ";;; The house management service.\n",
+            "service HouseService {\n",
+            "  ;;; List all members of a house.\n",
+            "  list-members: ListMembersRequest -> ListMembersResponse\n",
+            "}"
+        );
+        let spec = parse_csil(input).unwrap();
+
+        let rule = &spec.rules[0];
+        assert_eq!(
+            rule.doc_comments,
+            vec!["The house management service.".to_string()]
+        );
+        match &rule.rule_type {
+            RuleType::ServiceDef(service) => {
+                assert_eq!(
+                    service.operations[0].doc_comments,
+                    vec!["List all members of a house.".to_string()]
+                );
+            }
+            other => panic!("expected service, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_regular_comments_are_not_doc_comments() {
+        // A double-semicolon comment must not be captured as a doc comment
+        let input = ";; just a note\nHouseID = text";
+        let spec = parse_csil(input).unwrap();
+
+        assert!(spec.rules[0].doc_comments.is_empty());
+    }
+
+    #[test]
+    fn test_doc_comment_dropped_across_blank_line() {
+        // A blank line separates the doc comment from the rule, so it is not attached
+        let input = ";;; orphaned doc\n\nHouseID = text";
+        let spec = parse_csil(input).unwrap();
+
+        assert!(spec.rules[0].doc_comments.is_empty());
+    }
+
+    #[test]
+    fn test_doc_comment_survives_interleaved_regular_comment() {
+        let input = ";;; the real doc\n;; an aside\nHouseID = text";
+        let spec = parse_csil(input).unwrap();
+
+        assert_eq!(spec.rules[0].doc_comments, vec!["the real doc".to_string()]);
     }
 }

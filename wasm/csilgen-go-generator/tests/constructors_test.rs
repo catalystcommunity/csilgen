@@ -4,7 +4,10 @@ use csilgen_common::*;
 use std::collections::HashMap;
 
 /// Helper to create a test generator input with default constraints
-fn create_test_input_with_defaults(entries: Vec<CsilGroupEntry>, type_name: &str) -> WasmGeneratorInput {
+fn create_test_input_with_defaults(
+    entries: Vec<CsilGroupEntry>,
+    type_name: &str,
+) -> WasmGeneratorInput {
     let mut options = HashMap::new();
     options.insert(
         "package_name".to_string(),
@@ -25,6 +28,7 @@ fn create_test_input_with_defaults(entries: Vec<CsilGroupEntry>, type_name: &str
                     column: 1,
                     offset: 0,
                 },
+                doc_comments: Vec::new(),
             }],
             source_content: None,
             service_count: 0,
@@ -60,6 +64,7 @@ fn test_constructor_with_string_default() {
                     value: CsilLiteralValue::Text("user".to_string()),
                 },
             )],
+            doc_comments: Vec::new(),
         }],
         "User",
     );
@@ -94,19 +99,18 @@ fn test_constructor_with_bool_default() {
                     value: CsilLiteralValue::Bool(true),
                 },
             )],
+            doc_comments: Vec::new(),
         }],
         "Status",
     );
 
     match &input.csil_spec.rules[0].rule_type {
-        CsilRuleType::GroupDef(group) => {
-            match &group.entries[0].metadata[0] {
-                CsilFieldMetadata::Constraint(CsilValidationConstraint::Custom { value, .. }) => {
-                    assert_eq!(value, &CsilLiteralValue::Bool(true));
-                }
-                _ => panic!("Expected default constraint"),
+        CsilRuleType::GroupDef(group) => match &group.entries[0].metadata[0] {
+            CsilFieldMetadata::Constraint(CsilValidationConstraint::Custom { value, .. }) => {
+                assert_eq!(value, &CsilLiteralValue::Bool(true));
             }
-        }
+            _ => panic!("Expected default constraint"),
+        },
         _ => panic!("Expected GroupDef"),
     }
 }
@@ -124,19 +128,18 @@ fn test_constructor_with_int_default() {
                     value: CsilLiteralValue::Integer(30),
                 },
             )],
+            doc_comments: Vec::new(),
         }],
         "Config",
     );
 
     match &input.csil_spec.rules[0].rule_type {
-        CsilRuleType::GroupDef(group) => {
-            match &group.entries[0].metadata[0] {
-                CsilFieldMetadata::Constraint(CsilValidationConstraint::Custom { value, .. }) => {
-                    assert_eq!(value, &CsilLiteralValue::Integer(30));
-                }
-                _ => panic!("Expected default constraint"),
+        CsilRuleType::GroupDef(group) => match &group.entries[0].metadata[0] {
+            CsilFieldMetadata::Constraint(CsilValidationConstraint::Custom { value, .. }) => {
+                assert_eq!(value, &CsilLiteralValue::Integer(30));
             }
-        }
+            _ => panic!("Expected default constraint"),
+        },
         _ => panic!("Expected GroupDef"),
     }
 }
@@ -154,6 +157,7 @@ fn test_constructor_with_optional_field_default() {
                     value: CsilLiteralValue::Text("localhost".to_string()),
                 },
             )],
+            doc_comments: Vec::new(),
         }],
         "ServerConfig",
     );
@@ -162,7 +166,9 @@ fn test_constructor_with_optional_field_default() {
         CsilRuleType::GroupDef(group) => {
             assert_eq!(group.entries[0].occurrence, Some(CsilOccurrence::Optional));
             match &group.entries[0].metadata[0] {
-                CsilFieldMetadata::Constraint(CsilValidationConstraint::Custom { value, .. }) => {
+                CsilFieldMetadata::Constraint(CsilValidationConstraint::Custom {
+                    value, ..
+                }) => {
                     assert_eq!(value, &CsilLiteralValue::Text("localhost".to_string()));
                 }
                 _ => panic!("Expected default constraint"),
@@ -186,6 +192,7 @@ fn test_constructor_with_multiple_defaults() {
                         value: CsilLiteralValue::Text("localhost".to_string()),
                     },
                 )],
+                doc_comments: Vec::new(),
             },
             CsilGroupEntry {
                 key: Some(CsilGroupKey::Bare("port".to_string())),
@@ -197,6 +204,7 @@ fn test_constructor_with_multiple_defaults() {
                         value: CsilLiteralValue::Integer(8080),
                     },
                 )],
+                doc_comments: Vec::new(),
             },
             CsilGroupEntry {
                 key: Some(CsilGroupKey::Bare("timeout".to_string())),
@@ -208,6 +216,7 @@ fn test_constructor_with_multiple_defaults() {
                         value: CsilLiteralValue::Integer(30),
                     },
                 )],
+                doc_comments: Vec::new(),
             },
         ],
         "ServerConfig",
@@ -237,7 +246,8 @@ fn test_no_constructor_when_no_defaults() {
             key: Some(CsilGroupKey::Bare("name".to_string())),
             value_type: CsilTypeExpression::Builtin("text".to_string()),
             occurrence: None,
-            metadata: vec![], // No defaults
+            metadata: vec![], // No defaults,
+            doc_comments: Vec::new(),
         }],
         "User",
     );
@@ -277,6 +287,7 @@ fn test_constructor_disabled_via_config() {
                                 value: CsilLiteralValue::Text("user".to_string()),
                             },
                         )],
+                        doc_comments: Vec::new(),
                     }],
                 }),
                 position: CsilPosition {
@@ -284,6 +295,7 @@ fn test_constructor_disabled_via_config() {
                     column: 1,
                     offset: 0,
                 },
+                doc_comments: Vec::new(),
             }],
             source_content: None,
             service_count: 0,
@@ -307,7 +319,10 @@ fn test_constructor_disabled_via_config() {
 
     // Verify the config has constructors disabled
     assert!(
-        !input.config.options.get("generate_constructors")
+        !input
+            .config
+            .options
+            .get("generate_constructors")
             .and_then(|v| v.as_bool())
             .unwrap_or(true)
     );

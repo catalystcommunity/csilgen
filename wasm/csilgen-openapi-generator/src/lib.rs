@@ -1,4 +1,13 @@
-//! OpenAPI specification generator for csilgen
+//! OpenAPI specification generator for csilgen (WASM module).
+//!
+//! Discovered dynamically as `--target openapi` from
+//! `csilgen_openapi_generator.wasm`. The wasm entry points live in `wasm.rs`
+//! and call `generate_openapi_spec` after converting the serialized input
+//! into the core AST. The internals are unchanged from when this crate lived
+//! under `crates/core_generators/`; refactoring them to consume the
+//! serialized form directly is captured in `docs/csilgen-requests/`.
+
+mod wasm;
 
 use csilgen_common::{GeneratedFile, GeneratedFiles, GeneratorConfig, Result};
 use csilgen_core::ast::{
@@ -295,7 +304,7 @@ impl OpenApiGenerator {
                 constraints,
             } => {
                 let mut schema = self.type_expression_to_schema(base_type, type_definitions)?;
-                
+
                 // Apply constraints to the schema
                 for constraint in constraints {
                     match constraint {
@@ -335,11 +344,10 @@ impl OpenApiGenerator {
                                 }
                             }
                         }
-                        csilgen_core::ast::ControlOperator::Regex(pattern) => {
-                            if schema["type"] == "string" {
+                        csilgen_core::ast::ControlOperator::Regex(pattern)
+                            if schema["type"] == "string" => {
                                 schema["pattern"] = json!(pattern);
                             }
-                        }
                         csilgen_core::ast::ControlOperator::Default(value) => {
                             schema["default"] = self.literal_to_json_value(value);
                         }
@@ -375,31 +383,28 @@ impl OpenApiGenerator {
                                 schema["maximum"] = json!(f);
                             }
                         }
-                        csilgen_core::ast::ControlOperator::Json => {
+                        csilgen_core::ast::ControlOperator::Json
                             // For .json constraint in OpenAPI, we can use format
-                            if schema["type"] == "string" {
+                            if schema["type"] == "string" => {
                                 schema["format"] = json!("json");
                             }
-                        }
-                        csilgen_core::ast::ControlOperator::Cbor => {
+                        csilgen_core::ast::ControlOperator::Cbor
                             // For .cbor constraint in OpenAPI, we can use format
-                            if schema["type"] == "string" {
+                            if schema["type"] == "string" => {
                                 schema["format"] = json!("byte");
                                 schema["contentMediaType"] = json!("application/cbor");
                             }
-                        }
-                        csilgen_core::ast::ControlOperator::Cborseq => {
+                        csilgen_core::ast::ControlOperator::Cborseq
                             // For .cborseq constraint in OpenAPI, we can use format
-                            if schema["type"] == "string" {
+                            if schema["type"] == "string" => {
                                 schema["format"] = json!("byte");
                                 schema["contentMediaType"] = json!("application/cbor-seq");
                             }
-                        }
                         // Other operators not yet fully supported in OpenAPI
                         _ => {}
                     }
                 }
-                
+
                 Ok(schema)
             }
         }
@@ -530,7 +535,10 @@ impl OpenApiGenerator {
                 "description": format!("Byte array of length {}", val.len())
             }),
             LiteralValue::Array(elements) => {
-                let json_elements: Vec<Value> = elements.iter().map(|e| self.literal_to_json_value(e)).collect();
+                let json_elements: Vec<Value> = elements
+                    .iter()
+                    .map(|e| self.literal_to_json_value(e))
+                    .collect();
                 json!({
                     "type": "array",
                     "enum": [json_elements]
@@ -548,7 +556,10 @@ impl OpenApiGenerator {
             LiteralValue::Null => json!(null),
             LiteralValue::Bytes(val) => json!(val),
             LiteralValue::Array(elements) => {
-                let json_elements: Vec<Value> = elements.iter().map(|e| self.literal_to_json_value(e)).collect();
+                let json_elements: Vec<Value> = elements
+                    .iter()
+                    .map(|e| self.literal_to_json_value(e))
+                    .collect();
                 Value::Array(json_elements)
             }
         }
@@ -699,16 +710,19 @@ mod tests {
                             value_type: TypeExpression::Builtin("text".to_string()),
                             occurrence: None,
                             metadata: vec![],
+                            doc_comments: Vec::new(),
                         },
                         GroupEntry {
                             key: Some(GroupKey::Bare("age".to_string())),
                             value_type: TypeExpression::Builtin("int".to_string()),
                             occurrence: Some(Occurrence::Optional),
                             metadata: vec![],
+                            doc_comments: Vec::new(),
                         },
                     ],
                 }),
                 position: create_test_position(),
+                doc_comments: Vec::new(),
             }],
         };
 
@@ -746,9 +760,11 @@ mod tests {
                             value_type: TypeExpression::Builtin("text".to_string()),
                             occurrence: None,
                             metadata: vec![],
+                            doc_comments: Vec::new(),
                         }],
                     }),
                     position: create_test_position(),
+                    doc_comments: Vec::new(),
                 },
                 Rule {
                     name: "UserService".to_string(),
@@ -760,6 +776,7 @@ mod tests {
                                 output_type: TypeExpression::Reference("User".to_string()),
                                 direction: ServiceDirection::Unidirectional,
                                 position: create_test_position(),
+                                doc_comments: Vec::new(),
                             },
                             ServiceOperation {
                                 name: "get_user".to_string(),
@@ -767,10 +784,12 @@ mod tests {
                                 output_type: TypeExpression::Reference("User".to_string()),
                                 direction: ServiceDirection::Unidirectional,
                                 position: create_test_position(),
+                                doc_comments: Vec::new(),
                             },
                         ],
                     }),
                     position: create_test_position(),
+                    doc_comments: Vec::new(),
                 },
             ],
         };
@@ -813,6 +832,7 @@ mod tests {
                                 FieldMetadata::Description("User's full name".to_string()),
                                 FieldMetadata::Constraint(ValidationConstraint::MinLength(2)),
                             ],
+                            doc_comments: Vec::new(),
                         },
                         GroupEntry {
                             key: Some(GroupKey::Bare("email".to_string())),
@@ -822,12 +842,14 @@ mod tests {
                                 FieldMetadata::Visibility(FieldVisibility::SendOnly),
                                 FieldMetadata::Constraint(ValidationConstraint::MaxLength(100)),
                             ],
+                            doc_comments: Vec::new(),
                         },
                         GroupEntry {
                             key: Some(GroupKey::Bare("secret".to_string())),
                             value_type: TypeExpression::Builtin("text".to_string()),
                             occurrence: Some(Occurrence::Optional),
                             metadata: vec![FieldMetadata::Visibility(FieldVisibility::ReceiveOnly)],
+                            doc_comments: Vec::new(),
                         },
                         GroupEntry {
                             key: Some(GroupKey::Bare("age".to_string())),
@@ -837,10 +859,12 @@ mod tests {
                                 field: "status".to_string(),
                                 value: Some(LiteralValue::Text("verified".to_string())),
                             }],
+                            doc_comments: Vec::new(),
                         },
                     ],
                 }),
                 position: create_test_position(),
+                doc_comments: Vec::new(),
             }],
         };
 
@@ -891,6 +915,7 @@ mod tests {
                     }),
                 }),
                 position: create_test_position(),
+                doc_comments: Vec::new(),
             }],
         };
 
@@ -918,6 +943,7 @@ mod tests {
                     occurrence: None,
                 }),
                 position: create_test_position(),
+                doc_comments: Vec::new(),
             }],
         };
 
@@ -942,6 +968,7 @@ mod tests {
                     TypeExpression::Builtin("int".to_string()),
                 ]),
                 position: create_test_position(),
+                doc_comments: Vec::new(),
             }],
         };
 
@@ -971,6 +998,7 @@ mod tests {
                     inclusive: true,
                 }),
                 position: create_test_position(),
+                doc_comments: Vec::new(),
             }],
         };
 
@@ -995,6 +1023,7 @@ mod tests {
                     "active".to_string(),
                 ))),
                 position: create_test_position(),
+                doc_comments: Vec::new(),
             }],
         };
 
@@ -1050,9 +1079,11 @@ mod tests {
                         output_type: TypeExpression::Builtin("text".to_string()),
                         direction: ServiceDirection::Bidirectional,
                         position: create_test_position(),
+                        doc_comments: Vec::new(),
                     }],
                 }),
                 position: create_test_position(),
+                doc_comments: Vec::new(),
             }],
         };
 
@@ -1079,9 +1110,11 @@ mod tests {
                         output_type: TypeExpression::Builtin("text".to_string()),
                         direction: ServiceDirection::Reverse,
                         position: create_test_position(),
+                        doc_comments: Vec::new(),
                     }],
                 }),
                 position: create_test_position(),
+                doc_comments: Vec::new(),
             }],
         };
 
@@ -1128,9 +1161,11 @@ mod tests {
                         },
                         occurrence: None,
                         metadata: vec![],
+                        doc_comments: Vec::new(),
                     }],
                 }),
                 position: create_test_position(),
+                doc_comments: Vec::new(),
             }],
         };
 

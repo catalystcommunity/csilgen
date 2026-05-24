@@ -10,12 +10,32 @@ This is `csilgen`, a library and CLI tool for implementing CBOR Service Interfac
 
 The architecture follows a plugin-based approach similar to protocgen for protobufs:
 
-- **Core**: Written in Rust (`csilgen-core`), handles CSIL parsing, validation, and AST management
-- **CLI**: Separate crate (`csilgen-cli`) that provides the `csilgen` command-line tool
-- **Generators**: Multiple generator crates for different target languages (JSON, Rust, Python, TypeScript, OpenAPI)
-- **WASM Modules**: Sandboxed generators that receive loaded CSIL data structures and configuration, then return filename/content pairs
-- **Common**: Shared utilities, types, and error handling (`csilgen-common`)
-- **Security**: WASM modules have no direct filesystem access for security isolation
+- **Core**: `csilgen-core` — CSIL parsing, validation, AST.
+- **Common**: `csilgen-common` — shared types, errors, and the WASM boundary types (`CsilSpecSerialized`, `WasmGeneratorInput`, `WasmGeneratorOutput`).
+- **CLI**: `csilgen-cli` — the `csilgen` command-line tool.
+- **Runtime**: `csilgen-wasm-generators` — discovers and runs generator WASM modules.
+- **Generators**: each language target is **exactly one `cdylib` crate under `wasm/`** named `csilgen-<target>-generator`, producing `csilgen_<target>_generator.wasm`. There is no parallel "library" copy of any generator — the wasm crate is the single source of truth.
+
+### One pattern, no duplicates
+
+Every generator lives in `wasm/` and follows the same shape: a `cdylib` exporting `get_metadata`, `allocate`, `deallocate`, and `generate`. **Do not create a `lib` twin in `crates/` or anywhere else** — that's how `csilgen-rust` and `csilgen-typescript` drifted in the past, with features authored in the lib copy ("…like one does") then mirrored to the wasm copy ("also apply to the wasm rust generator") and inevitably falling out of sync. There is one crate per generator. Edits land where the code runs.
+
+### Dynamic generator discovery
+
+The CLI and runtime do not maintain any hardcoded list of generators. At startup the runtime scans, in priority order:
+
+1. `target/wasm32-unknown-unknown/release` — local dev build output (only meaningful inside the csilgen workspace).
+2. `./.generators` — a project-local pin/override.
+3. `~/.csilgen/generators` — the user's installed baseline.
+
+Discovery is **first-write-wins**: the first directory in this list that supplies a given generator id keeps it; later directories with the same id are ignored. That means a project can drop a specific build of a generator into `.generators/` to pin or replace whatever the user has installed system-wide, without touching `~/.csilgen/generators`. Files that don't match `csilgen_<target>_generator.wasm` are silently ignored everywhere.
+
+`--target <name>` resolves by finding the discovered generator whose target equals `<name>` (or that `<name>` is a sub-target of, e.g. `typescript-client` → the `typescript` generator). A third-party generator self-registers simply by being named correctly and dropped in any search path — no CLI patch needed.
+
+### Other rules
+
+- **No async.** Ever. Concurrency uses threads.
+- **Sandboxed by construction.** WASM modules have no direct filesystem access.
 
 ## Best Practices
 - We do not use async code. Ever. If we need concurrency, we do so with threads.
@@ -30,21 +50,26 @@ The architecture follows a plugin-based approach similar to protocgen for protob
 csilgen/
 ├── Cargo.toml                    # Workspace root
 ├── crates/
-│   ├── csilgen-core/            # Core CSIL parsing, validation, AST
+│   ├── csilgen-core/            # CSIL parsing, validation, AST
 │   ├── csilgen-cli/             # Command-line interface
-│   ├── csilgen-common/          # Shared utilities, types, errors
-│   └── core_generators/         # Core generator modules
-│       ├── csilgen-json/        # JSON Schema generator
-│       ├── csilgen-rust/        # Rust code generator
-│       ├── csilgen-python/      # Python code generator
-│       ├── csilgen-typescript/  # TypeScript generator
-│       └── csilgen-openapi/     # OpenAPI spec generator
-├── wasm/                        # WASM modules for CLI plugin system
-│   ├── csilgen-wasm-core/       # Core functionality as WASM
-│   └── csilgen-wasm-generators/ # Generator runtime/loader
-├── examples/                    # Usage examples and demos
-└── tools/xtask/                 # Development automation
+│   └── csilgen-common/          # Shared types (incl. the WASM boundary types)
+├── wasm/                        # All generators + the runtime live here
+│   ├── csilgen-wasm-core/             # Core types/helpers compiled to wasm
+│   ├── csilgen-wasm-generators/       # Discovery + execution runtime
+│   ├── csilgen-noop-generator/        # No-op fixture
+│   ├── csilgen-simple-test/           # Internal runtime test fixture (not a target)
+│   ├── csilgen-rust-generator/        # --target rust
+│   ├── csilgen-go-generator/          # --target go
+│   ├── csilgen-typescript-generator/  # --target typescript (+ typescript-* sub-targets)
+│   ├── csilgen-json-generator/        # --target json
+│   ├── csilgen-python-generator/      # --target python
+│   └── csilgen-openapi-generator/     # --target openapi
+├── docs/csilgen-requests/        # Captured-but-deferred internal work items
+├── examples/                     # Usage examples and demos
+└── tools/xtask/                  # Development automation
 ```
+
+Every entry under `wasm/csilgen-*-generator/` is a `cdylib`. No generator has a parallel lib crate.
 
 ## Development Commands
 

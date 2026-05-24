@@ -777,6 +777,7 @@ mod tests {
             name: name.to_string(),
             rule_type,
             position: crate::lexer::Position::new(1, 1, 0),
+            doc_comments: Vec::new(),
         }
     }
 
@@ -863,12 +864,14 @@ mod tests {
                         value_type: TypeExpression::Builtin("text".to_string()),
                         occurrence: None,
                         metadata: Vec::new(),
+                        doc_comments: Vec::new(),
                     },
                     GroupEntry {
                         key: Some(crate::ast::GroupKey::Bare("name".to_string())),
                         value_type: TypeExpression::Builtin("int".to_string()),
                         occurrence: None,
                         metadata: Vec::new(),
+                        doc_comments: Vec::new(),
                     },
                 ],
             }),
@@ -905,6 +908,7 @@ mod tests {
                     value_type: TypeExpression::Builtin("text".to_string()),
                     occurrence: None,
                     metadata: Vec::new(),
+                    doc_comments: Vec::new(),
                 }],
             }),
         )]);
@@ -1025,12 +1029,14 @@ mod tests {
                         value_type: TypeExpression::Builtin("text".to_string()),
                         occurrence: None,
                         metadata: vec![FieldMetadata::Visibility(FieldVisibility::SendOnly)],
+                        doc_comments: Vec::new(),
                     },
                     GroupEntry {
                         key: Some(GroupKey::Bare("field2".to_string())),
                         value_type: TypeExpression::Builtin("int".to_string()),
                         occurrence: None,
-                        metadata: vec![], // No metadata - inconsistent
+                        metadata: vec![], // No metadata - inconsistent,
+                        doc_comments: Vec::new(),
                     },
                 ],
             }),
@@ -1074,30 +1080,37 @@ mod tests {
                                                                 value_type: TypeExpression::Builtin("text".to_string()),
                                                                 occurrence: None,
                                                                 metadata: vec![],
+                                                                doc_comments: Vec::new(),
                                                             }],
                                                         }),
                                                         occurrence: None,
                                                         metadata: vec![],
+                                                        doc_comments: Vec::new(),
                                                     }],
                                                 }),
                                                 occurrence: None,
                                                 metadata: vec![],
+                                                doc_comments: Vec::new(),
                                             }],
                                         }),
                                         occurrence: None,
                                         metadata: vec![],
+                                        doc_comments: Vec::new(),
                                     }],
                                 }),
                                 occurrence: None,
                                 metadata: vec![],
+                                doc_comments: Vec::new(),
                             }],
                         }),
                         occurrence: None,
                         metadata: vec![],
+                        doc_comments: Vec::new(),
                     }],
                 }),
                 occurrence: None,
                 metadata: vec![],
+                doc_comments: Vec::new(),
             }],
         });
 
@@ -1127,6 +1140,7 @@ mod tests {
                 value_type: TypeExpression::Builtin("text".to_string()),
                 occurrence: None,
                 metadata: vec![],
+                doc_comments: Vec::new(),
             });
         }
 

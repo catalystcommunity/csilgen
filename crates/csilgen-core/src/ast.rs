@@ -49,6 +49,9 @@ pub struct Rule {
     pub name: String,
     pub rule_type: RuleType,
     pub position: Position,
+    /// Documentation comments (;;;) preceding this rule
+    #[serde(default)]
+    pub doc_comments: Vec<String>,
 }
 
 /// Types of CSIL rules
@@ -195,6 +198,9 @@ pub struct GroupEntry {
     pub value_type: TypeExpression,
     pub occurrence: Option<Occurrence>,
     pub metadata: Vec<FieldMetadata>,
+    /// Documentation comments (;;;) preceding this field
+    #[serde(default)]
+    pub doc_comments: Vec<String>,
 }
 
 /// Group key types
@@ -222,6 +228,9 @@ pub struct ServiceOperation {
     pub output_type: TypeExpression,
     pub direction: ServiceDirection,
     pub position: Position,
+    /// Documentation comments (;;;) preceding this operation
+    #[serde(default)]
+    pub doc_comments: Vec<String>,
 }
 
 /// Direction of service operation

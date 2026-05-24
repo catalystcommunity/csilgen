@@ -4,10 +4,11 @@
 //! service trait definitions, and proper handling of CSIL metadata.
 
 use csilgen_common::{
-    wasm_interface::*, CsilFieldMetadata, CsilFieldVisibility, CsilGroupExpression, CsilGroupKey,
-    CsilLiteralValue, CsilOccurrence, CsilRuleType, CsilServiceDefinition, CsilTypeExpression,
-    GeneratedFile, GenerationStats, GeneratorCapability, GeneratorMetadata, GeneratorWarning,
-    WarningLevel, WasmGeneratorInput, WasmGeneratorOutput,
+    CsilFieldMetadata, CsilFieldVisibility, CsilGroupExpression, CsilGroupKey, CsilLiteralValue,
+    CsilOccurrence, CsilRuleType, CsilServiceDefinition, CsilServiceDirection,
+    CsilServiceOperation, CsilTypeExpression, GeneratedFile, GenerationStats, GeneratorCapability,
+    GeneratorMetadata, GeneratorWarning, WarningLevel, WasmGeneratorInput, WasmGeneratorOutput,
+    wasm_interface::*,
 };
 use std::collections::HashSet;
 
@@ -281,8 +282,11 @@ impl<'a> RustCodeGenerator<'a> {
                 }
 
                 // Generate serde attributes based on metadata
-                let serde_attrs =
-                    self.generate_serde_attributes(&entry.metadata, &entry.occurrence, &entry.value_type);
+                let serde_attrs = self.generate_serde_attributes(
+                    &entry.metadata,
+                    &entry.occurrence,
+                    &entry.value_type,
+                );
                 if !serde_attrs.is_empty() {
                     content.push_str(&format!("    #[serde({})]\n", serde_attrs.join(", ")));
                 }
@@ -342,15 +346,58 @@ impl<'a> RustCodeGenerator<'a> {
         self.generate_service_error(&mut content);
         content.push('\n');
 
+        if self.spec_has_channel_ops() {
+            self.generate_codec_trait(&mut content);
+            content.push('\n');
+        }
+
         for rule in &self.input.csil_spec.rules {
             if let CsilRuleType::ServiceDef(service) = &rule.rule_type {
                 let trait_code = self.generate_service_trait(&rule.name, service)?;
                 content.push_str(&trait_code);
                 content.push_str("\n\n");
+
+                if Self::service_has_channel_ops(service) {
+                    content.push_str(&self.generate_service_router(&rule.name, service)?);
+                    content.push('\n');
+                    content.push_str(&self.generate_service_encoders(&rule.name, service)?);
+                    content.push('\n');
+                }
             }
         }
 
         Ok(content)
+    }
+
+    fn spec_has_channel_ops(&self) -> bool {
+        self.input
+            .csil_spec
+            .rules
+            .iter()
+            .any(|r| match &r.rule_type {
+                CsilRuleType::ServiceDef(def) => Self::service_has_channel_ops(def),
+                _ => false,
+            })
+    }
+
+    fn service_has_channel_ops(def: &CsilServiceDefinition) -> bool {
+        def.operations
+            .iter()
+            .any(|op| !matches!(op.direction, CsilServiceDirection::Unidirectional))
+    }
+
+    /// The codec abstraction the user supplies for the message-routing layer.
+    /// Same shape across all language targets that emit a router/encoder pair:
+    /// the generator never owns serialization or transport, only types and
+    /// dispatch.
+    fn generate_codec_trait(&self, code: &mut String) {
+        code.push_str("/// User-supplied (de)serialization for channel messages. The generator\n");
+        code.push_str("/// is codec-agnostic; the implementer wires this to CBOR, JSON, or\n");
+        code.push_str("/// anything else its protocol expects.\n");
+        code.push_str("pub trait Codec {\n");
+        code.push_str("    fn encode<T: serde::Serialize>(&self, value: &T) -> Result<Vec<u8>, ServiceError>;\n");
+        code.push_str("    fn decode<T: serde::de::DeserializeOwned>(&self, bytes: &[u8]) -> Result<T, ServiceError>;\n");
+        code.push_str("}\n");
     }
 
     fn generate_service_error(&self, code: &mut String) {
@@ -381,18 +428,147 @@ impl<'a> RustCodeGenerator<'a> {
         content.push_str("    type Context;\n");
 
         for operation in &service.operations {
-            let input_type = self.map_type_to_rust(&operation.input_type, &None)?;
-            let output_type = self.map_type_to_rust(&operation.output_type, &None)?;
-
             let op_name = self.to_snake_case(&operation.name);
-            content.push_str(&format!("    /// {} operation\n", operation.name));
-            content.push_str(&format!(
-                "    fn {op_name}(&self, ctx: &Self::Context, input: {input_type}) -> Result<{output_type}, ServiceError>;\n",
-            ));
+            match operation.direction {
+                CsilServiceDirection::Unidirectional => {
+                    let input_type = self.map_type_to_rust(&operation.input_type, &None)?;
+                    let output_type = self.map_type_to_rust(&operation.output_type, &None)?;
+                    Self::write_op_doc(&mut content, operation, "request/response");
+                    content.push_str(&format!(
+                        "    fn {op_name}(&self, ctx: &Self::Context, input: {input_type}) -> Result<{output_type}, ServiceError>;\n",
+                    ));
+                }
+                CsilServiceDirection::Bidirectional => {
+                    // Server-side inbound: receive the client's pushed message.
+                    // Outbound (Output) is encoded via the generated helper and
+                    // pushed by the implementer's connection plumbing — the
+                    // generator never owns the wire.
+                    let input_type = self.map_type_to_rust(&operation.input_type, &None)?;
+                    Self::write_op_doc(&mut content, operation, "channel inbound (bidirectional)");
+                    content.push_str(&format!(
+                        "    fn {op_name}(&self, ctx: &Self::Context, msg: {input_type}) -> Result<(), ServiceError>;\n",
+                    ));
+                }
+                CsilServiceDirection::Reverse => {
+                    // Reverse is server-pushed only: no inbound on the server
+                    // side, just an outbound encoder emitted below.
+                }
+            }
         }
 
         content.push('}');
         Ok(content)
+    }
+
+    fn write_op_doc(content: &mut String, op: &CsilServiceOperation, fallback: &str) {
+        if op.doc_comments.is_empty() {
+            content.push_str(&format!("    /// {} ({fallback}).\n", op.name));
+        } else {
+            for line in &op.doc_comments {
+                content.push_str(&format!("    /// {line}\n"));
+            }
+        }
+    }
+
+    /// For services with any `<->` op, emit `route_<service>_channel` that
+    /// decodes inbound bytes (keyed by the wire method name) and dispatches
+    /// to the trait method. Reverse ops never have an inbound route.
+    fn generate_service_router(
+        &mut self,
+        service_name: &str,
+        service: &CsilServiceDefinition,
+    ) -> Result<String, String> {
+        let inbound_ops: Vec<&CsilServiceOperation> = service
+            .operations
+            .iter()
+            .filter(|op| matches!(op.direction, CsilServiceDirection::Bidirectional))
+            .collect();
+
+        let mut content = String::new();
+        let fn_name = format!("route_{}_channel", self.to_snake_case(service_name));
+        content.push_str(&format!(
+            "/// Decode one inbound channel frame for {service_name} and dispatch\n\
+             /// to the matching trait method. The implementer feeds raw bytes\n\
+             /// from its connection here; we never own the wire.\n\
+             pub fn {fn_name}<H, C>(\n\
+             \x20   handlers: &H,\n\
+             \x20   ctx: &H::Context,\n\
+             \x20   codec: &C,\n\
+             \x20   method: &str,\n\
+             \x20   bytes: &[u8],\n\
+             ) -> Result<(), ServiceError>\n\
+             where\n\
+             \x20   H: {service_name},\n\
+             \x20   C: Codec,\n\
+             {{\n\
+             \x20   match method {{\n"
+        ));
+        for op in &inbound_ops {
+            let op_snake = self.to_snake_case(&op.name);
+            let input_type = self.map_type_to_rust(&op.input_type, &None)?;
+            let wire = Self::pascal_case(&op.name);
+            content.push_str(&format!("        \"{wire}\" => {{\n"));
+            content.push_str(&format!(
+                "            let msg: {input_type} = codec.decode(bytes)?;\n"
+            ));
+            content.push_str(&format!("            handlers.{op_snake}(ctx, msg)\n"));
+            content.push_str("        }\n");
+        }
+        content.push_str("        other => Err(ServiceError {\n");
+        content.push_str("            code: 404,\n");
+        content.push_str("            message: format!(\"unknown channel {other}\"),\n");
+        content.push_str("        }),\n");
+        content.push_str("    }\n");
+        content.push_str("}\n");
+        Ok(content)
+    }
+
+    /// For each `<->` and `<-` op, emit `encode_<service>_<op>` that returns
+    /// `(method, bytes)` for the implementer to put on the wire. Unidirectional
+    /// ops already have a return value from their trait method, so no encoder.
+    fn generate_service_encoders(
+        &mut self,
+        service_name: &str,
+        service: &CsilServiceDefinition,
+    ) -> Result<String, String> {
+        let mut content = String::new();
+        let svc_snake = self.to_snake_case(service_name);
+        for op in &service.operations {
+            if !matches!(
+                op.direction,
+                CsilServiceDirection::Bidirectional | CsilServiceDirection::Reverse
+            ) {
+                continue;
+            }
+            let op_snake = self.to_snake_case(&op.name);
+            let wire = Self::pascal_case(&op.name);
+            let output_type = self.map_type_to_rust(&op.output_type, &None)?;
+            let fn_name = format!("encode_{svc_snake}_{op_snake}");
+            content.push_str(&format!(
+                "/// Encode a `{wire}` message pushed from {service_name}'s server\n\
+                 /// side; the implementer frames `(method, bytes)` onto its connection.\n\
+                 pub fn {fn_name}<C: Codec>(codec: &C, msg: &{output_type}) -> Result<(String, Vec<u8>), ServiceError> {{\n\
+                 \x20   Ok((\"{wire}\".to_string(), codec.encode(msg)?))\n\
+                 }}\n"
+            ));
+        }
+        Ok(content)
+    }
+
+    fn pascal_case(s: &str) -> String {
+        let mut out = String::new();
+        let mut cap = true;
+        for ch in s.chars() {
+            if ch == '-' || ch == '_' {
+                cap = true;
+            } else if cap {
+                out.push(ch.to_ascii_uppercase());
+                cap = false;
+            } else {
+                out.push(ch);
+            }
+        }
+        out
     }
 
     fn generate_lib_file(&mut self, files: &[GeneratedFile]) -> Result<String, String> {
@@ -533,12 +709,12 @@ impl<'a> RustCodeGenerator<'a> {
                         _ => {} // Bidirectional is default
                     }
                 }
-                CsilFieldMetadata::Custom { name, parameters } => {
-                    if name == "rust" {
-                        for param in parameters {
-                            if let Some(param_name) = &param.name && let CsilLiteralValue::Text(value) = &param.value {
-                                attrs.push(format!("{param_name} = \"{value}\""));
-                            }
+                CsilFieldMetadata::Custom { name, parameters } if name == "rust" => {
+                    for param in parameters {
+                        if let Some(param_name) = &param.name
+                            && let CsilLiteralValue::Text(value) = &param.value
+                        {
+                            attrs.push(format!("{param_name} = \"{value}\""));
                         }
                     }
                 }
@@ -640,6 +816,7 @@ mod tests {
                             metadata: vec![CsilFieldMetadata::Description(
                                 "User's name".to_string(),
                             )],
+                            doc_comments: Vec::new(),
                         },
                         CsilGroupEntry {
                             key: Some(CsilGroupKey::Bare("email".to_string())),
@@ -648,6 +825,7 @@ mod tests {
                             metadata: vec![CsilFieldMetadata::Visibility(
                                 CsilFieldVisibility::SendOnly,
                             )],
+                            doc_comments: Vec::new(),
                         },
                     ],
                 }),
@@ -656,6 +834,7 @@ mod tests {
                     column: 1,
                     offset: 0,
                 },
+                doc_comments: Vec::new(),
             }],
             source_content: None,
             service_count: 0,
@@ -727,6 +906,7 @@ mod tests {
                         column: 4,
                         offset: 100,
                     },
+                    doc_comments: Vec::new(),
                 }],
             }),
             position: CsilPosition {
@@ -734,6 +914,7 @@ mod tests {
                 column: 1,
                 offset: 80,
             },
+            doc_comments: Vec::new(),
         });
         input.csil_spec.service_count = 1;
 
@@ -747,7 +928,9 @@ mod tests {
         assert!(services_content.contains("impl std::error::Error for ServiceError"));
         assert!(services_content.contains("pub trait UserService"));
         assert!(services_content.contains("type Context;"));
-        assert!(services_content.contains("fn create_user(&self, ctx: &Self::Context, input: User) -> Result<User, ServiceError>"));
+        assert!(services_content.contains(
+            "fn create_user(&self, ctx: &Self::Context, input: User) -> Result<User, ServiceError>"
+        ));
     }
 
     #[test]
@@ -768,6 +951,7 @@ mod tests {
                             column: 4,
                             offset: 20,
                         },
+                        doc_comments: Vec::new(),
                     },
                     CsilServiceOperation {
                         name: "list-entries".to_string(),
@@ -779,6 +963,7 @@ mod tests {
                             column: 4,
                             offset: 40,
                         },
+                        doc_comments: Vec::new(),
                     },
                 ],
             }),
@@ -787,17 +972,153 @@ mod tests {
                 column: 1,
                 offset: 0,
             },
+            doc_comments: Vec::new(),
         });
         input.csil_spec.service_count = 1;
 
         let mut generator = RustCodeGenerator::new(&input);
         let services_content = generator.generate_services().unwrap();
 
-        assert!(services_content.contains("fn create_entry(&self, ctx: &Self::Context, input: User) -> Result<User, ServiceError>"));
+        assert!(services_content.contains(
+            "fn create_entry(&self, ctx: &Self::Context, input: User) -> Result<User, ServiceError>"
+        ));
         assert!(!services_content.contains("fn create-entry("));
-        assert!(services_content.contains("fn list_entries(&self, ctx: &Self::Context, input: User) -> Result<User, ServiceError>"));
-        assert!(services_content.contains("/// create-entry operation"));
-        assert!(services_content.contains("/// list-entries operation"));
+        assert!(services_content.contains(
+            "fn list_entries(&self, ctx: &Self::Context, input: User) -> Result<User, ServiceError>"
+        ));
+        // Unidirectional ops get a generic (request/response) doc when the CSIL
+        // has no `;;;` doc comments on the operation itself.
+        assert!(services_content.contains("/// create-entry (request/response)."));
+        assert!(services_content.contains("/// list-entries (request/response)."));
+    }
+
+    fn service_with_directions(
+        name: &str,
+        ops: &[(&str, &str, &str, CsilServiceDirection)],
+    ) -> CsilRule {
+        CsilRule {
+            name: name.to_string(),
+            rule_type: CsilRuleType::ServiceDef(CsilServiceDefinition {
+                operations: ops
+                    .iter()
+                    .map(|(n, i, o, d)| CsilServiceOperation {
+                        name: n.to_string(),
+                        input_type: CsilTypeExpression::Reference(i.to_string()),
+                        output_type: CsilTypeExpression::Reference(o.to_string()),
+                        direction: d.clone(),
+                        position: CsilPosition {
+                            line: 1,
+                            column: 1,
+                            offset: 0,
+                        },
+                        doc_comments: Vec::new(),
+                    })
+                    .collect(),
+            }),
+            position: CsilPosition {
+                line: 1,
+                column: 1,
+                offset: 0,
+            },
+            doc_comments: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn bidirectional_op_emits_inbound_trait_method_router_and_outbound_encoder() {
+        let mut input = create_test_input();
+        input.csil_spec.rules.push(service_with_directions(
+            "Match",
+            &[
+                (
+                    "list-events",
+                    "User",
+                    "User",
+                    CsilServiceDirection::Unidirectional,
+                ),
+                ("play", "User", "User", CsilServiceDirection::Bidirectional),
+            ],
+        ));
+        input.csil_spec.service_count = 1;
+
+        let mut generator = RustCodeGenerator::new(&input);
+        let services = generator.generate_services().unwrap();
+
+        // Codec trait emitted once at the top of the file.
+        assert!(services.contains("pub trait Codec"), "codec trait expected");
+
+        // Unidirectional kept as request/response.
+        assert!(services.contains(
+            "fn list_events(&self, ctx: &Self::Context, input: User) -> Result<User, ServiceError>"
+        ));
+
+        // Bidirectional is a fire-and-forget inbound handler (no return value).
+        assert!(services.contains(
+            "fn play(&self, ctx: &Self::Context, msg: User) -> Result<(), ServiceError>"
+        ));
+
+        // Router decodes the inbound bytes and dispatches by wire method name.
+        assert!(services.contains("pub fn route_match_channel<H, C>"));
+        assert!(services.contains("\"Play\" => {"));
+        assert!(services.contains("handlers.play(ctx, msg)"));
+
+        // Outbound encoder for the bidirectional op.
+        assert!(services.contains(
+            "pub fn encode_match_play<C: Codec>(codec: &C, msg: &User) -> Result<(String, Vec<u8>), ServiceError>"
+        ));
+        assert!(services.contains("(\"Play\".to_string(), codec.encode(msg)?)"));
+    }
+
+    #[test]
+    fn reverse_op_emits_only_outbound_encoder_no_trait_method() {
+        let mut input = create_test_input();
+        input.csil_spec.rules.push(service_with_directions(
+            "Callbacks",
+            &[("notify", "User", "User", CsilServiceDirection::Reverse)],
+        ));
+        input.csil_spec.service_count = 1;
+
+        let mut generator = RustCodeGenerator::new(&input);
+        let services = generator.generate_services().unwrap();
+
+        // Reverse has no server-side inbound — no trait method at all.
+        assert!(
+            !services.contains("fn notify("),
+            "reverse must not emit a trait method"
+        );
+
+        // Router exists but its match must NOT include a Notify arm.
+        assert!(services.contains("pub fn route_callbacks_channel"));
+        let router_start = services.find("pub fn route_callbacks_channel").unwrap();
+        let router_block = &services[router_start..];
+        assert!(!router_block.contains("\"Notify\" =>"));
+
+        // The encoder for the reverse op (server pushes Output to the client).
+        assert!(services.contains(
+            "pub fn encode_callbacks_notify<C: Codec>(codec: &C, msg: &User) -> Result<(String, Vec<u8>), ServiceError>"
+        ));
+    }
+
+    #[test]
+    fn services_without_channel_ops_skip_codec_and_router() {
+        // create_test_input has no service rules; create_test_input + add a
+        // single unidirectional op should not pull in the channel scaffolding.
+        let mut input = create_test_input();
+        input.csil_spec.rules.push(service_with_directions(
+            "Auth",
+            &[(
+                "login",
+                "User",
+                "User",
+                CsilServiceDirection::Unidirectional,
+            )],
+        ));
+        input.csil_spec.service_count = 1;
+
+        let services = RustCodeGenerator::new(&input).generate_services().unwrap();
+        assert!(!services.contains("pub trait Codec"));
+        assert!(!services.contains("route_auth_channel"));
+        assert!(!services.contains("encode_auth_login"));
     }
 
     #[test]
@@ -813,10 +1134,10 @@ mod tests {
     #[test]
     fn test_module_root_filename_custom() {
         let mut input = create_test_input();
-        input
-            .config
-            .options
-            .insert("module_root_filename".to_string(), serde_json::Value::String("lib.rs".to_string()));
+        input.config.options.insert(
+            "module_root_filename".to_string(),
+            serde_json::Value::String("lib.rs".to_string()),
+        );
 
         let mut generator = RustCodeGenerator::new(&input);
         let files = generator.generate().unwrap();
@@ -884,6 +1205,7 @@ mod tests {
                 column: 1,
                 offset: 0,
             },
+            doc_comments: Vec::new(),
         });
 
         let mut generator = RustCodeGenerator::new(&input);
@@ -915,12 +1237,14 @@ mod tests {
                         value_type: CsilTypeExpression::Builtin("bool".to_string()),
                         occurrence: None,
                         metadata: vec![],
+                        doc_comments: Vec::new(),
                     },
                     CsilGroupEntry {
                         key: Some(CsilGroupKey::Bare("entries".to_string())),
                         value_type: CsilTypeExpression::Reference("CheckEntries".to_string()),
                         occurrence: None,
                         metadata: vec![],
+                        doc_comments: Vec::new(),
                     },
                 ],
             })),
@@ -929,6 +1253,7 @@ mod tests {
                 column: 1,
                 offset: 0,
             },
+            doc_comments: Vec::new(),
         });
 
         let mut generator = RustCodeGenerator::new(&input);
@@ -957,6 +1282,7 @@ mod tests {
                     value_type: CsilTypeExpression::Builtin("text".to_string()),
                     occurrence: Some(CsilOccurrence::Optional),
                     metadata: vec![],
+                    doc_comments: Vec::new(),
                 }],
             })),
             position: CsilPosition {
@@ -964,6 +1290,7 @@ mod tests {
                 column: 1,
                 offset: 0,
             },
+            doc_comments: Vec::new(),
         }];
 
         let mut generator = RustCodeGenerator::new(&input);
@@ -988,12 +1315,14 @@ mod tests {
                         metadata: vec![CsilFieldMetadata::Visibility(
                             CsilFieldVisibility::ReceiveOnly,
                         )],
+                        doc_comments: Vec::new(),
                     },
                     CsilGroupEntry {
                         key: Some(CsilGroupKey::Bare("name".to_string())),
                         value_type: CsilTypeExpression::Builtin("text".to_string()),
                         occurrence: None,
                         metadata: vec![],
+                        doc_comments: Vec::new(),
                     },
                     CsilGroupEntry {
                         key: Some(CsilGroupKey::Bare("created_at".to_string())),
@@ -1002,6 +1331,7 @@ mod tests {
                         metadata: vec![CsilFieldMetadata::Visibility(
                             CsilFieldVisibility::ReceiveOnly,
                         )],
+                        doc_comments: Vec::new(),
                     },
                 ],
             })),
@@ -1010,6 +1340,7 @@ mod tests {
                 column: 1,
                 offset: 0,
             },
+            doc_comments: Vec::new(),
         }];
 
         let mut generator = RustCodeGenerator::new(&input);
@@ -1020,7 +1351,8 @@ mod tests {
         assert!(types_content.contains("pub name: String"));
         assert!(types_content.contains("pub created_at: String"));
         // id and created_at should have skip_serializing, name should not
-        let id_section = &types_content[types_content.find("pub id:").unwrap() - 80..types_content.find("pub id:").unwrap()];
+        let id_section = &types_content
+            [types_content.find("pub id:").unwrap() - 80..types_content.find("pub id:").unwrap()];
         assert!(
             id_section.contains("skip_serializing"),
             "receive-only field 'id' should have skip_serializing"
@@ -1042,13 +1374,16 @@ mod tests {
                 column: 1,
                 offset: 0,
             },
+            doc_comments: Vec::new(),
         });
 
         let mut generator = RustCodeGenerator::new(&input);
         let types_content = generator.generate_types().unwrap();
 
-        assert!(types_content
-            .contains("pub type CheckEntries = std::collections::HashMap<String, CheckValue>;"));
+        assert!(
+            types_content
+                .contains("pub type CheckEntries = std::collections::HashMap<String, CheckValue>;")
+        );
     }
 
     #[test]
@@ -1062,7 +1397,12 @@ mod tests {
                     CsilTypeExpression::Builtin("int".to_string()),
                     CsilTypeExpression::Builtin("float".to_string()),
                 ])),
-                position: CsilPosition { line: 1, column: 1, offset: 0 },
+                position: CsilPosition {
+                    line: 1,
+                    column: 1,
+                    offset: 0,
+                },
+                doc_comments: Vec::new(),
             },
             CsilRule {
                 name: "CheckEntries".to_string(),
@@ -1071,7 +1411,12 @@ mod tests {
                     value: Box::new(CsilTypeExpression::Reference("CheckValue".to_string())),
                     occurrence: None,
                 }),
-                position: CsilPosition { line: 3, column: 1, offset: 30 },
+                position: CsilPosition {
+                    line: 3,
+                    column: 1,
+                    offset: 30,
+                },
+                doc_comments: Vec::new(),
             },
             CsilRule {
                 name: "CheckResult".to_string(),
@@ -1082,16 +1427,23 @@ mod tests {
                             value_type: CsilTypeExpression::Builtin("bool".to_string()),
                             occurrence: None,
                             metadata: vec![],
+                            doc_comments: Vec::new(),
                         },
                         CsilGroupEntry {
                             key: Some(CsilGroupKey::Bare("entries".to_string())),
                             value_type: CsilTypeExpression::Reference("CheckEntries".to_string()),
                             occurrence: None,
                             metadata: vec![],
+                            doc_comments: Vec::new(),
                         },
                     ],
                 })),
-                position: CsilPosition { line: 5, column: 1, offset: 60 },
+                position: CsilPosition {
+                    line: 5,
+                    column: 1,
+                    offset: 60,
+                },
+                doc_comments: Vec::new(),
             },
             CsilRule {
                 name: "HelloRequest".to_string(),
@@ -1101,9 +1453,15 @@ mod tests {
                         value_type: CsilTypeExpression::Builtin("text".to_string()),
                         occurrence: Some(CsilOccurrence::Optional),
                         metadata: vec![],
+                        doc_comments: Vec::new(),
                     }],
                 })),
-                position: CsilPosition { line: 10, column: 1, offset: 120 },
+                position: CsilPosition {
+                    line: 10,
+                    column: 1,
+                    offset: 120,
+                },
+                doc_comments: Vec::new(),
             },
             CsilRule {
                 name: "GuestbookEntry".to_string(),
@@ -1116,12 +1474,14 @@ mod tests {
                             metadata: vec![CsilFieldMetadata::Visibility(
                                 CsilFieldVisibility::ReceiveOnly,
                             )],
+                            doc_comments: Vec::new(),
                         },
                         CsilGroupEntry {
                             key: Some(CsilGroupKey::Bare("name".to_string())),
                             value_type: CsilTypeExpression::Builtin("text".to_string()),
                             occurrence: None,
                             metadata: vec![],
+                            doc_comments: Vec::new(),
                         },
                         CsilGroupEntry {
                             key: Some(CsilGroupKey::Bare("created_at".to_string())),
@@ -1130,6 +1490,7 @@ mod tests {
                             metadata: vec![CsilFieldMetadata::Visibility(
                                 CsilFieldVisibility::ReceiveOnly,
                             )],
+                            doc_comments: Vec::new(),
                         },
                         CsilGroupEntry {
                             key: Some(CsilGroupKey::Bare("updated_at".to_string())),
@@ -1138,10 +1499,16 @@ mod tests {
                             metadata: vec![CsilFieldMetadata::Visibility(
                                 CsilFieldVisibility::ReceiveOnly,
                             )],
+                            doc_comments: Vec::new(),
                         },
                     ],
                 })),
-                position: CsilPosition { line: 14, column: 1, offset: 160 },
+                position: CsilPosition {
+                    line: 14,
+                    column: 1,
+                    offset: 160,
+                },
+                doc_comments: Vec::new(),
             },
         ];
 
@@ -1155,8 +1522,10 @@ mod tests {
         assert!(types_content.contains("Variant2(f64)"));
 
         // CheckEntries is a HashMap
-        assert!(types_content
-            .contains("pub type CheckEntries = std::collections::HashMap<String, CheckValue>"));
+        assert!(
+            types_content
+                .contains("pub type CheckEntries = std::collections::HashMap<String, CheckValue>")
+        );
 
         // CheckResult is a struct
         assert!(types_content.contains("pub struct CheckResult"));

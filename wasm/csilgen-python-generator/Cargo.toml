@@ -1,13 +1,15 @@
 [package]
-name = "csilgen-json"
+name = "csilgen-python-generator"
 version = "0.1.0"
 edition = "2024"
-description = "JSON Schema generator for csilgen"
+description = "Python code generator WASM module for csilgen"
 license = "Apache-2.0"
+
+[lib]
+crate-type = ["cdylib"]
 
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true
-csilgen-core.workspace = true
 csilgen-common.workspace = true
-anyhow.workspace = true
+convert_case = "0.6"
