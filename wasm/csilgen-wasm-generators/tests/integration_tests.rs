@@ -34,6 +34,7 @@ fn create_test_csil_spec_with_services() -> CsilSpec {
                             metadata: vec![FieldMetadata::Visibility(
                                 FieldVisibility::Bidirectional,
                             )],
+                            doc_comments: Vec::new(),
                         },
                         GroupEntry {
                             key: Some(GroupKey::Bare("email".to_string())),
@@ -43,12 +44,14 @@ fn create_test_csil_spec_with_services() -> CsilSpec {
                                 FieldMetadata::Visibility(FieldVisibility::SendOnly),
                                 FieldMetadata::Constraint(ValidationConstraint::MinLength(5)),
                             ],
+                            doc_comments: Vec::new(),
                         },
                         GroupEntry {
                             key: Some(GroupKey::Bare("age".to_string())),
                             value_type: TypeExpression::Builtin("uint".to_string()),
                             occurrence: Some(Occurrence::Optional),
                             metadata: vec![FieldMetadata::Visibility(FieldVisibility::ReceiveOnly)],
+                            doc_comments: Vec::new(),
                         },
                     ],
                 }),
@@ -57,6 +60,7 @@ fn create_test_csil_spec_with_services() -> CsilSpec {
                     column: 1,
                     offset: 0,
                 },
+                doc_comments: Vec::new(),
             },
             // UserService with operations
             Rule {
@@ -73,6 +77,7 @@ fn create_test_csil_spec_with_services() -> CsilSpec {
                                 column: 4,
                                 offset: 150,
                             },
+                            doc_comments: Vec::new(),
                         },
                         ServiceOperation {
                             name: "get_user".to_string(),
@@ -84,6 +89,7 @@ fn create_test_csil_spec_with_services() -> CsilSpec {
                                 column: 4,
                                 offset: 200,
                             },
+                            doc_comments: Vec::new(),
                         },
                     ],
                 }),
@@ -92,6 +98,7 @@ fn create_test_csil_spec_with_services() -> CsilSpec {
                     column: 1,
                     offset: 120,
                 },
+                doc_comments: Vec::new(),
             },
             // NotificationService (bidirectional)
             Rule {
@@ -107,6 +114,7 @@ fn create_test_csil_spec_with_services() -> CsilSpec {
                             column: 4,
                             offset: 300,
                         },
+                        doc_comments: Vec::new(),
                     }],
                 }),
                 position: Position {
@@ -114,6 +122,7 @@ fn create_test_csil_spec_with_services() -> CsilSpec {
                     column: 1,
                     offset: 270,
                 },
+                doc_comments: Vec::new(),
             },
         ],
     }

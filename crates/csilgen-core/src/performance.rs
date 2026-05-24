@@ -296,6 +296,7 @@ mod tests {
                 column: 1,
                 offset: 0,
             },
+            doc_comments: Vec::new(),
         };
         context.save_progress(
             vec![dummy_rule],

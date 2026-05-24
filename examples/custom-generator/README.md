@@ -1,142 +1,104 @@
-# Custom Generator Development Example
+# Custom Generator Example
 
-This example demonstrates how to create a custom WASM generator for CSIL. This generator creates Go code from CSIL specifications, showing how to handle services, field metadata, and code generation patterns.
+This example demonstrates authoring a CSIL generator from scratch — emitting Go code, including how to handle services and field metadata. For the **canonical reference and the full interface spec**, see [`tools/generator-template/README.md`](../../tools/generator-template/README.md) and [`tools/generator-template/GENERATOR_INTERFACE.md`](../../tools/generator-template/GENERATOR_INTERFACE.md); this example is a working specimen, not the authoring docs.
 
 ## What This Generator Does
 
-- **Input**: CSIL specification with services and metadata
-- **Output**: Go code with structs, service interfaces, and HTTP clients
-- **Features**: 
-  - Respects field visibility metadata (`@send-only`, `@receive-only`, `@admin-only`)
-  - Generates service interfaces and client implementations
-  - Handles bidirectional operations for real-time services
-  - Creates appropriate Go naming conventions
+- **Input**: a CSIL specification (services + field metadata).
+- **Output**: Go source files (structs, service interfaces, etc.).
+- Demonstrates field-visibility handling (`@send-only` / `@receive-only` / `@bidirectional`), the per-direction service-operation emission model (handler + router + outbound encoders for `<->` / `<-`, not the gRPC-style send/recv streams), and idiomatic Go naming.
 
 ## Files
 
-- **`Cargo.toml`**: WASM crate configuration with required dependencies
-- **`src/lib.rs`**: The generator implementation with WASM exports
-- **`example-input.csil`**: Sample CSIL file to test the generator
-- **`build.sh`**: Script to build the WASM module
+- `Cargo.toml` — wasm `cdylib` crate config; the package is named `csilgen-<target>-generator` so the build output filename derives the `--target` name.
+- `src/lib.rs` — generator implementation with the four required WASM exports.
+- `example-input.csil` — sample CSIL to exercise it.
+- `build.sh` — convenience script to build the wasm module.
 
-## Building the Generator
+## Building & Using
 
 ```bash
 cd examples/custom-generator
-
-# Install wasm-pack if not already installed
-cargo install wasm-pack
-
-# Build the WASM module
 ./build.sh
-
-# The built module will be in pkg/custom_csil_generator.wasm
+# Produces target/wasm32-unknown-unknown/release/csilgen_<target>_generator.wasm
 ```
 
-## Testing the Generator
+To use it with the CLI, drop the built `.wasm` into a discovery directory. Discovery is **first-write-wins** across three paths:
+
+1. `target/wasm32-unknown-unknown/release/` — local dev build.
+2. `./.generators/` — project-local override.
+3. `~/.csilgen/generators/` — per-user baseline.
 
 ```bash
-# Test with the CLI (once csilgen supports custom generators)
+# Per-project pin (overrides any homedir copy without touching it):
+mkdir -p ../../.generators
+cp target/wasm32-unknown-unknown/release/csilgen_<target>_generator.wasm ../../.generators/
+
+# Now `--target <target>` resolves dynamically — no CLI change required:
 csilgen generate \
     --input example-input.csil \
-    --target ./pkg/custom_csil_generator.wasm \
+    --target <target> \
     --output ./generated/
-
-# Check the generated Go code
-ls generated/
-cat generated/types.go
-cat generated/userapi_service.go
-cat generated/userapi_client.go
 ```
 
-## Generator Interface
+`<target>` is whatever string sits between `csilgen_` and `_generator.wasm` in the filename. That's the entire registration mechanism — no `csilgen generator install` command exists, and none is needed.
 
-Every CSIL generator must implement this WASM interface:
+## Interface (Summary)
+
+A generator is a `cdylib` exporting four C-ABI functions:
 
 ```rust
-#[wasm_bindgen]
-pub fn generate(csil_spec_json: &str, config_json: &str) -> String {
-    // Parse the CSIL specification
-    // Apply the configuration
-    // Generate code files
-    // Return JSON array of GeneratedFile objects
-}
+#[unsafe(no_mangle)] pub extern "C" fn get_metadata() -> *const u8;
+#[unsafe(no_mangle)] pub extern "C" fn allocate(size: usize) -> *mut u8;
+#[unsafe(no_mangle)] pub extern "C" fn deallocate(ptr: *mut u8, size: usize);
+#[unsafe(no_mangle)] pub extern "C" fn generate(input_ptr: *const u8, input_len: usize) -> *mut u8;
 ```
 
-### Input Format
-
-- **`csil_spec_json`**: Serialized `CsilSpec` containing parsed AST with services and metadata
-- **`config_json`**: Generator-specific configuration options
-
-### Output Format
-
-Returns JSON array of `GeneratedFile` objects:
-```json
-[
-  {
-    "filename": "types.go",
-    "content": "package api\n\n// Generated types..."
-  },
-  {
-    "filename": "service.go", 
-    "content": "package api\n\n// Generated service..."
-  }
-]
-```
+The host serializes a `WasmGeneratorInput` (your spec + config + generator metadata) into wasm memory and calls `generate`. You return a length-prefixed JSON-serialized `WasmGeneratorOutput` containing `files: Vec<GeneratedFile>` (each with `path` and `content`), warnings, and stats. See `GENERATOR_INTERFACE.md` for the full spec.
 
 ## Key Implementation Patterns
 
-### 1. Handling Field Metadata
+### Field metadata (visibility, descriptions, constraints)
+
 ```rust
-fn create_json_tag(field: &Field) -> String {
-    let mut tag = field.name.clone();
-    
-    if field.metadata.send_only {
-        tag.push_str(",send_only");
+for entry in &group.entries {
+    for meta in &entry.metadata {
+        match meta {
+            CsilFieldMetadata::Visibility(CsilFieldVisibility::SendOnly) => { /* … */ }
+            CsilFieldMetadata::Visibility(CsilFieldVisibility::ReceiveOnly) => { /* … */ }
+            CsilFieldMetadata::Description(text) => { /* doc comment */ }
+            CsilFieldMetadata::Constraint(c) => { /* validation */ }
+            _ => {}
+        }
     }
-    
-    if field.metadata.receive_only {
-        tag.push_str(",receive_only");
+}
+```
+
+### Service operations by direction
+
+```rust
+for op in &service.operations {
+    match op.direction {
+        CsilServiceDirection::Unidirectional => {
+            // Emit: handler returns Output (server) / method calls transport (client).
+        }
+        CsilServiceDirection::Bidirectional => {
+            // Emit: per-side inbound handler + outbound encoder + router entry.
+            // Generators emit shapes + routing; the implementer owns the wire.
+        }
+        CsilServiceDirection::Reverse => {
+            // Server pushes Output; client handles Output. No server inbound,
+            // no client outbound.
+        }
     }
-    
-    tag
 }
 ```
 
-### 2. Service Code Generation
-```rust
-fn generate_go_service(service: &ServiceDefinition, config: &GeneratorConfig) -> String {
-    // Generate interface definition
-    // Handle bidirectional operations differently
-    // Include metadata-driven documentation
-}
-```
+See `csil-spec.md` "Operation Directions" for the contract every generator follows.
 
-### 3. Language-Specific Naming
-```rust
-fn to_go_field_name(name: &str) -> String {
-    // Convert snake_case to PascalCase for Go
-}
-```
+## Tips
 
-## Development Tips
-
-1. **Start Simple**: Begin with basic type generation, add services later
-2. **Test Incrementally**: Use small CSIL files to test each feature
-3. **Handle Metadata**: CSIL's power comes from rich metadata - use it!
-4. **Follow Conventions**: Generate idiomatic code for your target language
-5. **Error Handling**: Provide clear error messages for invalid inputs
-
-## Integration with csilgen
-
-Once built, custom generators can be used with:
-
-```bash
-# Register the generator (future feature)
-csilgen generator install ./pkg/custom_csil_generator.wasm --name go
-
-# Use the custom generator
-csilgen generate --input api.csil --target go --output ./generated/
-```
-
-This example serves as a template for creating generators for any target language or framework.
+1. **Start with type generation**; add services once your AST traversal is solid.
+2. **Test against small CSIL fixtures** in `#[cfg(test)]` modules in `src/lib.rs` — you can call `process_generation` directly without going through wasmtime.
+3. **Match the cross-generator wire convention**: PascalCase method names in router switches so frames are interoperable.
+4. **Don't open the connection**: emit handler interfaces and `(method, bytes)` from encoders; let the implementer wire those to their WebSocket/TCP/etc.

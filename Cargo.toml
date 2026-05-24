@@ -4,12 +4,6 @@ members = [
     "crates/csilgen-core",
     "crates/csilgen-cli",
     "crates/csilgen-common",
-    "crates/core_generators/csilgen-json",
-    "crates/core_generators/csilgen-rust",
-    "crates/core_generators/csilgen-python",
-    "crates/core_generators/csilgen-typescript",
-    "crates/core_generators/csilgen-openapi",
-    "crates/core_generators/csilgen-go",
     "wasm/csilgen-wasm-core",
     "wasm/csilgen-wasm-generators",
     "wasm/csilgen-noop-generator",
@@ -17,6 +11,9 @@ members = [
     "wasm/csilgen-json-generator",
     "wasm/csilgen-rust-generator",
     "wasm/csilgen-typescript-generator",
+    "wasm/csilgen-go-generator",
+    "wasm/csilgen-python-generator",
+    "wasm/csilgen-openapi-generator",
     "tools/xtask"
 ]
 
@@ -63,7 +60,13 @@ opt-level = "s"  # Optimize for size
 [profile.release.package."csilgen-noop-generator"]
 opt-level = "s"  # Optimize for size
 
-[profile.release.package."csilgen-go"]
+[profile.release.package."csilgen-go-generator"]
+opt-level = "s"  # Optimize for size
+
+[profile.release.package."csilgen-python-generator"]
+opt-level = "s"  # Optimize for size
+
+[profile.release.package."csilgen-openapi-generator"]
 opt-level = "s"  # Optimize for size
 
 # Development profile

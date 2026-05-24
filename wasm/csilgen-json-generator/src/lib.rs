@@ -4,10 +4,11 @@
 //! including support for service operation schemas and field metadata.
 
 use csilgen_common::{
-    wasm_interface::*, CsilFieldMetadata, CsilFieldVisibility, CsilGroupExpression, CsilGroupKey,
-    CsilLiteralValue, CsilOccurrence, CsilRuleType, CsilServiceDefinition, CsilTypeExpression,
+    CsilFieldMetadata, CsilFieldVisibility, CsilGroupExpression, CsilGroupKey, CsilLiteralValue,
+    CsilOccurrence, CsilRuleType, CsilServiceDefinition, CsilTypeExpression,
     CsilValidationConstraint, GeneratedFile, GenerationStats, GeneratorCapability,
     GeneratorMetadata, GeneratorWarning, WarningLevel, WasmGeneratorInput, WasmGeneratorOutput,
+    wasm_interface::*,
 };
 use serde_json::{Map, Value};
 use std::collections::HashMap;
@@ -749,6 +750,7 @@ mod tests {
                                 CsilFieldMetadata::Visibility(CsilFieldVisibility::Bidirectional),
                                 CsilFieldMetadata::Description("User's display name".to_string()),
                             ],
+                            doc_comments: Vec::new(),
                         },
                         CsilGroupEntry {
                             key: Some(CsilGroupKey::Bare("email".to_string())),
@@ -760,6 +762,7 @@ mod tests {
                                     5,
                                 )),
                             ],
+                            doc_comments: Vec::new(),
                         },
                     ],
                 }),
@@ -768,6 +771,7 @@ mod tests {
                     column: 1,
                     offset: 0,
                 },
+                doc_comments: Vec::new(),
             }],
             source_content: Some("User = { name: text, email?: text }".to_string()),
             service_count: 0,
@@ -919,6 +923,7 @@ mod tests {
                         column: 4,
                         offset: 100,
                     },
+                    doc_comments: Vec::new(),
                 }],
             }),
             position: CsilPosition {
@@ -926,6 +931,7 @@ mod tests {
                 column: 1,
                 offset: 80,
             },
+            doc_comments: Vec::new(),
         });
         input.csil_spec.service_count = 1;
 

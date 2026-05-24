@@ -28,6 +28,7 @@ fn create_test_input_with_package_desc(package_desc: Option<&str>) -> WasmGenera
                         value_type: CsilTypeExpression::Builtin("text".to_string()),
                         occurrence: None,
                         metadata: vec![],
+                        doc_comments: Vec::new(),
                     }],
                 }),
                 position: CsilPosition {
@@ -35,6 +36,7 @@ fn create_test_input_with_package_desc(package_desc: Option<&str>) -> WasmGenera
                     column: 1,
                     offset: 0,
                 },
+                doc_comments: Vec::new(),
             }],
             source_content: None,
             service_count: 0,
@@ -64,7 +66,10 @@ fn test_default_package_documentation() {
     // Verify default package documentation structure
     assert!(!input.config.options.contains_key("package_description"));
     assert_eq!(
-        input.config.options.get("package_name")
+        input
+            .config
+            .options
+            .get("package_name")
             .and_then(|v| v.as_str())
             .unwrap(),
         "testpkg"
@@ -78,7 +83,10 @@ fn test_custom_package_documentation() {
 
     // Verify custom package description is set
     assert_eq!(
-        input.config.options.get("package_description")
+        input
+            .config
+            .options
+            .get("package_description")
             .and_then(|v| v.as_str())
             .unwrap(),
         desc
@@ -91,7 +99,10 @@ fn test_multiline_package_documentation() {
     let input = create_test_input_with_package_desc(Some(desc));
 
     // Verify multiline description is preserved
-    let stored_desc = input.config.options.get("package_description")
+    let stored_desc = input
+        .config
+        .options
+        .get("package_description")
         .and_then(|v| v.as_str())
         .unwrap();
 
@@ -110,7 +121,10 @@ fn test_package_name_used_in_default_doc() {
     );
 
     assert_eq!(
-        input.config.options.get("package_name")
+        input
+            .config
+            .options
+            .get("package_name")
             .and_then(|v| v.as_str())
             .unwrap(),
         "mycustompkg"
@@ -132,7 +146,10 @@ fn test_empty_package_description() {
 
     // Verify empty description is handled
     assert_eq!(
-        input.config.options.get("package_description")
+        input
+            .config
+            .options
+            .get("package_description")
             .and_then(|v| v.as_str())
             .unwrap(),
         ""
@@ -144,7 +161,10 @@ fn test_package_doc_with_special_characters() {
     let desc = "Package testpkg provides types.\n\nSupports: JSON, YAML, & XML.";
     let input = create_test_input_with_package_desc(Some(desc));
 
-    let stored_desc = input.config.options.get("package_description")
+    let stored_desc = input
+        .config
+        .options
+        .get("package_description")
         .and_then(|v| v.as_str())
         .unwrap();
 

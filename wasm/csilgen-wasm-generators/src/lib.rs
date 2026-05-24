@@ -1,17 +1,17 @@
 //! WASM module loader and runtime for csilgen generators
 
 use csilgen_common::{
-    CsilControlOperator, CsilFieldMetadata, CsilFieldVisibility, CsilGroupEntry, CsilGroupExpression, 
-    CsilGroupKey, CsilLiteralValue, CsilOccurrence, CsilPosition, CsilRule, CsilRuleType, 
-    CsilServiceDefinition, CsilServiceDirection, CsilServiceOperation, CsilSizeConstraint,
-    CsilSpecSerialized, CsilTypeExpression, CsilValidationConstraint, CsilgenError, GeneratedFiles, 
-    GeneratorCapability, GeneratorConfig, GeneratorMetadata, Result, WasmGeneratorInput, 
-    WasmGeneratorOutput,
+    CsilControlOperator, CsilFieldMetadata, CsilFieldVisibility, CsilGroupEntry,
+    CsilGroupExpression, CsilGroupKey, CsilLiteralValue, CsilOccurrence, CsilPosition, CsilRule,
+    CsilRuleType, CsilServiceDefinition, CsilServiceDirection, CsilServiceOperation,
+    CsilSizeConstraint, CsilSpecSerialized, CsilTypeExpression, CsilValidationConstraint,
+    CsilgenError, GeneratedFiles, GeneratorCapability, GeneratorConfig, GeneratorMetadata, Result,
+    WasmGeneratorInput, WasmGeneratorOutput,
 };
 use csilgen_core::ast::{
-    ControlOperator, CsilSpec, FieldMetadata, FieldVisibility, GroupEntry, GroupExpression, GroupKey, 
-    LiteralValue, Occurrence, RuleType, ServiceDefinition, ServiceDirection, ServiceOperation, 
-    SizeConstraint, TypeExpression, ValidationConstraint,
+    ControlOperator, CsilSpec, FieldMetadata, FieldVisibility, GroupEntry, GroupExpression,
+    GroupKey, LiteralValue, Occurrence, RuleType, ServiceDefinition, ServiceDirection,
+    ServiceOperation, SizeConstraint, TypeExpression, ValidationConstraint,
 };
 use csilgen_core::lexer::Position;
 use std::collections::HashMap;
@@ -152,22 +152,29 @@ impl GeneratorRegistry {
         }
     }
 
-    /// Get default search paths for generators
+    /// Default search paths, in priority order.
+    ///
+    /// Discovery is **first-write-wins**, so paths earlier in this list
+    /// override later ones for the same generator id. From highest priority
+    /// to lowest:
+    ///
+    /// 1. `target/wasm32-unknown-unknown/release` — local dev build output
+    ///    (only meaningful inside the csilgen workspace).
+    /// 2. `.generators` (in the current working directory) — project-local
+    ///    pin/override of any user-installed generator.
+    /// 3. `~/.csilgen/generators` — the user's installed baseline.
     fn default_search_paths() -> Vec<PathBuf> {
         let mut paths = Vec::new();
 
-        // Built-in generators (in target directory for now)
         if let Ok(current_dir) = std::env::current_dir() {
             paths.push(current_dir.join("target/wasm32-unknown-unknown/release"));
         }
 
-        // System-wide generators
+        paths.push(PathBuf::from("./.generators"));
+
         if let Some(home) = dirs::home_dir() {
             paths.push(home.join(".csilgen/generators"));
         }
-
-        // Local project generators
-        paths.push(PathBuf::from("./generators"));
 
         paths
     }
@@ -208,8 +215,9 @@ impl GeneratorRegistry {
 
             let path = entry.path();
 
-            // Look for .wasm files
-            if path.extension().and_then(|s| s.to_str()) == Some("wasm")
+            // Only conforming generators (csilgen_<target>_generator.wasm) are
+            // discovered; everything else in the directory is ignored.
+            if Self::derive_target(&path).is_some()
                 && let Some(generator_id) = self.extract_generator_id(&path)
             {
                 match self.probe_generator_metadata(&path) {
@@ -230,30 +238,42 @@ impl GeneratorRegistry {
                             compatibility,
                         };
 
-                        self.discovered.insert(discovered.id.clone(), discovered);
-                        count += 1;
+                        // First-write-wins: a higher-priority search path
+                        // already registered this id, so we don't shadow it.
+                        if let std::collections::hash_map::Entry::Vacant(e) =
+                            self.discovered.entry(discovered.id.clone())
+                        {
+                            e.insert(discovered);
+                            count += 1;
+                        }
                     }
                     Err(e) => {
-                        // Create a placeholder entry for failed generators
                         let generator_id = self.extract_generator_id(&path).unwrap();
-                        let placeholder = DiscoveredGenerator {
-                            id: generator_id.clone(),
-                            metadata: GeneratorMetadata {
-                                name: generator_id.clone(),
-                                version: "unknown".to_string(),
-                                description: "Failed to load metadata".to_string(),
-                                target: "unknown".to_string(),
-                                capabilities: vec![],
-                                author: None,
-                                homepage: None,
-                            },
-                            wasm_path: path,
-                            generator_type: GeneratorType::Custom,
-                            compatibility: CompatibilityStatus::LoadError {
-                                error: e.to_string(),
-                            },
-                        };
-                        self.discovered.insert(generator_id, placeholder);
+                        // First-write-wins applies to failure placeholders too:
+                        // if a higher-priority path already supplied this id,
+                        // a broken duplicate in a lower-priority path must not
+                        // mask the working version.
+                        if let std::collections::hash_map::Entry::Vacant(slot) =
+                            self.discovered.entry(generator_id.clone())
+                        {
+                            slot.insert(DiscoveredGenerator {
+                                id: generator_id.clone(),
+                                metadata: GeneratorMetadata {
+                                    name: generator_id,
+                                    version: "unknown".to_string(),
+                                    description: "Failed to load metadata".to_string(),
+                                    target: "unknown".to_string(),
+                                    capabilities: vec![],
+                                    author: None,
+                                    homepage: None,
+                                },
+                                wasm_path: path,
+                                generator_type: GeneratorType::Custom,
+                                compatibility: CompatibilityStatus::LoadError {
+                                    error: e.to_string(),
+                                },
+                            });
+                        }
                     }
                 }
             }
@@ -274,70 +294,65 @@ impl GeneratorRegistry {
             .map(|s| s.replace('_', "-")) // Convert underscores to dashes for consistency
     }
 
+    /// Derive the `--target` name a generator serves from its filename.
+    ///
+    /// The sole convention is `csilgen_<target>_generator.wasm`; the target is
+    /// whatever sits between `csilgen_` and `_generator`. Anything else (the
+    /// runtime crates, test fixtures, a user's unrelated wasm) returns `None`
+    /// and is ignored by discovery. This is what lets a third-party generator
+    /// self-register simply by being named correctly.
+    fn derive_target(path: &Path) -> Option<String> {
+        if path.extension().and_then(|s| s.to_str()) != Some("wasm") {
+            return None;
+        }
+        let stem = path.file_stem().and_then(|s| s.to_str())?;
+        let target = stem.strip_prefix("csilgen_")?.strip_suffix("_generator")?;
+        if target.is_empty() {
+            None
+        } else {
+            Some(target.to_string())
+        }
+    }
+
     /// Check if a path is for built-in generators
     fn is_builtin_path(&self, path: &Path) -> bool {
         path.to_string_lossy()
             .contains("target/wasm32-unknown-unknown")
     }
 
-    /// Probe generator metadata without fully loading it
+    /// Probe generator metadata without fully loading it.
+    ///
+    /// The target a generator serves is derived purely from its filename
+    /// (`csilgen_<target>_generator.wasm`); there is no hardcoded registry of
+    /// known generators, so any conforming wasm — built-in or third-party —
+    /// is discovered the same way. Capabilities default to the full runtime-
+    /// supported set; a richer implementation could load `get_metadata` from
+    /// the module itself.
     fn probe_generator_metadata(&self, wasm_path: &Path) -> Result<GeneratorMetadata> {
-        // For now, we'll derive metadata from the filename
-        // In a full implementation, we could load the WASM just enough to call get_metadata
+        let target = Self::derive_target(wasm_path).ok_or_else(|| {
+            CsilgenError::WasmError(
+                "generator filename must be csilgen_<target>_generator.wasm".to_string(),
+            )
+        })?;
         let generator_id = self
             .extract_generator_id(wasm_path)
-            .ok_or_else(|| CsilgenError::WasmError("Invalid generator filename".to_string()))?;
-
-        // Determine target and capabilities from known generators
-        let (target, capabilities, description) = match generator_id.as_str() {
-            "csilgen-noop-generator" => (
-                "noop".to_string(),
-                vec![
-                    GeneratorCapability::BasicTypes,
-                    GeneratorCapability::Services,
-                    GeneratorCapability::FieldMetadata,
-                ],
-                "No-op test generator for validation".to_string(),
-            ),
-            "csilgen-simple-test" => (
-                "test".to_string(),
-                vec![GeneratorCapability::BasicTypes],
-                "Simple test generator".to_string(),
-            ),
-            "csilgen-json-generator" => (
-                "json".to_string(),
-                vec![
-                    GeneratorCapability::BasicTypes,
-                    GeneratorCapability::ComplexStructures,
-                    GeneratorCapability::Services,
-                    GeneratorCapability::FieldMetadata,
-                ],
-                "JSON Schema generator".to_string(),
-            ),
-            "csilgen-rust-generator" => (
-                "rust".to_string(),
-                vec![
-                    GeneratorCapability::BasicTypes,
-                    GeneratorCapability::ComplexStructures,
-                    GeneratorCapability::Services,
-                    GeneratorCapability::FieldMetadata,
-                    GeneratorCapability::FieldVisibility,
-                ],
-                "Rust code generator".to_string(),
-            ),
-            _ => (
-                "unknown".to_string(),
-                vec![],
-                "Unknown generator".to_string(),
-            ),
-        };
+            .unwrap_or_else(|| target.clone());
 
         Ok(GeneratorMetadata {
             name: generator_id,
-            version: "1.0.0".to_string(), // Would probe actual version in real implementation
-            description,
+            version: "1.0.0".to_string(),
+            description: format!("{target} generator"),
             target,
-            capabilities,
+            capabilities: vec![
+                GeneratorCapability::BasicTypes,
+                GeneratorCapability::ComplexStructures,
+                GeneratorCapability::Services,
+                GeneratorCapability::FieldMetadata,
+                GeneratorCapability::FieldVisibility,
+                GeneratorCapability::FieldDependencies,
+                GeneratorCapability::ValidationConstraints,
+                GeneratorCapability::CustomHints,
+            ],
             author: Some("CSIL Team".to_string()),
             homepage: None,
         })
@@ -500,6 +515,7 @@ fn convert_csil_spec_to_serializable(spec: &CsilSpec) -> CsilSpecSerialized {
                 name: rule.name.clone(),
                 rule_type: serializable_rule_type,
                 position: convert_position(&rule.position),
+                doc_comments: rule.doc_comments.clone(),
             }
         })
         .collect();
@@ -577,16 +593,32 @@ fn convert_control_operator(op: &ControlOperator) -> CsilControlOperator {
     match op {
         ControlOperator::Size(size) => CsilControlOperator::Size(convert_size_constraint(size)),
         ControlOperator::Regex(pattern) => CsilControlOperator::Regex(pattern.clone()),
-        ControlOperator::Default(value) => CsilControlOperator::Default(convert_literal_value(value)),
-        ControlOperator::GreaterEqual(value) => CsilControlOperator::GreaterEqual(convert_literal_value(value)),
-        ControlOperator::LessEqual(value) => CsilControlOperator::LessEqual(convert_literal_value(value)),
-        ControlOperator::GreaterThan(value) => CsilControlOperator::GreaterThan(convert_literal_value(value)),
-        ControlOperator::LessThan(value) => CsilControlOperator::LessThan(convert_literal_value(value)),
+        ControlOperator::Default(value) => {
+            CsilControlOperator::Default(convert_literal_value(value))
+        }
+        ControlOperator::GreaterEqual(value) => {
+            CsilControlOperator::GreaterEqual(convert_literal_value(value))
+        }
+        ControlOperator::LessEqual(value) => {
+            CsilControlOperator::LessEqual(convert_literal_value(value))
+        }
+        ControlOperator::GreaterThan(value) => {
+            CsilControlOperator::GreaterThan(convert_literal_value(value))
+        }
+        ControlOperator::LessThan(value) => {
+            CsilControlOperator::LessThan(convert_literal_value(value))
+        }
         ControlOperator::Equal(value) => CsilControlOperator::Equal(convert_literal_value(value)),
-        ControlOperator::NotEqual(value) => CsilControlOperator::NotEqual(convert_literal_value(value)),
+        ControlOperator::NotEqual(value) => {
+            CsilControlOperator::NotEqual(convert_literal_value(value))
+        }
         ControlOperator::Bits(bits) => CsilControlOperator::Bits(bits.clone()),
-        ControlOperator::And(type_expr) => CsilControlOperator::And(Box::new(convert_type_expression(type_expr))),
-        ControlOperator::Within(type_expr) => CsilControlOperator::Within(Box::new(convert_type_expression(type_expr))),
+        ControlOperator::And(type_expr) => {
+            CsilControlOperator::And(Box::new(convert_type_expression(type_expr)))
+        }
+        ControlOperator::Within(type_expr) => {
+            CsilControlOperator::Within(Box::new(convert_type_expression(type_expr)))
+        }
         ControlOperator::Json => CsilControlOperator::Json,
         ControlOperator::Cbor => CsilControlOperator::Cbor,
         ControlOperator::Cborseq => CsilControlOperator::Cborseq,
@@ -596,7 +628,10 @@ fn convert_control_operator(op: &ControlOperator) -> CsilControlOperator {
 fn convert_size_constraint(size: &SizeConstraint) -> CsilSizeConstraint {
     match size {
         SizeConstraint::Exact(val) => CsilSizeConstraint::Exact(*val),
-        SizeConstraint::Range { min, max } => CsilSizeConstraint::Range { min: *min, max: *max },
+        SizeConstraint::Range { min, max } => CsilSizeConstraint::Range {
+            min: *min,
+            max: *max,
+        },
         SizeConstraint::Min(val) => CsilSizeConstraint::Min(*val),
         SizeConstraint::Max(val) => CsilSizeConstraint::Max(*val),
     }
@@ -614,6 +649,7 @@ fn convert_group_entry(entry: &GroupEntry) -> CsilGroupEntry {
         value_type: convert_type_expression(&entry.value_type),
         occurrence: entry.occurrence.as_ref().map(convert_occurrence),
         metadata: entry.metadata.iter().map(convert_field_metadata).collect(),
+        doc_comments: entry.doc_comments.clone(),
     }
 }
 
@@ -646,9 +682,9 @@ fn convert_literal_value(literal: &LiteralValue) -> CsilLiteralValue {
         LiteralValue::Bytes(bytes) => CsilLiteralValue::Bytes(bytes.clone()),
         LiteralValue::Bool(b) => CsilLiteralValue::Bool(*b),
         LiteralValue::Null => CsilLiteralValue::Null,
-        LiteralValue::Array(elements) => CsilLiteralValue::Array(
-            elements.iter().map(convert_literal_value).collect()
-        ),
+        LiteralValue::Array(elements) => {
+            CsilLiteralValue::Array(elements.iter().map(convert_literal_value).collect())
+        }
     }
 }
 
@@ -722,6 +758,7 @@ fn convert_service_operation(operation: &ServiceOperation) -> CsilServiceOperati
         output_type: convert_type_expression(&operation.output_type),
         direction: convert_service_direction(&operation.direction),
         position: convert_position(&operation.position),
+        doc_comments: operation.doc_comments.clone(),
     }
 }
 
@@ -1201,6 +1238,7 @@ mod tests {
                                 metadata: vec![FieldMetadata::Visibility(
                                     FieldVisibility::Bidirectional,
                                 )],
+                                doc_comments: Vec::new(),
                             },
                             GroupEntry {
                                 key: Some(GroupKey::Bare("email".to_string())),
@@ -1210,6 +1248,7 @@ mod tests {
                                     FieldMetadata::Visibility(FieldVisibility::SendOnly),
                                     FieldMetadata::Constraint(ValidationConstraint::MinLength(5)),
                                 ],
+                                doc_comments: Vec::new(),
                             },
                         ],
                     }),
@@ -1218,6 +1257,7 @@ mod tests {
                         column: 1,
                         offset: 0,
                     },
+                    doc_comments: Vec::new(),
                 },
                 Rule {
                     name: "UserService".to_string(),
@@ -1232,6 +1272,7 @@ mod tests {
                                 column: 4,
                                 offset: 100,
                             },
+                            doc_comments: Vec::new(),
                         }],
                     }),
                     position: Position {
@@ -1239,6 +1280,7 @@ mod tests {
                         column: 1,
                         offset: 80,
                     },
+                    doc_comments: Vec::new(),
                 },
             ],
         }
@@ -1392,10 +1434,104 @@ mod tests {
             .probe_generator_metadata(test_path)
             .expect("Should probe metadata");
 
+        // Target is derived purely from the filename; the id matches the file
+        // stem with `_` -> `-`. No per-generator hardcoding.
         assert_eq!(metadata.name, "csilgen-noop-generator");
         assert_eq!(metadata.target, "noop");
         assert!(!metadata.capabilities.is_empty());
-        assert_eq!(metadata.description, "No-op test generator for validation");
+    }
+
+    #[test]
+    fn test_derive_target_from_filename() {
+        // Conforming names yield the target between csilgen_ and _generator.
+        assert_eq!(
+            GeneratorRegistry::derive_target(Path::new("csilgen_rust_generator.wasm")),
+            Some("rust".to_string())
+        );
+        assert_eq!(
+            GeneratorRegistry::derive_target(Path::new("csilgen_typescript_generator.wasm")),
+            Some("typescript".to_string())
+        );
+        assert_eq!(
+            GeneratorRegistry::derive_target(Path::new("/some/dir/csilgen_go_generator.wasm")),
+            Some("go".to_string())
+        );
+
+        // Non-conforming filenames are ignored: a third-party drop-in that
+        // does not follow the convention is invisible to discovery.
+        assert_eq!(
+            GeneratorRegistry::derive_target(Path::new("csilgen_simple_test.wasm")),
+            None
+        );
+        assert_eq!(
+            GeneratorRegistry::derive_target(Path::new("csilgen_go.wasm")),
+            None,
+            "missing _generator suffix should not register"
+        );
+        assert_eq!(
+            GeneratorRegistry::derive_target(Path::new("random.wasm")),
+            None
+        );
+        assert_eq!(
+            GeneratorRegistry::derive_target(Path::new("csilgen_rust_generator.txt")),
+            None,
+            "non-wasm extensions are not generators"
+        );
+        assert_eq!(
+            GeneratorRegistry::derive_target(Path::new("csilgen__generator.wasm")),
+            None,
+            "empty target string is not a valid generator"
+        );
+    }
+
+    #[test]
+    fn default_search_paths_prioritise_project_override_above_homedir() {
+        // .generators must come before ~/.csilgen/generators so first-write-wins
+        // makes the project pin override the user's installed baseline.
+        let paths = GeneratorRegistry::default_search_paths();
+        let project = paths
+            .iter()
+            .position(|p| p.ends_with(".generators"))
+            .expect("project-local .generators search path is registered");
+        let homedir = paths
+            .iter()
+            .position(|p| p.ends_with(".csilgen/generators"));
+        if let Some(homedir) = homedir {
+            assert!(
+                project < homedir,
+                ".generators ({project}) must precede ~/.csilgen/generators ({homedir})"
+            );
+        }
+    }
+
+    #[test]
+    fn discovery_is_first_write_wins() {
+        // Two directories register the same generator id; the first one
+        // scanned must keep its claim. This is the override mechanism — a
+        // project's .generators directory shadowing the user's homedir copy.
+        let high = tempfile::tempdir().expect("high-priority dir");
+        let low = tempfile::tempdir().expect("low-priority dir");
+
+        // Minimal bytes are enough; probe_generator_metadata reads only the
+        // filename, and we never load these as real wasm in this test.
+        let name = "csilgen_rust_generator.wasm";
+        std::fs::write(high.path().join(name), b"high").unwrap();
+        std::fs::write(low.path().join(name), b"low").unwrap();
+
+        let mut registry = GeneratorRegistry::new();
+        registry.search_paths.clear();
+        registry.search_paths.push(high.path().to_path_buf());
+        registry.search_paths.push(low.path().to_path_buf());
+        registry.discover_generators().expect("discover");
+
+        let entry = registry
+            .get_generator("csilgen-rust-generator")
+            .expect("rust generator registered");
+        assert_eq!(
+            entry.wasm_path.parent(),
+            Some(high.path()),
+            "the high-priority directory's copy must win"
+        );
     }
 
     #[test]

@@ -25,6 +25,7 @@ fn create_test_input_with_constraints(entries: Vec<CsilGroupEntry>) -> WasmGener
                     column: 1,
                     offset: 0,
                 },
+                doc_comments: Vec::new(),
             }],
             source_content: None,
             service_count: 0,
@@ -56,6 +57,7 @@ fn test_min_length_constraint_structure() {
         metadata: vec![CsilFieldMetadata::Constraint(
             CsilValidationConstraint::MinLength(5),
         )],
+        doc_comments: Vec::new(),
     }]);
 
     // Verify the constraint is properly structured
@@ -88,17 +90,16 @@ fn test_max_length_constraint_structure() {
         metadata: vec![CsilFieldMetadata::Constraint(
             CsilValidationConstraint::MaxLength(20),
         )],
+        doc_comments: Vec::new(),
     }]);
 
     match &input.csil_spec.rules[0].rule_type {
-        CsilRuleType::GroupDef(group) => {
-            match &group.entries[0].metadata[0] {
-                CsilFieldMetadata::Constraint(CsilValidationConstraint::MaxLength(len)) => {
-                    assert_eq!(*len, 20);
-                }
-                _ => panic!("Expected MaxLength constraint"),
+        CsilRuleType::GroupDef(group) => match &group.entries[0].metadata[0] {
+            CsilFieldMetadata::Constraint(CsilValidationConstraint::MaxLength(len)) => {
+                assert_eq!(*len, 20);
             }
-        }
+            _ => panic!("Expected MaxLength constraint"),
+        },
         _ => panic!("Expected GroupDef"),
     }
 }
@@ -115,17 +116,16 @@ fn test_min_items_constraint_structure() {
         metadata: vec![CsilFieldMetadata::Constraint(
             CsilValidationConstraint::MinItems(1),
         )],
+        doc_comments: Vec::new(),
     }]);
 
     match &input.csil_spec.rules[0].rule_type {
-        CsilRuleType::GroupDef(group) => {
-            match &group.entries[0].metadata[0] {
-                CsilFieldMetadata::Constraint(CsilValidationConstraint::MinItems(items)) => {
-                    assert_eq!(*items, 1);
-                }
-                _ => panic!("Expected MinItems constraint"),
+        CsilRuleType::GroupDef(group) => match &group.entries[0].metadata[0] {
+            CsilFieldMetadata::Constraint(CsilValidationConstraint::MinItems(items)) => {
+                assert_eq!(*items, 1);
             }
-        }
+            _ => panic!("Expected MinItems constraint"),
+        },
         _ => panic!("Expected GroupDef"),
     }
 }
@@ -142,17 +142,16 @@ fn test_max_items_constraint_structure() {
         metadata: vec![CsilFieldMetadata::Constraint(
             CsilValidationConstraint::MaxItems(10),
         )],
+        doc_comments: Vec::new(),
     }]);
 
     match &input.csil_spec.rules[0].rule_type {
-        CsilRuleType::GroupDef(group) => {
-            match &group.entries[0].metadata[0] {
-                CsilFieldMetadata::Constraint(CsilValidationConstraint::MaxItems(items)) => {
-                    assert_eq!(*items, 10);
-                }
-                _ => panic!("Expected MaxItems constraint"),
+        CsilRuleType::GroupDef(group) => match &group.entries[0].metadata[0] {
+            CsilFieldMetadata::Constraint(CsilValidationConstraint::MaxItems(items)) => {
+                assert_eq!(*items, 10);
             }
-        }
+            _ => panic!("Expected MaxItems constraint"),
+        },
         _ => panic!("Expected GroupDef"),
     }
 }
@@ -166,19 +165,18 @@ fn test_min_value_integer_constraint_structure() {
         metadata: vec![CsilFieldMetadata::Constraint(
             CsilValidationConstraint::MinValue(CsilLiteralValue::Integer(18)),
         )],
+        doc_comments: Vec::new(),
     }]);
 
     match &input.csil_spec.rules[0].rule_type {
-        CsilRuleType::GroupDef(group) => {
-            match &group.entries[0].metadata[0] {
-                CsilFieldMetadata::Constraint(CsilValidationConstraint::MinValue(
-                    CsilLiteralValue::Integer(val),
-                )) => {
-                    assert_eq!(*val, 18);
-                }
-                _ => panic!("Expected MinValue constraint with Integer"),
+        CsilRuleType::GroupDef(group) => match &group.entries[0].metadata[0] {
+            CsilFieldMetadata::Constraint(CsilValidationConstraint::MinValue(
+                CsilLiteralValue::Integer(val),
+            )) => {
+                assert_eq!(*val, 18);
             }
-        }
+            _ => panic!("Expected MinValue constraint with Integer"),
+        },
         _ => panic!("Expected GroupDef"),
     }
 }
@@ -192,19 +190,18 @@ fn test_max_value_integer_constraint_structure() {
         metadata: vec![CsilFieldMetadata::Constraint(
             CsilValidationConstraint::MaxValue(CsilLiteralValue::Integer(120)),
         )],
+        doc_comments: Vec::new(),
     }]);
 
     match &input.csil_spec.rules[0].rule_type {
-        CsilRuleType::GroupDef(group) => {
-            match &group.entries[0].metadata[0] {
-                CsilFieldMetadata::Constraint(CsilValidationConstraint::MaxValue(
-                    CsilLiteralValue::Integer(val),
-                )) => {
-                    assert_eq!(*val, 120);
-                }
-                _ => panic!("Expected MaxValue constraint with Integer"),
+        CsilRuleType::GroupDef(group) => match &group.entries[0].metadata[0] {
+            CsilFieldMetadata::Constraint(CsilValidationConstraint::MaxValue(
+                CsilLiteralValue::Integer(val),
+            )) => {
+                assert_eq!(*val, 120);
             }
-        }
+            _ => panic!("Expected MaxValue constraint with Integer"),
+        },
         _ => panic!("Expected GroupDef"),
     }
 }
@@ -219,6 +216,7 @@ fn test_min_max_value_float_constraint_structure() {
             metadata: vec![CsilFieldMetadata::Constraint(
                 CsilValidationConstraint::MinValue(CsilLiteralValue::Float(0.0)),
             )],
+            doc_comments: Vec::new(),
         },
         CsilGroupEntry {
             key: Some(CsilGroupKey::Bare("percentage".to_string())),
@@ -227,6 +225,7 @@ fn test_min_max_value_float_constraint_structure() {
             metadata: vec![CsilFieldMetadata::Constraint(
                 CsilValidationConstraint::MaxValue(CsilLiteralValue::Float(100.0)),
             )],
+            doc_comments: Vec::new(),
         },
     ]);
 
@@ -271,24 +270,20 @@ fn test_regex_custom_constraint_structure() {
                 value: CsilLiteralValue::Text(pattern.to_string()),
             },
         )],
+        doc_comments: Vec::new(),
     }]);
 
     match &input.csil_spec.rules[0].rule_type {
-        CsilRuleType::GroupDef(group) => {
-            match &group.entries[0].metadata[0] {
-                CsilFieldMetadata::Constraint(CsilValidationConstraint::Custom {
-                    name,
-                    value,
-                }) => {
-                    assert_eq!(name, "regex");
-                    match value {
-                        CsilLiteralValue::Text(p) => assert_eq!(p, pattern),
-                        _ => panic!("Expected Text literal value for regex pattern"),
-                    }
+        CsilRuleType::GroupDef(group) => match &group.entries[0].metadata[0] {
+            CsilFieldMetadata::Constraint(CsilValidationConstraint::Custom { name, value }) => {
+                assert_eq!(name, "regex");
+                match value {
+                    CsilLiteralValue::Text(p) => assert_eq!(p, pattern),
+                    _ => panic!("Expected Text literal value for regex pattern"),
                 }
-                _ => panic!("Expected Custom constraint"),
             }
-        }
+            _ => panic!("Expected Custom constraint"),
+        },
         _ => panic!("Expected GroupDef"),
     }
 }
@@ -307,6 +302,7 @@ fn test_multiple_constraints_on_field() {
                 value: CsilLiteralValue::Text("^[a-zA-Z0-9_]+$".to_string()),
             }),
         ],
+        doc_comments: Vec::new(),
     }]);
 
     match &input.csil_spec.rules[0].rule_type {
@@ -347,6 +343,7 @@ fn test_validation_serialization() {
         metadata: vec![CsilFieldMetadata::Constraint(
             CsilValidationConstraint::MinValue(CsilLiteralValue::Integer(18)),
         )],
+        doc_comments: Vec::new(),
     }]);
 
     // Verify the input can be serialized and deserialized
@@ -358,7 +355,12 @@ fn test_validation_serialization() {
     assert_eq!(deserialized.csil_spec.rules[0].name, "TestStruct");
 
     // Verify config options are preserved
-    assert!(deserialized.config.options.contains_key("generate_validation"));
+    assert!(
+        deserialized
+            .config
+            .options
+            .contains_key("generate_validation")
+    );
     assert!(
         deserialized
             .config

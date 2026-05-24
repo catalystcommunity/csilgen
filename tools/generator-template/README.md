@@ -1,29 +1,53 @@
 # CSIL Generator Development Template
 
-This template provides everything you need to create custom CSIL (CBOR Service Interface Language) code generators as WASM modules. Your generator will integrate seamlessly with the `csilgen` CLI tool and can process CSIL specifications with services, field metadata, and all CDDL features.
+This template walks through authoring a custom CSIL (CBOR Service Interface Language) generator as a WASM module. Your generator becomes `--target <yourname>` simply by *being named correctly* and dropped in a discovery directory — there is no CLI patch, no registration step, no manifest.
+
+## Discovery & naming convention (the load-bearing rule)
+
+The runtime discovers generators dynamically. **There is no hardcoded list of targets in the CLI.** It scans the following directories in priority order (first-write-wins):
+
+1. `target/wasm32-unknown-unknown/release/` — local dev build (only meaningful inside the csilgen workspace).
+2. `./.generators/` — project-local override of the user-installed baseline.
+3. `~/.csilgen/generators/` — the user's installed baseline.
+
+A file is registered as a generator iff its filename matches **`csilgen_<target>_generator.wasm`**. The `<target>` portion (the substring between `csilgen_` and `_generator.wasm`) is what users will pass to `--target`. Files that don't match the pattern are silently ignored. The `GeneratorMetadata.target` field returned by `get_metadata()` is **informational only** — the wire-level target comes from the filename.
+
+That means: pick a target name (e.g. `mylang`), name your Cargo package `csilgen-mylang-generator`, and the build will produce `csilgen_mylang_generator.wasm`. Drop it in any discovery directory and `csilgen generate --target mylang …` resolves automatically.
 
 ## Quick Start
 
-1. **Clone this template:**
+1. **Pick a target name and copy the template** with the matching crate name:
    ```bash
-   cp -r tools/generator-template my-custom-generator
-   cd my-custom-generator
+   cp -r tools/generator-template my-csilgen-mylang-generator
+   cd my-csilgen-mylang-generator
    ```
 
-2. **Customize the generator:**
-   - Edit `Cargo.toml` with your generator details
-   - Update the metadata in `src/lib.rs`
-   - Implement your code generation logic
+2. **Customize `Cargo.toml`:** set `name = "csilgen-mylang-generator"`, `crate-type = ["cdylib"]` (already present), and add any deps you need. The `csilgen-common` dep gives you `WasmGeneratorInput`, `WasmGeneratorOutput`, and the `Csil*` AST types.
 
-3. **Build the WASM module:**
+3. **Implement** in `src/lib.rs`. The four required exports (`get_metadata`, `allocate`, `deallocate`, `generate`) are scaffolded for you — fill in `process_generation` with your code emission. See "Generator Interface Overview" below.
+
+4. **Build the WASM module:**
    ```bash
    ./build.sh
    ```
+   produces `target/wasm32-unknown-unknown/release/csilgen_mylang_generator.wasm`.
 
-4. **Test your generator:**
+5. **Install + use it:**
    ```bash
-   csilgen generate --input example.csil --target my-custom-generator --output ./generated/
+   # Per-user (visible to every csilgen project):
+   mkdir -p ~/.csilgen/generators
+   cp target/wasm32-unknown-unknown/release/csilgen_mylang_generator.wasm ~/.csilgen/generators/
+
+   # Or per-project (overrides the per-user copy without touching the homedir):
+   mkdir -p .generators
+   cp target/wasm32-unknown-unknown/release/csilgen_mylang_generator.wasm .generators/
+
+   csilgen generate --input api.csil --target mylang --output ./gen/
    ```
+
+   No CLI patches, no `cargo install` of csilgen itself, no editing the runtime — the file's presence and name are the entire registration.
+
+6. **Sub-targets** (optional): if you want `--target mylang-server`, `--target mylang-types`, etc. to all route to the same generator, just look at `input.config.target` in your `process_generation` and dispatch. The runtime resolves sub-targets via longest-prefix-match, so a target of `mylang-server` finds the `mylang` generator and passes the full `mylang-server` string in `config.target`.
 
 ## Generator Interface Overview
 
@@ -141,34 +165,41 @@ Each rule can be:
 
 ### Processing Services
 
-Services are first-class citizens in CSIL. Here's how to process them:
+Services are first-class citizens in CSIL. The agreed cross-generator emission model for each direction:
+
+| Direction | Server side | Client side |
+|---|---|---|
+| `->` Unidirectional | Handler returning `Output` | Method calling the transport (request/response) |
+| `<->` Bidirectional | Inbound handler for `Input` + outbound encoder for `Output` | Inbound handler for `Output` + outbound encoder for `Input` |
+| `<-` Reverse | Outbound encoder for `Output` only (server-pushed) | Inbound handler for `Output` only |
+
+Bidirectional and reverse ops are **not** streams in the gRPC sense — generators emit only typed handler interfaces, a router that decodes inbound bytes by wire method name, and outbound encoders that return `(method, bytes)`. The implementer wires those to their connection (WebSocket / TCP / whatever); the generator never owns the wire. See `csil-spec.md` "Operation Directions" for the full contract.
 
 ```rust
 for rule in &input.csil_spec.rules {
-    match &rule.rule_type {
-        CsilRuleType::ServiceDef(service) => {
-            println!("Service: {}", rule.name);
-            
-            for operation in &service.operations {
-                println!("  Operation: {} ({:?} -> {:?})",
-                    operation.name,
-                    operation.input_type,
-                    operation.output_type);
-                    
-                match operation.direction {
-                    CsilServiceDirection::Unidirectional => {
-                        // Generate request-response method
-                    }
-                    CsilServiceDirection::Bidirectional => {
-                        // Generate bidirectional/streaming method
-                    }
-                    CsilServiceDirection::Reverse => {
-                        // Generate reverse-flow method
-                    }
+    if let CsilRuleType::ServiceDef(service) = &rule.rule_type {
+        for operation in &service.operations {
+            match operation.direction {
+                CsilServiceDirection::Unidirectional => {
+                    // Emit your language's request/response method:
+                    // input_type -> output_type
+                }
+                CsilServiceDirection::Bidirectional => {
+                    // Emit on the server side: an inbound handler for
+                    // input_type (fire-and-forget) + an outbound encoder
+                    // for output_type. On the client side: an inbound
+                    // handler for output_type + an outbound encoder for
+                    // input_type. Plus a router function that decodes one
+                    // frame and dispatches by wire-method name.
+                }
+                CsilServiceDirection::Reverse => {
+                    // Server pushes output_type to the client. Emit a
+                    // server-side outbound encoder for output_type and a
+                    // client-side inbound handler for output_type. No
+                    // server inbound; no client outbound.
                 }
             }
         }
-        _ => {}
     }
 }
 ```
@@ -414,34 +445,43 @@ Example memory layout:
 
 ## Testing Your Generator
 
-The template includes comprehensive tests:
+The template ships with unit tests in `src/lib.rs`. Once you've written a CSIL fixture and a host-side decoder for `WasmGeneratorOutput`, your in-crate `#[cfg(test)] mod tests` can exercise `process_generation` directly without going through the wasm runtime.
+
+For end-to-end testing against the real CLI:
 
 ```bash
-# Run unit tests
-cargo test
-
-# Build and test WASM module
+# Build the WASM module (assuming your package is csilgen-mylang-generator)
 ./build.sh
-csilgen generate --input test.csil --target my-generator --output ./test-output/
+
+# Drop it into the project-local override slot — first-write-wins, so this
+# beats any homedir copy without you having to touch ~/.csilgen/generators/
+mkdir -p .generators
+cp target/wasm32-unknown-unknown/release/csilgen_mylang_generator.wasm .generators/
+
+csilgen generate --input test.csil --target mylang --output ./test-output/
 ```
 
-Create test CSIL files with services and metadata:
+Create test CSIL files exercising services, metadata, and `;;;` doc comments:
 
 ```csil
-; Basic types with metadata
+;;; A logged-in user.
 User = {
+  ;;; Display name shown in the UI.
   name: text @bidirectional @description("User's display name"),
-  email: text ? @send-only @min-length(5),
+  ? email: text @send-only,
   id: uint @receive-only
 }
 
-; Service definition
+;;; Top-level user API.
 service UserAPI {
-  create-user: User -> User
-  get-user: uint -> User
-  update-user: User <-> User  ; bidirectional
+  create-user: User -> User,            ;; unidirectional
+  get-user: uint -> User,                ;; unidirectional
+  subscribe: uint <-> User,              ;; bidirectional connection
+  notify-deleted: uint <- Acknowledgment ;; reverse (server-pushed)
 }
 ```
+
+(Note: the `@bidirectional` in `name`'s field metadata is the *field visibility* annotation — the field flows in both directions in send/receive payloads. It's unrelated to the `<->` *operation direction* on `subscribe`. They share the word but the AST keeps them in separate enums: `CsilFieldVisibility::Bidirectional` vs `CsilServiceDirection::Bidirectional`.)
 
 ## Common Patterns
 
@@ -527,12 +567,9 @@ fn process_field_metadata(metadata: &[CsilFieldMetadata]) -> FieldInfo {
 
 ## Publishing Your Generator
 
-1. **Test thoroughly** with various CSIL specifications
-2. **Document** your generator's capabilities and options
-3. **Package** the WASM file with installation instructions
-4. **Consider** contributing to the official generator registry
-
-Your WASM module can be distributed as a single file and used by anyone with the csilgen CLI tool.
+1. **Test thoroughly** with various CSIL specifications.
+2. **Document** what target name your generator serves, the capabilities it advertises, and any options it reads from `WasmGeneratorInput.config.options`.
+3. **Distribute the wasm file directly.** Because discovery is filename-based, "installing" your generator is literally copying `csilgen_<target>_generator.wasm` into `~/.csilgen/generators/` (or `./.generators/` for a project pin). No registry, no Cargo dep, no patch to csilgen.
 
 ## Need Help?
 

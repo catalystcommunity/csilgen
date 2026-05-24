@@ -23,7 +23,10 @@ fn create_simple_test_input() -> WasmGeneratorInput {
         output_dir: "/tmp/output".to_string(),
         options: {
             let mut opts = HashMap::new();
-            opts.insert("package_name".to_string(), serde_json::Value::String("api".to_string()));
+            opts.insert(
+                "package_name".to_string(),
+                serde_json::Value::String("api".to_string()),
+            );
             opts
         },
     };
@@ -38,12 +41,14 @@ fn create_simple_test_input() -> WasmGeneratorInput {
                         value_type: CsilTypeExpression::Builtin("text".to_string()),
                         occurrence: None,
                         metadata: vec![],
+                        doc_comments: Vec::new(),
                     },
                     CsilGroupEntry {
                         key: Some(CsilGroupKey::Bare("email".to_string())),
                         value_type: CsilTypeExpression::Builtin("text".to_string()),
                         occurrence: Some(CsilOccurrence::Optional),
                         metadata: vec![],
+                        doc_comments: Vec::new(),
                     },
                 ],
             }),
@@ -52,6 +57,7 @@ fn create_simple_test_input() -> WasmGeneratorInput {
                 column: 1,
                 offset: 0,
             },
+            doc_comments: Vec::new(),
         }],
         source_content: None,
         service_count: 0,
@@ -78,11 +84,20 @@ fn test_basic_struct_generation() {
     match &input.csil_spec.rules[0].rule_type {
         CsilRuleType::GroupDef(group) => {
             assert_eq!(group.entries.len(), 2);
-            assert_eq!(group.entries[0].key, Some(CsilGroupKey::Bare("name".to_string())));
-            assert_eq!(group.entries[1].key, Some(CsilGroupKey::Bare("email".to_string())));
+            assert_eq!(
+                group.entries[0].key,
+                Some(CsilGroupKey::Bare("name".to_string()))
+            );
+            assert_eq!(
+                group.entries[1].key,
+                Some(CsilGroupKey::Bare("email".to_string()))
+            );
 
             // Verify optional field
-            assert!(matches!(group.entries[1].occurrence, Some(CsilOccurrence::Optional)));
+            assert!(matches!(
+                group.entries[1].occurrence,
+                Some(CsilOccurrence::Optional)
+            ));
         }
         _ => panic!("Expected GroupDef rule type"),
     }
@@ -94,8 +109,18 @@ fn test_generator_metadata() {
 
     assert_eq!(input.generator_metadata.name, "go-generator");
     assert_eq!(input.generator_metadata.target, "go");
-    assert!(input.generator_metadata.capabilities.contains(&GeneratorCapability::BasicTypes));
-    assert!(input.generator_metadata.capabilities.contains(&GeneratorCapability::ComplexStructures));
+    assert!(
+        input
+            .generator_metadata
+            .capabilities
+            .contains(&GeneratorCapability::BasicTypes)
+    );
+    assert!(
+        input
+            .generator_metadata
+            .capabilities
+            .contains(&GeneratorCapability::ComplexStructures)
+    );
 }
 
 #[test]

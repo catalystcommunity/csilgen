@@ -122,6 +122,8 @@ pub enum TokenType {
 
     // Comments
     Comment(String),
+    // Documentation comments (;;;) attached to the following definition
+    DocComment(String),
 
     // Whitespace and EOF
     Whitespace(String),
@@ -215,7 +217,13 @@ impl Lexer {
                 // Check for CDDL-style comment ;;
                 if self.peek() == ';' {
                     self.advance(); // consume second ;
-                    self.comment(start_pos)
+                    // A third ; marks a documentation comment attached to the next definition
+                    if self.peek() == ';' {
+                        self.advance(); // consume third ;
+                        self.doc_comment(start_pos)
+                    } else {
+                        self.comment(start_pos)
+                    }
                 } else if self.peek().is_ascii_whitespace() || self.is_at_end() {
                     // If followed by whitespace or end of input, treat as comment
                     self.comment(start_pos)
@@ -479,6 +487,22 @@ impl Lexer {
             TokenType::Comment(comment.clone()),
             start_pos,
             format!("{prefix}{comment}"),
+        ))
+    }
+
+    fn doc_comment(&mut self, start_pos: Position) -> Result<Token, LexerError> {
+        let mut content = String::new();
+        while self.peek() != '\n' && !self.is_at_end() {
+            content.push(self.advance());
+        }
+
+        // The stored value is the trimmed line content so generators can emit it
+        // directly as a doc string; the lexeme preserves the literal source.
+        let value = content.trim().to_string();
+        Ok(Token::new(
+            TokenType::DocComment(value),
+            start_pos,
+            format!(";;;{content}"),
         ))
     }
 
@@ -1045,6 +1069,32 @@ mod tests {
         assert_eq!(comments[0], " Main comment");
         assert_eq!(comments[1], " inline comment");
         assert_eq!(comments[2], " End comment");
+    }
+
+    #[test]
+    fn test_doc_comment_token() {
+        // Triple-semicolon yields a DocComment with trimmed content; double stays a Comment
+        let input = ";;; A doc comment.\n;; not a doc\nname = text";
+        let mut lexer = Lexer::new(input);
+        let tokens = lexer.tokenize().unwrap();
+
+        let docs: Vec<_> = tokens
+            .iter()
+            .filter_map(|t| match &t.token_type {
+                TokenType::DocComment(c) => Some(c.clone()),
+                _ => None,
+            })
+            .collect();
+        let comments: Vec<_> = tokens
+            .iter()
+            .filter_map(|t| match &t.token_type {
+                TokenType::Comment(c) => Some(c.clone()),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(docs, vec!["A doc comment.".to_string()]);
+        assert_eq!(comments, vec![" not a doc".to_string()]);
     }
 
     #[test]

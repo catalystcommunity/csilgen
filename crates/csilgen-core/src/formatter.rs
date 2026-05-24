@@ -621,6 +621,7 @@ mod tests {
             name: name.to_string(),
             rule_type,
             position: crate::lexer::Position::new(1, 1, 0),
+            doc_comments: Vec::new(),
         }
     }
 
@@ -679,12 +680,14 @@ mod tests {
                         value_type: TypeExpression::Builtin("text".to_string()),
                         occurrence: None,
                         metadata: Vec::new(),
+                        doc_comments: Vec::new(),
                     },
                     GroupEntry {
                         key: Some(crate::ast::GroupKey::Bare("age".to_string())),
                         value_type: TypeExpression::Builtin("int".to_string()),
                         occurrence: Some(crate::ast::Occurrence::Optional),
                         metadata: Vec::new(),
+                        doc_comments: Vec::new(),
                     },
                 ],
             }),
@@ -723,6 +726,7 @@ mod tests {
                     value_type: TypeExpression::Builtin("text".to_string()),
                     occurrence: None,
                     metadata: Vec::new(),
+                    doc_comments: Vec::new(),
                 }],
             }),
         )]);
@@ -761,6 +765,7 @@ mod tests {
                         value_type: TypeExpression::Builtin("text".to_string()),
                         occurrence: None,
                         metadata: Vec::new(),
+                        doc_comments: Vec::new(),
                     }],
                 },
                 GroupExpression {
@@ -769,6 +774,7 @@ mod tests {
                         value_type: TypeExpression::Builtin("int".to_string()),
                         occurrence: None,
                         metadata: Vec::new(),
+                        doc_comments: Vec::new(),
                     }],
                 },
             ]),
@@ -791,6 +797,7 @@ mod tests {
                         output_type: TypeExpression::Reference("UserResponse".to_string()),
                         direction: crate::ast::ServiceDirection::Unidirectional,
                         position: crate::lexer::Position::new(1, 1, 0),
+                        doc_comments: Vec::new(),
                     },
                     crate::ast::ServiceOperation {
                         name: "stream_updates".to_string(),
@@ -798,6 +805,7 @@ mod tests {
                         output_type: TypeExpression::Reference("StreamResponse".to_string()),
                         direction: crate::ast::ServiceDirection::Bidirectional,
                         position: crate::lexer::Position::new(2, 1, 0),
+                        doc_comments: Vec::new(),
                     },
                 ],
             }),
@@ -905,6 +913,7 @@ mod tests {
                         metadata: vec![crate::ast::FieldMetadata::Visibility(
                             crate::ast::FieldVisibility::SendOnly,
                         )],
+                        doc_comments: Vec::new(),
                     },
                     GroupEntry {
                         key: Some(crate::ast::GroupKey::Bare("constrained_field".to_string())),
@@ -918,6 +927,7 @@ mod tests {
                                 crate::ast::ValidationConstraint::MaxLength(100),
                             ),
                         ],
+                        doc_comments: Vec::new(),
                     },
                     GroupEntry {
                         key: Some(crate::ast::GroupKey::Bare("described_field".to_string())),
@@ -926,6 +936,7 @@ mod tests {
                         metadata: vec![crate::ast::FieldMetadata::Description(
                             "User age".to_string(),
                         )],
+                        doc_comments: Vec::new(),
                     },
                 ],
             }),
@@ -947,24 +958,28 @@ mod tests {
                         value_type: TypeExpression::Builtin("text".to_string()),
                         occurrence: Some(crate::ast::Occurrence::Optional),
                         metadata: Vec::new(),
+                        doc_comments: Vec::new(),
                     },
                     GroupEntry {
                         key: Some(crate::ast::GroupKey::Bare("zero_or_more".to_string())),
                         value_type: TypeExpression::Builtin("text".to_string()),
                         occurrence: Some(crate::ast::Occurrence::ZeroOrMore),
                         metadata: Vec::new(),
+                        doc_comments: Vec::new(),
                     },
                     GroupEntry {
                         key: Some(crate::ast::GroupKey::Bare("one_or_more".to_string())),
                         value_type: TypeExpression::Builtin("text".to_string()),
                         occurrence: Some(crate::ast::Occurrence::OneOrMore),
                         metadata: Vec::new(),
+                        doc_comments: Vec::new(),
                     },
                     GroupEntry {
                         key: Some(crate::ast::GroupKey::Bare("exact_five".to_string())),
                         value_type: TypeExpression::Builtin("text".to_string()),
                         occurrence: Some(crate::ast::Occurrence::Exact(5)),
                         metadata: Vec::new(),
+                        doc_comments: Vec::new(),
                     },
                     GroupEntry {
                         key: Some(crate::ast::GroupKey::Bare("range_one_to_ten".to_string())),
@@ -974,6 +989,7 @@ mod tests {
                             max: Some(10),
                         }),
                         metadata: Vec::new(),
+                        doc_comments: Vec::new(),
                     },
                 ],
             }),
@@ -1006,7 +1022,10 @@ mod tests {
             RuleType::TypeDef(TypeExpression::Constrained {
                 base_type: Box::new(TypeExpression::Builtin("text".to_string())),
                 constraints: vec![
-                    crate::ast::ControlOperator::Size(crate::ast::SizeConstraint::Range { min: 10, max: 1000 }),
+                    crate::ast::ControlOperator::Size(crate::ast::SizeConstraint::Range {
+                        min: 10,
+                        max: 1000,
+                    }),
                     crate::ast::ControlOperator::Json,
                 ],
             }),
@@ -1054,7 +1073,10 @@ mod tests {
             RuleType::TypeDef(TypeExpression::Constrained {
                 base_type: Box::new(TypeExpression::Builtin("bytes".to_string())),
                 constraints: vec![
-                    crate::ast::ControlOperator::Size(crate::ast::SizeConstraint::Range { min: 10, max: 1000 }),
+                    crate::ast::ControlOperator::Size(crate::ast::SizeConstraint::Range {
+                        min: 10,
+                        max: 1000,
+                    }),
                     crate::ast::ControlOperator::Cbor,
                 ],
             }),

@@ -40,14 +40,8 @@ git clone https://github.com/catalystcommunity/csilgen.git
 cd csilgen
 cargo build --workspace --release
 
-# Build the WASM generators (required for code generation)
-cargo build --target wasm32-unknown-unknown --release \
-  -p csilgen-json-generator \
-  -p csilgen-rust-generator \
-  -p csilgen-typescript-generator \
-  -p csilgen-python \
-  -p csilgen-openapi \
-  -p csilgen-go
+# Build and install the WASM generators to ~/.csilgen/generators/
+cargo run -p xtask install-wasm
 
 # Install the CLI tool globally
 cargo install --path crates/csilgen-cli
@@ -252,18 +246,24 @@ Now comes the magic - generating production-ready code in multiple languages:
 ### TypeScript Generation
 
 ```bash
-# Generate TypeScript interfaces and client
+# Generate TypeScript types, client, and server in one shot
 csilgen generate --input tasks.csil --target typescript --output ./generated/ts/
 
 # Check what was generated
 ls generated/ts/
-# Output: types.ts, TaskAPI.ts, client.ts, validations.ts
+# Output: types.gen.ts, client.gen.ts, server.gen.ts
 ```
 
-The generated TypeScript will include:
+`typescript` emits all three files. Use a focused target when you only need part:
+
+- `typescript-typesonly` — just `types.gen.ts`
+- `typescript-client` — `types.gen.ts` + `client.gen.ts` (a transport-agnostic typed client)
+- `typescript-server` — `types.gen.ts` + `server.gen.ts` (handler interfaces + a `dispatch` helper)
+
+The generated `types.gen.ts` will include:
 
 ```typescript
-// generated/ts/types.ts
+// generated/ts/types.gen.ts
 export interface Task {
   id: string;           // TaskID - received from server only
   title: string;        // min: 1, max: 200 characters
@@ -278,19 +278,30 @@ export interface Task {
 
 export type TaskStatus = "pending" | "in_progress" | "completed" | "cancelled";
 
-// generated/ts/client.ts
-export class TaskAPIClient {
-  constructor(private baseUrl: string) {}
-  
-  async createTask(request: CreateTaskRequest): Promise<Task> {
-    // Implementation with proper validation
-  }
-  
-  async watchTasks(request: WatchRequest): AsyncIterable<TaskUpdate> {
-    // WebSocket implementation for bidirectional communication
+// generated/ts/client.gen.ts
+import type { CreateTaskRequest, Task } from "./types.gen";
+
+// You supply the transport (CBOR, JSON, an in-memory fake, etc.).
+export interface ServiceTransport {
+  call<TReq, TRes>(
+    service: string,
+    method: string,
+    req: TReq,
+    opts?: { signal?: AbortSignal },
+  ): Promise<TRes>;
+}
+
+export class TaskClient {
+  constructor(private readonly t: ServiceTransport) {}
+
+  createTask(req: CreateTaskRequest, opts?: { signal?: AbortSignal }): Promise<Task> {
+    return this.t.call<CreateTaskRequest, Task>("task", "CreateTask", req, opts);
   }
 }
 ```
+
+The client is transport-agnostic: it emits `service`/`method` strings and delegates
+the wire format, URL, auth, and error decoding to the `ServiceTransport` you provide.
 
 ### Python Generation
 
@@ -300,7 +311,7 @@ csilgen generate --input tasks.csil --target python --output ./generated/py/
 
 # Check generated files
 ls generated/py/
-# Output: types.py, task_api.py, client.py, validators.py
+# Output: types.py, services.py, __init__.py
 ```
 
 Generated Python code:
@@ -342,7 +353,7 @@ csilgen generate --input tasks.csil --target rust --output ./generated/rust/
 
 # Check generated files
 ls generated/rust/
-# Output: mod.rs, types.rs, api.rs, client.rs
+# Output: mod.rs, types.rs, services.rs
 ```
 
 Generated Rust code:
@@ -1003,32 +1014,32 @@ fn generate_graphql_schema(spec: &CsilSpec) -> String {
 
 ### Building Your Generator
 
+Name your Cargo package `csilgen-<target>-generator` — the build output filename derives the `--target` name automatically. For a GraphQL generator targeting `--target graphql`, the package is `csilgen-graphql-generator`:
+
 ```bash
 # Build as WASM
-cargo build --target wasm32-unknown-unknown --release
+cargo build --target wasm32-unknown-unknown --release -p csilgen-graphql-generator
 
-# The WASM file will be at:
-# target/wasm32-unknown-unknown/release/my_graphql_generator.wasm
+# Output: target/wasm32-unknown-unknown/release/csilgen_graphql_generator.wasm
 ```
 
 ### Using Your Custom Generator
 
+Discovery is filename-based — drop the wasm into any of the search paths and the CLI's `--target graphql` resolves automatically. There is no registration step.
+
 ```bash
-# Use your custom generator
-csilgen generate \
-  --input api.csil \
-  --target ./my_graphql_generator.wasm \
-  --output ./generated/
+# Per-user (visible to every csilgen invocation):
+mkdir -p ~/.csilgen/generators
+cp target/wasm32-unknown-unknown/release/csilgen_graphql_generator.wasm ~/.csilgen/generators/
 
-# Your generator receives:
-# - Parsed CSIL AST with all types, services, and metadata
-# - Configuration options
-# - Output directory path
+# Or per-project (overrides the homedir copy, first-write-wins):
+mkdir -p .generators
+cp target/wasm32-unknown-unknown/release/csilgen_graphql_generator.wasm .generators/
 
-# And returns:
-# - Array of files to generate
-# - Each with a path and content
+csilgen generate --input api.csil --target graphql --output ./generated/
 ```
+
+Your generator receives a `WasmGeneratorInput` (parsed CSIL spec + config options from the CSIL `options{}` block + your generator metadata) and returns a `WasmGeneratorOutput` (a `files: Vec<GeneratedFile>` of `(path, content)` pairs, plus warnings and stats). See `tools/generator-template/GENERATOR_INTERFACE.md` for the precise interface.
 
 ### Generator Best Practices
 
@@ -1036,11 +1047,11 @@ csilgen generate \
 
 **❌ BAD**: Mixing generated and manual code
 ```typescript
-// types.ts - DON'T mix generated and manual code
+// types.gen.ts - DON'T mix generated and manual code
 export interface User {
   id: string;  // Generated
   name: string; // Generated
-  
+
   // Manual addition - will be lost on regeneration!
   getDisplayName() {
     return this.name.toUpperCase();
@@ -1050,14 +1061,14 @@ export interface User {
 
 **✅ GOOD**: Separate generated from manual code
 ```typescript
-// generated/types.ts - GENERATED, DO NOT EDIT
+// generated/types.gen.ts - GENERATED, DO NOT EDIT
 export interface UserBase {
   id: string;
   name: string;
 }
 
 // src/models/user.ts - Your extensions (not generated)
-import { UserBase } from '../generated/types';
+import type { UserBase } from '../generated/types.gen';
 
 export class User implements UserBase {
   constructor(public id: string, public name: string) {}

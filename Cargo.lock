@@ -589,21 +589,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "csilgen-go"
+name = "csilgen-go-generator"
 version = "0.1.0"
 dependencies = [
  "csilgen-common",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "csilgen-json"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "csilgen-common",
- "csilgen-core",
  "serde",
  "serde_json",
 ]
@@ -628,7 +617,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "csilgen-openapi"
+name = "csilgen-openapi-generator"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -639,25 +628,13 @@ dependencies = [
 ]
 
 [[package]]
-name = "csilgen-python"
+name = "csilgen-python-generator"
 version = "0.1.0"
 dependencies = [
- "anyhow",
  "convert_case",
  "csilgen-common",
- "csilgen-core",
  "serde",
  "serde_json",
-]
-
-[[package]]
-name = "csilgen-rust"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "csilgen-common",
- "csilgen-core",
- "serde",
 ]
 
 [[package]]
@@ -672,16 +649,6 @@ dependencies = [
 [[package]]
 name = "csilgen-simple-test"
 version = "0.1.0"
-
-[[package]]
-name = "csilgen-typescript"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "csilgen-common",
- "csilgen-core",
- "serde",
-]
 
 [[package]]
 name = "csilgen-typescript-generator"

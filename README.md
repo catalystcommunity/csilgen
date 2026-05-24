@@ -11,28 +11,7 @@ Flow is similar to protocgen for protobufs.
 
 ## Current Status
 
-This is a newly created project with the core architecture in place but key components still under development:
-
-### ✅ Working
-- CLI interface and command structure
-- Project structure and build system
-- WASM runtime for generators
-- WASM build automation
-- Core data types and error handling
-- Comprehensive test suite
-- CSIL parser (full CDDL + CSIL syntax including services and metadata)
-- Basic code generation through WASM modules
-
-### ✅ Complete Implementation
-- CSIL parser and lexer
-- CSIL validator with comprehensive error checking
-- Full code generation for JSON Schema, Rust, Go, Python, TypeScript, and OpenAPI
-- CSIL formatter for canonical code style
-- WASM plugin system for extensible generators
-- Breaking change detection and dependency analysis
-- Comprehensive testing and benchmarking infrastructure
-
-The CLI is fully functional with complete parsing, validation, formatting, and code generation capabilities.
+The core architecture is in place and the CLI is functional end-to-end: parsing, validation, formatting, linting, breaking-change detection, and code generation for Rust, Go, TypeScript, Python, JSON Schema, and OpenAPI all work today. See the [detailed Implementation Status](#implementation-status) below for what's polished vs. what's deferred to follow-ups (tracked in `docs/csilgen-requests/`).
 
 ## Current Usage
 
@@ -44,14 +23,16 @@ git clone <repo-url>
 cd csilgen
 cargo build --workspace --release
 
-# Build core WASM generators (required for generation)
-cargo build --target wasm32-unknown-unknown --release -p csilgen-noop-generator -p csilgen-json-generator -p csilgen-rust-generator -p csilgen-typescript-generator -p csilgen-python -p csilgen-openapi -p csilgen-go
+# Build and install the WASM generators to ~/.csilgen/generators/
+cargo run -p xtask install-wasm
 
 # Generate code from CSIL files
 cargo run -p csilgen -- generate --input your-file.csil --target rust --output ./generated/
 cargo run -p csilgen -- generate --input your-file.csil --target go --output ./generated/
 cargo run -p csilgen -- generate --input your-file.csil --target json --output ./generated/
 cargo run -p csilgen -- generate --input your-file.csil --target typescript --output ./generated/
+# TypeScript also offers focused targets: typescript-typesonly, typescript-client, typescript-server
+cargo run -p csilgen -- generate --input your-file.csil --target typescript-client --output ./generated/
 cargo run -p csilgen -- generate --input your-file.csil --target python --output ./generated/
 cargo run -p csilgen -- generate --input your-file.csil --target openapi --output ./generated/
 
@@ -93,7 +74,7 @@ See the examples directory for sample CSIL files to experiment with.
 - Maps with key-value pairs (`{ key => value }`)
 - Groups and choices (`( a, b )`, `( a / b )`)
 - Optional fields (`? fieldname: type`)
-- Comments (`#` and `;;` syntax)
+- Comments (`#` and `;;` syntax; `;;;` documentation comments attach to the following definition)
 - Type definitions and references
 - Range expressions (`0..100`)
 - Literal values and enums
@@ -109,46 +90,40 @@ See the examples directory for sample CSIL files to experiment with.
 
 ## Implementation Status
 
-### ✅ Fully Implemented
-- **Parser**: Complete CDDL parsing with CSIL extensions
-- **Validator**: Comprehensive validation with constraint checking
-- **Generators**: JSON Schema, Rust, Go, Python, TypeScript, OpenAPI
-- **CLI Tools**: validate, generate, format, lint, breaking change detection
-- **WASM System**: Plugin architecture for extensible generators
-- **Testing**: 430+ tests across all components
+### ✅ Working today
+- **Parser**: CDDL syntax plus the CSIL extensions (services, `/=`/`//=` choices, field metadata, `;;;` doc comments, options block, imports).
+- **Validator**: Constraint checking, dependency analysis, breaking-change detection.
+- **CLI tools**: `validate`, `generate`, `format`, `lint`, `breaking`.
+- **Plugin runtime**: Dynamic generator discovery from `~/.csilgen/generators/`, `./.generators/`, and `target/wasm32-unknown-unknown/release/` — first-write-wins precedence. Generators are conforming `csilgen_<target>_generator.wasm` cdylibs; no CLI map to edit.
+- **Generators**: Rust, Go, TypeScript (with the typescript-typesonly / typescript-client / typescript-server sub-targets), Python, JSON Schema, OpenAPI. Service directions `->`, `<->`, `<-` all emit consistently (handler + router + outbound encoders).
+- **Testing**: 465+ tests across the workspace.
 
-### 🔄 Under Development  
-- Additional CBOR constraint types (`.eq`, `.ne`, `.bits`, etc.)
-- Advanced field metadata syntax (`@description`, `@bidirectional`, etc.)
-- Enhanced error messages for unsupported syntax
-- Performance optimizations for large schemas
+### 🔄 Deferred / partial
+- **OpenAPI generator internals** still consume the core AST via a `Serialized → Core` shim in `wasm/csilgen-openapi-generator/src/wasm.rs`. Refactoring its body to operate on the serialized form directly (matching the other targets) is captured in `docs/csilgen-requests/openapi-generator-realignment.md`.
+- **JSON Schema generator's bidirectional handling**: JSON Schema doesn't model service operations richly; current behavior is documented in `docs/csilgen-requests/json-generator-realignment.md`.
+- **Additional CBOR constraint operators** (`.eq`, `.ne`, `.bits`, `.and`, `.within`, encoding/base operators) — see `csil-spec.md` for the supported subset.
+- **Performance optimizations** for very large schemas.
 
-### 📋 Planned Features
-- IDE integrations and language server  
-- Schema evolution and versioning tools
-- Additional target language generators
-- Live validation and hot-reload development mode
-- Schema documentation generation
+### 📋 Future ideas
+- IDE integrations / language server.
+- Schema evolution & versioning tools beyond `breaking`.
+- Live validation / hot-reload during development.
+- Schema documentation generation as a first-class generator.
 
 ## Project Structure
 
 This is a Rust workspace containing multiple crates:
 
-- **csilgen-core**: Core CSIL parsing, validation, and AST functionality
+- **csilgen-core**: CSIL parsing, validation, and AST functionality
 - **csilgen-cli**: Command-line interface (`csilgen` binary)
-- **csilgen-common**: Shared utilities, types, and error handling
-- **Core Generators**:
-  - **csilgen-json**: JSON Schema generator
-  - **csilgen-rust**: Rust code generator
-  - **csilgen-go**: Go code generator
-  - **csilgen-python**: Python code generator
-  - **csilgen-typescript**: TypeScript generator
-  - **csilgen-openapi**: OpenAPI specification generator
-- **WASM Modules**:
-  - **csilgen-wasm-core**: Core functionality as WASM
-  - **csilgen-wasm-generators**: WASM runtime for plugin generators
-- **Development Tools**:
-  - **xtask**: Build automation and development tasks
+- **csilgen-common**: Shared types incl. the WASM boundary types
+- **Runtime (`wasm/`)**:
+  - **csilgen-wasm-core**: Core types/helpers compiled to wasm
+  - **csilgen-wasm-generators**: Discovery + execution runtime
+- **Generators (`wasm/csilgen-<target>-generator/`)**: each is a single `cdylib` crate that produces `csilgen_<target>_generator.wasm`. Targets: `rust`, `go`, `typescript` (also `typescript-typesonly` / `typescript-client` / `typescript-server`), `json`, `python`, `openapi`, plus the `noop` test fixture. There is no parallel library copy — the wasm crate is the single source of truth for each generator.
+- **Development tools**: `tools/xtask` build automation.
+
+Generators are discovered dynamically, **first-write-wins**, scanning in this priority order: `target/wasm32-unknown-unknown/release` (local dev builds) → `./.generators` (project-local pin/override) → `~/.csilgen/generators/` (user-installed baseline). Files matching `csilgen_<target>_generator.wasm` are registered; everything else is ignored. A project can drop a wasm into `.generators/` to override the user's installed copy without touching the homedir. To ship a third-party generator, build a `cdylib` of the same shape and place it in any of those directories — `--target <yourname>` resolves automatically.
 
 ## Getting Started
 
@@ -302,78 +277,56 @@ See `examples/multi-file/` for concrete examples of these patterns.
 
 ## Custom Generator Development
 
-csilgen supports custom code generators via WASM modules. This allows you to create generators for any target language or use case.
+csilgen supports custom code generators via WASM modules. Every generator — including the built-in ones — is a `cdylib` crate that follows exactly one naming convention; nothing in the CLI is hardcoded.
 
-### Generator Discovery
+### How discovery works
 
-The CLI discovers generators in two ways:
+At startup the runtime scans, **first-write-wins**, in priority order:
 
-1. **Built-in Generators**: Packaged with the CLI installation
-2. **User Generators**: Located in `~/.csilgen/generators/`
+1. **`target/wasm32-unknown-unknown/release/`** — local dev build output (csilgen workspace only)
+2. **`./.generators/`** — project-local override of the user-installed baseline
+3. **`~/.csilgen/generators/`** — user-installed generators
 
-Generator filenames must use the format: `csilgen-<target>.wasm` where `<target>` is the name you'll use with `--target <target>`.
+Files that match **`csilgen_<target>_generator.wasm`** are registered as generators serving `--target <target>`. The target name is the substring between `csilgen_` and `_generator.wasm`. Anything that does not match the pattern is silently ignored, so a search directory can hold unrelated files without affecting discovery. A project pins or replaces a generator by dropping a wasm into `.generators/`; the homedir copy is shadowed without being touched. There is no map to edit — drop a conforming file in, run `--target <name>`, done.
 
-**Example**: `csilgen-go.wasm` is used with `--target go`
+### Authoring a generator
 
-### Creating a Custom Generator
+1. **Create the crate.** Place it under `wasm/` if upstreaming, or anywhere if external.
 
-1. **Create a new Rust crate** in `crates/core_generators/`:
    ```bash
-   cd crates/core_generators
-   cargo new --lib csilgen-go
+   cd wasm
+   cargo new --lib csilgen-mylang-generator
    ```
 
-2. **Configure for WASM** in `Cargo.toml`:
+2. **Configure as a cdylib in `Cargo.toml`:**
+
    ```toml
+   [package]
+   name = "csilgen-mylang-generator"
+   edition = "2024"
+
    [lib]
    crate-type = ["cdylib"]
 
    [dependencies]
-   csilgen-common = { path = "../../csilgen-common" }
-   # Add other dependencies as needed
+   csilgen-common = { path = "../../crates/csilgen-common" }
+   serde = { version = "1", features = ["derive"] }
+   serde_json = "1"
    ```
 
-3. **Implement the generator** in `src/lib.rs`:
-   ```rust
-   use csilgen_common::*;
+3. **Implement the four exports.** Use `csilgen-common`'s `WasmGeneratorInput` / `WasmGeneratorOutput` for I/O and `wasm_interface::*` for error codes / `MAX_INPUT_SIZE`. See any existing `wasm/csilgen-*-generator/` for the boilerplate.
 
-   #[no_mangle]
-   pub extern "C" fn generate(/* ... */) -> String {
-       // Your generation logic here
-       // Return JSON with filename/content pairs
-   }
-   ```
+4. **Wire into the workspace.** Add the crate path to `Cargo.toml` `members`, and the package name to `tools/xtask/src/main.rs` `build_wasm`'s `--package` list. Then `cargo run -p xtask install-wasm` builds and installs it.
 
-### Building and Installing
+5. **Use it.** `csilgen generate --input file.csil --target mylang --output ./out/`. No CLI changes required at any point.
 
-1. **Build the WASM module**:
-   ```bash
-   cargo build --target wasm32-unknown-unknown --release -p csilgen-go
-   ```
+### Rules
 
-   Output location: `target/wasm32-unknown-unknown/release/csilgen_go.wasm`
+- **One crate per generator.** Do not create a parallel `lib` version under `crates/`; the `cdylib` is the single source of truth. The codebase has been bitten by this twice before.
+- **Filename is the contract.** `csilgen_<target>_generator.wasm`. The CLI derives the target from it; if you rename, the target name changes.
+- **No async, no filesystem access** — generators run in a sandbox and return everything via the WASM result.
+- **Don't enumerate targets in the CLI.** If you find yourself patching a `match target` somewhere, stop — that's the anti-pattern the dynamic discovery exists to prevent.
 
-2. **Install for CLI use**:
-   ```bash
-   # Create user generators directory if it doesn't exist
-   mkdir -p ~/.csilgen/generators/
+### Existing generators
 
-   # Copy with correct naming (hyphen not underscore!)
-   cp target/wasm32-unknown-unknown/release/csilgen_go.wasm ~/.csilgen/generators/csilgen-go.wasm
-   ```
-
-3. **Use your generator**:
-   ```bash
-   csilgen generate --input your-file.csil --target go --output ./generated/
-   ```
-
-### Important Notes
-
-- **Naming Convention**: Build outputs use underscores (`csilgen_go.wasm`), but runtime discovery expects hyphens (`csilgen-go.wasm`)
-- **WASM Limitations**: Generators cannot print to stdout/stderr - all output must be returned via the function result
-- **Testing**: Generators run in a sandbox with no filesystem access for security
-- **Development**: After making changes, rebuild and recopy the WASM file to `~/.csilgen/generators/`
-
-### Example: Go Generator
-
-See `crates/core_generators/csilgen-go/` for a complete example of a custom generator that produces Go structs from CSIL definitions.
+See any of `wasm/csilgen-{rust,go,typescript,json,python,openapi}-generator/` for working examples.

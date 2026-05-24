@@ -1,19 +1,33 @@
 # CSIL Generator WASM Interface Specification
 
-This document provides the complete technical specification for implementing CSIL generators as WASM modules.
+This document is the complete technical specification for implementing CSIL generators as WASM modules.
 
 ## Interface Overview
 
-CSIL generators are WebAssembly modules that implement a standardized interface for code generation. They receive parsed CSIL specifications (including services and field metadata) through a well-defined API and produce generated code files.
+CSIL generators are WebAssembly modules that implement a standardized C-ABI interface. They receive parsed CSIL specifications (including services and field metadata) and produce generated code files. The host (the `csilgen` CLI) discovers them by filename — see *Discovery & Target Resolution* below — and there is no hardcoded registry of generators in the CLI.
 
 ### Core Principles
 
-1. **Sandboxed Execution**: WASM modules have no direct filesystem access for security
-2. **Standardized Interface**: All generators implement the same four C-compatible functions
-3. **JSON Communication**: All data exchange uses JSON serialization
-4. **Memory Management**: Generators manage their own WASM linear memory
-5. **Service-Aware**: Full support for CSIL service definitions and operations
-6. **Metadata-Rich**: Complete access to field metadata for advanced code generation
+1. **Sandboxed Execution**: WASM modules have no direct filesystem access.
+2. **Standardized Interface**: All generators implement the same four C-compatible functions.
+3. **JSON Communication**: Data crosses the boundary as JSON-serialized `WasmGeneratorInput` / `WasmGeneratorOutput`.
+4. **Memory Management**: Generators manage their own WASM linear memory.
+5. **Filename-derived Targets**: The CLI's `--target <name>` resolves dynamically from the filename of the wasm module the user has installed — no patch to the CLI required to add a new target.
+6. **Service-Aware**: Full support for CSIL service definitions and the `->` / `<->` / `<-` directions.
+
+## Discovery & Target Resolution
+
+The runtime scans these directories in priority order (first-write-wins):
+
+1. `target/wasm32-unknown-unknown/release/` — local dev build output.
+2. `./.generators/` — project-local pin/override of the user-installed baseline.
+3. `~/.csilgen/generators/` — the user's installed baseline.
+
+A file is registered as a generator iff its filename matches `csilgen_<target>_generator.wasm`. The `<target>` portion (the substring between `csilgen_` and `_generator.wasm`) is what users pass to `--target`. Files that don't match are silently ignored, so users can keep unrelated files in those directories.
+
+**The `target` field returned by `get_metadata()` is informational only.** The wire-level target name is derived from the wasm filename; `metadata.target` is exposed to the user (in listings, errors, logs) but the CLI does not match `--target` against it. To control the user-visible target, name your Cargo package `csilgen-<target>-generator`; the default lib name yields `csilgen_<target>_generator.wasm` automatically.
+
+**Sub-targets are routed by longest-prefix match.** A request for `--target foo-bar` will find the generator with target `foo` (if no `foo-bar` generator exists) and pass the full string `foo-bar` to it in `WasmGeneratorInput.config.target`, so a single generator can serve multiple variants — the TypeScript generator uses this for `typescript-typesonly` / `typescript-client` / `typescript-server`.
 
 ## Required Exports
 
@@ -650,14 +664,21 @@ fn map_type_expression(expr: &CsilTypeExpression) -> String {
 
 ## Configuration Processing
 
-Your generator can accept custom options via the CLI:
+Your generator can read custom options. **Options are set in the CSIL file's `options { … }` block**, not on the CLI — the CLI does not accept `--option` flags. The block is a flat `key: literal` map (string, number, bool, null, or array of literals). For example:
+
+```csil
+options {
+  indent_size: 4,
+  use_tabs: false,
+  generate_docs: true,
+  custom_header: "// Custom header comment",
+}
+```
+
+These flow through to your generator as `WasmGeneratorInput.config.options: HashMap<String, serde_json::Value>`.
 
 ```bash
-csilgen generate --input api.csil --target my-generator \
-  --option indent_size=4 \
-  --option use_tabs=false \
-  --option generate_docs=true \
-  --option custom_header="// Custom header comment"
+csilgen generate --input api.csil --target mylang --output ./gen/
 ```
 
 Process these options:

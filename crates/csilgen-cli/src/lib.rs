@@ -45,9 +45,7 @@ fn find_csil_files_in_directory(dir: &Path) -> CliResult<Vec<PathBuf>> {
                 if path.is_dir() {
                     // Recursively visit subdirectories
                     visit_dir(&path, files)?;
-                } else if path.is_file()
-                    && path.extension().is_some_and(|ext| ext == "csil")
-                {
+                } else if path.is_file() && path.extension().is_some_and(|ext| ext == "csil") {
                     files.push(path);
                 }
             }
@@ -191,7 +189,7 @@ fn process_single_file(
 
     // Execute the generator
     let generated_files = runtime
-        .execute_generator(generator_id, &spec, &config)
+        .execute_generator(&generator_id, &spec, &config)
         .map_err(|e| {
             format!(
                 "Failed to execute {} generator for {}: {}",
@@ -329,7 +327,7 @@ fn process_entry_points(
         };
 
         // Execute the generator for this file
-        let generated_files = match runtime.execute_generator(generator_id, &spec, &config) {
+        let generated_files = match runtime.execute_generator(&generator_id, &spec, &config) {
             Ok(files) => files,
             Err(e) => {
                 let detailed_error = format!(
@@ -388,7 +386,7 @@ fn process_entry_points(
 }
 
 /// Initialize WASM runtime and validate generator availability
-fn initialize_wasm_runtime(target: &str) -> CliResult<(WasmGeneratorRuntime, &'static str)> {
+fn initialize_wasm_runtime(target: &str) -> CliResult<(WasmGeneratorRuntime, String)> {
     // Initialize WASM runtime
     let mut runtime =
         WasmGeneratorRuntime::new().map_err(|e| format!("Error initializing WASM runtime: {e}"))?;
@@ -398,32 +396,48 @@ fn initialize_wasm_runtime(target: &str) -> CliResult<(WasmGeneratorRuntime, &'s
         .discover_generators()
         .map_err(|e| format!("Error discovering generators: {e}"))?;
 
-    // Map target to generator ID
-    let generator_id = match target {
-        "json" => "csilgen-json-generator",
-        "rust" => "csilgen-rust-generator",
-        "python" => "csilgen-python-generator",
-        "typescript" => "csilgen-typescript-generator",
-        "openapi" => "csilgen-openapi-generator",
-        "go" => "csilgen-go",
-        "noop" | "test" => "csilgen-noop-generator",
-        _ => {
-            return Err(format!("Unknown target '{target}'. Available targets: json, rust, python, typescript, openapi, go").into());
-        }
-    };
+    let generator_id = resolve_generator_for_target(&runtime, target)?;
+    Ok((runtime, generator_id))
+}
 
-    // Check if generator is available
-    if runtime.registry().get_generator(generator_id).is_none() {
-        let available_generators: Vec<&str> = runtime.list_discovered_generators();
-        return Err(format!(
-            "Generator '{}' not found. Available generators: {}",
-            generator_id,
-            available_generators.join(", ")
-        )
-        .into());
+/// Resolve a `--target` to a discovered generator's id.
+///
+/// Each generator advertises the target it serves (derived from its filename).
+/// A target matches a generator either exactly, or as a sub-target — e.g.
+/// `typescript-client` is served by the `typescript` generator, which then
+/// emits the requested subset based on `config.target`. When several match, the
+/// most specific (longest) generator target wins.
+fn resolve_generator_for_target(runtime: &WasmGeneratorRuntime, target: &str) -> CliResult<String> {
+    let mut best: Option<(&str, &str)> = None; // (generator_target, generator_id)
+    for discovered in runtime.registry().discovered_generators().values() {
+        let gt = discovered.metadata.target.as_str();
+        let matches = gt == target || target.starts_with(&format!("{gt}-"));
+        if matches && best.is_none_or(|(bt, _)| gt.len() > bt.len()) {
+            best = Some((gt, discovered.id.as_str()));
+        }
     }
 
-    Ok((runtime, generator_id))
+    if let Some((_, id)) = best {
+        return Ok(id.to_string());
+    }
+
+    let mut available: Vec<&str> = runtime
+        .registry()
+        .discovered_generators()
+        .values()
+        .map(|g| g.metadata.target.as_str())
+        .collect();
+    available.sort_unstable();
+    available.dedup();
+    Err(format!(
+        "Unknown target '{target}'. Available targets: {}",
+        if available.is_empty() {
+            "(none discovered — run `cargo run -p xtask install-wasm`)".to_string()
+        } else {
+            available.join(", ")
+        }
+    )
+    .into())
 }
 
 /// Write generated files to the output directory
@@ -476,16 +490,14 @@ fn literal_value_to_json(literal: &LiteralValue) -> Option<serde_json::Value> {
         LiteralValue::Text(s) => Some(serde_json::Value::String(s.clone())),
         LiteralValue::Integer(i) => Some(serde_json::Value::Number((*i).into())),
         LiteralValue::Float(f) => Some(serde_json::Value::Number(
-            serde_json::Number::from_f64(*f).unwrap_or_else(|| serde_json::Number::from(0))
+            serde_json::Number::from_f64(*f).unwrap_or_else(|| serde_json::Number::from(0)),
         )),
         LiteralValue::Bool(b) => Some(serde_json::Value::Bool(*b)),
         LiteralValue::Null => Some(serde_json::Value::Null),
         LiteralValue::Bytes(_) => None,
         LiteralValue::Array(elements) => {
-            let json_elements: Vec<serde_json::Value> = elements
-                .iter()
-                .filter_map(literal_value_to_json)
-                .collect();
+            let json_elements: Vec<serde_json::Value> =
+                elements.iter().filter_map(literal_value_to_json).collect();
             Some(serde_json::Value::Array(json_elements))
         }
     }

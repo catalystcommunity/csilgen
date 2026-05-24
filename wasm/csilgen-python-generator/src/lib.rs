@@ -1,330 +1,117 @@
-//! Python code generator for csilgen
+//! Python code generator for csilgen (WASM module).
+//!
+//! Discovered dynamically as `--target python` from `csilgen_python_generator.wasm`.
 
 use convert_case::{Case, Casing};
 use csilgen_common::{
     CsilFieldMetadata, CsilFieldVisibility, CsilGroupEntry, CsilGroupExpression, CsilGroupKey,
     CsilLiteralValue, CsilOccurrence, CsilRuleType, CsilServiceDefinition, CsilServiceDirection,
     CsilServiceOperation, CsilSpecSerialized, CsilTypeExpression, CsilValidationConstraint,
-    CsilgenError, GeneratedFile, GeneratedFiles, GeneratorConfig, Result,
+    CsilgenError, GeneratedFile, GeneratedFiles, GenerationStats, GeneratorCapability,
+    GeneratorConfig, GeneratorMetadata, GeneratorWarning, Result, WasmGeneratorInput,
+    WasmGeneratorOutput, wasm_interface::*,
 };
-use csilgen_core::ast::CsilSpec;
 use std::collections::HashSet;
 
-/// Generate Python dataclasses from CDDL specification (legacy interface)
-pub fn generate_python_code(spec: &CsilSpec, config: &GeneratorConfig) -> Result<GeneratedFiles> {
-    let serialized_spec = convert_csil_spec_to_serialized(spec);
-    generate_python_code_from_serialized(&serialized_spec, config)
+// ---------------------------------------------------------------------------
+// WASM exports
+// ---------------------------------------------------------------------------
+
+#[unsafe(no_mangle)]
+pub extern "C" fn get_metadata() -> *const u8 {
+    let metadata = GeneratorMetadata {
+        name: "python-generator".to_string(),
+        version: "1.0.0".to_string(),
+        description: "Python code generator".to_string(),
+        target: "python".to_string(),
+        capabilities: vec![
+            GeneratorCapability::BasicTypes,
+            GeneratorCapability::ComplexStructures,
+            GeneratorCapability::Services,
+            GeneratorCapability::FieldMetadata,
+        ],
+        author: Some("CSIL Team".to_string()),
+        homepage: None,
+    };
+    write_json_to_wasm(&metadata) as *const u8
 }
 
-fn convert_csil_spec_to_serialized(spec: &CsilSpec) -> CsilSpecSerialized {
-    use csilgen_common::*;
-
-    let mut service_count = 0;
-    let mut fields_with_metadata_count = 0;
-
-    let rules: Vec<_> = spec
-        .rules
-        .iter()
-        .map(|rule| {
-            if matches!(rule.rule_type, csilgen_core::ast::RuleType::ServiceDef(_)) {
-                service_count += 1;
-            }
-
-            if let csilgen_core::ast::RuleType::TypeDef(csilgen_core::ast::TypeExpression::Group(
-                group,
-            )) = &rule.rule_type
-            {
-                fields_with_metadata_count += group
-                    .entries
-                    .iter()
-                    .filter(|entry| !entry.metadata.is_empty())
-                    .count();
-            }
-
-            CsilRule {
-                name: rule.name.clone(),
-                rule_type: convert_rule_type(&rule.rule_type),
-                position: convert_position(&rule.position),
-            }
-        })
-        .collect();
-
-    CsilSpecSerialized {
-        rules,
-        source_content: None,
-        service_count,
-        fields_with_metadata_count,
-    }
+#[unsafe(no_mangle)]
+pub extern "C" fn allocate(size: usize) -> *mut u8 {
+    let mut buf = Vec::with_capacity(size);
+    let ptr = buf.as_mut_ptr();
+    std::mem::forget(buf);
+    ptr
 }
 
-fn convert_rule_type(rule_type: &csilgen_core::ast::RuleType) -> CsilRuleType {
-    match rule_type {
-        csilgen_core::ast::RuleType::TypeDef(type_expr) => {
-            CsilRuleType::TypeDef(convert_type_expression(type_expr))
-        }
-        csilgen_core::ast::RuleType::GroupDef(group) => {
-            CsilRuleType::GroupDef(convert_group_expression(group))
-        }
-        csilgen_core::ast::RuleType::GroupChoice(groups) => {
-            CsilRuleType::GroupChoice(groups.iter().map(convert_group_expression).collect())
-        }
-        csilgen_core::ast::RuleType::TypeChoice(types) => {
-            CsilRuleType::TypeChoice(types.iter().map(convert_type_expression).collect())
-        }
-        csilgen_core::ast::RuleType::ServiceDef(service) => {
-            CsilRuleType::ServiceDef(convert_service_definition(service))
+#[unsafe(no_mangle)]
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub extern "C" fn deallocate(ptr: *mut u8, size: usize) {
+    if !ptr.is_null() && size > 0 {
+        unsafe {
+            let _ = Vec::from_raw_parts(ptr, 0, size);
         }
     }
 }
 
-fn convert_type_expression(type_expr: &csilgen_core::ast::TypeExpression) -> CsilTypeExpression {
-    match type_expr {
-        csilgen_core::ast::TypeExpression::Builtin(name) => {
-            CsilTypeExpression::Builtin(name.clone())
-        }
-        csilgen_core::ast::TypeExpression::Reference(name) => {
-            CsilTypeExpression::Reference(name.clone())
-        }
-        csilgen_core::ast::TypeExpression::Array {
-            element_type,
-            occurrence,
-        } => CsilTypeExpression::Array {
-            element_type: Box::new(convert_type_expression(element_type)),
-            occurrence: occurrence.as_ref().map(convert_occurrence),
-        },
-        csilgen_core::ast::TypeExpression::Map {
-            key,
-            value,
-            occurrence,
-        } => CsilTypeExpression::Map {
-            key: Box::new(convert_type_expression(key)),
-            value: Box::new(convert_type_expression(value)),
-            occurrence: occurrence.as_ref().map(convert_occurrence),
-        },
-        csilgen_core::ast::TypeExpression::Group(group) => {
-            CsilTypeExpression::Group(convert_group_expression(group))
-        }
-        csilgen_core::ast::TypeExpression::Choice(choices) => {
-            CsilTypeExpression::Choice(choices.iter().map(convert_type_expression).collect())
-        }
-        csilgen_core::ast::TypeExpression::Literal(literal) => {
-            CsilTypeExpression::Literal(convert_literal_value(literal))
-        }
-        csilgen_core::ast::TypeExpression::Socket(name) => CsilTypeExpression::Socket(name.clone()),
-        csilgen_core::ast::TypeExpression::Plug(name) => CsilTypeExpression::Plug(name.clone()),
-        csilgen_core::ast::TypeExpression::Range {
-            start,
-            end,
-            inclusive,
-        } => CsilTypeExpression::Range {
-            start: *start,
-            end: *end,
-            inclusive: *inclusive,
-        },
-        csilgen_core::ast::TypeExpression::Constrained {
-            base_type,
-            constraints,
-        } => {
-            // Convert base type and track if we have .json constraint
-            let base_converted = convert_type_expression(base_type);
-            
-            // Check for constraints
-            for constraint in constraints {
-                match constraint {
-                    csilgen_core::ast::ControlOperator::Json => {
-                        // For .json constraint, the type should be a string that contains valid JSON
-                        // In Python, this is still str but with validation
-                        if matches!(base_converted, CsilTypeExpression::Builtin(ref s) if s == "str" || s == "bytes") {
-                            // Keep the base type but note that validation would check JSON validity
-                        }
-                    }
-                    csilgen_core::ast::ControlOperator::Cbor | csilgen_core::ast::ControlOperator::Cborseq => {
-                        // For .cbor and .cborseq constraints, the type should be bytes
-                        // In Python, this is bytes but with validation for CBOR format
-                        if matches!(base_converted, CsilTypeExpression::Builtin(ref s) if s == "bytes") {
-                            // Keep the base type but note that validation would check CBOR validity
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            
-            base_converted
-        }
+#[unsafe(no_mangle)]
+pub extern "C" fn generate(input_ptr: *const u8, input_len: usize) -> *mut u8 {
+    match process_generation(input_ptr, input_len) {
+        Ok(output) => write_json_to_wasm(&output),
+        Err(_) => std::ptr::null_mut(),
     }
 }
 
-fn convert_group_expression(group: &csilgen_core::ast::GroupExpression) -> CsilGroupExpression {
-    CsilGroupExpression {
-        entries: group.entries.iter().map(convert_group_entry).collect(),
+fn write_json_to_wasm<T: serde::Serialize>(value: &T) -> *mut u8 {
+    let json = match serde_json::to_string(value) {
+        Ok(j) => j,
+        Err(_) => return std::ptr::null_mut(),
+    };
+    let bytes = json.as_bytes();
+    let ptr = allocate(bytes.len() + 4);
+    if ptr.is_null() {
+        return std::ptr::null_mut();
     }
+    unsafe {
+        std::ptr::write(ptr as *mut u32, bytes.len() as u32);
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr.add(4), bytes.len());
+    }
+    ptr
 }
 
-fn convert_group_entry(entry: &csilgen_core::ast::GroupEntry) -> CsilGroupEntry {
-    CsilGroupEntry {
-        key: entry.key.as_ref().map(convert_group_key),
-        value_type: convert_type_expression(&entry.value_type),
-        occurrence: entry.occurrence.as_ref().map(convert_occurrence),
-        metadata: entry.metadata.iter().map(convert_field_metadata).collect(),
+fn process_generation(
+    input_ptr: *const u8,
+    input_len: usize,
+) -> std::result::Result<WasmGeneratorOutput, i32> {
+    if input_ptr.is_null() || input_len == 0 || input_len > MAX_INPUT_SIZE {
+        return Err(error_codes::INVALID_INPUT);
     }
+    let bytes = unsafe { std::slice::from_raw_parts(input_ptr, input_len) };
+    let s = std::str::from_utf8(bytes).map_err(|_| error_codes::INVALID_INPUT)?;
+    let input: WasmGeneratorInput =
+        serde_json::from_str(s).map_err(|_| error_codes::SERIALIZATION_ERROR)?;
+
+    let files = generate_python_code_from_serialized(&input.csil_spec, &input.config)
+        .map_err(|_| error_codes::GENERATION_ERROR)?;
+
+    let stats = GenerationStats {
+        files_generated: files.len(),
+        total_size_bytes: files.iter().map(|f| f.content.len()).sum(),
+        services_count: input.csil_spec.service_count,
+        fields_with_metadata_count: input.csil_spec.fields_with_metadata_count,
+        generation_time_ms: 0,
+        peak_memory_bytes: None,
+    };
+    Ok(WasmGeneratorOutput {
+        files,
+        warnings: Vec::<GeneratorWarning>::new(),
+        stats,
+    })
 }
 
-fn convert_group_key(key: &csilgen_core::ast::GroupKey) -> CsilGroupKey {
-    match key {
-        csilgen_core::ast::GroupKey::Bare(name) => CsilGroupKey::Bare(name.clone()),
-        csilgen_core::ast::GroupKey::Type(type_expr) => {
-            CsilGroupKey::Type(convert_type_expression(type_expr))
-        }
-        csilgen_core::ast::GroupKey::Literal(literal) => {
-            CsilGroupKey::Literal(convert_literal_value(literal))
-        }
-    }
-}
-
-fn convert_service_definition(
-    service: &csilgen_core::ast::ServiceDefinition,
-) -> CsilServiceDefinition {
-    CsilServiceDefinition {
-        operations: service
-            .operations
-            .iter()
-            .map(convert_service_operation)
-            .collect(),
-    }
-}
-
-fn convert_service_operation(
-    operation: &csilgen_core::ast::ServiceOperation,
-) -> CsilServiceOperation {
-    CsilServiceOperation {
-        name: operation.name.clone(),
-        input_type: convert_type_expression(&operation.input_type),
-        output_type: convert_type_expression(&operation.output_type),
-        direction: convert_service_direction(&operation.direction),
-        position: convert_position(&operation.position),
-    }
-}
-
-fn convert_service_direction(
-    direction: &csilgen_core::ast::ServiceDirection,
-) -> CsilServiceDirection {
-    match direction {
-        csilgen_core::ast::ServiceDirection::Unidirectional => CsilServiceDirection::Unidirectional,
-        csilgen_core::ast::ServiceDirection::Bidirectional => CsilServiceDirection::Bidirectional,
-        csilgen_core::ast::ServiceDirection::Reverse => CsilServiceDirection::Reverse,
-    }
-}
-
-fn convert_occurrence(occurrence: &csilgen_core::ast::Occurrence) -> CsilOccurrence {
-    match occurrence {
-        csilgen_core::ast::Occurrence::Optional => CsilOccurrence::Optional,
-        csilgen_core::ast::Occurrence::ZeroOrMore => CsilOccurrence::ZeroOrMore,
-        csilgen_core::ast::Occurrence::OneOrMore => CsilOccurrence::OneOrMore,
-        csilgen_core::ast::Occurrence::Exact(count) => CsilOccurrence::Exact(*count),
-        csilgen_core::ast::Occurrence::Range { min, max } => CsilOccurrence::Range {
-            min: *min,
-            max: *max,
-        },
-    }
-}
-
-fn convert_field_metadata(metadata: &csilgen_core::ast::FieldMetadata) -> CsilFieldMetadata {
-    match metadata {
-        csilgen_core::ast::FieldMetadata::Visibility(visibility) => {
-            CsilFieldMetadata::Visibility(convert_field_visibility(visibility))
-        }
-        csilgen_core::ast::FieldMetadata::DependsOn { field, value } => {
-            CsilFieldMetadata::DependsOn {
-                field: field.clone(),
-                value: value.as_ref().map(convert_literal_value),
-            }
-        }
-        csilgen_core::ast::FieldMetadata::Constraint(constraint) => {
-            CsilFieldMetadata::Constraint(convert_validation_constraint(constraint))
-        }
-        csilgen_core::ast::FieldMetadata::Description(desc) => {
-            CsilFieldMetadata::Description(desc.clone())
-        }
-        csilgen_core::ast::FieldMetadata::Custom { name, parameters } => {
-            CsilFieldMetadata::Custom {
-                name: name.clone(),
-                parameters: parameters.iter().map(convert_metadata_parameter).collect(),
-            }
-        }
-    }
-}
-
-fn convert_field_visibility(
-    visibility: &csilgen_core::ast::FieldVisibility,
-) -> CsilFieldVisibility {
-    match visibility {
-        csilgen_core::ast::FieldVisibility::SendOnly => CsilFieldVisibility::SendOnly,
-        csilgen_core::ast::FieldVisibility::ReceiveOnly => CsilFieldVisibility::ReceiveOnly,
-        csilgen_core::ast::FieldVisibility::Bidirectional => CsilFieldVisibility::Bidirectional,
-    }
-}
-
-fn convert_validation_constraint(
-    constraint: &csilgen_core::ast::ValidationConstraint,
-) -> CsilValidationConstraint {
-    match constraint {
-        csilgen_core::ast::ValidationConstraint::MinLength(val) => {
-            CsilValidationConstraint::MinLength(*val)
-        }
-        csilgen_core::ast::ValidationConstraint::MaxLength(val) => {
-            CsilValidationConstraint::MaxLength(*val)
-        }
-        csilgen_core::ast::ValidationConstraint::MinItems(val) => {
-            CsilValidationConstraint::MinItems(*val)
-        }
-        csilgen_core::ast::ValidationConstraint::MaxItems(val) => {
-            CsilValidationConstraint::MaxItems(*val)
-        }
-        csilgen_core::ast::ValidationConstraint::MinValue(value) => {
-            CsilValidationConstraint::MinValue(convert_literal_value(value))
-        }
-        csilgen_core::ast::ValidationConstraint::MaxValue(value) => {
-            CsilValidationConstraint::MaxValue(convert_literal_value(value))
-        }
-        csilgen_core::ast::ValidationConstraint::Custom { name, value } => {
-            CsilValidationConstraint::Custom {
-                name: name.clone(),
-                value: convert_literal_value(value),
-            }
-        }
-    }
-}
-
-fn convert_metadata_parameter(
-    param: &csilgen_core::ast::MetadataParameter,
-) -> csilgen_common::CsilMetadataParameter {
-    csilgen_common::CsilMetadataParameter {
-        name: param.name.clone(),
-        value: convert_literal_value(&param.value),
-    }
-}
-
-fn convert_literal_value(literal: &csilgen_core::ast::LiteralValue) -> CsilLiteralValue {
-    match literal {
-        csilgen_core::ast::LiteralValue::Integer(val) => CsilLiteralValue::Integer(*val),
-        csilgen_core::ast::LiteralValue::Float(val) => CsilLiteralValue::Float(*val),
-        csilgen_core::ast::LiteralValue::Text(val) => CsilLiteralValue::Text(val.clone()),
-        csilgen_core::ast::LiteralValue::Bytes(val) => CsilLiteralValue::Bytes(val.clone()),
-        csilgen_core::ast::LiteralValue::Bool(val) => CsilLiteralValue::Bool(*val),
-        csilgen_core::ast::LiteralValue::Null => CsilLiteralValue::Null,
-        csilgen_core::ast::LiteralValue::Array(elements) => {
-            CsilLiteralValue::Array(elements.iter().map(convert_literal_value).collect())
-        }
-    }
-}
-
-fn convert_position(position: &csilgen_core::lexer::Position) -> csilgen_common::CsilPosition {
-    csilgen_common::CsilPosition {
-        line: position.line,
-        column: position.column,
-        offset: position.offset,
-    }
-}
+// ---------------------------------------------------------------------------
+// Generation
+// ---------------------------------------------------------------------------
 
 fn csil_literal_to_python_str(value: &CsilLiteralValue) -> String {
     match value {
@@ -385,6 +172,15 @@ impl PythonGenerator {
         let mut types_code = String::new();
         let mut services_code = String::new();
 
+        // Detect channel ops once so the services prelude (Codec) is emitted
+        // exactly once at the top of the services file, not per-service.
+        let has_channel_ops = spec.rules.iter().any(|r| {
+            matches!(&r.rule_type, CsilRuleType::ServiceDef(def)
+                if Self::service_has_channel_ops(def))
+        });
+
+        let mut prelude_emitted = false;
+
         for rule in &spec.rules {
             match &rule.rule_type {
                 CsilRuleType::TypeDef(type_expr) => {
@@ -400,8 +196,11 @@ impl PythonGenerator {
                     types_code.push_str(&self.generate_group_choice(&rule.name, choices)?);
                 }
                 CsilRuleType::ServiceDef(service) => {
-                    services_code.push_str(&self.generate_service_client(&rule.name, service)?);
-                    services_code.push_str(&self.generate_service_server(&rule.name, service)?);
+                    if !prelude_emitted {
+                        services_code.push_str(&Self::generate_services_prelude(has_channel_ops));
+                        prelude_emitted = true;
+                    }
+                    services_code.push_str(&self.generate_service_artifacts(&rule.name, service)?);
                 }
             }
         }
@@ -852,230 +651,195 @@ impl PythonGenerator {
         Ok(code)
     }
 
-    fn generate_service_client(
-        &mut self,
+    fn service_has_channel_ops(def: &CsilServiceDefinition) -> bool {
+        def.operations
+            .iter()
+            .any(|op| !matches!(op.direction, CsilServiceDirection::Unidirectional))
+    }
+
+    /// Once-per-file preamble for the services module: `ServiceError`
+    /// exception, plus a `Codec` Protocol when any service has channel ops.
+    /// Imports needed for these definitions live inline so the file's existing
+    /// imports block (assembled from `self.imports`) isn't affected.
+    fn generate_services_prelude(has_channel_ops: bool) -> String {
+        let mut out = String::new();
+        out.push_str("from abc import ABC, abstractmethod\n");
+        if has_channel_ops {
+            out.push_str("from typing import Protocol, Any, Tuple\n");
+        }
+        out.push('\n');
+        out.push_str("class ServiceError(Exception):\n");
+        out.push_str(
+            "    \"\"\"Transport-level error thrown by service routers and handlers.\"\"\"\n",
+        );
+        out.push_str("    def __init__(self, code: int, message: str):\n");
+        out.push_str("        self.code = code\n");
+        out.push_str("        self.message = message\n");
+        out.push_str("        super().__init__(f\"service error {code}: {message}\")\n\n");
+
+        if has_channel_ops {
+            out.push_str("class Codec(Protocol):\n");
+            out.push_str(
+                "    \"\"\"User-supplied (de)serialization for channel messages.\n\n\
+                 \x20   The generator is codec-agnostic; the implementer wires this to CBOR,\n\
+                 \x20   JSON, or anything else its protocol expects.\n\
+                 \x20   \"\"\"\n",
+            );
+            out.push_str("    def encode(self, value: Any) -> bytes: ...\n");
+            out.push_str("    def decode(self, data: bytes, target_type: type) -> Any: ...\n\n");
+        }
+        out
+    }
+
+    /// Emit the server-side handler ABC plus, when channel ops exist, a
+    /// `route_<service>_channel` dispatcher and per-op outbound encoders.
+    /// Reverse ops contribute only the outbound encoder (server pushes only).
+    fn generate_service_artifacts(
+        &self,
         name: &str,
         service: &CsilServiceDefinition,
     ) -> Result<String> {
-        let class_name = format!("{}Client", name.to_case(Case::Pascal));
-        self.generated_types.insert(class_name.clone());
+        let service_class = name.to_case(Case::Pascal);
+        let handler_class = format!("{service_class}Handlers");
+        let mut out = String::new();
 
-        let mut code = String::new();
-
-        if self.use_pydantic {
-            code.push_str(&format!("class {class_name}(BaseModel):\n"));
-            code.push_str("    \"\"\"Client for {} service operations.\"\"\"\n\n");
+        // Server-side handlers ABC: unidirectional ops return Output; <->
+        // inbound is fire-and-forget. Reverse has no server inbound here.
+        out.push_str(&format!("class {handler_class}(ABC):\n"));
+        out.push_str(&format!(
+            "    \"\"\"Server-side handlers for {name} service operations.\"\"\"\n"
+        ));
+        let server_inbound: Vec<&CsilServiceOperation> = service
+            .operations
+            .iter()
+            .filter(|op| {
+                matches!(
+                    op.direction,
+                    CsilServiceDirection::Unidirectional | CsilServiceDirection::Bidirectional
+                )
+            })
+            .collect();
+        if server_inbound.is_empty() {
+            // ABC must have a body; reverse-only services have nothing here.
+            out.push_str("    pass\n");
         } else {
-            code.push_str(&format!("class {class_name}:\n"));
-            code.push_str(&format!(
-                "    \"\"\"Client for {name} service operations.\"\"\"\n\n"
-            ));
-        }
-
-        code.push_str("    def __init__(self, endpoint: str = None):\n");
-        code.push_str("        self.endpoint = endpoint\n\n");
-
-        for operation in &service.operations {
-            code.push_str(&self.generate_service_method(operation)?);
-        }
-
-        code.push('\n');
-        Ok(code)
-    }
-
-    fn generate_service_method(&self, operation: &CsilServiceOperation) -> Result<String> {
-        let method_name = operation.name.to_case(Case::Snake);
-        let input_type = self.map_type_expression(&operation.input_type)?;
-        let output_type = self.map_type_expression(&operation.output_type)?;
-
-        let mut code = String::new();
-
-        code.push_str(&format!(
-            "    def {method_name}(self, request: {input_type}) -> {output_type}:\n"
-        ));
-        let operation_name = &operation.name;
-        code.push_str(&format!(
-            "        \"\"\"Execute {operation_name} operation.\"\"\"\n"
-        ));
-
-        match operation.direction {
-            CsilServiceDirection::Unidirectional => {
-                code.push_str("        # Unidirectional operation: client -> server\n");
-                code.push_str("        # Override this method in your implementation\n");
-                code.push_str(
-                    "        raise NotImplementedError(f\"Unidirectional operation '{operation_name}' not implemented\")\n\n",
-                );
-            }
-            CsilServiceDirection::Bidirectional => {
-                code.push_str("        # Bidirectional operation: client <-> server\n");
-                code.push_str("        # Override this method in your implementation\n");
-                code.push_str(
-                    "        # Note: This operation can maintain persistent connections\n",
-                );
-                code.push_str("        raise NotImplementedError(f\"Bidirectional operation '{operation_name}' not implemented\")\n\n");
-            }
-            CsilServiceDirection::Reverse => {
-                code.push_str("        # Reverse operation: server -> client (callback/push)\n");
-                code.push_str("        # Override this method in your implementation\n");
-                code.push_str(
-                    "        # Note: This is typically used for server-initiated notifications\n",
-                );
-                code.push_str("        raise NotImplementedError(f\"Reverse operation '{operation_name}' not implemented\")\n\n");
+            for op in &server_inbound {
+                let method_name = op.name.to_case(Case::Snake);
+                let input_type = self.map_type_expression(&op.input_type)?;
+                out.push('\n');
+                out.push_str("    @abstractmethod\n");
+                match op.direction {
+                    CsilServiceDirection::Unidirectional => {
+                        let output_type = self.map_type_expression(&op.output_type)?;
+                        out.push_str(&format!(
+                            "    def {method_name}(self, req: {input_type}, ctx: dict) -> {output_type}:\n"
+                        ));
+                    }
+                    CsilServiceDirection::Bidirectional => {
+                        // Fire-and-forget channel inbound: the implementer's
+                        // connection plumbing pulls a frame, the router decodes
+                        // it, and this method handles it.
+                        out.push_str(&format!(
+                            "    def {method_name}(self, msg: {input_type}, ctx: dict) -> None:\n"
+                        ));
+                    }
+                    CsilServiceDirection::Reverse => unreachable!(),
+                }
+                if op.doc_comments.is_empty() {
+                    out.push_str(&format!("        \"\"\"{}\"\"\"\n", op.name));
+                } else {
+                    out.push_str("        \"\"\"");
+                    for (i, line) in op.doc_comments.iter().enumerate() {
+                        if i > 0 {
+                            out.push_str("\n        ");
+                        }
+                        out.push_str(line);
+                    }
+                    out.push_str("\"\"\"\n");
+                }
+                out.push_str("        ...\n");
             }
         }
+        out.push('\n');
 
-        Ok(code)
-    }
+        if Self::service_has_channel_ops(service) {
+            // Channel router: only <-> dispatches inbound on the server side.
+            let route_fn = format!("route_{}_channel", name.to_case(Case::Snake));
+            let bidi_ops: Vec<&CsilServiceOperation> = service
+                .operations
+                .iter()
+                .filter(|op| matches!(op.direction, CsilServiceDirection::Bidirectional))
+                .collect();
 
-    fn generate_service_server(
-        &mut self,
-        name: &str,
-        service: &CsilServiceDefinition,
-    ) -> Result<String> {
-        let server_class_name = format!("{}Server", name.to_case(Case::Pascal));
-        let handler_class_name = format!("{}Handler", name.to_case(Case::Pascal));
-        self.generated_types.insert(server_class_name.clone());
-        self.generated_types.insert(handler_class_name.clone());
-
-        let mut code = String::new();
-
-        // Generate abstract handler base class
-        code.push_str("from abc import ABC, abstractmethod\n\n");
-        code.push_str(&format!("class {handler_class_name}(ABC):\n"));
-        code.push_str(&format!(
-            "    \"\"\"Abstract handler for {name} service operations.\"\"\"\n\n"
-        ));
-
-        for operation in &service.operations {
-            code.push_str(&self.generate_server_handler_method(operation)?);
-        }
-
-        code.push('\n');
-
-        // Generate concrete server class with routing
-        code.push_str(&format!("class {server_class_name}:\n"));
-        code.push_str(&format!(
-            "    \"\"\"Server implementation for {name} service.\"\"\"\n\n"
-        ));
-
-        code.push_str(&format!(
-            "    def __init__(self, handler: {handler_class_name}):\n"
-        ));
-        code.push_str("        self.handler = handler\n\n");
-
-        code.push_str("    def dispatch(self, operation: str, request_data: dict) -> dict:\n");
-        code.push_str("        \"\"\"Dispatch operation to appropriate handler method.\"\"\"\n");
-
-        for operation in &service.operations {
-            let method_name = operation.name.to_case(Case::Snake);
-            code.push_str(&format!(
-                "        if operation == \"{}\":\n",
-                operation.name
+            out.push_str(&format!(
+                "def {route_fn}(handlers: {handler_class}, codec: Codec, method: str, data: bytes, ctx: dict) -> None:\n"
             ));
-            code.push_str(&format!(
-                "            return self._handle_{method_name}(request_data)\n"
+            out.push_str(&format!(
+                "    \"\"\"Decode one inbound channel frame for {name} and dispatch.\n\n\
+                 \x20   The implementer feeds frames pulled off its connection here; this\n\
+                 \x20   function never touches the wire.\n\
+                 \x20   \"\"\"\n"
             ));
-        }
-
-        code.push_str("        raise ValueError(f\"Unknown operation: {operation}\")\n\n");
-
-        // Generate handler wrapper methods
-        for operation in &service.operations {
-            code.push_str(&self.generate_server_dispatch_method(operation)?);
-        }
-
-        code.push('\n');
-        Ok(code)
-    }
-
-    fn generate_server_handler_method(&self, operation: &CsilServiceOperation) -> Result<String> {
-        let method_name = operation.name.to_case(Case::Snake);
-        let input_type = self.map_type_expression(&operation.input_type)?;
-        let output_type = self.map_type_expression(&operation.output_type)?;
-
-        let mut code = String::new();
-
-        code.push_str("    @abstractmethod\n");
-        code.push_str(&format!(
-            "    def {method_name}(self, request: {input_type}) -> {output_type}:\n"
-        ));
-        code.push_str(&format!(
-            "        \"\"\"Handle {} operation.\"\"\"\n",
-            operation.name
-        ));
-        code.push_str("        pass\n\n");
-
-        Ok(code)
-    }
-
-    fn generate_server_dispatch_method(&self, operation: &CsilServiceOperation) -> Result<String> {
-        let method_name = operation.name.to_case(Case::Snake);
-        let _input_type = self.map_type_expression(&operation.input_type)?;
-        let _output_type = self.map_type_expression(&operation.output_type)?;
-
-        let mut code = String::new();
-
-        code.push_str(&format!(
-            "    def _handle_{method_name}(self, request_data: dict) -> dict:\n"
-        ));
-        code.push_str(&format!(
-            "        \"\"\"Handle {} operation with serialization.\"\"\"\n",
-            operation.name
-        ));
-
-        // Handle different input types
-        match &operation.input_type {
-            CsilTypeExpression::Builtin(builtin) => match builtin.as_str() {
-                "text" | "tstr" => {
-                    code.push_str("        request = request_data.get('value', '')\n");
+            if bidi_ops.is_empty() {
+                // A reverse-only service still gets a router so consumers can
+                // always call it, but any incoming method is a protocol error.
+                out.push_str("    raise ServiceError(404, f\"unknown channel {method}\")\n\n");
+            } else {
+                for op in &bidi_ops {
+                    let wire = Self::wire_method(&op.name);
+                    let method_name = op.name.to_case(Case::Snake);
+                    let input_type = self.map_type_expression(&op.input_type)?;
+                    out.push_str(&format!("    if method == \"{wire}\":\n"));
+                    out.push_str(&format!("        msg = codec.decode(data, {input_type})\n"));
+                    out.push_str(&format!("        handlers.{method_name}(msg, ctx)\n"));
+                    out.push_str("        return\n");
                 }
-                "int" | "uint" => {
-                    code.push_str("        request = request_data.get('value', 0)\n");
+                out.push_str("    raise ServiceError(404, f\"unknown channel {method}\")\n\n");
+            }
+
+            // Outbound encoders for <-> and <- (server pushes Output to client).
+            for op in &service.operations {
+                if !matches!(
+                    op.direction,
+                    CsilServiceDirection::Bidirectional | CsilServiceDirection::Reverse
+                ) {
+                    continue;
                 }
-                _ => {
-                    code.push_str("        request = request_data\n");
-                }
-            },
-            CsilTypeExpression::Reference(type_name) => {
-                let class_name = type_name.to_case(Case::Pascal);
-                code.push_str(&format!(
-                    "        request = {class_name}.from_dict(request_data)\n"
+                let method_name = op.name.to_case(Case::Snake);
+                let output_type = self.map_type_expression(&op.output_type)?;
+                let wire = Self::wire_method(&op.name);
+                let fn_name = format!("encode_{}_{}", name.to_case(Case::Snake), method_name);
+                out.push_str(&format!(
+                    "def {fn_name}(codec: Codec, msg: {output_type}) -> Tuple[str, bytes]:\n"
                 ));
-            }
-            _ => {
-                code.push_str("        request = request_data\n");
-            }
-        }
-
-        code.push_str(&format!(
-            "        result = self.handler.{method_name}(request)\n"
-        ));
-
-        // Handle different output types
-        match &operation.output_type {
-            CsilTypeExpression::Builtin(builtin) => match builtin.as_str() {
-                "text" | "tstr" | "int" | "uint" | "bool" => {
-                    code.push_str("        return {'value': result}\n");
-                }
-                _ => {
-                    code.push_str("        return result if isinstance(result, dict) else {'value': result}\n");
-                }
-            },
-            CsilTypeExpression::Reference(_) => {
-                code.push_str(
-                    "        return result.to_dict() if hasattr(result, 'to_dict') else result\n",
-                );
-            }
-            _ => {
-                code.push_str(
-                    "        return result if isinstance(result, dict) else {'value': result}\n",
-                );
+                out.push_str(&format!(
+                    "    \"\"\"Encode a `{wire}` message the server pushes to a peer.\n\n\
+                     \x20   Returns (method, bytes) for the implementer to frame on its connection.\n\
+                     \x20   \"\"\"\n"
+                ));
+                out.push_str(&format!("    return (\"{wire}\", codec.encode(msg))\n\n"));
             }
         }
 
-        code.push('\n');
+        Ok(out)
+    }
 
-        Ok(code)
+    /// PascalCase wire method name — same convention as TS/Rust/Go so a CBOR
+    /// or JSON frame keyed by method is routable across all generated targets.
+    fn wire_method(s: &str) -> String {
+        let mut out = String::new();
+        let mut cap = true;
+        for ch in s.chars() {
+            if ch == '-' || ch == '_' {
+                cap = true;
+            } else if cap {
+                out.push(ch.to_ascii_uppercase());
+                cap = false;
+            } else {
+                out.push(ch);
+            }
+        }
+        out
     }
 
     fn map_type_expression(&self, type_expr: &CsilTypeExpression) -> Result<String> {
@@ -1269,16 +1033,19 @@ mod tests {
                             value_type: CsilTypeExpression::Builtin("text".to_string()),
                             occurrence: None,
                             metadata: vec![],
+                            doc_comments: Vec::new(),
                         },
                         CsilGroupEntry {
                             key: Some(CsilGroupKey::Bare("email".to_string())),
                             value_type: CsilTypeExpression::Builtin("text".to_string()),
                             occurrence: Some(CsilOccurrence::Optional),
                             metadata: vec![],
+                            doc_comments: Vec::new(),
                         },
                     ],
                 }),
                 position: create_test_position(),
+                doc_comments: Vec::new(),
             }],
             source_content: None,
             service_count: 0,
@@ -1313,9 +1080,11 @@ mod tests {
                             CsilFieldMetadata::Description("User's full name".to_string()),
                             CsilFieldMetadata::Constraint(CsilValidationConstraint::MinLength(1)),
                         ],
+                        doc_comments: Vec::new(),
                     }],
                 }),
                 position: create_test_position(),
+                doc_comments: Vec::new(),
             }],
             source_content: None,
             service_count: 0,
@@ -1342,7 +1111,7 @@ mod tests {
     }
 
     #[test]
-    fn test_generate_service_client_and_server() {
+    fn unidirectional_service_emits_handlers_abc_no_router() {
         let spec = CsilSpecSerialized {
             rules: vec![CsilRule {
                 name: "UserService".to_string(),
@@ -1353,9 +1122,11 @@ mod tests {
                         output_type: CsilTypeExpression::Builtin("text".to_string()),
                         direction: CsilServiceDirection::Unidirectional,
                         position: create_test_position(),
+                        doc_comments: Vec::new(),
                     }],
                 }),
                 position: create_test_position(),
+                doc_comments: Vec::new(),
             }],
             source_content: None,
             service_count: 1,
@@ -1364,41 +1135,147 @@ mod tests {
 
         let config = create_test_config(false);
         let result = generate_python_code_from_serialized(&spec, &config).unwrap();
-
-        assert_eq!(result.len(), 2); // services.py and __init__.py
-
         let services_file = result.iter().find(|f| f.path == "services.py").unwrap();
+        let content = &services_file.content;
 
-        // Test client generation
-        assert!(services_file.content.contains("class UserServiceClient:"));
-        assert!(
-            services_file
-                .content
-                .contains("def create_user(self, request: str) -> str:")
-        );
+        // ServiceError exception always emitted alongside any service.
+        assert!(content.contains("class ServiceError(Exception):"));
+        // No Codec when there are no channel ops.
+        assert!(!content.contains("class Codec(Protocol):"));
 
-        // Test server generation
+        // Server-side handlers ABC; reverse/bidi-free service has only the
+        // unary ABC method, no channel router, no encoders.
+        assert!(content.contains("class UserServiceHandlers(ABC):"));
+        assert!(content.contains("def create_user(self, req: str, ctx: dict) -> str:"));
+        assert!(!content.contains("route_user_service_channel"));
+        assert!(!content.contains("encode_user_service_create_user"));
+
+        // The legacy Client/Server/dispatch shape must NOT reappear.
+        assert!(!content.contains("UserServiceClient"));
+        assert!(!content.contains("UserServiceServer"));
+        assert!(!content.contains("def dispatch(self, operation: str"));
+    }
+
+    #[test]
+    fn bidirectional_op_emits_channel_inbound_router_and_outbound_encoder() {
+        let spec = CsilSpecSerialized {
+            rules: vec![CsilRule {
+                name: "Match".to_string(),
+                rule_type: CsilRuleType::ServiceDef(CsilServiceDefinition {
+                    operations: vec![
+                        CsilServiceOperation {
+                            name: "list_events".to_string(),
+                            input_type: CsilTypeExpression::Builtin("text".to_string()),
+                            output_type: CsilTypeExpression::Builtin("text".to_string()),
+                            direction: CsilServiceDirection::Unidirectional,
+                            position: create_test_position(),
+                            doc_comments: Vec::new(),
+                        },
+                        CsilServiceOperation {
+                            name: "play".to_string(),
+                            input_type: CsilTypeExpression::Builtin("text".to_string()),
+                            output_type: CsilTypeExpression::Builtin("text".to_string()),
+                            direction: CsilServiceDirection::Bidirectional,
+                            position: create_test_position(),
+                            doc_comments: vec!["Open a play channel.".to_string()],
+                        },
+                    ],
+                }),
+                position: create_test_position(),
+                doc_comments: Vec::new(),
+            }],
+            source_content: None,
+            service_count: 1,
+            fields_with_metadata_count: 0,
+        };
+
+        let result =
+            generate_python_code_from_serialized(&spec, &create_test_config(false)).unwrap();
+        let content = &result
+            .iter()
+            .find(|f| f.path == "services.py")
+            .unwrap()
+            .content;
+
+        // Codec protocol emitted exactly once at the top of the services file.
+        assert!(content.contains("class Codec(Protocol):"));
+        assert_eq!(content.matches("class Codec(Protocol):").count(), 1);
+
+        // Handlers ABC contains both unidirectional (returns Output) and
+        // bidirectional inbound (fire-and-forget, returns None).
+        assert!(content.contains("class MatchHandlers(ABC):"));
+        assert!(content.contains("def list_events(self, req: str, ctx: dict) -> str:"));
+        assert!(content.contains("def play(self, msg: str, ctx: dict) -> None:"));
+        // Doc comment surfaces as the method docstring.
+        assert!(content.contains("\"\"\"Open a play channel.\"\"\""));
+
+        // Router routes inbound by wire-method name (PascalCase, matches
+        // TS/Rust/Go so frames are cross-language compatible).
+        assert!(content.contains(
+            "def route_match_channel(handlers: MatchHandlers, codec: Codec, method: str, data: bytes, ctx: dict) -> None:"
+        ));
+        assert!(content.contains("if method == \"Play\":"));
+        assert!(content.contains("msg = codec.decode(data, str)"));
+        assert!(content.contains("handlers.play(msg, ctx)"));
+        assert!(content.contains("raise ServiceError(404, f\"unknown channel {method}\")"));
+
+        // Outbound encoder for the bidirectional op (server pushes Output).
         assert!(
-            services_file
-                .content
-                .contains("class UserServiceHandler(ABC):")
+            content.contains("def encode_match_play(codec: Codec, msg: str) -> Tuple[str, bytes]:")
         );
-        assert!(services_file.content.contains("class UserServiceServer:"));
+        assert!(content.contains("return (\"Play\", codec.encode(msg))"));
+    }
+
+    #[test]
+    fn reverse_op_emits_only_outbound_encoder_no_handler_no_router_case() {
+        let spec = CsilSpecSerialized {
+            rules: vec![CsilRule {
+                name: "Callbacks".to_string(),
+                rule_type: CsilRuleType::ServiceDef(CsilServiceDefinition {
+                    operations: vec![CsilServiceOperation {
+                        name: "notify".to_string(),
+                        input_type: CsilTypeExpression::Builtin("text".to_string()),
+                        output_type: CsilTypeExpression::Builtin("text".to_string()),
+                        direction: CsilServiceDirection::Reverse,
+                        position: create_test_position(),
+                        doc_comments: Vec::new(),
+                    }],
+                }),
+                position: create_test_position(),
+                doc_comments: Vec::new(),
+            }],
+            source_content: None,
+            service_count: 1,
+            fields_with_metadata_count: 0,
+        };
+
+        let result =
+            generate_python_code_from_serialized(&spec, &create_test_config(false)).unwrap();
+        let content = &result
+            .iter()
+            .find(|f| f.path == "services.py")
+            .unwrap()
+            .content;
+
+        // Reverse-only service: ABC body is `pass` (no inbound methods).
+        assert!(content.contains("class CallbacksHandlers(ABC):"));
+        assert!(content.contains("    pass\n"));
+        // No inbound method named `notify` on the server side.
+        assert!(!content.contains("def notify(self, "));
+
+        // Router still exists for API consistency but has no `Notify` case.
+        assert!(content.contains("def route_callbacks_channel("));
+        let router_start = content.find("def route_callbacks_channel(").unwrap();
+        let router_body = &content[router_start..];
+        assert!(!router_body.contains("if method == \"Notify\":"));
+
+        // The server-pushed encoder is present.
         assert!(
-            services_file
-                .content
-                .contains("def dispatch(self, operation: str, request_data: dict) -> dict:")
+            content.contains(
+                "def encode_callbacks_notify(codec: Codec, msg: str) -> Tuple[str, bytes]:"
+            )
         );
-        assert!(
-            services_file
-                .content
-                .contains("def _handle_create_user(self, request_data: dict) -> dict:")
-        );
-        assert!(
-            services_file
-                .content
-                .contains("from abc import ABC, abstractmethod")
-        );
+        assert!(content.contains("return (\"Notify\", codec.encode(msg))"));
     }
 
     #[test]
@@ -1415,6 +1292,7 @@ mod tests {
                             metadata: vec![CsilFieldMetadata::Visibility(
                                 CsilFieldVisibility::Bidirectional,
                             )],
+                            doc_comments: Vec::new(),
                         },
                         CsilGroupEntry {
                             key: Some(CsilGroupKey::Bare("timestamp".to_string())),
@@ -1423,10 +1301,12 @@ mod tests {
                             metadata: vec![CsilFieldMetadata::Visibility(
                                 CsilFieldVisibility::ReceiveOnly,
                             )],
+                            doc_comments: Vec::new(),
                         },
                     ],
                 }),
                 position: create_test_position(),
+                doc_comments: Vec::new(),
             }],
             source_content: None,
             service_count: 0,
@@ -1455,6 +1335,7 @@ mod tests {
                             value_type: CsilTypeExpression::Builtin("text".to_string()),
                             occurrence: None,
                             metadata: vec![],
+                            doc_comments: Vec::new(),
                         },
                         CsilGroupEntry {
                             key: Some(CsilGroupKey::Bare("extra_data".to_string())),
@@ -1464,10 +1345,12 @@ mod tests {
                                 field: "type".to_string(),
                                 value: Some(CsilLiteralValue::Text("advanced".to_string())),
                             }],
+                            doc_comments: Vec::new(),
                         },
                     ],
                 }),
                 position: create_test_position(),
+                doc_comments: Vec::new(),
             }],
             source_content: None,
             service_count: 0,
@@ -1504,6 +1387,7 @@ mod tests {
                             },
                             occurrence: None,
                             metadata: vec![],
+                            doc_comments: Vec::new(),
                         },
                         CsilGroupEntry {
                             key: Some(CsilGroupKey::Bare("mapping".to_string())),
@@ -1514,10 +1398,12 @@ mod tests {
                             },
                             occurrence: None,
                             metadata: vec![],
+                            doc_comments: Vec::new(),
                         },
                     ],
                 }),
                 position: create_test_position(),
+                doc_comments: Vec::new(),
             }],
             source_content: None,
             service_count: 0,
@@ -1542,6 +1428,7 @@ mod tests {
                     CsilTypeExpression::Builtin("int".to_string()),
                 ]),
                 position: create_test_position(),
+                doc_comments: Vec::new(),
             }],
             source_content: None,
             service_count: 0,
@@ -1570,9 +1457,11 @@ mod tests {
                         value_type: CsilTypeExpression::Builtin("text".to_string()),
                         occurrence: None,
                         metadata: vec![],
+                        doc_comments: Vec::new(),
                     }],
                 }),
                 position: create_test_position(),
+                doc_comments: Vec::new(),
             }],
             source_content: None,
             service_count: 0,
@@ -1610,6 +1499,7 @@ mod tests {
                     name: "User".to_string(),
                     rule_type: CsilRuleType::GroupDef(CsilGroupExpression { entries: vec![] }),
                     position: create_test_position(),
+                    doc_comments: Vec::new(),
                 },
                 CsilRule {
                     name: "UserService".to_string(),
@@ -1617,6 +1507,7 @@ mod tests {
                         operations: vec![],
                     }),
                     position: create_test_position(),
+                    doc_comments: Vec::new(),
                 },
             ],
             source_content: None,

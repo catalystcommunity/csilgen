@@ -10,8 +10,22 @@ fn test_yaml_and_json_tags_generated() {
 
     // Note: This test validates the structure is correct
     // Actual tag generation is tested at the CLI/integration level
-    assert!(input.config.options.get("use_json_tags").and_then(|v| v.as_bool()).unwrap_or(false));
-    assert!(input.config.options.get("use_yaml_tags").and_then(|v| v.as_bool()).unwrap_or(false));
+    assert!(
+        input
+            .config
+            .options
+            .get("use_json_tags")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+    );
+    assert!(
+        input
+            .config
+            .options
+            .get("use_yaml_tags")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+    );
 }
 
 /// Test that only JSON tags are generated when YAML is disabled
@@ -19,8 +33,22 @@ fn test_yaml_and_json_tags_generated() {
 fn test_json_only_tags() {
     let input = create_test_input_with_config(true, false);
 
-    assert!(input.config.options.get("use_json_tags").and_then(|v| v.as_bool()).unwrap_or(false));
-    assert!(!input.config.options.get("use_yaml_tags").and_then(|v| v.as_bool()).unwrap_or(true));
+    assert!(
+        input
+            .config
+            .options
+            .get("use_json_tags")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+    );
+    assert!(
+        !input
+            .config
+            .options
+            .get("use_yaml_tags")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true)
+    );
 }
 
 /// Test optional fields get omitempty in both tags
@@ -29,9 +57,16 @@ fn test_optional_field_omitempty() {
     let input = create_test_input_with_optional_field();
 
     // Verify we have an optional field in the spec
-    if let Some(CsilRuleType::GroupDef(group)) = input.csil_spec.rules.first().map(|r| &r.rule_type) {
-        let optional_field = group.entries.iter().find(|e| matches!(e.occurrence, Some(CsilOccurrence::Optional)));
-        assert!(optional_field.is_some(), "Should have at least one optional field");
+    if let Some(CsilRuleType::GroupDef(group)) = input.csil_spec.rules.first().map(|r| &r.rule_type)
+    {
+        let optional_field = group
+            .entries
+            .iter()
+            .find(|e| matches!(e.occurrence, Some(CsilOccurrence::Optional)));
+        assert!(
+            optional_field.is_some(),
+            "Should have at least one optional field"
+        );
     }
 }
 
@@ -48,9 +83,18 @@ fn create_test_input_with_config(use_json: bool, use_yaml: bool) -> WasmGenerato
     };
 
     let mut options = HashMap::new();
-    options.insert("package_name".to_string(), serde_json::Value::String("api".to_string()));
-    options.insert("use_json_tags".to_string(), serde_json::Value::Bool(use_json));
-    options.insert("use_yaml_tags".to_string(), serde_json::Value::Bool(use_yaml));
+    options.insert(
+        "package_name".to_string(),
+        serde_json::Value::String("api".to_string()),
+    );
+    options.insert(
+        "use_json_tags".to_string(),
+        serde_json::Value::Bool(use_json),
+    );
+    options.insert(
+        "use_yaml_tags".to_string(),
+        serde_json::Value::Bool(use_yaml),
+    );
 
     let config = GeneratorConfig {
         target: "go".to_string(),
@@ -62,16 +106,20 @@ fn create_test_input_with_config(use_json: bool, use_yaml: bool) -> WasmGenerato
         rules: vec![CsilRule {
             name: "TestStruct".to_string(),
             rule_type: CsilRuleType::GroupDef(CsilGroupExpression {
-                entries: vec![
-                    CsilGroupEntry {
-                        key: Some(CsilGroupKey::Bare("name".to_string())),
-                        value_type: CsilTypeExpression::Builtin("text".to_string()),
-                        occurrence: None,
-                        metadata: vec![],
-                    },
-                ],
+                entries: vec![CsilGroupEntry {
+                    key: Some(CsilGroupKey::Bare("name".to_string())),
+                    value_type: CsilTypeExpression::Builtin("text".to_string()),
+                    occurrence: None,
+                    metadata: vec![],
+                    doc_comments: Vec::new(),
+                }],
             }),
-            position: CsilPosition { line: 1, column: 1, offset: 0 },
+            position: CsilPosition {
+                line: 1,
+                column: 1,
+                offset: 0,
+            },
+            doc_comments: Vec::new(),
         }],
         source_content: None,
         service_count: 0,
@@ -102,7 +150,10 @@ fn create_test_input_with_optional_field() -> WasmGeneratorInput {
         output_dir: "/tmp/output".to_string(),
         options: {
             let mut opts = HashMap::new();
-            opts.insert("package_name".to_string(), serde_json::Value::String("api".to_string()));
+            opts.insert(
+                "package_name".to_string(),
+                serde_json::Value::String("api".to_string()),
+            );
             opts
         },
     };
@@ -117,16 +168,23 @@ fn create_test_input_with_optional_field() -> WasmGeneratorInput {
                         value_type: CsilTypeExpression::Builtin("text".to_string()),
                         occurrence: None,
                         metadata: vec![],
+                        doc_comments: Vec::new(),
                     },
                     CsilGroupEntry {
                         key: Some(CsilGroupKey::Bare("email".to_string())),
                         value_type: CsilTypeExpression::Builtin("text".to_string()),
                         occurrence: Some(CsilOccurrence::Optional),
                         metadata: vec![],
+                        doc_comments: Vec::new(),
                     },
                 ],
             }),
-            position: CsilPosition { line: 1, column: 1, offset: 0 },
+            position: CsilPosition {
+                line: 1,
+                column: 1,
+                offset: 0,
+            },
+            doc_comments: Vec::new(),
         }],
         source_content: None,
         service_count: 0,

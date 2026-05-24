@@ -411,10 +411,8 @@ fn validate_service_optimized(
             // Suggest similar type names for typos
             let available_names: Vec<String> =
                 validation_context.type_names.iter().cloned().collect();
-            let suggestions = csilgen_common::CsilgenError::suggest_similar_names(
-                &input_name,
-                &available_names,
-            );
+            let suggestions =
+                csilgen_common::CsilgenError::suggest_similar_names(&input_name, &available_names);
 
             let suggestion_text = if !suggestions.is_empty() {
                 format!(" Did you mean: {}?", suggestions.join(", "))
@@ -437,10 +435,8 @@ fn validate_service_optimized(
             // Suggest similar type names for typos
             let available_names: Vec<String> =
                 validation_context.type_names.iter().cloned().collect();
-            let suggestions = csilgen_common::CsilgenError::suggest_similar_names(
-                &output_name,
-                &available_names,
-            );
+            let suggestions =
+                csilgen_common::CsilgenError::suggest_similar_names(&output_name, &available_names);
 
             let suggestion_text = if !suggestions.is_empty() {
                 format!(" Did you mean: {}?", suggestions.join(", "))
@@ -710,7 +706,7 @@ fn validate_control_operator(
                 }
                 _ => false,
             };
-            
+
             if !is_bits_applicable {
                 errors.push(ValidationError::ConstraintTypeMismatch {
                     constraint_type: ".bits".to_string(),
@@ -1173,16 +1169,16 @@ fn validate_field_metadata(
                     ValidationConstraint::MinLength(val)
                     | ValidationConstraint::MaxLength(val)
                     | ValidationConstraint::MinItems(val)
-                    | ValidationConstraint::MaxItems(val) => {
+                    | ValidationConstraint::MaxItems(val)
                         if *val == 0
-                            && (constraint_type == "min-length" || constraint_type == "min-items")
-                        {
-                            errors.push(ValidationError::InvalidConstraint {
-                                field_context: field_context.to_string(),
-                                constraint: constraint_type.to_string(),
-                                reason: "minimum value should be greater than 0".to_string(),
-                            });
-                        }
+                            && (constraint_type == "min-length"
+                                || constraint_type == "min-items") =>
+                    {
+                        errors.push(ValidationError::InvalidConstraint {
+                            field_context: field_context.to_string(),
+                            constraint: constraint_type.to_string(),
+                            reason: "minimum value should be greater than 0".to_string(),
+                        });
                     }
                     _ => {} // Custom constraints are not validated here
                 }
@@ -1325,6 +1321,7 @@ mod tests {
             name: name.to_string(),
             rule_type,
             position: Position::new(1, 1, 0),
+            doc_comments: Vec::new(),
         }
     }
 
@@ -1349,6 +1346,7 @@ mod tests {
                         FieldMetadata::Visibility(FieldVisibility::SendOnly),
                         FieldMetadata::Visibility(FieldVisibility::ReceiveOnly),
                     ],
+                    doc_comments: Vec::new(),
                 }],
             })),
         )]);
@@ -1372,6 +1370,7 @@ mod tests {
                         field: "nonexistent_field".to_string(),
                         value: None,
                     }],
+                    doc_comments: Vec::new(),
                 }],
             })),
         )]);
@@ -1395,6 +1394,7 @@ mod tests {
                         FieldMetadata::Constraint(ValidationConstraint::MinLength(3)),
                         FieldMetadata::Constraint(ValidationConstraint::MinLength(5)),
                     ],
+                    doc_comments: Vec::new(),
                 }],
             })),
         )]);
@@ -1419,6 +1419,7 @@ mod tests {
                             field: "field_b".to_string(),
                             value: None,
                         }],
+                        doc_comments: Vec::new(),
                     },
                     GroupEntry {
                         key: Some(GroupKey::Bare("field_b".to_string())),
@@ -1428,6 +1429,7 @@ mod tests {
                             field: "field_a".to_string(),
                             value: None,
                         }],
+                        doc_comments: Vec::new(),
                     },
                 ],
             })),
@@ -1451,6 +1453,7 @@ mod tests {
                     metadata: vec![FieldMetadata::Constraint(ValidationConstraint::MinLength(
                         0,
                     ))],
+                    doc_comments: Vec::new(),
                 }],
             })),
         )]);
@@ -1476,12 +1479,14 @@ mod tests {
                             FieldMetadata::Description("User's password".to_string()),
                             FieldMetadata::Constraint(ValidationConstraint::MinLength(8)),
                         ],
+                        doc_comments: Vec::new(),
                     },
                     GroupEntry {
                         key: Some(GroupKey::Bare("type".to_string())),
                         value_type: TypeExpression::Builtin("text".to_string()),
                         occurrence: None,
                         metadata: Vec::new(),
+                        doc_comments: Vec::new(),
                     },
                     GroupEntry {
                         key: Some(GroupKey::Bare("expedite_fee".to_string())),
@@ -1491,6 +1496,7 @@ mod tests {
                             field: "type".to_string(),
                             value: Some(LiteralValue::Text("express".to_string())),
                         }],
+                        doc_comments: Vec::new(),
                     },
                 ],
             })),
@@ -1513,6 +1519,7 @@ mod tests {
                             value_type: TypeExpression::Builtin("text".to_string()),
                             occurrence: None,
                             metadata: vec![FieldMetadata::Visibility(FieldVisibility::SendOnly)],
+                            doc_comments: Vec::new(),
                         }],
                     }),
                     output_type: TypeExpression::Group(GroupExpression {
@@ -1521,10 +1528,12 @@ mod tests {
                             value_type: TypeExpression::Builtin("int".to_string()),
                             occurrence: None,
                             metadata: vec![FieldMetadata::Visibility(FieldVisibility::ReceiveOnly)],
+                            doc_comments: Vec::new(),
                         }],
                     }),
                     direction: ServiceDirection::Unidirectional,
                     position: Position::new(1, 1, 0),
+                    doc_comments: Vec::new(),
                 }],
             }),
         )]);
@@ -1546,6 +1555,7 @@ mod tests {
                             value_type: TypeExpression::Builtin("text".to_string()),
                             occurrence: None,
                             metadata: vec![FieldMetadata::Visibility(FieldVisibility::SendOnly)],
+                            doc_comments: Vec::new(),
                         }],
                     }),
                     output_type: TypeExpression::Group(GroupExpression {
@@ -1554,10 +1564,12 @@ mod tests {
                             value_type: TypeExpression::Builtin("int".to_string()),
                             occurrence: None,
                             metadata: vec![FieldMetadata::Visibility(FieldVisibility::ReceiveOnly)],
+                            doc_comments: Vec::new(),
                         }],
                     }),
                     direction: ServiceDirection::Bidirectional,
                     position: Position::new(1, 1, 0),
+                    doc_comments: Vec::new(),
                 }],
             }),
         )]);
@@ -1578,6 +1590,7 @@ mod tests {
                         output_type: TypeExpression::Builtin("text".to_string()),
                         direction: ServiceDirection::Unidirectional,
                         position: Position::new(1, 1, 0),
+                        doc_comments: Vec::new(),
                     },
                     ServiceOperation {
                         name: "process".to_string(),
@@ -1585,6 +1598,7 @@ mod tests {
                         output_type: TypeExpression::Builtin("int".to_string()),
                         direction: ServiceDirection::Unidirectional,
                         position: Position::new(2, 1, 0),
+                        doc_comments: Vec::new(),
                     },
                 ],
             }),
@@ -1613,11 +1627,13 @@ mod tests {
                                 FieldMetadata::Visibility(FieldVisibility::SendOnly),
                                 FieldMetadata::Visibility(FieldVisibility::ReceiveOnly),
                             ],
+                            doc_comments: Vec::new(),
                         }],
                     }),
                     output_type: TypeExpression::Builtin("int".to_string()),
                     direction: ServiceDirection::Unidirectional,
                     position: Position::new(1, 1, 0),
+                    doc_comments: Vec::new(),
                 }],
             }),
         )]);
@@ -1639,6 +1655,7 @@ mod tests {
                         value_type: TypeExpression::Builtin("text".to_string()),
                         occurrence: None,
                         metadata: Vec::new(),
+                        doc_comments: Vec::new(),
                     },
                     GroupEntry {
                         key: Some(GroupKey::Bare("priority".to_string())),
@@ -1648,6 +1665,7 @@ mod tests {
                             field: "customer_type".to_string(),
                             value: Some(LiteralValue::Text("premium".to_string())),
                         }],
+                        doc_comments: Vec::new(),
                     },
                     GroupEntry {
                         key: Some(GroupKey::Bare("expedite_fee".to_string())),
@@ -1657,6 +1675,7 @@ mod tests {
                             field: "priority".to_string(),
                             value: Some(LiteralValue::Integer(5)),
                         }],
+                        doc_comments: Vec::new(),
                     },
                 ],
             })),
@@ -1680,6 +1699,7 @@ mod tests {
                             FieldMetadata::Constraint(ValidationConstraint::MinLength(3)),
                             FieldMetadata::Constraint(ValidationConstraint::MaxLength(20)),
                         ],
+                        doc_comments: Vec::new(),
                     },
                     GroupEntry {
                         key: Some(GroupKey::Bare("tags".to_string())),
@@ -1692,6 +1712,7 @@ mod tests {
                             FieldMetadata::Constraint(ValidationConstraint::MinItems(1)),
                             FieldMetadata::Constraint(ValidationConstraint::MaxItems(10)),
                         ],
+                        doc_comments: Vec::new(),
                     },
                 ],
             })),
@@ -1716,6 +1737,7 @@ mod tests {
                     metadata: vec![FieldMetadata::Constraint(ValidationConstraint::MinLength(
                         1,
                     ))],
+                    doc_comments: Vec::new(),
                 }],
             })),
         )]);
@@ -1738,6 +1760,7 @@ mod tests {
                             FieldMetadata::Visibility(FieldVisibility::SendOnly),
                             FieldMetadata::Visibility(FieldVisibility::ReceiveOnly),
                         ],
+                        doc_comments: Vec::new(),
                     },
                     GroupEntry {
                         key: Some(GroupKey::Bare("field2".to_string())),
@@ -1747,6 +1770,7 @@ mod tests {
                             field: "nonexistent".to_string(),
                             value: None,
                         }],
+                        doc_comments: Vec::new(),
                     },
                     GroupEntry {
                         key: Some(GroupKey::Bare("field3".to_string())),
@@ -1755,6 +1779,7 @@ mod tests {
                         metadata: vec![FieldMetadata::Constraint(ValidationConstraint::MinLength(
                             0,
                         ))],
+                        doc_comments: Vec::new(),
                     },
                 ],
             })),
@@ -1784,6 +1809,7 @@ mod tests {
                     FieldMetadata::Description(format!("Description for field {i}")),
                     FieldMetadata::Constraint(ValidationConstraint::MinLength(1)),
                 ],
+                doc_comments: Vec::new(),
             });
         }
 
@@ -1806,6 +1832,7 @@ mod tests {
                 metadata: vec![FieldMetadata::Constraint(ValidationConstraint::MinLength(
                     1,
                 ))],
+                doc_comments: Vec::new(),
             }],
         };
 
@@ -1815,6 +1842,7 @@ mod tests {
                 value_type: TypeExpression::Group(inner_group),
                 occurrence: None,
                 metadata: Vec::new(),
+                doc_comments: Vec::new(),
             }],
         };
 
@@ -1840,6 +1868,7 @@ mod tests {
                         field: "self_field".to_string(),
                         value: Some(LiteralValue::Text("trigger".to_string())),
                     }],
+                    doc_comments: Vec::new(),
                 }],
             })),
         )]);
@@ -1877,6 +1906,7 @@ mod tests {
                         output_type: TypeExpression::Reference("UserResponse".to_string()),
                         direction: ServiceDirection::Unidirectional,
                         position: Position::new(3, 1, 0),
+                        doc_comments: Vec::new(),
                     }],
                 }),
             )],
@@ -1900,6 +1930,7 @@ mod tests {
                         value_type: TypeExpression::Builtin("int".to_string()),
                         occurrence: None,
                         metadata: Vec::new(),
+                        doc_comments: Vec::new(),
                     }],
                 })),
             ),
@@ -1912,6 +1943,7 @@ mod tests {
                             value_type: TypeExpression::Reference("BaseType".to_string()),
                             occurrence: None,
                             metadata: Vec::new(),
+                            doc_comments: Vec::new(),
                         },
                         GroupEntry {
                             key: Some(GroupKey::Bare("extension".to_string())),
@@ -1921,6 +1953,7 @@ mod tests {
                                 field: "base.id".to_string(),
                                 value: None,
                             }],
+                            doc_comments: Vec::new(),
                         },
                     ],
                 })),
@@ -1943,6 +1976,7 @@ mod tests {
                 name: "UserType".to_string(),
                 rule_type: RuleType::TypeDef(TypeExpression::Builtin("int".to_string())),
                 position: Position::new(2, 1, 20),
+                doc_comments: Vec::new(),
             },
         ]);
 
@@ -1965,6 +1999,7 @@ mod tests {
                         output_type: TypeExpression::Builtin("text".to_string()),
                         direction: ServiceDirection::Unidirectional,
                         position: Position::new(1, 1, 0),
+                        doc_comments: Vec::new(),
                     },
                     ServiceOperation {
                         name: "process".to_string(),
@@ -1972,6 +2007,7 @@ mod tests {
                         output_type: TypeExpression::Builtin("int".to_string()),
                         direction: ServiceDirection::Unidirectional,
                         position: Position::new(3, 1, 30),
+                        doc_comments: Vec::new(),
                     },
                 ],
             }),
@@ -2154,6 +2190,7 @@ mod tests {
                         },
                         occurrence: None,
                         metadata: vec![],
+                        doc_comments: Vec::new(),
                     },
                     GroupEntry {
                         key: Some(GroupKey::Bare("active".to_string())),
@@ -2163,6 +2200,7 @@ mod tests {
                         },
                         occurrence: Some(Occurrence::Optional),
                         metadata: vec![],
+                        doc_comments: Vec::new(),
                     },
                 ],
             }),
@@ -2206,6 +2244,7 @@ mod tests {
                         },
                         occurrence: None,
                         metadata: vec![],
+                        doc_comments: Vec::new(),
                     },
                     GroupEntry {
                         key: Some(GroupKey::Bare("field2".to_string())),
@@ -2215,6 +2254,7 @@ mod tests {
                         },
                         occurrence: None,
                         metadata: vec![],
+                        doc_comments: Vec::new(),
                     },
                     GroupEntry {
                         key: Some(GroupKey::Bare("field3".to_string())),
@@ -2226,6 +2266,7 @@ mod tests {
                         },
                         occurrence: None,
                         metadata: vec![],
+                        doc_comments: Vec::new(),
                     },
                 ],
             }),
@@ -2283,6 +2324,7 @@ mod tests {
                         output_type: TypeExpression::Builtin("int".to_string()),
                         direction: ServiceDirection::Unidirectional,
                         position: Position::new(1, 1, 0),
+                        doc_comments: Vec::new(),
                     }],
                 }),
             ),
@@ -2295,6 +2337,7 @@ mod tests {
                         output_type: TypeExpression::Builtin("int".to_string()),
                         direction: ServiceDirection::Unidirectional,
                         position: Position::new(2, 1, 20),
+                        doc_comments: Vec::new(),
                     }],
                 }),
             ),
@@ -2320,6 +2363,7 @@ mod tests {
                         output_type: TypeExpression::Reference("UserType".to_string()),
                         direction: ServiceDirection::Unidirectional,
                         position: Position::new(1, 1, 0),
+                        doc_comments: Vec::new(),
                     }],
                 }),
             ),
@@ -2356,7 +2400,11 @@ mod tests {
         let result = validate_spec(&spec);
         assert!(result.is_err());
         let error_msg = result.unwrap_err().to_string();
-        assert!(error_msg.contains("not compatible with type"), "Error message: {}", error_msg);
+        assert!(
+            error_msg.contains("not compatible with type"),
+            "Error message: {}",
+            error_msg
+        );
     }
 
     #[test]
@@ -2395,10 +2443,15 @@ mod tests {
             "Combined",
             RuleType::TypeDef(TypeExpression::Constrained {
                 base_type: Box::new(TypeExpression::Builtin("text".to_string())),
-                constraints: vec![ControlOperator::And(Box::new(TypeExpression::Constrained {
-                    base_type: Box::new(TypeExpression::Builtin("text".to_string())),
-                    constraints: vec![ControlOperator::Size(SizeConstraint::Range { min: 3, max: 10 })],
-                }))],
+                constraints: vec![ControlOperator::And(Box::new(
+                    TypeExpression::Constrained {
+                        base_type: Box::new(TypeExpression::Builtin("text".to_string())),
+                        constraints: vec![ControlOperator::Size(SizeConstraint::Range {
+                            min: 3,
+                            max: 10,
+                        })],
+                    },
+                ))],
             }),
         )]);
 
@@ -2412,11 +2465,13 @@ mod tests {
             "Subset",
             RuleType::TypeDef(TypeExpression::Constrained {
                 base_type: Box::new(TypeExpression::Builtin("int".to_string())),
-                constraints: vec![ControlOperator::Within(Box::new(TypeExpression::Choice(vec![
-                    TypeExpression::Literal(LiteralValue::Integer(1)),
-                    TypeExpression::Literal(LiteralValue::Integer(2)),
-                    TypeExpression::Literal(LiteralValue::Integer(3)),
-                ])))],
+                constraints: vec![ControlOperator::Within(Box::new(TypeExpression::Choice(
+                    vec![
+                        TypeExpression::Literal(LiteralValue::Integer(1)),
+                        TypeExpression::Literal(LiteralValue::Integer(2)),
+                        TypeExpression::Literal(LiteralValue::Integer(3)),
+                    ],
+                )))],
             }),
         )]);
 
