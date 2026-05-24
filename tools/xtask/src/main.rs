@@ -52,6 +52,11 @@ fn build_wasm() -> Result<()> {
             "csilgen-python-generator",
             "--package",
             "csilgen-openapi-generator",
+            // Not a target — a tiny wasm fixture loaded directly by the
+            // wasm-generators integration tests. Building it here keeps those
+            // tests runnable without a manual `cargo build --target wasm32` step.
+            "--package",
+            "csilgen-simple-test",
         ])
         .status()
         .context("Failed to run cargo build")?;
