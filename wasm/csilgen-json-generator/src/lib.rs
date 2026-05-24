@@ -5,7 +5,7 @@
 
 use csilgen_common::{
     CsilFieldMetadata, CsilFieldVisibility, CsilGroupExpression, CsilGroupKey, CsilLiteralValue,
-    CsilOccurrence, CsilRuleType, CsilServiceDefinition, CsilTypeExpression,
+    CsilOccurrence, CsilRuleType, CsilServiceDefinition, CsilServiceDirection, CsilTypeExpression,
     CsilValidationConstraint, GeneratedFile, GenerationStats, GeneratorCapability,
     GeneratorMetadata, GeneratorWarning, WarningLevel, WasmGeneratorInput, WasmGeneratorOutput,
     wasm_interface::*,
@@ -313,8 +313,45 @@ impl<'a> JsonSchemaGenerator<'a> {
         schema.insert("type".to_string(), Value::String("object".to_string()));
 
         let mut operations = Map::new();
+        // Operations skipped because JSON Schema doesn't meaningfully describe
+        // their persistent-channel semantics. We record them as a vendor
+        // extension so downstream tooling knows the schema is intentionally
+        // incomplete for this service.
+        let mut skipped = Vec::<Value>::new();
 
         for operation in &service.operations {
+            if !matches!(operation.direction, CsilServiceDirection::Unidirectional) {
+                let direction_label = match operation.direction {
+                    CsilServiceDirection::Bidirectional => "bidirectional (<->)",
+                    CsilServiceDirection::Reverse => "reverse (<-)",
+                    CsilServiceDirection::Unidirectional => unreachable!(),
+                };
+                self.warnings.push(GeneratorWarning {
+                    level: WarningLevel::Warning,
+                    message: format!(
+                        "Skipping {service_name}.{op}: JSON Schema only meaningfully describes \
+                         request/response (->) operations; {direction_label} operations require a \
+                         persistent channel that JSON Schema cannot express.",
+                        op = operation.name
+                    ),
+                    location: None,
+                    suggestion: Some(
+                        "Generate types from this spec with --target json for the data shapes, \
+                         and use a code target (rust/go/typescript/python) for the service \
+                         channel handlers."
+                            .to_string(),
+                    ),
+                });
+                let mut entry = Map::new();
+                entry.insert("name".to_string(), Value::String(operation.name.clone()));
+                entry.insert(
+                    "direction".to_string(),
+                    Value::String(direction_label.to_string()),
+                );
+                skipped.push(Value::Object(entry));
+                continue;
+            }
+
             let mut op_schema = Map::new();
             op_schema.insert("type".to_string(), Value::String("object".to_string()));
             op_schema.insert(
@@ -324,11 +361,9 @@ impl<'a> JsonSchemaGenerator<'a> {
 
             let mut op_properties = Map::new();
 
-            // Input schema
             let input_schema = self.generate_type_schema(&operation.input_type)?;
             op_properties.insert("input".to_string(), input_schema);
 
-            // Output schema
             let output_schema = self.generate_type_schema(&operation.output_type)?;
             op_properties.insert("output".to_string(), output_schema);
 
@@ -345,6 +380,12 @@ impl<'a> JsonSchemaGenerator<'a> {
         }
 
         schema.insert("properties".to_string(), Value::Object(operations));
+        if !skipped.is_empty() {
+            schema.insert(
+                "x-csil-skipped-operations".to_string(),
+                Value::Array(skipped),
+            );
+        }
 
         Ok(Value::Object(schema))
     }
@@ -967,5 +1008,109 @@ mod tests {
         assert_eq!(output.files.len(), 1);
         assert_eq!(output.stats.files_generated, 1);
         assert_eq!(output.stats.fields_with_metadata_count, 2);
+    }
+
+    #[test]
+    fn nonunidirectional_ops_are_skipped_with_warning() {
+        let mut input = create_test_input();
+        input.csil_spec.rules.push(CsilRule {
+            name: "ChatService".to_string(),
+            rule_type: CsilRuleType::ServiceDef(CsilServiceDefinition {
+                operations: vec![
+                    CsilServiceOperation {
+                        name: "send_message".to_string(),
+                        input_type: CsilTypeExpression::Reference("User".to_string()),
+                        output_type: CsilTypeExpression::Reference("User".to_string()),
+                        direction: CsilServiceDirection::Unidirectional,
+                        position: CsilPosition {
+                            line: 1,
+                            column: 1,
+                            offset: 0,
+                        },
+                        doc_comments: Vec::new(),
+                    },
+                    CsilServiceOperation {
+                        name: "subscribe".to_string(),
+                        input_type: CsilTypeExpression::Reference("User".to_string()),
+                        output_type: CsilTypeExpression::Reference("User".to_string()),
+                        direction: CsilServiceDirection::Bidirectional,
+                        position: CsilPosition {
+                            line: 2,
+                            column: 1,
+                            offset: 0,
+                        },
+                        doc_comments: Vec::new(),
+                    },
+                    CsilServiceOperation {
+                        name: "notify".to_string(),
+                        input_type: CsilTypeExpression::Reference("User".to_string()),
+                        output_type: CsilTypeExpression::Reference("User".to_string()),
+                        direction: CsilServiceDirection::Reverse,
+                        position: CsilPosition {
+                            line: 3,
+                            column: 1,
+                            offset: 0,
+                        },
+                        doc_comments: Vec::new(),
+                    },
+                ],
+            }),
+            position: CsilPosition {
+                line: 1,
+                column: 1,
+                offset: 0,
+            },
+            doc_comments: Vec::new(),
+        });
+        input.csil_spec.service_count = 1;
+
+        let mut generator = JsonSchemaGenerator::new(&input);
+        let service = match &input.csil_spec.rules.last().unwrap().rule_type {
+            CsilRuleType::ServiceDef(s) => s,
+            _ => unreachable!(),
+        };
+        let schema = generator
+            .generate_service_schema(service, "ChatService")
+            .unwrap();
+
+        let obj = match &schema {
+            Value::Object(o) => o,
+            _ => panic!("expected object"),
+        };
+
+        // Unidirectional op stays in `properties`; bidi/reverse are skipped.
+        let properties = obj
+            .get("properties")
+            .and_then(|v| v.as_object())
+            .expect("properties");
+        assert!(properties.contains_key("send_message"));
+        assert!(!properties.contains_key("subscribe"));
+        assert!(!properties.contains_key("notify"));
+
+        // Skipped ops surface as a vendor extension so consumers know the
+        // schema is intentionally incomplete for those operations.
+        let skipped = obj
+            .get("x-csil-skipped-operations")
+            .and_then(|v| v.as_array())
+            .expect("x-csil-skipped-operations array");
+        assert_eq!(skipped.len(), 2);
+        let names: Vec<&str> = skipped
+            .iter()
+            .filter_map(|v| v.get("name").and_then(|n| n.as_str()))
+            .collect();
+        assert!(names.contains(&"subscribe"));
+        assert!(names.contains(&"notify"));
+
+        // One warning per skipped op, naming both the service and the op.
+        let warning_text: String = generator
+            .warnings
+            .iter()
+            .map(|w| w.message.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(warning_text.contains("ChatService.subscribe"));
+        assert!(warning_text.contains("ChatService.notify"));
+        assert!(warning_text.contains("bidirectional"));
+        assert!(warning_text.contains("reverse"));
     }
 }

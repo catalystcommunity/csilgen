@@ -11,7 +11,7 @@ Flow is similar to protocgen for protobufs.
 
 ## Current Status
 
-The core architecture is in place and the CLI is functional end-to-end: parsing, validation, formatting, linting, breaking-change detection, and code generation for Rust, Go, TypeScript, Python, JSON Schema, and OpenAPI all work today. See the [detailed Implementation Status](#implementation-status) below for what's polished vs. what's deferred to follow-ups (tracked in `docs/csilgen-requests/`).
+The core architecture is in place and the CLI is functional end-to-end: parsing, validation, formatting, linting, breaking-change detection, and code generation for Rust, Go, TypeScript, Python, JSON Schema, and OpenAPI all work today. See the [detailed Implementation Status](#implementation-status) below for what's polished vs. what's still on the roadmap.
 
 ## Current Usage
 
@@ -99,8 +99,6 @@ See the examples directory for sample CSIL files to experiment with.
 - **Testing**: 465+ tests across the workspace.
 
 ### 🔄 Deferred / partial
-- **OpenAPI generator internals** still consume the core AST via a `Serialized → Core` shim in `wasm/csilgen-openapi-generator/src/wasm.rs`. Refactoring its body to operate on the serialized form directly (matching the other targets) is captured in `docs/csilgen-requests/openapi-generator-realignment.md`.
-- **JSON Schema generator's bidirectional handling**: JSON Schema doesn't model service operations richly; current behavior is documented in `docs/csilgen-requests/json-generator-realignment.md`.
 - **Additional CBOR constraint operators** (`.eq`, `.ne`, `.bits`, `.and`, `.within`, encoding/base operators) — see `csil-spec.md` for the supported subset.
 - **Performance optimizations** for very large schemas.
 

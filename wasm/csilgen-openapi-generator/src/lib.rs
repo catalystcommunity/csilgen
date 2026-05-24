@@ -1,40 +1,48 @@
 //! OpenAPI specification generator for csilgen (WASM module).
 //!
 //! Discovered dynamically as `--target openapi` from
-//! `csilgen_openapi_generator.wasm`. The wasm entry points live in `wasm.rs`
-//! and call `generate_openapi_spec` after converting the serialized input
-//! into the core AST. The internals are unchanged from when this crate lived
-//! under `crates/core_generators/`; refactoring them to consume the
-//! serialized form directly is captured in `docs/csilgen-requests/`.
+//! `csilgen_openapi_generator.wasm`. Operates directly on
+//! `csilgen_common::CsilSpecSerialized` like the other live generators — no
+//! `csilgen-core` dependency, no `Serialized → Core` shim.
 
 mod wasm;
 
-use csilgen_common::{GeneratedFile, GeneratedFiles, GeneratorConfig, Result};
-use csilgen_core::ast::{
-    CsilSpec, FieldVisibility, GroupEntry, GroupKey, LiteralValue, Occurrence, RuleType,
-    ServiceDefinition, ServiceDirection, ServiceOperation, TypeExpression, ValidationConstraint,
+use csilgen_common::{
+    CsilControlOperator, CsilFieldMetadata, CsilFieldVisibility, CsilGroupEntry, CsilGroupKey,
+    CsilLiteralValue, CsilOccurrence, CsilRuleType, CsilServiceDefinition, CsilServiceDirection,
+    CsilServiceOperation, CsilSizeConstraint, CsilSpecSerialized, CsilTypeExpression,
+    CsilValidationConstraint, GeneratedFile, GeneratedFiles, GeneratorConfig, GeneratorWarning,
+    Result, WarningLevel,
 };
 use serde_json::{Map, Value, json};
 use std::collections::HashMap;
 
-/// Generate OpenAPI specification from CSIL specification
-pub fn generate_openapi_spec(spec: &CsilSpec, config: &GeneratorConfig) -> Result<GeneratedFiles> {
+/// Generate an OpenAPI specification from a CSIL specification, along with any
+/// warnings raised during generation (e.g. operations OpenAPI cannot natively
+/// model — see `generate_operation_path`).
+pub fn generate_openapi_spec(
+    spec: &CsilSpecSerialized,
+    config: &GeneratorConfig,
+) -> Result<(GeneratedFiles, Vec<GeneratorWarning>)> {
     let mut generator = OpenApiGenerator::new(config);
-    generator.generate(spec)
+    let files = generator.generate(spec)?;
+    Ok((files, generator.warnings))
 }
 
 struct OpenApiGenerator {
     config: GeneratorConfig,
+    warnings: Vec<GeneratorWarning>,
 }
 
 impl OpenApiGenerator {
     fn new(config: &GeneratorConfig) -> Self {
         Self {
             config: config.clone(),
+            warnings: Vec::new(),
         }
     }
 
-    fn generate(&mut self, spec: &CsilSpec) -> Result<GeneratedFiles> {
+    fn generate(&mut self, spec: &CsilSpecSerialized) -> Result<GeneratedFiles> {
         let mut openapi_spec = json!({
             "openapi": "3.0.3",
             "info": {
@@ -59,25 +67,29 @@ impl OpenApiGenerator {
 
         for rule in &spec.rules {
             match &rule.rule_type {
-                RuleType::TypeDef(type_expr) => {
+                CsilRuleType::TypeDef(type_expr) => {
                     type_definitions.insert(rule.name.clone(), type_expr.clone());
                 }
-                RuleType::GroupDef(group_expr) => {
-                    type_definitions
-                        .insert(rule.name.clone(), TypeExpression::Group(group_expr.clone()));
+                CsilRuleType::GroupDef(group_expr) => {
+                    type_definitions.insert(
+                        rule.name.clone(),
+                        CsilTypeExpression::Group(group_expr.clone()),
+                    );
                 }
-                RuleType::ServiceDef(service_def) => {
+                CsilRuleType::ServiceDef(service_def) => {
                     services.push((rule.name.clone(), service_def));
                 }
-                RuleType::TypeChoice(choices) => {
-                    type_definitions
-                        .insert(rule.name.clone(), TypeExpression::Choice(choices.clone()));
+                CsilRuleType::TypeChoice(choices) => {
+                    type_definitions.insert(
+                        rule.name.clone(),
+                        CsilTypeExpression::Choice(choices.clone()),
+                    );
                 }
-                RuleType::GroupChoice(groups) => {
+                CsilRuleType::GroupChoice(groups) => {
                     if let Some(first_group) = groups.first() {
                         type_definitions.insert(
                             rule.name.clone(),
-                            TypeExpression::Group(first_group.clone()),
+                            CsilTypeExpression::Group(first_group.clone()),
                         );
                     }
                 }
@@ -103,7 +115,7 @@ impl OpenApiGenerator {
     fn generate_schemas(
         &self,
         openapi_spec: &mut Value,
-        type_definitions: &HashMap<String, TypeExpression>,
+        type_definitions: &HashMap<String, CsilTypeExpression>,
     ) -> Result<()> {
         let schemas = openapi_spec
             .get_mut("components")
@@ -119,10 +131,10 @@ impl OpenApiGenerator {
     }
 
     fn generate_paths(
-        &self,
+        &mut self,
         openapi_spec: &mut Value,
-        services: &[(String, &ServiceDefinition)],
-        type_definitions: &HashMap<String, TypeExpression>,
+        services: &[(String, &CsilServiceDefinition)],
+        type_definitions: &HashMap<String, CsilTypeExpression>,
     ) -> Result<()> {
         let paths = openapi_spec.get_mut("paths").unwrap();
 
@@ -136,25 +148,55 @@ impl OpenApiGenerator {
     }
 
     fn generate_operation_path(
-        &self,
+        &mut self,
         paths: &mut Value,
         service_name: &str,
-        operation: &ServiceOperation,
-        type_definitions: &HashMap<String, TypeExpression>,
+        operation: &CsilServiceOperation,
+        type_definitions: &HashMap<String, CsilTypeExpression>,
     ) -> Result<()> {
         let path = format!("/{}/{}", service_name.to_lowercase(), operation.name);
-        let method = match operation.direction {
-            ServiceDirection::Unidirectional => "post",
-            ServiceDirection::Bidirectional => "post",
-            ServiceDirection::Reverse => "get",
+        // OpenAPI describes HTTP. `->` maps to a request/response POST cleanly;
+        // `<->` and `<-` need a persistent channel that OpenAPI cannot model
+        // natively, so we surface a warning and tag the operation with
+        // `x-csil-direction` so consumers know the HTTP shape is a documentation
+        // placeholder rather than a faithful spec.
+        let (method, csil_direction) = match operation.direction {
+            CsilServiceDirection::Unidirectional => ("post", None),
+            CsilServiceDirection::Bidirectional => ("post", Some("bidirectional")),
+            CsilServiceDirection::Reverse => ("get", Some("reverse")),
         };
+
+        if let Some(direction_label) = csil_direction {
+            self.warnings.push(GeneratorWarning {
+                level: WarningLevel::Warning,
+                message: format!(
+                    "{service_name}.{op}: OpenAPI doesn't natively model {direction_label} \
+                     ({arrow}) operations; the generated HTTP {method} is a documentation \
+                     placeholder. The real semantics require a persistent channel (e.g. \
+                     WebSocket). The operation carries `x-csil-direction: \"{direction_label}\"` \
+                     so consumers can detect it.",
+                    op = operation.name,
+                    arrow = match operation.direction {
+                        CsilServiceDirection::Bidirectional => "<->",
+                        CsilServiceDirection::Reverse => "<-",
+                        CsilServiceDirection::Unidirectional => unreachable!(),
+                    },
+                ),
+                location: None,
+                suggestion: Some(
+                    "Use a code target (rust/go/typescript/python) to generate the actual \
+                     channel handlers + router for this operation."
+                        .to_string(),
+                ),
+            });
+        }
 
         let request_schema =
             self.type_expression_to_schema(&operation.input_type, type_definitions)?;
         let response_schema =
             self.type_expression_to_schema(&operation.output_type, type_definitions)?;
 
-        let operation_spec = json!({
+        let mut operation_spec = json!({
             "summary": format!("{} operation", operation.name),
             "operationId": format!("{}_{}", service_name.to_lowercase(), operation.name),
             "requestBody": {
@@ -182,6 +224,9 @@ impl OpenApiGenerator {
                 }
             }
         });
+        if let Some(direction_label) = csil_direction {
+            operation_spec["x-csil-direction"] = json!(direction_label);
+        }
 
         if paths.get(&path).is_none() {
             paths[&path] = json!({});
@@ -194,15 +239,17 @@ impl OpenApiGenerator {
 
     fn type_expression_to_schema(
         &self,
-        type_expr: &TypeExpression,
-        type_definitions: &HashMap<String, TypeExpression>,
+        type_expr: &CsilTypeExpression,
+        type_definitions: &HashMap<String, CsilTypeExpression>,
     ) -> Result<Value> {
         match type_expr {
-            TypeExpression::Builtin(builtin_type) => Ok(self.builtin_type_to_schema(builtin_type)),
-            TypeExpression::Reference(ref_name) => Ok(json!({
+            CsilTypeExpression::Builtin(builtin_type) => {
+                Ok(self.builtin_type_to_schema(builtin_type))
+            }
+            CsilTypeExpression::Reference(ref_name) => Ok(json!({
                 "$ref": format!("#/components/schemas/{}", ref_name)
             })),
-            TypeExpression::Array {
+            CsilTypeExpression::Array {
                 element_type,
                 occurrence,
             } => {
@@ -219,7 +266,7 @@ impl OpenApiGenerator {
 
                 Ok(array_schema)
             }
-            TypeExpression::Map {
+            CsilTypeExpression::Map {
                 key: _,
                 value,
                 occurrence,
@@ -237,7 +284,7 @@ impl OpenApiGenerator {
 
                 Ok(object_schema)
             }
-            TypeExpression::Group(group_expr) => {
+            CsilTypeExpression::Group(group_expr) => {
                 let mut properties = Map::new();
                 let mut required = Vec::new();
 
@@ -268,7 +315,7 @@ impl OpenApiGenerator {
 
                 Ok(schema)
             }
-            TypeExpression::Choice(choices) => {
+            CsilTypeExpression::Choice(choices) => {
                 let choice_schemas: Result<Vec<Value>> = choices
                     .iter()
                     .map(|choice| self.type_expression_to_schema(choice, type_definitions))
@@ -278,7 +325,7 @@ impl OpenApiGenerator {
                     "oneOf": choice_schemas?
                 }))
             }
-            TypeExpression::Range {
+            CsilTypeExpression::Range {
                 start,
                 end,
                 inclusive: _,
@@ -297,9 +344,9 @@ impl OpenApiGenerator {
 
                 Ok(schema)
             }
-            TypeExpression::Literal(literal) => Ok(self.literal_to_schema(literal)),
-            TypeExpression::Socket(_) | TypeExpression::Plug(_) => Ok(json!({})),
-            TypeExpression::Constrained {
+            CsilTypeExpression::Literal(literal) => Ok(self.literal_to_schema(literal)),
+            CsilTypeExpression::Socket(_) | CsilTypeExpression::Plug(_) => Ok(json!({})),
+            CsilTypeExpression::Constrained {
                 base_type,
                 constraints,
             } => {
@@ -308,9 +355,9 @@ impl OpenApiGenerator {
                 // Apply constraints to the schema
                 for constraint in constraints {
                     match constraint {
-                        csilgen_core::ast::ControlOperator::Size(size_constraint) => {
+                        CsilControlOperator::Size(size_constraint) => {
                             match size_constraint {
-                                csilgen_core::ast::SizeConstraint::Exact(val) => {
+                                CsilSizeConstraint::Exact(val) => {
                                     if schema["type"] == "string" {
                                         schema["minLength"] = json!(val);
                                         schema["maxLength"] = json!(val);
@@ -319,7 +366,7 @@ impl OpenApiGenerator {
                                         schema["maxItems"] = json!(val);
                                     }
                                 }
-                                csilgen_core::ast::SizeConstraint::Range { min, max } => {
+                                CsilSizeConstraint::Range { min, max } => {
                                     if schema["type"] == "string" {
                                         schema["minLength"] = json!(min);
                                         schema["maxLength"] = json!(max);
@@ -328,14 +375,14 @@ impl OpenApiGenerator {
                                         schema["maxItems"] = json!(max);
                                     }
                                 }
-                                csilgen_core::ast::SizeConstraint::Min(val) => {
+                                CsilSizeConstraint::Min(val) => {
                                     if schema["type"] == "string" {
                                         schema["minLength"] = json!(val);
                                     } else if schema["type"] == "array" {
                                         schema["minItems"] = json!(val);
                                     }
                                 }
-                                csilgen_core::ast::SizeConstraint::Max(val) => {
+                                CsilSizeConstraint::Max(val) => {
                                     if schema["type"] == "string" {
                                         schema["maxLength"] = json!(val);
                                     } else if schema["type"] == "array" {
@@ -344,57 +391,57 @@ impl OpenApiGenerator {
                                 }
                             }
                         }
-                        csilgen_core::ast::ControlOperator::Regex(pattern)
+                        CsilControlOperator::Regex(pattern)
                             if schema["type"] == "string" => {
                                 schema["pattern"] = json!(pattern);
                             }
-                        csilgen_core::ast::ControlOperator::Default(value) => {
+                        CsilControlOperator::Default(value) => {
                             schema["default"] = self.literal_to_json_value(value);
                         }
-                        csilgen_core::ast::ControlOperator::GreaterEqual(value) => {
-                            if let csilgen_core::ast::LiteralValue::Integer(i) = value {
+                        CsilControlOperator::GreaterEqual(value) => {
+                            if let CsilLiteralValue::Integer(i) = value {
                                 schema["minimum"] = json!(i);
-                            } else if let csilgen_core::ast::LiteralValue::Float(f) = value {
+                            } else if let CsilLiteralValue::Float(f) = value {
                                 schema["minimum"] = json!(f);
                             }
                         }
-                        csilgen_core::ast::ControlOperator::LessEqual(value) => {
-                            if let csilgen_core::ast::LiteralValue::Integer(i) = value {
+                        CsilControlOperator::LessEqual(value) => {
+                            if let CsilLiteralValue::Integer(i) = value {
                                 schema["maximum"] = json!(i);
-                            } else if let csilgen_core::ast::LiteralValue::Float(f) = value {
+                            } else if let CsilLiteralValue::Float(f) = value {
                                 schema["maximum"] = json!(f);
                             }
                         }
-                        csilgen_core::ast::ControlOperator::GreaterThan(value) => {
-                            if let csilgen_core::ast::LiteralValue::Integer(i) = value {
+                        CsilControlOperator::GreaterThan(value) => {
+                            if let CsilLiteralValue::Integer(i) = value {
                                 schema["exclusiveMinimum"] = json!(true);
                                 schema["minimum"] = json!(i);
-                            } else if let csilgen_core::ast::LiteralValue::Float(f) = value {
+                            } else if let CsilLiteralValue::Float(f) = value {
                                 schema["exclusiveMinimum"] = json!(true);
                                 schema["minimum"] = json!(f);
                             }
                         }
-                        csilgen_core::ast::ControlOperator::LessThan(value) => {
-                            if let csilgen_core::ast::LiteralValue::Integer(i) = value {
+                        CsilControlOperator::LessThan(value) => {
+                            if let CsilLiteralValue::Integer(i) = value {
                                 schema["exclusiveMaximum"] = json!(true);
                                 schema["maximum"] = json!(i);
-                            } else if let csilgen_core::ast::LiteralValue::Float(f) = value {
+                            } else if let CsilLiteralValue::Float(f) = value {
                                 schema["exclusiveMaximum"] = json!(true);
                                 schema["maximum"] = json!(f);
                             }
                         }
-                        csilgen_core::ast::ControlOperator::Json
+                        CsilControlOperator::Json
                             // For .json constraint in OpenAPI, we can use format
                             if schema["type"] == "string" => {
                                 schema["format"] = json!("json");
                             }
-                        csilgen_core::ast::ControlOperator::Cbor
+                        CsilControlOperator::Cbor
                             // For .cbor constraint in OpenAPI, we can use format
                             if schema["type"] == "string" => {
                                 schema["format"] = json!("byte");
                                 schema["contentMediaType"] = json!("application/cbor");
                             }
-                        csilgen_core::ast::ControlOperator::Cborseq
+                        CsilControlOperator::Cborseq
                             // For .cborseq constraint in OpenAPI, we can use format
                             if schema["type"] == "string" => {
                                 schema["format"] = json!("byte");
@@ -412,31 +459,31 @@ impl OpenApiGenerator {
 
     fn generate_property_schema(
         &self,
-        entry: &GroupEntry,
-        type_definitions: &HashMap<String, TypeExpression>,
+        entry: &CsilGroupEntry,
+        type_definitions: &HashMap<String, CsilTypeExpression>,
     ) -> Result<Value> {
         let mut schema = self.type_expression_to_schema(&entry.value_type, type_definitions)?;
 
         for metadata in &entry.metadata {
             match metadata {
-                csilgen_core::ast::FieldMetadata::Visibility(visibility) => match visibility {
-                    FieldVisibility::SendOnly => {
+                CsilFieldMetadata::Visibility(visibility) => match visibility {
+                    CsilFieldVisibility::SendOnly => {
                         schema["description"] =
                             json!("Send-only field (not included in responses)");
                     }
-                    FieldVisibility::ReceiveOnly => {
+                    CsilFieldVisibility::ReceiveOnly => {
                         schema["description"] =
                             json!("Receive-only field (not included in requests)");
                     }
-                    FieldVisibility::Bidirectional => {}
+                    CsilFieldVisibility::Bidirectional => {}
                 },
-                csilgen_core::ast::FieldMetadata::Constraint(constraint) => {
+                CsilFieldMetadata::Constraint(constraint) => {
                     self.add_validation_constraint(&mut schema, constraint);
                 }
-                csilgen_core::ast::FieldMetadata::Description(desc) => {
+                CsilFieldMetadata::Description(desc) => {
                     schema["description"] = json!(desc);
                 }
-                csilgen_core::ast::FieldMetadata::DependsOn { field, value } => {
+                CsilFieldMetadata::DependsOn { field, value } => {
                     let dependency_desc = if let Some(val) = value {
                         format!("Depends on field '{field}' having value '{val:?}'")
                     } else {
@@ -454,7 +501,7 @@ impl OpenApiGenerator {
                         schema["description"] = json!(dependency_desc);
                     }
                 }
-                csilgen_core::ast::FieldMetadata::Custom {
+                CsilFieldMetadata::Custom {
                     name,
                     parameters: _,
                 } => {
@@ -508,33 +555,33 @@ impl OpenApiGenerator {
         }
     }
 
-    fn literal_to_schema(&self, literal: &LiteralValue) -> Value {
+    fn literal_to_schema(&self, literal: &CsilLiteralValue) -> Value {
         match literal {
-            LiteralValue::Integer(val) => json!({
+            CsilLiteralValue::Integer(val) => json!({
                 "type": "integer",
                 "enum": [val]
             }),
-            LiteralValue::Float(val) => json!({
+            CsilLiteralValue::Float(val) => json!({
                 "type": "number",
                 "enum": [val]
             }),
-            LiteralValue::Text(val) => json!({
+            CsilLiteralValue::Text(val) => json!({
                 "type": "string",
                 "enum": [val]
             }),
-            LiteralValue::Bool(val) => json!({
+            CsilLiteralValue::Bool(val) => json!({
                 "type": "boolean",
                 "enum": [val]
             }),
-            LiteralValue::Null => json!({
+            CsilLiteralValue::Null => json!({
                 "type": "null"
             }),
-            LiteralValue::Bytes(val) => json!({
+            CsilLiteralValue::Bytes(val) => json!({
                 "type": "string",
                 "format": "byte",
                 "description": format!("Byte array of length {}", val.len())
             }),
-            LiteralValue::Array(elements) => {
+            CsilLiteralValue::Array(elements) => {
                 let json_elements: Vec<Value> = elements
                     .iter()
                     .map(|e| self.literal_to_json_value(e))
@@ -547,15 +594,15 @@ impl OpenApiGenerator {
         }
     }
 
-    fn literal_to_json_value(&self, literal: &LiteralValue) -> Value {
+    fn literal_to_json_value(&self, literal: &CsilLiteralValue) -> Value {
         match literal {
-            LiteralValue::Integer(val) => json!(val),
-            LiteralValue::Float(val) => json!(val),
-            LiteralValue::Text(val) => json!(val),
-            LiteralValue::Bool(val) => json!(val),
-            LiteralValue::Null => json!(null),
-            LiteralValue::Bytes(val) => json!(val),
-            LiteralValue::Array(elements) => {
+            CsilLiteralValue::Integer(val) => json!(val),
+            CsilLiteralValue::Float(val) => json!(val),
+            CsilLiteralValue::Text(val) => json!(val),
+            CsilLiteralValue::Bool(val) => json!(val),
+            CsilLiteralValue::Null => json!(null),
+            CsilLiteralValue::Bytes(val) => json!(val),
+            CsilLiteralValue::Array(elements) => {
                 let json_elements: Vec<Value> = elements
                     .iter()
                     .map(|e| self.literal_to_json_value(e))
@@ -565,38 +612,38 @@ impl OpenApiGenerator {
         }
     }
 
-    fn group_key_to_string(&self, key: &GroupKey) -> String {
+    fn group_key_to_string(&self, key: &CsilGroupKey) -> String {
         match key {
-            GroupKey::Bare(name) => name.clone(),
-            GroupKey::Type(_) => "typed_key".to_string(),
-            GroupKey::Literal(literal) => match literal {
-                LiteralValue::Text(s) => s.clone(),
-                LiteralValue::Integer(i) => i.to_string(),
+            CsilGroupKey::Bare(name) => name.clone(),
+            CsilGroupKey::Type(_) => "typed_key".to_string(),
+            CsilGroupKey::Literal(literal) => match literal {
+                CsilLiteralValue::Text(s) => s.clone(),
+                CsilLiteralValue::Integer(i) => i.to_string(),
                 _ => "literal_key".to_string(),
             },
         }
     }
 
-    fn add_occurrence_constraints(&self, schema: &mut Value, occurrence: &Occurrence) {
+    fn add_occurrence_constraints(&self, schema: &mut Value, occurrence: &CsilOccurrence) {
         match occurrence {
-            Occurrence::Optional => {}
-            Occurrence::ZeroOrMore => {
+            CsilOccurrence::Optional => {}
+            CsilOccurrence::ZeroOrMore => {
                 if schema["type"] == "array" {
                     schema["minItems"] = json!(0);
                 }
             }
-            Occurrence::OneOrMore => {
+            CsilOccurrence::OneOrMore => {
                 if schema["type"] == "array" {
                     schema["minItems"] = json!(1);
                 }
             }
-            Occurrence::Exact(count) => {
+            CsilOccurrence::Exact(count) => {
                 if schema["type"] == "array" {
                     schema["minItems"] = json!(count);
                     schema["maxItems"] = json!(count);
                 }
             }
-            Occurrence::Range { min, max } => {
+            CsilOccurrence::Range { min, max } => {
                 if schema["type"] == "array" {
                     if let Some(min_val) = min {
                         schema["minItems"] = json!(min_val);
@@ -609,43 +656,43 @@ impl OpenApiGenerator {
         }
     }
 
-    fn add_validation_constraint(&self, schema: &mut Value, constraint: &ValidationConstraint) {
+    fn add_validation_constraint(&self, schema: &mut Value, constraint: &CsilValidationConstraint) {
         match constraint {
-            ValidationConstraint::MinLength(min) => {
+            CsilValidationConstraint::MinLength(min) => {
                 schema["minLength"] = json!(min);
             }
-            ValidationConstraint::MaxLength(max) => {
+            CsilValidationConstraint::MaxLength(max) => {
                 schema["maxLength"] = json!(max);
             }
-            ValidationConstraint::MinItems(min) => {
+            CsilValidationConstraint::MinItems(min) => {
                 if schema["type"] == "array" {
                     schema["minItems"] = json!(min);
                 } else if schema["type"] == "object" {
                     schema["minProperties"] = json!(min);
                 }
             }
-            ValidationConstraint::MaxItems(max) => {
+            CsilValidationConstraint::MaxItems(max) => {
                 if schema["type"] == "array" {
                     schema["maxItems"] = json!(max);
                 } else if schema["type"] == "object" {
                     schema["maxProperties"] = json!(max);
                 }
             }
-            ValidationConstraint::MinValue(value) => {
+            CsilValidationConstraint::MinValue(value) => {
                 schema["minimum"] = match value {
-                    LiteralValue::Integer(v) => json!(v),
-                    LiteralValue::Float(v) => json!(v),
+                    CsilLiteralValue::Integer(v) => json!(v),
+                    CsilLiteralValue::Float(v) => json!(v),
                     _ => json!(null),
                 };
             }
-            ValidationConstraint::MaxValue(value) => {
+            CsilValidationConstraint::MaxValue(value) => {
                 schema["maximum"] = match value {
-                    LiteralValue::Integer(v) => json!(v),
-                    LiteralValue::Float(v) => json!(v),
+                    CsilLiteralValue::Integer(v) => json!(v),
+                    CsilLiteralValue::Float(v) => json!(v),
                     _ => json!(null),
                 };
             }
-            ValidationConstraint::Custom { name, value } => {
+            CsilValidationConstraint::Custom { name, value } => {
                 let constraint_desc = format!("Custom constraint '{name}': {value:?}");
                 if let Some(existing_desc) = schema.get("description") {
                     let combined = format!(
@@ -661,10 +708,10 @@ impl OpenApiGenerator {
         }
     }
 
-    fn is_optional_occurrence(&self, occurrence: &Option<Occurrence>) -> bool {
+    fn is_optional_occurrence(&self, occurrence: &Option<CsilOccurrence>) -> bool {
         matches!(
             occurrence,
-            Some(Occurrence::Optional) | Some(Occurrence::ZeroOrMore)
+            Some(CsilOccurrence::Optional) | Some(CsilOccurrence::ZeroOrMore)
         )
     }
 }
@@ -672,12 +719,12 @@ impl OpenApiGenerator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use csilgen_core::ast::{
-        CsilSpec, FieldMetadata, FieldVisibility, GroupEntry, GroupExpression, GroupKey,
-        LiteralValue, Occurrence, Rule, RuleType, ServiceDefinition, ServiceDirection,
-        ServiceOperation, TypeExpression, ValidationConstraint,
+    use csilgen_common::{
+        CsilFieldMetadata, CsilFieldVisibility, CsilGroupEntry, CsilGroupExpression, CsilGroupKey,
+        CsilLiteralValue, CsilOccurrence, CsilPosition, CsilRule, CsilRuleType,
+        CsilServiceDefinition, CsilServiceDirection, CsilServiceOperation, CsilSpecSerialized,
+        CsilTypeExpression, CsilValidationConstraint,
     };
-    use csilgen_core::lexer::Position;
     use std::collections::HashMap;
 
     fn create_test_config() -> GeneratorConfig {
@@ -688,46 +735,58 @@ mod tests {
         }
     }
 
-    fn create_test_position() -> Position {
-        Position {
+    fn create_test_position() -> CsilPosition {
+        CsilPosition {
             line: 1,
             column: 1,
             offset: 0,
         }
     }
 
+    /// Build a `CsilSpecSerialized` from rules, hiding the boilerplate of the
+    /// non-rule fields (`source_content`, the counts) so test fixtures stay
+    /// focused on what they're actually asserting.
+    fn spec_from_rules(rules: Vec<CsilRule>) -> CsilSpecSerialized {
+        let service_count = rules
+            .iter()
+            .filter(|r| matches!(r.rule_type, CsilRuleType::ServiceDef(_)))
+            .count();
+        CsilSpecSerialized {
+            rules,
+            source_content: None,
+            service_count,
+            fields_with_metadata_count: 0,
+        }
+    }
+
     #[test]
     fn test_generate_openapi_spec_with_basic_types() {
-        let spec = CsilSpec {
-            imports: Vec::new(),
-            options: None,
-            rules: vec![Rule {
-                name: "User".to_string(),
-                rule_type: RuleType::GroupDef(GroupExpression {
-                    entries: vec![
-                        GroupEntry {
-                            key: Some(GroupKey::Bare("name".to_string())),
-                            value_type: TypeExpression::Builtin("text".to_string()),
-                            occurrence: None,
-                            metadata: vec![],
-                            doc_comments: Vec::new(),
-                        },
-                        GroupEntry {
-                            key: Some(GroupKey::Bare("age".to_string())),
-                            value_type: TypeExpression::Builtin("int".to_string()),
-                            occurrence: Some(Occurrence::Optional),
-                            metadata: vec![],
-                            doc_comments: Vec::new(),
-                        },
-                    ],
-                }),
-                position: create_test_position(),
-                doc_comments: Vec::new(),
-            }],
-        };
+        let spec = spec_from_rules(vec![CsilRule {
+            name: "User".to_string(),
+            rule_type: CsilRuleType::GroupDef(CsilGroupExpression {
+                entries: vec![
+                    CsilGroupEntry {
+                        key: Some(CsilGroupKey::Bare("name".to_string())),
+                        value_type: CsilTypeExpression::Builtin("text".to_string()),
+                        occurrence: None,
+                        metadata: vec![],
+                        doc_comments: Vec::new(),
+                    },
+                    CsilGroupEntry {
+                        key: Some(CsilGroupKey::Bare("age".to_string())),
+                        value_type: CsilTypeExpression::Builtin("int".to_string()),
+                        occurrence: Some(CsilOccurrence::Optional),
+                        metadata: vec![],
+                        doc_comments: Vec::new(),
+                    },
+                ],
+            }),
+            position: create_test_position(),
+            doc_comments: Vec::new(),
+        }]);
 
         let config = create_test_config();
-        let result = generate_openapi_spec(&spec, &config).unwrap();
+        let (result, _warnings) = generate_openapi_spec(&spec, &config).unwrap();
 
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].path, "openapi.json");
@@ -748,54 +807,50 @@ mod tests {
 
     #[test]
     fn test_generate_openapi_spec_with_service_operations() {
-        let spec = CsilSpec {
-            imports: Vec::new(),
-            options: None,
-            rules: vec![
-                Rule {
-                    name: "User".to_string(),
-                    rule_type: RuleType::GroupDef(GroupExpression {
-                        entries: vec![GroupEntry {
-                            key: Some(GroupKey::Bare("name".to_string())),
-                            value_type: TypeExpression::Builtin("text".to_string()),
-                            occurrence: None,
-                            metadata: vec![],
+        let spec = spec_from_rules(vec![
+            CsilRule {
+                name: "User".to_string(),
+                rule_type: CsilRuleType::GroupDef(CsilGroupExpression {
+                    entries: vec![CsilGroupEntry {
+                        key: Some(CsilGroupKey::Bare("name".to_string())),
+                        value_type: CsilTypeExpression::Builtin("text".to_string()),
+                        occurrence: None,
+                        metadata: vec![],
+                        doc_comments: Vec::new(),
+                    }],
+                }),
+                position: create_test_position(),
+                doc_comments: Vec::new(),
+            },
+            CsilRule {
+                name: "UserService".to_string(),
+                rule_type: CsilRuleType::ServiceDef(CsilServiceDefinition {
+                    operations: vec![
+                        CsilServiceOperation {
+                            name: "create_user".to_string(),
+                            input_type: CsilTypeExpression::Reference("User".to_string()),
+                            output_type: CsilTypeExpression::Reference("User".to_string()),
+                            direction: CsilServiceDirection::Unidirectional,
+                            position: create_test_position(),
                             doc_comments: Vec::new(),
-                        }],
-                    }),
-                    position: create_test_position(),
-                    doc_comments: Vec::new(),
-                },
-                Rule {
-                    name: "UserService".to_string(),
-                    rule_type: RuleType::ServiceDef(ServiceDefinition {
-                        operations: vec![
-                            ServiceOperation {
-                                name: "create_user".to_string(),
-                                input_type: TypeExpression::Reference("User".to_string()),
-                                output_type: TypeExpression::Reference("User".to_string()),
-                                direction: ServiceDirection::Unidirectional,
-                                position: create_test_position(),
-                                doc_comments: Vec::new(),
-                            },
-                            ServiceOperation {
-                                name: "get_user".to_string(),
-                                input_type: TypeExpression::Builtin("text".to_string()),
-                                output_type: TypeExpression::Reference("User".to_string()),
-                                direction: ServiceDirection::Unidirectional,
-                                position: create_test_position(),
-                                doc_comments: Vec::new(),
-                            },
-                        ],
-                    }),
-                    position: create_test_position(),
-                    doc_comments: Vec::new(),
-                },
-            ],
-        };
+                        },
+                        CsilServiceOperation {
+                            name: "get_user".to_string(),
+                            input_type: CsilTypeExpression::Builtin("text".to_string()),
+                            output_type: CsilTypeExpression::Reference("User".to_string()),
+                            direction: CsilServiceDirection::Unidirectional,
+                            position: create_test_position(),
+                            doc_comments: Vec::new(),
+                        },
+                    ],
+                }),
+                position: create_test_position(),
+                doc_comments: Vec::new(),
+            },
+        ]);
 
         let config = create_test_config();
-        let result = generate_openapi_spec(&spec, &config).unwrap();
+        let (result, _warnings) = generate_openapi_spec(&spec, &config).unwrap();
         let openapi_json: Value = serde_json::from_str(&result[0].content).unwrap();
 
         let paths = &openapi_json["paths"];
@@ -817,59 +872,57 @@ mod tests {
 
     #[test]
     fn test_generate_openapi_spec_with_field_metadata() {
-        let spec = CsilSpec {
-            imports: Vec::new(),
-            options: None,
-            rules: vec![Rule {
-                name: "User".to_string(),
-                rule_type: RuleType::GroupDef(GroupExpression {
-                    entries: vec![
-                        GroupEntry {
-                            key: Some(GroupKey::Bare("name".to_string())),
-                            value_type: TypeExpression::Builtin("text".to_string()),
-                            occurrence: None,
-                            metadata: vec![
-                                FieldMetadata::Description("User's full name".to_string()),
-                                FieldMetadata::Constraint(ValidationConstraint::MinLength(2)),
-                            ],
-                            doc_comments: Vec::new(),
-                        },
-                        GroupEntry {
-                            key: Some(GroupKey::Bare("email".to_string())),
-                            value_type: TypeExpression::Builtin("text".to_string()),
-                            occurrence: Some(Occurrence::Optional),
-                            metadata: vec![
-                                FieldMetadata::Visibility(FieldVisibility::SendOnly),
-                                FieldMetadata::Constraint(ValidationConstraint::MaxLength(100)),
-                            ],
-                            doc_comments: Vec::new(),
-                        },
-                        GroupEntry {
-                            key: Some(GroupKey::Bare("secret".to_string())),
-                            value_type: TypeExpression::Builtin("text".to_string()),
-                            occurrence: Some(Occurrence::Optional),
-                            metadata: vec![FieldMetadata::Visibility(FieldVisibility::ReceiveOnly)],
-                            doc_comments: Vec::new(),
-                        },
-                        GroupEntry {
-                            key: Some(GroupKey::Bare("age".to_string())),
-                            value_type: TypeExpression::Builtin("int".to_string()),
-                            occurrence: Some(Occurrence::Optional),
-                            metadata: vec![FieldMetadata::DependsOn {
-                                field: "status".to_string(),
-                                value: Some(LiteralValue::Text("verified".to_string())),
-                            }],
-                            doc_comments: Vec::new(),
-                        },
-                    ],
-                }),
-                position: create_test_position(),
-                doc_comments: Vec::new(),
-            }],
-        };
+        let spec = spec_from_rules(vec![CsilRule {
+            name: "User".to_string(),
+            rule_type: CsilRuleType::GroupDef(CsilGroupExpression {
+                entries: vec![
+                    CsilGroupEntry {
+                        key: Some(CsilGroupKey::Bare("name".to_string())),
+                        value_type: CsilTypeExpression::Builtin("text".to_string()),
+                        occurrence: None,
+                        metadata: vec![
+                            CsilFieldMetadata::Description("User's full name".to_string()),
+                            CsilFieldMetadata::Constraint(CsilValidationConstraint::MinLength(2)),
+                        ],
+                        doc_comments: Vec::new(),
+                    },
+                    CsilGroupEntry {
+                        key: Some(CsilGroupKey::Bare("email".to_string())),
+                        value_type: CsilTypeExpression::Builtin("text".to_string()),
+                        occurrence: Some(CsilOccurrence::Optional),
+                        metadata: vec![
+                            CsilFieldMetadata::Visibility(CsilFieldVisibility::SendOnly),
+                            CsilFieldMetadata::Constraint(CsilValidationConstraint::MaxLength(100)),
+                        ],
+                        doc_comments: Vec::new(),
+                    },
+                    CsilGroupEntry {
+                        key: Some(CsilGroupKey::Bare("secret".to_string())),
+                        value_type: CsilTypeExpression::Builtin("text".to_string()),
+                        occurrence: Some(CsilOccurrence::Optional),
+                        metadata: vec![CsilFieldMetadata::Visibility(
+                            CsilFieldVisibility::ReceiveOnly,
+                        )],
+                        doc_comments: Vec::new(),
+                    },
+                    CsilGroupEntry {
+                        key: Some(CsilGroupKey::Bare("age".to_string())),
+                        value_type: CsilTypeExpression::Builtin("int".to_string()),
+                        occurrence: Some(CsilOccurrence::Optional),
+                        metadata: vec![CsilFieldMetadata::DependsOn {
+                            field: "status".to_string(),
+                            value: Some(CsilLiteralValue::Text("verified".to_string())),
+                        }],
+                        doc_comments: Vec::new(),
+                    },
+                ],
+            }),
+            position: create_test_position(),
+            doc_comments: Vec::new(),
+        }]);
 
         let config = create_test_config();
-        let result = generate_openapi_spec(&spec, &config).unwrap();
+        let (result, _warnings) = generate_openapi_spec(&spec, &config).unwrap();
         let openapi_json: Value = serde_json::from_str(&result[0].content).unwrap();
 
         let user_schema = &openapi_json["components"]["schemas"]["User"];
@@ -902,25 +955,21 @@ mod tests {
 
     #[test]
     fn test_generate_openapi_spec_with_array_types() {
-        let spec = CsilSpec {
-            imports: Vec::new(),
-            options: None,
-            rules: vec![Rule {
-                name: "UserList".to_string(),
-                rule_type: RuleType::TypeDef(TypeExpression::Array {
-                    element_type: Box::new(TypeExpression::Builtin("text".to_string())),
-                    occurrence: Some(Occurrence::Range {
-                        min: Some(1),
-                        max: Some(10),
-                    }),
+        let spec = spec_from_rules(vec![CsilRule {
+            name: "UserList".to_string(),
+            rule_type: CsilRuleType::TypeDef(CsilTypeExpression::Array {
+                element_type: Box::new(CsilTypeExpression::Builtin("text".to_string())),
+                occurrence: Some(CsilOccurrence::Range {
+                    min: Some(1),
+                    max: Some(10),
                 }),
-                position: create_test_position(),
-                doc_comments: Vec::new(),
-            }],
-        };
+            }),
+            position: create_test_position(),
+            doc_comments: Vec::new(),
+        }]);
 
         let config = create_test_config();
-        let result = generate_openapi_spec(&spec, &config).unwrap();
+        let (result, _warnings) = generate_openapi_spec(&spec, &config).unwrap();
         let openapi_json: Value = serde_json::from_str(&result[0].content).unwrap();
 
         let user_list_schema = &openapi_json["components"]["schemas"]["UserList"];
@@ -932,23 +981,19 @@ mod tests {
 
     #[test]
     fn test_generate_openapi_spec_with_map_types() {
-        let spec = CsilSpec {
-            imports: Vec::new(),
-            options: None,
-            rules: vec![Rule {
-                name: "StringMap".to_string(),
-                rule_type: RuleType::TypeDef(TypeExpression::Map {
-                    key: Box::new(TypeExpression::Builtin("text".to_string())),
-                    value: Box::new(TypeExpression::Builtin("int".to_string())),
-                    occurrence: None,
-                }),
-                position: create_test_position(),
-                doc_comments: Vec::new(),
-            }],
-        };
+        let spec = spec_from_rules(vec![CsilRule {
+            name: "StringMap".to_string(),
+            rule_type: CsilRuleType::TypeDef(CsilTypeExpression::Map {
+                key: Box::new(CsilTypeExpression::Builtin("text".to_string())),
+                value: Box::new(CsilTypeExpression::Builtin("int".to_string())),
+                occurrence: None,
+            }),
+            position: create_test_position(),
+            doc_comments: Vec::new(),
+        }]);
 
         let config = create_test_config();
-        let result = generate_openapi_spec(&spec, &config).unwrap();
+        let (result, _warnings) = generate_openapi_spec(&spec, &config).unwrap();
         let openapi_json: Value = serde_json::from_str(&result[0].content).unwrap();
 
         let string_map_schema = &openapi_json["components"]["schemas"]["StringMap"];
@@ -958,22 +1003,18 @@ mod tests {
 
     #[test]
     fn test_generate_openapi_spec_with_choice_types() {
-        let spec = CsilSpec {
-            imports: Vec::new(),
-            options: None,
-            rules: vec![Rule {
-                name: "StringOrInt".to_string(),
-                rule_type: RuleType::TypeChoice(vec![
-                    TypeExpression::Builtin("text".to_string()),
-                    TypeExpression::Builtin("int".to_string()),
-                ]),
-                position: create_test_position(),
-                doc_comments: Vec::new(),
-            }],
-        };
+        let spec = spec_from_rules(vec![CsilRule {
+            name: "StringOrInt".to_string(),
+            rule_type: CsilRuleType::TypeChoice(vec![
+                CsilTypeExpression::Builtin("text".to_string()),
+                CsilTypeExpression::Builtin("int".to_string()),
+            ]),
+            position: create_test_position(),
+            doc_comments: Vec::new(),
+        }]);
 
         let config = create_test_config();
-        let result = generate_openapi_spec(&spec, &config).unwrap();
+        let (result, _warnings) = generate_openapi_spec(&spec, &config).unwrap();
         let openapi_json: Value = serde_json::from_str(&result[0].content).unwrap();
 
         let choice_schema = &openapi_json["components"]["schemas"]["StringOrInt"];
@@ -987,23 +1028,19 @@ mod tests {
 
     #[test]
     fn test_generate_openapi_spec_with_range_types() {
-        let spec = CsilSpec {
-            imports: Vec::new(),
-            options: None,
-            rules: vec![Rule {
-                name: "Age".to_string(),
-                rule_type: RuleType::TypeDef(TypeExpression::Range {
-                    start: Some(0),
-                    end: Some(120),
-                    inclusive: true,
-                }),
-                position: create_test_position(),
-                doc_comments: Vec::new(),
-            }],
-        };
+        let spec = spec_from_rules(vec![CsilRule {
+            name: "Age".to_string(),
+            rule_type: CsilRuleType::TypeDef(CsilTypeExpression::Range {
+                start: Some(0),
+                end: Some(120),
+                inclusive: true,
+            }),
+            position: create_test_position(),
+            doc_comments: Vec::new(),
+        }]);
 
         let config = create_test_config();
-        let result = generate_openapi_spec(&spec, &config).unwrap();
+        let (result, _warnings) = generate_openapi_spec(&spec, &config).unwrap();
         let openapi_json: Value = serde_json::from_str(&result[0].content).unwrap();
 
         let age_schema = &openapi_json["components"]["schemas"]["Age"];
@@ -1014,21 +1051,17 @@ mod tests {
 
     #[test]
     fn test_generate_openapi_spec_with_literal_values() {
-        let spec = CsilSpec {
-            imports: Vec::new(),
-            options: None,
-            rules: vec![Rule {
-                name: "Status".to_string(),
-                rule_type: RuleType::TypeDef(TypeExpression::Literal(LiteralValue::Text(
-                    "active".to_string(),
-                ))),
-                position: create_test_position(),
-                doc_comments: Vec::new(),
-            }],
-        };
+        let spec = spec_from_rules(vec![CsilRule {
+            name: "Status".to_string(),
+            rule_type: CsilRuleType::TypeDef(CsilTypeExpression::Literal(CsilLiteralValue::Text(
+                "active".to_string(),
+            ))),
+            position: create_test_position(),
+            doc_comments: Vec::new(),
+        }]);
 
         let config = create_test_config();
-        let result = generate_openapi_spec(&spec, &config).unwrap();
+        let (result, _warnings) = generate_openapi_spec(&spec, &config).unwrap();
         let openapi_json: Value = serde_json::from_str(&result[0].content).unwrap();
 
         let status_schema = &openapi_json["components"]["schemas"]["Status"];
@@ -1048,13 +1081,9 @@ mod tests {
             .options
             .insert("description".to_string(), json!("A custom API description"));
 
-        let spec = CsilSpec {
-            imports: Vec::new(),
-            options: None,
-            rules: vec![],
-        };
+        let spec = spec_from_rules(vec![]);
 
-        let result = generate_openapi_spec(&spec, &config).unwrap();
+        let (result, _warnings) = generate_openapi_spec(&spec, &config).unwrap();
         let openapi_json: Value = serde_json::from_str(&result[0].content).unwrap();
 
         assert_eq!(openapi_json["info"]["title"], "My Custom API");
@@ -1067,28 +1096,24 @@ mod tests {
 
     #[test]
     fn test_generate_openapi_spec_with_bidirectional_service() {
-        let spec = CsilSpec {
-            imports: Vec::new(),
-            options: None,
-            rules: vec![Rule {
-                name: "NotificationService".to_string(),
-                rule_type: RuleType::ServiceDef(ServiceDefinition {
-                    operations: vec![ServiceOperation {
-                        name: "subscribe".to_string(),
-                        input_type: TypeExpression::Builtin("text".to_string()),
-                        output_type: TypeExpression::Builtin("text".to_string()),
-                        direction: ServiceDirection::Bidirectional,
-                        position: create_test_position(),
-                        doc_comments: Vec::new(),
-                    }],
-                }),
-                position: create_test_position(),
-                doc_comments: Vec::new(),
-            }],
-        };
+        let spec = spec_from_rules(vec![CsilRule {
+            name: "NotificationService".to_string(),
+            rule_type: CsilRuleType::ServiceDef(CsilServiceDefinition {
+                operations: vec![CsilServiceOperation {
+                    name: "subscribe".to_string(),
+                    input_type: CsilTypeExpression::Builtin("text".to_string()),
+                    output_type: CsilTypeExpression::Builtin("text".to_string()),
+                    direction: CsilServiceDirection::Bidirectional,
+                    position: create_test_position(),
+                    doc_comments: Vec::new(),
+                }],
+            }),
+            position: create_test_position(),
+            doc_comments: Vec::new(),
+        }]);
 
         let config = create_test_config();
-        let result = generate_openapi_spec(&spec, &config).unwrap();
+        let (result, _warnings) = generate_openapi_spec(&spec, &config).unwrap();
         let openapi_json: Value = serde_json::from_str(&result[0].content).unwrap();
 
         let subscribe_op = &openapi_json["paths"]["/notificationservice/subscribe"]["post"];
@@ -1098,28 +1123,24 @@ mod tests {
 
     #[test]
     fn test_generate_openapi_spec_with_reverse_service() {
-        let spec = CsilSpec {
-            imports: Vec::new(),
-            options: None,
-            rules: vec![Rule {
-                name: "CallbackService".to_string(),
-                rule_type: RuleType::ServiceDef(ServiceDefinition {
-                    operations: vec![ServiceOperation {
-                        name: "webhook".to_string(),
-                        input_type: TypeExpression::Builtin("text".to_string()),
-                        output_type: TypeExpression::Builtin("text".to_string()),
-                        direction: ServiceDirection::Reverse,
-                        position: create_test_position(),
-                        doc_comments: Vec::new(),
-                    }],
-                }),
-                position: create_test_position(),
-                doc_comments: Vec::new(),
-            }],
-        };
+        let spec = spec_from_rules(vec![CsilRule {
+            name: "CallbackService".to_string(),
+            rule_type: CsilRuleType::ServiceDef(CsilServiceDefinition {
+                operations: vec![CsilServiceOperation {
+                    name: "webhook".to_string(),
+                    input_type: CsilTypeExpression::Builtin("text".to_string()),
+                    output_type: CsilTypeExpression::Builtin("text".to_string()),
+                    direction: CsilServiceDirection::Reverse,
+                    position: create_test_position(),
+                    doc_comments: Vec::new(),
+                }],
+            }),
+            position: create_test_position(),
+            doc_comments: Vec::new(),
+        }]);
 
         let config = create_test_config();
-        let result = generate_openapi_spec(&spec, &config).unwrap();
+        let (result, _warnings) = generate_openapi_spec(&spec, &config).unwrap();
         let openapi_json: Value = serde_json::from_str(&result[0].content).unwrap();
 
         let webhook_op = &openapi_json["paths"]["/callbackservice/webhook"]["get"];
@@ -1140,40 +1161,130 @@ mod tests {
 
     #[test]
     fn test_generate_openapi_spec_validates_json() {
-        let spec = CsilSpec {
-            imports: Vec::new(),
-            options: None,
-            rules: vec![Rule {
-                name: "ComplexType".to_string(),
-                rule_type: RuleType::GroupDef(GroupExpression {
-                    entries: vec![GroupEntry {
-                        key: Some(GroupKey::Bare("nested".to_string())),
-                        value_type: TypeExpression::Array {
-                            element_type: Box::new(TypeExpression::Map {
-                                key: Box::new(TypeExpression::Builtin("text".to_string())),
-                                value: Box::new(TypeExpression::Choice(vec![
-                                    TypeExpression::Builtin("int".to_string()),
-                                    TypeExpression::Builtin("text".to_string()),
-                                ])),
-                                occurrence: None,
-                            }),
-                            occurrence: Some(Occurrence::OneOrMore),
-                        },
-                        occurrence: None,
-                        metadata: vec![],
-                        doc_comments: Vec::new(),
-                    }],
-                }),
-                position: create_test_position(),
-                doc_comments: Vec::new(),
-            }],
-        };
+        let spec = spec_from_rules(vec![CsilRule {
+            name: "ComplexType".to_string(),
+            rule_type: CsilRuleType::GroupDef(CsilGroupExpression {
+                entries: vec![CsilGroupEntry {
+                    key: Some(CsilGroupKey::Bare("nested".to_string())),
+                    value_type: CsilTypeExpression::Array {
+                        element_type: Box::new(CsilTypeExpression::Map {
+                            key: Box::new(CsilTypeExpression::Builtin("text".to_string())),
+                            value: Box::new(CsilTypeExpression::Choice(vec![
+                                CsilTypeExpression::Builtin("int".to_string()),
+                                CsilTypeExpression::Builtin("text".to_string()),
+                            ])),
+                            occurrence: None,
+                        }),
+                        occurrence: Some(CsilOccurrence::OneOrMore),
+                    },
+                    occurrence: None,
+                    metadata: vec![],
+                    doc_comments: Vec::new(),
+                }],
+            }),
+            position: create_test_position(),
+            doc_comments: Vec::new(),
+        }]);
 
         let config = create_test_config();
-        let result = generate_openapi_spec(&spec, &config).unwrap();
+        let (result, _warnings) = generate_openapi_spec(&spec, &config).unwrap();
 
         let parsed_json: Value =
             serde_json::from_str(&result[0].content).expect("Generated JSON should be valid");
         assert_eq!(parsed_json["openapi"], "3.0.3");
+    }
+
+    #[test]
+    fn bidirectional_op_emits_x_csil_direction_and_warning() {
+        let spec = spec_from_rules(vec![CsilRule {
+            name: "Chat".to_string(),
+            rule_type: CsilRuleType::ServiceDef(CsilServiceDefinition {
+                operations: vec![CsilServiceOperation {
+                    name: "subscribe".to_string(),
+                    input_type: CsilTypeExpression::Builtin("text".to_string()),
+                    output_type: CsilTypeExpression::Builtin("text".to_string()),
+                    direction: CsilServiceDirection::Bidirectional,
+                    position: create_test_position(),
+                    doc_comments: Vec::new(),
+                }],
+            }),
+            position: create_test_position(),
+            doc_comments: Vec::new(),
+        }]);
+
+        let (result, warnings) = generate_openapi_spec(&spec, &create_test_config()).unwrap();
+        let openapi: Value = serde_json::from_str(&result[0].content).unwrap();
+
+        // Bidirectional maps to POST as a documentation placeholder, but the
+        // operation carries `x-csil-direction: "bidirectional"` so consumers
+        // can detect that HTTP is a stand-in.
+        let op = &openapi["paths"]["/chat/subscribe"]["post"];
+        assert_eq!(op["x-csil-direction"], "bidirectional");
+
+        // A warning explains the limitation.
+        assert_eq!(warnings.len(), 1);
+        let msg = &warnings[0].message;
+        assert!(msg.contains("Chat.subscribe"));
+        assert!(msg.contains("bidirectional"));
+        assert!(msg.contains("<->"));
+    }
+
+    #[test]
+    fn reverse_op_emits_x_csil_direction_and_warning() {
+        let spec = spec_from_rules(vec![CsilRule {
+            name: "Notify".to_string(),
+            rule_type: CsilRuleType::ServiceDef(CsilServiceDefinition {
+                operations: vec![CsilServiceOperation {
+                    name: "deleted".to_string(),
+                    input_type: CsilTypeExpression::Builtin("text".to_string()),
+                    output_type: CsilTypeExpression::Builtin("text".to_string()),
+                    direction: CsilServiceDirection::Reverse,
+                    position: create_test_position(),
+                    doc_comments: Vec::new(),
+                }],
+            }),
+            position: create_test_position(),
+            doc_comments: Vec::new(),
+        }]);
+
+        let (result, warnings) = generate_openapi_spec(&spec, &create_test_config()).unwrap();
+        let openapi: Value = serde_json::from_str(&result[0].content).unwrap();
+
+        // Reverse maps to GET (server-pushed semantics shoe-horned into HTTP).
+        let op = &openapi["paths"]["/notify/deleted"]["get"];
+        assert_eq!(op["x-csil-direction"], "reverse");
+
+        assert_eq!(warnings.len(), 1);
+        let msg = &warnings[0].message;
+        assert!(msg.contains("Notify.deleted"));
+        assert!(msg.contains("reverse"));
+        assert!(msg.contains("<-"));
+    }
+
+    #[test]
+    fn unidirectional_op_does_not_emit_x_csil_direction_or_warning() {
+        let spec = spec_from_rules(vec![CsilRule {
+            name: "Auth".to_string(),
+            rule_type: CsilRuleType::ServiceDef(CsilServiceDefinition {
+                operations: vec![CsilServiceOperation {
+                    name: "login".to_string(),
+                    input_type: CsilTypeExpression::Builtin("text".to_string()),
+                    output_type: CsilTypeExpression::Builtin("text".to_string()),
+                    direction: CsilServiceDirection::Unidirectional,
+                    position: create_test_position(),
+                    doc_comments: Vec::new(),
+                }],
+            }),
+            position: create_test_position(),
+            doc_comments: Vec::new(),
+        }]);
+
+        let (result, warnings) = generate_openapi_spec(&spec, &create_test_config()).unwrap();
+        let openapi: Value = serde_json::from_str(&result[0].content).unwrap();
+
+        // `->` is a faithful HTTP POST; no extension, no warning.
+        let op = &openapi["paths"]["/auth/login"]["post"];
+        assert!(op.get("x-csil-direction").is_none());
+        assert!(warnings.is_empty());
     }
 }

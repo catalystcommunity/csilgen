@@ -64,7 +64,7 @@ csilgen/
 │   ├── csilgen-json-generator/        # --target json
 │   ├── csilgen-python-generator/      # --target python
 │   └── csilgen-openapi-generator/     # --target openapi
-├── docs/csilgen-requests/        # Captured-but-deferred internal work items
+├── docs/csilgen-requests/        # Inbox for requests from consumer repos
 ├── examples/                     # Usage examples and demos
 └── tools/xtask/                  # Development automation
 ```
