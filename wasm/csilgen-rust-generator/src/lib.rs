@@ -728,6 +728,11 @@ impl<'a> RustCodeGenerator<'a> {
 
         // Handle optional fields
         if matches!(occurrence, Some(CsilOccurrence::Optional)) {
+            // An optional field carrying a custom `with` (serde_bytes) loses serde's
+            // automatic "missing -> None", so it must also opt into `default`.
+            if Self::is_bytes_type(value_type) {
+                attrs.push("default".to_string());
+            }
             attrs.push("skip_serializing_if = \"Option::is_none\"".to_string());
         }
 
@@ -1299,6 +1304,90 @@ mod tests {
         assert!(types_content.contains("pub struct HelloRequest"));
         assert!(types_content.contains("pub name: Option<String>"));
         assert!(types_content.contains("skip_serializing_if = \"Option::is_none\""));
+        // optional non-bytes already round-trips via serde's Option special-casing,
+        // so it must not gain `default`.
+        assert!(
+            !types_content.contains("default"),
+            "optional text field must not emit serde `default`"
+        );
+    }
+
+    #[test]
+    fn test_struct_with_optional_bytes_field() {
+        let mut input = create_test_input();
+        input.csil_spec.rules = vec![CsilRule {
+            name: "DomainPublicKey".to_string(),
+            rule_type: CsilRuleType::TypeDef(CsilTypeExpression::Group(CsilGroupExpression {
+                entries: vec![CsilGroupEntry {
+                    key: Some(CsilGroupKey::Bare("key_signature".to_string())),
+                    value_type: CsilTypeExpression::Builtin("bytes".to_string()),
+                    occurrence: Some(CsilOccurrence::Optional),
+                    metadata: vec![],
+                    doc_comments: Vec::new(),
+                }],
+            })),
+            position: CsilPosition {
+                line: 1,
+                column: 1,
+                offset: 0,
+            },
+            doc_comments: Vec::new(),
+        }];
+
+        let mut generator = RustCodeGenerator::new(&input);
+        let types_content = generator.generate_types().unwrap();
+
+        assert!(types_content.contains("pub key_signature: Option<Vec<u8>>"));
+        // A custom `with` disables serde's "missing -> None", so all three must be present.
+        let field_pos = types_content.find("pub key_signature:").unwrap();
+        let attrs = &types_content[field_pos.saturating_sub(160)..field_pos];
+        assert!(
+            attrs.contains("default"),
+            "optional bytes must emit `default`"
+        );
+        assert!(attrs.contains("with = \"serde_bytes\""));
+        assert!(attrs.contains("skip_serializing_if = \"Option::is_none\""));
+    }
+
+    // Reproduces the serde semantics behind the fix: a custom `with`/`deserialize_with`
+    // disables serde's automatic "missing Option field -> None", so the bytes-shaped
+    // module below stands in for the generated `with = "serde_bytes"`. This is the exact
+    // regression that broke linkkeys `DomainPublicKey.key_signature` deserialization.
+    mod bytes_with {
+        use serde::{Deserialize, Deserializer};
+
+        pub fn deserialize<'de, D: Deserializer<'de>>(
+            deserializer: D,
+        ) -> Result<Option<Vec<u8>>, D::Error> {
+            Option::<Vec<u8>>::deserialize(deserializer)
+        }
+    }
+
+    #[test]
+    fn test_optional_bytes_missing_field_round_trips_with_default() {
+        #[derive(serde::Deserialize)]
+        struct Fixed {
+            #[serde(default, with = "bytes_with", skip_serializing_if = "Option::is_none")]
+            key_signature: Option<Vec<u8>>,
+        }
+
+        #[derive(serde::Deserialize)]
+        struct WithoutDefault {
+            #[serde(with = "bytes_with", skip_serializing_if = "Option::is_none")]
+            #[allow(dead_code)]
+            key_signature: Option<Vec<u8>>,
+        }
+
+        // A signing key omits `key_signature` entirely.
+        let json = "{}";
+
+        // With `default` (what the generator now emits) the field becomes None.
+        let fixed: Fixed = serde_json::from_str(json).unwrap();
+        assert_eq!(fixed.key_signature, None);
+
+        // Without `default` the custom `with` turns a missing field into a hard error,
+        // which is precisely the production breakage the request describes.
+        assert!(serde_json::from_str::<WithoutDefault>(json).is_err());
     }
 
     #[test]
