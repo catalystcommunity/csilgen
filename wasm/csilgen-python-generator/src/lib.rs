@@ -139,6 +139,44 @@ pub fn generate_python_code_from_serialized(
     generator.generate(spec)
 }
 
+/// Reduce an operation output to its success type by dropping a top-level
+/// `ServiceError` member of a `Res / ServiceError` union — the error half is
+/// raised by the transport, not part of the returned value.
+fn python_success_type(type_expr: &CsilTypeExpression) -> CsilTypeExpression {
+    if let CsilTypeExpression::Choice(choices) = type_expr {
+        let kept: Vec<CsilTypeExpression> = choices
+            .iter()
+            .filter(|c| !matches!(c, CsilTypeExpression::Reference(name) if name == "ServiceError"))
+            .cloned()
+            .collect();
+        match kept.len() {
+            1 => kept.into_iter().next().unwrap(),
+            0 => type_expr.clone(),
+            _ => CsilTypeExpression::Choice(kept),
+        }
+    } else {
+        type_expr.clone()
+    }
+}
+
+/// PascalCase an operation name for the wire, using the same simple rule the
+/// TypeScript/Go/Rust clients use so all four agree on the method string.
+fn wire_method_name(name: &str) -> String {
+    let mut out = String::new();
+    let mut cap = true;
+    for ch in name.chars() {
+        if ch == '_' || ch == '-' {
+            cap = true;
+        } else if cap {
+            out.extend(ch.to_uppercase());
+            cap = false;
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
 /// Python code generator implementation
 struct PythonGenerator {
     #[allow(dead_code)]
@@ -165,6 +203,26 @@ impl PythonGenerator {
     }
 
     fn generate(&mut self, spec: &CsilSpecSerialized) -> Result<GeneratedFiles> {
+        // Dispatch on target: the base `python` (and explicit `python-server`)
+        // target emits server-side handler ABCs; `python-client` emits
+        // transport-agnostic clients; `python-typesonly` emits the dataclasses
+        // alone. An unrecognized sub-target is an error, not a silent fall-through.
+        enum Surface {
+            Server,
+            Client,
+            TypesOnly,
+        }
+        let surface = match self.config.target.as_str() {
+            "python" | "python-server" => Surface::Server,
+            "python-client" => Surface::Client,
+            "python-typesonly" => Surface::TypesOnly,
+            other => {
+                return Err(CsilgenError::GenerationError(format!(
+                    "Unknown python sub-target '{other}'. Supported: python, python-server, python-client, python-typesonly"
+                )));
+            }
+        };
+
         let mut files = Vec::new();
 
         self.setup_imports();
@@ -195,13 +253,25 @@ impl PythonGenerator {
                 CsilRuleType::GroupChoice(choices) => {
                     types_code.push_str(&self.generate_group_choice(&rule.name, choices)?);
                 }
-                CsilRuleType::ServiceDef(service) => {
-                    if !prelude_emitted {
-                        services_code.push_str(&Self::generate_services_prelude(has_channel_ops));
-                        prelude_emitted = true;
+                CsilRuleType::ServiceDef(service) => match &surface {
+                    Surface::TypesOnly => {}
+                    Surface::Client => {
+                        if !prelude_emitted {
+                            services_code.push_str(&Self::generate_client_prelude());
+                            prelude_emitted = true;
+                        }
+                        services_code.push_str(&self.generate_client_class(&rule.name, service)?);
                     }
-                    services_code.push_str(&self.generate_service_artifacts(&rule.name, service)?);
-                }
+                    Surface::Server => {
+                        if !prelude_emitted {
+                            services_code
+                                .push_str(&Self::generate_services_prelude(has_channel_ops));
+                            prelude_emitted = true;
+                        }
+                        services_code
+                            .push_str(&self.generate_service_artifacts(&rule.name, service)?);
+                    }
+                },
             }
         }
 
@@ -211,8 +281,9 @@ impl PythonGenerator {
         }
 
         if !services_code.is_empty() {
-            let services_file = self.generate_services_file(services_code)?;
-            files.push(services_file);
+            let module_file =
+                self.generate_module_file(services_code, matches!(surface, Surface::Client))?;
+            files.push(module_file);
         }
 
         if !files.is_empty() {
@@ -238,6 +309,14 @@ impl PythonGenerator {
     }
 
     fn generate_type_def(&mut self, name: &str, type_expr: &CsilTypeExpression) -> Result<String> {
+        // `Name = { ... }` parses to a TypeDef carrying a Group expression. Emit a
+        // real dataclass for it (as the Rust/Go generators do) instead of a bare
+        // `Dict[str, Any]` alias, so records keep field-level typing. Named scalar
+        // and map aliases stay aliases via the fallthrough below.
+        if let CsilTypeExpression::Group(group) = type_expr {
+            return self.generate_group_def(name, group);
+        }
+
         let class_name = name.to_case(Case::Pascal);
         self.generated_types.insert(class_name.clone());
 
@@ -691,6 +770,91 @@ impl PythonGenerator {
         out
     }
 
+    /// Once-per-file preamble for the client module: the `ServiceError`
+    /// exception the transport raises, and the `Transport` Protocol every client
+    /// delegates to. The generator never owns the wire (CBOR-over-HTTP etc.).
+    fn generate_client_prelude() -> String {
+        let mut out = String::new();
+        out.push_str("from typing import Protocol, Any\n\n");
+        out.push_str("class ServiceError(Exception):\n");
+        out.push_str(
+            "    \"\"\"Structured error a service returns; raised by the transport.\"\"\"\n",
+        );
+        out.push_str("    def __init__(self, code: int, message: str):\n");
+        out.push_str("        self.code = code\n");
+        out.push_str("        self.message = message\n");
+        out.push_str("        super().__init__(f\"service error {code}: {message}\")\n\n");
+        out.push_str("class Transport(Protocol):\n");
+        out.push_str(
+            "    \"\"\"Caller-supplied wire. Encodes req (CBOR over HTTP, say), performs the\n\
+             \x20   call named by (service, method), and returns the decoded response, or\n\
+             \x20   raises ServiceError. The generator never owns the wire.\n\
+             \x20   \"\"\"\n",
+        );
+        out.push_str("    def call(self, service: str, method: str, req: Any) -> Any: ...\n\n");
+        out
+    }
+
+    /// Emit a typed client class for one service: one method per unary operation
+    /// that delegates to the `Transport`, returning the typed success response.
+    fn generate_client_class(&self, name: &str, service: &CsilServiceDefinition) -> Result<String> {
+        let service_class = name.to_case(Case::Pascal);
+        let base = service_class
+            .strip_suffix("Service")
+            .filter(|s| !s.is_empty())
+            .unwrap_or(&service_class);
+        let client_class = format!("{base}Client");
+        let wire_service = base.to_lowercase();
+
+        let mut out = String::new();
+        out.push_str(&format!("class {client_class}:\n"));
+        out.push_str(&format!(
+            "    \"\"\"Typed client for the {name} service.\"\"\"\n"
+        ));
+        out.push_str("    def __init__(self, transport: Transport):\n");
+        out.push_str("        self._transport = transport\n");
+
+        for op in &service.operations {
+            // Only unary request/response ops belong on the RPC client; channel
+            // ops ride the router/encoder surface emitted by the base target.
+            if !matches!(op.direction, CsilServiceDirection::Unidirectional) {
+                out.push_str(&format!(
+                    "\n    # channel operation {} is not part of the RPC client\n",
+                    op.name
+                ));
+                continue;
+            }
+            let method_name = op.name.to_case(Case::Snake);
+            // The wire method must agree byte-for-byte with the other language
+            // clients, which all PascalCase the op name with the same simple
+            // rule — convert_case would diverge on acronyms, so avoid it here.
+            let wire_method = wire_method_name(&op.name);
+            let input_type = self.map_type_expression(&op.input_type)?;
+            let output_type = self.map_type_expression(&python_success_type(&op.output_type))?;
+            out.push('\n');
+            out.push_str(&format!(
+                "    def {method_name}(self, req: {input_type}) -> {output_type}:\n"
+            ));
+            if op.doc_comments.is_empty() {
+                out.push_str(&format!("        \"\"\"{}\"\"\"\n", op.name));
+            } else {
+                out.push_str("        \"\"\"");
+                for (i, line) in op.doc_comments.iter().enumerate() {
+                    if i > 0 {
+                        out.push_str("\n        ");
+                    }
+                    out.push_str(line);
+                }
+                out.push_str("\"\"\"\n");
+            }
+            out.push_str(&format!(
+                "        return self._transport.call(\"{wire_service}\", \"{wire_method}\", req)\n"
+            ));
+        }
+        out.push('\n');
+        Ok(out)
+    }
+
     /// Emit the server-side handler ABC plus, when channel ops exist, a
     /// `route_<service>_channel` dispatcher and per-op outbound encoders.
     /// Reverse ops contribute only the outbound encoder (server pushes only).
@@ -936,10 +1100,21 @@ impl PythonGenerator {
         })
     }
 
-    fn generate_services_file(&self, services_code: String) -> Result<GeneratedFile> {
-        let mut content = String::new();
+    fn generate_module_file(&self, body_code: String, want_client: bool) -> Result<GeneratedFile> {
+        let (path, banner) = if want_client {
+            (
+                "client.py",
+                "# Generated service clients from CSIL specification\n",
+            )
+        } else {
+            (
+                "services.py",
+                "# Generated service handlers from CSIL specification\n",
+            )
+        };
 
-        content.push_str("# Generated service clients from CSIL specification\n");
+        let mut content = String::new();
+        content.push_str(banner);
         content.push_str("# Do not edit this file manually\n\n");
 
         for import in &self.imports {
@@ -949,10 +1124,10 @@ impl PythonGenerator {
         content.push_str("from .types import *\n");
 
         content.push_str("\n\n");
-        content.push_str(&services_code);
+        content.push_str(&body_code);
 
         Ok(GeneratedFile {
-            path: "services.py".to_string(),
+            path: path.to_string(),
             content,
         })
     }
@@ -972,6 +1147,9 @@ impl PythonGenerator {
             } else if file.path == "services.py" {
                 content.push_str("from .services import *\n");
                 exports.push("services");
+            } else if file.path == "client.py" {
+                content.push_str("from .client import *\n");
+                exports.push("client");
             }
         }
 
@@ -1529,5 +1707,127 @@ mod tests {
                 .content
                 .contains("__all__ = [\"types\", \"services\"]")
         );
+    }
+
+    #[test]
+    fn test_typedef_group_emits_dataclass_not_dict_alias() {
+        // `Task = { ... }` parses to a TypeDef carrying a Group; it must become a
+        // real dataclass, not a bare `Dict[str, Any]` alias.
+        let spec = CsilSpecSerialized {
+            rules: vec![CsilRule {
+                name: "Task".to_string(),
+                rule_type: CsilRuleType::TypeDef(CsilTypeExpression::Group(CsilGroupExpression {
+                    entries: vec![
+                        CsilGroupEntry {
+                            key: Some(CsilGroupKey::Bare("uuid".to_string())),
+                            value_type: CsilTypeExpression::Builtin("text".to_string()),
+                            occurrence: None,
+                            metadata: vec![],
+                            doc_comments: Vec::new(),
+                        },
+                        CsilGroupEntry {
+                            key: Some(CsilGroupKey::Bare("payload".to_string())),
+                            value_type: CsilTypeExpression::Builtin("bytes".to_string()),
+                            occurrence: None,
+                            metadata: vec![],
+                            doc_comments: Vec::new(),
+                        },
+                    ],
+                })),
+                position: create_test_position(),
+                doc_comments: Vec::new(),
+            }],
+            source_content: None,
+            service_count: 0,
+            fields_with_metadata_count: 0,
+        };
+
+        let result =
+            generate_python_code_from_serialized(&spec, &create_test_config(false)).unwrap();
+        let types_file = result.iter().find(|f| f.path == "types.py").unwrap();
+        assert!(types_file.content.contains("@dataclass"));
+        assert!(types_file.content.contains("class Task:"));
+        assert!(types_file.content.contains("uuid: str"));
+        assert!(types_file.content.contains("payload: bytes"));
+        assert!(!types_file.content.contains("Task = Dict[str, Any]"));
+    }
+
+    fn service_spec_with_union_op() -> CsilSpecSerialized {
+        CsilSpecSerialized {
+            rules: vec![CsilRule {
+                name: "CorndogsService".to_string(),
+                rule_type: CsilRuleType::ServiceDef(CsilServiceDefinition {
+                    operations: vec![CsilServiceOperation {
+                        name: "SubmitTask".to_string(),
+                        input_type: CsilTypeExpression::Reference("SubmitTaskRequest".to_string()),
+                        output_type: CsilTypeExpression::Choice(vec![
+                            CsilTypeExpression::Reference("SubmitTaskResponse".to_string()),
+                            CsilTypeExpression::Reference("ServiceError".to_string()),
+                        ]),
+                        direction: CsilServiceDirection::Unidirectional,
+                        position: create_test_position(),
+                        doc_comments: Vec::new(),
+                    }],
+                }),
+                position: create_test_position(),
+                doc_comments: Vec::new(),
+            }],
+            source_content: None,
+            service_count: 1,
+            fields_with_metadata_count: 0,
+        }
+    }
+
+    #[test]
+    fn test_python_client_target_emits_typed_client() {
+        let spec = service_spec_with_union_op();
+        let mut config = create_test_config(false);
+        config.target = "python-client".to_string();
+
+        let result = generate_python_code_from_serialized(&spec, &config).unwrap();
+        let client = result
+            .iter()
+            .find(|f| f.path == "client.py")
+            .expect("client.py emitted");
+        assert!(client.content.contains("class Transport(Protocol):"));
+        assert!(client.content.contains("class CorndogsClient:"));
+        // Success type is stripped from the `/ ServiceError` union.
+        assert!(
+            client
+                .content
+                .contains("def submit_task(self, req: SubmitTaskRequest) -> SubmitTaskResponse:")
+        );
+        assert!(
+            client
+                .content
+                .contains("return self._transport.call(\"corndogs\", \"SubmitTask\", req)")
+        );
+        // The server handler surface must not be emitted for the client target.
+        assert!(!result.iter().any(|f| f.path == "services.py"));
+    }
+
+    #[test]
+    fn test_python_server_alias_and_typesonly() {
+        let spec = service_spec_with_union_op();
+
+        let mut config = create_test_config(false);
+        config.target = "python-server".to_string();
+        let result = generate_python_code_from_serialized(&spec, &config).unwrap();
+        assert!(result.iter().any(|f| f.path == "services.py"));
+        assert!(!result.iter().any(|f| f.path == "client.py"));
+
+        let mut config = create_test_config(false);
+        config.target = "python-typesonly".to_string();
+        let result = generate_python_code_from_serialized(&spec, &config).unwrap();
+        assert!(!result.iter().any(|f| f.path == "services.py"));
+        assert!(!result.iter().any(|f| f.path == "client.py"));
+    }
+
+    #[test]
+    fn test_unknown_python_subtarget_errors() {
+        let spec = service_spec_with_union_op();
+        let mut config = create_test_config(false);
+        config.target = "python-bogus".to_string();
+        assert!(generate_python_code_from_serialized(&spec, &config).is_err());
     }
 }

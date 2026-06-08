@@ -104,14 +104,42 @@ fn process_generation(input: WasmGeneratorInput) -> Result<WasmGeneratorOutput, 
         });
     }
 
-    // Generate services file if there are services
-    if input.csil_spec.service_count > 0
-        && let Some(services_content) = generate_services(&input, &config, &mut warnings)?
-    {
-        files.push(GeneratedFile {
-            path: make_path("services.gen.go"),
-            content: services_content,
-        });
+    // Dispatch on target: the base `go` (and explicit `go-server`) target emits
+    // the server interface; `go-client` emits a transport-agnostic client;
+    // `go-typesonly` emits the types (and their validation/constructors) alone.
+    // An unrecognized sub-target is an error, not a silent fall-through.
+    enum Surface {
+        Server,
+        Client,
+        TypesOnly,
+    }
+    let surface = match input.config.target.as_str() {
+        "go" | "go-server" => Surface::Server,
+        "go-client" => Surface::Client,
+        "go-typesonly" => Surface::TypesOnly,
+        _ => return Err(error_codes::GENERATION_ERROR),
+    };
+
+    if input.csil_spec.service_count > 0 {
+        match surface {
+            Surface::Client => {
+                if let Some(client_content) = generate_client(&input, &config, &mut warnings)? {
+                    files.push(GeneratedFile {
+                        path: make_path("client.gen.go"),
+                        content: client_content,
+                    });
+                }
+            }
+            Surface::Server => {
+                if let Some(services_content) = generate_services(&input, &config, &mut warnings)? {
+                    files.push(GeneratedFile {
+                        path: make_path("services.gen.go"),
+                        content: services_content,
+                    });
+                }
+            }
+            Surface::TypesOnly => {}
+        }
     }
 
     // Generate validation file if there are constraints
@@ -158,6 +186,7 @@ struct GoConfig {
     output_subdir: String,
     use_json_tags: bool,
     use_yaml_tags: bool,
+    use_cbor_tags: bool,
     generate_validation: bool,
     generate_constructors: bool,
     indent_style: String,
@@ -215,6 +244,14 @@ impl GoConfig {
                 .unwrap_or(true),
             use_yaml_tags: options
                 .get("use_yaml_tags")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true),
+            // CSIL is the CBOR Service Interface Language: the canonical wire is
+            // CBOR keyed by the CSIL field name verbatim. fxamacker/cbor keys by
+            // the Go field name (PascalCase) unless a `cbor` tag says otherwise,
+            // so these tags are on by default to keep four-language clients aligned.
+            use_cbor_tags: options
+                .get("use_cbor_tags")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(true),
             generate_validation: options
@@ -359,6 +396,17 @@ fn generate_types(
                             }
                         }
 
+                        // Canonical CBOR wire key: the CSIL field name verbatim,
+                        // so a Go server and Rust/Python/TS clients agree on map keys.
+                        if config.use_cbor_tags {
+                            let cbor_name = go_json_name_from_key(key);
+                            if matches!(entry.occurrence, Some(CsilOccurrence::Optional)) {
+                                tag_parts.push(format!("cbor:\"{cbor_name},omitempty\""));
+                            } else {
+                                tag_parts.push(format!("cbor:\"{cbor_name}\""));
+                            }
+                        }
+
                         if !tag_parts.is_empty() {
                             content.push_str(&format!(" `{}`", tag_parts.join(" ")));
                         }
@@ -428,6 +476,15 @@ fn generate_types(
                                 }
                             }
 
+                            if config.use_cbor_tags {
+                                let cbor_name = go_json_name_from_key(key);
+                                if matches!(entry.occurrence, Some(CsilOccurrence::Optional)) {
+                                    tag_parts.push(format!("cbor:\"{cbor_name},omitempty\""));
+                                } else {
+                                    tag_parts.push(format!("cbor:\"{cbor_name}\""));
+                                }
+                            }
+
                             if !tag_parts.is_empty() {
                                 content.push_str(&format!(" `{}`", tag_parts.join(" ")));
                             }
@@ -452,6 +509,133 @@ fn generate_types(
         Ok(Some(content))
     } else {
         Ok(None)
+    }
+}
+
+/// Client scaffolding emitted once at the top of `client.gen.go`: the error type
+/// and the caller-supplied `Transport` every per-service client delegates to.
+const CLIENT_PRELUDE_GO: &str = "\
+// ClientError is returned by a generated client call: a structured error the
+// service returned (Code/Message), or a transport-level failure (Err).
+type ClientError struct {
+\tCode    int64
+\tMessage string
+\tErr     error
+}
+
+func (e *ClientError) Error() string {
+\tif e.Err != nil {
+\t\treturn \"transport error: \" + e.Err.Error()
+\t}
+\treturn fmt.Sprintf(\"service error %d: %s\", e.Code, e.Message)
+}
+
+// Transport is supplied by the caller: it encodes req (CBOR over HTTP, say),
+// performs the call named by (service, method), and decodes the response into
+// resp, or returns an error. The generator never owns the wire.
+type Transport interface {
+\tCall(ctx context.Context, service string, method string, req any, resp any) error
+}
+";
+
+/// Strip a trailing `Service` suffix and PascalCase the remainder, matching the
+/// wire service base used across the TypeScript/Rust/Python clients.
+fn go_service_base(name: &str) -> String {
+    let pascal = pascal_case(name);
+    pascal
+        .strip_suffix("Service")
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or(pascal)
+}
+
+fn generate_client(
+    input: &WasmGeneratorInput,
+    config: &GoConfig,
+    _warnings: &mut Vec<GeneratorWarning>,
+) -> Result<Option<String>, i32> {
+    let mut content = String::new();
+
+    content.push_str(&format!(
+        "// Package {} contains generated service clients.\n",
+        config.package_name
+    ));
+    content.push_str("//\n");
+    content.push_str("// Code generated by csilgen; DO NOT EDIT.\n");
+    content.push_str(&format!("package {}\n\n", config.package_name));
+
+    content.push_str("import (\n");
+    content.push_str(&format!("{}\"context\"\n", config.indent_style));
+    content.push_str(&format!("{}\"fmt\"\n", config.indent_style));
+    content.push_str(")\n\n");
+
+    content.push_str(CLIENT_PRELUDE_GO);
+    content.push('\n');
+
+    let mut emitted_any = false;
+    for rule in &input.csil_spec.rules {
+        if let CsilRuleType::ServiceDef(service) = &rule.rule_type {
+            emit_client_struct(&mut content, &rule.name, service, config);
+            emitted_any = true;
+        }
+    }
+
+    if emitted_any {
+        Ok(Some(content))
+    } else {
+        Ok(None)
+    }
+}
+
+fn emit_client_struct(
+    content: &mut String,
+    name: &str,
+    service: &CsilServiceDefinition,
+    config: &GoConfig,
+) {
+    let base = go_service_base(name);
+    let client = format!("{base}Client");
+    let wire_service = base.to_lowercase();
+
+    content.push_str(&format!(
+        "// {client} is a typed client for the {name} service.\n"
+    ));
+    content.push_str(&format!("type {client} struct {{\n"));
+    content.push_str(&format!("{}transport Transport\n", config.indent_style));
+    content.push_str("}\n\n");
+
+    content.push_str(&format!(
+        "func New{client}(transport Transport) *{client} {{\n"
+    ));
+    content.push_str(&format!(
+        "{}return &{client}{{transport: transport}}\n",
+        config.indent_style
+    ));
+    content.push_str("}\n\n");
+
+    for operation in &service.operations {
+        // Only unary request/response ops belong on the RPC client; channel ops
+        // ride the router/encoder surface emitted by the base `go` target.
+        if !matches!(operation.direction, CsilServiceDirection::Unidirectional) {
+            content.push_str(&format!(
+                "// channel operation {} is not part of the RPC client\n\n",
+                operation.name
+            ));
+            continue;
+        }
+        let method_name = go_method_name(&operation.name);
+        let input_type = map_csil_type_to_go(&operation.input_type, &None);
+        let output_type = map_csil_type_to_go(&go_success_type(&operation.output_type), &None);
+        content.push_str(&format!(
+            "func (c *{client}) {method_name}(ctx context.Context, req {input_type}) ({output_type}, error) {{\n"
+        ));
+        content.push_str(&format!("{}var resp {output_type}\n", config.indent_style));
+        content.push_str(&format!(
+            "{}err := c.transport.Call(ctx, \"{wire_service}\", \"{method_name}\", req, &resp)\n",
+            config.indent_style
+        ));
+        content.push_str(&format!("{}return resp, err\n", config.indent_style));
+        content.push_str("}\n\n");
     }
 }
 
@@ -541,7 +725,8 @@ fn emit_service_interface(
         match operation.direction {
             CsilServiceDirection::Unidirectional => {
                 let input_type = map_csil_type_to_go(&operation.input_type, &None);
-                let output_type = map_csil_type_to_go(&operation.output_type, &None);
+                let output_type =
+                    map_csil_type_to_go(&go_success_type(&operation.output_type), &None);
                 content.push_str(&format!(
                     "{}{}(ctx context.Context, req {}) ({}, error)\n",
                     config.indent_style, method_name, input_type, output_type
@@ -898,6 +1083,27 @@ fn generate_constructors(
         Ok(Some(content))
     } else {
         Ok(None)
+    }
+}
+
+/// Reduce an operation output to its success type by dropping a top-level
+/// `ServiceError` member of a `Res / ServiceError` union — that error half is the
+/// Go `error` return, not part of the typed response. Without this the whole
+/// union maps to the untyped `interface{}` fallback.
+fn go_success_type(type_expr: &CsilTypeExpression) -> CsilTypeExpression {
+    if let CsilTypeExpression::Choice(choices) = type_expr {
+        let kept: Vec<CsilTypeExpression> = choices
+            .iter()
+            .filter(|c| !matches!(c, CsilTypeExpression::Reference(name) if name == "ServiceError"))
+            .cloned()
+            .collect();
+        match kept.len() {
+            1 => kept.into_iter().next().unwrap(),
+            0 => type_expr.clone(),
+            _ => CsilTypeExpression::Choice(kept),
+        }
+    } else {
+        type_expr.clone()
     }
 }
 
@@ -1316,5 +1522,151 @@ mod tests {
         assert!(!services.contains("EncodeAuthLogin"));
         // "fmt" should not be imported when no router exists.
         assert!(!services.contains("\"fmt\""));
+    }
+
+    fn unary_union_op(name: &str) -> CsilServiceOperation {
+        CsilServiceOperation {
+            name: name.to_string(),
+            input_type: CsilTypeExpression::Reference("SubmitTaskRequest".to_string()),
+            output_type: CsilTypeExpression::Choice(vec![
+                CsilTypeExpression::Reference("SubmitTaskResponse".to_string()),
+                CsilTypeExpression::Reference("ServiceError".to_string()),
+            ]),
+            direction: CsilServiceDirection::Unidirectional,
+            position: CsilPosition {
+                line: 1,
+                column: 1,
+                offset: 0,
+            },
+            doc_comments: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn cbor_tags_key_by_csil_field_name() {
+        use csilgen_common::{CsilGroupEntry, CsilGroupExpression};
+        let input = WasmGeneratorInput {
+            csil_spec: CsilSpecSerialized {
+                rules: vec![CsilRule {
+                    name: "Task".to_string(),
+                    rule_type: CsilRuleType::GroupDef(CsilGroupExpression {
+                        entries: vec![
+                            CsilGroupEntry {
+                                key: Some(CsilGroupKey::Bare("current_state".to_string())),
+                                value_type: CsilTypeExpression::Builtin("text".to_string()),
+                                occurrence: None,
+                                metadata: vec![],
+                                doc_comments: Vec::new(),
+                            },
+                            CsilGroupEntry {
+                                key: Some(CsilGroupKey::Bare("note".to_string())),
+                                value_type: CsilTypeExpression::Builtin("text".to_string()),
+                                occurrence: Some(CsilOccurrence::Optional),
+                                metadata: vec![],
+                                doc_comments: Vec::new(),
+                            },
+                        ],
+                    }),
+                    position: CsilPosition {
+                        line: 1,
+                        column: 1,
+                        offset: 0,
+                    },
+                    doc_comments: Vec::new(),
+                }],
+                source_content: None,
+                service_count: 0,
+                fields_with_metadata_count: 0,
+            },
+            config: GeneratorConfig {
+                target: "go".to_string(),
+                output_dir: "/tmp".to_string(),
+                options: HashMap::new(),
+            },
+            generator_metadata: GeneratorMetadata {
+                name: "go".to_string(),
+                version: "1.0.0".to_string(),
+                description: String::new(),
+                target: "go".to_string(),
+                capabilities: vec![],
+                author: None,
+                homepage: None,
+            },
+        };
+        let config = GoConfig::from_options(&input.config.options);
+        let types = super::generate_types(&input, &config, &mut Vec::new())
+            .unwrap()
+            .expect("types emitted");
+        // Wire key is the CSIL field name verbatim, alongside the existing tags.
+        assert!(
+            types
+                .contains("`json:\"current_state\" yaml:\"current_state\" cbor:\"current_state\"`")
+        );
+        assert!(types.contains("cbor:\"note,omitempty\""));
+    }
+
+    #[test]
+    fn typed_response_strips_service_error() {
+        let input = input_with_service("CorndogsService", vec![unary_union_op("SubmitTask")]);
+        let config = GoConfig::from_options(&input.config.options);
+        let services = super::generate_services(&input, &config, &mut Vec::new())
+            .unwrap()
+            .expect("services emitted");
+        assert!(services.contains(
+            "SubmitTask(ctx context.Context, req SubmitTaskRequest) (SubmitTaskResponse, error)"
+        ));
+        assert!(!services.contains("interface{}"));
+    }
+
+    #[test]
+    fn go_client_target_emits_typed_client() {
+        let mut input = input_with_service("CorndogsService", vec![unary_union_op("SubmitTask")]);
+        input.config.target = "go-client".to_string();
+        let output = super::process_generation(input).expect("generation ok");
+        let client = output
+            .files
+            .iter()
+            .find(|f| f.path == "client.gen.go")
+            .expect("client.gen.go emitted");
+        assert!(client.content.contains("type Transport interface"));
+        assert!(client.content.contains("type ClientError struct"));
+        assert!(
+            client
+                .content
+                .contains("func NewCorndogsClient(transport Transport) *CorndogsClient")
+        );
+        assert!(client.content.contains(
+            "func (c *CorndogsClient) SubmitTask(ctx context.Context, req SubmitTaskRequest) (SubmitTaskResponse, error)"
+        ));
+        assert!(
+            client
+                .content
+                .contains("err := c.transport.Call(ctx, \"corndogs\", \"SubmitTask\", req, &resp)")
+        );
+        // Server interface must not be emitted for the client target.
+        assert!(!output.files.iter().any(|f| f.path == "services.gen.go"));
+    }
+
+    #[test]
+    fn go_server_alias_and_typesonly() {
+        let mut input = input_with_service("CorndogsService", vec![unary_union_op("SubmitTask")]);
+        input.config.target = "go-server".to_string();
+        let output = super::process_generation(input).expect("generation ok");
+        assert!(output.files.iter().any(|f| f.path == "services.gen.go"));
+        assert!(!output.files.iter().any(|f| f.path == "client.gen.go"));
+
+        let mut input = input_with_service("CorndogsService", vec![unary_union_op("SubmitTask")]);
+        input.config.target = "go-typesonly".to_string();
+        let output = super::process_generation(input).expect("generation ok");
+        // This spec has no type rules, so the service surface is simply absent.
+        assert!(!output.files.iter().any(|f| f.path == "services.gen.go"));
+        assert!(!output.files.iter().any(|f| f.path == "client.gen.go"));
+    }
+
+    #[test]
+    fn unknown_go_subtarget_errors() {
+        let mut input = input_with_service("CorndogsService", vec![unary_union_op("SubmitTask")]);
+        input.config.target = "go-bogus".to_string();
+        assert!(super::process_generation(input).is_err());
     }
 }

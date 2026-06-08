@@ -12,6 +12,51 @@ use csilgen_common::{
 };
 use std::collections::HashSet;
 
+/// Which artifact surface a generator run emits, selected by the sub-target.
+enum Surface {
+    /// Server-side trait surface (`rust` / `rust-server`).
+    Server,
+    /// Transport-agnostic client (`rust-client`).
+    Client,
+    /// Types alone, no service surface (`rust-typesonly`).
+    TypesOnly,
+}
+
+/// Shared client scaffolding emitted at the top of `client.rs`: the error type
+/// and the caller-supplied `Transport` abstraction every per-service client
+/// delegates to. The generator never owns the wire (CBOR-over-HTTP etc.).
+const CLIENT_PRELUDE: &str = "\
+/// Error from a generated client call: a structured error the service returned,
+/// or a transport-level failure. The caller-supplied `Transport` decides how an
+/// error response maps onto `Service`.
+#[derive(Debug, Clone)]
+pub enum ClientError {
+    Service { code: i64, message: String },
+    Transport(String),
+}
+
+impl std::fmt::Display for ClientError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ClientError::Service { code, message } => write!(f, \"service error {code}: {message}\"),
+            ClientError::Transport(msg) => write!(f, \"transport error: {msg}\"),
+        }
+    }
+}
+
+impl std::error::Error for ClientError {}
+
+/// The wire is the caller's concern: an implementation encodes `req` (CBOR over
+/// HTTP, say), performs the call named by `(service, method)`, and decodes the
+/// response into `Res`, or yields a `ClientError`.
+pub trait Transport {
+    fn call<Req, Res>(&self, service: &str, method: &str, req: &Req) -> Result<Res, ClientError>
+    where
+        Req: serde::Serialize,
+        Res: serde::de::DeserializeOwned;
+}
+";
+
 /// Get generator metadata (WASM export)
 #[unsafe(no_mangle)]
 pub extern "C" fn get_metadata() -> *const u8 {
@@ -168,6 +213,22 @@ impl<'a> RustCodeGenerator<'a> {
     }
 
     fn generate(&mut self) -> Result<Vec<GeneratedFile>, String> {
+        // Dispatch on the requested target. The base `rust` (and explicit
+        // `rust-server`) target emits the server-side trait surface;
+        // `rust-client` emits a transport-agnostic client; `rust-typesonly`
+        // emits the types alone. An unrecognized sub-target is an error rather
+        // than a silent fall-through.
+        let surface = match self.input.config.target.as_str() {
+            "rust" | "rust-server" => Surface::Server,
+            "rust-client" => Surface::Client,
+            "rust-typesonly" => Surface::TypesOnly,
+            other => {
+                return Err(format!(
+                    "Unknown rust sub-target '{other}'. Supported: rust, rust-server, rust-client, rust-typesonly"
+                ));
+            }
+        };
+
         let mut files = Vec::new();
 
         // Generate types.rs for structs and enums
@@ -179,13 +240,22 @@ impl<'a> RustCodeGenerator<'a> {
             });
         }
 
-        // Generate service traits if services exist
         if self.input.csil_spec.service_count > 0 {
-            let services_content = self.generate_services()?;
-            files.push(GeneratedFile {
-                path: "services.rs".to_string(),
-                content: services_content,
-            });
+            match surface {
+                Surface::Client => {
+                    files.push(GeneratedFile {
+                        path: "client.rs".to_string(),
+                        content: self.generate_client()?,
+                    });
+                }
+                Surface::Server => {
+                    files.push(GeneratedFile {
+                        path: "services.rs".to_string(),
+                        content: self.generate_services()?,
+                    });
+                }
+                Surface::TypesOnly => {}
+            }
         }
 
         // Generate module root file to tie everything together
@@ -343,8 +413,14 @@ impl<'a> RustCodeGenerator<'a> {
         content.push_str("//! Generated service traits from CSIL specification\n\n");
         content.push_str("use super::types::*;\n\n");
 
-        self.generate_service_error(&mut content);
-        content.push('\n');
+        // Only emit the fallback `ServiceError` when the spec doesn't declare its
+        // own; otherwise it collides with the type from `types.rs` (both are
+        // re-exported through `mod.rs`). A spec-defined `ServiceError` is used
+        // verbatim via the `use super::types::*` import above.
+        if !self.spec_defines_service_error() {
+            self.generate_service_error(&mut content);
+            content.push('\n');
+        }
 
         if self.spec_has_channel_ops() {
             self.generate_codec_trait(&mut content);
@@ -367,6 +443,117 @@ impl<'a> RustCodeGenerator<'a> {
         }
 
         Ok(content)
+    }
+
+    /// Emit `client.rs`: a transport-agnostic, typed client per service. Each
+    /// unary operation becomes a method that hands `(service, method, req)` to a
+    /// caller-supplied `Transport` and returns the typed success response, with
+    /// the `/ ServiceError` half surfaced through `ClientError`.
+    fn generate_client(&mut self) -> Result<String, String> {
+        let mut content = String::new();
+
+        content.push_str(
+            "//! Generated transport-agnostic service clients from CSIL specification\n\n",
+        );
+        content.push_str("use super::types::*;\n\n");
+
+        content.push_str(CLIENT_PRELUDE);
+        content.push('\n');
+
+        for rule in &self.input.csil_spec.rules {
+            if let CsilRuleType::ServiceDef(service) = &rule.rule_type {
+                let client_code = self.generate_client_struct(&rule.name, service)?;
+                content.push_str(&client_code);
+                content.push_str("\n\n");
+            }
+        }
+
+        Ok(content)
+    }
+
+    fn generate_client_struct(
+        &mut self,
+        name: &str,
+        service: &CsilServiceDefinition,
+    ) -> Result<String, String> {
+        let base = Self::service_base(name);
+        let client = format!("{base}Client");
+
+        let mut content = String::new();
+        content.push_str(&format!("/// Typed client for the {name} service.\n"));
+        content.push_str(&format!("pub struct {client}<T: Transport> {{\n"));
+        content.push_str("    transport: T,\n");
+        content.push_str("}\n\n");
+
+        content.push_str(&format!("impl<T: Transport> {client}<T> {{\n"));
+        content.push_str("    pub fn new(transport: T) -> Self {\n");
+        content.push_str("        Self { transport }\n");
+        content.push_str("    }\n");
+
+        let wire_service = base.to_lowercase();
+        for operation in &service.operations {
+            // Only unary request/response operations belong on the RPC client;
+            // channel (`<->`/`<-`) ops ride the router/encoder surface instead.
+            if !matches!(operation.direction, CsilServiceDirection::Unidirectional) {
+                content.push_str(&format!(
+                    "\n    // channel operation `{}` is not part of the RPC client\n",
+                    operation.name
+                ));
+                continue;
+            }
+            let method = self.to_snake_case(&operation.name);
+            let wire_method = Self::to_pascal_case(&operation.name);
+            let input_type = self.map_type_to_rust(&operation.input_type, &None)?;
+            let output_type =
+                self.map_type_to_rust(&success_type(&operation.output_type), &None)?;
+            content.push('\n');
+            Self::write_op_doc(&mut content, operation, "request/response");
+            content.push_str(&format!(
+                "    pub fn {method}(&self, req: {input_type}) -> Result<{output_type}, ClientError> {{\n"
+            ));
+            content.push_str(&format!(
+                "        self.transport.call(\"{wire_service}\", \"{wire_method}\", &req)\n"
+            ));
+            content.push_str("    }\n");
+        }
+
+        content.push('}');
+        Ok(content)
+    }
+
+    /// Strip a trailing `Service` suffix and PascalCase the remainder, matching
+    /// the wire service base used across the TypeScript/Go/Python clients.
+    fn service_base(name: &str) -> String {
+        let pascal = Self::to_pascal_case(name);
+        pascal
+            .strip_suffix("Service")
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .unwrap_or(pascal)
+    }
+
+    fn to_pascal_case(s: &str) -> String {
+        let mut out = String::new();
+        let mut cap = true;
+        for ch in s.chars() {
+            if ch == '-' || ch == '_' {
+                cap = true;
+            } else if cap {
+                out.push(ch.to_ascii_uppercase());
+                cap = false;
+            } else {
+                out.push(ch);
+            }
+        }
+        out
+    }
+
+    /// Whether the spec declares its own `ServiceError` type (group/type rule),
+    /// in which case the generator must not emit its hardcoded fallback.
+    fn spec_defines_service_error(&self) -> bool {
+        self.input.csil_spec.rules.iter().any(|r| {
+            r.name == "ServiceError" && !matches!(r.rule_type, CsilRuleType::ServiceDef(_))
+        })
     }
 
     fn spec_has_channel_ops(&self) -> bool {
@@ -432,7 +619,11 @@ impl<'a> RustCodeGenerator<'a> {
             match operation.direction {
                 CsilServiceDirection::Unidirectional => {
                     let input_type = self.map_type_to_rust(&operation.input_type, &None)?;
-                    let output_type = self.map_type_to_rust(&operation.output_type, &None)?;
+                    // `Res / ServiceError` rides the `Result` error channel, so the
+                    // success signature uses the response half only — otherwise the
+                    // whole union falls back to the untyped `serde_json::Value`.
+                    let output_type =
+                        self.map_type_to_rust(&success_type(&operation.output_type), &None)?;
                     Self::write_op_doc(&mut content, operation, "request/response");
                     content.push_str(&format!(
                         "    fn {op_name}(&self, ctx: &Self::Context, input: {input_type}) -> Result<{output_type}, ServiceError>;\n",
@@ -585,6 +776,11 @@ impl<'a> RustCodeGenerator<'a> {
         if files.iter().any(|f| f.path == "services.rs") {
             content.push_str("pub mod services;\n");
             content.push_str("pub use services::*;\n\n");
+        }
+
+        if files.iter().any(|f| f.path == "client.rs") {
+            content.push_str("pub mod client;\n");
+            content.push_str("pub use client::*;\n\n");
         }
 
         Ok(content)
@@ -766,21 +962,60 @@ impl<'a> RustCodeGenerator<'a> {
     }
 
     fn to_snake_case(&self, s: &str) -> String {
+        let chars: Vec<char> = s.chars().collect();
         let mut result = String::new();
 
-        for ch in s.chars() {
-            if ch == '-' {
+        for (i, &ch) in chars.iter().enumerate() {
+            if ch == '-' || ch == '_' {
                 result.push('_');
-            } else if ch.is_ascii_uppercase() && !result.is_empty() {
-                result.push('_');
-                result.push(ch.to_ascii_lowercase());
-            } else {
-                result.push(ch.to_ascii_lowercase());
+                continue;
             }
+
+            // Insert a boundary only at real word starts so acronym runs stay
+            // intact: `GetTaskStateByID` -> `get_task_state_by_id`, not
+            // `..._by_i_d`. A boundary is a lower/digit->Upper transition, or the
+            // tail of an acronym handing off to a new word (Upper->Upper-then-lower).
+            if ch.is_ascii_uppercase() && !result.is_empty() && !result.ends_with('_') {
+                let prev = chars[i - 1];
+                let next_is_lower = chars.get(i + 1).is_some_and(char::is_ascii_lowercase);
+                if prev.is_ascii_lowercase()
+                    || prev.is_ascii_digit()
+                    || (prev.is_ascii_uppercase() && next_is_lower)
+                {
+                    result.push('_');
+                }
+            }
+
+            result.push(ch.to_ascii_lowercase());
         }
 
         result
     }
+}
+
+/// Reduce an operation's output to its success type by dropping a top-level
+/// `ServiceError` member of a `Res / ServiceError` union — that error half is the
+/// `Result::Err` channel, not part of the returned value. Non-union outputs and
+/// unions without a `ServiceError` member pass through unchanged.
+fn success_type(type_expr: &CsilTypeExpression) -> CsilTypeExpression {
+    if let CsilTypeExpression::Choice(choices) = type_expr {
+        let kept: Vec<CsilTypeExpression> = choices
+            .iter()
+            .filter(|c| !is_service_error(c))
+            .cloned()
+            .collect();
+        match kept.len() {
+            1 => kept.into_iter().next().unwrap(),
+            0 => type_expr.clone(),
+            _ => CsilTypeExpression::Choice(kept),
+        }
+    } else {
+        type_expr.clone()
+    }
+}
+
+fn is_service_error(type_expr: &CsilTypeExpression) -> bool {
+    matches!(type_expr, CsilTypeExpression::Reference(name) if name == "ServiceError")
 }
 
 #[cfg(test)]
@@ -883,7 +1118,12 @@ mod tests {
         let generator = RustCodeGenerator::new(&input);
 
         assert_eq!(generator.to_snake_case("CamelCase"), "camel_case");
-        assert_eq!(generator.to_snake_case("HTTPResponse"), "h_t_t_p_response");
+        // Acronym runs stay intact: the boundary lands where a new word starts.
+        assert_eq!(generator.to_snake_case("HTTPResponse"), "http_response");
+        assert_eq!(
+            generator.to_snake_case("GetTaskStateByID"),
+            "get_task_state_by_id"
+        );
         assert_eq!(generator.to_snake_case("simple"), "simple");
         assert_eq!(generator.to_snake_case("create-entry"), "create_entry");
         assert_eq!(
@@ -936,6 +1176,151 @@ mod tests {
         assert!(services_content.contains(
             "fn create_user(&self, ctx: &Self::Context, input: User) -> Result<User, ServiceError>"
         ));
+    }
+
+    fn make_unary_service_input(target: &str) -> WasmGeneratorInput {
+        let mut input = create_test_input();
+        input.config.target = target.to_string();
+        input.csil_spec.rules.push(CsilRule {
+            name: "CorndogsService".to_string(),
+            rule_type: CsilRuleType::ServiceDef(CsilServiceDefinition {
+                operations: vec![CsilServiceOperation {
+                    name: "SubmitTask".to_string(),
+                    input_type: CsilTypeExpression::Reference("SubmitTaskRequest".to_string()),
+                    // `Res / ServiceError` union: the success type must be stripped.
+                    output_type: CsilTypeExpression::Choice(vec![
+                        CsilTypeExpression::Reference("SubmitTaskResponse".to_string()),
+                        CsilTypeExpression::Reference("ServiceError".to_string()),
+                    ]),
+                    direction: CsilServiceDirection::Unidirectional,
+                    position: CsilPosition {
+                        line: 1,
+                        column: 1,
+                        offset: 0,
+                    },
+                    doc_comments: Vec::new(),
+                }],
+            }),
+            position: CsilPosition {
+                line: 1,
+                column: 1,
+                offset: 0,
+            },
+            doc_comments: Vec::new(),
+        });
+        input.csil_spec.service_count = 1;
+        input
+    }
+
+    #[test]
+    fn test_typed_response_strips_service_error() {
+        // The `rust` server trait must return the concrete success type, not the
+        // untyped `serde_json::Value` the whole union would otherwise map to.
+        let input = make_unary_service_input("rust");
+        let mut generator = RustCodeGenerator::new(&input);
+        let services = generator.generate_services().unwrap();
+        assert!(services.contains(
+            "fn submit_task(&self, ctx: &Self::Context, input: SubmitTaskRequest) -> Result<SubmitTaskResponse, ServiceError>"
+        ));
+        assert!(!services.contains("serde_json::Value"));
+    }
+
+    #[test]
+    fn test_rust_client_target_emits_typed_client() {
+        let input = make_unary_service_input("rust-client");
+        let mut generator = RustCodeGenerator::new(&input);
+        let files = generator.generate().unwrap();
+
+        let client = files
+            .iter()
+            .find(|f| f.path == "client.rs")
+            .expect("client.rs emitted");
+        assert!(client.content.contains("pub trait Transport"));
+        assert!(client.content.contains("pub enum ClientError"));
+        assert!(
+            client
+                .content
+                .contains("pub struct CorndogsClient<T: Transport>")
+        );
+        assert!(client.content.contains(
+            "pub fn submit_task(&self, req: SubmitTaskRequest) -> Result<SubmitTaskResponse, ClientError>"
+        ));
+        assert!(
+            client
+                .content
+                .contains("self.transport.call(\"corndogs\", \"SubmitTask\", &req)")
+        );
+        // The server surface must not leak into the client target.
+        assert!(!files.iter().any(|f| f.path == "services.rs"));
+    }
+
+    #[test]
+    fn test_unknown_rust_subtarget_errors() {
+        let input = make_unary_service_input("rust-bogus");
+        let mut generator = RustCodeGenerator::new(&input);
+        assert!(generator.generate().is_err());
+    }
+
+    #[test]
+    fn test_rust_server_alias_and_typesonly() {
+        // `rust-server` is an explicit alias for the base server surface.
+        let input = make_unary_service_input("rust-server");
+        let mut generator = RustCodeGenerator::new(&input);
+        let files = generator.generate().unwrap();
+        assert!(files.iter().any(|f| f.path == "services.rs"));
+        assert!(!files.iter().any(|f| f.path == "client.rs"));
+
+        // `rust-typesonly` emits the types (and mod) but no service surface.
+        let input = make_unary_service_input("rust-typesonly");
+        let mut generator = RustCodeGenerator::new(&input);
+        let files = generator.generate().unwrap();
+        assert!(files.iter().any(|f| f.path == "types.rs"));
+        assert!(!files.iter().any(|f| f.path == "services.rs"));
+        assert!(!files.iter().any(|f| f.path == "client.rs"));
+    }
+
+    #[test]
+    fn test_spec_defined_service_error_not_duplicated() {
+        // When the spec declares its own `ServiceError`, the generator must not
+        // emit its hardcoded fallback (which would collide via `mod.rs`).
+        let mut input = make_unary_service_input("rust");
+        input.csil_spec.rules.push(CsilRule {
+            name: "ServiceError".to_string(),
+            rule_type: CsilRuleType::GroupDef(CsilGroupExpression {
+                entries: vec![CsilGroupEntry {
+                    key: Some(CsilGroupKey::Bare("code".to_string())),
+                    value_type: CsilTypeExpression::Builtin("uint".to_string()),
+                    occurrence: None,
+                    metadata: vec![],
+                    doc_comments: Vec::new(),
+                }],
+            }),
+            position: CsilPosition {
+                line: 1,
+                column: 1,
+                offset: 0,
+            },
+            doc_comments: Vec::new(),
+        });
+
+        let mut generator = RustCodeGenerator::new(&input);
+        let services = generator.generate_services().unwrap();
+        // The fallback struct (with `pub code: i32`) must be absent; the
+        // spec's own definition lives in types.rs and is imported.
+        assert!(!services.contains("pub struct ServiceError"));
+        // The trait still references the type.
+        assert!(services.contains("Result<SubmitTaskResponse, ServiceError>"));
+    }
+
+    #[test]
+    fn test_success_type_helper() {
+        let union = CsilTypeExpression::Choice(vec![
+            CsilTypeExpression::Reference("Res".to_string()),
+            CsilTypeExpression::Reference("ServiceError".to_string()),
+        ]);
+        assert!(matches!(success_type(&union), CsilTypeExpression::Reference(n) if n == "Res"));
+        let plain = CsilTypeExpression::Reference("Res".to_string());
+        assert!(matches!(success_type(&plain), CsilTypeExpression::Reference(n) if n == "Res"));
     }
 
     #[test]
