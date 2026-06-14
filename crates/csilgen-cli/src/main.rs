@@ -53,8 +53,10 @@ enum Commands {
         #[arg(short, long)]
         input: String,
         /// Target generator name, resolved from installed generators in ~/.csilgen/generators/
-        /// (e.g. rust, go, typescript, json, python, openapi). TypeScript also accepts the
-        /// sub-targets typescript-typesonly / typescript-client / typescript-server.
+        /// (e.g. rust, go, typescript, json, python, openapi). The rust, go, python, and
+        /// typescript generators also accept -server / -client / -typesonly sub-targets
+        /// (e.g. rust-client, go-typesonly). The bare rust/go/python target emits the server
+        /// surface; bare typescript emits client, server, and types together.
         #[arg(short, long)]
         target: String,
         /// Output directory
