@@ -828,7 +828,7 @@ Email = text .regex "^[^@]+@[^@]+\.[^@]+$"
 **models/user.csil**:
 ```csil
 ;; Import shared types
-;; @import "../common/types.csil"
+include "../common/types.csil"
 
 UserID = ID
 User = {
@@ -840,9 +840,9 @@ User = {
 
 **services/user-api.csil**:
 ```csil
-;; @import "../common/types.csil"
-;; @import "../common/errors.csil"
-;; @import "../models/user.csil"
+include "../common/types.csil"
+include "../common/errors.csil"
+include "../models/user.csil"
 
 service UserAPI {
     get-user: UserID -> User / APIError,

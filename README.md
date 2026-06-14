@@ -31,7 +31,7 @@ cargo run -p csilgen -- generate --input your-file.csil --target rust --output .
 cargo run -p csilgen -- generate --input your-file.csil --target go --output ./generated/
 cargo run -p csilgen -- generate --input your-file.csil --target json --output ./generated/
 cargo run -p csilgen -- generate --input your-file.csil --target typescript --output ./generated/
-# TypeScript also offers focused targets: typescript-typesonly, typescript-client, typescript-server
+# rust, go, python, and typescript also offer focused -typesonly / -client / -server sub-targets
 cargo run -p csilgen -- generate --input your-file.csil --target typescript-client --output ./generated/
 cargo run -p csilgen -- generate --input your-file.csil --target python --output ./generated/
 cargo run -p csilgen -- generate --input your-file.csil --target openapi --output ./generated/
@@ -95,7 +95,7 @@ See the examples directory for sample CSIL files to experiment with.
 - **Validator**: Constraint checking, dependency analysis, breaking-change detection.
 - **CLI tools**: `validate`, `generate`, `format`, `lint`, `breaking`.
 - **Plugin runtime**: Dynamic generator discovery from `~/.csilgen/generators/`, `./.generators/`, and `target/wasm32-unknown-unknown/release/` — first-write-wins precedence. Generators are conforming `csilgen_<target>_generator.wasm` cdylibs; no CLI map to edit.
-- **Generators**: Rust, Go, TypeScript (with the typescript-typesonly / typescript-client / typescript-server sub-targets), Python, JSON Schema, OpenAPI. Service directions `->`, `<->`, `<-` all emit consistently (handler + router + outbound encoders).
+- **Generators**: Rust, Go, TypeScript, Python (each with `-typesonly` / `-client` / `-server` sub-targets, e.g. `rust-client`, `go-typesonly`), plus JSON Schema and OpenAPI. Service directions `->`, `<->`, `<-` all emit consistently (handler + router + outbound encoders).
 - **Testing**: 465+ tests across the workspace.
 
 ### 🔄 Deferred / partial
@@ -118,7 +118,7 @@ This is a Rust workspace containing multiple crates:
 - **Runtime (`wasm/`)**:
   - **csilgen-wasm-core**: Core types/helpers compiled to wasm
   - **csilgen-wasm-generators**: Discovery + execution runtime
-- **Generators (`wasm/csilgen-<target>-generator/`)**: each is a single `cdylib` crate that produces `csilgen_<target>_generator.wasm`. Targets: `rust`, `go`, `typescript` (also `typescript-typesonly` / `typescript-client` / `typescript-server`), `json`, `python`, `openapi`, plus the `noop` test fixture. There is no parallel library copy — the wasm crate is the single source of truth for each generator.
+- **Generators (`wasm/csilgen-<target>-generator/`)**: each is a single `cdylib` crate that produces `csilgen_<target>_generator.wasm`. Targets: `rust`, `go`, `typescript`, `python` (each also accepting `-typesonly` / `-client` / `-server` sub-targets, e.g. `rust-client`), `json`, `openapi`, plus the `noop` test fixture. There is no parallel library copy — the wasm crate is the single source of truth for each generator.
 - **Development tools**: `tools/xtask` build automation.
 
 Generators are discovered dynamically, **first-write-wins**, scanning in this priority order: `target/wasm32-unknown-unknown/release` (local dev builds) → `./.generators` (project-local pin/override) → `~/.csilgen/generators/` (user-installed baseline). Files matching `csilgen_<target>_generator.wasm` are registered; everything else is ignored. A project can drop a wasm into `.generators/` to override the user's installed copy without touching the homedir. To ship a third-party generator, build a `cdylib` of the same shape and place it in any of those directories — `--target <yourname>` resolves automatically.
