@@ -147,6 +147,20 @@ fn format_type_expression(
             format_type_expression(value, output, indent, config);
             output.push('}');
         }
+        crate::ast::TypeExpression::Tuple(group) => {
+            output.push('[');
+            for (i, entry) in group.entries.iter().enumerate() {
+                if i > 0 {
+                    output.push_str(", ");
+                }
+                if let Some(crate::ast::GroupKey::Bare(name)) = &entry.key {
+                    output.push_str(name);
+                    output.push_str(": ");
+                }
+                format_type_expression(&entry.value_type, output, indent, config);
+            }
+            output.push(']');
+        }
         crate::ast::TypeExpression::Group(group) => {
             format_group_expression(group, output, indent, config);
         }
@@ -412,6 +426,42 @@ fn format_group_expression(
     output.push('}');
 }
 
+fn format_depends_condition(condition: &crate::ast::DependsCondition, output: &mut String) {
+    use crate::ast::{DependsCompareOp, DependsCondition};
+    match condition {
+        DependsCondition::Compare { field, op, value } => {
+            output.push_str(field);
+            if let (Some(op), Some(val)) = (op, value) {
+                let sym = match op {
+                    DependsCompareOp::Eq => " = ",
+                    DependsCompareOp::Ne => " != ",
+                    DependsCompareOp::Lt => " < ",
+                    DependsCompareOp::Le => " <= ",
+                    DependsCompareOp::Gt => " > ",
+                    DependsCompareOp::Ge => " >= ",
+                };
+                output.push_str(sym);
+                format_literal_value(val, output);
+            }
+        }
+        DependsCondition::All(conds) => format_joined_conditions(conds, " & ", output),
+        DependsCondition::Any(conds) => format_joined_conditions(conds, " | ", output),
+    }
+}
+
+fn format_joined_conditions(
+    conds: &[crate::ast::DependsCondition],
+    sep: &str,
+    output: &mut String,
+) {
+    for (i, c) in conds.iter().enumerate() {
+        if i > 0 {
+            output.push_str(sep);
+        }
+        format_depends_condition(c, output);
+    }
+}
+
 fn format_field_metadata(metadata: &crate::ast::FieldMetadata, output: &mut String) {
     match metadata {
         crate::ast::FieldMetadata::Visibility(visibility) => match visibility {
@@ -425,6 +475,11 @@ fn format_field_metadata(metadata: &crate::ast::FieldMetadata, output: &mut Stri
                 output.push_str(" = ");
                 format_literal_value(val, output);
             }
+        }
+        crate::ast::FieldMetadata::DependsOnExpr(condition) => {
+            output.push_str("@depends-on(");
+            format_depends_condition(condition, output);
+            output.push(')');
         }
         crate::ast::FieldMetadata::Constraint(constraint) => match constraint {
             crate::ast::ValidationConstraint::MinLength(n) => {

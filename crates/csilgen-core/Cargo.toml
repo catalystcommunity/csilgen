@@ -11,6 +11,9 @@ anyhow.workspace = true
 thiserror.workspace = true
 csilgen-common.workspace = true
 regex = "1.10"
+# Validates `timestamp` bounds are well-formed RFC3339 before they reach the
+# generators, where a malformed bound would otherwise panic or be silently dropped.
+chrono = { version = "0.4", default-features = false, features = ["alloc"] }
 
 [dev-dependencies]
 csilgen-common = { workspace = true, features = ["testing"] }

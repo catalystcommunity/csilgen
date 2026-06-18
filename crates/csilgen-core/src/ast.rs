@@ -76,11 +76,14 @@ pub enum TypeExpression {
     Builtin(String),
     /// User-defined type reference
     Reference(String),
-    /// Array type with occurrence
+    /// Array type with occurrence (a homogeneous `[* T]` / `[N T]` array)
     Array {
         element_type: Box<TypeExpression>,
         occurrence: Option<Occurrence>,
     },
+    /// Fixed-shape array: a heterogeneous tuple `[a, b, c]` or a keyed array
+    /// `[tag: text, value: any]`. Entries are positional; keys are names only.
+    Tuple(GroupExpression),
     /// Map type
     Map {
         key: Box<TypeExpression>,
@@ -249,11 +252,15 @@ pub enum ServiceDirection {
 pub enum FieldMetadata {
     /// Field visibility metadata
     Visibility(FieldVisibility),
-    /// Field dependency metadata
+    /// Field dependency metadata — the simple single-comparison form
+    /// (`@depends-on(field)` / `@depends-on(field = value)`).
     DependsOn {
         field: String,
         value: Option<LiteralValue>,
     },
+    /// Field dependency on a boolean condition
+    /// (`@depends-on(a = "x" & b != "y")`, etc.).
+    DependsOnExpr(DependsCondition),
     /// Validation constraint metadata
     Constraint(ValidationConstraint),
     /// Documentation metadata
@@ -263,6 +270,33 @@ pub enum FieldMetadata {
         name: String,
         parameters: Vec<MetadataParameter>,
     },
+}
+
+/// A `@depends-on(...)` boolean condition. `&` is conjunction, `|` is
+/// disjunction; a bare field tests presence.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum DependsCondition {
+    /// `field` (presence, `op`/`value` are `None`) or `field <op> value`
+    Compare {
+        field: String,
+        op: Option<DependsCompareOp>,
+        value: Option<LiteralValue>,
+    },
+    /// All sub-conditions must hold (`&`)
+    All(Vec<DependsCondition>),
+    /// Any sub-condition must hold (`|`)
+    Any(Vec<DependsCondition>),
+}
+
+/// Comparison operator within a `@depends-on` condition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DependsCompareOp {
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
 }
 
 /// Field visibility annotations

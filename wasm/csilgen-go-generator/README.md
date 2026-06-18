@@ -98,7 +98,28 @@ Set inside the CSIL `options { … }` block; the CLI does **not** accept `--opti
 | `use_yaml_tags` | bool | `false` | Also emit `yaml:"…"` struct tags |
 | `generate_validation` | bool | `true` | Emit `Validate()` methods from constraints |
 | `generate_constructors` | bool | `false` | Emit `NewT()` constructors that wire up default values |
+| `decimal_mapping` | string | `"csil"` | In-memory type for `decimal`: `"csil"` emits a self-contained `CsilDecimal`; `"library"` uses `github.com/shopspring/decimal`. Any other value is a hard error |
 | `go_imports` | array of strings | `[]` | Extra `import` paths to inject |
+
+### Core types: `timestamp` and `decimal`
+
+`timestamp` maps to `time.Time` (kept in UTC) and encodes as CBOR tag 0 (RFC 3339);
+`time` is imported automatically wherever a timestamp appears. `decimal` is the
+exact, base-10 CBOR tag-4 decimal fraction `[exponent, mantissa]`. Under the
+default `decimal_mapping: "csil"` a single self-contained `CsilDecimal` helper is
+emitted to `csil_decimal.gen.go` **only when the spec actually uses `decimal`**; it
+(de)serializes the tag-4 wire form and bridges to/from `shopspring` via
+`String()`/`ParseCsilDecimal` without depending on it. Under `"library"` the field
+is `decimal.Decimal` and `github.com/shopspring/decimal` is imported instead.
+
+### Constraints
+
+Both constraint systems feed the same `Validate()` method: the `@`-annotations
+(`@min_length`, `@max_value`, `@regex`, …) and the `.`-control-operators carried
+inline on a field's type (`.size`, `.ge`/`.le`/`.gt`/`.lt`/`.eq`/`.ne`, `.regex`).
+`.default` is applied by the constructor. Encoding-only operators
+(`.json`/`.cbor`/`.cborseq`/`.bits`/`.and`/`.within`) are documented but never
+produce a runtime check. `regexp` is imported only when a pattern check is emitted.
 
 ## Building & Installing
 

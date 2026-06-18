@@ -248,4 +248,80 @@ mod tests {
         assert_eq!(test_cases[0].name, "simple");
         assert!(test_cases[0].metadata.should_parse);
     }
+
+    fn collect_csil_files(dir: &std::path::Path, out: &mut Vec<PathBuf>) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                collect_csil_files(&path, out);
+            } else if path.extension().is_some_and(|e| e == "csil") {
+                out.push(path);
+            }
+        }
+    }
+
+    /// Every fixture that declares intent via a sibling `.meta.json` must behave as
+    /// declared (parse success/failure and presence of validation errors). Fixtures
+    /// without a `.meta.json` are multi-file / dependency-graph cases exercised by
+    /// their own file-based tests, so they're skipped here. This guards against the
+    /// silent drift that previously left `should_parse: true` fixtures unparseable.
+    #[test]
+    fn all_metadata_fixtures_conform_to_their_meta() {
+        let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("tests")
+            .join("fixtures");
+
+        let mut csil_files = Vec::new();
+        collect_csil_files(&fixtures, &mut csil_files);
+        csil_files.sort();
+        assert!(!csil_files.is_empty(), "no fixtures discovered");
+
+        let mut checked = 0;
+        let mut failures = Vec::new();
+        for csil_path in &csil_files {
+            let meta_path = csil_path.with_extension("meta.json");
+            if !meta_path.exists() {
+                continue;
+            }
+            checked += 1;
+            let meta: TestCaseMetadata =
+                serde_json::from_str(&std::fs::read_to_string(&meta_path).unwrap()).unwrap();
+            let content = std::fs::read_to_string(csil_path).unwrap();
+            let rel = csil_path.display();
+
+            match (parse_csil(&content), meta.should_parse) {
+                (Ok(ast), true) => {
+                    let expects_errors = !meta.expected_validation_errors.is_empty();
+                    match (validate_spec(&ast), expects_errors) {
+                        (Ok(()), true) => {
+                            failures.push(format!("{rel}: expected validation errors, but passed"))
+                        }
+                        (Err(e), false) => {
+                            failures.push(format!("{rel}: unexpected validation error: {e}"))
+                        }
+                        _ => {}
+                    }
+                }
+                (Ok(_), false) => {
+                    failures.push(format!("{rel}: expected parse failure, but it parsed"))
+                }
+                (Err(e), true) => {
+                    failures.push(format!("{rel}: expected parse success, but failed: {e}"))
+                }
+                (Err(_), false) => {}
+            }
+        }
+
+        assert!(checked > 0, "no fixtures with .meta.json were found");
+        assert!(
+            failures.is_empty(),
+            "{} fixture(s) do not match their .meta.json:\n{}",
+            failures.len(),
+            failures.join("\n")
+        );
+    }
 }

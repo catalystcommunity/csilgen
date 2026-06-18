@@ -149,6 +149,7 @@ pub fn generate_files(input: &WasmGeneratorInput) -> Result<Vec<GeneratedFile>, 
     // Validate options *before* deciding which files to emit so a bad option
     // fails the entire run, regardless of which target is requested.
     let _mode = common::bidi_transport(input)?;
+    let _decimal = common::decimal_mapping(input)?;
 
     let (want_client, want_server) = match input.config.target.as_str() {
         "typescript-typesonly" => (false, false),
