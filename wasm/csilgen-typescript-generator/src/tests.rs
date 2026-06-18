@@ -22,6 +22,40 @@ fn builtin(name: &str) -> CsilTypeExpression {
     CsilTypeExpression::Builtin(name.to_string())
 }
 
+fn constrained(
+    base: CsilTypeExpression,
+    constraints: Vec<CsilControlOperator>,
+) -> CsilTypeExpression {
+    CsilTypeExpression::Constrained {
+        base_type: Box::new(base),
+        constraints,
+    }
+}
+
+fn field_meta(
+    name: &str,
+    ty: CsilTypeExpression,
+    optional: bool,
+    metadata: Vec<CsilFieldMetadata>,
+) -> CsilGroupEntry {
+    CsilGroupEntry {
+        key: bare(name),
+        value_type: ty,
+        occurrence: optional.then_some(CsilOccurrence::Optional),
+        metadata,
+        doc_comments: vec![],
+    }
+}
+
+fn spec_of(rules: Vec<CsilRule>) -> CsilSpecSerialized {
+    CsilSpecSerialized {
+        rules,
+        source_content: None,
+        service_count: 0,
+        fields_with_metadata_count: 0,
+    }
+}
+
 fn reference(name: &str) -> CsilTypeExpression {
     CsilTypeExpression::Reference(name.to_string())
 }
@@ -639,4 +673,939 @@ fn reverse_only_service_emits_router_with_no_inbound_cases_on_server() {
         !iface_body.contains("(msg:"),
         "reverse-only service must yield an empty server channel handlers interface, got {iface_body:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Tagged core types: timestamp + decimal
+// ---------------------------------------------------------------------------
+
+/// A spec whose single record carries a `decimal` and a `timestamp` field.
+fn money_spec() -> CsilSpecSerialized {
+    spec_of(vec![group_rule(
+        "Money",
+        vec![
+            field("amount", builtin("decimal"), false),
+            field("captured_at", builtin("timestamp"), false),
+        ],
+        vec![],
+    )])
+}
+
+#[test]
+fn timestamp_maps_to_date() {
+    let types = file(
+        &generate_files(&input_with_spec("typescript-typesonly", money_spec())).expect("generate"),
+        "types.gen.ts",
+    )
+    .to_string();
+    assert!(types.contains("capturedAt: Date;"));
+}
+
+#[test]
+fn decimal_csil_default_injects_helper_and_no_decimal_js() {
+    let types = file(
+        &generate_files(&input_with_spec("typescript-typesonly", money_spec())).expect("generate"),
+        "types.gen.ts",
+    )
+    .to_string();
+    // Field maps to the generated helper.
+    assert!(types.contains("amount: CsilDecimal;"));
+    // The helper is injected once, self-contained, with the tag-4 contract.
+    assert!(types.contains("export class CsilDecimal {"));
+    assert!(types.contains("static readonly CBOR_TAG = 4;"));
+    assert!(types.contains("toTag4(): [number, bigint]"));
+    assert!(types.contains("static fromString(text: string): CsilDecimal"));
+    // Default mode must NOT import decimal.js (the doc comment may still name it
+    // as the bridge target, so assert specifically on the import statement).
+    assert!(!types.contains("from \"decimal.js\""));
+    assert!(!types.contains("import Decimal"));
+}
+
+#[test]
+fn decimal_library_mode_uses_decimal_js_and_no_helper() {
+    let mut input = input_with_spec("typescript-typesonly", money_spec());
+    input.config.options.insert(
+        "decimal_mapping".to_string(),
+        serde_json::Value::String("library".to_string()),
+    );
+    let types = file(&generate_files(&input).expect("generate"), "types.gen.ts").to_string();
+    assert!(types.contains("import Decimal from \"decimal.js\";"));
+    assert!(types.contains("amount: Decimal;"));
+    // No self-contained helper when the library type is selected.
+    assert!(!types.contains("export class CsilDecimal"));
+}
+
+#[test]
+fn csil_decimal_not_injected_when_decimal_unused() {
+    // The sample spec has no `decimal`, so neither the helper nor the import appears.
+    let types = file(
+        &generate_files(&input_for("typescript-typesonly")).expect("generate"),
+        "types.gen.ts",
+    )
+    .to_string();
+    assert!(!types.contains("CsilDecimal"));
+    assert!(!types.contains("decimal.js"));
+}
+
+#[test]
+fn invalid_decimal_mapping_fails_generation() {
+    let mut input = input_with_spec("typescript-typesonly", money_spec());
+    input.config.options.insert(
+        "decimal_mapping".to_string(),
+        serde_json::Value::String("bignum".to_string()),
+    );
+    let err = generate_files(&input).expect_err("invalid value must fail");
+    assert!(
+        err.contains("decimal_mapping") && err.contains("bignum"),
+        "error must name the option and bad value, got {err:?}"
+    );
+}
+
+#[test]
+fn decimal_in_operation_signature_maps_with_mapping() {
+    // An inline `decimal` in an op signature must follow the same mapping the
+    // struct fields do, in both client and server outputs.
+    let spec = spec_of(vec![CsilRule {
+        name: "PriceService".to_string(),
+        rule_type: CsilRuleType::ServiceDef(CsilServiceDefinition {
+            operations: vec![CsilServiceOperation {
+                name: "Quote".to_string(),
+                input_type: builtin("decimal"),
+                output_type: builtin("decimal"),
+                direction: CsilServiceDirection::Unidirectional,
+                position: pos(),
+                doc_comments: vec![],
+            }],
+        }),
+        position: pos(),
+        doc_comments: vec![],
+    }]);
+    let mut input = input_with_spec("typescript-client", spec);
+    input.csil_spec.service_count = 1;
+    let client = file(&generate_files(&input).expect("generate"), "client.gen.ts").to_string();
+    assert!(client.contains("Promise<CsilDecimal>"));
+    assert!(client.contains("req: CsilDecimal"));
+}
+
+// ---------------------------------------------------------------------------
+// Validation
+// ---------------------------------------------------------------------------
+
+/// A record exercising both constraint systems: a `.size`-constrained string, a
+/// `@MinValue` numeric, an optional `@MaxItems` array, and a `.regex`.
+fn constrained_spec() -> CsilSpecSerialized {
+    spec_of(vec![group_rule(
+        "SignupRequest",
+        vec![
+            field(
+                "username",
+                constrained(
+                    builtin("text"),
+                    vec![CsilControlOperator::Size(CsilSizeConstraint::Range {
+                        min: 3,
+                        max: 20,
+                    })],
+                ),
+                false,
+            ),
+            field(
+                "slug",
+                constrained(
+                    builtin("text"),
+                    vec![CsilControlOperator::Regex("^[a-z]+$".to_string())],
+                ),
+                false,
+            ),
+            field_meta(
+                "age",
+                builtin("int"),
+                false,
+                vec![CsilFieldMetadata::Constraint(
+                    CsilValidationConstraint::MinValue(CsilLiteralValue::Integer(18)),
+                )],
+            ),
+            field_meta(
+                "tags",
+                CsilTypeExpression::Array {
+                    element_type: Box::new(builtin("text")),
+                    occurrence: Some(CsilOccurrence::ZeroOrMore),
+                },
+                true,
+                vec![CsilFieldMetadata::Constraint(
+                    CsilValidationConstraint::MaxItems(5),
+                )],
+            ),
+        ],
+        vec![],
+    )])
+}
+
+#[test]
+fn validation_emits_checks_for_both_constraint_systems() {
+    let types = file(
+        &generate_files(&input_with_spec("typescript-typesonly", constrained_spec()))
+            .expect("generate"),
+        "types.gen.ts",
+    )
+    .to_string();
+
+    assert!(
+        types.contains("export function validateSignupRequest(value: SignupRequest): string[] {")
+    );
+    assert!(types.contains("const errors: string[] = [];"));
+    assert!(types.contains("return errors;"));
+
+    // .size (control operator) → length range check.
+    assert!(types.contains(
+        "if (value.username.length < 3 || value.username.length > 20) errors.push(\"username: length must be between 3 and 20\");"
+    ));
+    // .regex (control operator) → module-level compiled RegExp + test.
+    assert!(types.contains("const signupRequestSlugRe = new RegExp(\"^[a-z]+$\");"));
+    assert!(types.contains("if (!signupRequestSlugRe.test(value.slug)) errors.push(\"slug: must match the required pattern\");"));
+    // @MinValue (metadata) → numeric guard.
+    assert!(types.contains("if (value.age < 18) errors.push(\"age: must be >= 18\");"));
+    // @MaxItems on an optional field → guarded by presence test.
+    assert!(types.contains("if (value.tags !== undefined) {"));
+    assert!(
+        types.contains("if (value.tags.length > 5) errors.push(\"tags: must have <= 5 items\");")
+    );
+}
+
+#[test]
+fn constrained_type_alias_emits_value_validator() {
+    let spec = spec_of(vec![CsilRule {
+        name: "HouseID".to_string(),
+        rule_type: CsilRuleType::TypeDef(constrained(
+            builtin("text"),
+            vec![CsilControlOperator::Size(CsilSizeConstraint::Min(1))],
+        )),
+        position: pos(),
+        doc_comments: vec![],
+    }]);
+    let types = file(
+        &generate_files(&input_with_spec("typescript-typesonly", spec)).expect("generate"),
+        "types.gen.ts",
+    )
+    .to_string();
+    assert!(types.contains("export function validateHouseID(value: HouseID): string[] {"));
+    assert!(types.contains("if (value.length < 1) errors.push(\"value: length must be >= 1\");"));
+}
+
+#[test]
+fn encoding_only_constraints_emit_no_validator() {
+    // `.cbor` describes wire framing, not validity — no validator should appear.
+    let spec = spec_of(vec![CsilRule {
+        name: "Payload".to_string(),
+        rule_type: CsilRuleType::TypeDef(constrained(
+            builtin("bytes"),
+            vec![CsilControlOperator::Cbor],
+        )),
+        position: pos(),
+        doc_comments: vec![],
+    }]);
+    let types = file(
+        &generate_files(&input_with_spec("typescript-typesonly", spec)).expect("generate"),
+        "types.gen.ts",
+    )
+    .to_string();
+    assert!(!types.contains("validatePayload"));
+}
+
+#[test]
+fn types_without_constraints_emit_no_validator() {
+    // The constraint-free sample spec must produce no validator functions.
+    let types = file(
+        &generate_files(&input_for("typescript-typesonly")).expect("generate"),
+        "types.gen.ts",
+    )
+    .to_string();
+    assert!(!types.contains("export function validate"));
+}
+
+/// The exact spec from the bug report:
+/// `user = { balance: decimal .ge "0.00", created_at: timestamp .ge "1970-..." }`
+fn tagged_bound_spec() -> CsilSpecSerialized {
+    spec_of(vec![group_rule(
+        "user",
+        vec![
+            field(
+                "balance",
+                constrained(
+                    builtin("decimal"),
+                    vec![CsilControlOperator::GreaterEqual(CsilLiteralValue::Text(
+                        "0.00".to_string(),
+                    ))],
+                ),
+                false,
+            ),
+            field(
+                "created_at",
+                constrained(
+                    builtin("timestamp"),
+                    vec![CsilControlOperator::GreaterEqual(CsilLiteralValue::Text(
+                        "1970-01-01T00:00:00Z".to_string(),
+                    ))],
+                ),
+                false,
+            ),
+        ],
+        vec![],
+    )])
+}
+
+/// Every `errors.push(...)` argument must be a single, well-formed double-quoted
+/// string literal — i.e. an even number of unescaped `"` after the opening one.
+/// This is the syntactic guard against the original defect, which interpolated a
+/// raw `"0.00"` and produced `errors.push("...>= "0.00"")`.
+fn push_args_are_valid_string_literals(source: &str) {
+    for line in source.lines() {
+        let Some(rest) = line.split_once("errors.push(").map(|(_, r)| r) else {
+            continue;
+        };
+        let arg = rest.trim_end().trim_end_matches(';').trim_end_matches(')');
+        assert!(
+            arg.starts_with('"') && arg.ends_with('"') && arg.len() >= 2,
+            "push argument is not a quoted string: {arg:?}"
+        );
+        // Count quotes that are not backslash-escaped; the body between the outer
+        // quotes must contain none, or the literal is broken.
+        let body = &arg[1..arg.len() - 1];
+        let mut chars = body.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c == '\\' {
+                chars.next(); // skip the escaped character
+            } else {
+                assert_ne!(c, '"', "unescaped quote inside string literal: {arg:?}");
+            }
+        }
+    }
+}
+
+#[test]
+fn tagged_bounds_escape_literals_and_compare_via_in_memory_types() {
+    let types = file(
+        &generate_files(&input_with_spec(
+            "typescript-typesonly",
+            tagged_bound_spec(),
+        ))
+        .expect("generate"),
+        "types.gen.ts",
+    )
+    .to_string();
+
+    // No generated `errors.push` may carry an unescaped quote.
+    push_args_are_valid_string_literals(&types);
+    // The specific shape of the original defect must be gone.
+    assert!(
+        !types.contains("0.00\"\""),
+        "the unescaped-literal defect is still present"
+    );
+
+    // `decimal` bound is reconstructed as CsilDecimal and compared by ordering;
+    // the message keeps the (now escaped) bound text.
+    assert!(types.contains(
+        "if (value.balance.compare(CsilDecimal.fromString(\"0.00\")) < 0) errors.push(\"balance: must be >= \\\"0.00\\\"\");"
+    ));
+
+    // `timestamp` bound is reconstructed as a Date and compared chronologically.
+    assert!(types.contains(
+        "if (value.createdAt.getTime() < new Date(\"1970-01-01T00:00:00Z\").getTime()) errors.push(\"createdAt: must be >= \\\"1970-01-01T00:00:00Z\\\"\");"
+    ));
+
+    // The CsilDecimal helper now carries the ordering used by the guard.
+    assert!(types.contains("compare(other: CsilDecimal): number"));
+}
+
+#[test]
+fn decimal_bound_in_library_mode_uses_decimal_js_comparison() {
+    let mut input = input_with_spec("typescript-typesonly", tagged_bound_spec());
+    input.config.options.insert(
+        "decimal_mapping".to_string(),
+        serde_json::Value::String("library".to_string()),
+    );
+    let types = file(&generate_files(&input).expect("generate"), "types.gen.ts").to_string();
+
+    push_args_are_valid_string_literals(&types);
+    assert!(types.contains(
+        "if (value.balance.cmp(new Decimal(\"0.00\")) < 0) errors.push(\"balance: must be >= \\\"0.00\\\"\");"
+    ));
+}
+
+#[test]
+fn numeric_bounds_keep_direct_comparison() {
+    // A regression guard: numeric fields must NOT be routed through decimal/date
+    // reconstruction — the bound stays a bare number literal.
+    let spec = spec_of(vec![group_rule(
+        "Account",
+        vec![field(
+            "balance",
+            constrained(
+                builtin("int"),
+                vec![CsilControlOperator::GreaterEqual(
+                    CsilLiteralValue::Integer(0),
+                )],
+            ),
+            false,
+        )],
+        vec![],
+    )]);
+    let types = file(
+        &generate_files(&input_with_spec("typescript-typesonly", spec)).expect("generate"),
+        "types.gen.ts",
+    )
+    .to_string();
+    assert!(types.contains("if (value.balance < 0) errors.push(\"balance: must be >= 0\");"));
+}
+
+#[test]
+fn regex_is_hoisted_to_module_level_const() {
+    // The compiled RegExp must live at module scope (before the validator
+    // function) so it is built once, not on every validate call.
+    let types = file(
+        &generate_files(&input_with_spec("typescript-typesonly", constrained_spec()))
+            .expect("generate"),
+        "types.gen.ts",
+    )
+    .to_string();
+
+    let const_at = types
+        .find("const signupRequestSlugRe = new RegExp(\"^[a-z]+$\");")
+        .expect("hoisted regex const present");
+    let fn_at = types
+        .find("export function validateSignupRequest")
+        .expect("validator present");
+    assert!(
+        const_at < fn_at,
+        "regex const must be declared before the validator that uses it"
+    );
+    // The validator references the const, never an inline RegExp.
+    assert!(!types.contains("new RegExp(\"^[a-z]+$\").test"));
+    // The const sits at module scope (no leading indentation).
+    assert!(
+        types
+            .lines()
+            .any(|l| l == "const signupRequestSlugRe = new RegExp(\"^[a-z]+$\");")
+    );
+}
+
+/// A service whose single op takes and returns a bare inline `decimal`, so
+/// `ts_type` prints `CsilDecimal`/`Decimal` directly into client/server.
+fn decimal_op_spec() -> CsilSpecSerialized {
+    let mut spec = spec_of(vec![CsilRule {
+        name: "PriceService".to_string(),
+        rule_type: CsilRuleType::ServiceDef(CsilServiceDefinition {
+            operations: vec![CsilServiceOperation {
+                name: "Quote".to_string(),
+                input_type: builtin("decimal"),
+                output_type: builtin("decimal"),
+                direction: CsilServiceDirection::Unidirectional,
+                position: pos(),
+                doc_comments: vec![],
+            }],
+        }),
+        position: pos(),
+        doc_comments: vec![],
+    }]);
+    spec.service_count = 1;
+    spec
+}
+
+#[test]
+fn inline_decimal_in_op_signature_injects_import_in_client_and_server() {
+    // csil (default): `CsilDecimal` is a value, pulled from the types module so
+    // the emitted reference is not an undefined identifier.
+    for (target, path) in [
+        ("typescript-client", "client.gen.ts"),
+        ("typescript-server", "server.gen.ts"),
+    ] {
+        let src = file(
+            &generate_files(&input_with_spec(target, decimal_op_spec())).expect("generate"),
+            path,
+        )
+        .to_string();
+        assert!(
+            src.contains("import { CsilDecimal } from \"./types.gen\";"),
+            "{target} must import CsilDecimal, got:\n{src}"
+        );
+    }
+
+    // library mode: the inline `decimal` maps to `Decimal`, imported from
+    // decimal.js directly in the client/server file.
+    for (target, path) in [
+        ("typescript-client", "client.gen.ts"),
+        ("typescript-server", "server.gen.ts"),
+    ] {
+        let mut input = input_with_spec(target, decimal_op_spec());
+        input.config.options.insert(
+            "decimal_mapping".to_string(),
+            serde_json::Value::String("library".to_string()),
+        );
+        let src = file(&generate_files(&input).expect("generate"), path).to_string();
+        assert!(
+            src.contains("import Decimal from \"decimal.js\";"),
+            "{target} library mode must import Decimal, got:\n{src}"
+        );
+    }
+}
+
+#[test]
+fn text_bound_with_control_char_uses_ts_escapes_not_debug() {
+    // A `.eq` text bound carrying a control char must use TS `\uNNNN` escapes,
+    // never Rust debug's `\u{NN}` brace form (invalid TypeScript).
+    let spec = spec_of(vec![group_rule(
+        "Token",
+        vec![field(
+            "code",
+            constrained(
+                builtin("text"),
+                vec![CsilControlOperator::Equal(CsilLiteralValue::Text(
+                    "a\u{1}b".to_string(),
+                ))],
+            ),
+            false,
+        )],
+        vec![],
+    )]);
+    let types = file(
+        &generate_files(&input_with_spec("typescript-typesonly", spec)).expect("generate"),
+        "types.gen.ts",
+    )
+    .to_string();
+    assert!(
+        types.contains("value.code !== \"a\\u0001b\""),
+        "expected TS unicode escape in comparison, got:\n{types}"
+    );
+    assert!(
+        !types.contains("\\u{1}"),
+        "must not emit Rust debug brace escape"
+    );
+}
+
+#[test]
+fn integer_decimal_bound_is_quoted_for_constructor() {
+    // The core may hand a `decimal` bound as an Integer (`decimal .ge 0`); both
+    // `fromString` and `new Decimal` take a string, so it must be quoted.
+    let spec = spec_of(vec![group_rule(
+        "Wallet",
+        vec![field(
+            "balance",
+            constrained(
+                builtin("decimal"),
+                vec![CsilControlOperator::GreaterEqual(
+                    CsilLiteralValue::Integer(0),
+                )],
+            ),
+            false,
+        )],
+        vec![],
+    )]);
+
+    // csil (default) mode quotes the integer bound for fromString.
+    let types = file(
+        &generate_files(&input_with_spec("typescript-typesonly", spec.clone())).expect("generate"),
+        "types.gen.ts",
+    )
+    .to_string();
+    push_args_are_valid_string_literals(&types);
+    assert!(types.contains(
+        "if (value.balance.compare(CsilDecimal.fromString(\"0\")) < 0) errors.push(\"balance: must be >= 0\");"
+    ));
+    assert!(
+        !types.contains("fromString(0)"),
+        "integer bound must not be passed unquoted"
+    );
+
+    // library mode uses the string form too, for consistency.
+    let mut input = input_with_spec("typescript-typesonly", spec);
+    input.config.options.insert(
+        "decimal_mapping".to_string(),
+        serde_json::Value::String("library".to_string()),
+    );
+    let types = file(&generate_files(&input).expect("generate"), "types.gen.ts").to_string();
+    assert!(types.contains(
+        "if (value.balance.cmp(new Decimal(\"0\")) < 0) errors.push(\"balance: must be >= 0\");"
+    ));
+    assert!(
+        !types.contains("new Decimal(0)"),
+        "integer bound must not be passed unquoted"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Tuples, boolean @depends-on, and push-only (`<- Event`) operations
+// ---------------------------------------------------------------------------
+
+/// A single tuple slot: `key` is `None` for a positional element, `Some(Bare)`
+/// for a labeled one.
+fn tuple_entry(
+    key: Option<CsilGroupKey>,
+    ty: CsilTypeExpression,
+    optional: bool,
+) -> CsilGroupEntry {
+    CsilGroupEntry {
+        key,
+        value_type: ty,
+        occurrence: optional.then_some(CsilOccurrence::Optional),
+        metadata: vec![],
+        doc_comments: vec![],
+    }
+}
+
+fn alias_rule(name: &str, ty: CsilTypeExpression) -> CsilRule {
+    CsilRule {
+        name: name.to_string(),
+        rule_type: CsilRuleType::TypeDef(ty),
+        position: pos(),
+        doc_comments: vec![],
+    }
+}
+
+#[test]
+fn tuple_maps_to_positional_and_labeled_ts_tuple() {
+    // `[text, int, bool]` is positional; an optional trailing slot becomes `?`.
+    let positional = CsilTypeExpression::Tuple(CsilGroupExpression {
+        entries: vec![
+            tuple_entry(None, builtin("text"), false),
+            tuple_entry(None, builtin("int"), false),
+            tuple_entry(None, builtin("bool"), true),
+        ],
+    });
+    // `[tag: text, value: any]` is fully keyed, so it is a labeled tuple.
+    let labeled = CsilTypeExpression::Tuple(CsilGroupExpression {
+        entries: vec![
+            tuple_entry(bare("tag"), builtin("text"), false),
+            tuple_entry(bare("value"), builtin("any"), false),
+        ],
+    });
+    let spec = spec_of(vec![
+        alias_rule("Row", positional),
+        alias_rule("Tagged", labeled),
+    ]);
+    let types = file(
+        &generate_files(&input_with_spec("typescript-typesonly", spec)).expect("generate"),
+        "types.gen.ts",
+    )
+    .to_string();
+
+    assert!(
+        types.contains("export type Row = [string, number, boolean?];"),
+        "positional tuple, got: {types}"
+    );
+    assert!(
+        types.contains("export type Tagged = [tag: string, value: any];"),
+        "labeled tuple, got: {types}"
+    );
+}
+
+#[test]
+fn depends_on_expr_renders_as_jsdoc_note() {
+    // country != "US" && (shipping_method == "express" || has_phone)
+    let cond = CsilDependsCondition::All(vec![
+        CsilDependsCondition::Compare {
+            field: "country".to_string(),
+            op: Some(CsilDependsCompareOp::Ne),
+            value: Some(CsilLiteralValue::Text("US".to_string())),
+        },
+        CsilDependsCondition::Any(vec![
+            CsilDependsCondition::Compare {
+                field: "shipping_method".to_string(),
+                op: Some(CsilDependsCompareOp::Eq),
+                value: Some(CsilLiteralValue::Text("express".to_string())),
+            },
+            // No operator: a bare presence check.
+            CsilDependsCondition::Compare {
+                field: "has_phone".to_string(),
+                op: None,
+                value: None,
+            },
+        ]),
+    ]);
+    let spec = spec_of(vec![group_rule(
+        "ShippingForm",
+        vec![
+            field("country", builtin("text"), false),
+            field_meta(
+                "postal_code",
+                builtin("text"),
+                true,
+                vec![CsilFieldMetadata::DependsOnExpr(cond)],
+            ),
+        ],
+        vec![],
+    )]);
+    let types = file(
+        &generate_files(&input_with_spec("typescript-typesonly", spec)).expect("generate"),
+        "types.gen.ts",
+    )
+    .to_string();
+
+    // Field names are camelCased; `&&`/`||` join with nested groups parenthesized.
+    assert!(
+        types.contains(
+            "@depends-on country !== \"US\" && (shippingMethod === \"express\" || hasPhone)"
+        ),
+        "got: {types}"
+    );
+    assert!(types.contains("postalCode?: string;"));
+}
+
+#[test]
+fn labeled_tuple_optional_before_required_stays_valid_ts() {
+    // `[note?: text, id: int]`: an optional element precedes a required one. A `?`
+    // suffix here is TS1257; the optional slot must instead admit `undefined`.
+    let tuple = CsilTypeExpression::Tuple(CsilGroupExpression {
+        entries: vec![
+            tuple_entry(bare("note"), builtin("text"), true),
+            tuple_entry(bare("id"), builtin("int"), false),
+        ],
+    });
+    let spec = spec_of(vec![alias_rule("Entry", tuple)]);
+    let types = file(
+        &generate_files(&input_with_spec("typescript-typesonly", spec)).expect("generate"),
+        "types.gen.ts",
+    )
+    .to_string();
+
+    assert!(
+        types.contains("export type Entry = [note: string | undefined, id: number];"),
+        "non-trailing optional must become `T | undefined`, got: {types}"
+    );
+    // The defective `?`-before-required shape must be gone.
+    assert!(
+        !types.contains("note?: string"),
+        "optional `?` must not precede a required element, got: {types}"
+    );
+}
+
+#[test]
+fn positional_tuple_optional_before_required_stays_valid_ts() {
+    // The positional twin of the above: `[text?, int]` → `[string | undefined, number]`.
+    let tuple = CsilTypeExpression::Tuple(CsilGroupExpression {
+        entries: vec![
+            tuple_entry(None, builtin("text"), true),
+            tuple_entry(None, builtin("int"), false),
+        ],
+    });
+    let spec = spec_of(vec![alias_rule("Row", tuple)]);
+    let types = file(
+        &generate_files(&input_with_spec("typescript-typesonly", spec)).expect("generate"),
+        "types.gen.ts",
+    )
+    .to_string();
+    assert!(
+        types.contains("export type Row = [string | undefined, number];"),
+        "got: {types}"
+    );
+    assert!(!types.contains("string?, number"), "got: {types}");
+}
+
+#[test]
+fn depends_on_value_with_comment_terminator_is_sanitized() {
+    // A `@depends-on` value carrying `*/` would close the JSDoc block early; the
+    // emitted comment must neutralize it.
+    let cond = CsilDependsCondition::Compare {
+        field: "note".to_string(),
+        op: Some(CsilDependsCompareOp::Eq),
+        value: Some(CsilLiteralValue::Text("x*/y".to_string())),
+    };
+    let spec = spec_of(vec![group_rule(
+        "Form",
+        vec![field_meta(
+            "field",
+            builtin("text"),
+            true,
+            vec![CsilFieldMetadata::DependsOnExpr(cond)],
+        )],
+        vec![],
+    )]);
+    let types = file(
+        &generate_files(&input_with_spec("typescript-typesonly", spec)).expect("generate"),
+        "types.gen.ts",
+    )
+    .to_string();
+
+    // The note line carries the sanitized form, never a raw `*/` inside the value.
+    let note = types
+        .lines()
+        .find(|l| l.contains("@depends-on"))
+        .expect("depends-on note present");
+    assert!(
+        !note.contains("*/"),
+        "raw comment terminator must be neutralized, got: {note:?}"
+    );
+    assert!(
+        note.contains("x*\\/y"),
+        "value must be present in escaped form, got: {note:?}"
+    );
+}
+
+#[test]
+fn both_depends_on_forms_render_as_jsdoc_notes() {
+    // The simple equality form stays `DependsOn`; the `!=` form becomes
+    // `DependsOnExpr`. Both must surface a note.
+    let spec = spec_of(vec![group_rule(
+        "Order",
+        vec![
+            field_meta(
+                "shipped_at",
+                builtin("timestamp"),
+                true,
+                vec![CsilFieldMetadata::DependsOn {
+                    field: "status".to_string(),
+                    value: Some(CsilLiteralValue::Text("active".to_string())),
+                }],
+            ),
+            field_meta(
+                "cancelled_at",
+                builtin("timestamp"),
+                true,
+                vec![CsilFieldMetadata::DependsOnExpr(
+                    CsilDependsCondition::Compare {
+                        field: "status".to_string(),
+                        op: Some(CsilDependsCompareOp::Ne),
+                        value: Some(CsilLiteralValue::Text("active".to_string())),
+                    },
+                )],
+            ),
+        ],
+        vec![],
+    )]);
+    let types = file(
+        &generate_files(&input_with_spec("typescript-typesonly", spec)).expect("generate"),
+        "types.gen.ts",
+    )
+    .to_string();
+
+    assert!(
+        types.contains("@depends-on status === \"active\""),
+        "simple form must render, got: {types}"
+    );
+    assert!(
+        types.contains("@depends-on status !== \"active\""),
+        "expr form must render, got: {types}"
+    );
+}
+
+#[test]
+fn unidirectional_op_with_null_input_omits_request_param() {
+    // A push op `-> Event` reaches the generator as a Unidirectional op whose
+    // input is the `null` builtin; the unary client method must drop the request
+    // parameter instead of emitting `req: null`.
+    let mut rules = vec![group_rule(
+        "Event",
+        vec![field("kind", builtin("text"), false)],
+        vec![],
+    )];
+    rules.push(CsilRule {
+        name: "FeedService".to_string(),
+        rule_type: CsilRuleType::ServiceDef(CsilServiceDefinition {
+            operations: vec![CsilServiceOperation {
+                name: "poll-event".to_string(),
+                input_type: builtin("null"),
+                output_type: reference("Event"),
+                direction: CsilServiceDirection::Unidirectional,
+                position: pos(),
+                doc_comments: vec![],
+            }],
+        }),
+        position: pos(),
+        doc_comments: vec![],
+    });
+    let spec = CsilSpecSerialized {
+        rules,
+        source_content: None,
+        service_count: 1,
+        fields_with_metadata_count: 0,
+    };
+
+    let client = file(
+        &generate_files(&input_with_spec("typescript-client", spec)).expect("generate"),
+        "client.gen.ts",
+    )
+    .to_string();
+
+    assert!(
+        client.contains("pollEvent(opts?: { signal?: AbortSignal }): Promise<Event>"),
+        "null input must drop the request param, got: {client}"
+    );
+    assert!(
+        !client.contains("req: null"),
+        "null input must not surface as a request param, got: {client}"
+    );
+    assert!(
+        client.contains("this.t.call<undefined, Event>(\"feed\", \"PollEvent\", undefined, opts)"),
+        "call must pass undefined for the null request, got: {client}"
+    );
+}
+
+#[test]
+fn push_only_reverse_op_with_null_input_emits_cleanly() {
+    // `new-event: <- Event` reaches the generator as a Reverse op whose
+    // input_type is the `null` builtin (the server pushes; there is no request).
+    let mut rules = vec![group_rule(
+        "Event",
+        vec![field("kind", builtin("text"), false)],
+        vec![],
+    )];
+    rules.push(CsilRule {
+        name: "FeedService".to_string(),
+        rule_type: CsilRuleType::ServiceDef(CsilServiceDefinition {
+            operations: vec![CsilServiceOperation {
+                name: "new-event".to_string(),
+                input_type: builtin("null"),
+                output_type: reference("Event"),
+                direction: CsilServiceDirection::Reverse,
+                position: pos(),
+                doc_comments: vec![],
+            }],
+        }),
+        position: pos(),
+        doc_comments: vec![],
+    });
+    let spec = CsilSpecSerialized {
+        rules,
+        source_content: None,
+        service_count: 1,
+        fields_with_metadata_count: 0,
+    };
+
+    // Connection mode (default): client receives via a handler, server pushes via
+    // an encoder, and `null` never surfaces as a request parameter anywhere.
+    let client = file(
+        &generate_files(&input_with_spec("typescript-client", spec.clone())).expect("generate"),
+        "client.gen.ts",
+    )
+    .to_string();
+    assert!(
+        client.contains("newEvent(msg: Event): void;"),
+        "got: {client}"
+    );
+    assert!(
+        !client.contains("req: null"),
+        "null input must not surface as a request param"
+    );
+
+    let server = file(
+        &generate_files(&input_with_spec("typescript-server", spec.clone())).expect("generate"),
+        "server.gen.ts",
+    )
+    .to_string();
+    assert!(
+        server.contains("export function encodeFeedNewEvent(codec: Codec, msg: Event)"),
+        "got: {server}"
+    );
+    assert!(!server.contains("req: null"));
+
+    // RPC mode degrades reverse to a `check<Op>` poll; still no request param.
+    let mut input = input_with_spec("typescript-server", spec);
+    input.config.options.insert(
+        "ts_bidirectional_transport".to_string(),
+        serde_json::Value::String("rpc".to_string()),
+    );
+    let server_rpc = file(&generate_files(&input).expect("generate"), "server.gen.ts").to_string();
+    assert!(
+        server_rpc.contains("checkNewEvent(ctx: RequestContext): Promise<Event[]>;"),
+        "got: {server_rpc}"
+    );
+    assert!(!server_rpc.contains("req: null"));
 }

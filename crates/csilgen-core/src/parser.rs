@@ -220,25 +220,108 @@ impl Parser {
     }
 
     fn parse_type_expression(&mut self) -> Result<TypeExpression, ParseError> {
+        // An open-start range (`..end`) begins with the range operator itself.
+        if matches!(
+            self.peek().token_type,
+            TokenType::Range | TokenType::RangeInclusive
+        ) {
+            return self.parse_range(None);
+        }
+
         let mut expr = self.parse_primary_type()?;
 
-        // Handle choices (type1 / type2 / type3)
-        if self.match_token(&TokenType::Choice) {
+        // A numeric literal followed by a range operator is a range type
+        // (`start..end`, `start..`, `start...end`). Ranges lower to comparison
+        // constraints so every generator honors them through the same machinery as
+        // an explicit `.ge`/`.le`, rather than each needing a bespoke range path.
+        if matches!(
+            self.peek().token_type,
+            TokenType::Range | TokenType::RangeInclusive
+        ) && let TypeExpression::Literal(
+            lit @ (LiteralValue::Integer(_) | LiteralValue::Float(_)),
+        ) = &expr
+        {
+            let start = lit.clone();
+            return self.parse_range(Some(start));
+        }
+
+        // Handle choices: `/` type choice and `//` group choice both lower to a
+        // choice between the operands (a value is one of them).
+        if matches!(
+            self.peek().token_type,
+            TokenType::Choice | TokenType::GroupChoiceInfix
+        ) {
+            self.advance();
             let mut choices = vec![expr];
 
             loop {
                 self.skip_whitespace_and_comments();
                 choices.push(self.parse_primary_type()?);
 
-                if !self.match_token(&TokenType::Choice) {
+                if !matches!(
+                    self.peek().token_type,
+                    TokenType::Choice | TokenType::GroupChoiceInfix
+                ) {
                     break;
                 }
+                self.advance();
             }
 
             expr = TypeExpression::Choice(choices);
         }
 
         Ok(expr)
+    }
+
+    /// Lower a `start..end` / `start..` / `..end` range to a constrained int/float.
+    /// `..` is inclusive (`.ge`/`.le`); `...` excludes the upper bound (`.lt`). The
+    /// base type is `float` when either bound is a float, otherwise `int`.
+    fn parse_range(&mut self, start: Option<LiteralValue>) -> Result<TypeExpression, ParseError> {
+        let exclusive_upper = matches!(self.peek().token_type, TokenType::RangeInclusive);
+        self.advance(); // consume `..` / `...`
+        self.skip_whitespace_and_comments();
+
+        let end = match &self.peek().token_type {
+            TokenType::Integer(v) => {
+                let v = *v;
+                self.advance();
+                Some(LiteralValue::Integer(v))
+            }
+            TokenType::Float(v) => {
+                let v = *v;
+                self.advance();
+                Some(LiteralValue::Float(v))
+            }
+            _ => None,
+        };
+
+        if start.is_none() && end.is_none() {
+            return Err(ParseError::ExpectedToken {
+                expected: "a numeric range bound".to_string(),
+                found: self.peek().clone(),
+            });
+        }
+
+        let is_float = matches!(start, Some(LiteralValue::Float(_)))
+            || matches!(end, Some(LiteralValue::Float(_)));
+        let base = TypeExpression::Builtin(if is_float { "float" } else { "int" }.to_string());
+
+        let mut constraints = Vec::new();
+        if let Some(s) = start {
+            constraints.push(ControlOperator::GreaterEqual(s));
+        }
+        if let Some(e) = end {
+            constraints.push(if exclusive_upper {
+                ControlOperator::LessThan(e)
+            } else {
+                ControlOperator::LessEqual(e)
+            });
+        }
+
+        Ok(TypeExpression::Constrained {
+            base_type: Box::new(base),
+            constraints,
+        })
     }
 
     fn parse_primary_type(&mut self) -> Result<TypeExpression, ParseError> {
@@ -322,6 +405,13 @@ impl Parser {
             TokenType::LeftParen => {
                 self.advance(); // consume (
                 self.skip_whitespace_and_comments();
+                // `( key: type, … )` is a CDDL group; a single parenthesized
+                // type/choice keeps its existing grouping behavior.
+                if self.check_for_group_key() {
+                    let entries = self.parse_group_entries(&TokenType::RightParen, ")")?;
+                    self.consume_token(&TokenType::RightParen)?;
+                    return Ok(TypeExpression::Group(GroupExpression { entries }));
+                }
                 let expr = self.parse_type_expression()?;
                 self.skip_whitespace_and_comments();
                 self.consume_token(&TokenType::RightParen)?;
@@ -355,23 +445,68 @@ impl Parser {
         self.consume_token(&TokenType::LeftBracket)?;
         self.skip_whitespace_and_comments();
 
-        // Parse occurrence if present
-        let occurrence = if self.match_occurrence_indicator() {
+        // Parse comma-separated array members. One unkeyed member is the common
+        // homogeneous `[* T]` array; multiple members or any key make it a
+        // fixed-shape tuple.
+        let mut members = Vec::new();
+        while !self.check(&TokenType::RightBracket) && !self.is_at_end() {
+            members.push(self.parse_array_member()?);
+            self.skip_whitespace_and_comments();
+            if self.match_token(&TokenType::Comma) {
+                self.skip_whitespace_and_comments();
+                continue;
+            }
+            if !self.check(&TokenType::RightBracket) {
+                return Err(ParseError::ExpectedToken {
+                    expected: "comma or ]".to_string(),
+                    found: self.peek().clone(),
+                });
+            }
+        }
+        self.consume_token(&TokenType::RightBracket)?;
+
+        if members.len() == 1 && members[0].key.is_none() {
+            let member = members.pop().unwrap();
+            Ok(TypeExpression::Array {
+                element_type: Box::new(member.value_type),
+                occurrence: member.occurrence,
+            })
+        } else {
+            Ok(TypeExpression::Tuple(GroupExpression { entries: members }))
+        }
+    }
+
+    /// One member of an array body: an optional occurrence and/or member key
+    /// followed by a type.
+    fn parse_array_member(&mut self) -> Result<GroupEntry, ParseError> {
+        let occurrence = if self.array_member_starts_with_occurrence() {
             Some(self.parse_occurrence()?)
         } else {
             None
         };
-
         self.skip_whitespace_and_comments();
-        let element_type = Box::new(self.parse_type_expression()?);
 
-        self.skip_whitespace_and_comments();
-        self.consume_token(&TokenType::RightBracket)?;
-
-        Ok(TypeExpression::Array {
-            element_type,
-            occurrence,
-        })
+        if self.check_for_group_key() {
+            let (key, key_occurrence) = self.parse_group_key()?;
+            self.skip_whitespace_and_comments();
+            let value_type = self.parse_type_expression()?;
+            Ok(GroupEntry {
+                key: Some(key),
+                value_type,
+                occurrence: occurrence.or(key_occurrence),
+                metadata: Vec::new(),
+                doc_comments: Vec::new(),
+            })
+        } else {
+            let value_type = self.parse_type_expression()?;
+            Ok(GroupEntry {
+                key: None,
+                value_type,
+                occurrence,
+                metadata: Vec::new(),
+                doc_comments: Vec::new(),
+            })
+        }
     }
 
     fn parse_map_type(&mut self) -> Result<TypeExpression, ParseError> {
@@ -409,11 +544,22 @@ impl Parser {
 
     fn parse_group_expression(&mut self) -> Result<GroupExpression, ParseError> {
         self.consume_token(&TokenType::LeftBrace)?;
-        self.skip_whitespace_and_comments();
+        let entries = self.parse_group_entries(&TokenType::RightBrace, "}")?;
+        self.consume_token(&TokenType::RightBrace)?;
+        Ok(GroupExpression { entries })
+    }
 
+    /// Parse comma-separated group entries up to (but not consuming) `close`.
+    /// Shared by brace records `{…}` and paren groups `(…)`.
+    fn parse_group_entries(
+        &mut self,
+        close: &TokenType,
+        close_desc: &str,
+    ) -> Result<Vec<GroupEntry>, ParseError> {
+        self.skip_whitespace_and_comments();
         let mut entries = Vec::new();
 
-        while !self.check(&TokenType::RightBrace) && !self.is_at_end() {
+        while !self.check(close) && !self.is_at_end() {
             let entry = self.parse_group_entry()?;
             entries.push(entry);
 
@@ -424,31 +570,48 @@ impl Parser {
                 continue;
             }
 
-            if !self.check(&TokenType::RightBrace) {
+            if !self.check(close) {
                 return Err(ParseError::ExpectedToken {
-                    expected: "comma or }".to_string(),
+                    expected: format!("comma or {close_desc}"),
                     found: self.peek().clone(),
                 });
             }
         }
 
-        self.consume_token(&TokenType::RightBrace)?;
-
-        Ok(GroupExpression { entries })
+        Ok(entries)
     }
 
     fn check_for_map_syntax(&self) -> bool {
-        // Look ahead for => pattern indicating a map
+        // Look ahead for a `=>` at this group's own level. The scan starts at the
+        // opening `{` (depth 0 -> 1); nested braces are skipped so a `=>` inside a
+        // nested map (e.g. `{ a: {text => int} }`) doesn't misclassify the outer
+        // record as a map.
         let mut i = self.current;
         let mut paren_depth = 0;
+        let mut bracket_depth = 0;
+        let mut brace_depth = 0;
 
         while i < self.tokens.len() {
             match &self.tokens[i].token_type {
-                TokenType::Arrow => return true,
+                TokenType::LeftBrace => brace_depth += 1,
+                TokenType::RightBrace => {
+                    brace_depth -= 1;
+                    if brace_depth == 0 {
+                        return false; // closed the outer group without a top-level `=>`
+                    }
+                }
                 TokenType::LeftParen => paren_depth += 1,
                 TokenType::RightParen => paren_depth -= 1,
-                TokenType::RightBrace if paren_depth == 0 => return false,
-                TokenType::Comma if paren_depth == 0 => return false,
+                // Brackets are tracked too so a comma inside an array-typed map key
+                // (e.g. `{ [uint, text] => bool }`) doesn't end the scan early.
+                TokenType::LeftBracket => bracket_depth += 1,
+                TokenType::RightBracket => bracket_depth -= 1,
+                TokenType::Arrow if paren_depth == 0 && bracket_depth == 0 && brace_depth == 1 => {
+                    return true;
+                }
+                TokenType::Comma if paren_depth == 0 && bracket_depth == 0 && brace_depth == 1 => {
+                    return false;
+                }
                 _ => {}
             }
             i += 1;
@@ -522,7 +685,11 @@ impl Parser {
         let token = self.peek().clone();
 
         match &token.token_type {
-            TokenType::Identifier(name) => {
+            // A builtin type name before `:` is a field *name*, not a type key. CDDL's
+            // predefined names aren't reserved words, and type-keyed maps use `=>`, so
+            // `{ timestamp: text }` is the field `timestamp` — the same as before
+            // `timestamp`/`decimal` became builtins.
+            TokenType::Identifier(name) | TokenType::Builtin(name) => {
                 let name = name.clone();
                 self.advance();
                 self.skip_whitespace_and_comments();
@@ -570,7 +737,17 @@ impl Parser {
             }
             TokenType::ZeroOrMore => {
                 self.advance();
-                Ok(Occurrence::ZeroOrMore)
+                // `*N` bounds the maximum (0..=N); a bare `*` is unbounded.
+                if let TokenType::Integer(max) = &self.peek().token_type {
+                    let max = *max as u64;
+                    self.advance();
+                    Ok(Occurrence::Range {
+                        min: Some(0),
+                        max: Some(max),
+                    })
+                } else {
+                    Ok(Occurrence::ZeroOrMore)
+                }
             }
             TokenType::OneOrMore => {
                 self.advance();
@@ -609,10 +786,21 @@ impl Parser {
     fn check_for_group_key(&self) -> bool {
         let mut i = self.current;
 
+        // A builtin name is a field key only before `:` (a named field like
+        // `timestamp: text`); before `=>` it stays a map key type, parsed at the
+        // type-expression level.
+        let candidate_is_builtin = matches!(
+            self.tokens.get(i).map(|t| &t.token_type),
+            Some(TokenType::Builtin(_))
+        );
+
         // Skip the potential key token (identifier, string, integer, or bracketed type)
         if i < self.tokens.len() {
             match &self.tokens[i].token_type {
-                TokenType::Identifier(_) | TokenType::TextString(_) | TokenType::Integer(_) => {
+                TokenType::Identifier(_)
+                | TokenType::Builtin(_)
+                | TokenType::TextString(_)
+                | TokenType::Integer(_) => {
                     i += 1;
                 }
                 TokenType::LeftBracket => {
@@ -643,7 +831,9 @@ impl Parser {
                 TokenType::Whitespace(_) | TokenType::Newline => i += 1,
                 TokenType::Optional => i += 1, // Skip optional indicator
                 TokenType::Colon => return true,
-                TokenType::Arrow => return true, // => is also a key indicator for maps
+                // => is a key indicator for maps, but a builtin before => is a map
+                // key *type*, not a named field, so leave it to the type parser.
+                TokenType::Arrow => return !candidate_is_builtin,
                 _ => return false,
             }
         }
@@ -659,6 +849,27 @@ impl Parser {
                 | TokenType::OneOrMore
                 | TokenType::Integer(_)
         )
+    }
+
+    /// Like `match_occurrence_indicator`, but an integer counts as an occurrence
+    /// only when a type follows it (`N type` / `N*M type`). A bare integer before
+    /// `,` or `]` is a literal tuple member (e.g. `[1, 2, 3]`), not a count.
+    fn array_member_starts_with_occurrence(&self) -> bool {
+        match self.peek().token_type {
+            TokenType::Optional | TokenType::ZeroOrMore | TokenType::OneOrMore => true,
+            TokenType::Integer(_) => {
+                let mut i = self.current + 1;
+                while i < self.tokens.len() {
+                    match &self.tokens[i].token_type {
+                        TokenType::Whitespace(_) | TokenType::Newline => i += 1,
+                        TokenType::Comma | TokenType::RightBracket => return false,
+                        _ => return true,
+                    }
+                }
+                false
+            }
+            _ => false,
+        }
     }
 
     fn skip_whitespace_and_comments(&mut self) {
@@ -772,11 +983,21 @@ impl Parser {
 
         while matches!(
             self.peek().token_type,
-            TokenType::DotSize | TokenType::DotRegex | TokenType::DotDefault |
-            TokenType::DotGe | TokenType::DotLe | TokenType::DotGt | TokenType::DotLt | TokenType::DotEq |
-            // Unsupported tokens (will produce helpful error messages)
-            TokenType::DotNe | TokenType::DotBits | TokenType::DotAnd | TokenType::DotWithin |
-            TokenType::DotJson | TokenType::DotCbor | TokenType::DotCborseq
+            TokenType::DotSize
+                | TokenType::DotRegex
+                | TokenType::DotDefault
+                | TokenType::DotGe
+                | TokenType::DotLe
+                | TokenType::DotGt
+                | TokenType::DotLt
+                | TokenType::DotEq
+                | TokenType::DotNe
+                | TokenType::DotBits
+                | TokenType::DotAnd
+                | TokenType::DotWithin
+                | TokenType::DotJson
+                | TokenType::DotCbor
+                | TokenType::DotCborseq
         ) {
             match self.peek().token_type {
                 TokenType::DotSize => {
@@ -841,7 +1062,6 @@ impl Parser {
                     let value = self.parse_literal_value()?;
                     constraints.push(ControlOperator::Equal(value));
                 }
-                // Unsupported CDDL control operators with helpful error messages
                 TokenType::DotNe => {
                     self.advance(); // consume .ne
                     self.skip_whitespace_and_comments();
@@ -1037,39 +1257,52 @@ impl Parser {
         self.consume_token(&TokenType::Colon)?;
         self.skip_whitespace_and_comments();
 
-        let input_type = self.parse_type_expression()?;
+        // A leading direction arrow (`op: <- Event`, `op: -> Event`) denotes a
+        // push-style operation with no input payload, modeled as a `null` input.
+        let leading_direction = match self.peek().token_type {
+            TokenType::ServiceBackArrow => Some(ServiceDirection::Reverse),
+            TokenType::ServiceArrow => Some(ServiceDirection::Unidirectional),
+            _ => None,
+        };
 
-        self.skip_whitespace_and_comments();
+        let (input_type, direction) = if let Some(dir) = leading_direction {
+            self.advance(); // consume the leading arrow
+            (TypeExpression::Builtin("null".to_string()), dir)
+        } else {
+            let input_type = self.parse_type_expression()?;
+            self.skip_whitespace_and_comments();
 
-        let direction = match self.peek().token_type {
-            TokenType::ServiceArrow => {
-                self.advance();
-                ServiceDirection::Unidirectional
-            }
-            TokenType::ServiceBackArrow => {
-                self.advance();
-                ServiceDirection::Reverse
-            }
-            TokenType::ServiceBidirectional => {
-                self.advance();
-                ServiceDirection::Bidirectional
-            }
-            _ => {
-                // Check if user might have used regular arrow (=>) instead
-                if self.peek().token_type == TokenType::Arrow {
+            let direction = match self.peek().token_type {
+                TokenType::ServiceArrow => {
+                    self.advance();
+                    ServiceDirection::Unidirectional
+                }
+                TokenType::ServiceBackArrow => {
+                    self.advance();
+                    ServiceDirection::Reverse
+                }
+                TokenType::ServiceBidirectional => {
+                    self.advance();
+                    ServiceDirection::Bidirectional
+                }
+                _ => {
+                    // Check if user might have used regular arrow (=>) instead
+                    if self.peek().token_type == TokenType::Arrow {
+                        return Err(ParseError::ServiceDefinitionError {
+                            message:
+                                "Service operations use '->' not '=>'. The '=>' arrow is for map types"
+                                    .to_string(),
+                            token: self.peek().clone(),
+                        });
+                    }
+
                     return Err(ParseError::ServiceDefinitionError {
-                        message:
-                            "Service operations use '->' not '=>'. The '=>' arrow is for map types"
-                                .to_string(),
+                        message: "Service operations require a direction arrow: -> (unidirectional), <- (reverse), or <-> (bidirectional)".to_string(),
                         token: self.peek().clone(),
                     });
                 }
-
-                return Err(ParseError::ServiceDefinitionError {
-                    message: "Service operations require a direction arrow: -> (unidirectional), <- (reverse), or <-> (bidirectional)".to_string(),
-                    token: self.peek().clone(),
-                });
-            }
+            };
+            (input_type, direction)
         };
 
         self.skip_whitespace_and_comments();
@@ -1185,49 +1418,112 @@ impl Parser {
         }
 
         self.skip_whitespace_and_comments();
+        let condition = self.parse_depends_condition()?;
+        self.skip_whitespace_and_comments();
+        self.consume_token(&TokenType::RightParen)?;
 
-        let field_token = self.consume_identifier()?;
-        let mut field = match &field_token.token_type {
-            TokenType::Identifier(name) => name.clone(),
-            _ => {
-                return Err(ParseError::MetadataError {
-                    message: "@depends-on requires a field name as first parameter: @depends-on(field_name)".to_string(),
-                    token: field_token,
-                });
+        // The common single-comparison form (`field` / `field = value`) keeps the
+        // backward-compatible `DependsOn` variant so existing consumers are untouched;
+        // anything with `!=`/`<`/`>`/`&`/`|` becomes the richer `DependsOnExpr`.
+        if let DependsCondition::Compare { field, op, value } = &condition
+            && matches!(op, None | Some(DependsCompareOp::Eq))
+        {
+            return Ok(FieldMetadata::DependsOn {
+                field: field.clone(),
+                value: value.clone(),
+            });
+        }
+        Ok(FieldMetadata::DependsOnExpr(condition))
+    }
+
+    /// `@depends-on` disjunction: `and ('|' and)*`.
+    fn parse_depends_condition(&mut self) -> Result<DependsCondition, ParseError> {
+        let mut terms = vec![self.parse_depends_and()?];
+        loop {
+            self.skip_whitespace_and_comments();
+            if self.match_token(&TokenType::Pipe) {
+                self.skip_whitespace_and_comments();
+                terms.push(self.parse_depends_and()?);
+            } else {
+                break;
             }
-        };
+        }
+        if terms.len() == 1 {
+            Ok(terms.pop().unwrap())
+        } else {
+            Ok(DependsCondition::Any(terms))
+        }
+    }
+
+    /// `@depends-on` conjunction: `compare ('&' compare)*`.
+    fn parse_depends_and(&mut self) -> Result<DependsCondition, ParseError> {
+        let mut terms = vec![self.parse_depends_compare()?];
+        loop {
+            self.skip_whitespace_and_comments();
+            if self.match_token(&TokenType::Ampersand) {
+                self.skip_whitespace_and_comments();
+                terms.push(self.parse_depends_compare()?);
+            } else {
+                break;
+            }
+        }
+        if terms.len() == 1 {
+            Ok(terms.pop().unwrap())
+        } else {
+            Ok(DependsCondition::All(terms))
+        }
+    }
+
+    /// Consume one `@depends-on` field-path segment (an identifier or a builtin name).
+    fn consume_depends_field_name(&mut self) -> Result<String, ParseError> {
+        let token = self.peek().clone();
+        match &token.token_type {
+            TokenType::Identifier(name) | TokenType::Builtin(name) => {
+                let name = name.clone();
+                self.advance();
+                Ok(name)
+            }
+            _ => Err(ParseError::MetadataError {
+                message: "@depends-on requires a field name: @depends-on(field_name)".to_string(),
+                token,
+            }),
+        }
+    }
+
+    /// A single `@depends-on` comparison: `field[.path] [= value | != value]`.
+    fn parse_depends_compare(&mut self) -> Result<DependsCondition, ParseError> {
+        // A field may be named after a builtin (e.g. `timestamp`), just like a group
+        // key, so accept Builtin as well as Identifier here.
+        let mut field = self.consume_depends_field_name()?;
 
         // Handle dotted field paths like permissions.can_read
         while self.match_token(&TokenType::Dot) {
             self.skip_whitespace_and_comments();
-            let next_token = self.consume_identifier()?;
-            match &next_token.token_type {
-                TokenType::Identifier(name) => {
-                    field.push('.');
-                    field.push_str(name);
-                }
-                _ => {
-                    return Err(ParseError::MetadataError {
-                        message: "Expected identifier after '.' in field path".to_string(),
-                        token: next_token,
-                    });
-                }
-            }
+            field.push('.');
+            field.push_str(&self.consume_depends_field_name()?);
         }
 
         self.skip_whitespace_and_comments();
 
-        let value = if self.match_token(&TokenType::Assign) {
+        let op = match self.peek().token_type {
+            TokenType::Assign => Some(DependsCompareOp::Eq),
+            TokenType::NotEqual => Some(DependsCompareOp::Ne),
+            TokenType::Less => Some(DependsCompareOp::Lt),
+            TokenType::LessEqual => Some(DependsCompareOp::Le),
+            TokenType::Greater => Some(DependsCompareOp::Gt),
+            TokenType::GreaterEqual => Some(DependsCompareOp::Ge),
+            _ => None,
+        };
+
+        let value = if let Some(_op) = op {
+            self.advance(); // consume the operator
             self.skip_whitespace_and_comments();
             Some(self.parse_literal_value()?)
         } else {
             None
         };
 
-        self.skip_whitespace_and_comments();
-        self.consume_token(&TokenType::RightParen)?;
-
-        Ok(FieldMetadata::DependsOn { field, value })
+        Ok(DependsCondition::Compare { field, op, value })
     }
 
     fn parse_description_annotation(&mut self) -> Result<FieldMetadata, ParseError> {
@@ -3152,6 +3448,253 @@ mod tests {
         );
         // The undocumented field carries no docs
         assert!(group.entries[1].doc_comments.is_empty());
+    }
+
+    #[test]
+    fn test_tuple_with_integer_literal_members() {
+        // Integer literals are tuple members, not occurrence counts, before `,`/`]`.
+        let s = parse_csil("a = [1, 2, 3]").unwrap();
+        match &s.rules[0].rule_type {
+            RuleType::TypeDef(TypeExpression::Tuple(g)) => assert_eq!(g.entries.len(), 3),
+            other => panic!("expected 3-tuple, got {other:?}"),
+        }
+        // But `[3 bool]` is still an occurrence count (3 bools), an Array.
+        let s = parse_csil("a = [3 bool]").unwrap();
+        assert!(matches!(
+            &s.rules[0].rule_type,
+            RuleType::TypeDef(TypeExpression::Array { .. })
+        ));
+    }
+
+    #[test]
+    fn test_depends_on_field_named_builtin() {
+        // A field named after a builtin (`timestamp`) is referenceable in @depends-on.
+        let input = "F = { timestamp: int, @depends-on(timestamp = 1) x?: int }";
+        parse_csil(input).expect("builtin field name should be valid in @depends-on");
+    }
+
+    #[test]
+    fn test_array_typed_map_key_not_misclassified() {
+        // The comma inside an array-typed map key must not end the map-syntax scan.
+        let s = parse_csil("m = { [uint, text] => bool }").unwrap();
+        assert!(
+            matches!(
+                &s.rules[0].rule_type,
+                RuleType::TypeDef(TypeExpression::Map { .. })
+            ),
+            "expected a map, got {:?}",
+            s.rules[0].rule_type
+        );
+    }
+
+    #[test]
+    fn test_tuple_and_keyed_array() {
+        // Heterogeneous tuple stays a Tuple...
+        let s = parse_csil("a = [text, int, bool]").unwrap();
+        match &s.rules[0].rule_type {
+            RuleType::TypeDef(TypeExpression::Tuple(g)) => assert_eq!(g.entries.len(), 3),
+            other => panic!("expected tuple, got {other:?}"),
+        }
+        // ...keyed array entries too...
+        let s = parse_csil("a = [tag: text, value: any]").unwrap();
+        match &s.rules[0].rule_type {
+            RuleType::TypeDef(TypeExpression::Tuple(g)) => {
+                assert!(
+                    matches!(&g.entries[0].key, Some(crate::ast::GroupKey::Bare(k)) if k == "tag")
+                );
+            }
+            other => panic!("expected tuple, got {other:?}"),
+        }
+        // ...but a single homogeneous element stays an Array.
+        let s = parse_csil("a = [* text]").unwrap();
+        assert!(matches!(
+            &s.rules[0].rule_type,
+            RuleType::TypeDef(TypeExpression::Array { .. })
+        ));
+    }
+
+    #[test]
+    fn test_nested_map_in_record_not_misclassified() {
+        // The `=>` inside the nested map must not make the outer record parse as a map.
+        let s = parse_csil("a = { m: {text => int}, n: int }").unwrap();
+        assert!(matches!(
+            &s.rules[0].rule_type,
+            RuleType::TypeDef(TypeExpression::Group(_)) | RuleType::GroupDef(_)
+        ));
+    }
+
+    #[test]
+    fn test_leading_arrow_op_has_null_input() {
+        // `op: <- Event` is a push op with no input payload (null input, Reverse).
+        let input = "service S {\n  ev: <- Event,\n}";
+        let spec = parse_csil(input).unwrap();
+        let RuleType::ServiceDef(service) = &spec.rules[0].rule_type else {
+            panic!("expected service");
+        };
+        let op = &service.operations[0];
+        assert!(matches!(op.direction, ServiceDirection::Reverse));
+        assert!(matches!(&op.input_type, TypeExpression::Builtin(b) if b == "null"));
+        assert!(matches!(&op.output_type, TypeExpression::Reference(r) if r == "Event"));
+    }
+
+    #[test]
+    fn test_boolean_depends_on_expression() {
+        let input = concat!(
+            "Form = {\n",
+            "  account_type: text,\n",
+            "  size: int,\n",
+            "  @depends-on(account_type = \"premium\" | size > 5 & account_type != \"free\")\n",
+            "  extra?: text,\n",
+            "}\n"
+        );
+        let spec = parse_csil(input).expect("boolean @depends-on should parse");
+        let group = match &spec.rules[0].rule_type {
+            RuleType::TypeDef(TypeExpression::Group(g)) | RuleType::GroupDef(g) => g,
+            other => panic!("expected group, got {other:?}"),
+        };
+        let extra = group
+            .entries
+            .iter()
+            .find(|e| matches!(&e.key, Some(crate::ast::GroupKey::Bare(n)) if n == "extra"))
+            .unwrap();
+        assert!(
+            extra
+                .metadata
+                .iter()
+                .any(|m| matches!(m, FieldMetadata::DependsOnExpr(DependsCondition::Any(_)))),
+            "expected a DependsOnExpr with an Any (|) at the top level"
+        );
+    }
+
+    #[test]
+    fn test_simple_depends_on_stays_backward_compatible() {
+        // A plain `field = value` keeps the simple `DependsOn` variant.
+        let input = "F = { a: text, @depends-on(a = \"x\") b?: text }";
+        let spec = parse_csil(input).unwrap();
+        let group = match &spec.rules[0].rule_type {
+            RuleType::TypeDef(TypeExpression::Group(g)) | RuleType::GroupDef(g) => g,
+            other => panic!("got {other:?}"),
+        };
+        assert!(group.entries.iter().any(|e| {
+            e.metadata
+                .iter()
+                .any(|m| matches!(m, FieldMetadata::DependsOn { .. }))
+        }));
+    }
+
+    #[test]
+    fn test_range_lowers_to_comparison_constraints() {
+        let spec = parse_csil("bounded = 1..10").unwrap();
+        match &spec.rules[0].rule_type {
+            RuleType::TypeDef(TypeExpression::Constrained {
+                base_type,
+                constraints,
+            }) => {
+                assert!(matches!(base_type.as_ref(), TypeExpression::Builtin(b) if b == "int"));
+                assert!(matches!(
+                    constraints[0],
+                    ControlOperator::GreaterEqual(LiteralValue::Integer(1))
+                ));
+                assert!(matches!(
+                    constraints[1],
+                    ControlOperator::LessEqual(LiteralValue::Integer(10))
+                ));
+            }
+            other => panic!("expected constrained int, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_open_and_exclusive_and_float_ranges() {
+        // open-start `..end` -> only an upper bound
+        let s = parse_csil("a = ..100").unwrap();
+        match &s.rules[0].rule_type {
+            RuleType::TypeDef(TypeExpression::Constrained { constraints, .. }) => {
+                assert_eq!(constraints.len(), 1);
+                assert!(matches!(
+                    constraints[0],
+                    ControlOperator::LessEqual(LiteralValue::Integer(100))
+                ));
+            }
+            other => panic!("got {other:?}"),
+        }
+        // exclusive upper `...` -> `.lt`
+        let s = parse_csil("a = 1...10").unwrap();
+        match &s.rules[0].rule_type {
+            RuleType::TypeDef(TypeExpression::Constrained { constraints, .. }) => {
+                assert!(matches!(
+                    constraints[1],
+                    ControlOperator::LessThan(LiteralValue::Integer(10))
+                ));
+            }
+            other => panic!("got {other:?}"),
+        }
+        // a float bound makes the base `float`
+        let s = parse_csil("a = 0.0..1.0").unwrap();
+        match &s.rules[0].rule_type {
+            RuleType::TypeDef(TypeExpression::Constrained { base_type, .. }) => {
+                assert!(matches!(base_type.as_ref(), TypeExpression::Builtin(b) if b == "float"));
+            }
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_bounded_occurrence_star_n() {
+        // `*10` means 0..=10
+        let spec = parse_csil("a = [*10 float]").unwrap();
+        match &spec.rules[0].rule_type {
+            RuleType::TypeDef(TypeExpression::Array { occurrence, .. }) => {
+                assert!(matches!(
+                    occurrence,
+                    Some(Occurrence::Range {
+                        min: Some(0),
+                        max: Some(10)
+                    })
+                ));
+            }
+            other => panic!("expected array, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_builtin_names_usable_as_field_keys() {
+        // CDDL's predefined type names aren't reserved words. After `timestamp` and
+        // `decimal` became builtins, common field names like these must still parse as
+        // named fields, not break specs that have always used them.
+        let input = "Event = { timestamp: text, decimal: int, id: text }";
+        let spec = parse_csil(input).unwrap();
+
+        let group = match &spec.rules[0].rule_type {
+            RuleType::TypeDef(TypeExpression::Group(g)) | RuleType::GroupDef(g) => g,
+            other => panic!("expected group, got {other:?}"),
+        };
+        let keys: Vec<&str> = group
+            .entries
+            .iter()
+            .filter_map(|e| match &e.key {
+                Some(crate::ast::GroupKey::Bare(name)) => Some(name.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(keys, vec!["timestamp", "decimal", "id"]);
+    }
+
+    #[test]
+    fn test_builtin_before_arrow_is_map_key_type_not_field() {
+        // A builtin before `=>` is a map key *type*, so it must not be captured as a
+        // named field by the group-key lookahead.
+        let input = "scores = { text => int }";
+        let spec = parse_csil(input).unwrap();
+
+        assert!(
+            matches!(
+                &spec.rules[0].rule_type,
+                RuleType::TypeDef(TypeExpression::Map { .. })
+            ),
+            "expected a map type, got {:?}",
+            spec.rules[0].rule_type
+        );
     }
 
     #[test]

@@ -1,17 +1,18 @@
 //! WASM module loader and runtime for csilgen generators
 
 use csilgen_common::{
-    CsilControlOperator, CsilFieldMetadata, CsilFieldVisibility, CsilGroupEntry,
-    CsilGroupExpression, CsilGroupKey, CsilLiteralValue, CsilOccurrence, CsilPosition, CsilRule,
-    CsilRuleType, CsilServiceDefinition, CsilServiceDirection, CsilServiceOperation,
-    CsilSizeConstraint, CsilSpecSerialized, CsilTypeExpression, CsilValidationConstraint,
-    CsilgenError, GeneratedFiles, GeneratorCapability, GeneratorConfig, GeneratorMetadata, Result,
-    WasmGeneratorInput, WasmGeneratorOutput,
+    CsilControlOperator, CsilDependsCompareOp, CsilDependsCondition, CsilFieldMetadata,
+    CsilFieldVisibility, CsilGroupEntry, CsilGroupExpression, CsilGroupKey, CsilLiteralValue,
+    CsilOccurrence, CsilPosition, CsilRule, CsilRuleType, CsilServiceDefinition,
+    CsilServiceDirection, CsilServiceOperation, CsilSizeConstraint, CsilSpecSerialized,
+    CsilTypeExpression, CsilValidationConstraint, CsilgenError, GeneratedFiles,
+    GeneratorCapability, GeneratorConfig, GeneratorMetadata, Result, WasmGeneratorInput,
+    WasmGeneratorOutput,
 };
 use csilgen_core::ast::{
-    ControlOperator, CsilSpec, FieldMetadata, FieldVisibility, GroupEntry, GroupExpression,
-    GroupKey, LiteralValue, Occurrence, RuleType, ServiceDefinition, ServiceDirection,
-    ServiceOperation, SizeConstraint, TypeExpression, ValidationConstraint,
+    ControlOperator, CsilSpec, DependsCompareOp, DependsCondition, FieldMetadata, FieldVisibility,
+    GroupEntry, GroupExpression, GroupKey, LiteralValue, Occurrence, RuleType, ServiceDefinition,
+    ServiceDirection, ServiceOperation, SizeConstraint, TypeExpression, ValidationConstraint,
 };
 use csilgen_core::lexer::Position;
 use std::collections::HashMap;
@@ -559,6 +560,9 @@ fn convert_type_expression(type_expr: &TypeExpression) -> CsilTypeExpression {
         TypeExpression::Group(group_expr) => {
             CsilTypeExpression::Group(convert_group_expression(group_expr))
         }
+        TypeExpression::Tuple(group_expr) => {
+            CsilTypeExpression::Tuple(convert_group_expression(group_expr))
+        }
         TypeExpression::Choice(choices) => {
             CsilTypeExpression::Choice(choices.iter().map(convert_type_expression).collect())
         }
@@ -697,6 +701,9 @@ fn convert_field_metadata(metadata: &FieldMetadata) -> CsilFieldMetadata {
             field: field.clone(),
             value: value.as_ref().map(convert_literal_value),
         },
+        FieldMetadata::DependsOnExpr(condition) => {
+            CsilFieldMetadata::DependsOnExpr(convert_depends_condition(condition))
+        }
         FieldMetadata::Constraint(constraint) => {
             CsilFieldMetadata::Constraint(convert_validation_constraint(constraint))
         }
@@ -711,6 +718,29 @@ fn convert_field_metadata(metadata: &FieldMetadata) -> CsilFieldMetadata {
                 })
                 .collect(),
         },
+    }
+}
+
+fn convert_depends_condition(condition: &DependsCondition) -> CsilDependsCondition {
+    match condition {
+        DependsCondition::Compare { field, op, value } => CsilDependsCondition::Compare {
+            field: field.clone(),
+            op: op.map(|o| match o {
+                DependsCompareOp::Eq => CsilDependsCompareOp::Eq,
+                DependsCompareOp::Ne => CsilDependsCompareOp::Ne,
+                DependsCompareOp::Lt => CsilDependsCompareOp::Lt,
+                DependsCompareOp::Le => CsilDependsCompareOp::Le,
+                DependsCompareOp::Gt => CsilDependsCompareOp::Gt,
+                DependsCompareOp::Ge => CsilDependsCompareOp::Ge,
+            }),
+            value: value.as_ref().map(convert_literal_value),
+        },
+        DependsCondition::All(conds) => {
+            CsilDependsCondition::All(conds.iter().map(convert_depends_condition).collect())
+        }
+        DependsCondition::Any(conds) => {
+            CsilDependsCondition::Any(conds.iter().map(convert_depends_condition).collect())
+        }
     }
 }
 

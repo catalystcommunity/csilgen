@@ -15,7 +15,7 @@
 //!   handler methods on `XxxHandlers`.
 
 use crate::{
-    common::{self, BidiTransport},
+    common::{self, BidiTransport, DecimalMapping},
     types,
 };
 use csilgen_common::{CsilServiceDefinition, CsilServiceOperation, WasmGeneratorInput};
@@ -37,6 +37,7 @@ export interface Codec {
 
 pub fn generate(input: &WasmGeneratorInput) -> Result<String, String> {
     let mode = common::bidi_transport(input)?;
+    let mapping = common::decimal_mapping(input)?;
     let spec = &input.csil_spec;
     let services = common::sorted_services(spec);
 
@@ -56,6 +57,21 @@ pub fn generate(input: &WasmGeneratorInput) -> Result<String, String> {
         imports.join(", ")
     ));
 
+    // An inline `decimal` in an op signature makes `ts_type` print
+    // `CsilDecimal`/`Decimal` straight into this file. The type-import block
+    // above carries only named refs (never a builtin), so the value import is
+    // injected here or the file references an undefined identifier.
+    if common::services_use_decimal_inline(&services) {
+        match mapping {
+            DecimalMapping::Csil => {
+                out.push_str(&format!("import {{ CsilDecimal }} from \"{module}\";\n\n"));
+            }
+            DecimalMapping::Library => {
+                out.push_str("import Decimal from \"decimal.js\";\n\n");
+            }
+        }
+    }
+
     if let Some(url) = string_option_opt(input, "ts_ws_base_url") {
         // Hint only — the generator never opens this connection itself.
         out.push_str(&format!("export const WS_BASE_URL = {url:?};\n\n"));
@@ -65,35 +81,40 @@ pub fn generate(input: &WasmGeneratorInput) -> Result<String, String> {
     out.push('\n');
 
     for (name, def) in &services {
-        out.push_str(&handlers_interface(name, def, mode));
+        out.push_str(&handlers_interface(name, def, mode, mapping));
         out.push('\n');
         if mode == BidiTransport::Connection && common::service_has_channel_ops(def) {
-            out.push_str(&channel_block(name, def));
+            out.push_str(&channel_block(name, def, mapping));
             out.push('\n');
         }
     }
 
     out.push_str(&server_handlers(&services));
     out.push('\n');
-    out.push_str(&dispatch(&services, mode));
+    out.push_str(&dispatch(&services, mode, mapping));
 
     Ok(out)
 }
 
-fn handlers_interface(name: &str, def: &CsilServiceDefinition, mode: BidiTransport) -> String {
+fn handlers_interface(
+    name: &str,
+    def: &CsilServiceDefinition,
+    mode: BidiTransport,
+    mapping: DecimalMapping,
+) -> String {
     let iface = format!("{}Handlers", common::service_base(name));
     let mut out = format!("export interface {iface} {{\n");
     for op in &def.operations {
         match (mode, &op.direction) {
             (_, csilgen_common::CsilServiceDirection::Unidirectional) => {
-                out.push_str(&unary_handler_method(op));
+                out.push_str(&unary_handler_method(op, mapping));
             }
             (BidiTransport::Rpc, csilgen_common::CsilServiceDirection::Bidirectional) => {
-                out.push_str(&rpc_send_handler_method(op));
-                out.push_str(&rpc_check_handler_method(op));
+                out.push_str(&rpc_send_handler_method(op, mapping));
+                out.push_str(&rpc_check_handler_method(op, mapping));
             }
             (BidiTransport::Rpc, csilgen_common::CsilServiceDirection::Reverse) => {
-                out.push_str(&rpc_check_handler_method(op));
+                out.push_str(&rpc_check_handler_method(op, mapping));
             }
             // Channel ops in connection mode live in XxxChannelHandlers
             (BidiTransport::Connection, _) => {}
@@ -103,10 +124,10 @@ fn handlers_interface(name: &str, def: &CsilServiceDefinition, mode: BidiTranspo
     out
 }
 
-fn unary_handler_method(op: &CsilServiceOperation) -> String {
+fn unary_handler_method(op: &CsilServiceOperation, mapping: DecimalMapping) -> String {
     let method = common::to_camel(&op.name);
-    let req = common::ts_type(&op.input_type);
-    let res = common::ts_type(&common::success_type(&op.output_type));
+    let req = common::ts_type(&op.input_type, mapping);
+    let res = common::ts_type(&common::success_type(&op.output_type), mapping);
     let mut out = common::jsdoc(&op.doc_comments, &[], "  ");
     out.push_str(&format!(
         "  {method}(req: {req}, ctx: RequestContext): Promise<{res}>;\n"
@@ -115,10 +136,10 @@ fn unary_handler_method(op: &CsilServiceOperation) -> String {
 }
 
 /// rpc-mode handler: receives a message the client pushed via `send<Op>`.
-fn rpc_send_handler_method(op: &CsilServiceOperation) -> String {
+fn rpc_send_handler_method(op: &CsilServiceOperation, mapping: DecimalMapping) -> String {
     let camel = common::to_camel(&op.name);
     let pascal = pascal_from_camel(&camel);
-    let req = common::ts_type(&op.input_type);
+    let req = common::ts_type(&op.input_type, mapping);
     let mut out = common::jsdoc(&op.doc_comments, &[], "  ");
     out.push_str(&format!(
         "  send{pascal}(req: {req}, ctx: RequestContext): Promise<void>;\n"
@@ -127,10 +148,10 @@ fn rpc_send_handler_method(op: &CsilServiceOperation) -> String {
 }
 
 /// rpc-mode handler: drains the server's outbound queue for this op.
-fn rpc_check_handler_method(op: &CsilServiceOperation) -> String {
+fn rpc_check_handler_method(op: &CsilServiceOperation, mapping: DecimalMapping) -> String {
     let camel = common::to_camel(&op.name);
     let pascal = pascal_from_camel(&camel);
-    let res = common::ts_type(&common::success_type(&op.output_type));
+    let res = common::ts_type(&common::success_type(&op.output_type), mapping);
     let mut out = common::jsdoc(&op.doc_comments, &[], "  ");
     out.push_str(&format!(
         "  check{pascal}(ctx: RequestContext): Promise<{res}[]>;\n"
@@ -148,7 +169,7 @@ fn pascal_from_camel(s: &str) -> String {
 
 /// Connection-mode emission for the server side of channel ops:
 /// inbound handlers (for `<->` only) + router + outbound encoders.
-fn channel_block(name: &str, def: &CsilServiceDefinition) -> String {
+fn channel_block(name: &str, def: &CsilServiceDefinition, mapping: DecimalMapping) -> String {
     let base = common::service_base(name);
     let handlers_iface = format!("{base}ChannelHandlers");
     let wire_service = common::service_wire(name);
@@ -172,7 +193,7 @@ fn channel_block(name: &str, def: &CsilServiceDefinition) -> String {
     out.push_str(&format!("export interface {handlers_iface} {{\n"));
     for op in &inbound_ops {
         let method = common::to_camel(&op.name);
-        let inbound = common::ts_type(&op.input_type);
+        let inbound = common::ts_type(&op.input_type, mapping);
         out.push_str(&common::jsdoc(&op.doc_comments, &[], "  "));
         out.push_str(&format!(
             "  {method}(msg: {inbound}, ctx: RequestContext): void;\n"
@@ -202,7 +223,7 @@ fn channel_block(name: &str, def: &CsilServiceDefinition) -> String {
     for op in &inbound_ops {
         let wire_method = common::method_wire(op);
         let method = common::to_camel(&op.name);
-        let inbound = common::ts_type(&op.input_type);
+        let inbound = common::ts_type(&op.input_type, mapping);
         out.push_str(&format!("    case \"{wire_method}\":\n"));
         out.push_str(&format!(
             "      handlers.{method}(codec.decode<{inbound}>(bytes), ctx);\n"
@@ -219,7 +240,7 @@ fn channel_block(name: &str, def: &CsilServiceDefinition) -> String {
     for op in &outbound_ops {
         let camel = common::to_camel(&op.name);
         let wire_method = common::method_wire(op);
-        let outbound = common::ts_type(&common::success_type(&op.output_type));
+        let outbound = common::ts_type(&common::success_type(&op.output_type), mapping);
         let fn_name = format!("encode{base}{}", pascal_from_camel(&camel));
         out.push_str(&format!(
             "\n\
@@ -247,7 +268,11 @@ fn server_handlers(services: &[(&str, &CsilServiceDefinition)]) -> String {
     out
 }
 
-fn dispatch(services: &[(&str, &CsilServiceDefinition)], mode: BidiTransport) -> String {
+fn dispatch(
+    services: &[(&str, &CsilServiceDefinition)],
+    mode: BidiTransport,
+    mapping: DecimalMapping,
+) -> String {
     let mut out = String::from(
         "/**\n\
          \x20* Dispatch a single call. The caller decodes service+method from the wire,\n\
@@ -275,7 +300,7 @@ fn dispatch(services: &[(&str, &CsilServiceDefinition)], mode: BidiTransport) ->
                 (_, csilgen_common::CsilServiceDirection::Unidirectional) => {
                     let wire_method = common::method_wire(op);
                     let method = common::to_camel(&op.name);
-                    let req = common::ts_type(&op.input_type);
+                    let req = common::ts_type(&op.input_type, mapping);
                     out.push_str(&format!("        case \"{wire_method}\": {{\n"));
                     out.push_str(&format!(
                         "          const req = codec.decode<{req}>(reqBytes);\n"
@@ -289,7 +314,7 @@ fn dispatch(services: &[(&str, &CsilServiceDefinition)], mode: BidiTransport) ->
                 (BidiTransport::Rpc, csilgen_common::CsilServiceDirection::Bidirectional) => {
                     let camel = common::to_camel(&op.name);
                     let pascal = pascal_from_camel(&camel);
-                    let req = common::ts_type(&op.input_type);
+                    let req = common::ts_type(&op.input_type, mapping);
                     let wire = common::method_wire(op);
                     // <Op>Send: receive a client-pushed message
                     out.push_str(&format!("        case \"{wire}Send\": {{\n"));

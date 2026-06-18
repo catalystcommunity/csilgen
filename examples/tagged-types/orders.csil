@@ -1,0 +1,52 @@
+;; Tagged core types + the full range of CBOR constraints.
+;;
+;; `timestamp` is CBOR tag 0 (RFC3339 text, ALWAYS serialized in UTC) and
+;; `decimal` is CBOR tag 4 (an exact base-10 value, never a float). See
+;; docs/cbor-wire-contract.md for the normative wire form.
+
+;; By default `decimal` maps to a generated, dependency-free `CsilDecimal` helper
+;; type. Set `decimal_mapping: "library"` to map straight to the language's
+;; popular decimal library instead (rust_decimal / shopspring / decimal.js);
+;; Python always uses the stdlib `decimal.Decimal`. The wire form is identical
+;; either way — only the in-memory type changes.
+options {
+    decimal_mapping: "csil"
+}
+
+;; Control operators (the `.`-form) constrain a type inline.
+order_id = text .size 26
+sku = text .size (1..32)
+quantity = uint .ge 1 .le 1000
+;; Exact decimal bounds are written as text so no float rounding sneaks in.
+unit_price = decimal .ge "0.00"
+discount_rate = decimal .ge "0.0" .le "1.0" .default "0.0"
+;; A timestamp bound is an RFC3339 instant; ordering is chronological.
+not_before = timestamp .ge "2000-01-01T00:00:00Z"
+
+line_item = {
+    sku: sku,
+    quantity: quantity,
+    unit_price: unit_price,
+    ;; `@`-annotations are the other constraint system and compose with the above.
+    note: text @max-length(280),
+}
+
+order = {
+    id: order_id,
+    placed_at: timestamp,
+    items: [1* line_item],
+    subtotal: decimal .ge "0.00",
+    discount: discount_rate,
+    total: decimal .ge "0.00",
+    ? settled_at: timestamp,
+}
+
+service OrderService {
+    place-order: order -> order / order_error,
+    get-order: order_id -> order / order_error,
+}
+
+order_error = {
+    code: int,
+    message: text,
+}

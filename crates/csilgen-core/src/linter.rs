@@ -1,6 +1,9 @@
 //! CSIL linting functionality for style and best practice enforcement
 
-use crate::ast::{CsilSpec, GroupEntry, GroupExpression, Rule, RuleType, TypeExpression};
+use crate::ast::{
+    CsilSpec, FieldMetadata, GroupEntry, GroupExpression, Rule, RuleType, TypeExpression,
+    ValidationConstraint,
+};
 use anyhow::Result;
 use std::path::Path;
 
@@ -40,6 +43,11 @@ pub struct LintConfig {
     pub enforce_snake_case: bool,
     /// Whether to require documentation comments
     pub require_docs: bool,
+    /// Whether to warn on `;;;` documentation comments (a CSIL extension beyond CDDL)
+    pub warn_doc_comments: bool,
+    /// Whether to warn on degenerate constraints (e.g. `min-items(0)`/`min-length(0)`,
+    /// which are always satisfied)
+    pub warn_degenerate_constraints: bool,
     /// Maximum rule name length
     pub max_rule_name_length: usize,
     /// Whether to disallow unused rules
@@ -61,6 +69,8 @@ impl Default for LintConfig {
         Self {
             enforce_snake_case: true,
             require_docs: false,
+            warn_doc_comments: true,
+            warn_degenerate_constraints: true,
             max_rule_name_length: 64,
             disallow_unused_rules: true,
             enforce_consistent_metadata: true,
@@ -155,7 +165,68 @@ pub fn lint_spec(spec: &CsilSpec, config: &LintConfig) -> Result<LintResult> {
     Ok(result)
 }
 
+/// `;;;` documentation comments attach to the following definition, but they are a
+/// CSIL extension with no CDDL equivalent (CDDL has only `;` comments), so flag
+/// each definition that uses one.
+fn lint_doc_comments(rule: &Rule, result: &mut LintResult) {
+    if !rule.doc_comments.is_empty() {
+        push_doc_comment_warning(result, &rule.name, rule.position.line, rule.position.column);
+    }
+
+    let group = match &rule.rule_type {
+        RuleType::GroupDef(group) | RuleType::TypeDef(TypeExpression::Group(group)) => Some(group),
+        RuleType::ServiceDef(service) => {
+            for op in &service.operations {
+                if !op.doc_comments.is_empty() {
+                    push_doc_comment_warning(
+                        result,
+                        &op.name,
+                        op.position.line,
+                        op.position.column,
+                    );
+                }
+            }
+            None
+        }
+        _ => None,
+    };
+
+    // Fields have no position of their own, so a documented field is attributed to
+    // its enclosing rule.
+    if let Some(group) = group {
+        for entry in &group.entries {
+            if !entry.doc_comments.is_empty() {
+                push_doc_comment_warning(
+                    result,
+                    &rule.name,
+                    rule.position.line,
+                    rule.position.column,
+                );
+            }
+        }
+    }
+}
+
+fn push_doc_comment_warning(result: &mut LintResult, name: &str, line: usize, column: usize) {
+    result.add_issue(LintIssue {
+        severity: LintSeverity::Warning,
+        rule_name: name.to_string(),
+        message:
+            "`;;;` documentation comments are a CSIL extension beyond CDDL; prefer `;;` comments"
+                .to_string(),
+        suggestion: None,
+        auto_fixable: false,
+        line: Some(line),
+        column: Some(column),
+        fix: None,
+    });
+}
+
 fn lint_rule(rule: &Rule, config: &LintConfig, result: &mut LintResult) {
+    if config.warn_doc_comments {
+        lint_doc_comments(rule, result);
+    }
+
     // Check naming convention
     if config.enforce_snake_case && !is_snake_case(&rule.name) {
         result.add_issue(LintIssue {
@@ -246,6 +317,11 @@ fn lint_type_expression_with_config(
         TypeExpression::Group(group) => {
             lint_group_expression_with_config(group, rule_name, result, config);
         }
+        TypeExpression::Tuple(group) => {
+            for entry in &group.entries {
+                lint_type_expression_with_config(&entry.value_type, rule_name, result, config);
+            }
+        }
         TypeExpression::Choice(choices) => {
             for choice in choices {
                 lint_type_expression_with_config(choice, rule_name, result, config);
@@ -320,7 +396,8 @@ fn lint_group_entry_with_config(
     config: &LintConfig,
 ) {
     // Check key naming if present
-    if let Some(crate::ast::GroupKey::Bare(key_name)) = &entry.key
+    if config.enforce_snake_case
+        && let Some(crate::ast::GroupKey::Bare(key_name)) = &entry.key
         && !is_snake_case(key_name)
     {
         result.add_issue_with_suggestion(
@@ -330,6 +407,27 @@ fn lint_group_entry_with_config(
             to_snake_case(key_name),
             true,
         );
+    }
+
+    if config.warn_degenerate_constraints {
+        for meta in &entry.metadata {
+            if let FieldMetadata::Constraint(
+                ValidationConstraint::MinLength(0) | ValidationConstraint::MinItems(0),
+            ) = meta
+            {
+                let field = match &entry.key {
+                    Some(crate::ast::GroupKey::Bare(name)) => name.as_str(),
+                    _ => "field",
+                };
+                result.add_simple_issue(
+                    LintSeverity::Warning,
+                    rule_name.to_string(),
+                    format!(
+                        "Field '{field}' has a zero minimum constraint, which is always satisfied; remove it or set a meaningful bound"
+                    ),
+                );
+            }
+        }
     }
 
     // Lint the value type
@@ -626,7 +724,7 @@ fn find_type_references(expr: &TypeExpression, used_rules: &mut std::collections
             find_type_references(key, used_rules);
             find_type_references(value, used_rules);
         }
-        TypeExpression::Group(group) => {
+        TypeExpression::Group(group) | TypeExpression::Tuple(group) => {
             for entry in &group.entries {
                 find_type_references(&entry.value_type, used_rules);
             }
@@ -967,6 +1065,77 @@ mod tests {
         assert_eq!(to_snake_case("XMLHttpRequest"), "xmlhttp_request");
         assert_eq!(to_snake_case("snake_case"), "snake_case");
         assert_eq!(to_snake_case("UPPER"), "upper");
+    }
+
+    #[test]
+    fn test_warn_on_degenerate_min_constraint() {
+        let spec = create_test_spec(vec![create_test_rule(
+            "user",
+            RuleType::TypeDef(TypeExpression::Group(GroupExpression {
+                entries: vec![GroupEntry {
+                    key: Some(crate::ast::GroupKey::Bare("name".to_string())),
+                    value_type: TypeExpression::Builtin("text".to_string()),
+                    occurrence: None,
+                    metadata: vec![FieldMetadata::Constraint(ValidationConstraint::MinLength(
+                        0,
+                    ))],
+                    doc_comments: Vec::new(),
+                }],
+            })),
+        )]);
+
+        let warned = lint_spec(&spec, &LintConfig::default()).unwrap();
+        assert!(
+            warned
+                .issues
+                .iter()
+                .any(|i| i.message.contains("zero minimum constraint")),
+            "expected a degenerate-constraint warning"
+        );
+
+        let config = LintConfig {
+            warn_degenerate_constraints: false,
+            ..Default::default()
+        };
+        let silent = lint_spec(&spec, &config).unwrap();
+        assert!(
+            !silent
+                .issues
+                .iter()
+                .any(|i| i.message.contains("zero minimum constraint"))
+        );
+    }
+
+    #[test]
+    fn test_warn_on_doc_comments() {
+        let mut rule = create_test_rule(
+            "documented",
+            RuleType::TypeDef(TypeExpression::Builtin("int".to_string())),
+        );
+        rule.doc_comments = vec!["A documented rule.".to_string()];
+        let spec = create_test_spec(vec![rule]);
+
+        // Default config warns; disabling the flag silences it.
+        let warned = lint_spec(&spec, &LintConfig::default()).unwrap();
+        assert!(
+            warned
+                .issues
+                .iter()
+                .any(|i| i.message.contains("`;;;` documentation comments")),
+            "expected a doc-comment warning"
+        );
+
+        let config = LintConfig {
+            warn_doc_comments: false,
+            ..Default::default()
+        };
+        let silent = lint_spec(&spec, &config).unwrap();
+        assert!(
+            !silent
+                .issues
+                .iter()
+                .any(|i| i.message.contains("`;;;` documentation comments"))
+        );
     }
 
     #[test]

@@ -646,6 +646,20 @@ fn are_type_expressions_compatible(old: &TypeExpression, new: &TypeExpression) -
         // Literals must be exactly equal
         (TypeExpression::Literal(old_lit), TypeExpression::Literal(new_lit)) => old_lit == new_lit,
 
+        // Tuples are positional: compatible when they have the same length and each
+        // position's type and occurrence are compatible.
+        (TypeExpression::Tuple(old_group), TypeExpression::Tuple(new_group)) => {
+            old_group.entries.len() == new_group.entries.len()
+                && old_group
+                    .entries
+                    .iter()
+                    .zip(&new_group.entries)
+                    .all(|(o, n)| {
+                        are_type_expressions_compatible(&o.value_type, &n.value_type)
+                            && are_occurrences_compatible(&o.occurrence, &n.occurrence)
+                    })
+        }
+
         // Different expression types are generally incompatible
         _ => false,
     }
@@ -676,13 +690,21 @@ fn extract_visibility(metadata: &[FieldMetadata]) -> Option<FieldVisibility> {
 fn extract_dependencies(metadata: &[FieldMetadata]) -> Vec<String> {
     let mut deps = Vec::new();
     for meta in metadata {
-        if let FieldMetadata::DependsOn { field, value } = meta {
-            let dep_str = if let Some(val) = value {
-                format!("{}={:?}", field, val)
-            } else {
-                field.clone()
-            };
-            deps.push(dep_str);
+        match meta {
+            FieldMetadata::DependsOn { field, value } => {
+                let dep_str = if let Some(val) = value {
+                    format!("{}={:?}", field, val)
+                } else {
+                    field.clone()
+                };
+                deps.push(dep_str);
+            }
+            // A boolean condition's debug form captures its full structure, so any
+            // change to the condition shows up as a dependency change.
+            FieldMetadata::DependsOnExpr(condition) => {
+                deps.push(format!("{:?}", condition));
+            }
+            _ => {}
         }
     }
     deps

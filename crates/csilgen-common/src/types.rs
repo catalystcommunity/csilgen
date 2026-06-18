@@ -158,6 +158,9 @@ pub enum CsilTypeExpression {
     },
     /// Group expression
     Group(CsilGroupExpression),
+    /// Fixed-shape array: a heterogeneous tuple `[a, b, c]` or keyed array
+    /// `[tag: text, value: any]`
+    Tuple(CsilGroupExpression),
     /// Choice between types
     Choice(Vec<CsilTypeExpression>),
     /// Range expression
@@ -315,11 +318,13 @@ pub enum CsilServiceDirection {
 pub enum CsilFieldMetadata {
     /// Field visibility metadata
     Visibility(CsilFieldVisibility),
-    /// Field dependency metadata
+    /// Field dependency metadata — simple single-comparison form
     DependsOn {
         field: String,
         value: Option<CsilLiteralValue>,
     },
+    /// Field dependency on a boolean condition
+    DependsOnExpr(CsilDependsCondition),
     /// Validation constraint metadata
     Constraint(CsilValidationConstraint),
     /// Documentation metadata
@@ -329,6 +334,32 @@ pub enum CsilFieldMetadata {
         name: String,
         parameters: Vec<CsilMetadataParameter>,
     },
+}
+
+/// A `@depends-on(...)` boolean condition for the WASM boundary.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum CsilDependsCondition {
+    /// `field` (presence) or `field <op> value`
+    Compare {
+        field: String,
+        op: Option<CsilDependsCompareOp>,
+        value: Option<CsilLiteralValue>,
+    },
+    /// All sub-conditions must hold (`&`)
+    All(Vec<CsilDependsCondition>),
+    /// Any sub-condition must hold (`|`)
+    Any(Vec<CsilDependsCondition>),
+}
+
+/// Comparison operator within a `@depends-on` condition (WASM boundary).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CsilDependsCompareOp {
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
 }
 
 /// CSIL field visibility for WASM boundary

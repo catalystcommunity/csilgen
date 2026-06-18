@@ -1,0 +1,7 @@
+{
+  "description": "Tagged CSIL core types: timestamp (CBOR tag 0, UTC) and decimal (CBOR tag 4), with ordered comparison and default constraints",
+  "should_parse": true,
+  "expected_validation_errors": [],
+  "expected_ast": null,
+  "tags": ["valid", "timestamp", "decimal", "cbor-tags", "constraints"]
+}

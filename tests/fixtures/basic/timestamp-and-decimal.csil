@@ -1,0 +1,17 @@
+; Tagged CSIL core types: timestamp is CBOR tag 0 (RFC3339 text, always UTC)
+; and decimal is CBOR tag 4 (exact decimal fraction).
+created_at = timestamp
+price = decimal
+
+; Constraints apply to the tagged types: timestamps are ordered chronologically
+; and decimals are ordered and exact (bounds written as text avoid float rounding).
+not_before_epoch = timestamp .ge "1970-01-01T00:00:00Z"
+non_negative_price = decimal .ge "0.00"
+default_price = decimal .default "0.00"
+
+invoice = {
+  id: text,
+  issued_at: timestamp,
+  total: decimal,
+  paid_at: timestamp,
+}

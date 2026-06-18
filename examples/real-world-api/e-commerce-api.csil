@@ -351,7 +351,7 @@ OrderUpdate = {
 
 APIError = {
     @receive-only
-    code: int .size (400..599),
+    code: int .ge 400 .le 599,
     
     @receive-only
     message: text,

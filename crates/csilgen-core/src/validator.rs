@@ -464,9 +464,13 @@ fn validate_service_optimized(
 /// Extract the primary type name from a TypeExpression for validation
 fn extract_type_name(type_expr: &TypeExpression) -> Option<String> {
     match type_expr {
-        TypeExpression::Builtin(name) => Some(name.clone()),
+        // Builtins are always valid (an unknown type name lexes as a Reference, not a
+        // Builtin), so there is nothing to resolve — this also lets a builtin, or a
+        // `null` no-input op, stand as an operation input/output type.
+        TypeExpression::Builtin(_) => None,
         TypeExpression::Reference(name) => Some(name.clone()),
         TypeExpression::Group(_) => None, // Inline groups don't have names to validate
+        TypeExpression::Tuple(_) => None, // Inline tuples don't have a single name
         TypeExpression::Array { element_type, .. } => extract_type_name(element_type),
         TypeExpression::Map { key, value, .. } => {
             // For maps, validate both key and value types
@@ -614,6 +618,13 @@ fn validate_type_expression(
         TypeExpression::Group(group) => {
             if let Err(group_errors) = validate_group(group, context) {
                 errors.extend(group_errors);
+            }
+        }
+        TypeExpression::Tuple(group) => {
+            for entry in &group.entries {
+                if let Err(entry_errors) = validate_type_expression(&entry.value_type, context) {
+                    errors.extend(entry_errors);
+                }
             }
         }
         TypeExpression::Choice(choices) => {
@@ -904,16 +915,26 @@ fn validate_default_value(
     // Check type compatibility between default value and base type
     let is_compatible = match (default_value, base_type) {
         (LiteralValue::Integer(_), TypeExpression::Builtin(name)) => {
-            matches!(name.as_str(), "int" | "uint" | "pint" | "nint" | "integer")
+            matches!(
+                name.as_str(),
+                "int" | "uint" | "pint" | "nint" | "integer" | "decimal"
+            )
         }
         (LiteralValue::Float(_), TypeExpression::Builtin(name)) => {
+            // See `validate_comparison_constraint`: a float default on `decimal`
+            // would round; write it as exact text instead.
             matches!(
                 name.as_str(),
                 "float" | "float16" | "float32" | "float64" | "number"
             )
         }
         (LiteralValue::Text(_), TypeExpression::Builtin(name)) => {
-            matches!(name.as_str(), "text" | "tstr" | "string")
+            // `decimal` defaults are best written as exact text, and `timestamp`
+            // defaults are RFC3339 strings.
+            matches!(
+                name.as_str(),
+                "text" | "tstr" | "string" | "decimal" | "timestamp"
+            )
         }
         (LiteralValue::Bool(_), TypeExpression::Builtin(name)) => {
             matches!(name.as_str(), "bool" | "boolean")
@@ -936,10 +957,61 @@ fn validate_default_value(
         });
     }
 
+    if let Err(reason) = check_tagged_bound_well_formed(default_value, base_type) {
+        errors.push(ValidationError::InvalidConstraint {
+            field_context: context.to_string(),
+            constraint: ".default".to_string(),
+            reason,
+        });
+    }
+
     if errors.is_empty() {
         Ok(())
     } else {
         Err(errors)
+    }
+}
+
+/// A text bound/default on `decimal` must parse as an exact decimal and on
+/// `timestamp` as an RFC3339 instant. Catching this in core keeps a malformed
+/// literal — a known compile-time constant — from reaching the generators, where
+/// it would otherwise panic (Go), raise (Python), or silently disable the check
+/// (TypeScript's `new Date(bad)` is NaN). Non-text and non-tagged cases are fine.
+fn check_tagged_bound_well_formed(
+    value: &LiteralValue,
+    base_type: &TypeExpression,
+) -> Result<(), String> {
+    let TypeExpression::Builtin(name) = base_type else {
+        return Ok(());
+    };
+    let LiteralValue::Text(text) = value else {
+        return Ok(());
+    };
+    match name.as_str() {
+        "decimal" => is_well_formed_decimal(text)
+            .then_some(())
+            .ok_or_else(|| format!("decimal bound {text:?} is not a valid decimal number")),
+        "timestamp" => chrono::DateTime::parse_from_rfc3339(text)
+            .map(|_| ())
+            .map_err(|e| format!("timestamp bound {text:?} is not a valid RFC3339 instant: {e}")),
+        _ => Ok(()),
+    }
+}
+
+/// An optionally-signed integer with an optional fractional part — the exact
+/// textual form a `decimal` bound takes. Exponents are intentionally not accepted
+/// so the literal stays unambiguous.
+fn is_well_formed_decimal(text: &str) -> bool {
+    let rest = text.strip_prefix(['+', '-']).unwrap_or(text);
+    let (int_part, frac_part) = match rest.split_once('.') {
+        Some((i, f)) => (i, Some(f)),
+        None => (rest, None),
+    };
+    let digits_only = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    match frac_part {
+        // A trailing/leading dot ("1." or ".5") is rejected: require digits on both sides.
+        Some(frac) => digits_only(int_part) && digits_only(frac),
+        None => digits_only(int_part),
     }
 }
 
@@ -958,6 +1030,14 @@ fn format_type_expression(type_expr: &TypeExpression) -> String {
             )
         }
         TypeExpression::Group(_) => "group".to_string(),
+        TypeExpression::Tuple(group) => {
+            let parts: Vec<String> = group
+                .entries
+                .iter()
+                .map(|e| format_type_expression(&e.value_type))
+                .collect();
+            format!("[{}]", parts.join(", "))
+        }
         TypeExpression::Choice(choices) => {
             let choice_strs: Vec<String> = choices.iter().map(format_type_expression).collect();
             choice_strs.join(" | ")
@@ -1005,7 +1085,8 @@ fn validate_comparison_constraint(
                 // Equality and inequality comparisons are allowed for any type
                 true
             } else {
-                // Other comparisons only for numeric types
+                // Other comparisons only for ordered types. `decimal` is ordered like
+                // any number, and `timestamp` is ordered chronologically.
                 matches!(
                     name.as_str(),
                     "int"
@@ -1018,6 +1099,8 @@ fn validate_comparison_constraint(
                         | "float32"
                         | "float64"
                         | "number"
+                        | "decimal"
+                        | "timestamp"
                 )
             }
         }
@@ -1050,9 +1133,13 @@ fn validate_comparison_constraint(
                     | "float32"
                     | "float64"
                     | "number"
+                    | "decimal"
             )
         }
         (LiteralValue::Float(_), TypeExpression::Builtin(name)) => {
+            // `decimal` deliberately excludes float bounds: a binary float can't
+            // represent most decimals exactly, which would reintroduce the rounding
+            // `decimal` exists to avoid. Write the bound as exact text instead.
             matches!(
                 name.as_str(),
                 "float" | "float16" | "float32" | "float64" | "number"
@@ -1060,7 +1147,9 @@ fn validate_comparison_constraint(
         }
         (LiteralValue::Bool(_), TypeExpression::Builtin(name)) => name.as_str() == "bool",
         (LiteralValue::Text(_), TypeExpression::Builtin(name)) => {
-            matches!(name.as_str(), "text" | "tstr")
+            // A `decimal` bound may be written as exact text ("0.1") to avoid float
+            // rounding, and a `timestamp` bound is an RFC3339 string.
+            matches!(name.as_str(), "text" | "tstr" | "decimal" | "timestamp")
         }
         _ => false,
     };
@@ -1077,10 +1166,84 @@ fn validate_comparison_constraint(
         });
     }
 
+    // A text bound on a tagged type must be parseable, otherwise the malformed
+    // string flows to the generators and panics or is silently dropped there.
+    if let Err(reason) = check_tagged_bound_well_formed(value, base_type) {
+        errors.push(ValidationError::InvalidConstraint {
+            field_context: context.to_string(),
+            constraint: format!("{operator} constraint"),
+            reason,
+        });
+    }
+
     if errors.is_empty() {
         Ok(())
     } else {
         Err(errors)
+    }
+}
+
+/// Check that a `@depends-on` target field exists (or is a well-formed dotted
+/// cross-structure path).
+fn validate_dependency_field(
+    field: &str,
+    field_context: &str,
+    available_fields: &HashSet<String>,
+    errors: &mut Vec<ValidationError>,
+) {
+    if field.contains('.') {
+        // Dotted paths reference cross-structure fields; only sanity-check the shape.
+        let parts: Vec<&str> = field.split('.').collect();
+        if parts.len() < 2 || parts.iter().any(|part| part.is_empty()) {
+            errors.push(ValidationError::UnknownDependencyField {
+                field_context: format!("{field_context}. Invalid dependency path format"),
+                depends_on: field.to_string(),
+            });
+        }
+    } else if !available_fields.contains(field) {
+        let available_names: Vec<String> = available_fields.iter().cloned().collect();
+        let suggestions =
+            csilgen_common::CsilgenError::suggest_similar_names(field, &available_names);
+        let suggestion_text = if suggestions.is_empty() {
+            String::new()
+        } else {
+            format!(" Did you mean: {}?", suggestions.join(", "))
+        };
+        errors.push(ValidationError::UnknownDependencyField {
+            field_context: format!("{field_context}{suggestion_text}"),
+            depends_on: field.to_string(),
+        });
+    }
+}
+
+/// Collect every field name referenced by a boolean `@depends-on` condition.
+fn collect_depends_fields(condition: &DependsCondition, out: &mut Vec<String>) {
+    match condition {
+        DependsCondition::Compare { field, .. } => out.push(field.clone()),
+        DependsCondition::All(conds) | DependsCondition::Any(conds) => {
+            for c in conds {
+                collect_depends_fields(c, out);
+            }
+        }
+    }
+}
+
+/// Validate every field referenced by a boolean `@depends-on` condition.
+fn validate_depends_condition(
+    condition: &DependsCondition,
+    field_context: &str,
+    available_fields: &HashSet<String>,
+    errors: &mut Vec<ValidationError>,
+) {
+    match condition {
+        DependsCondition::Compare { field, .. } => {
+            validate_dependency_field(field, field_context, available_fields, errors);
+        }
+        DependsCondition::All(conds) | DependsCondition::Any(conds) => {
+            for c in conds {
+                validate_depends_condition(c, field_context, available_fields, errors);
+            }
+        }
     }
 }
 
@@ -1107,41 +1270,10 @@ fn validate_field_metadata(
                 }
             }
             FieldMetadata::DependsOn { field, .. } => {
-                // Handle cross-structure dependencies (dotted field paths)
-                if field.contains('.') {
-                    // For dotted paths like "permissions.can_read", we assume they reference
-                    // valid cross-structure dependencies for now. A full implementation would
-                    // require resolving these through the complete specification context.
-
-                    // Basic validation: ensure the path looks reasonable
-                    let parts: Vec<&str> = field.split('.').collect();
-                    if parts.len() < 2 || parts.iter().any(|part| part.is_empty()) {
-                        errors.push(ValidationError::UnknownDependencyField {
-                            field_context: format!(
-                                "{field_context}. Invalid dependency path format"
-                            ),
-                            depends_on: field.clone(),
-                        });
-                    }
-                } else if !available_fields.contains(field) {
-                    // For simple field names, check within current structure
-                    let available_names: Vec<String> = available_fields.iter().cloned().collect();
-                    let suggestions = csilgen_common::CsilgenError::suggest_similar_names(
-                        field,
-                        &available_names,
-                    );
-
-                    let suggestion_text = if !suggestions.is_empty() {
-                        format!(" Did you mean: {}?", suggestions.join(", "))
-                    } else {
-                        String::new()
-                    };
-
-                    errors.push(ValidationError::UnknownDependencyField {
-                        field_context: format!("{field_context}{suggestion_text}"),
-                        depends_on: field.clone(),
-                    });
-                }
+                validate_dependency_field(field, field_context, available_fields, &mut errors);
+            }
+            FieldMetadata::DependsOnExpr(condition) => {
+                validate_depends_condition(condition, field_context, available_fields, &mut errors);
             }
             FieldMetadata::Constraint(constraint) => {
                 let constraint_type = match constraint {
@@ -1164,24 +1296,9 @@ fn validate_field_metadata(
                     });
                 }
 
-                // Validate constraint values
-                match constraint {
-                    ValidationConstraint::MinLength(val)
-                    | ValidationConstraint::MaxLength(val)
-                    | ValidationConstraint::MinItems(val)
-                    | ValidationConstraint::MaxItems(val)
-                        if *val == 0
-                            && (constraint_type == "min-length"
-                                || constraint_type == "min-items") =>
-                    {
-                        errors.push(ValidationError::InvalidConstraint {
-                            field_context: field_context.to_string(),
-                            constraint: constraint_type.to_string(),
-                            reason: "minimum value should be greater than 0".to_string(),
-                        });
-                    }
-                    _ => {} // Custom constraints are not validated here
-                }
+                // A zero minimum (`min-items(0)`/`min-length(0)`) is a valid, if
+                // degenerate, bound — it is allowed here and the linter flags it
+                // instead (see `warn_degenerate_constraints`).
             }
             FieldMetadata::Description(_) => {
                 // Description metadata doesn't need validation
@@ -1221,8 +1338,12 @@ fn check_circular_dependencies(
         if let Some(GroupKey::Bare(field_name)) = &entry.key {
             let mut dependencies = Vec::new();
             for meta in &entry.metadata {
-                if let FieldMetadata::DependsOn { field, .. } = meta {
-                    dependencies.push(field.clone());
+                match meta {
+                    FieldMetadata::DependsOn { field, .. } => dependencies.push(field.clone()),
+                    FieldMetadata::DependsOnExpr(condition) => {
+                        collect_depends_fields(condition, &mut dependencies)
+                    }
+                    _ => {}
                 }
             }
             dependency_map.insert(field_name.clone(), dependencies);
@@ -1442,7 +1563,9 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_invalid_constraint_value() {
+    fn test_validate_zero_min_length_is_allowed() {
+        // `min-length(0)` is a valid (degenerate) bound; the validator accepts it and
+        // the linter is responsible for nudging.
         let spec = create_test_spec(vec![create_test_rule(
             "User",
             RuleType::TypeDef(TypeExpression::Group(GroupExpression {
@@ -1458,10 +1581,7 @@ mod tests {
             })),
         )]);
 
-        let result = validate_spec(&spec);
-        assert!(result.is_err());
-        let error_msg = result.unwrap_err().to_string();
-        assert!(error_msg.contains("minimum value should be greater than 0"));
+        assert!(validate_spec(&spec).is_ok());
     }
 
     #[test]
@@ -1774,11 +1894,14 @@ mod tests {
                     },
                     GroupEntry {
                         key: Some(GroupKey::Bare("field3".to_string())),
-                        value_type: TypeExpression::Builtin("text".to_string()),
+                        // `.size` on an int is a genuine error (size applies to
+                        // text/bytes/arrays only).
+                        value_type: TypeExpression::Constrained {
+                            base_type: Box::new(TypeExpression::Builtin("int".to_string())),
+                            constraints: vec![ControlOperator::Size(SizeConstraint::Min(1))],
+                        },
                         occurrence: None,
-                        metadata: vec![FieldMetadata::Constraint(ValidationConstraint::MinLength(
-                            0,
-                        ))],
+                        metadata: Vec::new(),
                         doc_comments: Vec::new(),
                     },
                 ],
@@ -1792,7 +1915,7 @@ mod tests {
         // Should contain multiple errors
         assert!(error_msg.contains("conflicting visibility"));
         assert!(error_msg.contains("depends on unknown field"));
-        assert!(error_msg.contains("minimum value should be greater than 0"));
+        assert!(error_msg.contains("size constraints are not applicable"));
     }
 
     #[test]
@@ -2310,6 +2433,101 @@ mod tests {
         assert!(result.is_err());
         let error_msg = result.unwrap_err().to_string();
         assert!(error_msg.contains("comparison constraints are only applicable to numeric types"));
+    }
+
+    #[test]
+    fn test_validate_decimal_comparison_and_default() {
+        // `decimal` is ordered and exact: ordered comparisons apply, and bounds may be
+        // written as exact text to avoid float rounding.
+        let spec = create_test_spec(vec![create_test_rule(
+            "Price",
+            RuleType::TypeDef(TypeExpression::Constrained {
+                base_type: Box::new(TypeExpression::Builtin("decimal".to_string())),
+                constraints: vec![
+                    ControlOperator::GreaterEqual(LiteralValue::Text("0.00".to_string())),
+                    ControlOperator::Default(LiteralValue::Text("0.00".to_string())),
+                ],
+            }),
+        )]);
+
+        assert!(validate_spec(&spec).is_ok());
+    }
+
+    #[test]
+    fn test_validate_rejects_malformed_decimal_bound() {
+        let spec = create_test_spec(vec![create_test_rule(
+            "Price",
+            RuleType::TypeDef(TypeExpression::Constrained {
+                base_type: Box::new(TypeExpression::Builtin("decimal".to_string())),
+                constraints: vec![ControlOperator::GreaterEqual(LiteralValue::Text(
+                    "not-a-number".to_string(),
+                ))],
+            }),
+        )]);
+
+        let err = validate_spec(&spec).unwrap_err().to_string();
+        assert!(err.contains("not a valid decimal"), "{err}");
+    }
+
+    #[test]
+    fn test_validate_rejects_malformed_timestamp_bound() {
+        let spec = create_test_spec(vec![create_test_rule(
+            "When",
+            RuleType::TypeDef(TypeExpression::Constrained {
+                base_type: Box::new(TypeExpression::Builtin("timestamp".to_string())),
+                constraints: vec![ControlOperator::GreaterEqual(LiteralValue::Text(
+                    "2024-13-99".to_string(),
+                ))],
+            }),
+        )]);
+
+        let err = validate_spec(&spec).unwrap_err().to_string();
+        assert!(err.contains("not a valid RFC3339"), "{err}");
+    }
+
+    #[test]
+    fn test_validate_rejects_float_decimal_bound() {
+        // A float bound on `decimal` reintroduces the rounding `decimal` avoids; it
+        // must be written as exact text.
+        let spec = create_test_spec(vec![create_test_rule(
+            "Rate",
+            RuleType::TypeDef(TypeExpression::Constrained {
+                base_type: Box::new(TypeExpression::Builtin("decimal".to_string())),
+                constraints: vec![ControlOperator::GreaterEqual(LiteralValue::Float(0.1))],
+            }),
+        )]);
+
+        assert!(validate_spec(&spec).is_err());
+    }
+
+    #[test]
+    fn test_validate_accepts_integer_decimal_bound() {
+        // An integer bound is exact, so it stays allowed.
+        let spec = create_test_spec(vec![create_test_rule(
+            "Count",
+            RuleType::TypeDef(TypeExpression::Constrained {
+                base_type: Box::new(TypeExpression::Builtin("decimal".to_string())),
+                constraints: vec![ControlOperator::GreaterEqual(LiteralValue::Integer(0))],
+            }),
+        )]);
+
+        assert!(validate_spec(&spec).is_ok());
+    }
+
+    #[test]
+    fn test_validate_timestamp_comparison_with_rfc3339() {
+        // `timestamp` is ordered chronologically; bounds are RFC3339 strings.
+        let spec = create_test_spec(vec![create_test_rule(
+            "NotBeforeEpoch",
+            RuleType::TypeDef(TypeExpression::Constrained {
+                base_type: Box::new(TypeExpression::Builtin("timestamp".to_string())),
+                constraints: vec![ControlOperator::GreaterEqual(LiteralValue::Text(
+                    "1970-01-01T00:00:00Z".to_string(),
+                ))],
+            }),
+        )]);
+
+        assert!(validate_spec(&spec).is_ok());
     }
 
     #[test]

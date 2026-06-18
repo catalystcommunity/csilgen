@@ -34,6 +34,15 @@ pub enum TokenType {
     GroupChoice, // //=
     TypeChoice,  // /=
 
+    // `@depends-on(...)` boolean and comparison operators
+    NotEqual,     // !=
+    Ampersand,    // &
+    Pipe,         // |
+    Less,         // <
+    LessEqual,    // <=
+    Greater,      // >
+    GreaterEqual, // >=
+
     // CDDL Delimiters
     LeftBrace,    // {
     RightBrace,   // }
@@ -50,9 +59,10 @@ pub enum TokenType {
     Dot,       // .
 
     // CDDL Choice and Ranges
-    Choice,         // /
-    Range,          // ..
-    RangeInclusive, // ...
+    Choice,           // /
+    GroupChoiceInfix, // //
+    Range,            // ..
+    RangeInclusive,   // ...
 
     // CDDL Occurrence Indicators
     Optional,   // ?
@@ -97,14 +107,13 @@ pub enum TokenType {
     DotLt,      // .lt (less than)
     DotEq,      // .eq (equal to)
 
-    // CDDL Control Operators - Unsupported (planned features)
-    DotNe,      // .ne (not equal) - coming soon
-    DotBits,    // .bits (bit control) - coming soon
-    DotAnd,     // .and (type intersection) - coming soon
-    DotWithin,  // .within (subset constraint) - coming soon
-    DotJson,    // .json (JSON encoding) - coming soon
-    DotCbor,    // .cbor (CBOR encoding) - coming soon
-    DotCborseq, // .cborseq (CBOR sequence) - coming soon
+    DotNe,      // .ne (not equal)
+    DotBits,    // .bits (bit control)
+    DotAnd,     // .and (type intersection)
+    DotWithin,  // .within (subset constraint)
+    DotJson,    // .json (JSON encoding)
+    DotCbor,    // .cbor (CBOR encoding)
+    DotCborseq, // .cborseq (CBOR sequence)
 
     // CDDL Socket/Plug
     Socket, // $<identifier>
@@ -300,6 +309,13 @@ impl Lexer {
                         start_pos,
                         "//=".to_string(),
                     ))
+                } else if self.peek() == '/' {
+                    self.advance(); // consume second /
+                    Ok(Token::new(
+                        TokenType::GroupChoiceInfix,
+                        start_pos,
+                        "//".to_string(),
+                    ))
                 } else if self.peek() == '=' {
                     self.advance(); // consume =
                     Ok(Token::new(
@@ -342,11 +358,28 @@ impl Lexer {
                             "<-".to_string(),
                         ))
                     }
+                } else if self.peek() == '=' {
+                    self.advance();
+                    Ok(Token::new(
+                        TokenType::LessEqual,
+                        start_pos,
+                        "<=".to_string(),
+                    ))
                 } else {
-                    Err(LexerError::UnexpectedCharacter {
-                        ch,
-                        position: start_pos,
-                    })
+                    Ok(Token::new(TokenType::Less, start_pos, "<".to_string()))
+                }
+            }
+
+            '>' => {
+                if self.peek() == '=' {
+                    self.advance();
+                    Ok(Token::new(
+                        TokenType::GreaterEqual,
+                        start_pos,
+                        ">=".to_string(),
+                    ))
+                } else {
+                    Ok(Token::new(TokenType::Greater, start_pos, ">".to_string()))
                 }
             }
 
@@ -378,10 +411,12 @@ impl Lexer {
                             start_pos,
                             ".size".to_string(),
                         )),
-                        "regex" => Ok(Token::new(
+                        // `.regexp` is the RFC 8610 spelling; `.regex` is accepted as
+                        // an alias.
+                        "regex" | "regexp" => Ok(Token::new(
                             TokenType::DotRegex,
                             start_pos,
-                            ".regex".to_string(),
+                            format!(".{ident}"),
                         )),
                         "default" => Ok(Token::new(
                             TokenType::DotDefault,
@@ -453,11 +488,22 @@ impl Lexer {
                 }
             }
 
+            // `@depends-on(...)` boolean operators
+            '!' if self.peek() == '=' => {
+                self.advance();
+                Ok(Token::new(TokenType::NotEqual, start_pos, "!=".to_string()))
+            }
+            '&' => Ok(Token::new(TokenType::Ampersand, start_pos, "&".to_string())),
+            '|' => Ok(Token::new(TokenType::Pipe, start_pos, "|".to_string())),
+
             // Metadata annotations
             '@' => self.metadata_annotation(start_pos),
 
-            // Hash comments
-            '#' => self.comment(start_pos),
+            // CDDL hex byte string `h'...'`; the bare `'...'` form is handled above.
+            'h' if self.peek() == '\'' => {
+                self.advance(); // consume the opening quote
+                self.byte_string(start_pos)
+            }
 
             // Numbers and identifiers
             _ if ch.is_ascii_digit() => self.number_or_identifier(ch, start_pos),
@@ -471,22 +517,17 @@ impl Lexer {
     }
 
     fn comment(&mut self, start_pos: Position) -> Result<Token, LexerError> {
-        let comment_start = if start_pos.offset > 0 {
-            self.input[start_pos.offset - 1]
-        } else {
-            '#'
-        };
-
+        // Only reached for CDDL `;` comments; the leading semicolon(s) are already
+        // consumed by the caller, so the lexeme is reconstructed with a `;` prefix.
         let mut comment = String::new();
         while self.peek() != '\n' && !self.is_at_end() {
             comment.push(self.advance());
         }
 
-        let prefix = if comment_start == '#' { "#" } else { ";" };
         Ok(Token::new(
             TokenType::Comment(comment.clone()),
             start_pos,
-            format!("{prefix}{comment}"),
+            format!(";{comment}"),
         ))
     }
 
@@ -546,20 +587,25 @@ impl Lexer {
     }
 
     fn byte_string(&mut self, start_pos: Position) -> Result<Token, LexerError> {
-        let mut bytes = Vec::new();
+        // Collect the literal content (interior whitespace is allowed and ignored),
+        // then validate it is an even number of hex digits before decoding — a
+        // malformed literal is an error, never silently truncated.
+        let mut hex = String::new();
         let mut lexeme = String::from('\'');
 
         while self.peek() != '\'' && !self.is_at_end() {
             let ch = self.advance();
             lexeme.push(ch);
-
-            if ch.is_ascii_hexdigit()
-                && let Some(next_ch) = self.peek().to_digit(16)
-            {
-                let byte_val = (ch.to_digit(16).unwrap() * 16 + next_ch) as u8;
-                bytes.push(byte_val);
-                lexeme.push(self.advance());
+            if ch.is_ascii_whitespace() {
+                continue;
             }
+            if !ch.is_ascii_hexdigit() {
+                return Err(LexerError::InvalidByteString {
+                    reason: format!("non-hex character '{ch}'"),
+                    position: start_pos,
+                });
+            }
+            hex.push(ch);
         }
 
         if self.is_at_end() {
@@ -570,6 +616,18 @@ impl Lexer {
 
         self.advance(); // consume closing '
         lexeme.push('\'');
+
+        if !hex.len().is_multiple_of(2) {
+            return Err(LexerError::InvalidByteString {
+                reason: format!("odd number of hex digits ({})", hex.len()),
+                position: start_pos,
+            });
+        }
+
+        let bytes = (0..hex.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).expect("validated hex above"))
+            .collect();
 
         Ok(Token::new(TokenType::ByteString(bytes), start_pos, lexeme))
     }
@@ -674,10 +732,12 @@ impl Lexer {
             "from" => TokenType::From,
             "as" => TokenType::As,
 
-            // CDDL built-in types
+            // CDDL built-in types, plus CSIL tagged extensions: `timestamp` is CBOR
+            // tag 0 (RFC3339 text, always UTC) and `decimal` is CBOR tag 4 (exact
+            // decimal fraction), so neither is expressible as a plain CDDL primitive.
             "int" | "uint" | "nint" | "text" | "tstr" | "bytes" | "bstr" | "bool" | "true"
             | "false" | "null" | "undefined" | "float" | "float16" | "float32" | "float64"
-            | "any" => TokenType::Builtin(lexeme.clone()),
+            | "any" | "timestamp" | "decimal" => TokenType::Builtin(lexeme.clone()),
 
             _ => TokenType::Identifier(lexeme.clone()),
         };
@@ -742,6 +802,7 @@ pub enum LexerError {
     UnexpectedCharacter { ch: char, position: Position },
     UnterminatedString { position: Position },
     InvalidNumber { lexeme: String, position: Position },
+    InvalidByteString { reason: String, position: Position },
 }
 
 impl fmt::Display for LexerError {
@@ -755,6 +816,9 @@ impl fmt::Display for LexerError {
             }
             LexerError::InvalidNumber { lexeme, position } => {
                 write!(f, "Invalid number '{lexeme}' at {position}")
+            }
+            LexerError::InvalidByteString { reason, position } => {
+                write!(f, "Invalid byte string at {position}: {reason}")
             }
         }
     }
@@ -876,7 +940,7 @@ mod tests {
 
     #[test]
     fn test_all_builtin_types() {
-        let input = "int uint nint text tstr bytes bstr bool true false null undefined float float16 float32 float64 any";
+        let input = "int uint nint text tstr bytes bstr bool true false null undefined float float16 float32 float64 any timestamp decimal";
         let mut lexer = Lexer::new(input);
         let tokens = lexer.tokenize().unwrap();
 
@@ -885,7 +949,21 @@ mod tests {
             .filter(|t| matches!(t.token_type, TokenType::Builtin(_)))
             .collect();
 
-        assert_eq!(builtins.len(), 17);
+        assert_eq!(builtins.len(), 19);
+    }
+
+    #[test]
+    fn test_timestamp_and_decimal_are_builtins() {
+        // These CSIL extensions map to CBOR tags 0 and 4 and must lex as builtins,
+        // not as user-defined identifiers.
+        for input in ["timestamp", "decimal"] {
+            let mut lexer = Lexer::new(input);
+            let tokens = lexer.tokenize().unwrap();
+            assert!(
+                matches!(&tokens[0].token_type, TokenType::Builtin(name) if name == input),
+                "{input} should lex as a builtin"
+            );
+        }
     }
 
     #[test]
@@ -1148,14 +1226,14 @@ mod tests {
 
     #[test]
     fn test_error_unexpected_character() {
-        let input = "valid & invalid";
+        let input = "valid ~ invalid";
         let mut lexer = Lexer::new(input);
         let result = lexer.tokenize();
 
         assert!(result.is_err());
         assert!(matches!(
             result.unwrap_err(),
-            LexerError::UnexpectedCharacter { ch: '&', .. }
+            LexerError::UnexpectedCharacter { ch: '~', .. }
         ));
     }
 
@@ -1291,7 +1369,7 @@ service UserService {
 
     #[test]
     fn test_cddl_comment_syntax() {
-        let input = ";; This is a CDDL comment\n# This is also a comment";
+        let input = "; single comment\n;; double comment";
         let mut lexer = Lexer::new(input);
         let tokens = lexer.tokenize().unwrap();
 
@@ -1301,5 +1379,49 @@ service UserService {
             .collect();
 
         assert_eq!(comments.len(), 2);
+    }
+
+    #[test]
+    fn test_hex_byte_string_literal() {
+        for (input, expected) in [
+            ("h'89504E47'", vec![0x89u8, 0x50, 0x4E, 0x47]),
+            ("h''", vec![]),
+        ] {
+            let mut lexer = Lexer::new(input);
+            let tokens = lexer.tokenize().unwrap();
+            assert!(
+                matches!(&tokens[0].token_type, TokenType::ByteString(b) if *b == expected),
+                "{input} should lex to {expected:?}, got {:?}",
+                tokens[0].token_type
+            );
+        }
+    }
+
+    #[test]
+    fn test_malformed_byte_string_errors() {
+        // Odd digit count and non-hex content are errors, never silently truncated.
+        for bad in ["h'ABC'", "h'ZZ'", "h'4G'"] {
+            assert!(
+                matches!(
+                    Lexer::new(bad).tokenize(),
+                    Err(LexerError::InvalidByteString { .. })
+                ),
+                "{bad} should be rejected"
+            );
+        }
+        // A valid even-length hex string still works.
+        let toks = Lexer::new("h'89AB'").tokenize().unwrap();
+        assert!(matches!(&toks[0].token_type, TokenType::ByteString(b) if b == &[0x89u8, 0xAB]));
+    }
+
+    #[test]
+    fn test_hash_is_not_a_comment() {
+        // `#` was a non-CDDL CSIL comment extension; it now lexes as an unexpected
+        // character (in CDDL `#` is the tag operator, not a comment).
+        let mut lexer = Lexer::new("# not a comment");
+        assert!(matches!(
+            lexer.tokenize(),
+            Err(LexerError::UnexpectedCharacter { ch: '#', .. })
+        ));
     }
 }

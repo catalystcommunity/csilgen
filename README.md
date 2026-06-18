@@ -45,43 +45,56 @@ See the examples directory for sample CSIL files to experiment with.
 
 ## CDDL Syntax Support
 
-### ✅ Currently Supported CBOR Constraint Types
-- `.size` - Size constraints (exact, range, min, max)
-- `.regex` - Regular expression pattern matching  
-- `.default` - Default value specification
-- `.ge` - Greater than or equal comparison
-- `.le` - Less than or equal comparison  
-- `.gt` - Greater than comparison
-- `.lt` - Less than comparison
+### ✅ Supported CBOR Constraint Types
 
-### ❌ Planned CBOR Constraint Types (from RFC 8610)
-- `.eq` - Equality comparison
-- `.ne` - Not equal comparison  
+All of the RFC 8610 control operators below are parsed, validated, and carried
+through every generator. Comparison/size/regex/default constraints are emitted as
+runtime checks (code generators) and schema keywords (JSON Schema / OpenAPI);
+the encoding/structural operators are represented as encoding hints (e.g.
+`contentMediaType`, `allOf`, vendor extensions, doc comments) rather than runtime
+checks.
+
+- `.size` - Size constraints (exact, range, min, max)
+- `.regex` - Regular expression pattern matching
+- `.default` - Default value specification
+- `.ge` / `.le` / `.gt` / `.lt` - Ordered comparisons
+- `.eq` / `.ne` - Equality / inequality comparisons
 - `.bits` - Bit control constraints
 - `.and` - Type intersection
 - `.within` - Subset constraints
-- `.cbor` - CBOR validation
-- `.cborseq` - CBOR sequence validation
+- `.json` - JSON text representation
+- `.cbor` / `.cborseq` - CBOR / CBOR-sequence encoding
 
-### ❌ Additional Constraint Types (future extensions)
-- `.json` - JSON text representation validation
+CSIL also accepts an `@`-annotation constraint system (`@min-length`,
+`@max-length`, `@min-items`, `@max-items`, `@min-value`, `@max-value`) that
+composes with the control operators above; both are honored by every generator.
+
+### ❌ Not yet supported (future extensions)
 - Base encoding operators (`.b64u`, `.b64c`, `.hex`, etc.)
 - Text processing operators (`.printf`, `.join`, etc.)
 
 ### ✅ Core CDDL Syntax Support
 - Basic types (`int`, `text`, `bool`, `bytes`, `float`, etc.)
-- Arrays with occurrence indicators (`[* type]`, `[+ type]`, `[? type]`)  
-- Maps with key-value pairs (`{ key => value }`)
-- Groups and choices (`( a, b )`, `( a / b )`)
+- Tagged core types: `timestamp` (CBOR tag 0, RFC3339, always UTC) and `decimal`
+  (CBOR tag 4, exact). `decimal` maps to a generated, dependency-free
+  `CsilDecimal` by default, or to the language's decimal library via
+  `options { decimal_mapping: "library" }`. See `docs/cbor-wire-contract.md` and
+  `examples/tagged-types/`.
+- Arrays with occurrence indicators (`[* type]`, `[+ type]`, `[? type]`, bounded `[*10 type]`, `[2*5 type]`)
+- Fixed-shape arrays: heterogeneous tuples `[text, int, bool]` and keyed arrays `[tag: text, value: any]`
+- Maps with key-value pairs (`{ key => value }`), including nested maps inside records
+- Groups (`( name: text, age: int )`), type choice `/`, and group choice `//`
 - Optional fields (`? fieldname: type`)
-- Comments (`#` and `;;` syntax; `;;;` documentation comments attach to the following definition)
+- Comments — CDDL `;` line comments (a leading `;;` is just a `;` comment)
 - Type definitions and references
-- Range expressions (`0..100`)
+- Range expressions — inclusive `1..100`, open-ended `1..` / `..100`, exclusive `1...100`, and float ranges (lowered to `.ge`/`.le`/`.lt` constraints)
+- Hex byte-string literals (`h'89504E47'`)
 - Literal values and enums
 
 ### ✅ CSIL Extensions (beyond CDDL)
-- Service definitions with operations  
-- Field metadata annotations
+- `;;;` documentation comments (attach to the following definition); the linter warns on them as a non-CDDL extension
+- Service definitions with operations, including push-only ops with no input payload (`op: <- Event`)
+- Field metadata annotations, including boolean `@depends-on` conditions (`@depends-on(a = "x" & b != "y" | c > 5)`)
 - Import/include statements
 - File-level options
 - Socket/plug type system
@@ -96,10 +109,11 @@ See the examples directory for sample CSIL files to experiment with.
 - **CLI tools**: `validate`, `generate`, `format`, `lint`, `breaking`.
 - **Plugin runtime**: Dynamic generator discovery from `~/.csilgen/generators/`, `./.generators/`, and `target/wasm32-unknown-unknown/release/` — first-write-wins precedence. Generators are conforming `csilgen_<target>_generator.wasm` cdylibs; no CLI map to edit.
 - **Generators**: Rust, Go, TypeScript, Python (each with `-typesonly` / `-client` / `-server` sub-targets, e.g. `rust-client`, `go-typesonly`), plus JSON Schema and OpenAPI. Service directions `->`, `<->`, `<-` all emit consistently (handler + router + outbound encoders).
-- **Testing**: 465+ tests across the workspace.
+- **Constraints & tagged types**: the full RFC 8610 control-operator set and the `@`-annotation constraints are honored across all six generators; the `timestamp` (tag 0) and `decimal` (tag 4) core types emit per the CBOR wire contract.
+- **Testing**: 605 tests across the workspace.
 
 ### 🔄 Deferred / partial
-- **Additional CBOR constraint operators** (`.eq`, `.ne`, `.bits`, `.and`, `.within`, encoding/base operators) — see `csil-spec.md` for the supported subset.
+- **Base-encoding and text-processing operators** (`.b64u`, `.hex`, `.printf`, `.join`, …) — not yet parsed; everything else in RFC 8610's control-operator set is supported.
 - **Performance optimizations** for very large schemas.
 
 ### 📋 Future ideas

@@ -8,11 +8,12 @@
 mod wasm;
 
 use csilgen_common::{
-    CsilControlOperator, CsilFieldMetadata, CsilFieldVisibility, CsilGroupEntry, CsilGroupKey,
-    CsilLiteralValue, CsilOccurrence, CsilRuleType, CsilServiceDefinition, CsilServiceDirection,
-    CsilServiceOperation, CsilSizeConstraint, CsilSpecSerialized, CsilTypeExpression,
-    CsilValidationConstraint, GeneratedFile, GeneratedFiles, GeneratorConfig, GeneratorWarning,
-    Result, WarningLevel,
+    CsilControlOperator, CsilDependsCompareOp, CsilDependsCondition, CsilFieldMetadata,
+    CsilFieldVisibility, CsilGroupEntry, CsilGroupKey, CsilLiteralValue, CsilOccurrence,
+    CsilRuleType, CsilServiceDefinition, CsilServiceDirection, CsilServiceOperation,
+    CsilSizeConstraint, CsilSpecSerialized, CsilTypeExpression, CsilValidationConstraint,
+    CsilgenError, GeneratedFile, GeneratedFiles, GeneratorConfig, GeneratorWarning, Result,
+    WarningLevel,
 };
 use serde_json::{Map, Value, json};
 use std::collections::HashMap;
@@ -43,6 +44,12 @@ impl OpenApiGenerator {
     }
 
     fn generate(&mut self, spec: &CsilSpecSerialized) -> Result<GeneratedFiles> {
+        // Validate options before doing any work so a misconfiguration fails the
+        // whole run rather than silently degrading — the same validate-early
+        // idiom the other generators use so a bad option behaves identically
+        // across targets.
+        self.validate_options()?;
+
         let mut openapi_spec = json!({
             "openapi": "3.0.3",
             "info": {
@@ -110,6 +117,26 @@ impl OpenApiGenerator {
             path: "openapi.json".to_string(),
             content,
         }])
+    }
+
+    /// The `decimal_mapping` option only selects the in-memory type a *code*
+    /// generator emits; the OpenAPI schema is identical (`decimal` is exact text
+    /// either way). We still validate it here so an unknown value is a hard
+    /// error rather than a silent no-op, keeping behavior consistent with the
+    /// code generators that do act on it (per the wire contract).
+    fn validate_options(&self) -> Result<()> {
+        match self.config.options.get("decimal_mapping") {
+            None => Ok(()),
+            Some(value) => match value.as_str() {
+                Some("csil") | Some("library") => Ok(()),
+                Some(other) => Err(CsilgenError::GenerationError(format!(
+                    "decimal_mapping must be \"csil\" or \"library\", got {other:?}"
+                ))),
+                None => Err(CsilgenError::GenerationError(format!(
+                    "decimal_mapping must be a string, got {value:?}"
+                ))),
+            },
+        }
     }
 
     fn generate_schemas(
@@ -191,22 +218,31 @@ impl OpenApiGenerator {
             });
         }
 
-        let request_schema =
-            self.type_expression_to_schema(&operation.input_type, type_definitions)?;
-        let response_schema =
-            self.type_expression_to_schema(&operation.output_type, type_definitions)?;
-
-        let mut operation_spec = json!({
-            "summary": format!("{} operation", operation.name),
-            "operationId": format!("{}_{}", service_name.to_lowercase(), operation.name),
-            "requestBody": {
+        // A push-only operation (`op: <- Event`) carries no input — its
+        // `input_type` is the `null` builtin. Emitting a `null`-typed, required
+        // request body would force callers to send an explicit JSON null, so we
+        // omit the body entirely and let the operation describe a payload-less
+        // request.
+        let request_body = if Self::is_null_type(&operation.input_type) {
+            None
+        } else {
+            let request_schema =
+                self.type_expression_to_schema(&operation.input_type, type_definitions)?;
+            Some(json!({
                 "required": true,
                 "content": {
                     "application/json": {
                         "schema": request_schema
                     }
                 }
-            },
+            }))
+        };
+        let response_schema =
+            self.type_expression_to_schema(&operation.output_type, type_definitions)?;
+
+        let mut operation_spec = json!({
+            "summary": format!("{} operation", operation.name),
+            "operationId": format!("{}_{}", service_name.to_lowercase(), operation.name),
             "responses": {
                 "200": {
                     "description": "Successful response",
@@ -224,6 +260,9 @@ impl OpenApiGenerator {
                 }
             }
         });
+        if let Some(body) = request_body {
+            operation_spec["requestBody"] = body;
+        }
         if let Some(direction_label) = csil_direction {
             operation_spec["x-csil-direction"] = json!(direction_label);
         }
@@ -315,6 +354,39 @@ impl OpenApiGenerator {
 
                 Ok(schema)
             }
+            // OpenAPI 3.0 has no native tuple, so a fixed-shape array is modeled
+            // as a length-pinned array (`minItems == maxItems == N`) whose
+            // `items` is the union of the distinct entry value-type schemas. We
+            // deliberately avoid 3.1's `prefixItems` so the output validates
+            // against the `3.0.3` document this generator declares. Each entry's
+            // value type reuses the same converter as everything else, so keyed
+            // tuples (`[tag: text, value: any]`) and bare tuples (`[text, int]`)
+            // behave identically — only the value type matters to the schema.
+            CsilTypeExpression::Tuple(group_expr) => {
+                let arity = group_expr.entries.len();
+                let mut distinct: Vec<Value> = Vec::new();
+                for entry in &group_expr.entries {
+                    let entry_schema =
+                        self.type_expression_to_schema(&entry.value_type, type_definitions)?;
+                    if !distinct.contains(&entry_schema) {
+                        distinct.push(entry_schema);
+                    }
+                }
+                // A `oneOf` requires at least one branch and is pointless for a
+                // single distinct type, so collapse those cases to a plain
+                // schema (or an unconstrained schema for the empty tuple).
+                let items = match distinct.len() {
+                    0 => json!({}),
+                    1 => distinct.pop().unwrap(),
+                    _ => json!({ "oneOf": distinct }),
+                };
+                Ok(json!({
+                    "type": "array",
+                    "minItems": arity,
+                    "maxItems": arity,
+                    "items": items
+                }))
+            }
             CsilTypeExpression::Choice(choices) => {
                 let choice_schemas: Result<Vec<Value>> = choices
                     .iter()
@@ -399,36 +471,40 @@ impl OpenApiGenerator {
                             schema["default"] = self.literal_to_json_value(value);
                         }
                         CsilControlOperator::GreaterEqual(value) => {
-                            if let CsilLiteralValue::Integer(i) = value {
-                                schema["minimum"] = json!(i);
-                            } else if let CsilLiteralValue::Float(f) = value {
-                                schema["minimum"] = json!(f);
-                            }
+                            self.apply_comparison_bound(
+                                &mut schema,
+                                "minimum",
+                                "x-csil-minimum",
+                                None,
+                                value,
+                            );
                         }
                         CsilControlOperator::LessEqual(value) => {
-                            if let CsilLiteralValue::Integer(i) = value {
-                                schema["maximum"] = json!(i);
-                            } else if let CsilLiteralValue::Float(f) = value {
-                                schema["maximum"] = json!(f);
-                            }
+                            self.apply_comparison_bound(
+                                &mut schema,
+                                "maximum",
+                                "x-csil-maximum",
+                                None,
+                                value,
+                            );
                         }
                         CsilControlOperator::GreaterThan(value) => {
-                            if let CsilLiteralValue::Integer(i) = value {
-                                schema["exclusiveMinimum"] = json!(true);
-                                schema["minimum"] = json!(i);
-                            } else if let CsilLiteralValue::Float(f) = value {
-                                schema["exclusiveMinimum"] = json!(true);
-                                schema["minimum"] = json!(f);
-                            }
+                            self.apply_comparison_bound(
+                                &mut schema,
+                                "minimum",
+                                "x-csil-exclusive-minimum",
+                                Some("exclusiveMinimum"),
+                                value,
+                            );
                         }
                         CsilControlOperator::LessThan(value) => {
-                            if let CsilLiteralValue::Integer(i) = value {
-                                schema["exclusiveMaximum"] = json!(true);
-                                schema["maximum"] = json!(i);
-                            } else if let CsilLiteralValue::Float(f) = value {
-                                schema["exclusiveMaximum"] = json!(true);
-                                schema["maximum"] = json!(f);
-                            }
+                            self.apply_comparison_bound(
+                                &mut schema,
+                                "maximum",
+                                "x-csil-exclusive-maximum",
+                                Some("exclusiveMaximum"),
+                                value,
+                            );
                         }
                         CsilControlOperator::Json
                             // For .json constraint in OpenAPI, we can use format
@@ -447,7 +523,42 @@ impl OpenApiGenerator {
                                 schema["format"] = json!("byte");
                                 schema["contentMediaType"] = json!("application/cbor-seq");
                             }
-                        // Other operators not yet fully supported in OpenAPI
+                        // `.eq` pins the value to a single constant; JSON Schema
+                        // `const` is the direct equivalent.
+                        CsilControlOperator::Equal(value) => {
+                            schema["const"] = self.literal_to_json_value(value);
+                        }
+                        // `.ne` excludes a single value; the negation of `const`
+                        // expresses exactly that.
+                        CsilControlOperator::NotEqual(value) => {
+                            schema["not"] = json!({ "const": self.literal_to_json_value(value) });
+                        }
+                        // JSON Schema has no bit-field facet, so preserve the CSIL
+                        // intent in a vendor extension rather than dropping it.
+                        CsilControlOperator::Bits(bits) => {
+                            schema["x-csil-bits"] = json!(bits);
+                        }
+                        // `.and` intersects with another type; `allOf` is the JSON
+                        // Schema intersection, folding the current schema in so its
+                        // already-applied facets are not lost.
+                        CsilControlOperator::And(other) => {
+                            let other_schema =
+                                self.type_expression_to_schema(other, type_definitions)?;
+                            Self::merge_all_of(&mut schema, other_schema);
+                        }
+                        // `.within` constrains the value to a member of another
+                        // type. There is no single JSON Schema facet for "is a
+                        // member of"; carry the membership type as a vendor
+                        // extension so it survives round-tripping while keeping it
+                        // distinct from `.and`'s hard intersection.
+                        CsilControlOperator::Within(other) => {
+                            let within_schema =
+                                self.type_expression_to_schema(other, type_definitions)?;
+                            schema["x-csil-within"] = within_schema;
+                        }
+                        // Remaining arms are the guarded string-only operators
+                        // (`.regex`/`.json`/`.cbor*`) applied to a non-string base,
+                        // where the facet simply does not apply.
                         _ => {}
                     }
                 }
@@ -501,6 +612,24 @@ impl OpenApiGenerator {
                         schema["description"] = json!(dependency_desc);
                     }
                 }
+                // Boolean `@depends-on(...)` renders the same way as the simple
+                // `DependsOn` form (a human-readable note appended to the field
+                // description) so consumers don't have to learn a second
+                // mechanism; only the rendered condition is richer.
+                CsilFieldMetadata::DependsOnExpr(condition) => {
+                    let dependency_desc =
+                        format!("Depends on: {}", self.render_depends_condition(condition));
+                    if let Some(existing_desc) = schema.get("description") {
+                        let combined = format!(
+                            "{}. {}",
+                            existing_desc.as_str().unwrap_or(""),
+                            dependency_desc
+                        );
+                        schema["description"] = json!(combined);
+                    } else {
+                        schema["description"] = json!(dependency_desc);
+                    }
+                }
                 CsilFieldMetadata::Custom {
                     name,
                     parameters: _,
@@ -543,6 +672,18 @@ impl OpenApiGenerator {
             }),
             "bool" => json!({
                 "type": "boolean"
+            }),
+            // CBOR tag 0 (RFC 3339 date/time string); `date-time` is the
+            // standard JSON Schema/OpenAPI string format for this.
+            "timestamp" => json!({
+                "type": "string",
+                "format": "date-time"
+            }),
+            // CBOR tag 4 decimal fraction on the wire, but exact base-10 carried
+            // as text in JSON so no float rounding is introduced.
+            "decimal" => json!({
+                "type": "string",
+                "format": "decimal"
             }),
             "null" | "nil" => json!({
                 "type": "null"
@@ -609,6 +750,70 @@ impl OpenApiGenerator {
                     .collect();
                 Value::Array(json_elements)
             }
+        }
+    }
+
+    /// Place a comparison bound using the keyword that matches the schema's
+    /// type. Numeric schemas get the real `minimum`/`maximum` keyword (and the
+    /// OAS-3.0 boolean `exclusiveMinimum`/`exclusiveMaximum` flag for `.gt`/`.lt`);
+    /// the string-typed `decimal` (`format: decimal`) and `timestamp`
+    /// (`format: date-time`) schemas instead carry the bound as a string in a
+    /// vendor extension, since a string-valued numeric keyword would be an
+    /// invalid OpenAPI schema and the constraint would otherwise be silently lost.
+    fn apply_comparison_bound(
+        &self,
+        schema: &mut Value,
+        numeric_key: &str,
+        vendor_key: &str,
+        exclusive_flag_key: Option<&str>,
+        value: &CsilLiteralValue,
+    ) {
+        if schema.get("type").and_then(Value::as_str) == Some("string") {
+            schema[vendor_key] = self.bound_as_string(value);
+        } else if let Some(numeric) = self.numeric_bound(value) {
+            schema[numeric_key] = numeric;
+            if let Some(flag) = exclusive_flag_key {
+                schema[flag] = json!(true);
+            }
+        }
+    }
+
+    /// Numeric bounds carry only as integers or floats; anything else (e.g. a
+    /// `decimal`/`timestamp` text bound) is not a numeric keyword value. The
+    /// actual conversion defers to `literal_to_json_value` so there is a single
+    /// place that decides how a literal becomes JSON.
+    fn numeric_bound(&self, value: &CsilLiteralValue) -> Option<Value> {
+        match value {
+            CsilLiteralValue::Integer(_) | CsilLiteralValue::Float(_) => {
+                Some(self.literal_to_json_value(value))
+            }
+            _ => None,
+        }
+    }
+
+    /// The vendor-extension form always carries the bound as text, since the
+    /// whole reason for the extension is that the instance type is a string.
+    /// Conversion defers to `literal_to_json_value`; a text bound is already a
+    /// JSON string and passes through, while an integer decimal bound (e.g. `0`)
+    /// is rendered as its decimal string (`"0"`) so it stays consistent with the
+    /// text bounds it may sit alongside on the same string-typed field.
+    fn bound_as_string(&self, value: &CsilLiteralValue) -> Value {
+        match self.literal_to_json_value(value) {
+            Value::String(s) => Value::String(s),
+            other => json!(other.to_string()),
+        }
+    }
+
+    /// Intersect `schema` with `other` under JSON Schema `allOf`. If `schema`
+    /// is already an `allOf` (a prior `.and`), append rather than nest so
+    /// repeated `.and` constraints stay a flat list instead of growing a tower
+    /// of single-element wrappers.
+    fn merge_all_of(schema: &mut Value, other: Value) {
+        if let Some(all_of) = schema.get_mut("allOf").and_then(|v| v.as_array_mut()) {
+            all_of.push(other);
+        } else {
+            let existing = schema.take();
+            *schema = json!({ "allOf": [existing, other] });
         }
     }
 
@@ -679,18 +884,10 @@ impl OpenApiGenerator {
                 }
             }
             CsilValidationConstraint::MinValue(value) => {
-                schema["minimum"] = match value {
-                    CsilLiteralValue::Integer(v) => json!(v),
-                    CsilLiteralValue::Float(v) => json!(v),
-                    _ => json!(null),
-                };
+                self.apply_comparison_bound(schema, "minimum", "x-csil-minimum", None, value);
             }
             CsilValidationConstraint::MaxValue(value) => {
-                schema["maximum"] = match value {
-                    CsilLiteralValue::Integer(v) => json!(v),
-                    CsilLiteralValue::Float(v) => json!(v),
-                    _ => json!(null),
-                };
+                self.apply_comparison_bound(schema, "maximum", "x-csil-maximum", None, value);
             }
             CsilValidationConstraint::Custom { name, value } => {
                 let constraint_desc = format!("Custom constraint '{name}': {value:?}");
@@ -714,16 +911,82 @@ impl OpenApiGenerator {
             Some(CsilOccurrence::Optional) | Some(CsilOccurrence::ZeroOrMore)
         )
     }
+
+    /// A no-input operation's `input_type` is the `null`/`nil` builtin (or a
+    /// literal null). It's matched here rather than inline so the "push-only
+    /// means no request body" decision lives in one place.
+    fn is_null_type(type_expr: &CsilTypeExpression) -> bool {
+        matches!(type_expr, CsilTypeExpression::Builtin(name) if name == "null" || name == "nil")
+            || matches!(
+                type_expr,
+                CsilTypeExpression::Literal(CsilLiteralValue::Null)
+            )
+    }
+
+    /// Render a `@depends-on` condition tree into a single human-readable line
+    /// for a field description. Compound nodes join with " and "/" or " and a
+    /// nested compound is parenthesized so the grouping survives the flattening
+    /// into one line.
+    fn render_depends_condition(&self, condition: &CsilDependsCondition) -> String {
+        match condition {
+            CsilDependsCondition::Compare { field, op, value } => match (op, value) {
+                (Some(op), Some(value)) => {
+                    let op_str = match op {
+                        CsilDependsCompareOp::Eq => "==",
+                        CsilDependsCompareOp::Ne => "!=",
+                        CsilDependsCompareOp::Lt => "<",
+                        CsilDependsCompareOp::Le => "<=",
+                        CsilDependsCompareOp::Gt => ">",
+                        CsilDependsCompareOp::Ge => ">=",
+                    };
+                    format!("{field} {op_str} {}", self.render_depends_literal(value))
+                }
+                // No operator means a presence check (`@depends-on(field)`).
+                _ => format!("{field} is present"),
+            },
+            CsilDependsCondition::All(conditions) => conditions
+                .iter()
+                .map(|c| self.render_depends_child(c))
+                .collect::<Vec<_>>()
+                .join(" and "),
+            CsilDependsCondition::Any(conditions) => conditions
+                .iter()
+                .map(|c| self.render_depends_child(c))
+                .collect::<Vec<_>>()
+                .join(" or "),
+        }
+    }
+
+    /// Parenthesize a child only when it is itself a compound (`All`/`Any`) so a
+    /// mixed tree like `a and (b or c)` reads unambiguously while simple
+    /// comparisons stay bare.
+    fn render_depends_child(&self, condition: &CsilDependsCondition) -> String {
+        match condition {
+            CsilDependsCondition::Compare { .. } => self.render_depends_condition(condition),
+            _ => format!("({})", self.render_depends_condition(condition)),
+        }
+    }
+
+    fn render_depends_literal(&self, value: &CsilLiteralValue) -> String {
+        match value {
+            CsilLiteralValue::Text(s) => format!("'{s}'"),
+            CsilLiteralValue::Integer(i) => i.to_string(),
+            CsilLiteralValue::Float(f) => f.to_string(),
+            CsilLiteralValue::Bool(b) => b.to_string(),
+            CsilLiteralValue::Null => "null".to_string(),
+            other => format!("{other:?}"),
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use csilgen_common::{
-        CsilFieldMetadata, CsilFieldVisibility, CsilGroupEntry, CsilGroupExpression, CsilGroupKey,
-        CsilLiteralValue, CsilOccurrence, CsilPosition, CsilRule, CsilRuleType,
-        CsilServiceDefinition, CsilServiceDirection, CsilServiceOperation, CsilSpecSerialized,
-        CsilTypeExpression, CsilValidationConstraint,
+        CsilControlOperator, CsilFieldMetadata, CsilFieldVisibility, CsilGroupEntry,
+        CsilGroupExpression, CsilGroupKey, CsilLiteralValue, CsilOccurrence, CsilPosition,
+        CsilRule, CsilRuleType, CsilServiceDefinition, CsilServiceDirection, CsilServiceOperation,
+        CsilSpecSerialized, CsilTypeExpression, CsilValidationConstraint,
     };
     use std::collections::HashMap;
 
@@ -1026,6 +1289,68 @@ mod tests {
         assert_eq!(choices[1]["type"], "integer");
     }
 
+    // A `.ge`/`.le` bound on a string-typed `decimal` or `timestamp` field
+    // cannot ride as a numeric `minimum`/`maximum` (that would be an invalid
+    // OpenAPI schema), so it must survive as a string-valued vendor extension
+    // rather than being silently dropped.
+    #[test]
+    fn string_typed_comparison_bounds_use_vendor_extension() {
+        let spec = spec_from_rules(vec![CsilRule {
+            name: "user".to_string(),
+            rule_type: CsilRuleType::GroupDef(CsilGroupExpression {
+                entries: vec![
+                    CsilGroupEntry {
+                        key: Some(CsilGroupKey::Bare("balance".to_string())),
+                        value_type: CsilTypeExpression::Constrained {
+                            base_type: Box::new(CsilTypeExpression::Builtin("decimal".to_string())),
+                            constraints: vec![CsilControlOperator::GreaterEqual(
+                                CsilLiteralValue::Text("0.00".to_string()),
+                            )],
+                        },
+                        occurrence: None,
+                        metadata: Vec::new(),
+                        doc_comments: Vec::new(),
+                    },
+                    CsilGroupEntry {
+                        key: Some(CsilGroupKey::Bare("created_at".to_string())),
+                        value_type: CsilTypeExpression::Constrained {
+                            base_type: Box::new(CsilTypeExpression::Builtin(
+                                "timestamp".to_string(),
+                            )),
+                            constraints: vec![CsilControlOperator::GreaterEqual(
+                                CsilLiteralValue::Text("1970-01-01T00:00:00Z".to_string()),
+                            )],
+                        },
+                        occurrence: None,
+                        metadata: Vec::new(),
+                        doc_comments: Vec::new(),
+                    },
+                ],
+            }),
+            position: create_test_position(),
+            doc_comments: Vec::new(),
+        }]);
+
+        let config = create_test_config();
+        let (result, _warnings) = generate_openapi_spec(&spec, &config).unwrap();
+        let openapi_json: Value = serde_json::from_str(&result[0].content).unwrap();
+
+        let balance = &openapi_json["components"]["schemas"]["user"]["properties"]["balance"];
+        assert_eq!(balance["type"], "string");
+        assert_eq!(balance["format"], "decimal");
+        assert_eq!(balance["x-csil-minimum"], "0.00");
+        assert!(
+            balance.get("minimum").is_none(),
+            "a string bound must not become a numeric `minimum`: {balance}"
+        );
+
+        let created_at = &openapi_json["components"]["schemas"]["user"]["properties"]["created_at"];
+        assert_eq!(created_at["type"], "string");
+        assert_eq!(created_at["format"], "date-time");
+        assert_eq!(created_at["x-csil-minimum"], "1970-01-01T00:00:00Z");
+        assert!(created_at.get("minimum").is_none());
+    }
+
     #[test]
     fn test_generate_openapi_spec_with_range_types() {
         let spec = spec_from_rules(vec![CsilRule {
@@ -1148,6 +1473,44 @@ mod tests {
     }
 
     #[test]
+    fn unidirectional_null_input_op_omits_request_body() {
+        // `op: -> Event` parses to a Unidirectional operation whose input is the
+        // `null` builtin. Like the reverse push case, it must not emit a
+        // `requestBody` (and never a `{"type":"null"}` body schema), since there
+        // is no request payload for callers to send.
+        let spec = spec_from_rules(vec![CsilRule {
+            name: "PushService".to_string(),
+            rule_type: CsilRuleType::ServiceDef(CsilServiceDefinition {
+                operations: vec![CsilServiceOperation {
+                    name: "emit".to_string(),
+                    input_type: CsilTypeExpression::Builtin("null".to_string()),
+                    output_type: CsilTypeExpression::Builtin("text".to_string()),
+                    direction: CsilServiceDirection::Unidirectional,
+                    position: create_test_position(),
+                    doc_comments: Vec::new(),
+                }],
+            }),
+            position: create_test_position(),
+            doc_comments: Vec::new(),
+        }]);
+
+        let config = create_test_config();
+        let (result, _warnings) = generate_openapi_spec(&spec, &config).unwrap();
+        let openapi_json: Value = serde_json::from_str(&result[0].content).unwrap();
+
+        let emit_op = &openapi_json["paths"]["/pushservice/emit"]["post"];
+        assert!(emit_op.is_object());
+        assert!(
+            emit_op.get("requestBody").is_none(),
+            "null-input unidirectional op must omit requestBody, got {emit_op:#}"
+        );
+        assert!(
+            !result[0].content.contains("\"type\": \"null\""),
+            "no operation body schema should be emitted for a null input"
+        );
+    }
+
+    #[test]
     fn test_builtin_type_to_schema() {
         let generator = OpenApiGenerator::new(&create_test_config());
 
@@ -1157,6 +1520,273 @@ mod tests {
         assert_eq!(generator.builtin_type_to_schema("bool")["type"], "boolean");
         assert_eq!(generator.builtin_type_to_schema("bytes")["type"], "string");
         assert_eq!(generator.builtin_type_to_schema("bytes")["format"], "byte");
+    }
+
+    #[test]
+    fn timestamp_maps_to_date_time_string() {
+        let generator = OpenApiGenerator::new(&create_test_config());
+        let schema = generator.builtin_type_to_schema("timestamp");
+        assert_eq!(schema["type"], "string");
+        assert_eq!(schema["format"], "date-time");
+    }
+
+    #[test]
+    fn decimal_maps_to_decimal_string() {
+        let generator = OpenApiGenerator::new(&create_test_config());
+        let schema = generator.builtin_type_to_schema("decimal");
+        assert_eq!(schema["type"], "string");
+        assert_eq!(schema["format"], "decimal");
+    }
+
+    /// Build a single-rule spec whose rule is a `TypeDef` of `type_expr`, then
+    /// return the parsed schema generated for it. Keeps the constraint tests
+    /// focused on the schema rather than spec boilerplate.
+    fn schema_for_type(type_expr: CsilTypeExpression, config: &GeneratorConfig) -> Value {
+        let spec = spec_from_rules(vec![CsilRule {
+            name: "T".to_string(),
+            rule_type: CsilRuleType::TypeDef(type_expr),
+            position: create_test_position(),
+            doc_comments: Vec::new(),
+        }]);
+        let (result, _warnings) = generate_openapi_spec(&spec, config).unwrap();
+        let openapi_json: Value = serde_json::from_str(&result[0].content).unwrap();
+        openapi_json["components"]["schemas"]["T"].clone()
+    }
+
+    fn constrained(
+        base: CsilTypeExpression,
+        constraints: Vec<CsilControlOperator>,
+    ) -> CsilTypeExpression {
+        CsilTypeExpression::Constrained {
+            base_type: Box::new(base),
+            constraints,
+        }
+    }
+
+    #[test]
+    fn timestamp_and_decimal_appear_in_generated_schema() {
+        let config = create_test_config();
+        let ts = schema_for_type(
+            CsilTypeExpression::Builtin("timestamp".to_string()),
+            &config,
+        );
+        assert_eq!(ts["type"], "string");
+        assert_eq!(ts["format"], "date-time");
+
+        let dec = schema_for_type(CsilTypeExpression::Builtin("decimal".to_string()), &config);
+        assert_eq!(dec["type"], "string");
+        assert_eq!(dec["format"], "decimal");
+    }
+
+    #[test]
+    fn decimal_mapping_csil_and_library_are_accepted() {
+        for value in ["csil", "library"] {
+            let mut config = create_test_config();
+            config
+                .options
+                .insert("decimal_mapping".to_string(), json!(value));
+            // Both produce the identical schema — the option is a no-op for
+            // OpenAPI but must not error.
+            let dec = schema_for_type(CsilTypeExpression::Builtin("decimal".to_string()), &config);
+            assert_eq!(dec["format"], "decimal");
+        }
+    }
+
+    #[test]
+    fn decimal_mapping_unknown_value_is_hard_error() {
+        let mut config = create_test_config();
+        config
+            .options
+            .insert("decimal_mapping".to_string(), json!("bignum"));
+        let spec = spec_from_rules(vec![]);
+        let err = generate_openapi_spec(&spec, &config).unwrap_err();
+        assert!(format!("{err}").contains("decimal_mapping"));
+    }
+
+    #[test]
+    fn decimal_mapping_non_string_value_is_hard_error() {
+        let mut config = create_test_config();
+        config
+            .options
+            .insert("decimal_mapping".to_string(), json!(42));
+        let spec = spec_from_rules(vec![]);
+        assert!(generate_openapi_spec(&spec, &config).is_err());
+    }
+
+    #[test]
+    fn equal_operator_maps_to_const() {
+        let schema = schema_for_type(
+            constrained(
+                CsilTypeExpression::Builtin("text".to_string()),
+                vec![CsilControlOperator::Equal(CsilLiteralValue::Text(
+                    "fixed".to_string(),
+                ))],
+            ),
+            &create_test_config(),
+        );
+        assert_eq!(schema["const"], "fixed");
+    }
+
+    #[test]
+    fn not_equal_operator_maps_to_not_const() {
+        let schema = schema_for_type(
+            constrained(
+                CsilTypeExpression::Builtin("int".to_string()),
+                vec![CsilControlOperator::NotEqual(CsilLiteralValue::Integer(0))],
+            ),
+            &create_test_config(),
+        );
+        assert_eq!(schema["not"]["const"], 0);
+    }
+
+    #[test]
+    fn bits_operator_maps_to_extension() {
+        let schema = schema_for_type(
+            constrained(
+                CsilTypeExpression::Builtin("uint".to_string()),
+                vec![CsilControlOperator::Bits("flags".to_string())],
+            ),
+            &create_test_config(),
+        );
+        assert_eq!(schema["x-csil-bits"], "flags");
+    }
+
+    #[test]
+    fn and_operator_maps_to_all_of() {
+        let schema = schema_for_type(
+            constrained(
+                CsilTypeExpression::Builtin("text".to_string()),
+                vec![CsilControlOperator::And(Box::new(
+                    CsilTypeExpression::Reference("Other".to_string()),
+                ))],
+            ),
+            &create_test_config(),
+        );
+        let all_of = schema["allOf"].as_array().unwrap();
+        assert_eq!(all_of.len(), 2);
+        assert_eq!(all_of[0]["type"], "string");
+        assert_eq!(all_of[1]["$ref"], "#/components/schemas/Other");
+    }
+
+    #[test]
+    fn repeated_and_stays_flat_all_of() {
+        let schema = schema_for_type(
+            constrained(
+                CsilTypeExpression::Builtin("text".to_string()),
+                vec![
+                    CsilControlOperator::And(Box::new(CsilTypeExpression::Reference(
+                        "A".to_string(),
+                    ))),
+                    CsilControlOperator::And(Box::new(CsilTypeExpression::Reference(
+                        "B".to_string(),
+                    ))),
+                ],
+            ),
+            &create_test_config(),
+        );
+        let all_of = schema["allOf"].as_array().unwrap();
+        assert_eq!(all_of.len(), 3);
+        assert_eq!(all_of[1]["$ref"], "#/components/schemas/A");
+        assert_eq!(all_of[2]["$ref"], "#/components/schemas/B");
+    }
+
+    #[test]
+    fn within_operator_maps_to_extension() {
+        let schema = schema_for_type(
+            constrained(
+                CsilTypeExpression::Builtin("int".to_string()),
+                vec![CsilControlOperator::Within(Box::new(
+                    CsilTypeExpression::Reference("AllowedSet".to_string()),
+                ))],
+            ),
+            &create_test_config(),
+        );
+        assert_eq!(
+            schema["x-csil-within"]["$ref"],
+            "#/components/schemas/AllowedSet"
+        );
+    }
+
+    // The inner type of `.within`/`.and` must be run through the real
+    // type-expression converter, never `format!("{expr:?}")`. A Debug-format
+    // regression would emit a string like `Reference("X")` instead of a schema
+    // object, so assert both that the membership/intersection carry a real
+    // `$ref` schema object and that no Debug blob leaks into the output.
+    fn assert_no_debug_blob(schema: &Value) {
+        let serialized = schema.to_string();
+        assert!(
+            !serialized.contains("Reference("),
+            "schema leaked a Rust Debug blob instead of a real schema: {serialized}"
+        );
+    }
+
+    #[test]
+    fn within_emits_real_schema_not_debug_blob() {
+        let schema = schema_for_type(
+            constrained(
+                CsilTypeExpression::Builtin("int".to_string()),
+                vec![CsilControlOperator::Within(Box::new(
+                    CsilTypeExpression::Reference("SomeType".to_string()),
+                ))],
+            ),
+            &create_test_config(),
+        );
+        assert!(
+            schema["x-csil-within"].is_object(),
+            "x-csil-within must be a schema object, got {}",
+            schema["x-csil-within"]
+        );
+        assert_eq!(
+            schema["x-csil-within"]["$ref"],
+            "#/components/schemas/SomeType"
+        );
+        assert_no_debug_blob(&schema);
+    }
+
+    #[test]
+    fn and_emits_real_schema_not_debug_blob() {
+        let schema = schema_for_type(
+            constrained(
+                CsilTypeExpression::Builtin("text".to_string()),
+                vec![CsilControlOperator::And(Box::new(
+                    CsilTypeExpression::Reference("SomeType".to_string()),
+                ))],
+            ),
+            &create_test_config(),
+        );
+        let all_of = schema["allOf"].as_array().unwrap();
+        let member = all_of
+            .iter()
+            .find(|m| m.get("$ref").is_some())
+            .expect("an allOf member must carry the intersected type as a real $ref schema");
+        assert_eq!(member["$ref"], "#/components/schemas/SomeType");
+        assert_no_debug_blob(&schema);
+    }
+
+    // A `.ge`/`.le` bound on a string-typed `decimal` can be an Integer literal
+    // (the core guarantees no Float on decimal). It must render as its decimal
+    // string in the vendor extension, exactly like a text bound such as "0.00",
+    // never as a JSON number that would be invalid alongside a string instance.
+    #[test]
+    fn integer_decimal_bound_renders_as_decimal_string() {
+        let schema = schema_for_type(
+            constrained(
+                CsilTypeExpression::Builtin("decimal".to_string()),
+                vec![
+                    CsilControlOperator::GreaterEqual(CsilLiteralValue::Integer(0)),
+                    CsilControlOperator::LessEqual(CsilLiteralValue::Integer(100)),
+                ],
+            ),
+            &create_test_config(),
+        );
+        assert_eq!(schema["type"], "string");
+        assert_eq!(schema["format"], "decimal");
+        assert_eq!(schema["x-csil-minimum"], "0");
+        assert_eq!(schema["x-csil-maximum"], "100");
+        assert!(
+            schema.get("minimum").is_none() && schema.get("maximum").is_none(),
+            "an integer bound on a string-typed decimal must not become a numeric keyword: {schema}"
+        );
     }
 
     #[test]
@@ -1286,5 +1916,214 @@ mod tests {
         let op = &openapi["paths"]["/auth/login"]["post"];
         assert!(op.get("x-csil-direction").is_none());
         assert!(warnings.is_empty());
+    }
+
+    /// Build a tuple group expression from a list of value types, each as a
+    /// bare-keyed entry (keys are irrelevant to the array schema).
+    fn tuple_of(value_types: Vec<CsilTypeExpression>) -> CsilTypeExpression {
+        let entries = value_types
+            .into_iter()
+            .enumerate()
+            .map(|(i, value_type)| CsilGroupEntry {
+                key: Some(CsilGroupKey::Bare(format!("e{i}"))),
+                value_type,
+                occurrence: None,
+                metadata: Vec::new(),
+                doc_comments: Vec::new(),
+            })
+            .collect();
+        CsilTypeExpression::Tuple(CsilGroupExpression { entries })
+    }
+
+    #[test]
+    fn tuple_emits_length_pinned_array_with_oneof_items() {
+        let schema = schema_for_type(
+            tuple_of(vec![
+                CsilTypeExpression::Builtin("text".to_string()),
+                CsilTypeExpression::Builtin("int".to_string()),
+                CsilTypeExpression::Builtin("bool".to_string()),
+            ]),
+            &create_test_config(),
+        );
+        assert_eq!(schema["type"], "array");
+        assert_eq!(schema["minItems"], 3);
+        assert_eq!(schema["maxItems"], 3);
+        let one_of = schema["items"]["oneOf"].as_array().unwrap();
+        // Three distinct value types produce three union branches.
+        assert_eq!(one_of.len(), 3);
+        assert!(one_of.iter().any(|s| s["type"] == "string"));
+        assert!(one_of.iter().any(|s| s["type"] == "integer"));
+        assert!(one_of.iter().any(|s| s["type"] == "boolean"));
+    }
+
+    #[test]
+    fn tuple_collapses_duplicate_entry_types_to_single_items_schema() {
+        let schema = schema_for_type(
+            tuple_of(vec![
+                CsilTypeExpression::Builtin("text".to_string()),
+                CsilTypeExpression::Builtin("text".to_string()),
+            ]),
+            &create_test_config(),
+        );
+        assert_eq!(schema["minItems"], 2);
+        assert_eq!(schema["maxItems"], 2);
+        // One distinct type means no pointless single-branch `oneOf`.
+        assert!(schema["items"].get("oneOf").is_none());
+        assert_eq!(schema["items"]["type"], "string");
+    }
+
+    #[test]
+    fn empty_tuple_emits_zero_length_array() {
+        let schema = schema_for_type(tuple_of(vec![]), &create_test_config());
+        assert_eq!(schema["type"], "array");
+        assert_eq!(schema["minItems"], 0);
+        assert_eq!(schema["maxItems"], 0);
+        // An empty tuple's items schema is unconstrained, never an invalid
+        // empty `oneOf`.
+        assert!(schema["items"].get("oneOf").is_none());
+    }
+
+    #[test]
+    fn keyed_tuple_uses_entry_value_types() {
+        // `[tag: text, value: any]` — keys don't affect the array schema, only
+        // the value types do.
+        let schema = schema_for_type(
+            tuple_of(vec![
+                CsilTypeExpression::Builtin("text".to_string()),
+                CsilTypeExpression::Builtin("any".to_string()),
+            ]),
+            &create_test_config(),
+        );
+        assert_eq!(schema["type"], "array");
+        assert_eq!(schema["minItems"], 2);
+        let one_of = schema["items"]["oneOf"].as_array().unwrap();
+        // `any` is the empty schema, distinct from the `text` branch.
+        assert_eq!(one_of.len(), 2);
+        assert!(one_of.iter().any(|s| s["type"] == "string"));
+    }
+
+    fn field_with_depends_expr(condition: CsilDependsCondition) -> Value {
+        let spec = spec_from_rules(vec![CsilRule {
+            name: "Form".to_string(),
+            rule_type: CsilRuleType::GroupDef(CsilGroupExpression {
+                entries: vec![CsilGroupEntry {
+                    key: Some(CsilGroupKey::Bare("field".to_string())),
+                    value_type: CsilTypeExpression::Builtin("text".to_string()),
+                    occurrence: Some(CsilOccurrence::Optional),
+                    metadata: vec![CsilFieldMetadata::DependsOnExpr(condition)],
+                    doc_comments: Vec::new(),
+                }],
+            }),
+            position: create_test_position(),
+            doc_comments: Vec::new(),
+        }]);
+        let (result, _warnings) = generate_openapi_spec(&spec, &create_test_config()).unwrap();
+        let openapi: Value = serde_json::from_str(&result[0].content).unwrap();
+        openapi["components"]["schemas"]["Form"]["properties"]["field"].clone()
+    }
+
+    #[test]
+    fn depends_on_expr_compare_renders_in_description() {
+        let field = field_with_depends_expr(CsilDependsCondition::Compare {
+            field: "status".to_string(),
+            op: Some(CsilDependsCompareOp::Eq),
+            value: Some(CsilLiteralValue::Text("active".to_string())),
+        });
+        assert_eq!(field["description"], "Depends on: status == 'active'");
+    }
+
+    #[test]
+    fn depends_on_expr_presence_renders_in_description() {
+        let field = field_with_depends_expr(CsilDependsCondition::Compare {
+            field: "token".to_string(),
+            op: None,
+            value: None,
+        });
+        assert_eq!(field["description"], "Depends on: token is present");
+    }
+
+    #[test]
+    fn depends_on_expr_all_and_any_render_readable_tree() {
+        let field = field_with_depends_expr(CsilDependsCondition::All(vec![
+            CsilDependsCondition::Compare {
+                field: "kind".to_string(),
+                op: Some(CsilDependsCompareOp::Eq),
+                value: Some(CsilLiteralValue::Text("paid".to_string())),
+            },
+            CsilDependsCondition::Any(vec![
+                CsilDependsCondition::Compare {
+                    field: "amount".to_string(),
+                    op: Some(CsilDependsCompareOp::Gt),
+                    value: Some(CsilLiteralValue::Integer(0)),
+                },
+                CsilDependsCondition::Compare {
+                    field: "waived".to_string(),
+                    op: None,
+                    value: None,
+                },
+            ]),
+        ]));
+        // " and "/" or " joiners with the nested compound parenthesized.
+        assert_eq!(
+            field["description"],
+            "Depends on: kind == 'paid' and (amount > 0 or waived is present)"
+        );
+    }
+
+    #[test]
+    fn push_only_null_input_op_omits_request_body() {
+        let spec = spec_from_rules(vec![CsilRule {
+            name: "Events".to_string(),
+            rule_type: CsilRuleType::ServiceDef(CsilServiceDefinition {
+                operations: vec![CsilServiceOperation {
+                    name: "ping".to_string(),
+                    input_type: CsilTypeExpression::Builtin("null".to_string()),
+                    output_type: CsilTypeExpression::Builtin("text".to_string()),
+                    direction: CsilServiceDirection::Reverse,
+                    position: create_test_position(),
+                    doc_comments: Vec::new(),
+                }],
+            }),
+            position: create_test_position(),
+            doc_comments: Vec::new(),
+        }]);
+
+        let (result, _warnings) = generate_openapi_spec(&spec, &create_test_config()).unwrap();
+        let openapi: Value = serde_json::from_str(&result[0].content).unwrap();
+
+        // A `null`-input (push-only) op carries no request body rather than a
+        // required `null`-typed one, yet still describes its response.
+        let op = &openapi["paths"]["/events/ping"]["get"];
+        assert!(op.is_object());
+        assert!(op.get("requestBody").is_none());
+        assert!(op["responses"]["200"].is_object());
+    }
+
+    #[test]
+    fn non_null_input_op_still_has_required_request_body() {
+        let spec = spec_from_rules(vec![CsilRule {
+            name: "Auth".to_string(),
+            rule_type: CsilRuleType::ServiceDef(CsilServiceDefinition {
+                operations: vec![CsilServiceOperation {
+                    name: "login".to_string(),
+                    input_type: CsilTypeExpression::Builtin("text".to_string()),
+                    output_type: CsilTypeExpression::Builtin("text".to_string()),
+                    direction: CsilServiceDirection::Unidirectional,
+                    position: create_test_position(),
+                    doc_comments: Vec::new(),
+                }],
+            }),
+            position: create_test_position(),
+            doc_comments: Vec::new(),
+        }]);
+
+        let (result, _warnings) = generate_openapi_spec(&spec, &create_test_config()).unwrap();
+        let openapi: Value = serde_json::from_str(&result[0].content).unwrap();
+        let op = &openapi["paths"]["/auth/login"]["post"];
+        assert_eq!(op["requestBody"]["required"], true);
+        assert_eq!(
+            op["requestBody"]["content"]["application/json"]["schema"]["type"],
+            "string"
+        );
     }
 }

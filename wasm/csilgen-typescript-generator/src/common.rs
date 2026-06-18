@@ -1,8 +1,9 @@
 //! Shared helpers for the TypeScript emitters (types / client / server).
 
 use csilgen_common::{
-    CsilOccurrence, CsilRuleType, CsilServiceDefinition, CsilServiceDirection,
-    CsilServiceOperation, CsilSpecSerialized, CsilTypeExpression, WasmGeneratorInput,
+    CsilGroupExpression, CsilGroupKey, CsilOccurrence, CsilRule, CsilRuleType,
+    CsilServiceDefinition, CsilServiceDirection, CsilServiceOperation, CsilSpecSerialized,
+    CsilTypeExpression, WasmGeneratorInput,
 };
 use std::collections::BTreeSet;
 
@@ -36,6 +37,36 @@ pub fn bidi_transport(input: &WasmGeneratorInput) -> Result<BidiTransport, Strin
             None => Err(format!(
                 "ts_bidirectional_transport must be a string, got {v:?}"
             )),
+        },
+    }
+}
+
+/// In-memory mapping for the `decimal` core type. The wire form (CBOR tag 4)
+/// is identical either way — this only selects the generated TypeScript type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DecimalMapping {
+    /// Emit a self-contained `CsilDecimal` helper. Pulls in no third-party
+    /// dependency, so it is the default and works in any toolchain. Default.
+    Csil,
+    /// Use `Decimal` from `decimal.js`. The consumer must install that package;
+    /// the generated `types.gen.ts` carries the `import` that requires it.
+    Library,
+}
+
+/// Read & validate `decimal_mapping` from the CSIL options block. Mirrors
+/// `bidi_transport`: any value other than `csil`/`library` is rejected at
+/// generation time so misconfiguration fails loudly instead of silently
+/// emitting the wrong in-memory type.
+pub fn decimal_mapping(input: &WasmGeneratorInput) -> Result<DecimalMapping, String> {
+    match input.config.options.get("decimal_mapping") {
+        None => Ok(DecimalMapping::Csil),
+        Some(v) => match v.as_str() {
+            Some("csil") => Ok(DecimalMapping::Csil),
+            Some("library") => Ok(DecimalMapping::Library),
+            Some(other) => Err(format!(
+                "decimal_mapping must be \"csil\" or \"library\", got {other:?}"
+            )),
+            None => Err(format!("decimal_mapping must be a string, got {v:?}")),
         },
     }
 }
@@ -92,20 +123,30 @@ pub fn sorted_services(spec: &CsilSpecSerialized) -> Vec<(&str, &CsilServiceDefi
     services
 }
 
-/// Map a CSIL type expression to a TypeScript type string.
-pub fn ts_type(type_expr: &CsilTypeExpression) -> String {
+/// Map a CSIL type expression to a TypeScript type string. `mapping` selects the
+/// in-memory type for `decimal` (it is threaded everywhere so an inline `decimal`
+/// in an operation signature maps the same way a `decimal` struct field does).
+pub fn ts_type(type_expr: &CsilTypeExpression, mapping: DecimalMapping) -> String {
     match type_expr {
-        CsilTypeExpression::Builtin(name) => builtin(name),
+        CsilTypeExpression::Builtin(name) => builtin(name, mapping),
         CsilTypeExpression::Reference(name) => to_pascal(name),
-        CsilTypeExpression::Array { element_type, .. } => format!("{}[]", ts_type(element_type)),
-        CsilTypeExpression::Map { value, .. } => format!("Record<string, {}>", ts_type(value)),
-        CsilTypeExpression::Choice(choices) => {
-            choices.iter().map(ts_type).collect::<Vec<_>>().join(" | ")
+        CsilTypeExpression::Array { element_type, .. } => {
+            format!("{}[]", ts_type(element_type, mapping))
         }
+        CsilTypeExpression::Map { value, .. } => {
+            format!("Record<string, {}>", ts_type(value, mapping))
+        }
+        CsilTypeExpression::Choice(choices) => choices
+            .iter()
+            .map(|c| ts_type(c, mapping))
+            .collect::<Vec<_>>()
+            .join(" | "),
         CsilTypeExpression::Range { .. } => "number".to_string(),
         // Constrained types reduce to their base type in TypeScript
-        CsilTypeExpression::Constrained { base_type, .. } => ts_type(base_type),
+        CsilTypeExpression::Constrained { base_type, .. } => ts_type(base_type, mapping),
         CsilTypeExpression::Socket(name) | CsilTypeExpression::Plug(name) => to_pascal(name),
+        // A fixed-shape array maps to a TS tuple type.
+        CsilTypeExpression::Tuple(group) => tuple_type(group, mapping),
         // Inline groups and bare literals are uncommon in operation signatures;
         // fall back to a permissive type so output still compiles.
         CsilTypeExpression::Group(_) => "object".to_string(),
@@ -113,19 +154,139 @@ pub fn ts_type(type_expr: &CsilTypeExpression) -> String {
     }
 }
 
-fn builtin(name: &str) -> String {
+/// Map a fixed-shape array (`[text, int]` / `[tag: text, value: any]`) to a
+/// TypeScript tuple. When every entry carries a `Bare` key the result is a
+/// labeled tuple so the shape stays self-documenting; otherwise it is positional.
+/// TS requires *all* members labeled or none, so a mixed group falls back to
+/// positional rather than emit an invalid `[a: T, T]`.
+///
+/// An optional entry may use the `?` suffix only when every element after it is
+/// also optional — TS1257 forbids a required element following an optional one.
+/// A non-trailing optional element is therefore rendered as a required slot that
+/// admits `undefined` (`T | undefined`) so `[note?: text, id: int]` stays valid.
+fn tuple_type(group: &CsilGroupExpression, mapping: DecimalMapping) -> String {
+    let entries = &group.entries;
+    let all_labeled = !entries.is_empty()
+        && entries
+            .iter()
+            .all(|e| matches!(e.key, Some(CsilGroupKey::Bare(_))));
+    let elems: Vec<String> = entries
+        .iter()
+        .enumerate()
+        .map(|(i, e)| {
+            let ty = ts_type(&e.value_type, mapping);
+            let optional = is_optional(&e.occurrence);
+            // `?` is only legal when nothing required follows; otherwise keep the
+            // slot required but let it accept `undefined`.
+            let trailing_optional =
+                optional && entries[i + 1..].iter().all(|e| is_optional(&e.occurrence));
+            match (all_labeled, &e.key) {
+                (true, Some(CsilGroupKey::Bare(label))) => {
+                    let label = to_camel(label);
+                    if trailing_optional {
+                        format!("{label}?: {ty}")
+                    } else if optional {
+                        format!("{label}: {ty} | undefined")
+                    } else {
+                        format!("{label}: {ty}")
+                    }
+                }
+                _ => {
+                    if trailing_optional {
+                        format!("{ty}?")
+                    } else if optional {
+                        format!("{ty} | undefined")
+                    } else {
+                        ty
+                    }
+                }
+            }
+        })
+        .collect();
+    format!("[{}]", elems.join(", "))
+}
+
+fn builtin(name: &str, mapping: DecimalMapping) -> String {
     match name {
-        "text" | "string" => "string",
+        "text" | "string" => "string".to_string(),
         "int" | "uint" | "integer" | "float" | "float16" | "float32" | "float64" | "number" => {
-            "number"
+            "number".to_string()
         }
-        "bool" | "boolean" => "boolean",
-        "bytes" => "Uint8Array",
-        "null" => "null",
-        "any" => "any",
-        _ => "unknown",
+        "bool" | "boolean" => "boolean".to_string(),
+        "bytes" => "Uint8Array".to_string(),
+        // `timestamp` is CBOR tag 0 on the wire; in TS it is a UTC-based Date.
+        "timestamp" => "Date".to_string(),
+        // `decimal` is CBOR tag 4 on the wire; the in-memory type is selectable.
+        "decimal" => match mapping {
+            DecimalMapping::Csil => "CsilDecimal".to_string(),
+            DecimalMapping::Library => "Decimal".to_string(),
+        },
+        "null" => "null".to_string(),
+        "any" => "any".to_string(),
+        _ => "unknown".to_string(),
     }
-    .to_string()
+}
+
+/// Does the spec use the `decimal` core type anywhere (so the generator must
+/// inject the `CsilDecimal` helper or the `decimal.js` import)? Walks every rule
+/// and nested type position.
+pub fn spec_uses_decimal(spec: &CsilSpecSerialized) -> bool {
+    spec.rules.iter().any(rule_uses_decimal)
+}
+
+fn rule_uses_decimal(rule: &CsilRule) -> bool {
+    match &rule.rule_type {
+        CsilRuleType::TypeDef(t) => type_uses_decimal(t),
+        CsilRuleType::TypeChoice(choices) => choices.iter().any(type_uses_decimal),
+        CsilRuleType::GroupDef(g) => group_uses_decimal(g),
+        CsilRuleType::GroupChoice(groups) => groups.iter().any(group_uses_decimal),
+        CsilRuleType::ServiceDef(def) => def
+            .operations
+            .iter()
+            .any(|op| type_uses_decimal(&op.input_type) || type_uses_decimal(&op.output_type)),
+    }
+}
+
+fn group_uses_decimal(group: &CsilGroupExpression) -> bool {
+    group
+        .entries
+        .iter()
+        .any(|e| type_uses_decimal(&e.value_type))
+}
+
+fn type_uses_decimal(type_expr: &CsilTypeExpression) -> bool {
+    match type_expr {
+        CsilTypeExpression::Builtin(name) => name == "decimal",
+        CsilTypeExpression::Array { element_type, .. } => type_uses_decimal(element_type),
+        CsilTypeExpression::Map { key, value, .. } => {
+            type_uses_decimal(key) || type_uses_decimal(value)
+        }
+        CsilTypeExpression::Choice(choices) => choices.iter().any(type_uses_decimal),
+        CsilTypeExpression::Constrained { base_type, .. } => type_uses_decimal(base_type),
+        CsilTypeExpression::Group(group) | CsilTypeExpression::Tuple(group) => {
+            group_uses_decimal(group)
+        }
+        CsilTypeExpression::Reference(_)
+        | CsilTypeExpression::Range { .. }
+        | CsilTypeExpression::Socket(_)
+        | CsilTypeExpression::Plug(_)
+        | CsilTypeExpression::Literal(_) => false,
+    }
+}
+
+/// Whether any operation signature across these services places a `decimal`
+/// inline (directly, not behind a named `Reference`). Such an inline `decimal`
+/// makes `ts_type` emit `CsilDecimal`/`Decimal` straight into client.gen.ts /
+/// server.gen.ts, yet `collect_type_refs` only yields named refs and never a
+/// builtin, so without this the file would reference an undefined identifier.
+/// Output types are reduced to their success form first to match the signatures
+/// the emitters actually print.
+pub fn services_use_decimal_inline(services: &[(&str, &CsilServiceDefinition)]) -> bool {
+    services.iter().any(|(_, def)| {
+        def.operations.iter().any(|op| {
+            type_uses_decimal(&op.input_type) || type_uses_decimal(&success_type(&op.output_type))
+        })
+    })
 }
 
 /// Collect every user-defined type name referenced by a type expression.
@@ -147,7 +308,7 @@ pub fn collect_type_refs(type_expr: &CsilTypeExpression, out: &mut BTreeSet<Stri
             }
         }
         CsilTypeExpression::Constrained { base_type, .. } => collect_type_refs(base_type, out),
-        CsilTypeExpression::Group(group) => {
+        CsilTypeExpression::Group(group) | CsilTypeExpression::Tuple(group) => {
             for entry in &group.entries {
                 collect_type_refs(&entry.value_type, out);
             }
@@ -262,11 +423,25 @@ pub fn jsdoc(doc_comments: &[String], extra: &[String], indent: &str) -> String 
     }
     let mut out = format!("{indent}/**\n");
     for line in doc_comments {
-        out.push_str(&format!("{indent} * {line}\n"));
+        out.push_str(&format!("{indent} * {}\n", sanitize_block_comment(line)));
     }
     for line in extra {
-        out.push_str(&format!("{indent} * {line}\n"));
+        out.push_str(&format!("{indent} * {}\n", sanitize_block_comment(line)));
     }
     out.push_str(&format!("{indent} */\n"));
     out
+}
+
+/// Neutralize any `*/` inside text bound for a `/** ... */` block. A value
+/// rendered verbatim into a JSDoc note (e.g. a `@depends-on` string literal
+/// carrying `*/`) would otherwise close the comment early and break the source.
+pub fn sanitize_block_comment(line: &str) -> String {
+    line.replace("*/", "*\\/")
+}
+
+/// True when a type is the `null` builtin. A push op (`-> Event` / `<- Event`)
+/// has a `null` input: there is no request body, so the request parameter is
+/// omitted rather than typed `null`.
+pub fn is_null_type(type_expr: &CsilTypeExpression) -> bool {
+    matches!(type_expr, CsilTypeExpression::Builtin(name) if name == "null")
 }
