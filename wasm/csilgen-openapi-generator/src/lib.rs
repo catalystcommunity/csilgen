@@ -163,6 +163,23 @@ impl OpenApiGenerator {
         services: &[(String, &CsilServiceDefinition)],
         type_definitions: &HashMap<String, CsilTypeExpression>,
     ) -> Result<()> {
+        // Purely additive: a service carrying `@wire-id(N)` surfaces its ordinal
+        // as an OpenAPI tag (the service-level object) with the `x-csil-wire-id`
+        // vendor extension. Wire-id-free specs emit no `tags` and stay unchanged.
+        for (service_name, service_def) in services {
+            if let Some(wire_id) = service_def.wire_id {
+                let tags = openapi_spec
+                    .as_object_mut()
+                    .unwrap()
+                    .entry("tags")
+                    .or_insert_with(|| json!([]));
+                tags.as_array_mut().unwrap().push(json!({
+                    "name": service_name,
+                    "x-csil-wire-id": wire_id,
+                }));
+            }
+        }
+
         let paths = openapi_spec.get_mut("paths").unwrap();
 
         for (service_name, service_def) in services {
@@ -265,6 +282,9 @@ impl OpenApiGenerator {
         }
         if let Some(direction_label) = csil_direction {
             operation_spec["x-csil-direction"] = json!(direction_label);
+        }
+        if let Some(wire_id) = operation.wire_id {
+            operation_spec["x-csil-wire-id"] = json!(wire_id);
         }
 
         if paths.get(&path).is_none() {
@@ -1096,6 +1116,7 @@ mod tests {
                             direction: CsilServiceDirection::Unidirectional,
                             position: create_test_position(),
                             doc_comments: Vec::new(),
+                            wire_id: None,
                         },
                         CsilServiceOperation {
                             name: "get_user".to_string(),
@@ -1104,8 +1125,10 @@ mod tests {
                             direction: CsilServiceDirection::Unidirectional,
                             position: create_test_position(),
                             doc_comments: Vec::new(),
+                            wire_id: None,
                         },
                     ],
+                    wire_id: None,
                 }),
                 position: create_test_position(),
                 doc_comments: Vec::new(),
@@ -1431,7 +1454,9 @@ mod tests {
                     direction: CsilServiceDirection::Bidirectional,
                     position: create_test_position(),
                     doc_comments: Vec::new(),
+                    wire_id: None,
                 }],
+                wire_id: None,
             }),
             position: create_test_position(),
             doc_comments: Vec::new(),
@@ -1458,7 +1483,9 @@ mod tests {
                     direction: CsilServiceDirection::Reverse,
                     position: create_test_position(),
                     doc_comments: Vec::new(),
+                    wire_id: None,
                 }],
+                wire_id: None,
             }),
             position: create_test_position(),
             doc_comments: Vec::new(),
@@ -1488,7 +1515,9 @@ mod tests {
                     direction: CsilServiceDirection::Unidirectional,
                     position: create_test_position(),
                     doc_comments: Vec::new(),
+                    wire_id: None,
                 }],
+                wire_id: None,
             }),
             position: create_test_position(),
             doc_comments: Vec::new(),
@@ -1836,7 +1865,9 @@ mod tests {
                     direction: CsilServiceDirection::Bidirectional,
                     position: create_test_position(),
                     doc_comments: Vec::new(),
+                    wire_id: None,
                 }],
+                wire_id: None,
             }),
             position: create_test_position(),
             doc_comments: Vec::new(),
@@ -1871,7 +1902,9 @@ mod tests {
                     direction: CsilServiceDirection::Reverse,
                     position: create_test_position(),
                     doc_comments: Vec::new(),
+                    wire_id: None,
                 }],
+                wire_id: None,
             }),
             position: create_test_position(),
             doc_comments: Vec::new(),
@@ -1903,7 +1936,9 @@ mod tests {
                     direction: CsilServiceDirection::Unidirectional,
                     position: create_test_position(),
                     doc_comments: Vec::new(),
+                    wire_id: None,
                 }],
+                wire_id: None,
             }),
             position: create_test_position(),
             doc_comments: Vec::new(),
@@ -2082,7 +2117,9 @@ mod tests {
                     direction: CsilServiceDirection::Reverse,
                     position: create_test_position(),
                     doc_comments: Vec::new(),
+                    wire_id: None,
                 }],
+                wire_id: None,
             }),
             position: create_test_position(),
             doc_comments: Vec::new(),
@@ -2111,7 +2148,9 @@ mod tests {
                     direction: CsilServiceDirection::Unidirectional,
                     position: create_test_position(),
                     doc_comments: Vec::new(),
+                    wire_id: None,
                 }],
+                wire_id: None,
             }),
             position: create_test_position(),
             doc_comments: Vec::new(),
@@ -2124,6 +2163,59 @@ mod tests {
         assert_eq!(
             op["requestBody"]["content"]["application/json"]["schema"]["type"],
             "string"
+        );
+    }
+
+    fn wire_id_spec(service_wire: Option<u64>, op_wire: Option<u64>) -> CsilSpecSerialized {
+        spec_from_rules(vec![CsilRule {
+            name: "OrderService".to_string(),
+            rule_type: CsilRuleType::ServiceDef(CsilServiceDefinition {
+                operations: vec![CsilServiceOperation {
+                    name: "place_order".to_string(),
+                    input_type: CsilTypeExpression::Builtin("text".to_string()),
+                    output_type: CsilTypeExpression::Builtin("text".to_string()),
+                    direction: CsilServiceDirection::Unidirectional,
+                    position: create_test_position(),
+                    doc_comments: Vec::new(),
+                    wire_id: op_wire,
+                }],
+                wire_id: service_wire,
+            }),
+            position: create_test_position(),
+            doc_comments: Vec::new(),
+        }])
+    }
+
+    #[test]
+    fn wire_ids_emitted_as_vendor_extension_when_present() {
+        let spec = wire_id_spec(Some(3), Some(7));
+        let (result, _warnings) = generate_openapi_spec(&spec, &create_test_config()).unwrap();
+        let openapi: Value = serde_json::from_str(&result[0].content).unwrap();
+
+        // Operation ordinal on the per-operation object.
+        let op = &openapi["paths"]["/orderservice/place_order"]["post"];
+        assert_eq!(op["x-csil-wire-id"], json!(7));
+
+        // Service ordinal on the service-level object (an OpenAPI tag).
+        let tags = openapi["tags"].as_array().expect("tags array");
+        let tag = tags
+            .iter()
+            .find(|t| t["name"] == json!("OrderService"))
+            .expect("OrderService tag");
+        assert_eq!(tag["x-csil-wire-id"], json!(3));
+    }
+
+    #[test]
+    fn wire_ids_absent_when_unset() {
+        let spec = wire_id_spec(None, None);
+        let (result, _warnings) = generate_openapi_spec(&spec, &create_test_config()).unwrap();
+        assert!(
+            !result[0].content.contains("x-csil-wire-id"),
+            "no wire-id extension when service has no wire-id"
+        );
+        assert!(
+            !result[0].content.contains("\"tags\""),
+            "no tags emitted when no service carries a wire-id"
         );
     }
 }

@@ -1,0 +1,100 @@
+{
+  "vectors": [
+    {
+      "description": "A verbose event on a single-service connection (no service key).",
+      "hex": "a2656576656e746463686174677061796c6f6164d81841a0",
+      "input": {
+        "event": "chat",
+        "id": null,
+        "payload_hex": "a0",
+        "profile": "verbose",
+        "service": null
+      },
+      "name": "verbose_single_service"
+    },
+    {
+      "description": "A verbose, multi-service, correlated event.",
+      "hex": "a4626964182a656576656e746a726f6f6d2d7374617465677061796c6f6164d81841a0677365727669636565576f726c64",
+      "input": {
+        "event": "room-state",
+        "id": 42,
+        "payload_hex": "a0",
+        "profile": "verbose",
+        "service": "World"
+      },
+      "name": "verbose_multi_service_correlated"
+    },
+    {
+      "description": "A compact 3-element event [service_ord, op_ord, payload].",
+      "hex": "830100d81841a0",
+      "input": {
+        "id": null,
+        "op_ord": 0,
+        "payload_hex": "a0",
+        "profile": "compact",
+        "service_ord": 1
+      },
+      "name": "compact_fire_and_forget"
+    },
+    {
+      "description": "A compact 4-element event [service_ord, op_ord, id, payload].",
+      "hex": "840102182ad81841a0",
+      "input": {
+        "id": 42,
+        "op_ord": 2,
+        "payload_hex": "a0",
+        "profile": "compact",
+        "service_ord": 1
+      },
+      "name": "compact_correlated"
+    },
+    {
+      "description": "A $hello control payload.",
+      "hex": "a3677365727669636565576f726c646870726f66696c65738267636f6d7061637467766572626f73656876657273696f6e738101",
+      "input": {
+        "auth": null,
+        "control": "hello",
+        "profiles": [
+          "compact",
+          "verbose"
+        ],
+        "service": "World",
+        "versions": [
+          1
+        ]
+      },
+      "name": "control_hello"
+    },
+    {
+      "description": "A $hello-ack selecting the compact profile.",
+      "hex": "a36176016770726f66696c6567636f6d706163746773657373696f6e627331",
+      "input": {
+        "control": "hello_ack",
+        "profile": "compact",
+        "session": "s1",
+        "v": 1
+      },
+      "name": "control_hello_ack"
+    },
+    {
+      "description": "A $ping heartbeat.",
+      "hex": "a1656e6f6e636509",
+      "input": {
+        "at": null,
+        "control": "ping",
+        "nonce": 9
+      },
+      "name": "control_ping"
+    },
+    {
+      "description": "A $close with a transport status.",
+      "hex": "a266726561736f6e6562616420766673746174757305",
+      "input": {
+        "control": "close",
+        "reason": "bad v",
+        "status": 5
+      },
+      "name": "control_close"
+    }
+  ]
+}

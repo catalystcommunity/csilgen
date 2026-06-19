@@ -750,6 +750,17 @@ name = "csilgen-simple-test"
 version = "0.1.0"
 
 [[package]]
+name = "csilgen-transport"
+version = "0.1.0"
+dependencies = [
+ "ciborium",
+ "ciborium-io",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "csilgen-typescript-generator"
 version = "0.1.0"
 dependencies = [

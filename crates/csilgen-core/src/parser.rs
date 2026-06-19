@@ -143,13 +143,33 @@ impl Parser {
 
     fn parse_rule(&mut self) -> Result<Rule, ParseError> {
         // Capture docs that precede the rule before inner skips accumulate more
-        let doc_comments = self.take_pending_docs();
+        let mut doc_comments = self.take_pending_docs();
+
+        // Leading `@`-annotations (e.g. `@wire-id(1)`) before a rule attach to a
+        // service definition; they are not meaningful on other rule kinds.
+        let leading_metadata = self.parse_metadata_annotations()?;
+
+        // A `;;;` doc comment placed *between* the annotation(s) and the rule
+        // keyword is swept into pending_docs by the annotation loop's whitespace
+        // skipping; reclaim it so it attaches to this rule rather than leaking
+        // onto the next one.
+        doc_comments.extend(self.take_pending_docs());
 
         // Check for service definitions first
         if self.check(&TokenType::Service) {
             let mut rule = self.parse_service_rule()?;
             rule.doc_comments = doc_comments;
+            if let RuleType::ServiceDef(def) = &mut rule.rule_type {
+                def.metadata = leading_metadata;
+            }
             return Ok(rule);
+        }
+
+        if !leading_metadata.is_empty() {
+            return Err(ParseError::MetadataError {
+                message: "annotations here are only supported on service definitions and their operations".to_string(),
+                token: self.peek().clone(),
+            });
         }
 
         let identifier_token = self.consume_identifier()?;
@@ -1226,7 +1246,11 @@ impl Parser {
 
         self.consume_token(&TokenType::RightBrace)?;
 
-        let service_def = ServiceDefinition { operations };
+        let service_def = ServiceDefinition {
+            operations,
+            // Filled in by parse_rule from annotations preceding the `service` keyword.
+            metadata: Vec::new(),
+        };
         let rule_type = RuleType::ServiceDef(service_def);
 
         Ok(Rule {
@@ -1239,7 +1263,11 @@ impl Parser {
     }
 
     fn parse_service_operation(&mut self) -> Result<ServiceOperation, ParseError> {
-        let doc_comments = self.take_pending_docs();
+        let mut doc_comments = self.take_pending_docs();
+        let metadata = self.parse_metadata_annotations()?;
+        // Reclaim a doc comment placed between the annotation(s) and the operation
+        // name so it attaches here instead of leaking onto the next operation.
+        doc_comments.extend(self.take_pending_docs());
         let name_token = self.consume_identifier()?;
         let name = match &name_token.token_type {
             TokenType::Identifier(name) => name.clone(),
@@ -1315,6 +1343,7 @@ impl Parser {
             direction,
             position,
             doc_comments,
+            metadata,
         })
     }
 
@@ -2296,6 +2325,94 @@ mod tests {
             }
             Err(e) => panic!("Parse failed: {e}"),
         }
+    }
+
+    #[test]
+    fn test_parse_wire_id_on_service_and_operations() {
+        let input = r#"
+        @wire-id(1)
+        service Attestation {
+          @wire-id(0)
+          deposit-claim: DepositClaimRequest -> DepositClaimResponse,
+          @wire-id(1)
+          revoke-claim: RevokeClaimRequest -> RevokeClaimResponse
+        }
+        "#;
+        let spec = parse_csil(input).expect("parse should succeed");
+        let rule = &spec.rules[0];
+        match &rule.rule_type {
+            RuleType::ServiceDef(service) => {
+                assert_eq!(service.wire_id(), Some(1));
+                assert_eq!(service.operations[0].wire_id(), Some(0));
+                assert_eq!(service.operations[1].wire_id(), Some(1));
+            }
+            _ => panic!("Expected service definition"),
+        }
+    }
+
+    #[test]
+    fn test_parse_wire_id_absent_is_none() {
+        let input = r#"
+        service Plain {
+          ping: Empty -> Pong
+        }
+        "#;
+        let spec = parse_csil(input).expect("parse should succeed");
+        if let RuleType::ServiceDef(service) = &spec.rules[0].rule_type {
+            assert_eq!(service.wire_id(), None);
+            assert_eq!(service.operations[0].wire_id(), None);
+        } else {
+            panic!("Expected service definition");
+        }
+    }
+
+    #[test]
+    fn test_parse_wire_id_with_doc_comment_order() {
+        // `;;;` doc comment precedes the `@wire-id` annotation, which precedes the rule.
+        let input = r#"
+        ;;; The attestation service.
+        @wire-id(3)
+        service Attestation {
+          ;;; Deposit a claim.
+          @wire-id(0)
+          deposit-claim: Req -> Res
+        }
+        "#;
+        let spec = parse_csil(input).expect("parse should succeed");
+        let rule = &spec.rules[0];
+        assert_eq!(
+            rule.doc_comments,
+            vec!["The attestation service.".to_string()]
+        );
+        if let RuleType::ServiceDef(service) = &rule.rule_type {
+            assert_eq!(service.wire_id(), Some(3));
+            let op = &service.operations[0];
+            assert_eq!(op.doc_comments, vec!["Deposit a claim.".to_string()]);
+            assert_eq!(op.wire_id(), Some(0));
+        } else {
+            panic!("Expected service definition");
+        }
+    }
+
+    #[test]
+    fn test_parse_doc_between_annotation_and_rule_attaches_here() {
+        // Doc comment placed AFTER the annotation must attach to this service, not
+        // leak onto the next rule.
+        let input = "@wire-id(1)\n;;; The service doc.\nservice A {\n@wire-id(0)\nfoo: X -> Y\n}\nBar = int\n";
+        let spec = parse_csil(input).expect("parse should succeed");
+        let svc_rule = &spec.rules[0];
+        assert_eq!(svc_rule.name, "A");
+        assert_eq!(svc_rule.doc_comments, vec!["The service doc.".to_string()]);
+        // The trailing `Bar = int` rule must NOT have inherited the service's doc.
+        let bar_rule = spec.rules.iter().find(|r| r.name == "Bar").unwrap();
+        assert!(bar_rule.doc_comments.is_empty(), "doc leaked to next rule");
+    }
+
+    #[test]
+    fn test_parse_annotation_before_type_rule_is_error() {
+        // Annotations are only meaningful on services/operations, not other rules.
+        let input = "@wire-id(1)\nFoo = int\n";
+        assert!(parse_csil(input).is_err());
     }
 
     #[test]

@@ -510,6 +510,9 @@ impl PythonGenerator {
                             prelude_emitted = true;
                         }
                         services_code.push_str(&self.generate_client_class(&rule.name, service)?);
+                        if let Some(wire_ids) = Self::generate_wire_ids(&rule.name, service) {
+                            services_code.push_str(&wire_ids);
+                        }
                     }
                     Surface::Server => {
                         if !prelude_emitted {
@@ -519,6 +522,9 @@ impl PythonGenerator {
                         }
                         services_code
                             .push_str(&self.generate_service_artifacts(&rule.name, service)?);
+                        if let Some(wire_ids) = Self::generate_wire_ids(&rule.name, service) {
+                            services_code.push_str(&wire_ids);
+                        }
                     }
                 },
             }
@@ -1532,6 +1538,28 @@ impl PythonGenerator {
         out
     }
 
+    /// Emit a `<SERVICE>_WIRE_IDS` dict exposing the `@wire-id(N)` ordinals so a
+    /// host can reference them instead of hardcoding. Purely additive: returns
+    /// `None` unless the service carries a wire-id, so wire-id-free output is
+    /// byte-identical.
+    fn generate_wire_ids(name: &str, service: &CsilServiceDefinition) -> Option<String> {
+        let service_id = service.wire_id?;
+        let const_name = format!("{}_WIRE_IDS", name.to_case(Case::ScreamingSnake));
+        let mut out = format!("{const_name}: dict[str, object] = {{\n");
+        out.push_str(&format!("    \"service\": {service_id},\n"));
+        // Operations nest under `"ops"` so an op named `service` keys into
+        // `["ops"]["service"]` and can never overwrite the `"service"` ordinal.
+        out.push_str("    \"ops\": {\n");
+        for op in &service.operations {
+            if let Some(op_id) = op.wire_id {
+                out.push_str(&format!("        \"{}\": {op_id},\n", op.name));
+            }
+        }
+        out.push_str("    },\n");
+        out.push_str("}\n\n");
+        Some(out)
+    }
+
     /// Emit a typed client class for one service: one method per unary operation
     /// that delegates to the `Transport`, returning the typed success response.
     fn generate_client_class(&self, name: &str, service: &CsilServiceDefinition) -> Result<String> {
@@ -2114,7 +2142,9 @@ mod tests {
                         direction: CsilServiceDirection::Unidirectional,
                         position: create_test_position(),
                         doc_comments: Vec::new(),
+                        wire_id: None,
                     }],
+                    wire_id: None,
                 }),
                 position: create_test_position(),
                 doc_comments: Vec::new(),
@@ -2161,6 +2191,7 @@ mod tests {
                             direction: CsilServiceDirection::Unidirectional,
                             position: create_test_position(),
                             doc_comments: Vec::new(),
+                            wire_id: None,
                         },
                         CsilServiceOperation {
                             name: "play".to_string(),
@@ -2169,8 +2200,10 @@ mod tests {
                             direction: CsilServiceDirection::Bidirectional,
                             position: create_test_position(),
                             doc_comments: vec!["Open a play channel.".to_string()],
+                            wire_id: None,
                         },
                     ],
+                    wire_id: None,
                 }),
                 position: create_test_position(),
                 doc_comments: Vec::new(),
@@ -2230,7 +2263,9 @@ mod tests {
                         direction: CsilServiceDirection::Reverse,
                         position: create_test_position(),
                         doc_comments: Vec::new(),
+                        wire_id: None,
                     }],
+                    wire_id: None,
                 }),
                 position: create_test_position(),
                 doc_comments: Vec::new(),
@@ -2498,6 +2533,7 @@ mod tests {
                     name: "UserService".to_string(),
                     rule_type: CsilRuleType::ServiceDef(CsilServiceDefinition {
                         operations: vec![],
+                        wire_id: None,
                     }),
                     position: create_test_position(),
                     doc_comments: Vec::new(),
@@ -2582,7 +2618,9 @@ mod tests {
                         direction: CsilServiceDirection::Unidirectional,
                         position: create_test_position(),
                         doc_comments: Vec::new(),
+                        wire_id: None,
                     }],
+                    wire_id: None,
                 }),
                 position: create_test_position(),
                 doc_comments: Vec::new(),
@@ -3566,7 +3604,9 @@ mod tests {
                             direction: CsilServiceDirection::Unidirectional,
                             position: create_test_position(),
                             doc_comments: Vec::new(),
+                            wire_id: None,
                         }],
+                        wire_id: None,
                     }),
                     position: create_test_position(),
                     doc_comments: Vec::new(),
@@ -3610,5 +3650,119 @@ mod tests {
         );
         // The transport receives `None` as the payload, not a bound `req`.
         assert!(client_src.contains("\"ping\", \"Heartbeat\", None)"));
+    }
+
+    fn wire_id_service(service_wire: Option<u64>, op_wire: Option<u64>) -> CsilSpecSerialized {
+        CsilSpecSerialized {
+            rules: vec![CsilRule {
+                name: "OrderService".to_string(),
+                rule_type: CsilRuleType::ServiceDef(CsilServiceDefinition {
+                    operations: vec![
+                        CsilServiceOperation {
+                            name: "place-order".to_string(),
+                            input_type: CsilTypeExpression::Builtin("text".to_string()),
+                            output_type: CsilTypeExpression::Builtin("text".to_string()),
+                            direction: CsilServiceDirection::Unidirectional,
+                            position: create_test_position(),
+                            doc_comments: Vec::new(),
+                            wire_id: op_wire,
+                        },
+                        CsilServiceOperation {
+                            name: "cancel-order".to_string(),
+                            input_type: CsilTypeExpression::Builtin("text".to_string()),
+                            output_type: CsilTypeExpression::Builtin("text".to_string()),
+                            direction: CsilServiceDirection::Unidirectional,
+                            position: create_test_position(),
+                            doc_comments: Vec::new(),
+                            wire_id: None,
+                        },
+                    ],
+                    wire_id: service_wire,
+                }),
+                position: create_test_position(),
+                doc_comments: Vec::new(),
+            }],
+            source_content: None,
+            service_count: 1,
+            fields_with_metadata_count: 0,
+        }
+    }
+
+    #[test]
+    fn wire_ids_emitted_when_present() {
+        let spec = wire_id_service(Some(3), Some(7));
+        let result =
+            generate_python_code_from_serialized(&spec, &create_test_config(false)).unwrap();
+        let content = &result
+            .iter()
+            .find(|f| f.path == "services.py")
+            .unwrap()
+            .content;
+        assert!(
+            content.contains("ORDER_SERVICE_WIRE_IDS: dict[str, object] = {"),
+            "expected wire-ids dict, got:\n{content}"
+        );
+        assert!(
+            content.contains("\"service\": 3,"),
+            "expected service ordinal, got:\n{content}"
+        );
+        assert!(
+            content.contains("\"ops\": {"),
+            "expected nested ops dict, got:\n{content}"
+        );
+        assert!(
+            content.contains("\"place-order\": 7,"),
+            "expected operation ordinal, got:\n{content}"
+        );
+        // Operation without a wire-id contributes no entry.
+        assert!(
+            !content.contains("\"cancel-order\":"),
+            "operation without wire-id must not appear, got:\n{content}"
+        );
+    }
+
+    #[test]
+    fn wire_ids_op_named_service_does_not_collide() {
+        let mut spec = wire_id_service(Some(3), Some(7));
+        if let CsilRuleType::ServiceDef(service) = &mut spec.rules[0].rule_type {
+            service.operations[0].name = "service".to_string();
+        }
+        let result =
+            generate_python_code_from_serialized(&spec, &create_test_config(false)).unwrap();
+        let content = &result
+            .iter()
+            .find(|f| f.path == "services.py")
+            .unwrap()
+            .content;
+        // The op named `service` nests under `"ops"`, so the top-level
+        // `"service"` ordinal key is never overwritten.
+        assert!(
+            content.contains("\"service\": 3,"),
+            "expected service ordinal, got:\n{content}"
+        );
+        assert!(
+            content.contains("\"ops\": {"),
+            "expected nested ops dict, got:\n{content}"
+        );
+        assert!(
+            content.contains("\"service\": 7,"),
+            "expected nested op ordinal, got:\n{content}"
+        );
+    }
+
+    #[test]
+    fn wire_ids_absent_when_unset() {
+        let spec = wire_id_service(None, None);
+        let result =
+            generate_python_code_from_serialized(&spec, &create_test_config(false)).unwrap();
+        let content = &result
+            .iter()
+            .find(|f| f.path == "services.py")
+            .unwrap()
+            .content;
+        assert!(
+            !content.contains("WIRE_IDS"),
+            "no wire-id output when service has no wire-id, got:\n{content}"
+        );
     }
 }

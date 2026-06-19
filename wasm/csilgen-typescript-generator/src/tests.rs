@@ -91,6 +91,7 @@ fn op_with_direction(
         direction,
         position: pos(),
         doc_comments: docs,
+        wire_id: None,
     }
 }
 
@@ -102,6 +103,7 @@ fn op(name: &str, input: &str, output: &str, docs: Vec<String>) -> CsilServiceOp
         direction: CsilServiceDirection::Unidirectional,
         position: pos(),
         doc_comments: docs,
+        wire_id: None,
     }
 }
 
@@ -151,6 +153,7 @@ fn sample_spec() -> CsilSpecSerialized {
                     "ListMembersResponse",
                     vec!["List all members of a house.".to_string()],
                 )],
+                wire_id: None,
             }),
             position: pos(),
             doc_comments: vec![],
@@ -164,6 +167,7 @@ fn sample_spec() -> CsilSpecSerialized {
                     "LoginResponse",
                     vec!["Authenticate a caller.".to_string()],
                 )],
+                wire_id: None,
             }),
             position: pos(),
             doc_comments: vec!["The auth service.".to_string()],
@@ -451,6 +455,7 @@ fn channel_spec() -> CsilSpecSerialized {
                     vec![],
                 ),
             ],
+            wire_id: None,
         }),
         position: pos(),
         doc_comments: vec![],
@@ -775,7 +780,9 @@ fn decimal_in_operation_signature_maps_with_mapping() {
                 direction: CsilServiceDirection::Unidirectional,
                 position: pos(),
                 doc_comments: vec![],
+                wire_id: None,
             }],
+            wire_id: None,
         }),
         position: pos(),
         doc_comments: vec![],
@@ -1101,7 +1108,9 @@ fn decimal_op_spec() -> CsilSpecSerialized {
                 direction: CsilServiceDirection::Unidirectional,
                 position: pos(),
                 doc_comments: vec![],
+                wire_id: None,
             }],
+            wire_id: None,
         }),
         position: pos(),
         doc_comments: vec![],
@@ -1506,7 +1515,9 @@ fn unidirectional_op_with_null_input_omits_request_param() {
                 direction: CsilServiceDirection::Unidirectional,
                 position: pos(),
                 doc_comments: vec![],
+                wire_id: None,
             }],
+            wire_id: None,
         }),
         position: pos(),
         doc_comments: vec![],
@@ -1557,7 +1568,9 @@ fn push_only_reverse_op_with_null_input_emits_cleanly() {
                 direction: CsilServiceDirection::Reverse,
                 position: pos(),
                 doc_comments: vec![],
+                wire_id: None,
             }],
+            wire_id: None,
         }),
         position: pos(),
         doc_comments: vec![],
@@ -1608,4 +1621,103 @@ fn push_only_reverse_op_with_null_input_emits_cleanly() {
         "got: {server_rpc}"
     );
     assert!(!server_rpc.contains("req: null"));
+}
+
+fn wire_id_spec() -> CsilSpecSerialized {
+    let mut rules = vec![
+        group_rule("Order", vec![field("id", builtin("text"), false)], vec![]),
+        group_rule("Receipt", vec![field("id", builtin("text"), false)], vec![]),
+    ];
+    let mut place = op("place-order", "Order", "Receipt", vec![]);
+    place.wire_id = Some(7);
+    let cancel = op("cancel-order", "Order", "Receipt", vec![]);
+    rules.push(CsilRule {
+        name: "OrderService".to_string(),
+        rule_type: CsilRuleType::ServiceDef(CsilServiceDefinition {
+            operations: vec![place, cancel],
+            wire_id: Some(3),
+        }),
+        position: pos(),
+        doc_comments: vec![],
+    });
+    CsilSpecSerialized {
+        rules,
+        source_content: None,
+        service_count: 1,
+        fields_with_metadata_count: 0,
+    }
+}
+
+#[test]
+fn wire_ids_const_emitted_when_present() {
+    let server = file(
+        &generate_files(&input_with_spec("typescript-server", wire_id_spec())).expect("generate"),
+        "server.gen.ts",
+    )
+    .to_string();
+    assert!(
+        server.contains("export const OrderWireIds = {"),
+        "expected wire-ids const, got: {server}"
+    );
+    assert!(
+        server.contains("service: 3,"),
+        "expected service ordinal, got: {server}"
+    );
+    assert!(
+        server.contains("ops: {"),
+        "expected nested ops object, got: {server}"
+    );
+    assert!(
+        server.contains("placeOrder: 7,"),
+        "expected operation ordinal, got: {server}"
+    );
+    assert!(
+        server.contains("} as const;"),
+        "expected `as const`, got: {server}"
+    );
+    // Operation without a wire-id contributes no key.
+    assert!(
+        !server.contains("cancelOrder:"),
+        "operation without wire-id must not appear, got: {server}"
+    );
+}
+
+#[test]
+fn wire_ids_op_named_service_does_not_collide() {
+    let mut spec = wire_id_spec();
+    if let CsilRuleType::ServiceDef(service) = &mut spec.rules.last_mut().unwrap().rule_type {
+        service.operations[0].name = "service".to_string();
+    }
+    let server = file(
+        &generate_files(&input_with_spec("typescript-server", spec)).expect("generate"),
+        "server.gen.ts",
+    )
+    .to_string();
+    // The op named `service` nests under `ops`, so the top-level `service`
+    // ordinal key is never overwritten.
+    assert!(
+        server.contains("service: 3,"),
+        "expected service ordinal, got: {server}"
+    );
+    assert!(
+        server.contains("ops: {"),
+        "expected nested ops object, got: {server}"
+    );
+    assert!(
+        server.contains("service: 7,"),
+        "expected nested op ordinal, got: {server}"
+    );
+}
+
+#[test]
+fn wire_ids_const_absent_when_unset() {
+    let server = file(
+        &generate_files(&input_for("typescript-server")).expect("generate"),
+        "server.gen.ts",
+    )
+    .to_string();
+    assert!(
+        !server.contains("WireIds"),
+        "no wire-id output when services have no wire-id, got: {server}"
+    );
 }

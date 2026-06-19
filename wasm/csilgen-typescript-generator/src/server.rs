@@ -83,6 +83,10 @@ pub fn generate(input: &WasmGeneratorInput) -> Result<String, String> {
     for (name, def) in &services {
         out.push_str(&handlers_interface(name, def, mode, mapping));
         out.push('\n');
+        if let Some(consts) = wire_ids_const(name, def) {
+            out.push_str(&consts);
+            out.push('\n');
+        }
         if mode == BidiTransport::Connection && common::service_has_channel_ops(def) {
             out.push_str(&channel_block(name, def, mapping));
             out.push('\n');
@@ -94,6 +98,28 @@ pub fn generate(input: &WasmGeneratorInput) -> Result<String, String> {
     out.push_str(&dispatch(&services, mode, mapping));
 
     Ok(out)
+}
+
+/// Emit a `XxxWireIds` const exposing the `@wire-id(N)` ordinals so a host can
+/// reference them instead of hardcoding. Purely additive: returns `None` unless
+/// the service carries a wire-id, keeping wire-id-free output byte-identical.
+fn wire_ids_const(name: &str, def: &CsilServiceDefinition) -> Option<String> {
+    let service_id = def.wire_id?;
+    let const_name = format!("{}WireIds", common::service_base(name));
+    let mut out = format!("export const {const_name} = {{\n");
+    out.push_str(&format!("  service: {service_id},\n"));
+    // Operations are nested under `ops` so an op named `service` keys into
+    // `ops.service` and can never overwrite the top-level `service` ordinal.
+    out.push_str("  ops: {\n");
+    for op in &def.operations {
+        if let Some(op_id) = op.wire_id {
+            let key = common::to_camel(&op.name);
+            out.push_str(&format!("    {key}: {op_id},\n"));
+        }
+    }
+    out.push_str("  },\n");
+    out.push_str("} as const;\n");
+    Some(out)
 }
 
 fn handlers_interface(

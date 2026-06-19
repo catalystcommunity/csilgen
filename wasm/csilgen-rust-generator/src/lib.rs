@@ -1012,6 +1012,13 @@ impl<'a> RustCodeGenerator<'a> {
                 content.push_str(&trait_code);
                 content.push_str("\n\n");
 
+                // Purely additive: only specs carrying `@wire-id(N)` ordinals get
+                // a `wire_ids` module, so wire-id-free specs stay byte-identical.
+                if let Some(wire_ids) = self.generate_wire_ids(&rule.name, service) {
+                    content.push_str(&wire_ids);
+                    content.push_str("\n\n");
+                }
+
                 if Self::service_has_channel_ops(service) {
                     content.push_str(&self.generate_service_router(&rule.name, service)?);
                     content.push('\n');
@@ -1256,6 +1263,32 @@ impl<'a> RustCodeGenerator<'a> {
 
         content.push('}');
         Ok(content)
+    }
+
+    /// Emit a `wire_ids` module exposing the `@wire-id(N)` ordinals as `u64`
+    /// constants so a host can reference them instead of hardcoding. Returns
+    /// `None` when the service carries no wire-id, keeping output unchanged for
+    /// every wire-id-free spec.
+    fn generate_wire_ids(&self, name: &str, service: &CsilServiceDefinition) -> Option<String> {
+        let service_id = service.wire_id?;
+        let mod_name = format!("{}_wire_ids", self.to_snake_case(name));
+        let mut content = String::new();
+        content.push_str(&format!(
+            "/// Wire-id ordinals for the {name} service (transport compact profiles).\n"
+        ));
+        content.push_str(&format!("pub mod {mod_name} {{\n"));
+        content.push_str(&format!("    pub const SERVICE: u64 = {service_id};\n"));
+        for operation in &service.operations {
+            if let Some(op_id) = operation.wire_id {
+                // Prefix operation constants with `OP_` so an op literally named
+                // `service` emits `OP_SERVICE` rather than colliding with the
+                // `SERVICE` service ordinal (which would fail to compile).
+                let const_name = self.to_snake_case(&operation.name).to_ascii_uppercase();
+                content.push_str(&format!("    pub const OP_{const_name}: u64 = {op_id};\n"));
+            }
+        }
+        content.push('}');
+        Some(content)
     }
 
     fn write_op_doc(content: &mut String, op: &CsilServiceOperation, fallback: &str) {
@@ -2299,7 +2332,9 @@ mod tests {
                         offset: 100,
                     },
                     doc_comments: Vec::new(),
+                    wire_id: None,
                 }],
+                wire_id: None,
             }),
             position: CsilPosition {
                 line: 4,
@@ -2346,7 +2381,9 @@ mod tests {
                         offset: 0,
                     },
                     doc_comments: Vec::new(),
+                    wire_id: None,
                 }],
+                wire_id: None,
             }),
             position: CsilPosition {
                 line: 1,
@@ -2489,6 +2526,7 @@ mod tests {
                             offset: 20,
                         },
                         doc_comments: Vec::new(),
+                        wire_id: None,
                     },
                     CsilServiceOperation {
                         name: "list-entries".to_string(),
@@ -2501,8 +2539,10 @@ mod tests {
                             offset: 40,
                         },
                         doc_comments: Vec::new(),
+                        wire_id: None,
                     },
                 ],
+                wire_id: None,
             }),
             position: CsilPosition {
                 line: 1,
@@ -2549,8 +2589,10 @@ mod tests {
                             offset: 0,
                         },
                         doc_comments: Vec::new(),
+                        wire_id: None,
                     })
                     .collect(),
+                wire_id: None,
             }),
             position: CsilPosition {
                 line: 1,
@@ -4285,7 +4327,9 @@ mod tests {
                         offset: 0,
                     },
                     doc_comments: Vec::new(),
+                    wire_id: None,
                 }],
+                wire_id: None,
             }),
             position: CsilPosition {
                 line: 1,
@@ -4327,6 +4371,113 @@ mod tests {
                 .content
                 .contains("self.transport.call(\"events\", \"Heartbeat\", &())"),
             "null-input client must send the empty `()` payload"
+        );
+    }
+
+    fn wire_id_service_input() -> WasmGeneratorInput {
+        let mut input = create_test_input();
+        input.csil_spec.rules.push(CsilRule {
+            name: "OrderService".to_string(),
+            rule_type: CsilRuleType::ServiceDef(CsilServiceDefinition {
+                operations: vec![
+                    CsilServiceOperation {
+                        name: "place-order".to_string(),
+                        input_type: CsilTypeExpression::Reference("Order".to_string()),
+                        output_type: CsilTypeExpression::Reference("Receipt".to_string()),
+                        direction: CsilServiceDirection::Unidirectional,
+                        position: CsilPosition {
+                            line: 1,
+                            column: 1,
+                            offset: 0,
+                        },
+                        doc_comments: Vec::new(),
+                        wire_id: Some(7),
+                    },
+                    CsilServiceOperation {
+                        name: "cancel-order".to_string(),
+                        input_type: CsilTypeExpression::Reference("Order".to_string()),
+                        output_type: CsilTypeExpression::Reference("Receipt".to_string()),
+                        direction: CsilServiceDirection::Unidirectional,
+                        position: CsilPosition {
+                            line: 1,
+                            column: 1,
+                            offset: 0,
+                        },
+                        doc_comments: Vec::new(),
+                        wire_id: None,
+                    },
+                ],
+                wire_id: Some(3),
+            }),
+            position: CsilPosition {
+                line: 1,
+                column: 1,
+                offset: 0,
+            },
+            doc_comments: Vec::new(),
+        });
+        input.csil_spec.service_count = 1;
+        input
+    }
+
+    #[test]
+    fn test_wire_ids_emitted_when_present() {
+        let input = wire_id_service_input();
+        let services = RustCodeGenerator::new(&input).generate_services().unwrap();
+        assert!(
+            services.contains("pub mod order_service_wire_ids {"),
+            "expected wire_ids module, got:\n{services}"
+        );
+        assert!(
+            services.contains("pub const SERVICE: u64 = 3;"),
+            "expected service ordinal, got:\n{services}"
+        );
+        assert!(
+            services.contains("pub const OP_PLACE_ORDER: u64 = 7;"),
+            "expected operation ordinal, got:\n{services}"
+        );
+        // Operations without a wire-id contribute no constant.
+        assert!(
+            !services.contains("CANCEL_ORDER"),
+            "operation without wire-id must not emit a constant"
+        );
+    }
+
+    #[test]
+    fn test_wire_id_op_named_service_does_not_collide() {
+        let mut input = wire_id_service_input();
+        if let CsilRuleType::ServiceDef(service) =
+            &mut input.csil_spec.rules.last_mut().unwrap().rule_type
+        {
+            service.operations[0].name = "service".to_string();
+        }
+        let services = RustCodeGenerator::new(&input).generate_services().unwrap();
+        // The op named `service` becomes OP_SERVICE, distinct from SERVICE.
+        assert!(
+            services.contains("pub const SERVICE: u64 = 3;"),
+            "expected service ordinal, got:\n{services}"
+        );
+        assert!(
+            services.contains("pub const OP_SERVICE: u64 = 7;"),
+            "expected op ordinal prefixed to avoid collision, got:\n{services}"
+        );
+    }
+
+    #[test]
+    fn test_wire_ids_absent_when_unset() {
+        let mut input = wire_id_service_input();
+        if let CsilRuleType::ServiceDef(service) =
+            &mut input.csil_spec.rules.last_mut().unwrap().rule_type
+        {
+            service.wire_id = None;
+            for op in &mut service.operations {
+                op.wire_id = None;
+            }
+        }
+        let services = RustCodeGenerator::new(&input).generate_services().unwrap();
+        assert!(
+            !services.contains("wire_ids"),
+            "no wire-id output when service has no wire-id, got:\n{services}"
         );
     }
 }

@@ -5,7 +5,10 @@
 pub mod dependency_report;
 
 use csilgen_common::GeneratorConfig;
-use csilgen_core::{CsilSpec, FileDependencyGraph, ImportResolver, LiteralValue, parse_csil_file};
+use csilgen_core::{
+    CsilSpec, FileDependencyGraph, ImportResolver, LiteralValue, parse_csil_file,
+    validate_spec_optimized,
+};
 use csilgen_wasm_generators::WasmGeneratorRuntime;
 use dependency_report::{
     report_circular_dependency_error, report_dependency_strategy, report_generation_summary,
@@ -171,6 +174,12 @@ fn process_single_file(
     // Parse the CSIL file with import resolution
     let spec = parse_csil_with_imports(input_file)?;
 
+    // Validate before generating: the generate path consumes contracts (e.g. the
+    // @wire-id ordinals) that only validation enforces, so skipping it would emit
+    // code from a spec `csilgen validate` would reject.
+    validate_spec_optimized(&spec)
+        .map_err(|e| format!("Validation failed for {}: {}", input_file.display(), e))?;
+
     // Update progress: generation phase
     if let Some(pb) = &progress_bar {
         pb.set_message(format!("Generating {target}"));
@@ -309,6 +318,13 @@ fn process_entry_points(
                 continue;
             }
         };
+
+        // Validate before generating (see process_single_file).
+        if let Err(e) = validate_spec_optimized(&spec) {
+            eprintln!("Validation failed for {}: {}", input_file.display(), e);
+            error_count += 1;
+            continue;
+        }
 
         // Update progress: generation phase
         if let Some(pb) = &progress_bar {

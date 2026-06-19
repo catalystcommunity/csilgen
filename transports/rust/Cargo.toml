@@ -1,0 +1,18 @@
+[package]
+name = "csilgen-transport"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "Reference implementation of the CSIL transport family (CSIL-RPC, CSIL-Events, CSIL-Datagrams): envelope codecs, connection lifecycle, and a bring-your-own-carrier seam for both client and server."
+
+[lib]
+# Plain library (not a generator); consumed by hosts alongside csilgen-generated types.
+
+[dependencies]
+ciborium = "0.2"
+ciborium-io = "0.2"
+serde = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

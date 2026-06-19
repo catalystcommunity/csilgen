@@ -356,7 +356,9 @@ mod tests {
                                 offset: 100,
                             },
                             doc_comments: Vec::new(),
+                            wire_id: None,
                         }],
+                        wire_id: None,
                     }),
                     position: CsilPosition {
                         line: 4,

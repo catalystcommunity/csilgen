@@ -339,6 +339,12 @@ impl<'a> JsonSchemaGenerator<'a> {
         );
         schema.insert("type".to_string(), Value::String("object".to_string()));
 
+        // Purely additive: the `@wire-id(N)` service ordinal surfaces as a vendor
+        // extension only when assigned, so wire-id-free schemas are unchanged.
+        if let Some(wire_id) = service.wire_id {
+            schema.insert("x-csil-wire-id".to_string(), Value::Number(wire_id.into()));
+        }
+
         let mut operations = Map::new();
         // Operations skipped because JSON Schema doesn't meaningfully describe
         // their persistent-channel semantics. We record them as a vendor
@@ -385,6 +391,9 @@ impl<'a> JsonSchemaGenerator<'a> {
                 "title".to_string(),
                 Value::String(format!("{} Operation", operation.name)),
             );
+            if let Some(wire_id) = operation.wire_id {
+                op_schema.insert("x-csil-wire-id".to_string(), Value::Number(wire_id.into()));
+            }
 
             let mut op_properties = Map::new();
 
@@ -1357,7 +1366,9 @@ mod tests {
                         offset: 100,
                     },
                     doc_comments: Vec::new(),
+                    wire_id: None,
                 }],
+                wire_id: None,
             }),
             position: CsilPosition {
                 line: 4,
@@ -1420,6 +1431,7 @@ mod tests {
                             offset: 0,
                         },
                         doc_comments: Vec::new(),
+                        wire_id: None,
                     },
                     CsilServiceOperation {
                         name: "subscribe".to_string(),
@@ -1432,6 +1444,7 @@ mod tests {
                             offset: 0,
                         },
                         doc_comments: Vec::new(),
+                        wire_id: None,
                     },
                     CsilServiceOperation {
                         name: "notify".to_string(),
@@ -1444,8 +1457,10 @@ mod tests {
                             offset: 0,
                         },
                         doc_comments: Vec::new(),
+                        wire_id: None,
                     },
                 ],
+                wire_id: None,
             }),
             position: CsilPosition {
                 line: 1,
@@ -1504,6 +1519,89 @@ mod tests {
         assert!(warning_text.contains("ChatService.notify"));
         assert!(warning_text.contains("bidirectional"));
         assert!(warning_text.contains("reverse"));
+    }
+
+    fn wire_id_service_input(
+        service_wire: Option<u64>,
+        op_wire: Option<u64>,
+    ) -> WasmGeneratorInput {
+        let mut input = create_test_input();
+        input.csil_spec.rules.push(CsilRule {
+            name: "OrderService".to_string(),
+            rule_type: CsilRuleType::ServiceDef(CsilServiceDefinition {
+                operations: vec![CsilServiceOperation {
+                    name: "place_order".to_string(),
+                    input_type: CsilTypeExpression::Reference("User".to_string()),
+                    output_type: CsilTypeExpression::Reference("User".to_string()),
+                    direction: CsilServiceDirection::Unidirectional,
+                    position: CsilPosition {
+                        line: 1,
+                        column: 1,
+                        offset: 0,
+                    },
+                    doc_comments: Vec::new(),
+                    wire_id: op_wire,
+                }],
+                wire_id: service_wire,
+            }),
+            position: CsilPosition {
+                line: 1,
+                column: 1,
+                offset: 0,
+            },
+            doc_comments: Vec::new(),
+        });
+        input.csil_spec.service_count = 1;
+        input
+    }
+
+    #[test]
+    fn wire_ids_emitted_as_vendor_extension_when_present() {
+        let input = wire_id_service_input(Some(3), Some(7));
+        let mut generator = JsonSchemaGenerator::new(&input);
+        let service = match &input.csil_spec.rules.last().unwrap().rule_type {
+            CsilRuleType::ServiceDef(s) => s,
+            _ => unreachable!(),
+        };
+        let schema = generator
+            .generate_service_schema(service, "OrderService")
+            .unwrap();
+        let obj = schema.as_object().expect("object");
+        assert_eq!(
+            obj.get("x-csil-wire-id").and_then(|v| v.as_u64()),
+            Some(3),
+            "expected service-level wire-id"
+        );
+        let op = obj
+            .get("properties")
+            .and_then(|v| v.as_object())
+            .and_then(|p| p.get("place_order"))
+            .and_then(|v| v.as_object())
+            .expect("operation schema");
+        assert_eq!(
+            op.get("x-csil-wire-id").and_then(|v| v.as_u64()),
+            Some(7),
+            "expected operation-level wire-id"
+        );
+    }
+
+    #[test]
+    fn wire_ids_absent_when_unset() {
+        let input = wire_id_service_input(None, None);
+        let mut generator = JsonSchemaGenerator::new(&input);
+        let service = match &input.csil_spec.rules.last().unwrap().rule_type {
+            CsilRuleType::ServiceDef(s) => s,
+            _ => unreachable!(),
+        };
+        let schema = generator
+            .generate_service_schema(service, "OrderService")
+            .unwrap();
+        assert!(
+            !serde_json::to_string(&schema)
+                .unwrap()
+                .contains("x-csil-wire-id"),
+            "no wire-id extension when service has no wire-id"
+        );
     }
 
     fn schema_for(type_expr: CsilTypeExpression) -> Map<String, Value> {
@@ -2129,7 +2227,9 @@ mod tests {
                         offset: 0,
                     },
                     doc_comments: Vec::new(),
+                    wire_id: None,
                 }],
+                wire_id: None,
             }),
             position: CsilPosition {
                 line: 1,

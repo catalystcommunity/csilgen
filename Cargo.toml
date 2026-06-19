@@ -14,6 +14,7 @@ members = [
     "wasm/csilgen-go-generator",
     "wasm/csilgen-python-generator",
     "wasm/csilgen-openapi-generator",
+    "transports/rust",
     "tools/xtask"
 ]
 

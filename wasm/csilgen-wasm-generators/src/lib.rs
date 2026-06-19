@@ -778,6 +778,7 @@ fn convert_service_definition(service_def: &ServiceDefinition) -> CsilServiceDef
             .iter()
             .map(convert_service_operation)
             .collect(),
+        wire_id: service_def.wire_id(),
     }
 }
 
@@ -789,6 +790,7 @@ fn convert_service_operation(operation: &ServiceOperation) -> CsilServiceOperati
         direction: convert_service_direction(&operation.direction),
         position: convert_position(&operation.position),
         doc_comments: operation.doc_comments.clone(),
+        wire_id: operation.wire_id(),
     }
 }
 
@@ -1303,7 +1305,9 @@ mod tests {
                                 offset: 100,
                             },
                             doc_comments: Vec::new(),
+                            metadata: Vec::new(),
                         }],
+                        metadata: Vec::new(),
                     }),
                     position: Position {
                         line: 4,
