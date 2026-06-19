@@ -987,6 +987,7 @@ fn generate_services(
     for rule in &input.csil_spec.rules {
         if let CsilRuleType::ServiceDef(service) = &rule.rule_type {
             emit_service_interface(&mut content, &rule.name, service, config);
+            emit_wire_ids(&mut content, &rule.name, service);
 
             if service_has_channel_ops(service) {
                 emit_channel_router(&mut content, &rule.name, service, config);
@@ -1059,6 +1060,34 @@ fn emit_service_interface(
     }
 
     content.push_str("}\n\n");
+}
+
+/// Emit `const` wire-id ordinals exposing the `@wire-id(N)` values so a host can
+/// reference them instead of hardcoding. Purely additive: emits nothing unless
+/// the service carries a wire-id, keeping wire-id-free output byte-identical.
+fn emit_wire_ids(content: &mut String, name: &str, service: &CsilServiceDefinition) {
+    let Some(service_id) = service.wire_id else {
+        return;
+    };
+    let prefix = pascal_case(name);
+    content.push_str(&format!(
+        "// Wire-id ordinals for the {name} service (transport compact profiles).\n"
+    ));
+    content.push_str(&format!(
+        "const {prefix}ServiceWireID uint64 = {service_id}\n"
+    ));
+    for operation in &service.operations {
+        if let Some(op_id) = operation.wire_id {
+            // The `Op` infix keeps operation ordinals distinct from the service
+            // ordinal: an op named `service` emits `<Service>OpServiceWireID`,
+            // never `<Service>ServiceWireID`, so the two can't redeclare a name.
+            let op_exported = go_method_name(&operation.name);
+            content.push_str(&format!(
+                "const {prefix}Op{op_exported}WireID uint64 = {op_id}\n"
+            ));
+        }
+    }
+    content.push('\n');
 }
 
 fn emit_channel_router(
@@ -2398,7 +2427,10 @@ mod tests {
             csil_spec: CsilSpecSerialized {
                 rules: vec![CsilRule {
                     name: name.to_string(),
-                    rule_type: CsilRuleType::ServiceDef(CsilServiceDefinition { operations: ops }),
+                    rule_type: CsilRuleType::ServiceDef(CsilServiceDefinition {
+                        operations: ops,
+                        wire_id: None,
+                    }),
                     position: CsilPosition {
                         line: 1,
                         column: 1,
@@ -2444,6 +2476,7 @@ mod tests {
                 offset: 0,
             },
             doc_comments: Vec::new(),
+            wire_id: None,
         }
     }
 
@@ -2562,6 +2595,7 @@ mod tests {
                 offset: 0,
             },
             doc_comments: Vec::new(),
+            wire_id: None,
         }
     }
 
@@ -3677,6 +3711,7 @@ mod tests {
                 offset: 0,
             },
             doc_comments: Vec::new(),
+            wire_id: None,
         };
         let input = input_with_service("ChatService", vec![push_op]);
         let config = GoConfig::from_options(&input.config.options).unwrap();
@@ -3743,6 +3778,7 @@ mod tests {
                 offset: 0,
             },
             doc_comments: Vec::new(),
+            wire_id: None,
         };
         let input = input_with_service("HealthService", vec![push_op]);
         let config = GoConfig::from_options(&input.config.options).unwrap();
@@ -3760,5 +3796,98 @@ mod tests {
         assert!(!client.contains("Ping(ctx context.Context, req"));
         // The transport still needs a payload arg; a null input passes nil.
         assert!(client.contains("c.transport.Call(ctx, \"health\", \"Ping\", nil, &resp)"));
+    }
+
+    fn wire_id_input() -> WasmGeneratorInput {
+        let mut place = make_op(
+            "place-order",
+            "Order",
+            "Receipt",
+            CsilServiceDirection::Unidirectional,
+        );
+        place.wire_id = Some(7);
+        let cancel = make_op(
+            "cancel-order",
+            "Order",
+            "Receipt",
+            CsilServiceDirection::Unidirectional,
+        );
+        let mut input = input_with_service("OrderService", vec![place, cancel]);
+        if let CsilRuleType::ServiceDef(service) = &mut input.csil_spec.rules[0].rule_type {
+            service.wire_id = Some(3);
+        }
+        input
+    }
+
+    #[test]
+    fn wire_ids_emitted_when_present() {
+        let input = wire_id_input();
+        let config = GoConfig::from_options(&input.config.options).unwrap();
+        let services = super::generate_services(&input, &config, &mut Vec::new())
+            .unwrap()
+            .expect("services emitted");
+        assert!(
+            services.contains("const OrderServiceServiceWireID uint64 = 3"),
+            "expected service ordinal const, got:\n{services}"
+        );
+        assert!(
+            services.contains("const OrderServiceOpPlaceOrderWireID uint64 = 7"),
+            "expected operation ordinal const, got:\n{services}"
+        );
+        // Operation without a wire-id contributes no const.
+        assert!(
+            !services.contains("CancelOrderWireID"),
+            "operation without wire-id must not emit a const"
+        );
+    }
+
+    #[test]
+    fn wire_id_op_named_service_does_not_collide() {
+        let mut place = make_op(
+            "service",
+            "Order",
+            "Receipt",
+            CsilServiceDirection::Unidirectional,
+        );
+        place.wire_id = Some(7);
+        let mut input = input_with_service("OrderService", vec![place]);
+        if let CsilRuleType::ServiceDef(service) = &mut input.csil_spec.rules[0].rule_type {
+            service.wire_id = Some(3);
+        }
+        let config = GoConfig::from_options(&input.config.options).unwrap();
+        let services = super::generate_services(&input, &config, &mut Vec::new())
+            .unwrap()
+            .expect("services emitted");
+        // Op `service` becomes OrderServiceOpServiceWireID, distinct from the
+        // service const OrderServiceServiceWireID, so Go won't redeclare a name.
+        assert!(
+            services.contains("const OrderServiceServiceWireID uint64 = 3"),
+            "expected service ordinal const, got:\n{services}"
+        );
+        assert!(
+            services.contains("const OrderServiceOpServiceWireID uint64 = 7"),
+            "expected distinct op ordinal const, got:\n{services}"
+        );
+    }
+
+    #[test]
+    fn wire_ids_absent_when_unset() {
+        let input = input_with_service(
+            "OrderService",
+            vec![make_op(
+                "place-order",
+                "Order",
+                "Receipt",
+                CsilServiceDirection::Unidirectional,
+            )],
+        );
+        let config = GoConfig::from_options(&input.config.options).unwrap();
+        let services = super::generate_services(&input, &config, &mut Vec::new())
+            .unwrap()
+            .expect("services emitted");
+        assert!(
+            !services.contains("WireID"),
+            "no wire-id output when service has no wire-id, got:\n{services}"
+        );
     }
 }

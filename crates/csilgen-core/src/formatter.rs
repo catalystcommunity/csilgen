@@ -72,10 +72,23 @@ pub fn format_spec(spec: &CsilSpec, config: &FormatConfig) -> Result<String> {
                 }
             }
             crate::ast::RuleType::ServiceDef(service) => {
+                // Service-level annotations (e.g. @wire-id) precede the keyword, each
+                // on its own line, so they survive a format round-trip.
+                for meta in &service.metadata {
+                    format_field_metadata(meta, &mut output);
+                    output.push('\n');
+                }
                 output.push_str(&format!("service {} {{", rule.name));
                 if !service.operations.is_empty() {
                     output.push('\n');
                     for operation in &service.operations {
+                        for meta in &operation.metadata {
+                            for _ in 0..config.indent_size {
+                                output.push(' ');
+                            }
+                            format_field_metadata(meta, &mut output);
+                            output.push('\n');
+                        }
                         for _ in 0..config.indent_size {
                             output.push(' ');
                         }
@@ -853,6 +866,7 @@ mod tests {
                         direction: crate::ast::ServiceDirection::Unidirectional,
                         position: crate::lexer::Position::new(1, 1, 0),
                         doc_comments: Vec::new(),
+                        metadata: Vec::new(),
                     },
                     crate::ast::ServiceOperation {
                         name: "stream_updates".to_string(),
@@ -861,8 +875,10 @@ mod tests {
                         direction: crate::ast::ServiceDirection::Bidirectional,
                         position: crate::lexer::Position::new(2, 1, 0),
                         doc_comments: Vec::new(),
+                        metadata: Vec::new(),
                     },
                 ],
+                metadata: Vec::new(),
             }),
         )]);
         let config = FormatConfig::default();
@@ -1140,5 +1156,29 @@ mod tests {
         let result = format_spec(&spec, &config).unwrap();
         let expected = "CompactData = bytes .size (10..1000) .cbor\n";
         assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn test_format_preserves_wire_id() {
+        // @wire-id is part of the wire contract; a format round-trip must not drop it.
+        let src = "@wire-id(1)\nservice A {\n@wire-id(0)\nfoo: X -> Y\n}\n";
+        let spec = crate::parser::parse_csil(src).unwrap();
+        let formatted = format_spec(&spec, &FormatConfig::default()).unwrap();
+        assert!(
+            formatted.contains("@wire-id(1)"),
+            "service id missing: {formatted}"
+        );
+        assert!(
+            formatted.contains("@wire-id(0)"),
+            "op id missing: {formatted}"
+        );
+        // Reparse and confirm the ordinals survived.
+        let reparsed = crate::parser::parse_csil(&formatted).unwrap();
+        if let RuleType::ServiceDef(svc) = &reparsed.rules[0].rule_type {
+            assert_eq!(svc.wire_id(), Some(1));
+            assert_eq!(svc.operations[0].wire_id(), Some(0));
+        } else {
+            panic!("expected service");
+        }
     }
 }

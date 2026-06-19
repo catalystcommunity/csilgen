@@ -221,6 +221,16 @@ pub enum GroupKey {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServiceDefinition {
     pub operations: Vec<ServiceOperation>,
+    /// Annotations preceding the `service` keyword (e.g. `@wire-id`)
+    #[serde(default)]
+    pub metadata: Vec<FieldMetadata>,
+}
+
+impl ServiceDefinition {
+    /// The `@wire-id(N)` service ordinal, if assigned.
+    pub fn wire_id(&self) -> Option<u64> {
+        wire_id_of(&self.metadata)
+    }
 }
 
 /// A service operation definition
@@ -234,6 +244,58 @@ pub struct ServiceOperation {
     /// Documentation comments (;;;) preceding this operation
     #[serde(default)]
     pub doc_comments: Vec<String>,
+    /// Annotations preceding this operation (e.g. `@wire-id`)
+    #[serde(default)]
+    pub metadata: Vec<FieldMetadata>,
+}
+
+impl ServiceOperation {
+    /// The `@wire-id(N)` operation ordinal, if assigned.
+    pub fn wire_id(&self) -> Option<u64> {
+        wire_id_of(&self.metadata)
+    }
+}
+
+/// How a `@wire-id` annotation resolved on a service or operation. This is the
+/// single source of truth shared by the validator (which reports `Invalid`) and
+/// by `wire_id()` (used by the WASM-boundary conversion and breaking-change
+/// detection), so the two can never disagree about what a given annotation means.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WireIdState {
+    /// No `@wire-id` annotation present.
+    Absent,
+    /// Present and valid.
+    Valid(u64),
+    /// Present but the argument was missing, negative, non-integer, or there was
+    /// more than one argument.
+    Invalid,
+}
+
+/// Resolve the `@wire-id` annotation (if any) from a metadata list, distinguishing
+/// absent from malformed. The argument must be exactly one non-negative integer.
+pub fn wire_id_state(metadata: &[FieldMetadata]) -> WireIdState {
+    for m in metadata {
+        if let FieldMetadata::Custom { name, parameters } = m
+            && name == "wire-id"
+        {
+            return match parameters.first().map(|p| &p.value) {
+                Some(LiteralValue::Integer(n)) if *n >= 0 && parameters.len() == 1 => {
+                    WireIdState::Valid(*n as u64)
+                }
+                _ => WireIdState::Invalid,
+            };
+        }
+    }
+    WireIdState::Absent
+}
+
+/// The resolved ordinal, or `None` when absent **or malformed**. Callers that need
+/// to distinguish the two (the validator) use [`wire_id_state`] directly.
+fn wire_id_of(metadata: &[FieldMetadata]) -> Option<u64> {
+    match wire_id_state(metadata) {
+        WireIdState::Valid(n) => Some(n),
+        WireIdState::Absent | WireIdState::Invalid => None,
+    }
 }
 
 /// Direction of service operation

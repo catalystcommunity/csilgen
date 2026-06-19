@@ -70,6 +70,12 @@ pub enum BreakingChange {
         field_name: String,
         change_description: String,
     },
+    /// A service's `@wire-id` ordinal changed, was added, or was removed
+    ServiceWireIdChanged {
+        service_name: String,
+        old_wire_id: Option<u64>,
+        new_wire_id: Option<u64>,
+    },
 }
 
 /// Result of breaking change analysis
@@ -279,6 +285,16 @@ fn compare_service_definitions(
     old_service: &ServiceDefinition,
     new_service: &ServiceDefinition,
 ) {
+    // A service's wire-id ordinal is part of the transport contract; changing,
+    // adding, or removing it shifts the compact-profile wire.
+    if old_service.wire_id() != new_service.wire_id() {
+        breaking_changes.push(BreakingChange::ServiceWireIdChanged {
+            service_name: service_name.to_string(),
+            old_wire_id: old_service.wire_id(),
+            new_wire_id: new_service.wire_id(),
+        });
+    }
+
     // Build operation maps
     let old_ops: HashMap<_, _> = old_service
         .operations
@@ -365,6 +381,19 @@ fn compare_service_operations(
             change_description: format!(
                 "Direction changed from {:?} to {:?}",
                 old_op.direction, new_op.direction
+            ),
+        });
+    }
+
+    // The operation's @wire-id ordinal is part of the transport contract.
+    if old_op.wire_id() != new_op.wire_id() {
+        breaking_changes.push(BreakingChange::ServiceOperationSignatureChanged {
+            service_name: service_name.to_string(),
+            operation_name: old_op.name.clone(),
+            change_description: format!(
+                "@wire-id changed from {:?} to {:?}",
+                old_op.wire_id(),
+                new_op.wire_id()
             ),
         });
     }
@@ -835,6 +864,46 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_operation_wire_id_change_is_breaking() {
+        let old =
+            crate::parser::parse_csil("@wire-id(1)\nservice A {\n@wire-id(0)\nfoo: X -> Y\n}\n")
+                .unwrap();
+        let new =
+            crate::parser::parse_csil("@wire-id(1)\nservice A {\n@wire-id(5)\nfoo: X -> Y\n}\n")
+                .unwrap();
+        let report = detect_breaking_changes(&old, &new).unwrap();
+        assert!(report.has_breaking_changes);
+        assert!(
+            report.breaking_changes.iter().any(|c| matches!(
+                c,
+                BreakingChange::ServiceOperationSignatureChanged { change_description, .. }
+                    if change_description.contains("@wire-id")
+            )),
+            "expected a @wire-id signature change, got {:?}",
+            report.breaking_changes
+        );
+    }
+
+    #[test]
+    fn test_service_wire_id_change_is_breaking() {
+        let old =
+            crate::parser::parse_csil("@wire-id(1)\nservice A {\n@wire-id(0)\nfoo: X -> Y\n}\n")
+                .unwrap();
+        let new =
+            crate::parser::parse_csil("@wire-id(2)\nservice A {\n@wire-id(0)\nfoo: X -> Y\n}\n")
+                .unwrap();
+        let report = detect_breaking_changes(&old, &new).unwrap();
+        assert!(report.breaking_changes.iter().any(|c| matches!(
+            c,
+            BreakingChange::ServiceWireIdChanged {
+                old_wire_id: Some(1),
+                new_wire_id: Some(2),
+                ..
+            }
+        )));
+    }
+
     fn create_test_rule(name: &str, rule_type: RuleType) -> Rule {
         Rule {
             name: name.to_string(),
@@ -871,6 +940,7 @@ mod tests {
             direction: ServiceDirection::Unidirectional,
             position: crate::lexer::Position::new(1, 1, 0),
             doc_comments: Vec::new(),
+            metadata: Vec::new(),
         }
     }
 
@@ -951,6 +1021,7 @@ mod tests {
                     TypeExpression::Builtin("bool".to_string()),
                 ),
             ],
+            metadata: Vec::new(),
         };
 
         let new_service = ServiceDefinition {
@@ -959,6 +1030,7 @@ mod tests {
                 TypeExpression::Builtin("int".to_string()),
                 TypeExpression::Builtin("text".to_string()),
             )],
+            metadata: Vec::new(),
         };
 
         let spec1 = create_test_spec(vec![create_test_rule(
@@ -1182,6 +1254,7 @@ mod tests {
                 TypeExpression::Builtin("int".to_string()),
                 TypeExpression::Builtin("text".to_string()),
             )],
+            metadata: Vec::new(),
         };
 
         let new_service = ServiceDefinition {
@@ -1190,6 +1263,7 @@ mod tests {
                 TypeExpression::Builtin("text".to_string()), // Changed input type
                 TypeExpression::Builtin("text".to_string()),
             )],
+            metadata: Vec::new(),
         };
 
         let spec1 = create_test_spec(vec![create_test_rule(

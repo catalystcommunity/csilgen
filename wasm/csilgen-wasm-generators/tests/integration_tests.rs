@@ -78,6 +78,7 @@ fn create_test_csil_spec_with_services() -> CsilSpec {
                                 offset: 150,
                             },
                             doc_comments: Vec::new(),
+                            metadata: Vec::new(),
                         },
                         ServiceOperation {
                             name: "get_user".to_string(),
@@ -90,8 +91,10 @@ fn create_test_csil_spec_with_services() -> CsilSpec {
                                 offset: 200,
                             },
                             doc_comments: Vec::new(),
+                            metadata: Vec::new(),
                         },
                     ],
+                    metadata: Vec::new(),
                 }),
                 position: Position {
                     line: 7,
@@ -115,7 +118,9 @@ fn create_test_csil_spec_with_services() -> CsilSpec {
                             offset: 300,
                         },
                         doc_comments: Vec::new(),
+                        metadata: Vec::new(),
                     }],
+                    metadata: Vec::new(),
                 }),
                 position: Position {
                     line: 12,

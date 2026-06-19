@@ -1171,7 +1171,10 @@ mod tests {
         // Test empty service
         let empty_service = create_test_rule(
             "empty_service",
-            RuleType::ServiceDef(crate::ast::ServiceDefinition { operations: vec![] }),
+            RuleType::ServiceDef(crate::ast::ServiceDefinition {
+                operations: vec![],
+                metadata: Vec::new(),
+            }),
         );
         let spec = create_test_spec(vec![empty_service]);
         let config = LintConfig::default();

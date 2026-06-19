@@ -287,6 +287,9 @@ pub enum CsilGroupKey {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CsilServiceDefinition {
     pub operations: Vec<CsilServiceOperation>,
+    /// The `@wire-id(N)` service ordinal, if assigned (transport compact profiles).
+    #[serde(default)]
+    pub wire_id: Option<u64>,
 }
 
 /// CSIL service operation for WASM boundary
@@ -300,6 +303,9 @@ pub struct CsilServiceOperation {
     /// Documentation comments (;;;) preceding this operation
     #[serde(default)]
     pub doc_comments: Vec<String>,
+    /// The `@wire-id(N)` operation ordinal, if assigned (transport compact profiles).
+    #[serde(default)]
+    pub wire_id: Option<u64>,
 }
 
 /// CSIL service direction for WASM boundary
@@ -648,7 +654,9 @@ mod tests {
                                 offset: 100,
                             },
                             doc_comments: Vec::new(),
+                            wire_id: None,
                         }],
+                        wire_id: None,
                     }),
                     position: CsilPosition {
                         line: 4,
@@ -1103,6 +1111,7 @@ mod tests {
                                     offset: 100,
                                 },
                                 doc_comments: Vec::new(),
+                                wire_id: None,
                             },
                             CsilServiceOperation {
                                 name: "get_user".to_string(),
@@ -1115,8 +1124,10 @@ mod tests {
                                     offset: 150,
                                 },
                                 doc_comments: Vec::new(),
+                                wire_id: None,
                             },
                         ],
+                        wire_id: None,
                     }),
                     position: CsilPosition {
                         line: 4,

@@ -71,6 +71,19 @@ pub enum ValidationError {
         base_type: String,
         context: String,
     },
+    /// `@wire-id` present on some services/operations but not all (all-or-nothing)
+    WireIdPartial { context: String },
+    /// `@wire-id` argument is missing, negative, or not an integer
+    WireIdInvalid { context: String },
+    /// A service used the reserved service ordinal 0
+    WireIdReserved { service_name: String },
+    /// Two services, or two operations within one service, share a `@wire-id`
+    WireIdDuplicate {
+        scope: String,
+        id: u64,
+        first: String,
+        second: String,
+    },
 }
 
 impl std::fmt::Display for ValidationError {
@@ -179,6 +192,35 @@ impl std::fmt::Display for ValidationError {
                     "Constraint {constraint_type} cannot be applied to {base_type} in {context}"
                 )
             }
+            ValidationError::WireIdPartial { context } => {
+                write!(
+                    f,
+                    "@wire-id is all-or-nothing: {context} has no @wire-id while others do (assign one to every service and operation, or none)"
+                )
+            }
+            ValidationError::WireIdInvalid { context } => {
+                write!(
+                    f,
+                    "@wire-id on {context} requires a single non-negative integer argument, e.g. @wire-id(3)"
+                )
+            }
+            ValidationError::WireIdReserved { service_name } => {
+                write!(
+                    f,
+                    "service '{service_name}' uses the reserved @wire-id(0); application services must use 1 or greater (0 is the transport control plane)"
+                )
+            }
+            ValidationError::WireIdDuplicate {
+                scope,
+                id,
+                first,
+                second,
+            } => {
+                write!(
+                    f,
+                    "duplicate @wire-id({id}) in {scope}: {first} and {second} collide"
+                )
+            }
         }
     }
 }
@@ -193,6 +235,9 @@ pub fn validate_spec(spec: &CsilSpec) -> Result<()> {
     if let Err(duplicate_errors) = validate_unique_rule_names(spec) {
         errors.extend(duplicate_errors);
     }
+
+    // @wire-id is a spec-wide contract (all-or-nothing, cross-service uniqueness).
+    errors.extend(validate_wire_ids(spec));
 
     for rule in &spec.rules {
         if let Err(validation_errors) = validate_rule(rule, spec) {
@@ -233,6 +278,8 @@ struct ValidationContext {
 fn validate_spec_sequential(spec: &CsilSpec, context: ValidationContext) -> Result<()> {
     let mut errors = Vec::new();
 
+    errors.extend(validate_wire_ids(spec));
+
     for rule in &spec.rules {
         if let Err(validation_errors) = validate_rule_optimized(rule, spec, &context) {
             errors.extend(validation_errors);
@@ -250,7 +297,7 @@ fn validate_spec_sequential(spec: &CsilSpec, context: ValidationContext) -> Resu
 fn validate_spec_parallel(spec: &CsilSpec, context: ValidationContext) -> Result<()> {
     let spec = Arc::new(spec);
     let context = Arc::new(context);
-    let errors = Arc::new(Mutex::new(Vec::new()));
+    let errors = Arc::new(Mutex::new(validate_wire_ids(&spec)));
 
     // Split rules into chunks for parallel processing
     const CHUNK_SIZE: usize = 100;
@@ -356,6 +403,102 @@ fn validate_unique_rule_names(spec: &CsilSpec) -> Result<(), Vec<ValidationError
     } else {
         Err(errors)
     }
+}
+
+use crate::ast::{WireIdState, wire_id_state};
+
+/// Validate the spec-wide `@wire-id` contract: all-or-nothing across every service
+/// and operation, service ordinals unique and `>= 1` (0 is reserved for the
+/// transport control plane), operation ordinals unique within their service.
+fn validate_wire_ids(spec: &CsilSpec) -> Vec<ValidationError> {
+    let mut errors = Vec::new();
+
+    // Gather every service with its resolved states.
+    let mut services: Vec<(&str, WireIdState, &ServiceDefinition)> = Vec::new();
+    for rule in &spec.rules {
+        if let RuleType::ServiceDef(def) = &rule.rule_type {
+            services.push((rule.name.as_str(), wire_id_state(&def.metadata), def));
+        }
+    }
+    if services.is_empty() {
+        return errors;
+    }
+
+    // Determine whether the wire-id system is in use anywhere (any valid id on a
+    // service or operation). Malformed annotations count as "in use" so they are
+    // reported rather than masking the all-or-nothing check.
+    let mut any_present = false;
+    for (_, svc_state, def) in &services {
+        if matches!(svc_state, WireIdState::Valid(_) | WireIdState::Invalid) {
+            any_present = true;
+        }
+        for op in &def.operations {
+            if matches!(
+                wire_id_state(&op.metadata),
+                WireIdState::Valid(_) | WireIdState::Invalid
+            ) {
+                any_present = true;
+            }
+        }
+    }
+    if !any_present {
+        return errors;
+    }
+
+    // The system is in use: every service and operation must carry a valid id,
+    // service ids are unique and >= 1, operation ids are unique within a service.
+    let mut seen_service_ids: HashMap<u64, String> = HashMap::new();
+    for (svc_name, svc_state, def) in &services {
+        match svc_state {
+            WireIdState::Absent => errors.push(ValidationError::WireIdPartial {
+                context: format!("service '{svc_name}'"),
+            }),
+            WireIdState::Invalid => errors.push(ValidationError::WireIdInvalid {
+                context: format!("service '{svc_name}'"),
+            }),
+            WireIdState::Valid(0) => errors.push(ValidationError::WireIdReserved {
+                service_name: svc_name.to_string(),
+            }),
+            WireIdState::Valid(id) => {
+                if let Some(prev) = seen_service_ids.get(id) {
+                    errors.push(ValidationError::WireIdDuplicate {
+                        scope: "services".to_string(),
+                        id: *id,
+                        first: format!("service '{prev}'"),
+                        second: format!("service '{svc_name}'"),
+                    });
+                } else {
+                    seen_service_ids.insert(*id, svc_name.to_string());
+                }
+            }
+        }
+
+        let mut seen_op_ids: HashMap<u64, String> = HashMap::new();
+        for op in &def.operations {
+            match wire_id_state(&op.metadata) {
+                WireIdState::Absent => errors.push(ValidationError::WireIdPartial {
+                    context: format!("operation '{svc_name}/{}'", op.name),
+                }),
+                WireIdState::Invalid => errors.push(ValidationError::WireIdInvalid {
+                    context: format!("operation '{svc_name}/{}'", op.name),
+                }),
+                WireIdState::Valid(id) => {
+                    if let Some(prev) = seen_op_ids.get(&id) {
+                        errors.push(ValidationError::WireIdDuplicate {
+                            scope: format!("service '{svc_name}'"),
+                            id,
+                            first: format!("operation '{prev}'"),
+                            second: format!("operation '{}'", op.name),
+                        });
+                    } else {
+                        seen_op_ids.insert(id, op.name.clone());
+                    }
+                }
+            }
+        }
+    }
+
+    errors
 }
 
 /// Validate that all operation names within a service are unique
@@ -1455,6 +1598,80 @@ mod tests {
     }
 
     #[test]
+    fn test_wire_id_complete_is_valid() {
+        let spec = crate::parser::parse_csil(
+            "@wire-id(1)\nservice A {\n@wire-id(0)\nfoo: X -> Y,\n@wire-id(1)\nbar: X -> Y\n}\n",
+        )
+        .unwrap();
+        assert!(validate_spec(&spec).is_ok());
+    }
+
+    #[test]
+    fn test_wire_id_absent_everywhere_is_valid() {
+        let spec =
+            crate::parser::parse_csil("service A {\nfoo: X -> Y,\nbar: X -> Y\n}\n").unwrap();
+        assert!(validate_spec(&spec).is_ok());
+    }
+
+    #[test]
+    fn test_wire_id_partial_is_error() {
+        // Service has an id; one operation is missing one.
+        let spec = crate::parser::parse_csil(
+            "@wire-id(1)\nservice A {\n@wire-id(0)\nfoo: X -> Y,\nbar: X -> Y\n}\n",
+        )
+        .unwrap();
+        let err = validate_spec(&spec).unwrap_err().to_string();
+        assert!(err.contains("all-or-nothing"), "got: {err}");
+    }
+
+    #[test]
+    fn test_wire_id_service_zero_is_reserved() {
+        let spec =
+            crate::parser::parse_csil("@wire-id(0)\nservice A {\n@wire-id(0)\nfoo: X -> Y\n}\n")
+                .unwrap();
+        let err = validate_spec(&spec).unwrap_err().to_string();
+        assert!(err.contains("reserved"), "got: {err}");
+    }
+
+    #[test]
+    fn test_wire_id_duplicate_service_ordinals() {
+        let spec = crate::parser::parse_csil(
+            "@wire-id(1)\nservice A {\n@wire-id(0)\nfoo: X -> Y\n}\n@wire-id(1)\nservice B {\n@wire-id(0)\nbar: X -> Y\n}\n",
+        )
+        .unwrap();
+        let err = validate_spec(&spec).unwrap_err().to_string();
+        assert!(err.contains("duplicate @wire-id(1)"), "got: {err}");
+    }
+
+    #[test]
+    fn test_wire_id_duplicate_operation_ordinals() {
+        let spec = crate::parser::parse_csil(
+            "@wire-id(1)\nservice A {\n@wire-id(0)\nfoo: X -> Y,\n@wire-id(0)\nbar: X -> Y\n}\n",
+        )
+        .unwrap();
+        let err = validate_spec(&spec).unwrap_err().to_string();
+        assert!(err.contains("duplicate @wire-id(0)"), "got: {err}");
+    }
+
+    #[test]
+    fn test_wire_id_negative_is_invalid() {
+        let spec =
+            crate::parser::parse_csil("@wire-id(-1)\nservice A {\n@wire-id(0)\nfoo: X -> Y\n}\n")
+                .unwrap();
+        let err = validate_spec(&spec).unwrap_err().to_string();
+        assert!(err.contains("non-negative integer"), "got: {err}");
+    }
+
+    #[test]
+    fn test_wire_id_operation_zero_allowed() {
+        // Operation ordinals start at 0; only the *service* ordinal 0 is reserved.
+        let spec =
+            crate::parser::parse_csil("@wire-id(7)\nservice A {\n@wire-id(0)\nfoo: X -> Y\n}\n")
+                .unwrap();
+        assert!(validate_spec(&spec).is_ok());
+    }
+
+    #[test]
     fn test_validate_conflicting_visibility() {
         let spec = create_test_spec(vec![create_test_rule(
             "User",
@@ -1654,7 +1871,9 @@ mod tests {
                     direction: ServiceDirection::Unidirectional,
                     position: Position::new(1, 1, 0),
                     doc_comments: Vec::new(),
+                    metadata: Vec::new(),
                 }],
+                metadata: Vec::new(),
             }),
         )]);
 
@@ -1690,7 +1909,9 @@ mod tests {
                     direction: ServiceDirection::Bidirectional,
                     position: Position::new(1, 1, 0),
                     doc_comments: Vec::new(),
+                    metadata: Vec::new(),
                 }],
+                metadata: Vec::new(),
             }),
         )]);
 
@@ -1711,6 +1932,7 @@ mod tests {
                         direction: ServiceDirection::Unidirectional,
                         position: Position::new(1, 1, 0),
                         doc_comments: Vec::new(),
+                        metadata: Vec::new(),
                     },
                     ServiceOperation {
                         name: "process".to_string(),
@@ -1719,8 +1941,10 @@ mod tests {
                         direction: ServiceDirection::Unidirectional,
                         position: Position::new(2, 1, 0),
                         doc_comments: Vec::new(),
+                        metadata: Vec::new(),
                     },
                 ],
+                metadata: Vec::new(),
             }),
         )]);
 
@@ -1754,7 +1978,9 @@ mod tests {
                     direction: ServiceDirection::Unidirectional,
                     position: Position::new(1, 1, 0),
                     doc_comments: Vec::new(),
+                    metadata: Vec::new(),
                 }],
+                metadata: Vec::new(),
             }),
         )]);
 
@@ -2030,7 +2256,9 @@ mod tests {
                         direction: ServiceDirection::Unidirectional,
                         position: Position::new(3, 1, 0),
                         doc_comments: Vec::new(),
+                        metadata: Vec::new(),
                     }],
+                    metadata: Vec::new(),
                 }),
             )],
         };
@@ -2123,6 +2351,7 @@ mod tests {
                         direction: ServiceDirection::Unidirectional,
                         position: Position::new(1, 1, 0),
                         doc_comments: Vec::new(),
+                        metadata: Vec::new(),
                     },
                     ServiceOperation {
                         name: "process".to_string(),
@@ -2131,8 +2360,10 @@ mod tests {
                         direction: ServiceDirection::Unidirectional,
                         position: Position::new(3, 1, 30),
                         doc_comments: Vec::new(),
+                        metadata: Vec::new(),
                     },
                 ],
+                metadata: Vec::new(),
             }),
         )]);
 
@@ -2543,7 +2774,9 @@ mod tests {
                         direction: ServiceDirection::Unidirectional,
                         position: Position::new(1, 1, 0),
                         doc_comments: Vec::new(),
+                        metadata: Vec::new(),
                     }],
+                    metadata: Vec::new(),
                 }),
             ),
             create_test_rule(
@@ -2556,7 +2789,9 @@ mod tests {
                         direction: ServiceDirection::Unidirectional,
                         position: Position::new(2, 1, 20),
                         doc_comments: Vec::new(),
+                        metadata: Vec::new(),
                     }],
+                    metadata: Vec::new(),
                 }),
             ),
         ]);
@@ -2582,7 +2817,9 @@ mod tests {
                         direction: ServiceDirection::Unidirectional,
                         position: Position::new(1, 1, 0),
                         doc_comments: Vec::new(),
+                        metadata: Vec::new(),
                     }],
+                    metadata: Vec::new(),
                 }),
             ),
         ]);

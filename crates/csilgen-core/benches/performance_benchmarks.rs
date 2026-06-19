@@ -283,7 +283,9 @@ fn create_test_spec(num_rules: usize) -> csilgen_core::ast::CsilSpec {
                             offset: (num_rules + i) * 50 + 20,
                         },
                         doc_comments: Vec::new(),
+                        metadata: Vec::new(),
                     }],
+                    metadata: Vec::new(),
                 }),
                 position: Position {
                     line: num_rules + i + 1,

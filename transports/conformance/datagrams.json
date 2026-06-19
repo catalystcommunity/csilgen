@@ -1,0 +1,50 @@
+{
+  "vectors": [
+    {
+      "description": "A CBOR-array datagram [v, op_ord, seq, payload].",
+      "hex": "84010005d81841a0",
+      "input": {
+        "op_ord": 0,
+        "payload_hex": "a0",
+        "profile": "cbor-array",
+        "seq": 5
+      },
+      "name": "cbor_array"
+    },
+    {
+      "description": "A CBOR-array datagram with seq 0 (unsequenced).",
+      "hex": "84010100d81841a0",
+      "input": {
+        "op_ord": 1,
+        "payload_hex": "a0",
+        "profile": "cbor-array",
+        "seq": 0
+      },
+      "name": "cbor_array_unsequenced"
+    },
+    {
+      "description": "A compact fixed-header datagram, no epoch.",
+      "hex": "10011234010203",
+      "input": {
+        "body_hex": "010203",
+        "epoch": null,
+        "op_ord": 1,
+        "profile": "compact-header",
+        "seq": 4660
+      },
+      "name": "compact_header"
+    },
+    {
+      "description": "A compact fixed-header datagram with an epoch byte.",
+      "hex": "110200070409",
+      "input": {
+        "body_hex": "09",
+        "epoch": 4,
+        "op_ord": 2,
+        "profile": "compact-header",
+        "seq": 7
+      },
+      "name": "compact_header_epoch"
+    }
+  ]
+}

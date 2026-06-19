@@ -1,0 +1,16 @@
+{
+  "name": "csilgen-transport",
+  "version": "1.0.0",
+  "description": "Reference TypeScript implementation of the CSIL transport family (RPC, Events, Datagrams). Zero runtime dependencies; runs in browser/WASM clients and Node.",
+  "type": "module",
+  "license": "Apache-2.0",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "engines": {
+    "node": ">=22.18.0"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.ts"
+  }
+}

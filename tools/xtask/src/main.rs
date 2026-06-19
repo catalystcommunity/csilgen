@@ -28,6 +28,110 @@ enum Commands {
     BuildWasm,
     /// Build and install WASM modules to ~/.csilgen/generators/
     InstallWasm,
+    /// Run the transport reference-library tests for all four languages, checking
+    /// each against the shared conformance vectors. Languages whose toolchain is
+    /// absent are skipped with a message rather than failing the run.
+    TestTransports,
+}
+
+/// True if `cmd --version` (or `version`) runs successfully — used to detect an
+/// available language toolchain before invoking its test runner.
+fn toolchain_present(cmd: &str, version_arg: &str) -> bool {
+    std::process::Command::new(cmd)
+        .arg(version_arg)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+fn test_transports() -> Result<()> {
+    let mut ran = Vec::new();
+    let mut skipped = Vec::new();
+    let mut failed = Vec::new();
+
+    // Rust is always available (we are running under cargo).
+    println!("== Rust transport tests ==");
+    let rust_ok = std::process::Command::new("cargo")
+        .args(["test", "-p", "csilgen-transport"])
+        .status()?
+        .success();
+    if rust_ok {
+        ran.push("rust");
+    } else {
+        failed.push("rust");
+    }
+
+    // (language, toolchain cmd, version arg, project dir, runner program, runner args).
+    type LangTest = (
+        &'static str,
+        &'static str,
+        &'static str,
+        &'static str,
+        &'static str,
+        &'static [&'static str],
+    );
+    let langs: &[LangTest] = &[
+        (
+            "go",
+            "go",
+            "version",
+            "transports/go",
+            "go",
+            &["test", "./..."],
+        ),
+        (
+            "typescript",
+            "node",
+            "--version",
+            "transports/typescript",
+            "npm",
+            &["test", "--silent"],
+        ),
+        (
+            "python",
+            "python3",
+            "--version",
+            "transports/python",
+            "python3",
+            &["-m", "unittest", "discover", "-s", "tests"],
+        ),
+    ];
+
+    for (lang, tool, ver, dir, runner, args) in langs {
+        let path = PathBuf::from(dir);
+        if !path.exists() {
+            skipped.push(format!("{lang} (no {dir})"));
+            continue;
+        }
+        if !toolchain_present(tool, ver) {
+            skipped.push(format!("{lang} ({tool} toolchain not found)"));
+            continue;
+        }
+        println!("\n== {lang} transport tests ==");
+        let ok = std::process::Command::new(runner)
+            .args(*args)
+            .current_dir(&path)
+            .status()
+            .with_context(|| format!("failed to launch {runner} for {lang}"))?
+            .success();
+        if ok {
+            ran.push(lang);
+        } else {
+            failed.push(lang);
+        }
+    }
+
+    println!("\n== transport test summary ==");
+    println!("  ran:     {}", ran.join(", "));
+    if !skipped.is_empty() {
+        println!("  skipped: {}", skipped.join(", "));
+    }
+    if !failed.is_empty() {
+        anyhow::bail!("transport tests failed for: {}", failed.join(", "));
+    }
+    Ok(())
 }
 
 fn build_wasm() -> Result<()> {
@@ -151,6 +255,9 @@ fn main() -> Result<()> {
         }
         Commands::InstallWasm => {
             install_wasm()?;
+        }
+        Commands::TestTransports => {
+            test_transports()?;
         }
     }
 
