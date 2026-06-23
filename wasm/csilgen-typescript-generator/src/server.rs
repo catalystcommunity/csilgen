@@ -97,6 +97,13 @@ pub fn generate(input: &WasmGeneratorInput) -> Result<String, String> {
     out.push('\n');
     out.push_str(&dispatch(&services, mode, mapping));
 
+    // Compact-profile twin, emitted only when the spec carries wire-ids so
+    // wire-id-free specs stay byte-identical.
+    if let Some(compact) = dispatch_compact(&services, mapping) {
+        out.push('\n');
+        out.push_str(&compact);
+    }
+
     Ok(out)
 }
 
@@ -262,6 +269,50 @@ fn channel_block(name: &str, def: &CsilServiceDefinition, mapping: DecimalMappin
     );
     out.push_str("  }\n}\n");
 
+    // Compact-profile twin, emitted only for wire-id-bearing services so
+    // wire-id-free specs stay byte-identical. It dispatches on the operation
+    // ordinal instead of the wire method name; the profile is negotiated on the
+    // wire (never declared in CSIL), so the implementer keeps both routers and
+    // calls whichever the peer selected.
+    if def.wire_id.is_some() {
+        let route_fn_compact = format!("route{base}ChannelCompact");
+        out.push_str(&format!(
+            "\n\
+             /**\n\
+             \x20* Compact-profile twin of {route_fn}: dispatch one inbound frame by its\n\
+             \x20* @wire-id ordinal instead of the wire method name. The host calls whichever\n\
+             \x20* twin matches the profile negotiated on the wire.\n\
+             \x20*/\n\
+             export function {route_fn_compact}(\n\
+             \x20 handlers: {handlers_iface},\n\
+             \x20 codec: Codec,\n\
+             \x20 op: number,\n\
+             \x20 bytes: Uint8Array,\n\
+             \x20 ctx: RequestContext,\n\
+             ): void {{\n\
+             \x20 switch (op) {{\n"
+        ));
+        for op in &inbound_ops {
+            // The all-or-nothing wire-id rule (enforced by the validator) means a
+            // bidirectional op on a wire-id-bearing service always has an ordinal.
+            let Some(op_id) = op.wire_id else {
+                continue;
+            };
+            let method = common::to_camel(&op.name);
+            let inbound = common::ts_type(&op.input_type, mapping);
+            out.push_str(&format!("    case {op_id}:\n"));
+            out.push_str(&format!(
+                "      handlers.{method}(codec.decode<{inbound}>(bytes), ctx);\n"
+            ));
+            out.push_str("      return;\n");
+        }
+        out.push_str("    default:\n");
+        out.push_str(
+            "      throw { code: 404, message: `unknown channel ordinal ${op}` } satisfies ServiceError;\n",
+        );
+        out.push_str("  }\n}\n");
+    }
+
     // Server-side outbound encoders for `<->` and `<-` ops (output_type).
     for op in &outbound_ops {
         let camel = common::to_camel(&op.name);
@@ -389,6 +440,85 @@ fn dispatch(
     );
     out.push_str("  }\n}\n");
     out
+}
+
+/// The compact-profile twin of `dispatch`: the caller decodes the service and
+/// operation `@wire-id` ordinals from the wire and routes on those instead of
+/// names. Only unidirectional ops map to a single compact ordinal — channel
+/// frames use `route<Service>ChannelCompact`, and the rpc-mode poll fallback
+/// (`<Op>Send`/`<Op>Check`) has no single ordinal so it stays verbose. Returns
+/// `None` for wire-id-free specs, keeping their output byte-identical.
+fn dispatch_compact(
+    services: &[(&str, &CsilServiceDefinition)],
+    mapping: DecimalMapping,
+) -> Option<String> {
+    if !services.iter().any(|(_, def)| def.wire_id.is_some()) {
+        return None;
+    }
+    let mut out = String::from(
+        "/**\n\
+         \x20* Compact-profile twin of dispatch: the caller decodes the service and\n\
+         \x20* operation @wire-id ordinals from the wire and routes on those instead of\n\
+         \x20* names. The host calls whichever twin matches the negotiated profile. The\n\
+         \x20* rpc-mode poll fallback (<Op>Send/<Op>Check) has no single compact ordinal\n\
+         \x20* and stays on the verbose `dispatch`.\n\
+         \x20*/\n\
+         export async function dispatchCompact(\n\
+         \x20 handlers: ServerHandlers,\n\
+         \x20 codec: Codec,\n\
+         \x20 service: number,\n\
+         \x20 method: number,\n\
+         \x20 reqBytes: Uint8Array,\n\
+         \x20 ctx: RequestContext,\n\
+         ): Promise<Uint8Array> {\n\
+         \x20 switch (service) {\n",
+    );
+
+    for (name, def) in services {
+        let Some(service_id) = def.wire_id else {
+            continue;
+        };
+        let field = common::to_camel(&common::service_base(name));
+        out.push_str(&format!("    case {service_id}: {{\n"));
+        out.push_str("      switch (method) {\n");
+        for op in &def.operations {
+            if !matches!(
+                op.direction,
+                csilgen_common::CsilServiceDirection::Unidirectional
+            ) {
+                continue;
+            }
+            // The all-or-nothing wire-id rule (enforced by the validator) means a
+            // unidirectional op on a wire-id-bearing service always has an ordinal.
+            let Some(op_id) = op.wire_id else {
+                continue;
+            };
+            let method = common::to_camel(&op.name);
+            let req = common::ts_type(&op.input_type, mapping);
+            out.push_str(&format!("        case {op_id}: {{\n"));
+            out.push_str(&format!(
+                "          const req = codec.decode<{req}>(reqBytes);\n"
+            ));
+            out.push_str(&format!(
+                "          const res = await handlers.{field}.{method}(req, ctx);\n"
+            ));
+            out.push_str("          return codec.encode(res);\n");
+            out.push_str("        }\n");
+        }
+        out.push_str("        default:\n");
+        out.push_str(
+            "          throw { code: 404, message: `unknown ordinal ${service}.${method}` } satisfies ServiceError;\n",
+        );
+        out.push_str("      }\n");
+        out.push_str("    }\n");
+    }
+
+    out.push_str("    default:\n");
+    out.push_str(
+        "      throw { code: 404, message: `unknown service ordinal ${service}` } satisfies ServiceError;\n",
+    );
+    out.push_str("  }\n}\n");
+    Some(out)
 }
 
 fn string_option(input: &WasmGeneratorInput, key: &str, default: &str) -> String {

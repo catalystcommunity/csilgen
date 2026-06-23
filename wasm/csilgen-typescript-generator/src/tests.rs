@@ -1721,3 +1721,112 @@ fn wire_ids_const_absent_when_unset() {
         "no wire-id output when services have no wire-id, got: {server}"
     );
 }
+
+#[test]
+fn compact_dispatch_emitted_for_wire_id_spec() {
+    let server = file(
+        &generate_files(&input_with_spec("typescript-server", wire_id_spec())).expect("generate"),
+        "server.gen.ts",
+    )
+    .to_string();
+
+    // Verbose dispatch stays byte-identical alongside the compact twin.
+    assert!(
+        server.contains("export async function dispatch("),
+        "verbose dispatch expected, got: {server}"
+    );
+    // Compact twin routes on numeric service + op ordinals.
+    assert!(
+        server.contains("export async function dispatchCompact("),
+        "compact dispatch expected, got: {server}"
+    );
+    assert!(
+        server.contains("service: number,"),
+        "compact dispatch keys on numeric ordinals, got: {server}"
+    );
+    assert!(
+        server.contains("case 3: {"),
+        "compact dispatch matches the service ordinal, got: {server}"
+    );
+    assert!(
+        server.contains("case 7: {"),
+        "compact dispatch matches the op ordinal, got: {server}"
+    );
+    assert!(
+        server.contains("const res = await handlers.order.placeOrder(req, ctx);"),
+        "compact dispatch routes to the handler, got: {server}"
+    );
+    assert!(
+        server.contains("unknown service ordinal"),
+        "compact dispatch has an ordinal fallthrough, got: {server}"
+    );
+}
+
+// channel_spec() with `@wire-id` ordinals added so the compact channel router
+// twin has a bidirectional op to dispatch on.
+fn wire_id_channel_spec() -> CsilSpecSerialized {
+    let mut spec = channel_spec();
+    if let CsilRuleType::ServiceDef(service) = &mut spec.rules.last_mut().unwrap().rule_type {
+        service.wire_id = Some(1);
+        for op in &mut service.operations {
+            if matches!(op.direction, CsilServiceDirection::Bidirectional) {
+                op.wire_id = Some(5);
+            }
+        }
+    }
+    spec
+}
+
+#[test]
+fn compact_channel_router_emitted_for_wire_id_channel_spec() {
+    let server = file(
+        &generate_files(&input_with_spec(
+            "typescript-server",
+            wire_id_channel_spec(),
+        ))
+        .expect("generate"),
+        "server.gen.ts",
+    )
+    .to_string();
+
+    // Verbose router stays byte-identical alongside the compact twin.
+    assert!(
+        server.contains("export function routeMatchChannel("),
+        "verbose router expected, got: {server}"
+    );
+    // Compact twin dispatches on the op ordinal, not the wire name.
+    assert!(
+        server.contains("export function routeMatchChannelCompact("),
+        "compact router expected, got: {server}"
+    );
+    assert!(
+        server.contains("op: number,"),
+        "compact router keys on a numeric ordinal, got: {server}"
+    );
+    assert!(
+        server.contains("case 5:"),
+        "compact router matches the op ordinal, got: {server}"
+    );
+    assert!(
+        server.contains("unknown channel ordinal"),
+        "compact router has an ordinal fallthrough, got: {server}"
+    );
+}
+
+#[test]
+fn compact_dispatch_absent_when_unset() {
+    let server = file(
+        &generate_files(&input_for("typescript-server")).expect("generate"),
+        "server.gen.ts",
+    )
+    .to_string();
+    // The verbose dispatch survives; the compact twin must not appear.
+    assert!(
+        server.contains("export async function dispatch("),
+        "verbose dispatch expected, got: {server}"
+    );
+    assert!(
+        !server.contains("Compact"),
+        "no compact routing without wire-ids, got: {server}"
+    );
+}
