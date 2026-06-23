@@ -1750,6 +1750,45 @@ impl PythonGenerator {
                 out.push_str("    raise ServiceError(404, f\"unknown channel {method}\")\n\n");
             }
 
+            // Compact-profile twin, emitted only for wire-id-bearing services so
+            // wire-id-free specs stay byte-identical. It dispatches on the
+            // operation ordinal instead of the wire method name; the profile is
+            // negotiated on the wire (never declared in CSIL), so a host keeps
+            // both routers and calls whichever the peer selected.
+            if service.wire_id.is_some() {
+                let route_fn = format!("route_{}_channel_compact", name.to_case(Case::Snake));
+                out.push_str(&format!(
+                    "def {route_fn}(handlers: {handler_class}, codec: Codec, op: int, data: bytes, ctx: dict) -> None:\n"
+                ));
+                out.push_str(&format!(
+                    "    \"\"\"Decode one inbound channel frame for {name} by its @wire-id\n\n\
+                     \x20   ordinal (compact transport profile) and dispatch. The verbose-profile\n\
+                     \x20   twin is route_{}_channel; the host calls whichever matches the\n\
+                     \x20   profile negotiated on the wire.\n\
+                     \x20   \"\"\"\n",
+                    name.to_case(Case::Snake)
+                ));
+                for op in &bidi_ops {
+                    // The all-or-nothing wire-id rule (enforced by the validator)
+                    // means a bidirectional op on a wire-id-bearing service always
+                    // has an ordinal.
+                    let Some(op_id) = op.wire_id else {
+                        continue;
+                    };
+                    let method_name = op.name.to_case(Case::Snake);
+                    out.push_str(&format!("    if op == {op_id}:\n"));
+                    if is_null_input(&op.input_type) {
+                        out.push_str(&format!("        handlers.{method_name}(ctx)\n"));
+                    } else {
+                        let input_type = self.map_type_expression(&op.input_type)?;
+                        out.push_str(&format!("        msg = codec.decode(data, {input_type})\n"));
+                        out.push_str(&format!("        handlers.{method_name}(msg, ctx)\n"));
+                    }
+                    out.push_str("        return\n");
+                }
+                out.push_str("    raise ServiceError(404, f\"unknown channel ordinal {op}\")\n\n");
+            }
+
             // Outbound encoders for <-> and <- (server pushes Output to client).
             for op in &service.operations {
                 if !matches!(
@@ -3763,6 +3802,96 @@ mod tests {
         assert!(
             !content.contains("WIRE_IDS"),
             "no wire-id output when service has no wire-id, got:\n{content}"
+        );
+    }
+
+    // Build a channel (bidirectional) service carrying `@wire-id` ordinals so the
+    // compact-router twin has something to dispatch on.
+    fn wire_id_channel_service(
+        service_wire: Option<u64>,
+        op_wire: Option<u64>,
+    ) -> CsilSpecSerialized {
+        CsilSpecSerialized {
+            rules: vec![CsilRule {
+                name: "Match".to_string(),
+                rule_type: CsilRuleType::ServiceDef(CsilServiceDefinition {
+                    operations: vec![CsilServiceOperation {
+                        name: "play".to_string(),
+                        input_type: CsilTypeExpression::Builtin("text".to_string()),
+                        output_type: CsilTypeExpression::Builtin("text".to_string()),
+                        direction: CsilServiceDirection::Bidirectional,
+                        position: create_test_position(),
+                        doc_comments: Vec::new(),
+                        wire_id: op_wire,
+                    }],
+                    wire_id: service_wire,
+                }),
+                position: create_test_position(),
+                doc_comments: Vec::new(),
+            }],
+            source_content: None,
+            service_count: 1,
+            fields_with_metadata_count: 0,
+        }
+    }
+
+    #[test]
+    fn compact_router_emitted_for_wire_id_channel_service() {
+        let spec = wire_id_channel_service(Some(1), Some(5));
+        let result =
+            generate_python_code_from_serialized(&spec, &create_test_config(false)).unwrap();
+        let content = &result
+            .iter()
+            .find(|f| f.path == "services.py")
+            .unwrap()
+            .content;
+
+        // Verbose router stays byte-identical alongside the compact twin.
+        assert!(
+            content.contains(
+                "def route_match_channel(handlers: MatchHandlers, codec: Codec, method: str, data: bytes, ctx: dict) -> None:"
+            ),
+            "verbose router expected, got:\n{content}"
+        );
+        // Compact twin dispatches on the operation ordinal, not the wire name.
+        assert!(
+            content.contains(
+                "def route_match_channel_compact(handlers: MatchHandlers, codec: Codec, op: int, data: bytes, ctx: dict) -> None:"
+            ),
+            "compact router expected, got:\n{content}"
+        );
+        assert!(
+            content.contains("if op == 5:"),
+            "compact router matches the op ordinal, got:\n{content}"
+        );
+        assert!(
+            content.contains("handlers.play(msg, ctx)"),
+            "compact router dispatches to the handler, got:\n{content}"
+        );
+        assert!(
+            content.contains("raise ServiceError(404, f\"unknown channel ordinal {op}\")"),
+            "compact router has an ordinal fallthrough, got:\n{content}"
+        );
+    }
+
+    #[test]
+    fn compact_router_absent_without_wire_id() {
+        let spec = wire_id_channel_service(None, None);
+        let result =
+            generate_python_code_from_serialized(&spec, &create_test_config(false)).unwrap();
+        let content = &result
+            .iter()
+            .find(|f| f.path == "services.py")
+            .unwrap()
+            .content;
+        // The verbose router survives; the compact twin must not appear.
+        assert!(
+            content.contains("def route_match_channel("),
+            "verbose router expected, got:\n{content}"
+        );
+        assert!(
+            !content.contains("_compact"),
+            "no compact router without wire-ids, got:\n{content}"
         );
     }
 }

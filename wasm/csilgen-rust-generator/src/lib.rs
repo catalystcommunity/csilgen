@@ -1022,6 +1022,14 @@ impl<'a> RustCodeGenerator<'a> {
                 if Self::service_has_channel_ops(service) {
                     content.push_str(&self.generate_service_router(&rule.name, service)?);
                     content.push('\n');
+                    // Compact-profile twin, emitted only for wire-id-bearing
+                    // services so wire-id-free specs stay byte-identical.
+                    if let Some(compact) =
+                        self.generate_service_router_compact(&rule.name, service)?
+                    {
+                        content.push_str(&compact);
+                        content.push('\n');
+                    }
                     content.push_str(&self.generate_service_encoders(&rule.name, service)?);
                     content.push('\n');
                 }
@@ -1352,6 +1360,72 @@ impl<'a> RustCodeGenerator<'a> {
         content.push_str("    }\n");
         content.push_str("}\n");
         Ok(content)
+    }
+
+    /// The compact-profile twin of `generate_service_router`: when the service
+    /// carries `@wire-id` ordinals, emit `route_<service>_channel_compact` that
+    /// dispatches on the operation ordinal (`u64`) instead of the wire name.
+    /// The profile is negotiated on the wire (never declared in CSIL), so a host
+    /// keeps both routers and calls whichever the peer selected. Returns `None`
+    /// for wire-id-free specs, keeping their output byte-identical.
+    fn generate_service_router_compact(
+        &mut self,
+        service_name: &str,
+        service: &CsilServiceDefinition,
+    ) -> Result<Option<String>, String> {
+        if service.wire_id.is_none() {
+            return Ok(None);
+        }
+        let inbound_ops: Vec<&CsilServiceOperation> = service
+            .operations
+            .iter()
+            .filter(|op| matches!(op.direction, CsilServiceDirection::Bidirectional))
+            .collect();
+
+        let mut content = String::new();
+        let fn_name = format!("route_{}_channel_compact", self.to_snake_case(service_name));
+        content.push_str(&format!(
+            "/// Decode one inbound channel frame for {service_name} by its\n\
+             /// `@wire-id` ordinal (compact transport profile) and dispatch to the\n\
+             /// matching trait method. The verbose-profile twin is\n\
+             /// `route_{}_channel`; the host calls whichever matches the profile\n\
+             /// negotiated on the wire.\n\
+             pub fn {fn_name}<H, C>(\n\
+             \x20   handlers: &H,\n\
+             \x20   ctx: &H::Context,\n\
+             \x20   codec: &C,\n\
+             \x20   op: u64,\n\
+             \x20   bytes: &[u8],\n\
+             ) -> Result<(), ServiceError>\n\
+             where\n\
+             \x20   H: {service_name},\n\
+             \x20   C: Codec,\n\
+             {{\n\
+             \x20   match op {{\n",
+            self.to_snake_case(service_name)
+        ));
+        for op in &inbound_ops {
+            // The all-or-nothing wire-id rule (enforced by the validator) means a
+            // bidirectional op on a wire-id-bearing service always has an ordinal.
+            let Some(op_id) = op.wire_id else {
+                continue;
+            };
+            let op_snake = self.to_snake_case(&op.name);
+            let input_type = self.map_type_to_rust(&op.input_type, &None)?;
+            content.push_str(&format!("        {op_id} => {{\n"));
+            content.push_str(&format!(
+                "            let msg: {input_type} = codec.decode(bytes)?;\n"
+            ));
+            content.push_str(&format!("            handlers.{op_snake}(ctx, msg)\n"));
+            content.push_str("        }\n");
+        }
+        content.push_str("        other => Err(ServiceError {\n");
+        content.push_str("            code: 404,\n");
+        content.push_str("            message: format!(\"unknown channel ordinal {other}\"),\n");
+        content.push_str("        }),\n");
+        content.push_str("    }\n");
+        content.push_str("}\n");
+        Ok(Some(content))
     }
 
     /// For each `<->` and `<-` op, emit `encode_<service>_<op>` that returns
@@ -4478,6 +4552,77 @@ mod tests {
         assert!(
             !services.contains("wire_ids"),
             "no wire-id output when service has no wire-id, got:\n{services}"
+        );
+    }
+
+    // Build a channel (bidirectional) service carrying `@wire-id` ordinals so the
+    // compact-router twin has something to dispatch on.
+    fn wire_id_channel_input() -> WasmGeneratorInput {
+        let mut input = create_test_input();
+        let mut rule = service_with_directions(
+            "Match",
+            &[("play", "User", "User", CsilServiceDirection::Bidirectional)],
+        );
+        if let CsilRuleType::ServiceDef(service) = &mut rule.rule_type {
+            service.wire_id = Some(1);
+            service.operations[0].wire_id = Some(5);
+        }
+        input.csil_spec.rules.push(rule);
+        input.csil_spec.service_count = 1;
+        input
+    }
+
+    #[test]
+    fn compact_router_emitted_for_wire_id_channel_service() {
+        let input = wire_id_channel_input();
+        let services = RustCodeGenerator::new(&input).generate_services().unwrap();
+
+        // Verbose router stays byte-identical alongside the compact twin.
+        assert!(
+            services.contains("pub fn route_match_channel<H, C>"),
+            "verbose router expected, got:\n{services}"
+        );
+        // Compact twin dispatches on the operation ordinal, not the wire name.
+        assert!(
+            services.contains("pub fn route_match_channel_compact<H, C>"),
+            "compact router expected, got:\n{services}"
+        );
+        assert!(
+            services.contains("op: u64,"),
+            "compact router keys on a u64 ordinal, got:\n{services}"
+        );
+        assert!(
+            services.contains("        5 => {"),
+            "compact router matches the op ordinal, got:\n{services}"
+        );
+        assert!(
+            services.contains("handlers.play(ctx, msg)"),
+            "compact router dispatches to the handler, got:\n{services}"
+        );
+        assert!(
+            services.contains("unknown channel ordinal {other}"),
+            "compact router has an ordinal fallthrough, got:\n{services}"
+        );
+    }
+
+    #[test]
+    fn compact_router_absent_without_wire_id() {
+        let mut input = wire_id_channel_input();
+        if let CsilRuleType::ServiceDef(service) =
+            &mut input.csil_spec.rules.last_mut().unwrap().rule_type
+        {
+            service.wire_id = None;
+            service.operations[0].wire_id = None;
+        }
+        let services = RustCodeGenerator::new(&input).generate_services().unwrap();
+        // The verbose router survives; the compact twin must not appear.
+        assert!(
+            services.contains("pub fn route_match_channel<H, C>"),
+            "verbose router expected, got:\n{services}"
+        );
+        assert!(
+            !services.contains("_compact"),
+            "no compact router without wire-ids, got:\n{services}"
         );
     }
 }
