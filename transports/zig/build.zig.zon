@@ -1,0 +1,23 @@
+.{
+    .name = .csilgen_transport,
+    .version = "1.0.0",
+    .fingerprint = 0x843424311a2b3c4d,
+
+    // Pinned to the Zig 0.14 line: this code uses the 0.14 managed std.ArrayList and
+    // blocking std.io. 0.15+ made std.ArrayList unmanaged by default and reworked
+    // std.io, and 0.13 has the older addExecutable/addTest API — neither builds this
+    // unchanged. See README.md for the upgrade cost.
+    .minimum_zig_version = "0.14.1",
+
+    .dependencies = .{},
+
+    // paths is the package allow-list. The conformance vectors are deliberately NOT
+    // listed: they live outside this package and are read at build time only for our
+    // own `zig build test` (see build.zig), never shipped to consumers.
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "README.md",
+    },
+}

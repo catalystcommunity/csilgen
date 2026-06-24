@@ -1,0 +1,7 @@
+; Warnings stay visible but are not fatal: this lib is maintained where the OCaml
+; toolchain is not always present, so a stray style warning must never block a build.
+
+(env
+ (dev
+  (flags
+   (:standard -warn-error -a))))

@@ -1,0 +1,35 @@
+opam-version: "2.0"
+name: "csilgen-transport"
+version: "0.1.0-dev"
+synopsis: "Canonical-CBOR transport library for the CSIL transport family"
+description: """
+Hand-written, dependency-free OCaml implementation of the CSIL transport wire
+(the conventions doc plus the RPC, Events, and Datagrams specs): a canonical CBOR
+codec, the tag-24 / status / version conventions, a bring-your-own carrier seam
+(a record of closures), and matched client/server pairs for all three transports.
+
+All I/O is synchronous and blocking — no Lwt/Async/Eio; the host owns the I/O loop
+and threads. The library uses only the stdlib plus the bundled `unix` (for the UDP
+carrier); the conformance test target is stdlib-only.
+
+TODO: not yet published to opam-repository. To publish, add this package to
+ocaml/opam-repository (or a private opam-repo) so consumers can
+`opam install csilgen-transport` without a pin. Until then, consume via
+`opam pin --subpath transports/ocaml ...` or dune `(vendored_dirs ...)` — see README.
+"""
+maintainer: "Catalyst Community"
+authors: "Catalyst Community"
+license: "Apache-2.0"
+homepage: "https://github.com/catalystcommunity/csilgen"
+bug-reports: "https://github.com/catalystcommunity/csilgen/issues"
+dev-repo: "git+https://github.com/catalystcommunity/csilgen.git"
+depends: [
+  "ocaml" {>= "4.08"}
+  "dune" {>= "3.0"}
+]
+build: [
+  # Tests are not built under opam: the conformance vectors live at
+  # transports/conformance/, outside this package directory, so they are run from
+  # the repo via run-tests.sh, not via `opam install --with-test`.
+  ["dune" "build" "-p" name "-j" jobs]
+]

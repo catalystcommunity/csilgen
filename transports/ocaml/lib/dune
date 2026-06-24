@@ -1,0 +1,5 @@
+(library
+ (name csilgen_transport)
+ (public_name csilgen-transport)
+ ; `unix` ships with the compiler (used only by the UDP carrier); no opam deps.
+ (libraries unix))

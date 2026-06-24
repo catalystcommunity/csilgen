@@ -1,0 +1,19 @@
+name: csilgen_transport
+description: >-
+  Reference Dart implementation of the CSIL transport family (RPC, Events,
+  Datagrams). Pure Dart, zero runtime dependencies, Flutter-compatible.
+version: 1.0.0
+
+# Not on pub.dev yet; consumed straight from this git repo (see README "TODO").
+publish_to: none
+
+environment:
+  # >=3.0 is required for sealed classes / patterns; 3.5 is a safe modern floor.
+  sdk: ^3.5.0
+
+# `dependencies:` stays empty on purpose — the codec is hand-rolled on dart:* core
+# libraries so the package has no transitive runtime weight and no path deps (which
+# would break git-subdir resolution). Only dev tooling lives below.
+dev_dependencies:
+  test: ^1.25.0
+  lints: ^5.0.0

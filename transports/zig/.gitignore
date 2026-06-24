@@ -1,0 +1,6 @@
+# Zig build output and local cache — never commit build artifacts.
+.zig-cache/
+zig-out/
+
+# Older Zig (pre-0.14) put the cache here; ignore it too in case a maintainer runs one.
+zig-cache/

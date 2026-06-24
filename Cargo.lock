@@ -653,6 +653,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "csilgen-c-generator"
+version = "0.1.0"
+dependencies = [
+ "convert_case",
+ "csilgen-common",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "csilgen-common"
 version = "0.1.0"
 dependencies = [
@@ -686,9 +696,49 @@ dependencies = [
 ]
 
 [[package]]
+name = "csilgen-csharp-generator"
+version = "0.1.0"
+dependencies = [
+ "convert_case",
+ "csilgen-common",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "csilgen-dart-generator"
+version = "0.1.0"
+dependencies = [
+ "convert_case",
+ "csilgen-common",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "csilgen-elixir-generator"
+version = "0.1.0"
+dependencies = [
+ "convert_case",
+ "csilgen-common",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "csilgen-go-generator"
 version = "0.1.0"
 dependencies = [
+ "csilgen-common",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "csilgen-java-generator"
+version = "0.1.0"
+dependencies = [
+ "convert_case",
  "csilgen-common",
  "serde",
  "serde_json",
@@ -705,9 +755,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "csilgen-kotlin-generator"
+version = "0.1.0"
+dependencies = [
+ "csilgen-common",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "csilgen-noop-generator"
 version = "0.1.0"
 dependencies = [
+ "csilgen-common",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "csilgen-ocaml-generator"
+version = "0.1.0"
+dependencies = [
+ "convert_case",
  "csilgen-common",
  "serde",
  "serde_json",
@@ -734,6 +803,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "csilgen-ruby-generator"
+version = "0.1.0"
+dependencies = [
+ "convert_case",
+ "csilgen-common",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "csilgen-rust-generator"
 version = "0.1.0"
 dependencies = [
@@ -748,6 +827,16 @@ dependencies = [
 [[package]]
 name = "csilgen-simple-test"
 version = "0.1.0"
+
+[[package]]
+name = "csilgen-swift-generator"
+version = "0.1.0"
+dependencies = [
+ "convert_case",
+ "csilgen-common",
+ "serde",
+ "serde_json",
+]
 
 [[package]]
 name = "csilgen-transport"
@@ -795,6 +884,16 @@ dependencies = [
  "serde_json",
  "tempfile",
  "wasmtime",
+]
+
+[[package]]
+name = "csilgen-zig-generator"
+version = "0.1.0"
+dependencies = [
+ "convert_case",
+ "csilgen-common",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

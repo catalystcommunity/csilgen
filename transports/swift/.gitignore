@@ -1,0 +1,9 @@
+# SwiftPM build output and the resolved-dependency lock (no deps to pin; not committed).
+.build/
+Package.resolved
+
+# Editor/Xcode scratch.
+.swiftpm/
+*.xcodeproj
+DerivedData/
+.DS_Store

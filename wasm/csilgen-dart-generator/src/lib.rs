@@ -1,0 +1,1539 @@
+//! Dart code generator for csilgen (WASM module).
+//!
+//! Discovered dynamically as `--target dart` from `csilgen_dart_generator.wasm`.
+//! Emits idiomatic Dart 3 source: `final class` records with const constructors
+//! and `required` named params, `sealed class` hierarchies for output choices
+//! (exhaustive `switch`), transport-agnostic clients, server handler interfaces,
+//! and verbose/compact routers. The generator emits *shapes and routing only*,
+//! never wire bytes — the `csilgen_transport` package owns the CBOR wire.
+
+use convert_case::{Case, Casing};
+use csilgen_common::{
+    CsilControlOperator, CsilFieldMetadata, CsilFieldVisibility, CsilGroupEntry,
+    CsilGroupExpression, CsilGroupKey, CsilLiteralValue, CsilOccurrence, CsilRuleType,
+    CsilServiceDefinition, CsilServiceDirection, CsilSizeConstraint, CsilSpecSerialized,
+    CsilTypeExpression, CsilValidationConstraint, CsilgenError, GeneratedFile, GeneratedFiles,
+    GenerationStats, GeneratorCapability, GeneratorConfig, GeneratorMetadata, GeneratorWarning,
+    Result, WasmGeneratorInput, WasmGeneratorOutput, wasm_interface::*,
+};
+
+// ---------------------------------------------------------------------------
+// WASM exports
+// ---------------------------------------------------------------------------
+
+#[unsafe(no_mangle)]
+pub extern "C" fn get_metadata() -> *const u8 {
+    let metadata = GeneratorMetadata {
+        name: "dart-generator".to_string(),
+        version: "1.0.0".to_string(),
+        description: "Dart code generator (Dart 3, pure-Dart, Flutter-compatible)".to_string(),
+        target: "dart".to_string(),
+        capabilities: vec![
+            GeneratorCapability::BasicTypes,
+            GeneratorCapability::ComplexStructures,
+            GeneratorCapability::Services,
+            GeneratorCapability::FieldMetadata,
+            GeneratorCapability::FieldVisibility,
+            GeneratorCapability::ValidationConstraints,
+        ],
+        author: Some("CSIL Team".to_string()),
+        homepage: None,
+    };
+    write_json(&metadata) as *const u8
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn allocate(size: usize) -> *mut u8 {
+    let mut buf = Vec::with_capacity(size);
+    let ptr = buf.as_mut_ptr();
+    std::mem::forget(buf);
+    ptr
+}
+
+#[unsafe(no_mangle)]
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub extern "C" fn deallocate(ptr: *mut u8, size: usize) {
+    if !ptr.is_null() && size > 0 {
+        unsafe {
+            let _ = Vec::from_raw_parts(ptr, 0, size);
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn generate(input_ptr: *const u8, input_len: usize) -> *mut u8 {
+    match process_generation(input_ptr, input_len) {
+        Ok(output) => write_json(&output),
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
+fn write_json<T: serde::Serialize>(value: &T) -> *mut u8 {
+    let json = match serde_json::to_string(value) {
+        Ok(j) => j,
+        Err(_) => return std::ptr::null_mut(),
+    };
+    let bytes = json.as_bytes();
+    let ptr = allocate(bytes.len() + 4);
+    if ptr.is_null() {
+        return std::ptr::null_mut();
+    }
+    unsafe {
+        std::ptr::write(ptr as *mut u32, bytes.len() as u32);
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr.add(4), bytes.len());
+    }
+    ptr
+}
+
+fn process_generation(
+    input_ptr: *const u8,
+    input_len: usize,
+) -> std::result::Result<WasmGeneratorOutput, i32> {
+    if input_ptr.is_null() || input_len == 0 || input_len > MAX_INPUT_SIZE {
+        return Err(error_codes::INVALID_INPUT);
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(input_ptr, input_len) };
+    let s = std::str::from_utf8(bytes).map_err(|_| error_codes::INVALID_INPUT)?;
+    let input: WasmGeneratorInput =
+        serde_json::from_str(s).map_err(|_| error_codes::SERIALIZATION_ERROR)?;
+
+    let files = generate_dart_code(&input.csil_spec, &input.config)
+        .map_err(|_| error_codes::GENERATION_ERROR)?;
+
+    let stats = GenerationStats {
+        files_generated: files.len(),
+        total_size_bytes: files.iter().map(|f| f.content.len()).sum(),
+        services_count: input.csil_spec.service_count,
+        fields_with_metadata_count: input.csil_spec.fields_with_metadata_count,
+        generation_time_ms: 0,
+        peak_memory_bytes: None,
+    };
+    Ok(WasmGeneratorOutput {
+        files,
+        warnings: Vec::<GeneratorWarning>::new(),
+        stats,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Identifier mapping
+// ---------------------------------------------------------------------------
+
+// Dart reserved words / built-in identifiers that cannot be a plain member or
+// type name. A CSIL name colliding with one is suffixed with `_` (a valid and
+// idiomatic Dart escape) so the generated source still compiles. The wire key is
+// never touched by this — only the Dart identifier is.
+const DART_RESERVED: &[&str] = &[
+    "abstract",
+    "as",
+    "assert",
+    "async",
+    "await",
+    "base",
+    "break",
+    "case",
+    "catch",
+    "class",
+    "const",
+    "continue",
+    "covariant",
+    "default",
+    "deferred",
+    "do",
+    "dynamic",
+    "else",
+    "enum",
+    "export",
+    "extends",
+    "extension",
+    "external",
+    "factory",
+    "false",
+    "final",
+    "finally",
+    "for",
+    "Function",
+    "get",
+    "hide",
+    "if",
+    "implements",
+    "import",
+    "in",
+    "interface",
+    "is",
+    "late",
+    "library",
+    "mixin",
+    "new",
+    "null",
+    "on",
+    "operator",
+    "part",
+    "required",
+    "rethrow",
+    "return",
+    "sealed",
+    "set",
+    "show",
+    "static",
+    "super",
+    "switch",
+    "sync",
+    "this",
+    "throw",
+    "true",
+    "try",
+    "typedef",
+    "var",
+    "void",
+    "when",
+    "while",
+    "with",
+    "yield",
+];
+
+fn escape_reserved(name: &str) -> String {
+    if DART_RESERVED.contains(&name) {
+        format!("{name}_")
+    } else {
+        name.to_string()
+    }
+}
+
+/// A Dart type name: `UpperCamelCase`. CSIL types are already PascalCase, so this
+/// is effectively identity, but normalizing guards against snake/kebab spellings.
+fn dart_type_name(name: &str) -> String {
+    escape_reserved(&name.to_case(Case::Pascal))
+}
+
+/// A Dart member name: `lowerCamelCase`, with a reserved-word guard.
+fn dart_member_name(name: &str) -> String {
+    escape_reserved(&name.to_case(Case::Camel))
+}
+
+/// The verbatim wire key for a group entry's key — never case-transformed, so a
+/// Dart client and a Go/Python/TS peer agree on the CBOR map keys.
+fn wire_key(key: &CsilGroupKey) -> Option<String> {
+    match key {
+        CsilGroupKey::Bare(name) => Some(name.clone()),
+        CsilGroupKey::Literal(CsilLiteralValue::Text(name)) => Some(name.clone()),
+        _ => None,
+    }
+}
+
+/// The Dart member name plus verbatim wire key for an entry, or `None` for a
+/// keyless/typed-key entry that has no stable name (skipped consistently across
+/// every emitter so a field is never half-declared).
+fn entry_names(entry: &CsilGroupEntry) -> Option<(String, String)> {
+    let wire = match &entry.key {
+        Some(key) => wire_key(key)?,
+        None => match &entry.value_type {
+            CsilTypeExpression::Reference(name) | CsilTypeExpression::Builtin(name) => name.clone(),
+            _ => return None,
+        },
+    };
+    Some((dart_member_name(&wire), wire))
+}
+
+// ---------------------------------------------------------------------------
+// Type mapping
+// ---------------------------------------------------------------------------
+
+/// In-memory Dart type chosen for the CSIL `decimal` core type. The wire form is
+/// CBOR tag 4 either way; this only changes the generated field's static type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DecimalMapping {
+    /// Emit a self-contained `CsilDecimal` helper (no third-party dependency).
+    Csil,
+    /// Use `package:decimal`'s `Decimal`.
+    Library,
+}
+
+struct DartConfig {
+    decimal_mapping: DecimalMapping,
+    library_name: String,
+}
+
+impl DartConfig {
+    fn decimal_dart_type(&self) -> &'static str {
+        match self.decimal_mapping {
+            DecimalMapping::Csil => "CsilDecimal",
+            DecimalMapping::Library => "Decimal",
+        }
+    }
+}
+
+/// Map a CSIL type expression to its idiomatic Dart type. Optional occurrence
+/// becomes a nullable `T?`. A fixed-shape tuple becomes a Dart 3 record type
+/// (positional, or named when its entries are keyed) — the one place Dart 3's
+/// records beat the older generators' anonymous-struct fallbacks.
+fn map_type(
+    type_expr: &CsilTypeExpression,
+    occurrence: &Option<CsilOccurrence>,
+    decimal: &str,
+) -> String {
+    let base = match type_expr {
+        CsilTypeExpression::Builtin(name) => match name.as_str() {
+            "int" | "uint" => "int".to_string(),
+            "float" => "double".to_string(),
+            // `tstr`/`bstr` are the CDDL spellings; map identically to text/bytes.
+            "text" | "tstr" => "String".to_string(),
+            "bytes" | "bstr" => "Uint8List".to_string(),
+            "bool" => "bool".to_string(),
+            // CBOR tag 0, RFC3339, UTC; Dart's DateTime carries it (kept UTC).
+            "timestamp" => "DateTime".to_string(),
+            "decimal" => decimal.to_string(),
+            // `any`/`null`/`nil` carry no single static type — `Object?` is Dart's
+            // top type and is already nullable, so the occurrence guard below won't
+            // double the `?`.
+            "any" | "nil" | "null" => "Object?".to_string(),
+            other => dart_type_name(other),
+        },
+        CsilTypeExpression::Reference(name) => dart_type_name(name),
+        CsilTypeExpression::Array { element_type, .. } => {
+            format!("List<{}>", map_type(element_type, &None, decimal))
+        }
+        CsilTypeExpression::Map { key, value, .. } => {
+            format!(
+                "Map<{}, {}>",
+                map_type(key, &None, decimal),
+                map_type(value, &None, decimal)
+            )
+        }
+        CsilTypeExpression::Tuple(group) => dart_record_type(group, decimal),
+        CsilTypeExpression::Constrained { base_type, .. } => {
+            // `.size`/`.regex`/comparison constraints are validation, not a type;
+            // map the base and re-apply occurrence at the outer call.
+            return map_type(base_type, occurrence, decimal);
+        }
+        // A choice of text plus string literals (`text / "a" / "b"`) is a closed
+        // string set — its wire form is just the string, so `String` is both
+        // idiomatic and what the (de)serialization cast expects.
+        CsilTypeExpression::Choice(choices) if is_string_choice(choices) => "String".to_string(),
+        // Other inline choices/compound forms have no single static Dart type;
+        // `Object?` keeps the field usable while a top-level choice rule gets a
+        // proper sealed hierarchy.
+        _ => "Object?".to_string(),
+    };
+
+    // `Object?` (and any other already-nullable mapping) must not gain a second
+    // `?` — `Object??` is a syntax error.
+    match occurrence {
+        Some(CsilOccurrence::Optional) if !base.ends_with('?') => format!("{base}?"),
+        _ => base,
+    }
+}
+
+/// A choice whose members are all `text`/`tstr` and string literals — a closed
+/// string set. Mapped to `String` (see `map_type`) rather than a sealed class,
+/// because the wire form is the literal string itself.
+fn is_string_choice(choices: &[CsilTypeExpression]) -> bool {
+    !choices.is_empty()
+        && choices
+            .iter()
+            .any(|c| matches!(c, CsilTypeExpression::Literal(CsilLiteralValue::Text(_))))
+        && choices.iter().all(|c| {
+            matches!(c, CsilTypeExpression::Builtin(n) if n == "text" || n == "tstr")
+                || matches!(c, CsilTypeExpression::Literal(CsilLiteralValue::Text(_)))
+        })
+}
+
+/// A Dart 3 record type for a CSIL tuple: `(int, String)` positional, or
+/// `({int tag, String value})` when every slot is keyed.
+fn dart_record_type(group: &CsilGroupExpression, decimal: &str) -> String {
+    let all_keyed =
+        !group.entries.is_empty() && group.entries.iter().all(|e| wire_key_of_entry(e).is_some());
+    if all_keyed {
+        let fields: Vec<String> = group
+            .entries
+            .iter()
+            .map(|e| {
+                let name = dart_member_name(&wire_key_of_entry(e).unwrap());
+                format!("{} {name}", map_type(&e.value_type, &e.occurrence, decimal))
+            })
+            .collect();
+        format!("({{{}}})", fields.join(", "))
+    } else {
+        let fields: Vec<String> = group
+            .entries
+            .iter()
+            .map(|e| map_type(&e.value_type, &e.occurrence, decimal))
+            .collect();
+        format!("({})", fields.join(", "))
+    }
+}
+
+fn wire_key_of_entry(entry: &CsilGroupEntry) -> Option<String> {
+    entry.key.as_ref().and_then(wire_key)
+}
+
+// ---------------------------------------------------------------------------
+// Spec walking helpers
+// ---------------------------------------------------------------------------
+
+fn type_uses_builtin(type_expr: &CsilTypeExpression, builtin: &str) -> bool {
+    match type_expr {
+        CsilTypeExpression::Builtin(name) => name == builtin,
+        CsilTypeExpression::Array { element_type, .. } => type_uses_builtin(element_type, builtin),
+        CsilTypeExpression::Map { key, value, .. } => {
+            type_uses_builtin(key, builtin) || type_uses_builtin(value, builtin)
+        }
+        CsilTypeExpression::Choice(choices) => {
+            choices.iter().any(|c| type_uses_builtin(c, builtin))
+        }
+        CsilTypeExpression::Constrained { base_type, .. } => type_uses_builtin(base_type, builtin),
+        CsilTypeExpression::Group(group) | CsilTypeExpression::Tuple(group) => group
+            .entries
+            .iter()
+            .any(|e| type_uses_builtin(&e.value_type, builtin)),
+        _ => false,
+    }
+}
+
+fn spec_uses_builtin(spec: &CsilSpecSerialized, builtin: &str) -> bool {
+    spec.rules.iter().any(|rule| match &rule.rule_type {
+        CsilRuleType::GroupDef(group) => group
+            .entries
+            .iter()
+            .any(|e| type_uses_builtin(&e.value_type, builtin)),
+        CsilRuleType::TypeDef(t) => type_uses_builtin(t, builtin),
+        CsilRuleType::TypeChoice(cs) => cs.iter().any(|c| type_uses_builtin(c, builtin)),
+        CsilRuleType::GroupChoice(gs) => gs.iter().any(|g| {
+            g.entries
+                .iter()
+                .any(|e| type_uses_builtin(&e.value_type, builtin))
+        }),
+        CsilRuleType::ServiceDef(svc) => svc.operations.iter().any(|op| {
+            type_uses_builtin(&op.input_type, builtin)
+                || type_uses_builtin(&op.output_type, builtin)
+        }),
+    })
+}
+
+/// A push op (`-> Event`) carries a `null` input type: the unary client method
+/// then takes no request parameter and the router decodes no body.
+fn is_null_input(type_expr: &CsilTypeExpression) -> bool {
+    matches!(type_expr, CsilTypeExpression::Builtin(name) if name == "null" || name == "nil")
+}
+
+/// Reduce an output choice to its success type by dropping a top-level
+/// `ServiceError` arm — the error half is surfaced by the transport, not returned.
+fn success_type(type_expr: &CsilTypeExpression) -> CsilTypeExpression {
+    if let CsilTypeExpression::Choice(choices) = type_expr {
+        let kept: Vec<CsilTypeExpression> = choices
+            .iter()
+            .filter(|c| !matches!(c, CsilTypeExpression::Reference(name) if name == "ServiceError"))
+            .cloned()
+            .collect();
+        match kept.len() {
+            1 => kept.into_iter().next().unwrap(),
+            0 => type_expr.clone(),
+            _ => CsilTypeExpression::Choice(kept),
+        }
+    } else {
+        type_expr.clone()
+    }
+}
+
+fn control_operators(type_expr: &CsilTypeExpression) -> &[CsilControlOperator] {
+    match type_expr {
+        CsilTypeExpression::Constrained { constraints, .. } => constraints,
+        _ => &[],
+    }
+}
+
+fn service_has_channel_ops(def: &CsilServiceDefinition) -> bool {
+    def.operations
+        .iter()
+        .any(|op| !matches!(op.direction, CsilServiceDirection::Unidirectional))
+}
+
+fn field_description(metadata: &[CsilFieldMetadata]) -> Option<&str> {
+    metadata.iter().find_map(|m| match m {
+        CsilFieldMetadata::Description(d) => Some(d.as_str()),
+        _ => None,
+    })
+}
+
+fn field_visibility(metadata: &[CsilFieldMetadata]) -> CsilFieldVisibility {
+    metadata
+        .iter()
+        .find_map(|m| match m {
+            CsilFieldMetadata::Visibility(v) => Some(v.clone()),
+            _ => None,
+        })
+        .unwrap_or(CsilFieldVisibility::Bidirectional)
+}
+
+// ---------------------------------------------------------------------------
+// Literals & strings
+// ---------------------------------------------------------------------------
+
+/// A safely-escaped single-quoted Dart string literal. Dart strings interpolate
+/// `$` and `${...}`, so both the quote and the dollar must be escaped to keep an
+/// arbitrary message/pattern a literal.
+fn dart_string_lit(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('\'');
+    for ch in s.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '\'' => out.push_str("\\'"),
+            '$' => out.push_str("\\$"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c => out.push(c),
+        }
+    }
+    out.push('\'');
+    out
+}
+
+fn literal_to_dart(value: &CsilLiteralValue) -> String {
+    match value {
+        CsilLiteralValue::Text(t) => dart_string_lit(t),
+        CsilLiteralValue::Integer(n) => n.to_string(),
+        CsilLiteralValue::Float(f) => f.to_string(),
+        CsilLiteralValue::Bool(b) => b.to_string(),
+        CsilLiteralValue::Null => "null".to_string(),
+        CsilLiteralValue::Bytes(b) => {
+            let nums: Vec<String> = b.iter().map(|x| x.to_string()).collect();
+            format!("Uint8List.fromList([{}])", nums.join(", "))
+        }
+        CsilLiteralValue::Array(items) => {
+            let elems: Vec<String> = items.iter().map(literal_to_dart).collect();
+            format!("[{}]", elems.join(", "))
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Generation entry point
+// ---------------------------------------------------------------------------
+
+enum Surface {
+    Server,
+    Client,
+    TypesOnly,
+}
+
+/// Generate Dart source from a serialized CSIL spec. Public so the crate's
+/// integration tests can assert on the emitted Dart without going through the
+/// WASM boundary.
+pub fn generate_dart_code(
+    spec: &CsilSpecSerialized,
+    config: &GeneratorConfig,
+) -> Result<GeneratedFiles> {
+    let decimal_mapping = match config.options.get("decimal_mapping") {
+        None => DecimalMapping::Csil,
+        Some(v) => match v.as_str() {
+            Some("csil") => DecimalMapping::Csil,
+            Some("library") => DecimalMapping::Library,
+            other => {
+                return Err(CsilgenError::GenerationError(format!(
+                    "Unknown decimal_mapping {other:?}. Supported: \"csil\", \"library\""
+                )));
+            }
+        },
+    };
+    let library_name = config
+        .options
+        .get("library_name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("models")
+        .to_string();
+
+    let surface = match config.target.as_str() {
+        "dart" | "dart-server" => Surface::Server,
+        "dart-client" => Surface::Client,
+        "dart-typesonly" => Surface::TypesOnly,
+        other => {
+            return Err(CsilgenError::GenerationError(format!(
+                "Unknown dart sub-target '{other}'. Supported: dart, dart-server, dart-client, dart-typesonly"
+            )));
+        }
+    };
+
+    let cfg = DartConfig {
+        decimal_mapping,
+        library_name,
+    };
+    let dart = DartGenerator { cfg };
+    dart.generate(spec, surface)
+}
+
+struct DartGenerator {
+    cfg: DartConfig,
+}
+
+impl DartGenerator {
+    fn generate(&self, spec: &CsilSpecSerialized, surface: Surface) -> Result<GeneratedFiles> {
+        let mut files = Vec::new();
+
+        let mut types_code = String::new();
+        for rule in &spec.rules {
+            match &rule.rule_type {
+                CsilRuleType::TypeDef(type_expr) => {
+                    types_code.push_str(&self.generate_type_def(&rule.name, type_expr));
+                }
+                CsilRuleType::GroupDef(group) => {
+                    types_code.push_str(&self.generate_record(&rule.name, group));
+                }
+                CsilRuleType::TypeChoice(choices) => {
+                    types_code.push_str(&self.generate_sealed_choice(&rule.name, choices));
+                }
+                CsilRuleType::GroupChoice(groups) => {
+                    types_code.push_str(&self.generate_group_choice(&rule.name, groups));
+                }
+                CsilRuleType::ServiceDef(_) => {}
+            }
+        }
+
+        let has_types = !types_code.is_empty();
+        if has_types {
+            files.push(GeneratedFile {
+                path: "types.gen.dart".to_string(),
+                content: self.file_header("Generated CSIL types.", &[], &types_code),
+            });
+        }
+
+        // The exact-decimal helper rides alongside the types under the default
+        // (csil) mapping when the spec actually uses `decimal`; the library
+        // mapping pulls `Decimal` from package:decimal instead.
+        if self.cfg.decimal_mapping == DecimalMapping::Csil && spec_uses_builtin(spec, "decimal") {
+            files.push(GeneratedFile {
+                path: "csil_decimal.gen.dart".to_string(),
+                content: CSIL_DECIMAL_DART.to_string(),
+            });
+        }
+
+        if spec.service_count > 0 {
+            let mut services_code = String::new();
+            for rule in &spec.rules {
+                if let CsilRuleType::ServiceDef(service) = &rule.rule_type {
+                    match surface {
+                        Surface::TypesOnly => {}
+                        Surface::Client => {
+                            services_code.push_str(&self.generate_client(&rule.name, service));
+                            services_code.push_str(&self.generate_wire_ids(&rule.name, service));
+                        }
+                        Surface::Server => {
+                            services_code.push_str(&self.generate_server(&rule.name, service));
+                            services_code.push_str(&self.generate_wire_ids(&rule.name, service));
+                        }
+                    }
+                }
+            }
+            if !services_code.is_empty() {
+                let (title, prelude) = match surface {
+                    Surface::Client => ("Generated service clients.", CLIENT_PRELUDE_DART),
+                    _ => (
+                        "Generated service handlers and routers.",
+                        SERVER_PRELUDE_DART,
+                    ),
+                };
+                let mut body = String::new();
+                body.push_str(prelude);
+                body.push('\n');
+                body.push_str(&services_code);
+                // The routers/clients/handlers name the generated request/response
+                // types, so the services file must import the types library.
+                let extra = if has_types {
+                    vec!["types.gen.dart".to_string()]
+                } else {
+                    Vec::new()
+                };
+                files.push(GeneratedFile {
+                    path: "services.gen.dart".to_string(),
+                    content: self.file_header(title, &extra, &body),
+                });
+            }
+        }
+
+        // A barrel that re-exports the generated parts, mirroring Python's
+        // `__init__.py` and the Go package — one import for the consumer.
+        if !files.is_empty() {
+            let mut barrel = String::from("// Code generated by csilgen; DO NOT EDIT.\n\n");
+            for f in &files {
+                barrel.push_str(&format!("export '{}';\n", f.path));
+            }
+            files.push(GeneratedFile {
+                path: format!("{}.gen.dart", self.cfg.library_name),
+                content: barrel,
+            });
+        }
+
+        Ok(files)
+    }
+
+    /// Render a generated file: the banner, the imports `body` actually needs
+    /// (each emitted only when referenced, so no `unused_import` slips through),
+    /// then the body. `extra` carries cross-file dependencies the caller knows
+    /// about (e.g. the services file depending on the types file).
+    fn file_header(&self, title: &str, extra: &[String], body: &str) -> String {
+        let mut imports: Vec<String> = Vec::new();
+        // Bytes come in as Uint8List; pull the import only when something needs it.
+        if body.contains("Uint8List") {
+            imports.push("dart:typed_data".to_string());
+        }
+        if let Some(dec) = self.decimal_import(body) {
+            imports.push(dec.to_string());
+        }
+        imports.extend(extra.iter().cloned());
+
+        let mut out = String::new();
+        out.push_str(&format!("// {title}\n//\n"));
+        out.push_str("// Code generated by csilgen; DO NOT EDIT.\n\n");
+        for imp in &imports {
+            out.push_str(&format!("import '{imp}';\n"));
+        }
+        if !imports.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(body);
+        out
+    }
+
+    /// The import a body needs for the chosen `decimal` mapping, or `None` when it
+    /// references no decimal value. The two mappings live in different places: the
+    /// generated helper file vs. the third-party `package:decimal`.
+    fn decimal_import(&self, body: &str) -> Option<&'static str> {
+        if !body.contains(self.cfg.decimal_dart_type()) {
+            return None;
+        }
+        Some(match self.cfg.decimal_mapping {
+            DecimalMapping::Csil => "csil_decimal.gen.dart",
+            DecimalMapping::Library => "package:decimal/decimal.dart",
+        })
+    }
+
+    // -- Records ------------------------------------------------------------
+
+    fn generate_type_def(&self, name: &str, type_expr: &CsilTypeExpression) -> String {
+        // `Name = { ... }` parses to a TypeDef carrying a Group: emit a real
+        // record class so it keeps field-level typing, as the other generators do.
+        if let CsilTypeExpression::Group(group) = type_expr {
+            return self.generate_record(name, group);
+        }
+        if let CsilTypeExpression::Choice(choices) = type_expr {
+            return self.generate_sealed_choice(name, choices);
+        }
+        let class_name = dart_type_name(name);
+        let dart_type = map_type(type_expr, &None, self.cfg.decimal_dart_type());
+        format!("typedef {class_name} = {dart_type};\n\n")
+    }
+
+    fn generate_record(&self, name: &str, group: &CsilGroupExpression) -> String {
+        let class_name = dart_type_name(name);
+        let decimal = self.cfg.decimal_dart_type();
+        let mut out = String::new();
+        out.push_str(&format!("final class {class_name} {{\n"));
+
+        let named: Vec<(String, String, &CsilGroupEntry)> = group
+            .entries
+            .iter()
+            .filter_map(|e| entry_names(e).map(|(m, w)| (m, w, e)))
+            .collect();
+
+        // Fields.
+        for (member, _wire, entry) in &named {
+            if let Some(desc) = field_description(&entry.metadata) {
+                out.push_str(&format!("  /// {desc}\n"));
+            }
+            let ty = map_type(&entry.value_type, &entry.occurrence, decimal);
+            out.push_str(&format!("  final {ty} {member};\n"));
+        }
+        if named.is_empty() {
+            out.push_str("  // (no named fields)\n");
+        }
+        out.push('\n');
+
+        // Const constructor with required named params (optional fields are not
+        // required so a caller can omit them).
+        out.push_str(&format!("  const {class_name}({{\n"));
+        for (member, _wire, entry) in &named {
+            let optional = matches!(entry.occurrence, Some(CsilOccurrence::Optional));
+            if optional {
+                out.push_str(&format!("    this.{member},\n"));
+            } else {
+                out.push_str(&format!("    required this.{member},\n"));
+            }
+        }
+        out.push_str("  });\n\n");
+
+        out.push_str(&self.generate_to_map(&named));
+        out.push_str(&self.generate_from_map(&class_name, &named));
+        out.push_str(&self.generate_validate(&named));
+        out.push_str(&self.generate_equality(&class_name, &named));
+
+        out.push_str("}\n\n");
+        out
+    }
+
+    /// `toMap` maps each Dart member onto its verbatim wire key. A send-only field
+    /// is omitted (`@receive-only` excludes it from the inverse), and an absent
+    /// optional is dropped so it stays off the wire rather than encoding a null.
+    fn generate_to_map(&self, named: &[(String, String, &CsilGroupEntry)]) -> String {
+        let mut out = String::new();
+        out.push_str("  Map<String, Object?> toMap() {\n");
+        out.push_str("    final map = <String, Object?>{};\n");
+        for (member, wire, entry) in named {
+            if matches!(
+                field_visibility(&entry.metadata),
+                CsilFieldVisibility::ReceiveOnly
+            ) {
+                continue;
+            }
+            let wire_lit = dart_string_lit(wire);
+            if matches!(entry.occurrence, Some(CsilOccurrence::Optional)) {
+                out.push_str(&format!(
+                    "    if ({member} != null) map[{wire_lit}] = {member};\n"
+                ));
+            } else {
+                out.push_str(&format!("    map[{wire_lit}] = {member};\n"));
+            }
+        }
+        out.push_str("    return map;\n  }\n\n");
+        out
+    }
+
+    fn generate_from_map(
+        &self,
+        class_name: &str,
+        named: &[(String, String, &CsilGroupEntry)],
+    ) -> String {
+        let decimal = self.cfg.decimal_dart_type();
+        let mut out = String::new();
+        out.push_str(&format!(
+            "  factory {class_name}.fromMap(Map<String, Object?> map) {{\n"
+        ));
+        out.push_str(&format!("    return {class_name}(\n"));
+        // Every declared field is read back: the const constructor's `required`
+        // named params must all be supplied, so visibility can't drop a field here
+        // the way `toMap` drops a receive-only one (a map has no such obligation).
+        for (member, wire, entry) in named {
+            let wire_lit = dart_string_lit(wire);
+            let ty = map_type(&entry.value_type, &entry.occurrence, decimal);
+            // A cast keeps the typed field honest; `as T?` tolerates an absent key.
+            // A field already typed `Object?` matches the map's own value type, so
+            // casting it would be a redundant (lint-flagged) no-op.
+            if ty == "Object?" {
+                out.push_str(&format!("      {member}: map[{wire_lit}],\n"));
+            } else {
+                out.push_str(&format!("      {member}: map[{wire_lit}] as {ty},\n"));
+            }
+        }
+        out.push_str("    );\n  }\n\n");
+        out
+    }
+
+    /// Emit `validate()` collecting guards from both constraint systems. Only
+    /// emitted when at least one guard exists, so an unconstrained record stays bare.
+    fn generate_validate(&self, named: &[(String, String, &CsilGroupEntry)]) -> String {
+        let mut body = String::new();
+        for (member, _wire, entry) in named {
+            let optional = matches!(entry.occurrence, Some(CsilOccurrence::Optional));
+            for meta in &entry.metadata {
+                if let CsilFieldMetadata::Constraint(c) = meta {
+                    body.push_str(&self.annotation_guard(member, c, &entry.value_type, optional));
+                }
+            }
+            for op in control_operators(&entry.value_type) {
+                body.push_str(&self.control_guard(member, op, optional));
+            }
+        }
+        if body.is_empty() {
+            return String::new();
+        }
+        let mut out = String::new();
+        out.push_str("  /// Throws [ArgumentError] when a field constraint is violated.\n");
+        out.push_str("  void validate() {\n");
+        out.push_str(&body);
+        out.push_str("  }\n\n");
+        out
+    }
+
+    fn guard(&self, condition: &str, message: &str) -> String {
+        // Braces (not a bare `if (..) throw`) so the body never reads as an
+        // awkwardly-wrapped line and the output honors `curly_braces_in_flow_control`.
+        format!(
+            "    if ({condition}) {{\n      throw ArgumentError({});\n    }}\n",
+            dart_string_lit(message)
+        )
+    }
+
+    /// A length/count guard that prefers `isEmpty`/`isNotEmpty` at the
+    /// empty-boundary (what `dart analyze`'s `prefer_is_empty`/`prefer_is_not_empty`
+    /// expect) and drops a vacuous `length < 0`. `cmp` is the *failure* comparison.
+    fn len_guard(
+        &self,
+        member: &str,
+        bang: &str,
+        optional: bool,
+        cmp: &str,
+        n: u64,
+        message: &str,
+    ) -> String {
+        let access = format!("{member}{bang}");
+        let cond = match (cmp, n) {
+            // `length < 0` can never hold — the guard would be dead code.
+            ("<", 0) => return String::new(),
+            ("<", 1) => format!("{access}.isEmpty"),
+            (">", 0) | ("!=", 0) => format!("{access}.isNotEmpty"),
+            ("==", 0) => format!("{access}.isEmpty"),
+            _ => format!("{access}.length {cmp} {n}"),
+        };
+        let cond = if optional {
+            format!("{member} != null && {cond}")
+        } else {
+            cond
+        };
+        self.guard(&cond, message)
+    }
+
+    /// Read expression for a (possibly nullable) member inside a guard. The guard
+    /// itself short-circuits on null via `member != null && ...`.
+    fn annotation_guard(
+        &self,
+        member: &str,
+        constraint: &CsilValidationConstraint,
+        value_type: &CsilTypeExpression,
+        optional: bool,
+    ) -> String {
+        let g = |inner: &str| -> String {
+            if optional {
+                format!("{member} != null && {inner}")
+            } else {
+                inner.to_string()
+            }
+        };
+        let bang = if optional { "!" } else { "" };
+        match constraint {
+            CsilValidationConstraint::MinLength(n) => self.len_guard(
+                member,
+                bang,
+                optional,
+                "<",
+                *n,
+                &format!("'{member}' must have length >= {n}"),
+            ),
+            CsilValidationConstraint::MaxLength(n) => self.len_guard(
+                member,
+                bang,
+                optional,
+                ">",
+                *n,
+                &format!("'{member}' must have length <= {n}"),
+            ),
+            CsilValidationConstraint::MinItems(n) => self.len_guard(
+                member,
+                bang,
+                optional,
+                "<",
+                *n,
+                &format!("'{member}' must have at least {n} items"),
+            ),
+            CsilValidationConstraint::MaxItems(n) => self.len_guard(
+                member,
+                bang,
+                optional,
+                ">",
+                *n,
+                &format!("'{member}' must have at most {n} items"),
+            ),
+            CsilValidationConstraint::MinValue(v) => {
+                let bound = self.bound_expr(v, value_type);
+                self.guard(
+                    &g(&format!("{member}{bang} < {bound}")),
+                    &format!("'{member}' must be >= {}", literal_to_dart(v)),
+                )
+            }
+            CsilValidationConstraint::MaxValue(v) => {
+                let bound = self.bound_expr(v, value_type);
+                self.guard(
+                    &g(&format!("{member}{bang} > {bound}")),
+                    &format!("'{member}' must be <= {}", literal_to_dart(v)),
+                )
+            }
+            // Advisory only — surfaces as a comment, never a hard check.
+            CsilValidationConstraint::Custom { name, .. } => {
+                format!("    // custom constraint '{name}' on '{member}' is advisory\n")
+            }
+        }
+    }
+
+    fn control_guard(&self, member: &str, op: &CsilControlOperator, optional: bool) -> String {
+        let g = |inner: &str| -> String {
+            if optional {
+                format!("{member} != null && {inner}")
+            } else {
+                inner.to_string()
+            }
+        };
+        let bang = if optional { "!" } else { "" };
+        match op {
+            CsilControlOperator::Size(size) => self.size_guard(member, size, optional),
+            CsilControlOperator::Regex(pattern) => {
+                let pat = dart_string_lit(pattern);
+                self.guard(
+                    &g(&format!("!RegExp({pat}).hasMatch({member}{bang})")),
+                    &format!("'{member}' must match pattern {pattern}"),
+                )
+            }
+            CsilControlOperator::GreaterEqual(v) => self.guard(
+                &g(&format!("{member}{bang} < {}", literal_to_dart(v))),
+                &format!("'{member}' must be >= {}", literal_to_dart(v)),
+            ),
+            CsilControlOperator::LessEqual(v) => self.guard(
+                &g(&format!("{member}{bang} > {}", literal_to_dart(v))),
+                &format!("'{member}' must be <= {}", literal_to_dart(v)),
+            ),
+            CsilControlOperator::GreaterThan(v) => self.guard(
+                &g(&format!("{member}{bang} <= {}", literal_to_dart(v))),
+                &format!("'{member}' must be > {}", literal_to_dart(v)),
+            ),
+            CsilControlOperator::LessThan(v) => self.guard(
+                &g(&format!("{member}{bang} >= {}", literal_to_dart(v))),
+                &format!("'{member}' must be < {}", literal_to_dart(v)),
+            ),
+            CsilControlOperator::Equal(v) => self.guard(
+                &g(&format!("{member}{bang} != {}", literal_to_dart(v))),
+                &format!("'{member}' must equal {}", literal_to_dart(v)),
+            ),
+            CsilControlOperator::NotEqual(v) => self.guard(
+                &g(&format!("{member}{bang} == {}", literal_to_dart(v))),
+                &format!("'{member}' must not equal {}", literal_to_dart(v)),
+            ),
+            // Default lives on the field; encoding/structural ops are wire-only.
+            _ => String::new(),
+        }
+    }
+
+    fn size_guard(&self, member: &str, size: &CsilSizeConstraint, optional: bool) -> String {
+        let bang = if optional { "!" } else { "" };
+        match size {
+            CsilSizeConstraint::Exact(n) => self.len_guard(
+                member,
+                bang,
+                optional,
+                "!=",
+                *n,
+                &format!("'{member}' must have length {n}"),
+            ),
+            CsilSizeConstraint::Min(n) => self.len_guard(
+                member,
+                bang,
+                optional,
+                "<",
+                *n,
+                &format!("'{member}' must have length >= {n}"),
+            ),
+            CsilSizeConstraint::Max(n) => self.len_guard(
+                member,
+                bang,
+                optional,
+                ">",
+                *n,
+                &format!("'{member}' must have length <= {n}"),
+            ),
+            CsilSizeConstraint::Range { min, max } => {
+                let mut out = self.len_guard(
+                    member,
+                    bang,
+                    optional,
+                    "<",
+                    *min,
+                    &format!("'{member}' must have length >= {min}"),
+                );
+                out.push_str(&self.len_guard(
+                    member,
+                    bang,
+                    optional,
+                    ">",
+                    *max,
+                    &format!("'{member}' must have length <= {max}"),
+                ));
+                out
+            }
+        }
+    }
+
+    /// A `decimal`/`timestamp` bound must be reconstructed as the matching Dart
+    /// value so the comparison is type-correct; numeric/text bounds stay literal.
+    fn bound_expr(&self, value: &CsilLiteralValue, value_type: &CsilTypeExpression) -> String {
+        let base = match value_type {
+            CsilTypeExpression::Constrained { base_type, .. } => base_type.as_ref(),
+            other => other,
+        };
+        if let CsilTypeExpression::Builtin(name) = base {
+            match name.as_str() {
+                "timestamp" => {
+                    if let CsilLiteralValue::Text(t) = value {
+                        return format!("DateTime.parse({})", dart_string_lit(t));
+                    }
+                }
+                "decimal" => {
+                    let s = match value {
+                        CsilLiteralValue::Integer(n) => n.to_string(),
+                        CsilLiteralValue::Text(t) => t.clone(),
+                        _ => return literal_to_dart(value),
+                    };
+                    return match self.cfg.decimal_mapping {
+                        DecimalMapping::Csil => {
+                            format!("CsilDecimal.parse({})", dart_string_lit(&s))
+                        }
+                        DecimalMapping::Library => {
+                            format!("Decimal.parse({})", dart_string_lit(&s))
+                        }
+                    };
+                }
+                _ => {}
+            }
+        }
+        literal_to_dart(value)
+    }
+
+    /// Value equality over fields (Dart's default is identity). Byte fields are
+    /// compared by content so a decoded record equals its source — the conformance
+    /// gotcha for reference-equality languages, applied to generated records too.
+    fn generate_equality(
+        &self,
+        class_name: &str,
+        named: &[(String, String, &CsilGroupEntry)],
+    ) -> String {
+        let has_bytes = named.iter().any(|(_, _, e)| is_bytes_type(&e.value_type));
+        let mut out = String::new();
+        out.push_str("  @override\n  bool operator ==(Object other) {\n");
+        out.push_str(&format!("    if (other is! {class_name}) return false;\n"));
+        out.push_str("    return ");
+        if named.is_empty() {
+            out.push_str("true");
+        } else {
+            let parts: Vec<String> = named
+                .iter()
+                .map(|(member, _wire, entry)| {
+                    if is_bytes_type(&entry.value_type) {
+                        format!("_bytesEqual({member}, other.{member})")
+                    } else {
+                        format!("{member} == other.{member}")
+                    }
+                })
+                .collect();
+            out.push_str(&parts.join(" &&\n        "));
+        }
+        out.push_str(";\n  }\n\n");
+
+        out.push_str("  @override\n  int get hashCode => Object.hashAll([");
+        let hash_parts: Vec<String> = named
+            .iter()
+            .map(|(member, _wire, entry)| {
+                // Byte content (not list identity) drives the hash so it agrees with
+                // `==`. A non-optional byte field can't be null, so the null branch is
+                // only emitted when the field actually is optional.
+                if is_bytes_type(&entry.value_type) {
+                    if matches!(entry.occurrence, Some(CsilOccurrence::Optional)) {
+                        format!("{member} == null ? null : Object.hashAll({member}!)")
+                    } else {
+                        format!("Object.hashAll({member})")
+                    }
+                } else {
+                    member.clone()
+                }
+            })
+            .collect();
+        out.push_str(&hash_parts.join(", "));
+        out.push_str("]);\n");
+
+        // A small content-equality helper, emitted only for records that actually
+        // carry a byte field so it never lands as an unused declaration. It stays
+        // private to the record so there is no cross-file dependency.
+        if has_bytes {
+            out.push('\n');
+            out.push_str("  static bool _bytesEqual(Uint8List? a, Uint8List? b) {\n");
+            out.push_str("    if (a == null || b == null) return a == b;\n");
+            out.push_str("    if (a.length != b.length) return false;\n");
+            out.push_str("    for (var i = 0; i < a.length; i++) {\n");
+            out.push_str("      if (a[i] != b[i]) return false;\n    }\n    return true;\n  }\n");
+        }
+        out
+    }
+
+    // -- Sealed choices -----------------------------------------------------
+
+    /// A CSIL output/type choice → a `sealed class` base with one `final class`
+    /// arm per reference member, so the host pattern-matches exhaustively. Inline
+    /// (non-reference) arms are collapsed to a single `Other` arm carrying the raw
+    /// value, since they have no nameable Dart type.
+    fn generate_sealed_choice(&self, name: &str, choices: &[CsilTypeExpression]) -> String {
+        let base = dart_type_name(name);
+        // A closed string set is a `String` alias, not a one-arm sealed class: the
+        // wire carries the bare string, so a sealed wrapper would never round-trip.
+        if is_string_choice(choices) {
+            return format!("typedef {base} = String;\n\n");
+        }
+        let mut out = String::new();
+        out.push_str(&format!(
+            "sealed class {base} {{\n  const {base}();\n}}\n\n"
+        ));
+        let mut emitted_other = false;
+        for choice in choices {
+            match choice {
+                CsilTypeExpression::Reference(ref_name) => {
+                    let arm = dart_type_name(ref_name);
+                    let inner = dart_type_name(ref_name);
+                    out.push_str(&format!(
+                        "final class {base}{arm} extends {base} {{\n  final {inner} value;\n  const {base}{arm}(this.value);\n}}\n\n"
+                    ));
+                }
+                _ => {
+                    if !emitted_other {
+                        emitted_other = true;
+                        let dart_type = map_type(choice, &None, self.cfg.decimal_dart_type());
+                        out.push_str(&format!(
+                            "final class {base}Other extends {base} {{\n  final {dart_type} value;\n  const {base}Other(this.value);\n}}\n\n"
+                        ));
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    fn generate_group_choice(&self, name: &str, groups: &[CsilGroupExpression]) -> String {
+        let base = dart_type_name(name);
+        let mut out = String::new();
+        out.push_str(&format!(
+            "sealed class {base} {{\n  const {base}();\n}}\n\n"
+        ));
+        for (i, group) in groups.iter().enumerate() {
+            let arm = format!("{base}Variant{i}");
+            // Each variant is its own record-shaped final class extending the base.
+            out.push_str(&format!("final class {arm} extends {base} {{\n"));
+            let named: Vec<(String, String, &CsilGroupEntry)> = group
+                .entries
+                .iter()
+                .filter_map(|e| entry_names(e).map(|(m, w)| (m, w, e)))
+                .collect();
+            for (member, _wire, entry) in &named {
+                let ty = map_type(
+                    &entry.value_type,
+                    &entry.occurrence,
+                    self.cfg.decimal_dart_type(),
+                );
+                out.push_str(&format!("  final {ty} {member};\n"));
+            }
+            out.push_str(&format!("  const {arm}({{"));
+            let params: Vec<String> = named
+                .iter()
+                .map(|(member, _wire, entry)| {
+                    if matches!(entry.occurrence, Some(CsilOccurrence::Optional)) {
+                        format!("this.{member}")
+                    } else {
+                        format!("required this.{member}")
+                    }
+                })
+                .collect();
+            out.push_str(&params.join(", "));
+            out.push_str("});\n}\n\n");
+        }
+        out
+    }
+
+    // -- Clients ------------------------------------------------------------
+
+    fn service_base(&self, name: &str) -> String {
+        let pascal = name.to_case(Case::Pascal);
+        pascal
+            .strip_suffix("Service")
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .unwrap_or(pascal)
+    }
+
+    fn generate_client(&self, name: &str, service: &CsilServiceDefinition) -> String {
+        let base = self.service_base(name);
+        let client = format!("{base}Client");
+        let decimal = self.cfg.decimal_dart_type();
+        // Wire service/op names stay verbatim — case transforms never leak onto the
+        // wire, so a Dart client and a Go/Python/TS peer agree on the strings.
+        let wire_service = self.service_base(name);
+        let mut out = String::new();
+        out.push_str(&format!(
+            "/// A typed, transport-agnostic client for the {name} service.\nfinal class {client} {{\n"
+        ));
+        out.push_str("  final CsilTransport transport;\n");
+        out.push_str(&format!("  const {client}(this.transport);\n\n"));
+
+        for op in &service.operations {
+            if !matches!(op.direction, CsilServiceDirection::Unidirectional) {
+                out.push_str(&format!(
+                    "  // channel operation '{}' rides the router surface\n",
+                    op.name
+                ));
+                continue;
+            }
+            let method = dart_member_name(&op.name);
+            let wire_op = dart_string_lit(&op.name);
+            let out_type = map_type(&success_type(&op.output_type), &None, decimal);
+            if is_null_input(&op.input_type) {
+                out.push_str(&format!(
+                    "  {out_type} {method}() => transport.call({}, {wire_op}, const <int>[]);\n\n",
+                    dart_string_lit(&wire_service)
+                ));
+            } else {
+                let in_type = map_type(&op.input_type, &None, decimal);
+                out.push_str(&format!(
+                    "  {out_type} {method}({in_type} request) => transport.call({}, {wire_op}, request);\n\n",
+                    dart_string_lit(&wire_service)
+                ));
+            }
+        }
+        out.push_str("}\n\n");
+        out
+    }
+
+    // -- Servers ------------------------------------------------------------
+
+    fn generate_server(&self, name: &str, service: &CsilServiceDefinition) -> String {
+        let decimal = self.cfg.decimal_dart_type();
+        let handler = format!("{}Handler", dart_type_name(name));
+        let mut out = String::new();
+
+        // Handler interface — host implements one method per operation.
+        out.push_str(&format!(
+            "/// The {name} service contract. A host `implements` this; the router\n/// dispatches decoded requests/messages to it.\nabstract interface class {handler} {{\n"
+        ));
+        for op in &service.operations {
+            let method = dart_member_name(&op.name);
+            match op.direction {
+                CsilServiceDirection::Unidirectional => {
+                    let out_type = map_type(&success_type(&op.output_type), &None, decimal);
+                    if is_null_input(&op.input_type) {
+                        out.push_str(&format!("  {out_type} {method}();\n"));
+                    } else {
+                        let in_type = map_type(&op.input_type, &None, decimal);
+                        out.push_str(&format!("  {out_type} {method}({in_type} request);\n"));
+                    }
+                }
+                CsilServiceDirection::Bidirectional => {
+                    let in_type = map_type(&op.input_type, &None, decimal);
+                    out.push_str(&format!("  void {method}({in_type} message);\n"));
+                }
+                CsilServiceDirection::Reverse => {
+                    // Server pushes only; no inbound handler method.
+                }
+            }
+        }
+        out.push_str("}\n\n");
+
+        // Verbose router: dispatch on the verbatim wire op name.
+        if service_has_channel_ops(service) {
+            out.push_str(&self.generate_router_verbose(name, service, &handler));
+            if service.wire_id.is_some() {
+                out.push_str(&self.generate_router_compact(name, service, &handler));
+            }
+        }
+        out
+    }
+
+    fn generate_router_verbose(
+        &self,
+        name: &str,
+        service: &CsilServiceDefinition,
+        handler: &str,
+    ) -> String {
+        let decimal = self.cfg.decimal_dart_type();
+        let fn_name = format!("route{}Channel", dart_type_name(name));
+        let mut out = String::new();
+        out.push_str(&format!(
+            "/// Decode one inbound channel frame and dispatch to the matching {name}\n/// method by its verbatim wire op name (verbose profile).\nvoid {fn_name}({handler} handler, CsilCodec codec, String op, List<int> data) {{\n  switch (op) {{\n"
+        ));
+        for op in &service.operations {
+            if !matches!(op.direction, CsilServiceDirection::Bidirectional) {
+                continue;
+            }
+            let method = dart_member_name(&op.name);
+            let in_type = map_type(&op.input_type, &None, decimal);
+            out.push_str(&format!("    case {}:\n", dart_string_lit(&op.name)));
+            out.push_str(&format!(
+                "      handler.{method}(codec.decode(data) as {in_type});\n      return;\n"
+            ));
+        }
+        out.push_str(
+            "    default:\n      throw ArgumentError('unknown channel op: $op');\n  }\n}\n\n",
+        );
+        out
+    }
+
+    fn generate_router_compact(
+        &self,
+        name: &str,
+        service: &CsilServiceDefinition,
+        handler: &str,
+    ) -> String {
+        let decimal = self.cfg.decimal_dart_type();
+        let fn_name = format!("route{}ChannelCompact", dart_type_name(name));
+        let mut out = String::new();
+        out.push_str(&format!(
+            "/// Compact-profile twin of route{0}Channel: dispatch by @wire-id ordinal.\n/// The profile is negotiated on the wire, so a host keeps both routers.\nvoid {fn_name}({handler} handler, CsilCodec codec, int op, List<int> data) {{\n  switch (op) {{\n",
+            dart_type_name(name)
+        ));
+        for op in &service.operations {
+            if !matches!(op.direction, CsilServiceDirection::Bidirectional) {
+                continue;
+            }
+            let Some(op_id) = op.wire_id else { continue };
+            let method = dart_member_name(&op.name);
+            let in_type = map_type(&op.input_type, &None, decimal);
+            out.push_str(&format!("    case {op_id}:\n"));
+            out.push_str(&format!(
+                "      handler.{method}(codec.decode(data) as {in_type});\n      return;\n"
+            ));
+        }
+        out.push_str(
+            "    default:\n      throw ArgumentError('unknown channel ordinal: $op');\n  }\n}\n\n",
+        );
+        out
+    }
+
+    /// `const` wire-id ordinals exposing `@wire-id(N)` so a host references them
+    /// instead of hardcoding. Additive: nothing is emitted absent a wire-id.
+    fn generate_wire_ids(&self, name: &str, service: &CsilServiceDefinition) -> String {
+        let Some(service_id) = service.wire_id else {
+            return String::new();
+        };
+        let prefix = dart_member_name(name);
+        let mut out = String::new();
+        out.push_str(&format!(
+            "// Wire-id ordinals for the {name} service (compact profiles).\n"
+        ));
+        out.push_str(&format!(
+            "const int {prefix}ServiceWireId = {service_id};\n"
+        ));
+        for op in &service.operations {
+            if let Some(op_id) = op.wire_id {
+                let op_name = dart_member_name(&op.name).to_case(Case::Pascal);
+                out.push_str(&format!("const int {prefix}Op{op_name}WireId = {op_id};\n"));
+            }
+        }
+        out.push('\n');
+        out
+    }
+}
+
+fn is_bytes_type(type_expr: &CsilTypeExpression) -> bool {
+    matches!(type_expr, CsilTypeExpression::Builtin(name) if name == "bytes" || name == "bstr")
+}
+
+// ---------------------------------------------------------------------------
+// Static preludes
+// ---------------------------------------------------------------------------
+
+/// Client scaffolding: the transport seam every generated client delegates to.
+/// The generator never owns the wire — the host injects a `CsilTransport` that
+/// encodes the request, performs the (service, op) call, and decodes the reply.
+const CLIENT_PRELUDE_DART: &str = "\
+/// The transport seam a generated client delegates to. The host implements this
+/// over `csilgen_transport` (CBOR over a frame carrier) or any other wire; the
+/// generated client never touches bytes.
+abstract interface class CsilTransport {
+  /// Encode `request`, call `service`/`op`, and return the decoded response.
+  R call<R>(String service, String op, Object? request);
+}
+";
+
+/// Server scaffolding: the codec seam the routers use to decode inbound frames.
+const SERVER_PRELUDE_DART: &str = "\
+/// The (de)serialization seam the generated routers use. The host wires this to
+/// `csilgen_transport`'s CBOR codec or anything else its protocol expects; the
+/// router itself is codec-agnostic.
+abstract interface class CsilCodec {
+  List<int> encode(Object? value);
+  Object? decode(List<int> data);
+}
+";
+
+/// The self-contained exact-decimal helper, emitted only when the spec uses
+/// `decimal` under the default (csil) mapping. CBOR tag 4 `[exponent, mantissa]`;
+/// the value is kept as exact `BigInt`s so no precision is lost. Interop with
+/// `package:decimal` is via the canonical string form, so this takes no dep on it.
+const CSIL_DECIMAL_DART: &str = r#"// The exact, base-10 `decimal` core type (CBOR tag 4: [exponent, mantissa]).
+//
+// Code generated by csilgen; DO NOT EDIT.
+
+/// An exact base-10 decimal. The value is `mantissa * 10^exponent`, kept as
+/// exact integers so no float rounding can occur. Interop with package:decimal is
+/// via [toString]/[parse] (the canonical decimal-text form both agree on).
+final class CsilDecimal implements Comparable<CsilDecimal> {
+  final int exponent;
+  final BigInt mantissa;
+  const CsilDecimal(this.exponent, this.mantissa);
+
+  /// Parse canonical decimal text (what [toString] produces) into an exact value.
+  static CsilDecimal parse(String s) {
+    var text = s.trim();
+    var negative = false;
+    if (text.startsWith('-')) {
+      negative = true;
+      text = text.substring(1);
+    } else if (text.startsWith('+')) {
+      text = text.substring(1);
+    }
+    var intPart = text;
+    var fracPart = '';
+    final dot = text.indexOf('.');
+    if (dot >= 0) {
+      intPart = text.substring(0, dot);
+      fracPart = text.substring(dot + 1);
+    }
+    var digits = intPart + fracPart;
+    if (digits.isEmpty) digits = '0';
+    var m = BigInt.parse(digits);
+    if (negative) m = -m;
+    return CsilDecimal(-fracPart.length, m);
+  }
+
+  @override
+  String toString() {
+    if (exponent == 0) return mantissa.toString();
+    if (exponent > 0) {
+      final scale = BigInt.from(10).pow(exponent);
+      return (mantissa * scale).toString();
+    }
+    final negative = mantissa.isNegative;
+    final digits = mantissa.abs().toString();
+    final scale = -exponent;
+    final sign = negative ? '-' : '';
+    if (digits.length <= scale) {
+      return '${sign}0.${'0' * (scale - digits.length)}$digits';
+    }
+    final cut = digits.length - scale;
+    return '$sign${digits.substring(0, cut)}.${digits.substring(cut)}';
+  }
+
+  @override
+  int compareTo(CsilDecimal other) {
+    var dm = mantissa;
+    var om = other.mantissa;
+    if (exponent > other.exponent) {
+      dm = dm * BigInt.from(10).pow(exponent - other.exponent);
+    } else if (other.exponent > exponent) {
+      om = om * BigInt.from(10).pow(other.exponent - exponent);
+    }
+    return dm.compareTo(om);
+  }
+
+  bool operator <(CsilDecimal other) => compareTo(other) < 0;
+  bool operator <=(CsilDecimal other) => compareTo(other) <= 0;
+  bool operator >(CsilDecimal other) => compareTo(other) > 0;
+  bool operator >=(CsilDecimal other) => compareTo(other) >= 0;
+
+  @override
+  bool operator ==(Object other) =>
+      other is CsilDecimal && compareTo(other) == 0;
+
+  @override
+  int get hashCode => toString().hashCode;
+}
+"#;
