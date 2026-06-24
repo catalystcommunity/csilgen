@@ -1,0 +1,20 @@
+[package]
+name = "csilgen-dart-generator"
+version = "0.1.0"
+edition = "2024"
+authors = ["CSIL Team"]
+license = "Apache-2.0"
+description = "Dart code generator WASM module for csilgen"
+homepage = "https://github.com/catalystcommunity/csilgen"
+repository = "https://github.com/catalystcommunity/csilgen"
+
+[lib]
+# `rlib` alongside `cdylib` so the crate's integration tests can call
+# `generate_dart_code` directly; the wasm artifact is still produced from `cdylib`.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+csilgen-common = { path = "../../crates/csilgen-common", version = "0.1.0" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+convert_case = "0.6"

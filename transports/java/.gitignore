@@ -1,0 +1,4 @@
+.gradle/
+build/
+# Maven output, when building via pom.xml instead of Gradle.
+target/

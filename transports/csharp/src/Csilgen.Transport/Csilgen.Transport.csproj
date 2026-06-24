@@ -1,0 +1,25 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- ZERO PackageReference: the shipped library is stdlib-only, matching the house zero-dependency
+       rule. The canonical CBOR codec is hand-rolled (Cbor.cs) rather than taking System.Formats.Cbor,
+       which is an out-of-band NuGet package (not in the net8.0 shared framework) and so would be a
+       real external dependency — see Cbor.cs header for the full rationale. -->
+
+  <PropertyGroup>
+    <RootNamespace>Csilgen.Transport</RootNamespace>
+    <AssemblyName>Csilgen.Transport</AssemblyName>
+    <!--
+      TODO(nuget): Publish Csilgen.Transport as a NuGet package so consumers can use
+      <PackageReference Include="Csilgen.Transport" Version="x.y.z" /> instead of a
+      submodule + ProjectReference. Requires:
+        1. Set <PackageId>, <Version>, <Authors>, <Description>, <RepositoryUrl>,
+           <PackageLicenseExpression>Apache-2.0</PackageLicenseExpression> here.
+        2. `dotnet pack -c Release` to produce the .nupkg.
+        3. Publish to nuget.org (`dotnet nuget push`) OR to a GitHub Packages NuGet
+           feed (github.com/<org>) — note: GitHub Packages still requires an
+           authenticated nuget.config (a PAT), it is NOT consumable as a bare git URL.
+      Until then, consume via git submodule + ProjectReference (see README).
+    -->
+  </PropertyGroup>
+
+</Project>

@@ -1,0 +1,6 @@
+# Dart build output and pub state — never committed.
+.dart_tool/
+.packages
+pubspec.lock
+build/
+doc/api/

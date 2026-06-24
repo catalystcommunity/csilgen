@@ -14,6 +14,16 @@ members = [
     "wasm/csilgen-go-generator",
     "wasm/csilgen-python-generator",
     "wasm/csilgen-openapi-generator",
+    "wasm/csilgen-java-generator",
+    "wasm/csilgen-csharp-generator",
+    "wasm/csilgen-c-generator",
+    "wasm/csilgen-swift-generator",
+    "wasm/csilgen-kotlin-generator",
+    "wasm/csilgen-zig-generator",
+    "wasm/csilgen-ocaml-generator",
+    "wasm/csilgen-elixir-generator",
+    "wasm/csilgen-ruby-generator",
+    "wasm/csilgen-dart-generator",
     "transports/rust",
     "tools/xtask"
 ]
@@ -68,6 +78,36 @@ opt-level = "s"  # Optimize for size
 opt-level = "s"  # Optimize for size
 
 [profile.release.package."csilgen-openapi-generator"]
+opt-level = "s"  # Optimize for size
+
+[profile.release.package."csilgen-java-generator"]
+opt-level = "s"  # Optimize for size
+
+[profile.release.package."csilgen-csharp-generator"]
+opt-level = "s"  # Optimize for size
+
+[profile.release.package."csilgen-c-generator"]
+opt-level = "s"  # Optimize for size
+
+[profile.release.package."csilgen-swift-generator"]
+opt-level = "s"  # Optimize for size
+
+[profile.release.package."csilgen-kotlin-generator"]
+opt-level = "s"  # Optimize for size
+
+[profile.release.package."csilgen-zig-generator"]
+opt-level = "s"  # Optimize for size
+
+[profile.release.package."csilgen-ocaml-generator"]
+opt-level = "s"  # Optimize for size
+
+[profile.release.package."csilgen-elixir-generator"]
+opt-level = "s"  # Optimize for size
+
+[profile.release.package."csilgen-ruby-generator"]
+opt-level = "s"  # Optimize for size
+
+[profile.release.package."csilgen-dart-generator"]
 opt-level = "s"  # Optimize for size
 
 # Development profile

@@ -1,0 +1,20 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+
+  <!-- The test project carries the ONLY NuGet references in the whole deliverable; they are
+       test-time only, so the shipped library stays dependency-free. These restore from nuget.org on
+       the first `dotnet test` (the one network step). -->
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.11.1" />
+    <PackageReference Include="xunit" Version="2.9.2" />
+    <PackageReference Include="xunit.runner.visualstudio" Version="2.8.2" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="../../src/Csilgen.Transport/Csilgen.Transport.csproj" />
+  </ItemGroup>
+
+</Project>

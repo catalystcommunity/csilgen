@@ -1,0 +1,8 @@
+# The generated C and this hand-written library target this style. clang-format
+# is optional (the sources are emitted already-formatted); a contributor who has
+# it installed gets identical output.
+BasedOnStyle: LLVM
+IndentWidth: 4
+ColumnLimit: 88
+PointerAlignment: Right
+AlignAfterOpenBracket: Align

@@ -1,0 +1,4 @@
+# .NET build output -- never commit build artifacts.
+bin/
+obj/
+*.user
