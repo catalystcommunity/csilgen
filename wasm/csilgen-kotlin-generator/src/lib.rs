@@ -274,10 +274,20 @@ fn process_generation(input: WasmGeneratorInput) -> Result<WasmGeneratorOutput, 
             path: "settings.gradle.kts".to_string(),
             content: gradle_settings_kts(&config),
         });
-        files.push(GeneratedFile {
-            path: "README.md".to_string(),
-            content: generate_readme(&input, &config, surface),
-        });
+        // Only an explicit `emit_readme: false` suppresses the README; absent or non-bool
+        // leaves the publishable package's Quickstart in place.
+        if input
+            .config
+            .options
+            .get("emit_readme")
+            .and_then(|v| v.as_bool())
+            != Some(false)
+        {
+            files.push(GeneratedFile {
+                path: "README.md".to_string(),
+                content: generate_readme(&input, &config, surface),
+            });
+        }
     }
 
     let total_size: usize = files.iter().map(|f| f.content.len()).sum();
@@ -3687,6 +3697,35 @@ mod tests {
         )]))
         .unwrap();
         assert!(pkg.files.iter().any(|f| f.path == "README.md"));
+    }
+
+    /// `emit_readme: false` suppresses only the README; the rest of the package (notably the
+    /// gradle manifests) is unchanged.
+    #[test]
+    fn emit_readme_false_suppresses_only_readme() {
+        let on = process_generation(corndogs_package_input(vec![(
+            "emit_packages",
+            serde_json::json!(["kotlin"]),
+        )]))
+        .unwrap();
+        assert!(on.files.iter().any(|f| f.path == "README.md"));
+
+        let off = process_generation(corndogs_package_input(vec![
+            ("emit_packages", serde_json::json!(["kotlin"])),
+            ("emit_readme", serde_json::json!(false)),
+        ]))
+        .unwrap();
+        assert!(!off.files.iter().any(|f| f.path == "README.md"));
+        // Everything other than the README is still emitted.
+        assert!(off.files.iter().any(|f| f.path == "build.gradle.kts"));
+        let on_without_readme: Vec<_> = on
+            .files
+            .iter()
+            .filter(|f| f.path != "README.md")
+            .map(|f| &f.path)
+            .collect();
+        let off_paths: Vec<_> = off.files.iter().map(|f| &f.path).collect();
+        assert_eq!(on_without_readme, off_paths);
     }
 
     /// The client README's Quickstart must be a complete, self-describing CSIL-RPC

@@ -915,6 +915,46 @@ fn test_package_mode_emits_mix_and_lib_layout() {
 }
 
 #[test]
+fn emit_readme_false_suppresses_only_readme() {
+    let entries = || {
+        vec![bare_entry(
+            "a",
+            CsilTypeExpression::Builtin("int".to_string()),
+        )]
+    };
+    // Default package mode: the README rides along.
+    let on = process_generation(group_input(
+        "Thing",
+        entries(),
+        opts(&[("emit_packages", serde_json::json!(["elixir"]))]),
+    ))
+    .unwrap();
+    assert!(on.files.iter().any(|f| f.path == "README.md"));
+
+    // An explicit `emit_readme: false` drops only the README.
+    let off = process_generation(group_input(
+        "Thing",
+        entries(),
+        opts(&[
+            ("emit_packages", serde_json::json!(["elixir"])),
+            ("emit_readme", serde_json::json!(false)),
+        ]),
+    ))
+    .unwrap();
+    assert!(!off.files.iter().any(|f| f.path == "README.md"));
+    // The rest of the publishable package is unchanged.
+    assert!(off.files.iter().any(|f| f.path == "mix.exs"));
+    let on_without_readme: Vec<_> = on
+        .files
+        .iter()
+        .filter(|f| f.path != "README.md")
+        .map(|f| &f.path)
+        .collect();
+    let off_paths: Vec<_> = off.files.iter().map(|f| &f.path).collect();
+    assert_eq!(on_without_readme, off_paths);
+}
+
+#[test]
 fn test_package_mode_honors_name_and_version() {
     let input = group_input(
         "Thing",

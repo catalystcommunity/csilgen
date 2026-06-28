@@ -1521,10 +1521,22 @@ impl<'a> RustCodeGenerator<'a> {
             // back to a types/codec section, mirroring the TypeScript generator.
             let client_quickstart = matches!(surface, Surface::Client)
                 && matches!(style, ClientStyle::Sync | ClientStyle::Both);
-            files.push(GeneratedFile {
-                path: "README.md".to_string(),
-                content: self.generate_readme(client_quickstart),
-            });
+            // The README is opt-out: only an explicit `emit_readme: false` suppresses
+            // it. Absent / non-bool / `true` all keep the prior behavior so existing
+            // consumers see no change.
+            let emit_readme = self
+                .input
+                .config
+                .options
+                .get("emit_readme")
+                .and_then(|v| v.as_bool())
+                != Some(false);
+            if emit_readme {
+                files.push(GeneratedFile {
+                    path: "README.md".to_string(),
+                    content: self.generate_readme(client_quickstart),
+                });
+            }
         }
 
         Ok(files)
@@ -6562,6 +6574,34 @@ mod tests {
         let lib = files.iter().find(|f| f.path == "src/lib.rs").unwrap();
         assert!(lib.content.contains("pub mod types;"));
         assert!(lib.content.contains("#[path = \"codec.gen.rs\"]"));
+    }
+
+    /// The README is opt-out: package mode emits it by default, and only an
+    /// explicit `emit_readme: false` suppresses it. Everything else about the
+    /// package (Cargo.toml, the relocated `src/` files) is unchanged either way.
+    #[test]
+    fn emit_readme_false_suppresses_only_the_readme() {
+        let mut pkg = corndogs_client_input();
+        pkg.config
+            .options
+            .insert("emit_packages".to_string(), serde_json::json!(["rust"]));
+        let with_readme = RustCodeGenerator::new(&pkg)
+            .generate()
+            .expect("generation ok");
+        assert!(with_readme.iter().any(|f| f.path == "README.md"));
+
+        let mut off = pkg.clone();
+        off.config
+            .options
+            .insert("emit_readme".to_string(), serde_json::json!(false));
+        let without_readme = RustCodeGenerator::new(&off)
+            .generate()
+            .expect("generation ok");
+        assert!(!without_readme.iter().any(|f| f.path == "README.md"));
+        // The rest of the package is untouched: only the README disappears.
+        assert!(without_readme.iter().any(|f| f.path == "Cargo.toml"));
+        assert!(without_readme.iter().any(|f| f.path == "src/lib.rs"));
+        assert!(without_readme.iter().any(|f| f.path == "src/types.rs"));
     }
 
     /// The dep-free corndogs spec must yield no `[dependencies]`, and the explicit

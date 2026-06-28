@@ -314,11 +314,25 @@ fn wrap_as_ruby_gem(
         path: format!("{gem_name}.gemspec"),
         content: emit_gemspec(&gem_name, &version),
     });
-    out.push(GeneratedFile {
-        path: "README.md".to_string(),
-        content: emit_readme(&gem_name, spec),
-    });
+    // The README is opt-out: an explicit `emit_readme: false` suppresses it, while an
+    // absent, non-bool, or `true` value keeps the default emission.
+    if emit_readme_enabled(config) {
+        out.push(GeneratedFile {
+            path: "README.md".to_string(),
+            content: emit_readme(&gem_name, spec),
+        });
+    }
     out
+}
+
+/// Whether the package README should be emitted. Only an explicit `emit_readme: false`
+/// opts out; any other value (absent, non-bool, or `true`) keeps the README.
+fn emit_readme_enabled(config: &GeneratorConfig) -> bool {
+    config
+        .options
+        .get("emit_readme")
+        .and_then(|value| value.as_bool())
+        != Some(false)
 }
 
 // ---------------------------------------------------------------------------
@@ -2507,5 +2521,26 @@ mod tests {
         // No carrier for a types-only package; the consume section appears instead.
         assert!(!readme.content.contains("class CsilRpcTransport"));
         assert!(readme.content.contains("require its generated value"));
+    }
+
+    #[test]
+    fn package_readme_opt_out_suppresses_only_readme() {
+        // By default the README is emitted alongside the rest of the gem.
+        let default_files = generate_ruby_code_from_serialized(&pingpong_spec(), &package_config())
+            .expect("package generation succeeded");
+        assert!(default_files.iter().any(|f| f.path == "README.md"));
+
+        // An explicit `emit_readme: false` suppresses only the README; everything else
+        // the package emits is unchanged.
+        let mut config = package_config();
+        config
+            .options
+            .insert("emit_readme".to_string(), serde_json::json!(false));
+        let opted_out = generate_ruby_code_from_serialized(&pingpong_spec(), &config)
+            .expect("package generation succeeded");
+        assert!(!opted_out.iter().any(|f| f.path == "README.md"));
+        assert!(opted_out.iter().any(|f| f.path == "user_client.gemspec"));
+        assert!(opted_out.iter().any(|f| f.path == "lib/user_client.rb"));
+        assert!(opted_out.iter().any(|f| f.path == "lib/types.rb"));
     }
 }

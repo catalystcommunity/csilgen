@@ -1001,13 +1001,28 @@ impl PythonGenerator {
                 path: "pyproject.toml".to_string(),
                 content: render_pyproject(&pkg),
             });
-            files.push(GeneratedFile {
-                path: "README.md".to_string(),
-                content: readme,
-            });
+            // The README is opt-out: only an explicit `emit_readme: false` suppresses
+            // it, so a missing or non-bool value (and `true`) keeps it default-on.
+            if self.wants_readme() {
+                files.push(GeneratedFile {
+                    path: "README.md".to_string(),
+                    content: readme,
+                });
+            }
         }
 
         Ok(files)
+    }
+
+    /// Whether to emit the package `README.md`. Default true; only an explicit
+    /// `emit_readme: false` suppresses it, so a missing or non-bool value (and `true`)
+    /// leaves the README in place.
+    fn wants_readme(&self) -> bool {
+        self.config
+            .options
+            .get("emit_readme")
+            .and_then(|v| v.as_bool())
+            != Some(false)
     }
 
     /// Returns the package coordinates only when `emit_packages` opts Python in.
@@ -5878,6 +5893,40 @@ print("ok")
         assert!(toml.content.contains("name = \"csilgen_client\""));
         assert!(toml.content.contains("version = \"0.1.0\""));
         assert!(files.iter().any(|f| f.path == "csilgen_client/__init__.py"));
+    }
+
+    /// In package mode the README is emitted by default, and an explicit
+    /// `emit_readme: false` suppresses only the README — `pyproject.toml` and the
+    /// relocated modules are unaffected.
+    #[test]
+    fn emit_readme_false_suppresses_only_readme_in_package_mode() {
+        let mut cfg = create_test_config(false);
+        cfg.options
+            .insert("emit_packages".to_string(), serde_json::json!(["python"]));
+
+        // Default: README present alongside the pyproject.
+        let files = generate_python_code_from_serialized(&corndogs_spec(), &cfg).unwrap();
+        assert!(
+            files.iter().any(|f| f.path == "README.md"),
+            "README must be emitted by default in package mode"
+        );
+
+        // Explicit opt-out: README gone, pyproject and modules still present.
+        cfg.options
+            .insert("emit_readme".to_string(), serde_json::json!(false));
+        let files = generate_python_code_from_serialized(&corndogs_spec(), &cfg).unwrap();
+        assert!(
+            !files.iter().any(|f| f.path == "README.md"),
+            "emit_readme: false must suppress the README"
+        );
+        assert!(
+            files.iter().any(|f| f.path == "pyproject.toml"),
+            "emit_readme: false must leave pyproject.toml untouched"
+        );
+        assert!(
+            files.iter().any(|f| f.path == "csilgen_client/__init__.py"),
+            "emit_readme: false must leave the relocated modules untouched"
+        );
     }
 
     /// Generate a real `python-client` package into a temp dir, then prove the artifact

@@ -132,6 +132,46 @@ fn go_mod_emitted_when_emit_packages_includes_go() {
 }
 
 #[test]
+fn emit_readme_false_suppresses_only_readme_in_package_mode() {
+    // Default (no emit_readme): the README accompanies the go.mod.
+    let default_files = generate_go_files(input(
+        "go-client",
+        opts(&[
+            ("package_name", serde_json::json!("echoclient")),
+            ("emit_packages", serde_json::json!(["go"])),
+        ]),
+    ))
+    .unwrap();
+    assert!(
+        find(&default_files, "README.md").is_some(),
+        "README must be emitted by default in package mode"
+    );
+
+    // Explicit opt-out: README gone, but go.mod and the source remain.
+    let opted_out = generate_go_files(input(
+        "go-client",
+        opts(&[
+            ("package_name", serde_json::json!("echoclient")),
+            ("emit_packages", serde_json::json!(["go"])),
+            ("emit_readme", serde_json::json!(false)),
+        ]),
+    ))
+    .unwrap();
+    assert!(
+        find(&opted_out, "README.md").is_none(),
+        "emit_readme: false must suppress the README"
+    );
+    assert!(
+        find(&opted_out, "go.mod").is_some(),
+        "emit_readme: false must leave go.mod untouched"
+    );
+    assert!(
+        find(&opted_out, "client.gen.go").is_some(),
+        "emit_readme: false must leave the source untouched"
+    );
+}
+
+#[test]
 fn go_mod_absent_when_emit_packages_missing() {
     let options = opts(&[("package_name", serde_json::json!("echoclient"))]);
     let files = generate_go_files(input("go-client", options)).unwrap();

@@ -206,10 +206,14 @@ fn process_generation(input: WasmGeneratorInput) -> Result<WasmGeneratorOutput, 
             path: "go.mod".to_string(),
             content: format!("module {module_path}\n\ngo 1.21\n"),
         });
-        files.push(GeneratedFile {
-            path: "README.md".to_string(),
-            content: package_readme(&input, &module_path, &config),
-        });
+        // The README is opt-out: only an explicit `emit_readme: false` suppresses it,
+        // so a missing or non-bool value (and `true`) keeps the default-on behavior.
+        if wants_readme(&input.config.options) {
+            files.push(GeneratedFile {
+                path: "README.md".to_string(),
+                content: package_readme(&input, &module_path, &config),
+            });
+        }
     }
 
     let total_size: usize = files.iter().map(|f| f.content.len()).sum();
@@ -253,6 +257,13 @@ fn emit_packages_includes_go(options: &HashMap<String, serde_json::Value>) -> bo
                 .filter_map(|v| v.as_str())
                 .any(|token| token.eq_ignore_ascii_case("go"))
         })
+}
+
+/// Whether to emit the package `README.md`. Default true; only an explicit
+/// `emit_readme: false` suppresses it, so a missing or non-bool value (and `true`)
+/// leaves the README in place.
+fn wants_readme(options: &HashMap<String, serde_json::Value>) -> bool {
+    options.get("emit_readme").and_then(|v| v.as_bool()) != Some(false)
 }
 
 /// The module path written into `go.mod`. Precedence: an explicit `go_module`

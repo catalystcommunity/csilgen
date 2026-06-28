@@ -48,10 +48,26 @@ pub fn augment(input: &WasmGeneratorInput, files: &mut Vec<GeneratedFile>) {
         path: "tsconfig.json".to_string(),
         content: TSCONFIG.to_string(),
     });
-    files.push(GeneratedFile {
-        path: "README.md".to_string(),
-        content: readme(input),
-    });
+    // The README is the one piece a consumer can opt out of: only an explicit
+    // `emit_readme: false` suppresses it, so a missing or non-bool value (and `true`)
+    // leaves the default-on behavior untouched.
+    if wants_readme(input) {
+        files.push(GeneratedFile {
+            path: "README.md".to_string(),
+            content: readme(input),
+        });
+    }
+}
+
+/// Whether to emit the package `README.md`. Default true; only an explicit
+/// `emit_readme: false` suppresses it.
+fn wants_readme(input: &WasmGeneratorInput) -> bool {
+    input
+        .config
+        .options
+        .get("emit_readme")
+        .and_then(|v| v.as_bool())
+        != Some(false)
 }
 
 /// The package README, with a copy-paste **Quickstart**. For a client package the

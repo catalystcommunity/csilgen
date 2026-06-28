@@ -236,7 +236,16 @@ fn process_generation(input: WasmGeneratorInput) -> Result<WasmGeneratorOutput, 
     // Self-contained publishable-package mode: when `emit_packages` includes "zig",
     // emit a README with a copy-paste CSIL-RPC Quickstart alongside the source, so the
     // OUTPUT directory documents how to drive the generated client end to end.
-    if emit_packages_includes_zig(&input.config.options) {
+    // `emit_readme` defaults to true; only an explicit `false` suppresses the
+    // README, so a typo or missing value never silently drops the docs.
+    if emit_packages_includes_zig(&input.config.options)
+        && input
+            .config
+            .options
+            .get("emit_readme")
+            .and_then(|v| v.as_bool())
+            != Some(false)
+    {
         files.push(GeneratedFile {
             path: "README.md".to_string(),
             content: package_readme(&input),

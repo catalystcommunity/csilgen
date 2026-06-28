@@ -188,7 +188,13 @@ fn generate_ocaml(
     if package_requested(config) {
         let pkg = package_name(spec, config);
         let version = package_version(config);
-        return Ok(wrap_as_package(spec, files, &pkg, &version));
+        return Ok(wrap_as_package(
+            spec,
+            files,
+            &pkg,
+            &version,
+            emit_readme_enabled(config),
+        ));
     }
 
     Ok(files)
@@ -277,6 +283,12 @@ fn package_version(config: &GeneratorConfig) -> String {
         .to_string()
 }
 
+/// Whether the package README should be emitted. Only an explicit `emit_readme: false`
+/// opts out; any other value (absent, non-bool, or `true`) keeps the README.
+fn emit_readme_enabled(config: &GeneratorConfig) -> bool {
+    config.options.get("emit_readme").and_then(|v| v.as_bool()) != Some(false)
+}
+
 /// Relocate the generated modules into `lib/` and prepend the dune/opam scaffolding
 /// that turns the output directory into a standalone package, plus a copy-paste
 /// `README.md` Quickstart. The generated codec is self-contained, so the emitted
@@ -286,6 +298,7 @@ fn wrap_as_package(
     files: Vec<GeneratedFile>,
     pkg: &str,
     version: &str,
+    emit_readme: bool,
 ) -> Vec<GeneratedFile> {
     let mut out = Vec::with_capacity(files.len() + 4);
     out.push(GeneratedFile {
@@ -296,10 +309,14 @@ fn wrap_as_package(
         path: format!("{pkg}.opam"),
         content: opam_file(pkg, version),
     });
-    out.push(GeneratedFile {
-        path: "README.md".to_string(),
-        content: readme(spec, pkg),
-    });
+    // The README is opt-out: an explicit `emit_readme: false` suppresses it, while an
+    // absent, non-bool, or `true` value keeps the default emission.
+    if emit_readme {
+        out.push(GeneratedFile {
+            path: "README.md".to_string(),
+            content: readme(spec, pkg),
+        });
+    }
     out.push(GeneratedFile {
         path: "lib/dune".to_string(),
         content: lib_dune_file(pkg),
