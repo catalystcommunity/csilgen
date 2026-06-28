@@ -148,6 +148,16 @@ pub fn generate_ruby_code_from_serialized(
         });
     }
 
+    // The per-type CBOR codec rides alongside the types (every surface that has the
+    // value classes can serialize them), so a typesonly consumer still gets usable,
+    // wire-ready types. Emitted only when the spec declares record types.
+    if let Some(codec) = generate_codec_file(spec) {
+        files.push(GeneratedFile {
+            path: "codec.rb".to_string(),
+            content: codec,
+        });
+    }
+
     if spec.service_count > 0 {
         match surface {
             Surface::Client => {
@@ -170,7 +180,178 @@ pub fn generate_ruby_code_from_serialized(
         }
     }
 
+    // Package mode is opt-in and additive: only when the host asks for a Ruby package
+    // does the flat set of `.rb` files become a self-contained, publishable RubyGem.
+    if emit_packages_includes(config, "ruby") {
+        return Ok(wrap_as_ruby_gem(files, config));
+    }
+
     Ok(files)
+}
+
+// ---------------------------------------------------------------------------
+// Self-contained publishable RubyGem packaging (opt-in via `emit_packages`)
+// ---------------------------------------------------------------------------
+
+/// True when `config.options["emit_packages"]` is a JSON array that contains `lang`.
+/// Parsed defensively: a missing key, a non-array value, or non-string elements all
+/// read as "not requested" rather than erroring, so a malformed option degrades to the
+/// unchanged (non-package) output.
+fn emit_packages_includes(config: &GeneratorConfig, lang: &str) -> bool {
+    config
+        .options
+        .get("emit_packages")
+        .and_then(|value| value.as_array())
+        .map(|array| array.iter().any(|element| element.as_str() == Some(lang)))
+        .unwrap_or(false)
+}
+
+/// A non-empty string option, treating absent / wrong-typed / empty as "not set".
+fn option_str<'a>(config: &'a GeneratorConfig, key: &str) -> Option<&'a str> {
+    config
+        .options
+        .get(key)
+        .and_then(|value| value.as_str())
+        .filter(|text| !text.is_empty())
+}
+
+/// The gem name: `package_name` if given, else derived from the output directory's
+/// basename, else `csilgen_client`. Always sanitized to a valid lib-file stem so
+/// `require "<gem>"` resolves `lib/<gem>.rb`.
+fn package_gem_name(config: &GeneratorConfig) -> String {
+    if let Some(name) = option_str(config, "package_name") {
+        let sanitized = sanitize_gem_name(name);
+        if !sanitized.is_empty() {
+            return sanitized;
+        }
+    }
+    // The output directory is usually named for the package, so its basename is the
+    // most meaningful fallback before the generic default.
+    let derived = config
+        .output_dir
+        .rsplit(['/', '\\'])
+        .find(|segment| !segment.is_empty())
+        .map(sanitize_gem_name)
+        .unwrap_or_default();
+    if derived.is_empty() {
+        "csilgen_client".to_string()
+    } else {
+        derived
+    }
+}
+
+/// Reduce an arbitrary name to a gem-safe `snake_case` stem: lowercase alphanumerics,
+/// every other run collapsed to a single `_`, no leading/trailing separator. Hyphens
+/// are folded to `_` rather than kept so the gem name and its single `lib/<gem>.rb`
+/// entry agree (a hyphenated gem name conventionally maps to a nested `lib/<a>/<b>.rb`).
+fn sanitize_gem_name(raw: &str) -> String {
+    let mut out = String::new();
+    let mut pending_underscore = false;
+    for ch in raw.chars() {
+        let lowered = ch.to_ascii_lowercase();
+        if lowered.is_ascii_alphanumeric() {
+            if pending_underscore && !out.is_empty() {
+                out.push('_');
+            }
+            out.push(lowered);
+            pending_underscore = false;
+        } else {
+            pending_underscore = true;
+        }
+    }
+    out
+}
+
+/// The gem version: `package_version` if it is a plausible `Gem::Version` string, else
+/// `0.1.0`. The shape check keeps a malformed option from producing a gemspec that
+/// `gem build` would reject.
+fn package_version(config: &GeneratorConfig) -> String {
+    match option_str(config, "package_version") {
+        Some(version) if is_gem_version(version) => version.to_string(),
+        _ => "0.1.0".to_string(),
+    }
+}
+
+fn is_gem_version(version: &str) -> bool {
+    version.chars().next().is_some_and(|c| c.is_ascii_digit())
+        && version
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
+}
+
+/// Repackage the flat `.rb` output as a publishable RubyGem: relocate every generated
+/// source under `lib/`, add a `lib/<gem>.rb` entry point that `require_relative`s them,
+/// and a root `<gem>.gemspec`. The relative requires inside the generated files stay
+/// valid because the whole set moves together into `lib/`.
+fn wrap_as_ruby_gem(files: Vec<GeneratedFile>, config: &GeneratorConfig) -> Vec<GeneratedFile> {
+    let gem_name = package_gem_name(config);
+    let version = package_version(config);
+
+    // The entry point loads each generated module by basename; capture them before the
+    // files are relocated under `lib/`.
+    let requires: Vec<String> = files
+        .iter()
+        .map(|file| file.path.trim_end_matches(".rb").to_string())
+        .collect();
+
+    let mut out: Vec<GeneratedFile> = files
+        .into_iter()
+        .map(|file| GeneratedFile {
+            path: format!("lib/{}", file.path),
+            content: file.content,
+        })
+        .collect();
+
+    out.push(GeneratedFile {
+        path: format!("lib/{gem_name}.rb"),
+        content: emit_gem_entry(&requires),
+    });
+    out.push(GeneratedFile {
+        path: format!("{gem_name}.gemspec"),
+        content: emit_gemspec(&gem_name, &version),
+    });
+    out
+}
+
+/// The `lib/<gem>.rb` entry point: a require_relative for each relocated source so a
+/// single `require "<gem>"` loads the whole generated surface.
+fn emit_gem_entry(requires: &[String]) -> String {
+    let mut content = String::new();
+    content.push_str(FROZEN_HEADER);
+    content.push('\n');
+    content.push_str("# Code generated by csilgen; DO NOT EDIT.\n\n");
+    for module in requires {
+        content.push_str(&format!(
+            "require_relative {}\n",
+            ruby_string_literal(module)
+        ));
+    }
+    finalize(content)
+}
+
+/// The `<gem>.gemspec`. `files` is globbed from `lib/` so it tracks whatever surface
+/// was generated, and `required_ruby_version` is `>= 3.2` because the value objects are
+/// `Data.define`. No runtime dependencies: the generated codec is self-contained.
+fn emit_gemspec(gem_name: &str, version: &str) -> String {
+    let name_lit = ruby_string_literal(gem_name);
+    let version_lit = ruby_string_literal(version);
+    let summary_lit = ruby_string_literal(&format!("CSIL-generated Ruby package {gem_name}."));
+
+    let mut content = String::new();
+    content.push_str(FROZEN_HEADER);
+    content.push('\n');
+    content.push_str("# Code generated by csilgen; DO NOT EDIT.\n\n");
+    content.push_str("Gem::Specification.new do |spec|\n");
+    content.push_str(&format!("  spec.name = {name_lit}\n"));
+    content.push_str(&format!("  spec.version = {version_lit}\n"));
+    content.push_str(&format!("  spec.summary = {summary_lit}\n"));
+    content.push_str("  spec.authors = [\"csilgen\"]\n");
+    content.push_str("  spec.license = \"Apache-2.0\"\n");
+    content.push_str("  spec.required_ruby_version = \">= 3.2\"\n");
+    content.push_str("  spec.files = Dir[\"lib/**/*.rb\"]\n");
+    content.push_str("  spec.require_paths = [\"lib\"]\n");
+    content.push_str("end\n");
+    finalize(content)
 }
 
 // ---------------------------------------------------------------------------
@@ -825,6 +1006,466 @@ fn literal_value_to_ruby(value: &CsilLiteralValue) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// Per-type CBOR codec (codec.rb)
+// ---------------------------------------------------------------------------
+//
+// Ruby has no derive/serde CBOR ecosystem and a record's wire form must match the
+// other languages byte-for-byte, so — like the C/Zig/OCaml/Dart/Swift/Go/Python
+// generators — the Ruby generator emits a self-contained per-type codec. It is the
+// one place this generator emits payload-wire bytes rather than shapes only, because
+// nothing else can. Each record's map keys are laid down in canonical RFC 8949
+// §4.2.1 order, fixed at generation time, so the bytes are stable without a runtime
+// sort.
+
+/// The CBOR encoding of a text key (major type 3 head + bytes); comparing these byte
+/// vectors lexicographically is RFC 8949 §4.2.1 key ordering, computed once at
+/// generation time so the emitted map is canonical without a runtime sort.
+fn cbor_text_key_bytes(name: &str) -> Vec<u8> {
+    let bytes = name.as_bytes();
+    let n = bytes.len() as u64;
+    let mt = 3u8 << 5;
+    let mut head = Vec::new();
+    if n < 24 {
+        head.push(mt | n as u8);
+    } else if n < 0x100 {
+        head.push(mt | 24);
+        head.push(n as u8);
+    } else {
+        head.push(mt | 25);
+        head.extend_from_slice(&(n as u16).to_be_bytes());
+    }
+    head.extend_from_slice(bytes);
+    head
+}
+
+/// The CSIL rule names that get a generated codec. Only records (which encode as a
+/// CBOR map) are covered; a `Reference` to one of these recurses into its codec.
+fn codec_record_names(spec: &CsilSpecSerialized) -> std::collections::HashSet<String> {
+    spec.rules
+        .iter()
+        .filter_map(|r| match &r.rule_type {
+            CsilRuleType::GroupDef(_) => Some(r.name.clone()),
+            CsilRuleType::TypeDef(CsilTypeExpression::Group(_)) => Some(r.name.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The transparent type aliases the codec resolves through: a `TypeDef` whose target
+/// is a map / array / scalar / reference / tuple / constrained (NOT a record group or a
+/// choice, which have their own handling). A field referencing one must encode/decode
+/// as the underlying type rather than passing the bare value through the stub.
+fn codec_aliases(
+    spec: &CsilSpecSerialized,
+) -> std::collections::HashMap<String, CsilTypeExpression> {
+    spec.rules
+        .iter()
+        .filter_map(|rule| match &rule.rule_type {
+            CsilRuleType::TypeDef(t) => match t {
+                CsilTypeExpression::Group(_) | CsilTypeExpression::Choice(_) => None,
+                other => Some((rule.name.clone(), other.clone())),
+            },
+            _ => None,
+        })
+        .collect()
+}
+
+/// A constraint wraps its base for codec purposes; the wire form is the base's.
+fn codec_unwrap(ty: &CsilTypeExpression) -> &CsilTypeExpression {
+    match ty {
+        CsilTypeExpression::Constrained { base_type, .. } => codec_unwrap(base_type),
+        other => other,
+    }
+}
+
+/// A Ruby expression building the value-tree node for `expr` (a value of the Ruby
+/// type for `ty`). The tree is plain Ruby (Integer/Float/bool/nil/String/Array/Hash)
+/// plus `CsilCbor::Tag` for the tagged core types; `CsilCbor.encode` walks it. A
+/// `bytes` field is forced to a binary String so the encoder keys it to CBOR major
+/// type 2 — the text/bytes choice is driven by the CSIL field type here, not by the
+/// runtime Ruby class (both are `String`).
+fn enc_tree(
+    ty: &CsilTypeExpression,
+    expr: &str,
+    records: &std::collections::HashSet<String>,
+    aliases: &std::collections::HashMap<String, CsilTypeExpression>,
+) -> String {
+    match codec_unwrap(ty) {
+        CsilTypeExpression::Builtin(name) => match name.as_str() {
+            "int" | "uint" | "float" | "bool" => expr.to_string(),
+            "text" | "tstr" => expr.to_string(),
+            "bytes" | "bstr" => format!("({expr}).b"),
+            "timestamp" => format!("CsilCbor::Tag.new(0, ({expr}).getutc.iso8601)"),
+            "decimal" => format!("CsilCbor::Tag.new(4, CsilCbor.decimal_to_tag({expr}))"),
+            "nil" | "null" => "nil".to_string(),
+            _ => format!("({expr})"),
+        },
+        CsilTypeExpression::Reference(name) if records.contains(name) => {
+            format!("({expr}).csil_to_tree")
+        }
+        // A reference to a transparent alias (`StringInt64Map = {* text => int}`,
+        // `Tags = [* text]`, `Uuid = text`) has no codec of its own; its Ruby value is
+        // just the underlying Hash/Array/scalar, so encode it as the underlying type and
+        // let the same `expr` flow through. A map-of-record alias recurses into the
+        // record codec via the underlying Map's value type.
+        CsilTypeExpression::Reference(name) if aliases.contains_key(name) => {
+            enc_tree(&aliases[name], expr, records, aliases)
+        }
+        CsilTypeExpression::Array { element_type, .. } => {
+            let inner = enc_tree(element_type, "csil_e", records, aliases);
+            format!("({expr}).map {{ |csil_e| {inner} }}")
+        }
+        CsilTypeExpression::Map { key, value, .. } => {
+            let ek = enc_tree(key, "csil_k", records, aliases);
+            let ev = enc_tree(value, "csil_v", records, aliases);
+            format!(
+                "({expr}).each_with_object({{}}) {{ |(csil_k, csil_v), csil_h| csil_h[{ek}] = {ev} }}"
+            )
+        }
+        _ => format!("({expr})"),
+    }
+}
+
+/// A Ruby expression decoding the value-tree node `expr` back into the Ruby value
+/// for `ty`. `decode` already returns a binary String for major type 2 and a UTF-8
+/// String for major type 3, so `text`/`bytes` need no further coercion here.
+fn dec_tree(
+    ty: &CsilTypeExpression,
+    expr: &str,
+    records: &std::collections::HashSet<String>,
+    aliases: &std::collections::HashMap<String, CsilTypeExpression>,
+) -> String {
+    match codec_unwrap(ty) {
+        CsilTypeExpression::Builtin(name) => match name.as_str() {
+            "int" | "uint" | "float" | "bool" | "text" | "tstr" | "bytes" | "bstr" => {
+                expr.to_string()
+            }
+            "timestamp" => format!("Time.iso8601(({expr}).value)"),
+            "decimal" => format!("CsilCbor.tag_to_decimal(({expr}).value)"),
+            "nil" | "null" => "nil".to_string(),
+            _ => expr.to_string(),
+        },
+        CsilTypeExpression::Reference(name) if records.contains(name) => {
+            format!("{}.csil_from_tree({expr})", ruby_class_name(name))
+        }
+        // A reference to a transparent alias decodes as its underlying type; the decoded
+        // Hash/Array/scalar is the alias's Ruby value verbatim. A map-of-record alias
+        // recurses into the record codec via the underlying Map's value type.
+        CsilTypeExpression::Reference(name) if aliases.contains_key(name) => {
+            dec_tree(&aliases[name], expr, records, aliases)
+        }
+        CsilTypeExpression::Array { element_type, .. } => {
+            let inner = dec_tree(element_type, "csil_e", records, aliases);
+            format!("({expr}).map {{ |csil_e| {inner} }}")
+        }
+        CsilTypeExpression::Map { key, value, .. } => {
+            let dk = dec_tree(key, "csil_k", records, aliases);
+            let dv = dec_tree(value, "csil_v", records, aliases);
+            format!(
+                "({expr}).each_with_object({{}}) {{ |(csil_k, csil_v), csil_h| csil_h[{dk}] = {dv} }}"
+            )
+        }
+        _ => expr.to_string(),
+    }
+}
+
+/// Reopen one generated value class with `to_cbor` / `self.from_cbor` and the
+/// internal tree builders the nested-record path calls. The map is built in
+/// canonical key order; an absent optional is omitted on encode and read back as
+/// `nil` (a missing key) on decode.
+fn emit_record_codec(
+    name: &str,
+    group: &CsilGroupExpression,
+    records: &std::collections::HashSet<String>,
+    aliases: &std::collections::HashMap<String, CsilTypeExpression>,
+) -> String {
+    let class = ruby_class_name(name);
+    let in_order: Vec<&CsilGroupEntry> = group.entries.iter().filter(|e| e.key.is_some()).collect();
+
+    let mut out = String::new();
+    out.push_str(&format!(
+        "# CBOR codec for {class}: a map keyed by the verbatim CSIL field names in\n"
+    ));
+    out.push_str("# canonical RFC 8949 order.\n");
+    out.push_str(&format!("class {class}\n"));
+
+    out.push_str("  def to_cbor\n");
+    out.push_str("    CsilCbor.encode(csil_to_tree)\n");
+    out.push_str("  end\n\n");
+
+    out.push_str("  def csil_to_tree\n");
+    out.push_str("    csil_map = {}\n");
+    // Canonical RFC 8949 key order, fixed here so the emitted map needs no runtime sort.
+    let mut canonical = in_order.clone();
+    canonical.sort_by(|a, b| {
+        let ka = cbor_text_key_bytes(&field_name(a.key.as_ref().unwrap()));
+        let kb = cbor_text_key_bytes(&field_name(b.key.as_ref().unwrap()));
+        ka.cmp(&kb)
+    });
+    for entry in &canonical {
+        let field = field_name(entry.key.as_ref().unwrap());
+        let node = enc_tree(&entry.value_type, &field, records, aliases);
+        if matches!(entry.occurrence, Some(CsilOccurrence::Optional)) {
+            out.push_str(&format!(
+                "    csil_map[\"{field}\"] = {node} unless {field}.nil?\n"
+            ));
+        } else {
+            out.push_str(&format!("    csil_map[\"{field}\"] = {node}\n"));
+        }
+    }
+    out.push_str("    csil_map\n");
+    out.push_str("  end\n\n");
+
+    out.push_str("  def self.from_cbor(bytes)\n");
+    out.push_str("    csil_from_tree(CsilCbor.decode(bytes))\n");
+    out.push_str("  end\n\n");
+
+    out.push_str("  def self.csil_from_tree(node)\n");
+    if in_order.is_empty() {
+        out.push_str("    new\n");
+    } else {
+        out.push_str("    new(\n");
+        let parts: Vec<String> = in_order
+            .iter()
+            .map(|entry| {
+                let field = field_name(entry.key.as_ref().unwrap());
+                let access = format!("node[\"{field}\"]");
+                let dec = dec_tree(&entry.value_type, &access, records, aliases);
+                if matches!(entry.occurrence, Some(CsilOccurrence::Optional)) {
+                    format!("      {field}: (node.key?(\"{field}\") ? {dec} : nil)")
+                } else {
+                    format!("      {field}: {dec}")
+                }
+            })
+            .collect();
+        out.push_str(&parts.join(",\n"));
+        out.push('\n');
+        out.push_str("    )\n");
+    }
+    out.push_str("  end\n");
+    out.push_str("end\n\n");
+    out
+}
+
+/// Build `codec.rb`: the self-contained canonical-CBOR module plus a reopening of
+/// every generated value class with `to_cbor` / `self.from_cbor`. `None` when the
+/// spec declares no record types. Named `codec.rb` (not `codec.gen.rb`) so a
+/// consumer can `require_relative "codec"`.
+fn generate_codec_file(spec: &CsilSpecSerialized) -> Option<String> {
+    let records = codec_record_names(spec);
+    if records.is_empty() {
+        return None;
+    }
+    let aliases = codec_aliases(spec);
+
+    let mut content = String::new();
+    content.push_str(FROZEN_HEADER);
+    content.push('\n');
+    content.push_str("# Code generated by csilgen; DO NOT EDIT.\n\n");
+    // The codec reopens the generated classes, so it needs them loaded first.
+    content.push_str("require_relative \"types\"\n");
+    if spec_uses_builtin(spec, "timestamp") {
+        content.push_str("require \"time\"\n");
+    }
+    if spec_uses_builtin(spec, "decimal") {
+        content.push_str("require \"bigdecimal\"\n");
+    }
+    content.push('\n');
+    content.push_str(CODEC_RUNTIME_RUBY);
+    if spec_uses_builtin(spec, "decimal") {
+        content.push_str(CODEC_DECIMAL_RUBY);
+    }
+    content.push('\n');
+
+    for rule in &spec.rules {
+        let group = match &rule.rule_type {
+            CsilRuleType::GroupDef(group) => Some(group),
+            CsilRuleType::TypeDef(CsilTypeExpression::Group(group)) => Some(group),
+            _ => None,
+        };
+        if let Some(group) = group {
+            content.push_str(&emit_record_codec(&rule.name, group, &records, &aliases));
+        }
+    }
+
+    Some(finalize(content))
+}
+
+/// The self-contained canonical-CBOR runtime every generated codec builds on. It
+/// walks a plain Ruby value tree (Integer/Float/true/false/nil/String/Array/Hash)
+/// plus `CsilCbor::Tag` for the tagged core types, so the generated output needs no
+/// third-party CBOR gem. The text/bytes split is by String encoding: a binary
+/// (ASCII-8BIT) String is a `bytes` field (major type 2), any other encoding is
+/// `text` (major type 3); the per-record codec sets the encoding from the CSIL type.
+const CODEC_RUNTIME_RUBY: &str = r#"# A tagged CBOR value (major type 6): a semantic tag wrapping an inner value,
+# carrying the timestamp (tag 0) and decimal (tag 4) core types through the
+# otherwise-plain Ruby value tree.
+module CsilCbor
+  Tag = Struct.new(:tag, :value)
+
+  module_function
+
+  # Canonical-CBOR encode of a Ruby value tree to a binary String.
+  def encode(value)
+    buf = "".b
+    put(buf, value)
+    buf
+  end
+
+  def put_head(buf, major, arg)
+    mt = major << 5
+    if arg < 24
+      buf << (mt | arg).chr
+    elsif arg < 0x100
+      buf << (mt | 24).chr << arg.chr
+    elsif arg < 0x10000
+      buf << (mt | 25).chr << [arg].pack("n")
+    elsif arg < 0x100000000
+      buf << (mt | 26).chr << [arg].pack("N")
+    else
+      buf << (mt | 27).chr << [arg >> 32, arg & 0xffffffff].pack("NN")
+    end
+  end
+
+  def put(buf, value)
+    case value
+    when Integer
+      if value >= 0
+        put_head(buf, 0, value)
+      else
+        put_head(buf, 1, -1 - value)
+      end
+    when Float
+      buf << "\xfb".b << [value].pack("G")
+    when true
+      buf << "\xf5".b
+    when false
+      buf << "\xf4".b
+    when nil
+      buf << "\xf6".b
+    when String
+      if value.encoding == Encoding::BINARY
+        put_head(buf, 2, value.bytesize)
+        buf << value
+      else
+        bin = value.b
+        put_head(buf, 3, bin.bytesize)
+        buf << bin
+      end
+    when Array
+      put_head(buf, 4, value.length)
+      value.each { |item| put(buf, item) }
+    when Hash
+      put_head(buf, 5, value.length)
+      value.each do |k, v|
+        put(buf, k)
+        put(buf, v)
+      end
+    when Tag
+      put_head(buf, 6, value.tag)
+      put(buf, value.value)
+    else
+      raise ArgumentError, "csilgen: cannot encode #{value.class}"
+    end
+  end
+
+  # Decode a binary String to a Ruby value tree.
+  def decode(bytes)
+    bin = bytes.b
+    value, pos = take(bin, 0)
+    raise ArgumentError, "csilgen: trailing bytes" unless pos == bin.bytesize
+
+    value
+  end
+
+  def read_arg(bin, pos, low)
+    if low < 24
+      [low, pos + 1]
+    elsif low == 24
+      [bin.getbyte(pos + 1), pos + 2]
+    elsif low == 25
+      [bin[pos + 1, 2].unpack1("n"), pos + 3]
+    elsif low == 26
+      [bin[pos + 1, 4].unpack1("N"), pos + 5]
+    elsif low == 27
+      hi, lo = bin[pos + 1, 8].unpack("NN")
+      [(hi << 32) | lo, pos + 9]
+    else
+      raise ArgumentError, "csilgen: bad head"
+    end
+  end
+
+  def take(bin, pos)
+    ib = bin.getbyte(pos)
+    major = ib >> 5
+    low = ib & 0x1f
+    if major == 7
+      case low
+      when 20 then [false, pos + 1]
+      when 21 then [true, pos + 1]
+      when 22, 23 then [nil, pos + 1]
+      when 26 then [[bin[pos + 1, 4].unpack1("N")].pack("N").unpack1("g"), pos + 5]
+      when 27 then [bin[pos + 1, 8].unpack1("G"), pos + 9]
+      else raise ArgumentError, "csilgen: unsupported simple value"
+      end
+    else
+      arg, p = read_arg(bin, pos, low)
+      case major
+      when 0
+        [arg, p]
+      when 1
+        [-1 - arg, p]
+      when 2
+        [bin[p, arg].b, p + arg]
+      when 3
+        [bin[p, arg].dup.force_encoding(Encoding::UTF_8), p + arg]
+      when 4
+        items = []
+        arg.times do
+          item, p = take(bin, p)
+          items << item
+        end
+        [items, p]
+      when 5
+        hash = {}
+        arg.times do
+          k, p = take(bin, p)
+          v, p = take(bin, p)
+          hash[k] = v
+        end
+        [hash, p]
+      when 6
+        inner, p = take(bin, p)
+        [Tag.new(arg, inner), p]
+      else
+        raise ArgumentError, "csilgen: bad major"
+      end
+    end
+  end
+end
+"#;
+
+/// The `decimal` core type's tag-4 (de)serializers, appended to `CsilCbor` only when
+/// the spec uses `decimal` so a `bigdecimal` dependency is never pulled in otherwise.
+const CODEC_DECIMAL_RUBY: &str = r#"
+module CsilCbor
+  module_function
+
+  # The CBOR tag-4 decimal-fraction payload [exponent, mantissa] for a BigDecimal,
+  # exact: value = mantissa * 10**exponent.
+  def decimal_to_tag(value)
+    sign, digits, _base, exp = value.split
+    [exp - digits.length, sign * digits.to_i]
+  end
+
+  def tag_to_decimal(pair)
+    exp, mant = pair
+    BigDecimal(mant) * (BigDecimal(10)**exp)
+  end
+end
+"#;
+
+// ---------------------------------------------------------------------------
 // Type mapping (doc-comment only — Ruby is dynamically typed)
 // ---------------------------------------------------------------------------
 
@@ -1000,12 +1641,14 @@ fn service_has_channel_ops(def: &CsilServiceDefinition) -> bool {
 // ---------------------------------------------------------------------------
 
 const CLIENT_PRELUDE: &str = "\
-# Each generated client delegates to a host-supplied transport seam: a duck-typed
-# object responding to `call(service, op, payload)`, returning the decoded response.
-# The generator never owns the wire — it emits call shapes only.
+# Each generated client owns (de)serialization via the generated CBOR codec and
+# delegates only byte movement to a host-supplied transport seam: a duck-typed
+# object responding to `call(service, op, req_bytes) -> resp_bytes`. The carrier
+# moves bytes (HTTP, a queue, an in-process loop); it never sees the typed values.
 ";
 
 fn generate_client_file(spec: &CsilSpecSerialized) -> Option<String> {
+    let records = codec_record_names(spec);
     let mut body = String::new();
     let mut emitted = false;
     for rule in &spec.rules {
@@ -1025,6 +1668,11 @@ fn generate_client_file(spec: &CsilSpecSerialized) -> Option<String> {
     content.push_str(FROZEN_HEADER);
     content.push('\n');
     content.push_str("# Code generated by csilgen; DO NOT EDIT.\n\n");
+    // The typed methods call `to_cbor`/`from_cbor` on the generated value classes,
+    // which the codec defines; pull it in (it requires the types) when records exist.
+    if !records.is_empty() {
+        content.push_str("require_relative \"codec\"\n\n");
+    }
     content.push_str(CLIENT_PRELUDE);
     content.push('\n');
     content.push_str(&body);
@@ -1056,7 +1704,8 @@ fn emit_client_class(name: &str, service: &CsilServiceDefinition) -> String {
         let method = ruby_method_name(&op.name);
         let wire_method = wire_method_name(&op.name);
         let has_input = !op_input_is_null(&op.input_type);
-        let out_ty = map_csil_type_to_ruby(&success_type(&op.output_type));
+        let success = success_type(&op.output_type);
+        let out_ty = map_csil_type_to_ruby(&success);
 
         out.push('\n');
         if op.doc_comments.is_empty() {
@@ -1066,18 +1715,29 @@ fn emit_client_class(name: &str, service: &CsilServiceDefinition) -> String {
                 out.push_str(&format!("  # {line}\n"));
             }
         }
+        // The request encodes to its canonical CBOR bytes; a null-input op sends an
+        // empty byte payload since it carries no request body.
+        let payload = match (has_input, &op.input_type) {
+            (false, _) => "\"\".b".to_string(),
+            (true, CsilTypeExpression::Reference(_)) => "req.to_cbor".to_string(),
+            // A non-record request can't self-serialize; the caller passes ready bytes.
+            (true, _) => "req".to_string(),
+        };
+        let call = format!("@transport.call(\"{wire_service}\", \"{wire_method}\", {payload})");
+        // A reference success type is a generated value class, so decode the reply
+        // bytes through its codec; anything else rides back as raw bytes.
+        let body = match &success {
+            CsilTypeExpression::Reference(resp) => {
+                format!("{}.from_cbor({call})", ruby_class_name(resp))
+            }
+            _ => call,
+        };
         if has_input {
             out.push_str(&format!("  def {method}(req)\n"));
-            out.push_str(&format!(
-                "    @transport.call(\"{wire_service}\", \"{wire_method}\", req)\n"
-            ));
         } else {
-            // A null-input op carries no request body; pass nil as the payload.
             out.push_str(&format!("  def {method}\n"));
-            out.push_str(&format!(
-                "    @transport.call(\"{wire_service}\", \"{wire_method}\", nil)\n"
-            ));
         }
+        out.push_str(&format!("    {body}\n"));
         out.push_str("  end\n");
     }
 
@@ -1327,6 +1987,7 @@ fn emit_wire_ids(name: &str, service: &CsilServiceDefinition) -> Option<String> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use csilgen_common::{CsilPosition, CsilRule};
 
     #[test]
     fn class_and_method_naming() {
@@ -1340,5 +2001,145 @@ mod tests {
     fn string_literal_escapes_interpolation() {
         assert_eq!(ruby_string_literal("a#{b}"), "\"a\\#{b}\"");
         assert_eq!(ruby_string_literal("x\"y"), "\"x\\\"y\"");
+    }
+
+    fn bare(name: &str, ty: CsilTypeExpression) -> CsilGroupEntry {
+        CsilGroupEntry {
+            key: Some(CsilGroupKey::Bare(name.to_string())),
+            value_type: ty,
+            occurrence: None,
+            metadata: vec![],
+            doc_comments: vec![],
+        }
+    }
+
+    fn opt(name: &str, ty: CsilTypeExpression) -> CsilGroupEntry {
+        CsilGroupEntry {
+            occurrence: Some(CsilOccurrence::Optional),
+            ..bare(name, ty)
+        }
+    }
+
+    fn builtin(name: &str) -> CsilTypeExpression {
+        CsilTypeExpression::Builtin(name.to_string())
+    }
+
+    fn task_group() -> CsilGroupExpression {
+        CsilGroupExpression {
+            entries: vec![
+                bare("uuid", builtin("text")),
+                bare("current_state", builtin("text")),
+                bare("payload", builtin("bytes")),
+                opt("priority", builtin("int")),
+                bare(
+                    "labels",
+                    CsilTypeExpression::Map {
+                        key: Box::new(builtin("text")),
+                        value: Box::new(builtin("int")),
+                        occurrence: None,
+                    },
+                ),
+                bare(
+                    "tags",
+                    CsilTypeExpression::Array {
+                        element_type: Box::new(builtin("text")),
+                        occurrence: None,
+                    },
+                ),
+            ],
+        }
+    }
+
+    #[test]
+    fn codec_keys_in_canonical_order() {
+        let mut records = std::collections::HashSet::new();
+        records.insert("Task".to_string());
+        let aliases = std::collections::HashMap::new();
+        let out = emit_record_codec("Task", &task_group(), &records, &aliases);
+        assert!(out.contains("class Task"));
+        assert!(out.contains("def to_cbor"));
+        assert!(out.contains("def self.from_cbor(bytes)"));
+        // text -> the value as-is; bytes -> forced binary (CBOR major type 2).
+        assert!(out.contains("csil_map[\"uuid\"] = uuid"));
+        assert!(out.contains("csil_map[\"payload\"] = (payload).b"));
+        // An absent optional is omitted on encode.
+        assert!(out.contains("csil_map[\"priority\"] = priority unless priority.nil?"));
+        // Canonical RFC 8949 key order: tags(4) < uuid(4) < labels(6) < payload(7) <
+        // priority(8) < current_state(13).
+        let body = &out[out.find("csil_to_tree").unwrap()..];
+        let p_tags = body.find("\"tags\"").unwrap();
+        let p_uuid = body.find("\"uuid\"").unwrap();
+        let p_state = body.find("\"current_state\"").unwrap();
+        assert!(p_tags < p_uuid && p_uuid < p_state);
+        // A missing optional decodes to nil.
+        assert!(out.contains("priority: (node.key?(\"priority\") ? node[\"priority\"] : nil)"));
+    }
+
+    #[test]
+    fn codec_file_carries_runtime_and_classes() {
+        let spec = CsilSpecSerialized {
+            rules: vec![CsilRule {
+                name: "Task".to_string(),
+                rule_type: CsilRuleType::GroupDef(task_group()),
+                position: CsilPosition {
+                    line: 1,
+                    column: 1,
+                    offset: 0,
+                },
+                doc_comments: vec![],
+            }],
+            source_content: None,
+            service_count: 0,
+            fields_with_metadata_count: 0,
+        };
+        let codec = generate_codec_file(&spec).expect("records present -> codec emitted");
+        assert!(codec.starts_with("# frozen_string_literal: true\n"));
+        assert!(codec.contains("require_relative \"types\""));
+        assert!(codec.contains("module CsilCbor"));
+        assert!(codec.contains("def encode(value)"));
+        assert!(codec.contains("def decode(bytes)"));
+        // No timestamp/decimal in this spec, so no extra requires or helpers.
+        assert!(!codec.contains("require \"bigdecimal\""));
+        assert!(!codec.contains("decimal_to_tag"));
+    }
+
+    #[test]
+    fn no_codec_without_records() {
+        let spec = CsilSpecSerialized {
+            rules: vec![],
+            source_content: None,
+            service_count: 0,
+            fields_with_metadata_count: 0,
+        };
+        assert!(generate_codec_file(&spec).is_none());
+    }
+
+    #[test]
+    fn client_uses_byte_seam_and_codec() {
+        let service = CsilServiceDefinition {
+            operations: vec![CsilServiceOperation {
+                name: "submit-task".to_string(),
+                input_type: CsilTypeExpression::Reference("SubmitTaskRequest".to_string()),
+                output_type: CsilTypeExpression::Choice(vec![
+                    CsilTypeExpression::Reference("Task".to_string()),
+                    CsilTypeExpression::Reference("ServiceError".to_string()),
+                ]),
+                direction: CsilServiceDirection::Unidirectional,
+                position: CsilPosition {
+                    line: 1,
+                    column: 1,
+                    offset: 0,
+                },
+                doc_comments: vec![],
+                wire_id: None,
+            }],
+            wire_id: None,
+        };
+        let out = emit_client_class("CorndogsService", &service);
+        // The request self-encodes, the reply self-decodes; the transport only moves
+        // bytes. The ServiceError arm is dropped from the success type.
+        assert!(out.contains(
+            "Task.from_cbor(@transport.call(\"corndogs\", \"SubmitTask\", req.to_cbor))"
+        ));
     }
 }

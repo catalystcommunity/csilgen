@@ -34,6 +34,18 @@ every party encodes the map keys `uuid`, `current_state`, `payload` — never
   by those names.
 - **TypeScript**: the type uses `camelCase`, but the transport encodes/decodes by
   the CSIL field name (the longhouse CBOR transport keys this way).
+- **All 14 targets** now emit a generated per-type codec rather than relying on
+  runtime reflection or derive/tag libraries — one uniform architecture. Each
+  generator emits a self-contained CBOR codec (`codec.gen.h`, `codec.gen.zig`,
+  `codec.ml`, `csil_cbor.gen.dart` + per-record `toCbor`, `Codec.swift`,
+  `codec.gen.go`, `codec.gen.rs`, `codec.gen.ts`, `codec.py`, `codec.rb`,
+  `codec.gen.ex`, `CsilCbor.java`, `Codec.gen.cs`, `Codec.kt`) that keys the map by
+  the CSIL field name verbatim and orders a record's keys canonically at generation
+  time so the bytes match — the one place a csilgen generator emits payload-wire code
+  rather than shapes only. The typed client calls these codecs and hands the carrier
+  only bytes; the carrier never reflects, never sees an application type. (Swift in
+  particular uses a generated codec rather than `Codable`: `Codable` cannot emit CBOR
+  tags and would serialize `bytes`/`[UInt8]` as an array, not a byte string.)
 
 ## Scalar encodings
 

@@ -5,8 +5,8 @@
 
 use csilgen_common::{
     CsilControlOperator, CsilDependsCompareOp, CsilDependsCondition, CsilFieldMetadata,
-    CsilFieldVisibility, CsilGroupEntry, CsilGroupKey, CsilLiteralValue, CsilOccurrence,
-    CsilRuleType, CsilServiceDefinition, CsilServiceDirection, CsilSizeConstraint,
+    CsilFieldVisibility, CsilGroupEntry, CsilGroupExpression, CsilGroupKey, CsilLiteralValue,
+    CsilOccurrence, CsilRuleType, CsilServiceDefinition, CsilServiceDirection, CsilSizeConstraint,
     CsilTypeExpression, CsilValidationConstraint, GeneratedFile, GenerationStats,
     GeneratorCapability, GeneratorMetadata, GeneratorWarning, WarningLevel, WasmGeneratorInput,
     WasmGeneratorOutput, wasm_interface::*,
@@ -115,6 +115,16 @@ fn process_generation(input: WasmGeneratorInput) -> Result<WasmGeneratorOutput, 
         });
     }
 
+    // The self-contained per-type CBOR codec: emitted whenever the spec has record
+    // types, since that codec is what every payload (de)serializes through now (the
+    // typed client owns the wire; no reflection/derive path remains).
+    if let Some(codec_content) = generate_codec(&input, &config) {
+        files.push(GeneratedFile {
+            path: make_path("codec.gen.go"),
+            content: codec_content,
+        });
+    }
+
     // Dispatch on target: the base `go` (and explicit `go-server`) target emits
     // the server interface; `go-client` emits a transport-agnostic client;
     // `go-typesonly` emits the types (and their validation/constructors) alone.
@@ -183,6 +193,25 @@ fn process_generation(input: WasmGeneratorInput) -> Result<WasmGeneratorOutput, 
         });
     }
 
+    // Self-contained publishable-package mode: when `emit_packages` includes "go",
+    // emit the module manifest (and a README) alongside the source so the OUTPUT
+    // directory is itself a valid, `go build`-able module. A consumer points a
+    // require at the published repo path and imports it — no extra scaffolding, and
+    // no go.sum because the generated code is stdlib-only and dependency-free.
+    if emit_packages_includes_go(&input.config.options) {
+        let module_path = resolve_module_path(&input);
+        files.push(GeneratedFile {
+            // The manifest lives at the module root regardless of any output subdir;
+            // packages nested under a subdir are still part of this one module.
+            path: "go.mod".to_string(),
+            content: format!("module {module_path}\n\ngo 1.21\n"),
+        });
+        files.push(GeneratedFile {
+            path: "README.md".to_string(),
+            content: package_readme(&input, &module_path, &config),
+        });
+    }
+
     let total_size: usize = files.iter().map(|f| f.content.len()).sum();
 
     let stats = GenerationStats {
@@ -201,6 +230,107 @@ fn process_generation(input: WasmGeneratorInput) -> Result<WasmGeneratorOutput, 
     })
 }
 
+/// Run the full Go generation for a prepared input and return the emitted files.
+/// This is the exact path the wasm `generate` export drives; it is exposed so the
+/// crate's own tests can run generation — and compile the emitted module — without
+/// going through the pointer-based wasm boundary.
+pub fn generate_go_files(input: WasmGeneratorInput) -> Result<Vec<GeneratedFile>, i32> {
+    process_generation(input).map(|output| output.files)
+}
+
+/// True only when the `emit_packages` generation option is an array containing the
+/// `"go"` token. Parsed defensively against an arbitrary `serde_json::Value`: a
+/// missing option, a non-array value, or an array without `"go"` all leave the
+/// output as source-only. The token match is case-insensitive to be forgiving of
+/// callers that pass `"Go"`.
+fn emit_packages_includes_go(options: &HashMap<String, serde_json::Value>) -> bool {
+    options
+        .get("emit_packages")
+        .and_then(|v| v.as_array())
+        .is_some_and(|tokens| {
+            tokens
+                .iter()
+                .filter_map(|v| v.as_str())
+                .any(|token| token.eq_ignore_ascii_case("go"))
+        })
+}
+
+/// The module path written into `go.mod`. Precedence: an explicit `go_module`
+/// option wins; otherwise an explicit `package_name`; otherwise an `example.com/`
+/// path derived from the first service's wire base (falling back to a generic
+/// client name). A bare token is a legal Go module path, so a lone `package_name`
+/// is acceptable here even though it has no domain.
+fn resolve_module_path(input: &WasmGeneratorInput) -> String {
+    let options = &input.config.options;
+    if let Some(module) = options
+        .get("go_module")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+    {
+        return module.to_string();
+    }
+    if let Some(package) = options
+        .get("package_name")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+    {
+        return package.to_string();
+    }
+    format!("example.com/{}", default_package_token(input))
+}
+
+/// Fallback identifier used when neither a module path nor a package name was
+/// configured: the first service's lowercased wire base, else a generic client name.
+fn default_package_token(input: &WasmGeneratorInput) -> String {
+    input
+        .csil_spec
+        .rules
+        .iter()
+        .find_map(|rule| match &rule.rule_type {
+            CsilRuleType::ServiceDef(_) => Some(go_service_base(&rule.name).to_lowercase()),
+            _ => None,
+        })
+        .filter(|token| !token.is_empty())
+        .unwrap_or_else(|| "csilgenclient".to_string())
+}
+
+/// The package version. Go modules carry their version in VCS tags rather than in
+/// `go.mod`, so this feeds only the README; the accessor is kept so it matches the
+/// `package_version` option the sibling language generators read.
+fn resolve_package_version(options: &HashMap<String, serde_json::Value>) -> String {
+    options
+        .get("package_version")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("0.1.0")
+        .to_string()
+}
+
+/// Minimal README for the emitted module: the import path a consumer uses (the
+/// module path, plus the output subdir when the package is nested under one) and
+/// the version, since `go.mod` itself cannot record a version.
+fn package_readme(input: &WasmGeneratorInput, module_path: &str, config: &GoConfig) -> String {
+    let version = resolve_package_version(&input.config.options);
+    let import_path = if config.output_subdir.is_empty() {
+        module_path.to_string()
+    } else {
+        format!("{module_path}/{}", config.output_subdir)
+    };
+    format!(
+        "# {module_path}\n\n\
+         Version {version}\n\n\
+         Code generated by csilgen; DO NOT EDIT.\n\n\
+         This directory is a self-contained, dependency-free Go module. Publish it to a\n\
+         git repository, then depend on it from a consumer module:\n\n\
+         ```sh\n\
+         go get {import_path}\n\
+         ```\n\n\
+         ```go\n\
+         import \"{import_path}\"\n\
+         ```\n"
+    )
+}
+
 /// In-memory Go type selected for the CSIL `decimal` core type. The wire form is
 /// CBOR tag 4 either way; this only changes what the generated struct field is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -217,7 +347,6 @@ struct GoConfig {
     output_subdir: String,
     use_json_tags: bool,
     use_yaml_tags: bool,
-    use_cbor_tags: bool,
     generate_validation: bool,
     generate_constructors: bool,
     decimal_mapping: DecimalMapping,
@@ -298,14 +427,6 @@ impl GoConfig {
                 .unwrap_or(true),
             use_yaml_tags: options
                 .get("use_yaml_tags")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(true),
-            // CSIL is the CBOR Service Interface Language: the canonical wire is
-            // CBOR keyed by the CSIL field name verbatim. fxamacker/cbor keys by
-            // the Go field name (PascalCase) unless a `cbor` tag says otherwise,
-            // so these tags are on by default to keep four-language clients aligned.
-            use_cbor_tags: options
-                .get("use_cbor_tags")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(true),
             generate_validation: options
@@ -472,17 +593,6 @@ fn generate_types(
                             }
                         }
 
-                        // Canonical CBOR wire key: the CSIL field name verbatim,
-                        // so a Go server and Rust/Python/TS clients agree on map keys.
-                        if config.use_cbor_tags {
-                            let cbor_name = go_json_name_from_key(key);
-                            if matches!(entry.occurrence, Some(CsilOccurrence::Optional)) {
-                                tag_parts.push(format!("cbor:\"{cbor_name},omitempty\""));
-                            } else {
-                                tag_parts.push(format!("cbor:\"{cbor_name}\""));
-                            }
-                        }
-
                         if !tag_parts.is_empty() {
                             content.push_str(&format!(" `{}`", tag_parts.join(" ")));
                         }
@@ -563,15 +673,6 @@ fn generate_types(
                                 }
                             }
 
-                            if config.use_cbor_tags {
-                                let cbor_name = go_json_name_from_key(key);
-                                if matches!(entry.occurrence, Some(CsilOccurrence::Optional)) {
-                                    tag_parts.push(format!("cbor:\"{cbor_name},omitempty\""));
-                                } else {
-                                    tag_parts.push(format!("cbor:\"{cbor_name}\""));
-                                }
-                            }
-
                             if !tag_parts.is_empty() {
                                 content.push_str(&format!(" `{}`", tag_parts.join(" ")));
                             }
@@ -617,24 +718,27 @@ func (e *ClientError) Error() string {
 \treturn fmt.Sprintf(\"service error %d: %s\", e.Code, e.Message)
 }
 
-// Transport is supplied by the caller: it encodes req (CBOR over HTTP, say),
-// performs the call named by (service, method), and decodes the response into
-// resp, or returns an error. The generator never owns the wire.
+// Transport is the caller-supplied byte carrier: it performs the call named by
+// (service, op) with the already-encoded request bytes and returns the response
+// bytes, or an error. The generated client owns (de)serialization via the codec;
+// the carrier only moves bytes, so it can be HTTP, a queue, or an in-process loop.
 type Transport interface {
-\tCall(ctx context.Context, service string, method string, req any, resp any) error
+\tCall(ctx context.Context, service string, op string, req []byte) ([]byte, error)
 }
 ";
 
 /// The body of the self-contained `CsilDecimal` helper, injected as its own file
 /// only when the spec uses `decimal` under the default mapping. It holds the exact
-/// value (int exponent + big.Int mantissa) and (de)serializes as CBOR tag 4
-/// `[exponent, mantissa]`. Conversion to/from shopspring is via String() and
-/// ParseCsilDecimal, so the helper itself takes no dependency on shopspring.
+/// value (int exponent + big.Int mantissa); the generated `codec.gen.go` owns its
+/// CBOR tag-4 wire form directly (no third-party CBOR library). Conversion to/from
+/// shopspring is via String() and ParseCsilDecimal, so the helper itself takes no
+/// dependency on shopspring either.
 const CSIL_DECIMAL_GO: &str = r#"// CsilDecimal is the exact, base-10 `decimal` core type. On the wire it is CBOR
 // tag 4 (decimal fraction): a two-element array [exponent, mantissa] whose value
 // is Mantissa * 10^Exponent. The value is kept as exact integers, never a float,
-// so no precision is lost. Interop with github.com/shopspring/decimal is via
-// String()/ParseCsilDecimal, so this type needs no dependency on it.
+// so no precision is lost. The wire (de)serialization lives in codec.gen.go, which
+// reads/writes Exponent and mantissa() directly, so this type depends on no CBOR
+// library. Interop with github.com/shopspring/decimal is via String()/ParseCsilDecimal.
 type CsilDecimal struct {
 	Exponent int64
 	Mantissa *big.Int
@@ -646,41 +750,6 @@ func (d CsilDecimal) mantissa() *big.Int {
 		return big.NewInt(0)
 	}
 	return d.Mantissa
-}
-
-// MarshalCBOR encodes the value as CBOR tag 4: [exponent, mantissa].
-func (d CsilDecimal) MarshalCBOR() ([]byte, error) {
-	return cbor.Marshal(cbor.Tag{
-		Number:  4,
-		Content: []interface{}{d.Exponent, d.mantissa()},
-	})
-}
-
-// UnmarshalCBOR decodes a CBOR tag 4 decimal fraction. The mantissa may arrive as
-// a fixed-width integer or a bignum depending on its magnitude; both are exact.
-func (d *CsilDecimal) UnmarshalCBOR(data []byte) error {
-	var tag cbor.Tag
-	if err := cbor.Unmarshal(data, &tag); err != nil {
-		return err
-	}
-	if tag.Number != 4 {
-		return fmt.Errorf("CsilDecimal: expected CBOR tag 4, got %d", tag.Number)
-	}
-	arr, ok := tag.Content.([]interface{})
-	if !ok || len(arr) != 2 {
-		return fmt.Errorf("CsilDecimal: tag 4 content must be a two-element array")
-	}
-	exp, err := csilDecimalToInt64(arr[0])
-	if err != nil {
-		return fmt.Errorf("CsilDecimal: exponent: %w", err)
-	}
-	mant, err := csilDecimalToBigInt(arr[1])
-	if err != nil {
-		return fmt.Errorf("CsilDecimal: mantissa: %w", err)
-	}
-	d.Exponent = exp
-	d.Mantissa = mant
-	return nil
 }
 
 // String renders the exact value as canonical decimal text. This is the lossless
@@ -763,40 +832,6 @@ func (d CsilDecimal) Cmp(other CsilDecimal) int {
 	}
 	return dm.Cmp(om)
 }
-
-func csilDecimalToInt64(v interface{}) (int64, error) {
-	switch n := v.(type) {
-	case int64:
-		return n, nil
-	case uint64:
-		return int64(n), nil
-	case int:
-		return int64(n), nil
-	case big.Int:
-		return n.Int64(), nil
-	case *big.Int:
-		return n.Int64(), nil
-	default:
-		return 0, fmt.Errorf("expected integer, got %T", v)
-	}
-}
-
-func csilDecimalToBigInt(v interface{}) (*big.Int, error) {
-	switch n := v.(type) {
-	case int64:
-		return big.NewInt(n), nil
-	case uint64:
-		return new(big.Int).SetUint64(n), nil
-	case int:
-		return big.NewInt(int64(n)), nil
-	case big.Int:
-		return new(big.Int).Set(&n), nil
-	case *big.Int:
-		return new(big.Int).Set(n), nil
-	default:
-		return nil, fmt.Errorf("expected integer, got %T", v)
-	}
-}
 "#;
 
 /// Assemble the standalone `csil_decimal.gen.go` file: package header, the imports
@@ -814,15 +849,967 @@ fn csil_decimal_file(config: &GoConfig) -> String {
     content.push_str(&format!("{}\"fmt\"\n", config.indent_style));
     content.push_str(&format!("{}\"math/big\"\n", config.indent_style));
     content.push_str(&format!("{}\"strings\"\n", config.indent_style));
-    content.push('\n');
-    content.push_str(&format!(
-        "{}\"github.com/fxamacker/cbor/v2\"\n",
-        config.indent_style
-    ));
     content.push_str(")\n\n");
     content.push_str(CSIL_DECIMAL_GO);
     content
 }
+
+// ---------------------------------------------------------------------------
+// Per-type CBOR codec (codec.gen.go)
+//
+// CSIL is the CBOR Service Interface Language; the canonical wire is a CBOR map
+// keyed by the CSIL field name verbatim. Go could lean on a reflection codec
+// (fxamacker), but that drags in a third-party dependency and keys by reflection
+// at runtime; the references for this batch (C/Zig/OCaml/Dart/Swift) instead emit
+// a self-contained per-type codec so the bytes are owned by generated code. Go
+// follows the same shape here so every target agrees byte-for-byte.
+// ---------------------------------------------------------------------------
+
+/// The names of every record type in the spec (a `GroupDef`, or a `TypeDef` that
+/// wraps a `Group`). Only records get a codec, so a `Reference` to one of these is
+/// what a field/operation payload (de)serializes through.
+fn record_names(input: &WasmGeneratorInput) -> std::collections::HashSet<String> {
+    input
+        .csil_spec
+        .rules
+        .iter()
+        .filter_map(|rule| match &rule.rule_type {
+            CsilRuleType::GroupDef(_) => Some(rule.name.clone()),
+            CsilRuleType::TypeDef(CsilTypeExpression::Group(_)) => Some(rule.name.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Whether the spec declares any record type (and so wants a `codec.gen.go`).
+fn spec_has_records(input: &WasmGeneratorInput) -> bool {
+    input.csil_spec.rules.iter().any(|rule| {
+        matches!(
+            &rule.rule_type,
+            CsilRuleType::GroupDef(_) | CsilRuleType::TypeDef(CsilTypeExpression::Group(_))
+        )
+    })
+}
+
+/// The CBOR encoding of a text key. Comparing these byte slices lexicographically
+/// is exactly RFC 8949 §4.2.1 canonical key ordering, computed here at generation
+/// time so the emitted encoder lays a record's map keys down in canonical order.
+fn cbor_text_key_bytes(name: &str) -> Vec<u8> {
+    let bytes = name.as_bytes();
+    let n = bytes.len() as u64;
+    let mt = 3u8 << 5;
+    let mut head = Vec::new();
+    if n < 24 {
+        head.push(mt | n as u8);
+    } else if n < 0x100 {
+        head.push(mt | 24);
+        head.push(n as u8);
+    } else {
+        head.push(mt | 25);
+        head.extend_from_slice(&(n as u16).to_be_bytes());
+    }
+    head.extend_from_slice(bytes);
+    head
+}
+
+fn codec_unwrap_constrained(ty: &CsilTypeExpression) -> &CsilTypeExpression {
+    match ty {
+        CsilTypeExpression::Constrained { base_type, .. } => base_type,
+        other => other,
+    }
+}
+
+/// A Go expression building a `cborValue` from `expr` (a typed Go value of the
+/// field's mapped type). Composite types map via the generic `cborEncArray`/
+/// `cborEncMap` runtime helpers so nesting composes cleanly.
+fn go_enc_value(
+    ty: &CsilTypeExpression,
+    expr: &str,
+    records: &std::collections::HashSet<String>,
+    aliases: &std::collections::HashMap<String, CsilTypeExpression>,
+    config: &GoConfig,
+) -> String {
+    match codec_unwrap_constrained(ty) {
+        CsilTypeExpression::Builtin(name) => match name.as_str() {
+            "int" | "nint" => format!("cborInt({expr})"),
+            "uint" => format!("cborUint({expr})"),
+            "float" | "float64" | "double" => format!("cborFloat({expr})"),
+            "text" | "tstr" => format!("cborText({expr})"),
+            "bytes" | "bstr" => format!("cborBytes({expr})"),
+            "bool" => format!("cborBool({expr})"),
+            "timestamp" => format!("csilEncTimestamp({expr})"),
+            "decimal" => format!("csilEncDecimal({expr})"),
+            "nil" | "null" => "cborNull{}".to_string(),
+            _ => "cborNull{}".to_string(),
+        },
+        CsilTypeExpression::Reference(name) if records.contains(name) => {
+            format!("csilEnc{name}({expr})")
+        }
+        // A reference to a transparent alias (`StringInt64Map = {* text => int}`,
+        // `Tags = [* text]`, `Uuid = text`) has no codec of its own; encode it as its
+        // underlying type. The named Go type is assignable to the unnamed underlying
+        // the map/array/scalar encoder expects, so the same `expr` flows through.
+        CsilTypeExpression::Reference(name) if aliases.contains_key(name) => {
+            go_enc_value(&aliases[name], expr, records, aliases, config)
+        }
+        CsilTypeExpression::Array { element_type, .. } => {
+            let elem_ty = map_csil_type_to_go(element_type, &None, config.decimal_go_type());
+            let inner = go_enc_value(element_type, "csilElem", records, aliases, config);
+            format!("cborEncArray({expr}, func(csilElem {elem_ty}) cborValue {{ return {inner} }})")
+        }
+        CsilTypeExpression::Map { key, value, .. } => {
+            let key_ty = map_csil_type_to_go(key, &None, config.decimal_go_type());
+            let val_ty = map_csil_type_to_go(value, &None, config.decimal_go_type());
+            let kenc = go_enc_value(key, "csilK", records, aliases, config);
+            let venc = go_enc_value(value, "csilV", records, aliases, config);
+            format!(
+                "cborEncMap({expr}, func(csilK {key_ty}) cborValue {{ return {kenc} }}, func(csilV {val_ty}) cborValue {{ return {venc} }})"
+            )
+        }
+        // A type the codec cannot model precisely (a choice, a tuple, `any`) is
+        // carried as null rather than emitting uncompilable code.
+        _ => "cborNull{}".to_string(),
+    }
+}
+
+/// A Go expression of function type `func(cborValue) (<GoType>, error)` decoding a
+/// typed value from a `cborValue`. Builtins resolve to a bare runtime accessor
+/// name; composites wrap the generic `cborDecArray`/`cborDecMap` helpers.
+fn go_dec_func(
+    ty: &CsilTypeExpression,
+    records: &std::collections::HashSet<String>,
+    aliases: &std::collections::HashMap<String, CsilTypeExpression>,
+    config: &GoConfig,
+) -> String {
+    match codec_unwrap_constrained(ty) {
+        CsilTypeExpression::Builtin(name) => match name.as_str() {
+            "int" | "nint" => "cborAsI64".to_string(),
+            "uint" => "cborAsU64".to_string(),
+            "float" | "float64" | "double" => "cborAsF64".to_string(),
+            "text" | "tstr" => "cborAsText".to_string(),
+            "bytes" | "bstr" => "cborAsBytes".to_string(),
+            "bool" => "cborAsBool".to_string(),
+            "timestamp" => "csilAsTimestamp".to_string(),
+            "decimal" => "csilAsDecimal".to_string(),
+            other => codec_zero_decoder(&map_csil_type_to_go(
+                &CsilTypeExpression::Builtin(other.to_string()),
+                &None,
+                config.decimal_go_type(),
+            )),
+        },
+        CsilTypeExpression::Reference(name) if records.contains(name) => format!("csilDec{name}"),
+        // A reference to a transparent alias decodes as its underlying type; the
+        // unnamed underlying value the map/array/scalar decoder returns is assignable
+        // to the named alias-typed field.
+        CsilTypeExpression::Reference(name) if aliases.contains_key(name) => {
+            go_dec_func(&aliases[name], records, aliases, config)
+        }
+        CsilTypeExpression::Array { element_type, .. } => {
+            let elem_ty = map_csil_type_to_go(element_type, &None, config.decimal_go_type());
+            let inner = go_dec_func(element_type, records, aliases, config);
+            format!(
+                "func(csilV cborValue) ([]{elem_ty}, error) {{ return cborDecArray(csilV, {inner}) }}"
+            )
+        }
+        CsilTypeExpression::Map { key, value, .. } => {
+            let key_ty = map_csil_type_to_go(key, &None, config.decimal_go_type());
+            let val_ty = map_csil_type_to_go(value, &None, config.decimal_go_type());
+            let kf = go_dec_func(key, records, aliases, config);
+            let vf = go_dec_func(value, records, aliases, config);
+            format!(
+                "func(csilV cborValue) (map[{key_ty}]{val_ty}, error) {{ return cborDecMap(csilV, {kf}, {vf}) }}"
+            )
+        }
+        // The codec cannot reconstruct this shape; yield its zero value so the
+        // generated decoder still compiles against the field's Go type.
+        other => codec_zero_decoder(&map_csil_type_to_go(other, &None, config.decimal_go_type())),
+    }
+}
+
+/// The transparent type aliases the codec resolves through: a `TypeDef` whose target
+/// is a map / array / scalar / reference (NOT a record group or a choice, which have
+/// their own handling). A field referencing one must encode as the underlying type
+/// rather than the `null` stub a bare non-record reference would yield.
+fn codec_aliases(
+    input: &WasmGeneratorInput,
+) -> std::collections::HashMap<String, CsilTypeExpression> {
+    input
+        .csil_spec
+        .rules
+        .iter()
+        .filter_map(|rule| match &rule.rule_type {
+            CsilRuleType::TypeDef(t) => match t {
+                CsilTypeExpression::Group(_) | CsilTypeExpression::Choice(_) => None,
+                other => Some((rule.name.clone(), other.clone())),
+            },
+            _ => None,
+        })
+        .collect()
+}
+
+/// Whether an optional field maps to a Go pointer. `map_csil_type_to_go` wraps a
+/// scalar/record in `*T` for an optional, but a slice (`array`), map, or tuple is
+/// already nil-able in place and is returned unwrapped — so those are not pointers.
+fn optional_field_is_pointer(ty: &CsilTypeExpression) -> bool {
+    match ty {
+        CsilTypeExpression::Constrained { base_type, .. } => optional_field_is_pointer(base_type),
+        CsilTypeExpression::Array { .. }
+        | CsilTypeExpression::Map { .. }
+        | CsilTypeExpression::Tuple(_) => false,
+        _ => true,
+    }
+}
+
+/// A `func(cborValue) (<go_type>, error)` that ignores the value and returns the
+/// zero value — the decode fallback for a payload shape the codec cannot model.
+fn codec_zero_decoder(go_type: &str) -> String {
+    format!("func(cborValue) ({go_type}, error) {{ var csilZero {go_type}; return csilZero, nil }}")
+}
+
+/// Emit the `csilEnc<T>`/`csilDec<T>` pair plus the public `Encode<T>`/`Decode<T>`
+/// byte wrappers for one record. The encoder lays keys in canonical order; the
+/// decoder reads by key in declaration order (order is irrelevant on decode).
+fn emit_record_codec(
+    name: &str,
+    group: &CsilGroupExpression,
+    records: &std::collections::HashSet<String>,
+    aliases: &std::collections::HashMap<String, CsilTypeExpression>,
+    config: &GoConfig,
+) -> String {
+    // (member, wire, entry) in declaration order, plus a canonical-key-order copy
+    // for the encoder so the emitted map is deterministic across languages.
+    let named: Vec<(String, String, &CsilGroupEntry)> = group
+        .entries
+        .iter()
+        .filter_map(|e| {
+            let key = e.key.as_ref()?;
+            let member = go_field_name_from_key_with_metadata(key, &e.metadata);
+            let wire = go_json_name_from_key(key);
+            Some((member, wire, e))
+        })
+        .collect();
+    let mut canonical: Vec<&(String, String, &CsilGroupEntry)> = named.iter().collect();
+    canonical.sort_by_key(|f| cbor_text_key_bytes(&f.1));
+
+    let i = &config.indent_style;
+    let mut out = String::new();
+
+    out.push_str(&format!(
+        "// csilEnc{name} builds the canonical CBOR value tree for a {name}.\n"
+    ));
+    out.push_str(&format!("func csilEnc{name}(csilV {name}) cborValue {{\n"));
+    out.push_str(&format!(
+        "{i}csilEntries := make(cborMap, 0, {})\n",
+        named.len()
+    ));
+    for (member, wire, entry) in &canonical {
+        let wire_lit = go_string_lit(wire);
+        if matches!(entry.occurrence, Some(CsilOccurrence::Optional)) {
+            // An absent optional is omitted from the map entirely (wire contract). A
+            // scalar/record optional is a Go pointer (deref to read); an optional
+            // slice/map is nil-able in place, so it is read without a deref.
+            let read = if optional_field_is_pointer(&entry.value_type) {
+                format!("(*csilV.{member})")
+            } else {
+                format!("csilV.{member}")
+            };
+            let enc = go_enc_value(&entry.value_type, &read, records, aliases, config);
+            out.push_str(&format!(
+                "{i}if csilV.{member} != nil {{\n{i}{i}csilEntries = append(csilEntries, cborEntry{{cborText({wire_lit}), {enc}}})\n{i}}}\n"
+            ));
+        } else {
+            let enc = go_enc_value(
+                &entry.value_type,
+                &format!("csilV.{member}"),
+                records,
+                aliases,
+                config,
+            );
+            out.push_str(&format!(
+                "{i}csilEntries = append(csilEntries, cborEntry{{cborText({wire_lit}), {enc}}})\n"
+            ));
+        }
+    }
+    out.push_str(&format!("{i}return csilEntries\n}}\n\n"));
+
+    out.push_str(&format!(
+        "// csilDec{name} reconstructs a {name} from a decoded CBOR value tree.\n"
+    ));
+    out.push_str(&format!(
+        "func csilDec{name}(csilRoot cborValue) ({name}, error) {{\n"
+    ));
+    out.push_str(&format!("{i}var csilOut {name}\n"));
+    for (member, wire, entry) in &named {
+        let wire_lit = go_string_lit(wire);
+        let dec = go_dec_func(&entry.value_type, records, aliases, config);
+        if matches!(entry.occurrence, Some(CsilOccurrence::Optional)) {
+            // A missing optional key leaves the field at its zero value (nil); a
+            // present one decodes into a fresh local. A pointer field stores its
+            // address; a nil-able slice/map field stores the value directly.
+            let assign = if optional_field_is_pointer(&entry.value_type) {
+                format!("csilOut.{member} = &csilVal")
+            } else {
+                format!("csilOut.{member} = csilVal")
+            };
+            out.push_str(&format!(
+                "{i}if csilField, csilOk := cborMapGet(csilRoot, {wire_lit}); csilOk {{\n\
+                 {i}{i}csilVal, csilErr := ({dec})(csilField)\n\
+                 {i}{i}if csilErr != nil {{\n{i}{i}{i}return csilOut, csilErr\n{i}{i}}}\n\
+                 {i}{i}{assign}\n{i}}}\n"
+            ));
+        } else {
+            out.push_str(&format!(
+                "{i}{{\n\
+                 {i}{i}csilField, csilErr := cborRequire(csilRoot, {wire_lit})\n\
+                 {i}{i}if csilErr != nil {{\n{i}{i}{i}return csilOut, csilErr\n{i}{i}}}\n\
+                 {i}{i}csilVal, csilErr := ({dec})(csilField)\n\
+                 {i}{i}if csilErr != nil {{\n{i}{i}{i}return csilOut, csilErr\n{i}{i}}}\n\
+                 {i}{i}csilOut.{member} = csilVal\n{i}}}\n"
+            ));
+        }
+    }
+    out.push_str(&format!("{i}return csilOut, nil\n}}\n\n"));
+
+    out.push_str(&format!(
+        "// Encode{name} encodes a {name} to canonical CSIL CBOR bytes.\n"
+    ));
+    out.push_str(&format!(
+        "func Encode{name}(csilV {name}) []byte {{\n{i}return cborEncode(csilEnc{name}(csilV))\n}}\n\n"
+    ));
+    out.push_str(&format!(
+        "// Decode{name} decodes canonical CSIL CBOR bytes into a {name}.\n"
+    ));
+    out.push_str(&format!(
+        "func Decode{name}(csilData []byte) ({name}, error) {{\n\
+         {i}csilRoot, csilErr := cborDecode(csilData)\n\
+         {i}if csilErr != nil {{\n{i}{i}var csilZero {name}\n{i}{i}return csilZero, csilErr\n{i}}}\n\
+         {i}return csilDec{name}(csilRoot)\n}}\n\n"
+    ));
+    out
+}
+
+/// Build `codec.gen.go`: the self-contained canonical-CBOR runtime plus an
+/// `Encode`/`Decode` pair per record. `None` when the spec declares no records.
+fn generate_codec(input: &WasmGeneratorInput, config: &GoConfig) -> Option<String> {
+    if !spec_has_records(input) {
+        return None;
+    }
+    let records = record_names(input);
+    let aliases = codec_aliases(input);
+    let uses_timestamp = spec_uses_builtin(input, "timestamp");
+    let uses_decimal = spec_uses_builtin(input, "decimal");
+
+    let mut content = String::new();
+    content.push_str(&format!(
+        "// Package {} contains the self-contained canonical-CBOR codec.\n",
+        config.package_name
+    ));
+    content.push_str("//\n");
+    content.push_str("// Code generated by csilgen; DO NOT EDIT.\n");
+    content.push_str(&format!("package {}\n\n", config.package_name));
+
+    content.push_str("import (\n");
+    content.push_str(&format!("{}\"fmt\"\n", config.indent_style));
+    content.push_str(&format!("{}\"math\"\n", config.indent_style));
+    if uses_timestamp {
+        content.push_str(&format!("{}\"time\"\n", config.indent_style));
+    }
+    if uses_decimal {
+        // The bignum mantissa fallback (a tag-2/3 byte string) keeps the exact
+        // value when it exceeds 64 bits.
+        content.push_str(&format!("{}\"math/big\"\n", config.indent_style));
+        if config.decimal_mapping == DecimalMapping::Library {
+            content.push('\n');
+            content.push_str(&format!(
+                "{}\"github.com/shopspring/decimal\"\n",
+                config.indent_style
+            ));
+        }
+    }
+    content.push_str(")\n\n");
+
+    content.push_str(CODEC_RUNTIME_GO);
+    if uses_timestamp {
+        content.push('\n');
+        content.push_str(CODEC_TIMESTAMP_GO);
+    }
+    if uses_decimal {
+        content.push('\n');
+        content.push_str(CODEC_BIGINT_GO);
+        content.push('\n');
+        content.push_str(match config.decimal_mapping {
+            DecimalMapping::Csil => CODEC_DECIMAL_CSIL_GO,
+            DecimalMapping::Library => CODEC_DECIMAL_LIBRARY_GO,
+        });
+    }
+    content.push('\n');
+
+    for rule in &input.csil_spec.rules {
+        let group = match &rule.rule_type {
+            CsilRuleType::GroupDef(g) => Some(g),
+            CsilRuleType::TypeDef(CsilTypeExpression::Group(g)) => Some(g),
+            _ => None,
+        };
+        if let Some(group) = group {
+            content.push_str(&emit_record_codec(
+                &rule.name, group, &records, &aliases, config,
+            ));
+        }
+    }
+    Some(content)
+}
+
+/// The self-contained canonical-CBOR (RFC 8949 subset) value model, encoder,
+/// decoder, generic composite helpers, and accessors every generated codec builds
+/// on. `bytes` is a Go `[]byte` carried as a CBOR byte string (major type 2) by
+/// construction, never an array of integers.
+const CODEC_RUNTIME_GO: &str = r#"// cborValue is a minimal canonical-CBOR value tree: a closed set of variants the
+// generated codec builds and walks. The marker method keeps the set closed.
+type cborValue interface{ isCbor() }
+
+type cborUint uint64
+type cborInt int64
+type cborBool bool
+type cborFloat float64
+type cborNull struct{}
+type cborText string
+type cborBytes []byte
+type cborArray []cborValue
+
+// cborEntry is one map key/value pair; cborMap keeps entries ordered (a CBOR map is
+// an ordered list of pairs), so the encoder controls the wire order explicitly.
+type cborEntry struct {
+	key cborValue
+	val cborValue
+}
+type cborMap []cborEntry
+type cborTag struct {
+	num   uint64
+	inner cborValue
+}
+
+func (cborUint) isCbor()  {}
+func (cborInt) isCbor()   {}
+func (cborBool) isCbor()  {}
+func (cborFloat) isCbor() {}
+func (cborNull) isCbor()  {}
+func (cborText) isCbor()  {}
+func (cborBytes) isCbor() {}
+func (cborArray) isCbor() {}
+func (cborMap) isCbor()   {}
+func (cborTag) isCbor()   {}
+
+// cborEncode serializes a value tree to canonical CBOR bytes.
+func cborEncode(v cborValue) []byte {
+	var out []byte
+	cborEnc(v, &out)
+	return out
+}
+
+func cborHead(major byte, n uint64, out *[]byte) {
+	mt := major << 5
+	switch {
+	case n < 24:
+		*out = append(*out, mt|byte(n))
+	case n < 0x100:
+		*out = append(*out, mt|24, byte(n))
+	case n < 0x10000:
+		*out = append(*out, mt|25, byte(n>>8), byte(n))
+	case n < 0x100000000:
+		*out = append(*out, mt|26, byte(n>>24), byte(n>>16), byte(n>>8), byte(n))
+	default:
+		*out = append(*out, mt|27,
+			byte(n>>56), byte(n>>48), byte(n>>40), byte(n>>32),
+			byte(n>>24), byte(n>>16), byte(n>>8), byte(n))
+	}
+}
+
+func cborEnc(v cborValue, out *[]byte) {
+	switch x := v.(type) {
+	case cborUint:
+		cborHead(0, uint64(x), out)
+	case cborInt:
+		if x >= 0 {
+			cborHead(0, uint64(x), out)
+		} else {
+			cborHead(1, uint64(-(int64(x) + 1)), out)
+		}
+	case cborBool:
+		if bool(x) {
+			*out = append(*out, 0xf5)
+		} else {
+			*out = append(*out, 0xf4)
+		}
+	case cborNull:
+		*out = append(*out, 0xf6)
+	case cborFloat:
+		bits := math.Float64bits(float64(x))
+		*out = append(*out, 0xfb,
+			byte(bits>>56), byte(bits>>48), byte(bits>>40), byte(bits>>32),
+			byte(bits>>24), byte(bits>>16), byte(bits>>8), byte(bits))
+	case cborText:
+		s := []byte(x)
+		cborHead(3, uint64(len(s)), out)
+		*out = append(*out, s...)
+	case cborBytes:
+		cborHead(2, uint64(len(x)), out)
+		*out = append(*out, x...)
+	case cborArray:
+		cborHead(4, uint64(len(x)), out)
+		for _, e := range x {
+			cborEnc(e, out)
+		}
+	case cborMap:
+		cborHead(5, uint64(len(x)), out)
+		for _, e := range x {
+			cborEnc(e.key, out)
+			cborEnc(e.val, out)
+		}
+	case cborTag:
+		cborHead(6, x.num, out)
+		cborEnc(x.inner, out)
+	}
+}
+
+// cborDecode parses a full CBOR item and rejects trailing bytes, so a payload that
+// is not exactly one value is an error rather than a silently-truncated read.
+func cborDecode(b []byte) (cborValue, error) {
+	pos := 0
+	v, err := cborDec(b, &pos)
+	if err != nil {
+		return nil, err
+	}
+	if pos != len(b) {
+		return nil, fmt.Errorf("csil cbor: %d trailing bytes", len(b)-pos)
+	}
+	return v, nil
+}
+
+func cborReadArg(b []byte, pos *int, low byte) (uint64, error) {
+	if low < 24 {
+		*pos++
+		return uint64(low), nil
+	}
+	switch low {
+	case 24:
+		if *pos+2 > len(b) {
+			return 0, fmt.Errorf("csil cbor: truncated argument")
+		}
+		v := uint64(b[*pos+1])
+		*pos += 2
+		return v, nil
+	case 25:
+		if *pos+3 > len(b) {
+			return 0, fmt.Errorf("csil cbor: truncated argument")
+		}
+		v := uint64(b[*pos+1])<<8 | uint64(b[*pos+2])
+		*pos += 3
+		return v, nil
+	case 26:
+		if *pos+5 > len(b) {
+			return 0, fmt.Errorf("csil cbor: truncated argument")
+		}
+		var v uint64
+		for i := 1; i <= 4; i++ {
+			v = v<<8 | uint64(b[*pos+i])
+		}
+		*pos += 5
+		return v, nil
+	case 27:
+		if *pos+9 > len(b) {
+			return 0, fmt.Errorf("csil cbor: truncated argument")
+		}
+		var v uint64
+		for i := 1; i <= 8; i++ {
+			v = v<<8 | uint64(b[*pos+i])
+		}
+		*pos += 9
+		return v, nil
+	default:
+		return 0, fmt.Errorf("csil cbor: reserved additional info %d", low)
+	}
+}
+
+func cborDec(b []byte, pos *int) (cborValue, error) {
+	if *pos >= len(b) {
+		return nil, fmt.Errorf("csil cbor: unexpected end of input")
+	}
+	ib := b[*pos]
+	major := ib >> 5
+	low := ib & 0x1f
+	if major == 7 {
+		switch low {
+		case 20:
+			*pos++
+			return cborBool(false), nil
+		case 21:
+			*pos++
+			return cborBool(true), nil
+		case 22, 23:
+			*pos++
+			return cborNull{}, nil
+		case 26:
+			bits, err := cborReadArg(b, pos, low)
+			if err != nil {
+				return nil, err
+			}
+			return cborFloat(float64(math.Float32frombits(uint32(bits)))), nil
+		case 27:
+			bits, err := cborReadArg(b, pos, low)
+			if err != nil {
+				return nil, err
+			}
+			return cborFloat(math.Float64frombits(bits)), nil
+		default:
+			return nil, fmt.Errorf("csil cbor: unsupported simple value %d", low)
+		}
+	}
+	arg, err := cborReadArg(b, pos, low)
+	if err != nil {
+		return nil, err
+	}
+	switch major {
+	case 0:
+		return cborUint(arg), nil
+	case 1:
+		if arg > uint64(math.MaxInt64) {
+			return nil, fmt.Errorf("csil cbor: negative integer out of range")
+		}
+		return cborInt(-1 - int64(arg)), nil
+	case 2:
+		n := int(arg)
+		if *pos+n > len(b) {
+			return nil, fmt.Errorf("csil cbor: truncated byte string")
+		}
+		slice := make([]byte, n)
+		copy(slice, b[*pos:*pos+n])
+		*pos += n
+		return cborBytes(slice), nil
+	case 3:
+		n := int(arg)
+		if *pos+n > len(b) {
+			return nil, fmt.Errorf("csil cbor: truncated text string")
+		}
+		s := string(b[*pos : *pos+n])
+		*pos += n
+		return cborText(s), nil
+	case 4:
+		n := int(arg)
+		items := make(cborArray, 0, n)
+		for i := 0; i < n; i++ {
+			item, err := cborDec(b, pos)
+			if err != nil {
+				return nil, err
+			}
+			items = append(items, item)
+		}
+		return items, nil
+	case 5:
+		n := int(arg)
+		entries := make(cborMap, 0, n)
+		for i := 0; i < n; i++ {
+			k, err := cborDec(b, pos)
+			if err != nil {
+				return nil, err
+			}
+			val, err := cborDec(b, pos)
+			if err != nil {
+				return nil, err
+			}
+			entries = append(entries, cborEntry{k, val})
+		}
+		return entries, nil
+	case 6:
+		inner, err := cborDec(b, pos)
+		if err != nil {
+			return nil, err
+		}
+		return cborTag{num: arg, inner: inner}, nil
+	default:
+		return nil, fmt.Errorf("csil cbor: unexpected major type %d", major)
+	}
+}
+
+// cborEncArray maps a typed slice to a CBOR array via the per-element encoder.
+func cborEncArray[E any](xs []E, f func(E) cborValue) cborValue {
+	items := make(cborArray, 0, len(xs))
+	for _, x := range xs {
+		items = append(items, f(x))
+	}
+	return items
+}
+
+// cborEncMap maps a typed map to a CBOR map. Go map iteration is unordered, so the
+// inner map's entry order is not canonicalized; the record's own keys (laid down at
+// generation time) are what the cross-language wire contract pins.
+func cborEncMap[K comparable, V any](m map[K]V, kf func(K) cborValue, vf func(V) cborValue) cborValue {
+	entries := make(cborMap, 0, len(m))
+	for k, v := range m {
+		entries = append(entries, cborEntry{kf(k), vf(v)})
+	}
+	return entries
+}
+
+func cborDecArray[E any](v cborValue, f func(cborValue) (E, error)) ([]E, error) {
+	arr, err := cborAsArray(v)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]E, 0, len(arr))
+	for _, e := range arr {
+		x, err := f(e)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, x)
+	}
+	return out, nil
+}
+
+func cborDecMap[K comparable, V any](v cborValue, kf func(cborValue) (K, error), vf func(cborValue) (V, error)) (map[K]V, error) {
+	entries, err := cborAsMap(v)
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[K]V, len(entries))
+	for _, e := range entries {
+		k, err := kf(e.key)
+		if err != nil {
+			return nil, err
+		}
+		val, err := vf(e.val)
+		if err != nil {
+			return nil, err
+		}
+		out[k] = val
+	}
+	return out, nil
+}
+
+func cborMapGet(v cborValue, key string) (cborValue, bool) {
+	if m, ok := v.(cborMap); ok {
+		for _, e := range m {
+			if k, ok := e.key.(cborText); ok && string(k) == key {
+				return e.val, true
+			}
+		}
+	}
+	return nil, false
+}
+
+func cborRequire(v cborValue, key string) (cborValue, error) {
+	if x, ok := cborMapGet(v, key); ok {
+		return x, nil
+	}
+	return nil, fmt.Errorf("csil cbor: missing field %q", key)
+}
+
+func cborAsI64(v cborValue) (int64, error) {
+	switch x := v.(type) {
+	case cborUint:
+		if uint64(x) > uint64(math.MaxInt64) {
+			return 0, fmt.Errorf("csil cbor: integer overflows int64")
+		}
+		return int64(x), nil
+	case cborInt:
+		return int64(x), nil
+	default:
+		return 0, fmt.Errorf("csil cbor: expected integer, got %T", v)
+	}
+}
+
+func cborAsU64(v cborValue) (uint64, error) {
+	switch x := v.(type) {
+	case cborUint:
+		return uint64(x), nil
+	case cborInt:
+		if x < 0 {
+			return 0, fmt.Errorf("csil cbor: negative integer where unsigned expected")
+		}
+		return uint64(x), nil
+	default:
+		return 0, fmt.Errorf("csil cbor: expected unsigned integer, got %T", v)
+	}
+}
+
+func cborAsF64(v cborValue) (float64, error) {
+	switch x := v.(type) {
+	case cborFloat:
+		return float64(x), nil
+	case cborUint:
+		return float64(x), nil
+	case cborInt:
+		return float64(x), nil
+	default:
+		return 0, fmt.Errorf("csil cbor: expected float, got %T", v)
+	}
+}
+
+func cborAsBool(v cborValue) (bool, error) {
+	if b, ok := v.(cborBool); ok {
+		return bool(b), nil
+	}
+	return false, fmt.Errorf("csil cbor: expected bool, got %T", v)
+}
+
+func cborAsText(v cborValue) (string, error) {
+	if s, ok := v.(cborText); ok {
+		return string(s), nil
+	}
+	return "", fmt.Errorf("csil cbor: expected text, got %T", v)
+}
+
+func cborAsBytes(v cborValue) ([]byte, error) {
+	if b, ok := v.(cborBytes); ok {
+		return []byte(b), nil
+	}
+	return nil, fmt.Errorf("csil cbor: expected byte string, got %T", v)
+}
+
+func cborAsArray(v cborValue) ([]cborValue, error) {
+	if a, ok := v.(cborArray); ok {
+		return []cborValue(a), nil
+	}
+	return nil, fmt.Errorf("csil cbor: expected array, got %T", v)
+}
+
+func cborAsMap(v cborValue) (cborMap, error) {
+	if m, ok := v.(cborMap); ok {
+		return m, nil
+	}
+	return nil, fmt.Errorf("csil cbor: expected map, got %T", v)
+}
+"#;
+
+/// Timestamp (CBOR tag 0, RFC3339, always UTC) codec, emitted only when the spec
+/// uses `timestamp` so `time` is never an unused import.
+const CODEC_TIMESTAMP_GO: &str = r#"// csilEncTimestamp encodes a time.Time as CBOR tag 0 RFC3339 text in UTC, per the
+// wire contract; sub-second precision is preserved when present.
+func csilEncTimestamp(t time.Time) cborValue {
+	return cborTag{num: 0, inner: cborText(t.UTC().Format(time.RFC3339Nano))}
+}
+
+// csilAsTimestamp decodes a CBOR tag 0 RFC3339 timestamp back to a UTC time.Time.
+func csilAsTimestamp(v cborValue) (time.Time, error) {
+	t, ok := v.(cborTag)
+	if !ok || t.num != 0 {
+		return time.Time{}, fmt.Errorf("csil cbor: expected CBOR tag 0 timestamp")
+	}
+	s, ok := t.inner.(cborText)
+	if !ok {
+		return time.Time{}, fmt.Errorf("csil cbor: timestamp content must be text")
+	}
+	parsed, err := time.Parse(time.RFC3339, string(s))
+	if err != nil {
+		return time.Time{}, err
+	}
+	return parsed.UTC(), nil
+}
+"#;
+
+/// Exact-integer (de)serialization for a decimal mantissa: a 64-bit integer when it
+/// fits, otherwise a CBOR bignum (tag 2 non-negative / tag 3 negative). Emitted only
+/// alongside the decimal codec so `math/big` is never an unused import.
+const CODEC_BIGINT_GO: &str = r#"// csilEncBigInt encodes an exact integer mantissa: a CBOR integer when it fits in
+// 64 bits, otherwise a bignum (RFC 8949 §3.4.3) so the value stays exact.
+func csilEncBigInt(m *big.Int) cborValue {
+	if m.IsInt64() {
+		return cborInt(m.Int64())
+	}
+	if m.IsUint64() {
+		return cborUint(m.Uint64())
+	}
+	if m.Sign() >= 0 {
+		return cborTag{num: 2, inner: cborBytes(m.Bytes())}
+	}
+	// A negative bignum encodes the magnitude of -1 - value.
+	n := new(big.Int).Sub(new(big.Int).Neg(m), big.NewInt(1))
+	return cborTag{num: 3, inner: cborBytes(n.Bytes())}
+}
+
+func csilDecBigInt(v cborValue) (*big.Int, error) {
+	switch x := v.(type) {
+	case cborUint:
+		return new(big.Int).SetUint64(uint64(x)), nil
+	case cborInt:
+		return big.NewInt(int64(x)), nil
+	case cborTag:
+		bs, ok := x.inner.(cborBytes)
+		if !ok {
+			return nil, fmt.Errorf("csil cbor: bignum content must be a byte string")
+		}
+		mag := new(big.Int).SetBytes(bs)
+		switch x.num {
+		case 2:
+			return mag, nil
+		case 3:
+			return new(big.Int).Sub(new(big.Int).Neg(mag), big.NewInt(1)), nil
+		default:
+			return nil, fmt.Errorf("csil cbor: unexpected bignum tag %d", x.num)
+		}
+	default:
+		return nil, fmt.Errorf("csil cbor: expected integer mantissa, got %T", v)
+	}
+}
+"#;
+
+/// Decimal codec under the default `csil` mapping: the generated `CsilDecimal`
+/// (exponent + big.Int mantissa) maps straight onto CBOR tag 4 `[exponent, mantissa]`.
+const CODEC_DECIMAL_CSIL_GO: &str = r#"// csilEncDecimal encodes a CsilDecimal as CBOR tag 4: [exponent, mantissa].
+func csilEncDecimal(d CsilDecimal) cborValue {
+	return cborTag{num: 4, inner: cborArray{cborInt(d.Exponent), csilEncBigInt(d.mantissa())}}
+}
+
+// csilAsDecimal decodes a CBOR tag 4 decimal fraction into an exact CsilDecimal.
+func csilAsDecimal(v cborValue) (CsilDecimal, error) {
+	t, ok := v.(cborTag)
+	if !ok || t.num != 4 {
+		return CsilDecimal{}, fmt.Errorf("csil cbor: expected CBOR tag 4 decimal")
+	}
+	arr, ok := t.inner.(cborArray)
+	if !ok || len(arr) != 2 {
+		return CsilDecimal{}, fmt.Errorf("csil cbor: tag 4 content must be [exponent, mantissa]")
+	}
+	exp, err := cborAsI64(arr[0])
+	if err != nil {
+		return CsilDecimal{}, err
+	}
+	mant, err := csilDecBigInt(arr[1])
+	if err != nil {
+		return CsilDecimal{}, err
+	}
+	return CsilDecimal{Exponent: exp, Mantissa: mant}, nil
+}
+"#;
+
+/// Decimal codec under the `library` mapping: shopspring's Decimal carries the same
+/// exact value (coefficient * 10^exponent), so it maps onto CBOR tag 4 directly.
+const CODEC_DECIMAL_LIBRARY_GO: &str = r#"// csilEncDecimal encodes a shopspring Decimal as CBOR tag 4: [exponent, mantissa].
+func csilEncDecimal(d decimal.Decimal) cborValue {
+	return cborTag{num: 4, inner: cborArray{cborInt(int64(d.Exponent())), csilEncBigInt(d.Coefficient())}}
+}
+
+// csilAsDecimal decodes a CBOR tag 4 decimal fraction into a shopspring Decimal.
+func csilAsDecimal(v cborValue) (decimal.Decimal, error) {
+	t, ok := v.(cborTag)
+	if !ok || t.num != 4 {
+		return decimal.Decimal{}, fmt.Errorf("csil cbor: expected CBOR tag 4 decimal")
+	}
+	arr, ok := t.inner.(cborArray)
+	if !ok || len(arr) != 2 {
+		return decimal.Decimal{}, fmt.Errorf("csil cbor: tag 4 content must be [exponent, mantissa]")
+	}
+	exp, err := cborAsI64(arr[0])
+	if err != nil {
+		return decimal.Decimal{}, err
+	}
+	mant, err := csilDecBigInt(arr[1])
+	if err != nil {
+		return decimal.Decimal{}, err
+	}
+	return decimal.NewFromBigInt(mant, int32(exp)), nil
+}
+"#;
 
 /// Strip a trailing `Service` suffix and PascalCase the remainder, matching the
 /// wire service base used across the TypeScript/Rust/Python clients.
@@ -858,10 +1845,11 @@ fn generate_client(
     content.push_str(CLIENT_PRELUDE_GO);
     content.push('\n');
 
+    let records = record_names(input);
     let mut emitted_any = false;
     for rule in &input.csil_spec.rules {
         if let CsilRuleType::ServiceDef(service) = &rule.rule_type {
-            emit_client_struct(&mut content, &rule.name, service, config);
+            emit_client_struct(&mut content, &rule.name, service, config, &records);
             emitted_any = true;
         }
     }
@@ -873,18 +1861,27 @@ fn generate_client(
     }
 }
 
+/// Whether a type is a reference to a record the codec can (de)serialize, so a typed
+/// client method can call the generated `Encode<T>`/`Decode<T>` directly.
+fn is_record_ref(ty: &CsilTypeExpression, records: &std::collections::HashSet<String>) -> bool {
+    matches!(ty, CsilTypeExpression::Reference(name) if records.contains(name))
+}
+
 fn emit_client_struct(
     content: &mut String,
     name: &str,
     service: &CsilServiceDefinition,
     config: &GoConfig,
+    records: &std::collections::HashSet<String>,
 ) {
     let base = go_service_base(name);
     let client = format!("{base}Client");
+    // Canonical wire strings (the wire contract): service lowercased, op PascalCased.
     let wire_service = base.to_lowercase();
 
     content.push_str(&format!(
-        "// {client} is a typed client for the {name} service.\n"
+        "// {client} is a typed client for the {name} service. The client owns\n\
+         // (de)serialization via the generated codec; the transport only moves bytes.\n"
     ));
     content.push_str(&format!("type {client} struct {{\n"));
     content.push_str(&format!("{}transport Transport\n", config.indent_style));
@@ -909,13 +1906,22 @@ fn emit_client_struct(
             ));
             continue;
         }
-        let method_name = go_method_name(&operation.name);
-        let output_type = map_csil_type_to_go(
-            &go_success_type(&operation.output_type),
-            &None,
-            config.decimal_go_type(),
-        );
+        let success = go_success_type(&operation.output_type);
         let null_input = op_input_is_null(&operation.input_type);
+        // The typed-codec path needs a record success type (and a record or null
+        // request) so the method can call the generated Encode/Decode. Anything else
+        // is skipped with a note rather than emitting an uncompilable call.
+        if !is_record_ref(&success, records)
+            || !(null_input || is_record_ref(&operation.input_type, records))
+        {
+            content.push_str(&format!(
+                "// operation {} has a non-record payload; (de)serialize it manually\n\n",
+                operation.name
+            ));
+            continue;
+        }
+        let method_name = go_method_name(&operation.name);
+        let output_type = map_csil_type_to_go(&success, &None, config.decimal_go_type());
         let params = if null_input {
             "ctx context.Context".to_string()
         } else {
@@ -923,19 +1929,46 @@ fn emit_client_struct(
                 map_csil_type_to_go(&operation.input_type, &None, config.decimal_go_type());
             format!("ctx context.Context, req {input_type}")
         };
-        // With no request parameter there is nothing to marshal; the transport
-        // still needs a payload argument, so pass an explicit nil.
-        let req_arg = if null_input { "nil" } else { "req" };
         content.push_str(&format!(
             "func (c *{client}) {method_name}({params}) ({output_type}, error) {{\n"
         ));
-        content.push_str(&format!("{}var resp {output_type}\n", config.indent_style));
         content.push_str(&format!(
-            "{}err := c.transport.Call(ctx, \"{wire_service}\", \"{method_name}\", {req_arg}, &resp)\n",
+            "{}var csilZero {output_type}\n",
             config.indent_style
         ));
-        content.push_str(&format!("{}return resp, err\n", config.indent_style));
+        // A null input carries no request body, so the transport gets a nil payload;
+        // otherwise the request record is encoded to its canonical CBOR bytes first.
+        if null_input {
+            content.push_str(&format!(
+                "{}csilResp, csilErr := c.transport.Call(ctx, \"{wire_service}\", \"{method_name}\", nil)\n",
+                config.indent_style
+            ));
+        } else {
+            let req_type = type_ref_name(&operation.input_type);
+            content.push_str(&format!(
+                "{}csilResp, csilErr := c.transport.Call(ctx, \"{wire_service}\", \"{method_name}\", Encode{req_type}(req))\n",
+                config.indent_style
+            ));
+        }
+        content.push_str(&format!(
+            "{i}if csilErr != nil {{\n{i}{i}return csilZero, csilErr\n{i}}}\n",
+            i = config.indent_style
+        ));
+        let resp_type = type_ref_name(&success);
+        content.push_str(&format!(
+            "{}return Decode{resp_type}(csilResp)\n",
+            config.indent_style
+        ));
         content.push_str("}\n\n");
+    }
+}
+
+/// The bare type name of a record `Reference`. Only called after `is_record_ref`
+/// has confirmed the type is a record reference, so the fallback is never reached.
+fn type_ref_name(ty: &CsilTypeExpression) -> String {
+    match ty {
+        CsilTypeExpression::Reference(name) => name.clone(),
+        _ => String::new(),
     }
 }
 
@@ -2700,66 +3733,40 @@ mod tests {
     }
 
     #[test]
-    fn cbor_tags_key_by_csil_field_name() {
-        use csilgen_common::{CsilGroupEntry, CsilGroupExpression};
-        let input = WasmGeneratorInput {
-            csil_spec: CsilSpecSerialized {
-                rules: vec![CsilRule {
-                    name: "Task".to_string(),
-                    rule_type: CsilRuleType::GroupDef(CsilGroupExpression {
-                        entries: vec![
-                            CsilGroupEntry {
-                                key: Some(CsilGroupKey::Bare("current_state".to_string())),
-                                value_type: CsilTypeExpression::Builtin("text".to_string()),
-                                occurrence: None,
-                                metadata: vec![],
-                                doc_comments: Vec::new(),
-                            },
-                            CsilGroupEntry {
-                                key: Some(CsilGroupKey::Bare("note".to_string())),
-                                value_type: CsilTypeExpression::Builtin("text".to_string()),
-                                occurrence: Some(CsilOccurrence::Optional),
-                                metadata: vec![],
-                                doc_comments: Vec::new(),
-                            },
-                        ],
-                    }),
-                    position: CsilPosition {
-                        line: 1,
-                        column: 1,
-                        offset: 0,
-                    },
+    fn types_drop_cbor_tags_codec_keys_by_csil_field_name() {
+        // The reflection/derive payload path is gone: types carry only json/yaml
+        // tags, and the generated codec — not a `cbor:` struct tag — keys the wire
+        // by the CSIL field name verbatim.
+        let input = group_input(
+            "Task",
+            vec![
+                bare_entry(
+                    "current_state",
+                    CsilTypeExpression::Builtin("text".to_string()),
+                ),
+                CsilGroupEntry {
+                    key: Some(CsilGroupKey::Bare("note".to_string())),
+                    value_type: CsilTypeExpression::Builtin("text".to_string()),
+                    occurrence: Some(CsilOccurrence::Optional),
+                    metadata: vec![],
                     doc_comments: Vec::new(),
-                }],
-                source_content: None,
-                service_count: 0,
-                fields_with_metadata_count: 0,
-            },
-            config: GeneratorConfig {
-                target: "go".to_string(),
-                output_dir: "/tmp".to_string(),
-                options: HashMap::new(),
-            },
-            generator_metadata: GeneratorMetadata {
-                name: "go".to_string(),
-                version: "1.0.0".to_string(),
-                description: String::new(),
-                target: "go".to_string(),
-                capabilities: vec![],
-                author: None,
-                homepage: None,
-            },
-        };
+                },
+            ],
+            HashMap::new(),
+        );
         let config = GoConfig::from_options(&input.config.options).unwrap();
         let types = super::generate_types(&input, &config, &mut Vec::new())
             .unwrap()
             .expect("types emitted");
-        // Wire key is the CSIL field name verbatim, alongside the existing tags.
-        assert!(
-            types
-                .contains("`json:\"current_state\" yaml:\"current_state\" cbor:\"current_state\"`")
-        );
-        assert!(types.contains("cbor:\"note,omitempty\""));
+        assert!(types.contains("`json:\"current_state\" yaml:\"current_state\"`"));
+        assert!(!types.contains("cbor:"));
+
+        let codec = super::generate_codec(&input, &config).expect("codec emitted");
+        // The codec keys the map by the CSIL field name verbatim.
+        assert!(codec.contains("cborText(\"current_state\")"));
+        assert!(codec.contains("cborText(\"note\")"));
+        // No third-party CBOR library is referenced anywhere in the codec.
+        assert!(!codec.contains("fxamacker"));
     }
 
     #[test]
@@ -2775,33 +3782,239 @@ mod tests {
         assert!(!services.contains("interface{}"));
     }
 
+    /// A corndogs-shaped spec: a `Task` record (text/bytes/optional-int/map/list),
+    /// `SubmitTaskRequest`, a `ServiceError`, and `CorndogsService` with one unary
+    /// `submit-task: SubmitTaskRequest -> Task / ServiceError`.
+    fn corndogs_input(target: &str) -> WasmGeneratorInput {
+        let text = || CsilTypeExpression::Builtin("text".to_string());
+        let group_rule = |name: &str, entries: Vec<CsilGroupEntry>| CsilRule {
+            name: name.to_string(),
+            rule_type: CsilRuleType::GroupDef(CsilGroupExpression { entries }),
+            position: CsilPosition {
+                line: 1,
+                column: 1,
+                offset: 0,
+            },
+            doc_comments: Vec::new(),
+        };
+        let optional_int = CsilGroupEntry {
+            key: Some(CsilGroupKey::Bare("priority".to_string())),
+            value_type: CsilTypeExpression::Builtin("int".to_string()),
+            occurrence: Some(CsilOccurrence::Optional),
+            metadata: vec![],
+            doc_comments: Vec::new(),
+        };
+        let task = group_rule(
+            "Task",
+            vec![
+                bare_entry("uuid", text()),
+                bare_entry("current_state", text()),
+                bare_entry("payload", CsilTypeExpression::Builtin("bytes".to_string())),
+                optional_int,
+                bare_entry(
+                    "labels",
+                    CsilTypeExpression::Map {
+                        key: Box::new(text()),
+                        value: Box::new(CsilTypeExpression::Builtin("int".to_string())),
+                        occurrence: None,
+                    },
+                ),
+                bare_entry(
+                    "tags",
+                    CsilTypeExpression::Array {
+                        element_type: Box::new(text()),
+                        occurrence: None,
+                    },
+                ),
+                // Fields typed as named map ALIASES — the regression: their codec
+                // must walk the underlying map, not stub it to null. One map-of-int
+                // and one map-of-record.
+                bare_entry(
+                    "queue_counts",
+                    CsilTypeExpression::Reference("StringInt64Map".to_string()),
+                ),
+                bare_entry(
+                    "state_counts",
+                    CsilTypeExpression::Reference("QueueAndStateCountsMap".to_string()),
+                ),
+            ],
+        );
+        let counts = group_rule(
+            "QueueAndStateCounts",
+            vec![bare_entry(
+                "count",
+                CsilTypeExpression::Builtin("int".to_string()),
+            )],
+        );
+        // Named map aliases (`X = {* text => …}`) parse to a TypeDef carrying a Map.
+        let alias = |name: &str, value: CsilTypeExpression| CsilRule {
+            name: name.to_string(),
+            rule_type: CsilRuleType::TypeDef(CsilTypeExpression::Map {
+                key: Box::new(text()),
+                value: Box::new(value),
+                occurrence: None,
+            }),
+            position: CsilPosition {
+                line: 1,
+                column: 1,
+                offset: 0,
+            },
+            doc_comments: Vec::new(),
+        };
+        let str_int_map = alias(
+            "StringInt64Map",
+            CsilTypeExpression::Builtin("int".to_string()),
+        );
+        let state_map = alias(
+            "QueueAndStateCountsMap",
+            CsilTypeExpression::Reference("QueueAndStateCounts".to_string()),
+        );
+        let req = group_rule(
+            "SubmitTaskRequest",
+            vec![
+                bare_entry("task", CsilTypeExpression::Reference("Task".to_string())),
+                bare_entry("queue", text()),
+            ],
+        );
+        let err = group_rule(
+            "ServiceError",
+            vec![
+                bare_entry("code", CsilTypeExpression::Builtin("int".to_string())),
+                bare_entry("message", text()),
+            ],
+        );
+        let svc = CsilRule {
+            name: "CorndogsService".to_string(),
+            rule_type: CsilRuleType::ServiceDef(CsilServiceDefinition {
+                operations: vec![CsilServiceOperation {
+                    name: "submit-task".to_string(),
+                    input_type: CsilTypeExpression::Reference("SubmitTaskRequest".to_string()),
+                    output_type: CsilTypeExpression::Choice(vec![
+                        CsilTypeExpression::Reference("Task".to_string()),
+                        CsilTypeExpression::Reference("ServiceError".to_string()),
+                    ]),
+                    direction: CsilServiceDirection::Unidirectional,
+                    position: CsilPosition {
+                        line: 1,
+                        column: 1,
+                        offset: 0,
+                    },
+                    doc_comments: Vec::new(),
+                    wire_id: None,
+                }],
+                wire_id: None,
+            }),
+            position: CsilPosition {
+                line: 1,
+                column: 1,
+                offset: 0,
+            },
+            doc_comments: Vec::new(),
+        };
+        WasmGeneratorInput {
+            csil_spec: CsilSpecSerialized {
+                rules: vec![str_int_map, state_map, counts, task, req, err, svc],
+                source_content: None,
+                service_count: 1,
+                fields_with_metadata_count: 0,
+            },
+            config: GeneratorConfig {
+                target: target.to_string(),
+                output_dir: "/tmp".to_string(),
+                options: HashMap::new(),
+            },
+            generator_metadata: GeneratorMetadata {
+                name: "go".to_string(),
+                version: "1.0.0".to_string(),
+                description: String::new(),
+                target: "go".to_string(),
+                capabilities: vec![],
+                author: None,
+                homepage: None,
+            },
+        }
+    }
+
     #[test]
     fn go_client_target_emits_typed_client() {
-        let mut input = input_with_service("CorndogsService", vec![unary_union_op("SubmitTask")]);
-        input.config.target = "go-client".to_string();
-        let output = super::process_generation(input).expect("generation ok");
+        let output = super::process_generation(corndogs_input("go-client")).expect("generation ok");
         let client = output
             .files
             .iter()
             .find(|f| f.path == "client.gen.go")
             .expect("client.gen.go emitted");
         assert!(client.content.contains("type Transport interface"));
+        // The transport is a dumb byte seam now: bytes in, bytes out.
+        assert!(client.content.contains(
+            "Call(ctx context.Context, service string, op string, req []byte) ([]byte, error)"
+        ));
         assert!(client.content.contains("type ClientError struct"));
         assert!(
             client
                 .content
                 .contains("func NewCorndogsClient(transport Transport) *CorndogsClient")
         );
+        // Typed seam: a SubmitTaskRequest in, a Task out, codec called internally.
         assert!(client.content.contains(
-            "func (c *CorndogsClient) SubmitTask(ctx context.Context, req SubmitTaskRequest) (SubmitTaskResponse, error)"
+            "func (c *CorndogsClient) SubmitTask(ctx context.Context, req SubmitTaskRequest) (Task, error)"
         ));
-        assert!(
-            client
-                .content
-                .contains("err := c.transport.Call(ctx, \"corndogs\", \"SubmitTask\", req, &resp)")
-        );
+        assert!(client.content.contains(
+            "csilResp, csilErr := c.transport.Call(ctx, \"corndogs\", \"SubmitTask\", EncodeSubmitTaskRequest(req))"
+        ));
+        assert!(client.content.contains("return DecodeTask(csilResp)"));
+        // The codec ships alongside the client.
+        assert!(output.files.iter().any(|f| f.path == "codec.gen.go"));
         // Server interface must not be emitted for the client target.
         assert!(!output.files.iter().any(|f| f.path == "services.gen.go"));
+    }
+
+    #[test]
+    fn codec_emitted_with_typed_client() {
+        let output = super::process_generation(corndogs_input("go-client")).expect("generation ok");
+        let codec = output
+            .files
+            .iter()
+            .find(|f| f.path == "codec.gen.go")
+            .expect("codec.gen.go emitted");
+        // Public byte wrappers and the internal canonical-map encoder are present.
+        assert!(
+            codec
+                .content
+                .contains("func EncodeSubmitTaskRequest(csilV SubmitTaskRequest) []byte")
+        );
+        assert!(
+            codec
+                .content
+                .contains("func DecodeTask(csilData []byte) (Task, error)")
+        );
+        assert!(
+            codec
+                .content
+                .contains("func csilEncTask(csilV Task) cborValue")
+        );
+        // bytes -> CBOR byte string (major type 2), via the runtime's cborBytes.
+        assert!(
+            codec
+                .content
+                .contains("cborText(\"payload\"), cborBytes(csilV.Payload)")
+        );
+        // A nested record reference recurses into its codec.
+        assert!(codec.content.contains("csilEncTask(csilV.Task)"));
+        // Optional int is a pointer: guarded on encode, deref'd into the map.
+        assert!(codec.content.contains("if csilV.Priority != nil"));
+        assert!(codec.content.contains("cborInt((*csilV.Priority))"));
+        // Keys are laid down in canonical (encoded-key) order: within Task the len-4
+        // keys `tags`/`uuid` precede longer keys, and `current_state` (len 13) is last;
+        // `tags` < `uuid` on content.
+        let enc_start = codec.content.find("func csilEncTask").unwrap();
+        let enc = &codec.content[enc_start..];
+        let pos_tags = enc.find("\"tags\"").unwrap();
+        let pos_uuid = enc.find("\"uuid\"").unwrap();
+        let pos_state = enc.find("\"current_state\"").unwrap();
+        assert!(
+            pos_tags < pos_uuid && pos_uuid < pos_state,
+            "fields not in canonical key order"
+        );
     }
 
     #[test]
@@ -2943,19 +4156,9 @@ mod tests {
             .find(|f| f.path == "csil_decimal.gen.go")
             .expect("CsilDecimal helper emitted");
         assert!(helper.content.contains("type CsilDecimal struct"));
-        assert!(
-            helper
-                .content
-                .contains("func (d CsilDecimal) MarshalCBOR()")
-        );
-        // CBOR tag 4 decimal fraction is the normative wire form.
-        assert!(helper.content.contains("Number:  4,"));
-        assert!(
-            helper
-                .content
-                .contains("[]interface{}{d.Exponent, d.mantissa()}")
-        );
-        assert!(helper.content.contains("\"github.com/fxamacker/cbor/v2\""));
+        // The helper no longer owns the wire: no fxamacker, no Marshal/UnmarshalCBOR.
+        assert!(!helper.content.contains("MarshalCBOR"));
+        assert!(!helper.content.contains("fxamacker"));
         // Interop bridge present, but no hard dependency on shopspring.
         assert!(helper.content.contains("func ParseCsilDecimal"));
         assert!(
@@ -2965,6 +4168,23 @@ mod tests {
         );
         // The bridge is documented, but shopspring is never imported.
         assert!(!helper.content.contains("\"github.com/shopspring/decimal\""));
+
+        // The generated codec owns the CBOR tag-4 decimal wire form directly.
+        let codec = output
+            .files
+            .iter()
+            .find(|f| f.path == "codec.gen.go")
+            .expect("codec.gen.go emitted");
+        assert!(
+            codec
+                .content
+                .contains("func csilEncDecimal(d CsilDecimal) cborValue")
+        );
+        assert!(codec.content.contains(
+            "cborTag{num: 4, inner: cborArray{cborInt(d.Exponent), csilEncBigInt(d.mantissa())}}"
+        ));
+        assert!(codec.content.contains("\"math/big\""));
+        assert!(!codec.content.contains("fxamacker"));
     }
 
     #[test]
@@ -3880,7 +5100,24 @@ mod tests {
             doc_comments: Vec::new(),
             wire_id: None,
         };
-        let input = input_with_service("HealthService", vec![push_op]);
+        let mut input = input_with_service("HealthService", vec![push_op]);
+        // The typed client decodes the response through the codec, so the success
+        // type must be a record; add a `Pong` so the method is emitted.
+        input.csil_spec.rules.push(CsilRule {
+            name: "Pong".to_string(),
+            rule_type: CsilRuleType::GroupDef(CsilGroupExpression {
+                entries: vec![bare_entry(
+                    "ok",
+                    CsilTypeExpression::Builtin("bool".to_string()),
+                )],
+            }),
+            position: CsilPosition {
+                line: 1,
+                column: 1,
+                offset: 0,
+            },
+            doc_comments: Vec::new(),
+        });
         let config = GoConfig::from_options(&input.config.options).unwrap();
 
         let services = super::generate_services(&input, &config, &mut Vec::new())
@@ -3894,8 +5131,10 @@ mod tests {
             .expect("client emitted");
         assert!(client.contains("func (c *HealthClient) Ping(ctx context.Context) (Pong, error)"));
         assert!(!client.contains("Ping(ctx context.Context, req"));
-        // The transport still needs a payload arg; a null input passes nil.
-        assert!(client.contains("c.transport.Call(ctx, \"health\", \"Ping\", nil, &resp)"));
+        // A null input carries no body: the transport gets a nil payload, and the
+        // response bytes decode through the codec.
+        assert!(client.contains("c.transport.Call(ctx, \"health\", \"Ping\", nil)"));
+        assert!(client.contains("return DecodePong(csilResp)"));
     }
 
     fn wire_id_input() -> WasmGeneratorInput {
@@ -4060,4 +5299,145 @@ mod tests {
             "no compact router without wire-ids, got:\n{services}"
         );
     }
+
+    /// Compile the generated codec + typed client and round-trip a corndogs request
+    /// through a loopback transport with `go run`. Skips cleanly when no Go toolchain
+    /// is on PATH; with one present, this is the real proof the output is usable.
+    #[test]
+    fn codec_round_trips_through_go() {
+        let probe = std::process::Command::new("go").arg("version").output();
+        if probe.map(|o| !o.status.success()).unwrap_or(true) {
+            eprintln!("skipping: no go toolchain on PATH");
+            return;
+        }
+
+        let output = super::process_generation(corndogs_input("go-client")).expect("generation ok");
+
+        let dir = std::env::temp_dir().join(format!("csilgen-go-codec-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let api_dir = dir.join("api");
+        std::fs::create_dir_all(&api_dir).unwrap();
+        for file in &output.files {
+            std::fs::write(api_dir.join(&file.path), &file.content).unwrap();
+        }
+        // A go.mod pinning go 1.18 (the generics floor the codec needs) plus a driver
+        // main wiring a loopback transport that decodes the request and re-encodes its
+        // task as the response.
+        std::fs::write(dir.join("go.mod"), "module csilroundtrip\n\ngo 1.18\n").unwrap();
+        std::fs::write(dir.join("main.go"), GO_CODEC_DRIVER).unwrap();
+
+        let run = std::process::Command::new("go")
+            .arg("run")
+            .arg(".")
+            .current_dir(&dir)
+            // Keep the build hermetic: never fetch a toolchain or hit the module proxy
+            // (the generated code has no third-party deps), and confine the cache.
+            .env("GOTOOLCHAIN", "local")
+            .env("GOFLAGS", "-mod=mod")
+            .env("GOPROXY", "off")
+            .env("GO111MODULE", "on")
+            .env("GOCACHE", dir.join(".gocache"))
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&run.stdout);
+        let stderr = String::from_utf8_lossy(&run.stderr);
+        assert!(
+            run.status.success(),
+            "go run failed:\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        assert_eq!(
+            stdout.trim(),
+            "ok",
+            "unexpected output:\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    const GO_CODEC_DRIVER: &str = r#"package main
+
+import (
+	"bytes"
+	"context"
+	"fmt"
+	"os"
+
+	"csilroundtrip/api"
+)
+
+// loopback is a "server" on the far side of the dumb byte seam: it decodes the
+// typed request, then encodes its task as the typed response, exercising both
+// decode and encode across the transport boundary.
+type loopback struct{}
+
+func (loopback) Call(ctx context.Context, service, op string, req []byte) ([]byte, error) {
+	if service != "corndogs" || op != "SubmitTask" {
+		return nil, fmt.Errorf("unexpected route %s/%s", service, op)
+	}
+	in, err := api.DecodeSubmitTaskRequest(req)
+	if err != nil {
+		return nil, err
+	}
+	return api.EncodeTask(in.Task), nil
+}
+
+func check(cond bool, msg string) {
+	if !cond {
+		fmt.Println("FAIL:", msg)
+		os.Exit(1)
+	}
+}
+
+func must(err error) {
+	if err != nil {
+		fmt.Println("ERR:", err)
+		os.Exit(1)
+	}
+}
+
+func main() {
+	prio := int64(7)
+	task := api.Task{
+		Uuid:         "u-123",
+		CurrentState: "PENDING",
+		Payload:      []byte{0xde, 0xad, 0xbe},
+		Priority:     &prio,
+		Labels:       map[string]int64{"a": 1, "b": 2},
+		Tags:         []string{"x", "y"},
+		QueueCounts:  api.StringInt64Map{"q1": 3, "q2": 1},
+		StateCounts:  api.QueueAndStateCountsMap{"q1": {Count: 5}},
+	}
+	req := api.SubmitTaskRequest{Task: task, Queue: "default"}
+
+	// Direct codec round-trip through the nested record.
+	back, err := api.DecodeSubmitTaskRequest(api.EncodeSubmitTaskRequest(req))
+	must(err)
+	check(back.Task.Uuid == "u-123", "uuid")
+	check(bytes.Equal(back.Task.Payload, []byte{0xde, 0xad, 0xbe}), "payload")
+	check(back.Task.Priority != nil && *back.Task.Priority == 7, "priority")
+	check(len(back.Task.Labels) == 2 && back.Task.Labels["a"] == 1 && back.Task.Labels["b"] == 2, "labels")
+	check(len(back.Task.Tags) == 2 && back.Task.Tags[0] == "x" && back.Task.Tags[1] == "y", "tags")
+	check(back.Queue == "default", "queue")
+	// Named map aliases must round-trip their entries, not drop them (the regression).
+	check(len(back.Task.QueueCounts) == 2 && back.Task.QueueCounts["q1"] == 3 && back.Task.QueueCounts["q2"] == 1, "queue_counts map alias")
+	check(len(back.Task.StateCounts) == 1 && back.Task.StateCounts["q1"].Count == 5, "state_counts map-of-record alias")
+
+	// An absent optional must round-trip to nil, not a zero value.
+	task2 := task
+	task2.Priority = nil
+	back2, err := api.DecodeSubmitTaskRequest(api.EncodeSubmitTaskRequest(api.SubmitTaskRequest{Task: task2, Queue: "q"}))
+	must(err)
+	check(back2.Task.Priority == nil, "absent optional nil")
+
+	// Typed client round-trip over the loopback carrier.
+	client := api.NewCorndogsClient(loopback{})
+	resp, err := client.SubmitTask(context.Background(), req)
+	must(err)
+	check(resp.Uuid == "u-123", "client uuid")
+	check(bytes.Equal(resp.Payload, []byte{0xde, 0xad, 0xbe}), "client payload")
+	check(resp.Priority != nil && *resp.Priority == 7, "client priority")
+	check(len(resp.Tags) == 2 && resp.Tags[1] == "y", "client tags")
+
+	fmt.Println("ok")
+}
+"#;
 }

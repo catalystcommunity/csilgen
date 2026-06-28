@@ -5,12 +5,13 @@
 
 use csilgen_common::{
     CsilControlOperator, CsilDependsCompareOp, CsilDependsCondition, CsilFieldMetadata,
-    CsilFieldVisibility, CsilGroupEntry, CsilGroupExpression, CsilGroupKey, CsilLiteralValue,
-    CsilOccurrence, CsilRuleType, CsilServiceDefinition, CsilServiceDirection,
-    CsilServiceOperation, CsilSizeConstraint, CsilTypeExpression, CsilValidationConstraint,
-    GeneratedFile, GenerationStats, GeneratorCapability, GeneratorMetadata, GeneratorWarning,
-    WarningLevel, WasmGeneratorInput, WasmGeneratorOutput, wasm_interface::*,
+    CsilGroupEntry, CsilGroupExpression, CsilGroupKey, CsilLiteralValue, CsilOccurrence,
+    CsilRuleType, CsilServiceDefinition, CsilServiceDirection, CsilServiceOperation,
+    CsilSizeConstraint, CsilTypeExpression, CsilValidationConstraint, GeneratedFile,
+    GenerationStats, GeneratorCapability, GeneratorMetadata, GeneratorWarning, WarningLevel,
+    WasmGeneratorInput, WasmGeneratorOutput, wasm_interface::*,
 };
+use std::collections::HashMap;
 use std::collections::HashSet;
 
 /// Which artifact surface a generator run emits, selected by the sub-target.
@@ -53,6 +54,84 @@ fn decimal_mapping(input: &WasmGeneratorInput) -> Result<DecimalMapping, String>
     }
 }
 
+/// Whether this run should emit a self-contained publishable crate for Rust.
+///
+/// Triggered by `config.options["emit_packages"]` containing the token `"rust"`.
+/// Parsed defensively: the option is normally a JSON array of language tokens,
+/// but a single string or a JSON-encoded array string is tolerated too, and any
+/// other shape simply means "off" rather than an error — so a malformed option
+/// never blocks the default (non-package) output a consumer already relies on.
+fn emit_rust_package(input: &WasmGeneratorInput) -> bool {
+    let Some(value) = input.config.options.get("emit_packages") else {
+        return false;
+    };
+    let tokens: Vec<String> = match value {
+        serde_json::Value::Array(items) => items
+            .iter()
+            .filter_map(|i| i.as_str().map(str::to_string))
+            .collect(),
+        // A consumer that can only pass string options may hand us the array as a
+        // JSON-encoded string; fall back to treating a bare string as one token.
+        serde_json::Value::String(s) => {
+            serde_json::from_str::<Vec<String>>(s).unwrap_or_else(|_| vec![s.clone()])
+        }
+        _ => return false,
+    };
+    tokens.iter().any(|t| t == "rust")
+}
+
+/// Crate name for package mode: the `package_name` option verbatim, else a name
+/// derived from the first service's base (e.g. `CorndogsService` -> `corndogs`),
+/// else the neutral `csilgen_client`.
+fn package_name(input: &WasmGeneratorInput) -> String {
+    if let Some(name) = input
+        .config
+        .options
+        .get("package_name")
+        .and_then(|v| v.as_str())
+    {
+        return name.to_string();
+    }
+    for rule in &input.csil_spec.rules {
+        if matches!(rule.rule_type, CsilRuleType::ServiceDef(_)) {
+            return sanitize_crate_name(&RustCodeGenerator::service_base(&rule.name));
+        }
+    }
+    "csilgen_client".to_string()
+}
+
+/// Crate version for package mode: the `package_version` option, else `0.1.0`.
+fn package_version(input: &WasmGeneratorInput) -> String {
+    input
+        .config
+        .options
+        .get("package_version")
+        .and_then(|v| v.as_str())
+        .unwrap_or("0.1.0")
+        .to_string()
+}
+
+/// Fold an arbitrary derived label into a valid lowercase Cargo crate name,
+/// replacing anything outside `[a-z0-9_-]` so a service named with punctuation
+/// can't produce an unbuildable `Cargo.toml`. Empty input keeps the neutral name.
+fn sanitize_crate_name(s: &str) -> String {
+    let out: String = s
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c.to_ascii_lowercase()
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if out.is_empty() {
+        "csilgen_client".to_string()
+    } else {
+        out
+    }
+}
+
 /// Self-contained exact-decimal helper injected into `types.rs` only when the
 /// spec uses `decimal` under the default `csil` mapping. It carries the exact
 /// CBOR tag-4 payload `[exponent, mantissa]` and converts to/from a decimal
@@ -71,30 +150,13 @@ const CSIL_DECIMAL: &str = r#"/// Exact base-10 decimal carried on the wire as a
 ///
 /// On the wire it encodes as a CBOR **tag 4** decimal fraction — the two-element
 /// array `[exponent, mantissa]` — so it interoperates byte-for-byte with the Go,
-/// TypeScript, and Python generators. That tag is produced via serde's tag
-/// mechanism, which only a tag-aware CBOR codec honours: the generated crate
-/// assumes `ciborium` (`ciborium::tag::Required<_, 4>`). A bare-array serialization
-/// (what a plain `(i64, i128)` derive would emit) is NOT tag 4 and would not
-/// interoperate, so `Serialize`/`Deserialize` are implemented by hand below.
+/// TypeScript, and Python generators. The generated `codec.gen.rs` owns that wire
+/// form directly (reading/writing `exponent` and `mantissa` against its own value
+/// model), so this type carries no serde impl and the crate needs no CBOR library.
 #[derive(Debug, Clone, Copy)]
 pub struct CsilDecimal {
     pub exponent: i64,
     pub mantissa: i128,
-}
-
-impl Serialize for CsilDecimal {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        ciborium::tag::Required::<(i64, i128), 4>((self.exponent, self.mantissa))
-            .serialize(serializer)
-    }
-}
-
-impl<'de> Deserialize<'de> for CsilDecimal {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let ciborium::tag::Required::<(i64, i128), 4>((exponent, mantissa)) =
-            ciborium::tag::Required::<(i64, i128), 4>::deserialize(deserializer)?;
-        Ok(Self { exponent, mantissa })
-    }
 }
 
 impl PartialEq for CsilDecimal {
@@ -246,123 +308,6 @@ impl std::fmt::Display for CsilDecimal {
     }
 }"#;
 
-/// serde `with` adapters for `timestamp` fields, injected into `types.rs` only when
-/// the spec uses `timestamp`. A UTC instant rides the wire as a CBOR **tag 0**
-/// (RFC 3339 text, always normalized to a `Z` offset) and parses back the same way,
-/// matching every other CSIL generator. The tag is produced through serde's tag
-/// mechanism, which only a tag-aware CBOR codec honours — the generated crate
-/// assumes `ciborium`. A plain `chrono` serde impl would emit an untagged string,
-/// which is NOT tag 0, so these adapters wrap it explicitly.
-const CSIL_TIMESTAMP: &str = r#"pub mod csil_timestamp {
-    use serde::{Deserialize, Serialize};
-
-    pub fn serialize<S: serde::Serializer>(
-        value: &chrono::DateTime<chrono::Utc>,
-        serializer: S,
-    ) -> Result<S::Ok, S::Error> {
-        // `true` forces the `Z` UTC offset the contract requires; `AutoSi` keeps
-        // sub-second precision only when the instant actually carries it.
-        let text = value.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true);
-        ciborium::tag::Required::<String, 0>(text).serialize(serializer)
-    }
-
-    pub fn deserialize<'de, D: serde::Deserializer<'de>>(
-        deserializer: D,
-    ) -> Result<chrono::DateTime<chrono::Utc>, D::Error> {
-        let ciborium::tag::Required::<String, 0>(text) =
-            ciborium::tag::Required::<String, 0>::deserialize(deserializer)?;
-        chrono::DateTime::parse_from_rfc3339(&text)
-            .map(|dt| dt.with_timezone(&chrono::Utc))
-            .map_err(serde::de::Error::custom)
-    }
-}
-
-pub mod csil_timestamp_opt {
-    use serde::Deserialize;
-
-    pub fn serialize<S: serde::Serializer>(
-        value: &Option<chrono::DateTime<chrono::Utc>>,
-        serializer: S,
-    ) -> Result<S::Ok, S::Error> {
-        match value {
-            Some(dt) => super::csil_timestamp::serialize(dt, serializer),
-            None => serializer.serialize_none(),
-        }
-    }
-
-    pub fn deserialize<'de, D: serde::Deserializer<'de>>(
-        deserializer: D,
-    ) -> Result<Option<chrono::DateTime<chrono::Utc>>, D::Error> {
-        #[derive(Deserialize)]
-        struct Wrap(#[serde(with = "super::csil_timestamp")] chrono::DateTime<chrono::Utc>);
-        Ok(Option::<Wrap>::deserialize(deserializer)?.map(|w| w.0))
-    }
-}"#;
-
-/// serde `with` adapters for `decimal` fields under `decimal_mapping = "library"`,
-/// where the in-memory type is `rust_decimal::Decimal`. The value rides the wire as
-/// a CBOR **tag 4** decimal fraction (`[exponent, mantissa]`), identical to the
-/// `CsilDecimal` default mapping and to every other generator. The tag is produced
-/// through serde's tag mechanism — the generated crate assumes `ciborium`.
-const CSIL_DECIMAL_LIBRARY: &str = r#"pub mod csil_decimal {
-    use serde::{Deserialize, Serialize};
-
-    pub fn serialize<S: serde::Serializer>(
-        value: &rust_decimal::Decimal,
-        serializer: S,
-    ) -> Result<S::Ok, S::Error> {
-        // `rust_decimal` stores value = mantissa * 10^-scale, i.e. exponent = -scale.
-        let exponent = -(value.scale() as i64);
-        let mantissa = value.mantissa();
-        ciborium::tag::Required::<(i64, i128), 4>((exponent, mantissa)).serialize(serializer)
-    }
-
-    pub fn deserialize<'de, D: serde::Deserializer<'de>>(
-        deserializer: D,
-    ) -> Result<rust_decimal::Decimal, D::Error> {
-        let ciborium::tag::Required::<(i64, i128), 4>((exponent, mantissa)) =
-            ciborium::tag::Required::<(i64, i128), 4>::deserialize(deserializer)?;
-        // `rust_decimal`'s scale is non-negative, so a non-negative wire exponent
-        // (trailing-zero magnitude) is folded into the mantissa rather than the scale.
-        if exponent >= 0 {
-            let pow = 10i128
-                .checked_pow(exponent as u32)
-                .ok_or_else(|| serde::de::Error::custom("decimal exponent too large"))?;
-            let scaled = mantissa
-                .checked_mul(pow)
-                .ok_or_else(|| serde::de::Error::custom("decimal mantissa overflow"))?;
-            Ok(rust_decimal::Decimal::from_i128_with_scale(scaled, 0))
-        } else {
-            Ok(rust_decimal::Decimal::from_i128_with_scale(
-                mantissa,
-                (-exponent) as u32,
-            ))
-        }
-    }
-}
-
-pub mod csil_decimal_opt {
-    use serde::Deserialize;
-
-    pub fn serialize<S: serde::Serializer>(
-        value: &Option<rust_decimal::Decimal>,
-        serializer: S,
-    ) -> Result<S::Ok, S::Error> {
-        match value {
-            Some(d) => super::csil_decimal::serialize(d, serializer),
-            None => serializer.serialize_none(),
-        }
-    }
-
-    pub fn deserialize<'de, D: serde::Deserializer<'de>>(
-        deserializer: D,
-    ) -> Result<Option<rust_decimal::Decimal>, D::Error> {
-        #[derive(Deserialize)]
-        struct Wrap(#[serde(with = "super::csil_decimal")] rust_decimal::Decimal);
-        Ok(Option::<Wrap>::deserialize(deserializer)?.map(|w| w.0))
-    }
-}"#;
-
 /// Error type injected into `types.rs` when at least one generated struct gets a
 /// `validate` method. Self-contained so the generated crate needs no validation
 /// dependency.
@@ -406,16 +351,550 @@ impl std::fmt::Display for ClientError {
 
 impl std::error::Error for ClientError {}
 
-/// The wire is the caller's concern: an implementation encodes `req` (CBOR over
-/// HTTP, say), performs the call named by `(service, method)`, and decodes the
-/// response into `Res`, or yields a `ClientError`.
+/// The caller-supplied byte carrier: it performs the call named by `(service, op)`
+/// with the already-encoded request bytes and returns the response bytes, or an
+/// error. The generated client owns (de)serialization via the codec; the carrier
+/// only moves bytes, so it can be HTTP, a queue, or an in-process loop.
 pub trait Transport {
-    fn call<Req, Res>(&self, service: &str, method: &str, req: &Req) -> Result<Res, ClientError>
-    where
-        Req: serde::Serialize,
-        Res: serde::de::DeserializeOwned;
+    fn call(&self, service: &str, op: &str, req: &[u8]) -> Result<Vec<u8>, ClientError>;
 }
 ";
+
+/// The self-contained canonical-CBOR (RFC 8949 subset) value model, encoder,
+/// decoder, generic composite helpers, and accessors every generated per-type codec
+/// builds on. `bytes` is a Rust `Vec<u8>` carried as a CBOR byte string (major type
+/// 2) by construction, never an array of integers. CSIL is the CBOR Service
+/// Interface Language; the canonical wire is a CBOR map keyed by the CSIL field name
+/// verbatim. Rust has serde + ciborium available, but the references for this batch
+/// (C/Zig/OCaml/Dart/Swift/Go) instead emit a self-contained per-type codec so the
+/// bytes are owned by generated code; Rust follows the same shape so every target
+/// agrees byte-for-byte.
+const CODEC_RUNTIME_RUST: &str = r#"/// A decode failure: the CBOR was malformed or did not match the expected shape.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CsilCborError(pub String);
+
+impl std::fmt::Display for CsilCborError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for CsilCborError {}
+
+/// A minimal canonical-CBOR value tree: a closed set of variants the generated codec
+/// builds and walks. A map is an ordered list of pairs, so the encoder controls the
+/// wire order of a record's keys explicitly (laid down in canonical order).
+#[derive(Debug, Clone, PartialEq)]
+pub enum CsilCborValue {
+    Uint(u64),
+    Int(i64),
+    Bool(bool),
+    Float(f64),
+    Null,
+    Text(String),
+    Bytes(Vec<u8>),
+    Array(Vec<CsilCborValue>),
+    Map(Vec<(CsilCborValue, CsilCborValue)>),
+    Tag(u64, Box<CsilCborValue>),
+}
+
+fn cbor_int(x: i64) -> CsilCborValue {
+    CsilCborValue::Int(x)
+}
+fn cbor_uint(x: u64) -> CsilCborValue {
+    CsilCborValue::Uint(x)
+}
+fn cbor_float(x: f64) -> CsilCborValue {
+    CsilCborValue::Float(x)
+}
+fn cbor_bool(x: bool) -> CsilCborValue {
+    CsilCborValue::Bool(x)
+}
+fn cbor_text(x: &str) -> CsilCborValue {
+    CsilCborValue::Text(x.to_string())
+}
+fn cbor_bytes(x: &[u8]) -> CsilCborValue {
+    CsilCborValue::Bytes(x.to_vec())
+}
+
+/// Serialize a value tree to canonical CBOR bytes.
+fn cbor_encode(v: &CsilCborValue) -> Vec<u8> {
+    let mut out = Vec::new();
+    cbor_enc(v, &mut out);
+    out
+}
+
+fn cbor_head(major: u8, n: u64, out: &mut Vec<u8>) {
+    let mt = major << 5;
+    if n < 24 {
+        out.push(mt | n as u8);
+    } else if n < 0x100 {
+        out.push(mt | 24);
+        out.push(n as u8);
+    } else if n < 0x10000 {
+        out.push(mt | 25);
+        out.extend_from_slice(&(n as u16).to_be_bytes());
+    } else if n < 0x1_0000_0000 {
+        out.push(mt | 26);
+        out.extend_from_slice(&(n as u32).to_be_bytes());
+    } else {
+        out.push(mt | 27);
+        out.extend_from_slice(&n.to_be_bytes());
+    }
+}
+
+fn cbor_enc(v: &CsilCborValue, out: &mut Vec<u8>) {
+    match v {
+        CsilCborValue::Uint(x) => cbor_head(0, *x, out),
+        // A non-negative `Int` rides major type 0 so it is byte-identical to a `Uint`
+        // of the same magnitude; only a genuinely negative value uses major type 1.
+        CsilCborValue::Int(x) => {
+            if *x >= 0 {
+                cbor_head(0, *x as u64, out);
+            } else {
+                cbor_head(1, (-(*x + 1)) as u64, out);
+            }
+        }
+        CsilCborValue::Bool(x) => out.push(if *x { 0xf5 } else { 0xf4 }),
+        CsilCborValue::Null => out.push(0xf6),
+        CsilCborValue::Float(x) => {
+            out.push(0xfb);
+            out.extend_from_slice(&x.to_bits().to_be_bytes());
+        }
+        CsilCborValue::Text(s) => {
+            let bytes = s.as_bytes();
+            cbor_head(3, bytes.len() as u64, out);
+            out.extend_from_slice(bytes);
+        }
+        CsilCborValue::Bytes(b) => {
+            cbor_head(2, b.len() as u64, out);
+            out.extend_from_slice(b);
+        }
+        CsilCborValue::Array(items) => {
+            cbor_head(4, items.len() as u64, out);
+            for item in items {
+                cbor_enc(item, out);
+            }
+        }
+        CsilCborValue::Map(entries) => {
+            cbor_head(5, entries.len() as u64, out);
+            for (k, val) in entries {
+                cbor_enc(k, out);
+                cbor_enc(val, out);
+            }
+        }
+        CsilCborValue::Tag(num, inner) => {
+            cbor_head(6, *num, out);
+            cbor_enc(inner, out);
+        }
+    }
+}
+
+/// Parse a full CBOR item and reject trailing bytes, so a payload that is not
+/// exactly one value is an error rather than a silently-truncated read.
+fn cbor_decode(b: &[u8]) -> Result<CsilCborValue, CsilCborError> {
+    let mut pos = 0usize;
+    let v = cbor_dec(b, &mut pos)?;
+    if pos != b.len() {
+        return Err(CsilCborError(format!(
+            "csil cbor: {} trailing bytes",
+            b.len() - pos
+        )));
+    }
+    Ok(v)
+}
+
+fn cbor_read_arg(b: &[u8], pos: &mut usize, low: u8) -> Result<u64, CsilCborError> {
+    if low < 24 {
+        *pos += 1;
+        return Ok(low as u64);
+    }
+    let width = match low {
+        24 => 1usize,
+        25 => 2,
+        26 => 4,
+        27 => 8,
+        _ => return Err(CsilCborError(format!("csil cbor: reserved additional info {low}"))),
+    };
+    if *pos + 1 + width > b.len() {
+        return Err(CsilCborError("csil cbor: truncated argument".to_string()));
+    }
+    let mut v = 0u64;
+    for &byte in &b[*pos + 1..*pos + 1 + width] {
+        v = (v << 8) | byte as u64;
+    }
+    *pos += 1 + width;
+    Ok(v)
+}
+
+fn cbor_dec(b: &[u8], pos: &mut usize) -> Result<CsilCborValue, CsilCborError> {
+    if *pos >= b.len() {
+        return Err(CsilCborError("csil cbor: unexpected end of input".to_string()));
+    }
+    let ib = b[*pos];
+    let major = ib >> 5;
+    let low = ib & 0x1f;
+    if major == 7 {
+        return match low {
+            20 => {
+                *pos += 1;
+                Ok(CsilCborValue::Bool(false))
+            }
+            21 => {
+                *pos += 1;
+                Ok(CsilCborValue::Bool(true))
+            }
+            22 | 23 => {
+                *pos += 1;
+                Ok(CsilCborValue::Null)
+            }
+            26 => {
+                let bits = cbor_read_arg(b, pos, low)?;
+                Ok(CsilCborValue::Float(f32::from_bits(bits as u32) as f64))
+            }
+            27 => {
+                let bits = cbor_read_arg(b, pos, low)?;
+                Ok(CsilCborValue::Float(f64::from_bits(bits)))
+            }
+            _ => Err(CsilCborError(format!("csil cbor: unsupported simple value {low}"))),
+        };
+    }
+    let arg = cbor_read_arg(b, pos, low)?;
+    match major {
+        0 => Ok(CsilCborValue::Uint(arg)),
+        1 => {
+            if arg > i64::MAX as u64 {
+                return Err(CsilCborError("csil cbor: negative integer out of range".to_string()));
+            }
+            Ok(CsilCborValue::Int(-1 - arg as i64))
+        }
+        2 => {
+            let n = arg as usize;
+            if *pos + n > b.len() {
+                return Err(CsilCborError("csil cbor: truncated byte string".to_string()));
+            }
+            let slice = b[*pos..*pos + n].to_vec();
+            *pos += n;
+            Ok(CsilCborValue::Bytes(slice))
+        }
+        3 => {
+            let n = arg as usize;
+            if *pos + n > b.len() {
+                return Err(CsilCborError("csil cbor: truncated text string".to_string()));
+            }
+            let s = std::str::from_utf8(&b[*pos..*pos + n])
+                .map_err(|e| CsilCborError(format!("csil cbor: invalid utf-8: {e}")))?
+                .to_string();
+            *pos += n;
+            Ok(CsilCborValue::Text(s))
+        }
+        4 => {
+            let n = arg as usize;
+            let mut items = Vec::with_capacity(n);
+            for _ in 0..n {
+                items.push(cbor_dec(b, pos)?);
+            }
+            Ok(CsilCborValue::Array(items))
+        }
+        5 => {
+            let n = arg as usize;
+            let mut entries = Vec::with_capacity(n);
+            for _ in 0..n {
+                let k = cbor_dec(b, pos)?;
+                let val = cbor_dec(b, pos)?;
+                entries.push((k, val));
+            }
+            Ok(CsilCborValue::Map(entries))
+        }
+        6 => {
+            let inner = cbor_dec(b, pos)?;
+            Ok(CsilCborValue::Tag(arg, Box::new(inner)))
+        }
+        _ => Err(CsilCborError(format!("csil cbor: unexpected major type {major}"))),
+    }
+}
+
+/// Map a typed slice to a CBOR array via the per-element encoder.
+fn cbor_enc_array<E>(xs: &[E], f: impl Fn(&E) -> CsilCborValue) -> CsilCborValue {
+    CsilCborValue::Array(xs.iter().map(f).collect())
+}
+
+/// Map a typed map to a CBOR map. Rust `HashMap` iteration is unordered, so the inner
+/// map's entry order is not canonicalized; the record's own keys (laid down at
+/// generation time) are what the cross-language wire contract pins.
+fn cbor_enc_map<K, V>(
+    m: &std::collections::HashMap<K, V>,
+    kf: impl Fn(&K) -> CsilCborValue,
+    vf: impl Fn(&V) -> CsilCborValue,
+) -> CsilCborValue {
+    CsilCborValue::Map(m.iter().map(|(k, v)| (kf(k), vf(v))).collect())
+}
+
+fn cbor_dec_array<E>(
+    v: &CsilCborValue,
+    f: impl Fn(&CsilCborValue) -> Result<E, CsilCborError>,
+) -> Result<Vec<E>, CsilCborError> {
+    cbor_as_array(v)?.iter().map(f).collect()
+}
+
+fn cbor_dec_map<K: std::cmp::Eq + std::hash::Hash, V>(
+    v: &CsilCborValue,
+    kf: impl Fn(&CsilCborValue) -> Result<K, CsilCborError>,
+    vf: impl Fn(&CsilCborValue) -> Result<V, CsilCborError>,
+) -> Result<std::collections::HashMap<K, V>, CsilCborError> {
+    let entries = cbor_as_map(v)?;
+    let mut out = std::collections::HashMap::with_capacity(entries.len());
+    for (k, val) in entries {
+        out.insert(kf(k)?, vf(val)?);
+    }
+    Ok(out)
+}
+
+fn cbor_map_get<'a>(v: &'a CsilCborValue, key: &str) -> Option<&'a CsilCborValue> {
+    if let CsilCborValue::Map(entries) = v {
+        for (k, val) in entries {
+            if let CsilCborValue::Text(name) = k {
+                if name == key {
+                    return Some(val);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn cbor_require<'a>(v: &'a CsilCborValue, key: &str) -> Result<&'a CsilCborValue, CsilCborError> {
+    cbor_map_get(v, key)
+        .ok_or_else(|| CsilCborError(format!("csil cbor: missing field {key:?}")))
+}
+
+fn cbor_as_i64(v: &CsilCborValue) -> Result<i64, CsilCborError> {
+    match v {
+        CsilCborValue::Uint(x) => i64::try_from(*x)
+            .map_err(|_| CsilCborError("csil cbor: integer overflows i64".to_string())),
+        CsilCborValue::Int(x) => Ok(*x),
+        _ => Err(CsilCborError("csil cbor: expected integer".to_string())),
+    }
+}
+
+fn cbor_as_u64(v: &CsilCborValue) -> Result<u64, CsilCborError> {
+    match v {
+        CsilCborValue::Uint(x) => Ok(*x),
+        CsilCborValue::Int(x) if *x >= 0 => Ok(*x as u64),
+        CsilCborValue::Int(_) => {
+            Err(CsilCborError("csil cbor: negative integer where unsigned expected".to_string()))
+        }
+        _ => Err(CsilCborError("csil cbor: expected unsigned integer".to_string())),
+    }
+}
+
+fn cbor_as_f64(v: &CsilCborValue) -> Result<f64, CsilCborError> {
+    match v {
+        CsilCborValue::Float(x) => Ok(*x),
+        CsilCborValue::Uint(x) => Ok(*x as f64),
+        CsilCborValue::Int(x) => Ok(*x as f64),
+        _ => Err(CsilCborError("csil cbor: expected float".to_string())),
+    }
+}
+
+fn cbor_as_bool(v: &CsilCborValue) -> Result<bool, CsilCborError> {
+    match v {
+        CsilCborValue::Bool(b) => Ok(*b),
+        _ => Err(CsilCborError("csil cbor: expected bool".to_string())),
+    }
+}
+
+fn cbor_as_text(v: &CsilCborValue) -> Result<String, CsilCborError> {
+    match v {
+        CsilCborValue::Text(s) => Ok(s.clone()),
+        _ => Err(CsilCborError("csil cbor: expected text".to_string())),
+    }
+}
+
+fn cbor_as_bytes(v: &CsilCborValue) -> Result<Vec<u8>, CsilCborError> {
+    match v {
+        CsilCborValue::Bytes(b) => Ok(b.clone()),
+        _ => Err(CsilCborError("csil cbor: expected byte string".to_string())),
+    }
+}
+
+fn cbor_as_array(v: &CsilCborValue) -> Result<&[CsilCborValue], CsilCborError> {
+    match v {
+        CsilCborValue::Array(a) => Ok(a),
+        _ => Err(CsilCborError("csil cbor: expected array".to_string())),
+    }
+}
+
+fn cbor_as_map(v: &CsilCborValue) -> Result<&[(CsilCborValue, CsilCborValue)], CsilCborError> {
+    match v {
+        CsilCborValue::Map(m) => Ok(m),
+        _ => Err(CsilCborError("csil cbor: expected map".to_string())),
+    }
+}"#;
+
+/// Timestamp (CBOR tag 0, RFC3339, always UTC) codec, emitted only when the spec
+/// uses `timestamp` so `chrono` is never an unused dependency.
+const CODEC_TIMESTAMP_RUST: &str = r#"/// Encode a UTC instant as CBOR tag 0 RFC3339 text in UTC, per the wire contract;
+/// sub-second precision is preserved when present and the `Z` offset is forced.
+fn csil_enc_timestamp(t: &chrono::DateTime<chrono::Utc>) -> CsilCborValue {
+    let text = t.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true);
+    CsilCborValue::Tag(0, Box::new(CsilCborValue::Text(text)))
+}
+
+/// Decode a CBOR tag 0 RFC3339 timestamp back to a UTC instant.
+fn csil_as_timestamp(v: &CsilCborValue) -> Result<chrono::DateTime<chrono::Utc>, CsilCborError> {
+    let CsilCborValue::Tag(0, inner) = v else {
+        return Err(CsilCborError("csil cbor: expected CBOR tag 0 timestamp".to_string()));
+    };
+    let CsilCborValue::Text(s) = inner.as_ref() else {
+        return Err(CsilCborError("csil cbor: timestamp content must be text".to_string()));
+    };
+    chrono::DateTime::parse_from_rfc3339(s)
+        .map(|dt| dt.with_timezone(&chrono::Utc))
+        .map_err(|e| CsilCborError(format!("csil cbor: invalid timestamp: {e}")))
+}"#;
+
+/// Exact-integer (de)serialization for a decimal mantissa: a CBOR integer when it
+/// fits in 64 bits, otherwise a bignum (RFC 8949 §3.4.3, tag 2 non-negative / tag 3
+/// negative) so the full `i128` value stays exact. Emitted only alongside the decimal
+/// codec.
+const CODEC_BIGINT_RUST: &str = r#"fn csil_bigint_be_bytes(mut n: u128) -> Vec<u8> {
+    if n == 0 {
+        return vec![0];
+    }
+    let mut out = Vec::new();
+    while n > 0 {
+        out.push((n & 0xff) as u8);
+        n >>= 8;
+    }
+    out.reverse();
+    out
+}
+
+fn csil_be_bytes_to_u128(bytes: &[u8]) -> Result<u128, CsilCborError> {
+    if bytes.len() > 16 {
+        return Err(CsilCborError("csil cbor: bignum exceeds 128 bits".to_string()));
+    }
+    let mut n: u128 = 0;
+    for &b in bytes {
+        n = (n << 8) | b as u128;
+    }
+    Ok(n)
+}
+
+/// Encode an exact integer mantissa: a CBOR integer when it fits in 64 bits,
+/// otherwise a bignum so the value stays exact across the wire.
+fn csil_enc_bigint(m: i128) -> CsilCborValue {
+    if let Ok(v) = i64::try_from(m) {
+        CsilCborValue::Int(v)
+    } else if let Ok(v) = u64::try_from(m) {
+        CsilCborValue::Uint(v)
+    } else if m >= 0 {
+        CsilCborValue::Tag(2, Box::new(CsilCborValue::Bytes(csil_bigint_be_bytes(m as u128))))
+    } else {
+        // A negative bignum encodes the magnitude of -1 - value.
+        let mag = (-(m + 1)) as u128;
+        CsilCborValue::Tag(3, Box::new(CsilCborValue::Bytes(csil_bigint_be_bytes(mag))))
+    }
+}
+
+fn csil_dec_bigint(v: &CsilCborValue) -> Result<i128, CsilCborError> {
+    match v {
+        CsilCborValue::Uint(x) => Ok(*x as i128),
+        CsilCborValue::Int(x) => Ok(*x as i128),
+        CsilCborValue::Tag(num, inner) => {
+            let CsilCborValue::Bytes(bytes) = inner.as_ref() else {
+                return Err(CsilCborError("csil cbor: bignum content must be a byte string".to_string()));
+            };
+            let mag = csil_be_bytes_to_u128(bytes)?;
+            match num {
+                2 => i128::try_from(mag)
+                    .map_err(|_| CsilCborError("csil cbor: decimal mantissa overflows i128".to_string())),
+                3 => {
+                    let val = i128::try_from(mag)
+                        .map_err(|_| CsilCborError("csil cbor: decimal mantissa overflows i128".to_string()))?;
+                    Ok(-1 - val)
+                }
+                _ => Err(CsilCborError(format!("csil cbor: unexpected bignum tag {num}"))),
+            }
+        }
+        _ => Err(CsilCborError("csil cbor: expected integer mantissa".to_string())),
+    }
+}"#;
+
+/// Decimal codec under the default `csil` mapping: the generated `CsilDecimal`
+/// (exponent + i128 mantissa) maps straight onto CBOR tag 4 `[exponent, mantissa]`.
+const CODEC_DECIMAL_CSIL_RUST: &str = r#"/// Encode a `CsilDecimal` as CBOR tag 4: `[exponent, mantissa]`.
+fn csil_enc_decimal(d: &CsilDecimal) -> CsilCborValue {
+    CsilCborValue::Tag(
+        4,
+        Box::new(CsilCborValue::Array(vec![
+            CsilCborValue::Int(d.exponent),
+            csil_enc_bigint(d.mantissa),
+        ])),
+    )
+}
+
+/// Decode a CBOR tag 4 decimal fraction into an exact `CsilDecimal`.
+fn csil_as_decimal(v: &CsilCborValue) -> Result<CsilDecimal, CsilCborError> {
+    let CsilCborValue::Tag(4, inner) = v else {
+        return Err(CsilCborError("csil cbor: expected CBOR tag 4 decimal".to_string()));
+    };
+    let CsilCborValue::Array(arr) = inner.as_ref() else {
+        return Err(CsilCborError("csil cbor: tag 4 content must be [exponent, mantissa]".to_string()));
+    };
+    if arr.len() != 2 {
+        return Err(CsilCborError("csil cbor: tag 4 content must be [exponent, mantissa]".to_string()));
+    }
+    let exponent = cbor_as_i64(&arr[0])?;
+    let mantissa = csil_dec_bigint(&arr[1])?;
+    Ok(CsilDecimal { exponent, mantissa })
+}"#;
+
+/// Decimal codec under the `library` mapping: `rust_decimal::Decimal` carries the same
+/// exact value (mantissa * 10^-scale), so it maps onto CBOR tag 4 directly.
+const CODEC_DECIMAL_LIBRARY_RUST: &str = r#"/// Encode a `rust_decimal::Decimal` as CBOR tag 4: `[exponent, mantissa]`.
+fn csil_enc_decimal(d: &rust_decimal::Decimal) -> CsilCborValue {
+    let exponent = -(d.scale() as i64);
+    CsilCborValue::Tag(
+        4,
+        Box::new(CsilCborValue::Array(vec![
+            CsilCborValue::Int(exponent),
+            csil_enc_bigint(d.mantissa()),
+        ])),
+    )
+}
+
+/// Decode a CBOR tag 4 decimal fraction into a `rust_decimal::Decimal`.
+fn csil_as_decimal(v: &CsilCborValue) -> Result<rust_decimal::Decimal, CsilCborError> {
+    let CsilCborValue::Tag(4, inner) = v else {
+        return Err(CsilCborError("csil cbor: expected CBOR tag 4 decimal".to_string()));
+    };
+    let CsilCborValue::Array(arr) = inner.as_ref() else {
+        return Err(CsilCborError("csil cbor: tag 4 content must be [exponent, mantissa]".to_string()));
+    };
+    if arr.len() != 2 {
+        return Err(CsilCborError("csil cbor: tag 4 content must be [exponent, mantissa]".to_string()));
+    }
+    let exponent = cbor_as_i64(&arr[0])?;
+    let mantissa = csil_dec_bigint(&arr[1])?;
+    // `rust_decimal`'s scale is non-negative, so a non-negative wire exponent
+    // (trailing-zero magnitude) is folded into the mantissa rather than the scale.
+    if exponent >= 0 {
+        let pow = 10i128
+            .checked_pow(exponent as u32)
+            .ok_or_else(|| CsilCborError("csil cbor: decimal exponent too large".to_string()))?;
+        let scaled = mantissa
+            .checked_mul(pow)
+            .ok_or_else(|| CsilCborError("csil cbor: decimal mantissa overflow".to_string()))?;
+        Ok(rust_decimal::Decimal::from_i128_with_scale(scaled, 0))
+    } else {
+        Ok(rust_decimal::Decimal::from_i128_with_scale(
+            mantissa,
+            (-exponent) as u32,
+        ))
+    }
+}"#;
 
 /// Get generator metadata (WASM export)
 #[unsafe(no_mangle)]
@@ -615,6 +1094,17 @@ impl<'a> RustCodeGenerator<'a> {
             });
         }
 
+        // The self-contained per-type CBOR codec is emitted whenever the spec
+        // declares a record type, independent of the service surface: the types
+        // need (de)serialization regardless of whether a client or server rides
+        // on top. Nothing else in the generated crate owns the payload wire.
+        if let Some(codec) = self.generate_codec()? {
+            files.push(GeneratedFile {
+                path: "codec.gen.rs".to_string(),
+                content: codec,
+            });
+        }
+
         if self.input.csil_spec.service_count > 0 {
             match surface {
                 Surface::Client => {
@@ -633,22 +1123,87 @@ impl<'a> RustCodeGenerator<'a> {
             }
         }
 
-        // Generate module root file to tie everything together
-        let root_filename = self
-            .input
-            .config
-            .options
-            .get("module_root_filename")
-            .and_then(|v| v.as_str())
-            .unwrap_or("mod.rs")
-            .to_string();
+        // Generate module root file to tie everything together. In package mode the
+        // root is the crate root (`lib.rs`) so the emitted directory is itself a
+        // buildable crate; otherwise it is a plain module (`mod.rs` by default) the
+        // consumer drops into their own crate.
+        let package = emit_rust_package(self.input);
+        let root_filename = if package {
+            "lib.rs".to_string()
+        } else {
+            self.input
+                .config
+                .options
+                .get("module_root_filename")
+                .and_then(|v| v.as_str())
+                .unwrap_or("mod.rs")
+                .to_string()
+        };
         let lib_content = self.generate_lib_file(&files)?;
         files.push(GeneratedFile {
             path: root_filename,
             content: lib_content,
         });
 
+        // In package mode the generated `.rs` files become the crate's `src/`, and a
+        // `Cargo.toml` is added so the output directory is a publishable crate a
+        // consumer adds as a path/git dependency. The module declarations in
+        // `lib.rs` (`pub mod types;`, `#[path = "codec.gen.rs"]`) resolve relative to
+        // `src/lib.rs`, so prefixing every emitted file with `src/` is the whole of
+        // the restructuring — no content changes. The non-package output is untouched.
+        if package {
+            for file in &mut files {
+                file.path = format!("src/{}", file.path);
+            }
+            files.push(GeneratedFile {
+                path: "Cargo.toml".to_string(),
+                content: self.generate_cargo_toml(),
+            });
+        }
+
         Ok(files)
+    }
+
+    /// Build the `Cargo.toml` for package mode. The crate is kept dependency-free
+    /// whenever the spec allows it (the self-contained CBOR codec owns the wire); a
+    /// dependency is listed only when the in-memory type for a builtin demands it
+    /// (`chrono` for timestamp, `rust_decimal` only under the library mapping,
+    /// `regex` only when emitted validation needs it). Those versions resolve from
+    /// the local cargo cache, so the crate still builds offline.
+    fn generate_cargo_toml(&self) -> String {
+        let name = package_name(self.input);
+        let version = package_version(self.input);
+        let mut content = String::new();
+        content.push_str("[package]\n");
+        content.push_str(&format!("name = \"{name}\"\n"));
+        content.push_str(&format!("version = \"{version}\"\n"));
+        content.push_str("edition = \"2021\"\n");
+
+        let deps = self.crate_dependencies();
+        if !deps.is_empty() {
+            content.push_str("\n[dependencies]\n");
+            for (crate_name, req) in deps {
+                content.push_str(&format!("{crate_name} = \"{req}\"\n"));
+            }
+        }
+        content
+    }
+
+    /// The external crates the generated code needs, as `(name, version-req)` pairs.
+    /// Shared by the package-mode `Cargo.toml` and the non-package dependency note so
+    /// the two never drift. Empty for a spec whose codec is fully self-contained.
+    fn crate_dependencies(&self) -> Vec<(&'static str, &'static str)> {
+        let mut deps = Vec::new();
+        if self.spec_uses_builtin("timestamp") {
+            deps.push(("chrono", "0.4"));
+        }
+        if self.spec_uses_builtin("decimal") && self.decimal_mapping == DecimalMapping::Library {
+            deps.push(("rust_decimal", "1"));
+        }
+        if self.uses_regex {
+            deps.push(("regex", "1"));
+        }
+        deps
     }
 
     fn generate_types(&mut self) -> Result<String, String> {
@@ -682,34 +1237,13 @@ impl<'a> RustCodeGenerator<'a> {
 
         let mut content = String::new();
         content.push_str("//! Generated types from CSIL specification\n\n");
-        content.push_str("use serde::{Deserialize, Serialize};\n");
-
-        if self.spec_has_bytes_fields() {
-            content.push_str("use serde_bytes;\n");
-        }
-
-        content.push('\n');
 
         // The exact-decimal helper is emitted only when the spec uses `decimal`
         // under the default mapping; under `library` mode the type is
-        // `rust_decimal::Decimal` and no helper is needed.
+        // `rust_decimal::Decimal` and no helper is needed. Its CBOR tag-4 wire form
+        // lives in `codec.gen.rs`, so the type itself carries no serde impl.
         if self.decimal_mapping == DecimalMapping::Csil && self.spec_uses_builtin("decimal") {
             content.push_str(CSIL_DECIMAL);
-            content.push_str("\n\n");
-        }
-
-        // The tag-0 timestamp adapters are referenced by every `timestamp` field's
-        // `#[serde(with = ...)]`, so inject them whenever the spec uses `timestamp`.
-        if self.spec_uses_builtin("timestamp") {
-            content.push_str(CSIL_TIMESTAMP);
-            content.push_str("\n\n");
-        }
-
-        // Under `library` mapping the tag-4 adapters are referenced by every
-        // `rust_decimal::Decimal` field's `#[serde(with = ...)]`; the default `csil`
-        // mapping needs none because `CsilDecimal` carries its own tag-4 impl.
-        if self.decimal_mapping == DecimalMapping::Library && self.spec_uses_builtin("decimal") {
-            content.push_str(CSIL_DECIMAL_LIBRARY);
             content.push_str("\n\n");
         }
 
@@ -729,7 +1263,9 @@ impl<'a> RustCodeGenerator<'a> {
         group: &CsilGroupExpression,
     ) -> Result<String, String> {
         let mut content = String::new();
-        let mut derive_attrs = vec!["Debug", "Clone", "Serialize", "Deserialize"];
+        // The payload wire is owned by `codec.gen.rs`, so the type itself derives no
+        // serde traits — only the in-memory conveniences a consumer expects.
+        let mut derive_attrs = vec!["Debug", "Clone"];
 
         // Add struct documentation if any field has descriptions
         let has_descriptions = group.entries.iter().any(|e| {
@@ -771,16 +1307,6 @@ impl<'a> RustCodeGenerator<'a> {
                 // than dropping it silently.
                 for line in Self::depends_on_doc_lines(&entry.metadata) {
                     content.push_str(&format!("    /// {line}\n"));
-                }
-
-                // Generate serde attributes based on metadata
-                let serde_attrs = self.generate_serde_attributes(
-                    &entry.metadata,
-                    &entry.occurrence,
-                    &entry.value_type,
-                );
-                if !serde_attrs.is_empty() {
-                    content.push_str(&format!("    #[serde({})]\n", serde_attrs.join(", ")));
                 }
 
                 let rust_type = self.map_type_to_rust(&entry.value_type, &entry.occurrence)?;
@@ -957,8 +1483,7 @@ impl<'a> RustCodeGenerator<'a> {
         let mut content = String::new();
 
         content.push_str(&format!("/// {name} enum variants\n"));
-        content.push_str("#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]\n");
-        content.push_str("#[serde(untagged)]\n");
+        content.push_str("#[derive(Debug, Clone, PartialEq)]\n");
         content.push_str(&format!("pub enum {name} {{\n"));
 
         for (i, choice) in choices.iter().enumerate() {
@@ -1049,7 +1574,9 @@ impl<'a> RustCodeGenerator<'a> {
         content.push_str(
             "//! Generated transport-agnostic service clients from CSIL specification\n\n",
         );
-        content.push_str("use super::types::*;\n\n");
+        content.push_str("use super::types::*;\n");
+        // The client owns (de)serialization through the generated per-type codec.
+        content.push_str("use super::codec::*;\n\n");
 
         content.push_str(CLIENT_PRELUDE);
         content.push('\n');
@@ -1084,6 +1611,9 @@ impl<'a> RustCodeGenerator<'a> {
         content.push_str("        Self { transport }\n");
         content.push_str("    }\n");
 
+        let records = self.record_names();
+        // Canonical wire strings (the wire contract): service lowercased, op
+        // PascalCased — so a Rust client reaches the same endpoint as its peers.
         let wire_service = base.to_lowercase();
         for operation in &service.operations {
             // Only unary request/response operations belong on the RPC client;
@@ -1095,36 +1625,465 @@ impl<'a> RustCodeGenerator<'a> {
                 ));
                 continue;
             }
+            let success = success_type(&operation.output_type);
+            let null_input = is_null_input(&operation.input_type);
+            // The typed-codec path needs a record success type (and a record or null
+            // request) so the method can call the generated `encode_`/`decode_`.
+            // Anything else is skipped with a note rather than an uncompilable call.
+            if !Self::is_record_ref(&success, &records)
+                || !(null_input || Self::is_record_ref(&operation.input_type, &records))
+            {
+                content.push_str(&format!(
+                    "\n    // operation `{}` has a non-record payload; (de)serialize it manually\n",
+                    operation.name
+                ));
+                continue;
+            }
             let method = self.to_snake_case(&operation.name);
             let wire_method = Self::to_pascal_case(&operation.name);
-            let output_type =
-                self.map_type_to_rust(&success_type(&operation.output_type), &None)?;
+            let output_type = self.map_type_to_rust(&success, &None)?;
+            let resp_dec = format!(
+                "decode_{}",
+                self.to_snake_case(&Self::type_ref_name(&success))
+            );
             content.push('\n');
             Self::write_op_doc(&mut content, operation, "request/response");
             // A push-style op (`op: -> Event`) takes no request payload: emit a
-            // parameterless method and send the empty `()` value on the wire.
-            if is_null_input(&operation.input_type) {
+            // parameterless method and send empty request bytes on the wire.
+            if null_input {
                 content.push_str(&format!(
                     "    pub fn {method}(&self) -> Result<{output_type}, ClientError> {{\n"
                 ));
                 content.push_str(&format!(
-                    "        self.transport.call(\"{wire_service}\", \"{wire_method}\", &())\n"
+                    "        let csil_resp = self.transport.call(\"{wire_service}\", \"{wire_method}\", &[])?;\n"
                 ));
-                content.push_str("    }\n");
             } else {
                 let input_type = self.map_type_to_rust(&operation.input_type, &None)?;
+                let req_enc = format!(
+                    "encode_{}",
+                    self.to_snake_case(&Self::type_ref_name(&operation.input_type))
+                );
                 content.push_str(&format!(
                     "    pub fn {method}(&self, req: {input_type}) -> Result<{output_type}, ClientError> {{\n"
                 ));
                 content.push_str(&format!(
-                    "        self.transport.call(\"{wire_service}\", \"{wire_method}\", &req)\n"
+                    "        let csil_resp = self.transport.call(\"{wire_service}\", \"{wire_method}\", &{req_enc}(&req))?;\n"
                 ));
-                content.push_str("    }\n");
             }
+            content.push_str(&format!(
+                "        {resp_dec}(&csil_resp).map_err(|e| ClientError::Transport(e.to_string()))\n"
+            ));
+            content.push_str("    }\n");
         }
 
         content.push('}');
         Ok(content)
+    }
+
+    /// The bare type name of a record `Reference`. Only called after
+    /// `is_record_ref` has confirmed the type is a record reference.
+    fn type_ref_name(ty: &CsilTypeExpression) -> String {
+        match ty {
+            CsilTypeExpression::Reference(name) => name.clone(),
+            _ => String::new(),
+        }
+    }
+
+    /// Whether a type is a reference to a record the codec can (de)serialize, so a
+    /// typed client method can call the generated `encode_`/`decode_` directly.
+    fn is_record_ref(ty: &CsilTypeExpression, records: &HashSet<String>) -> bool {
+        matches!(ty, CsilTypeExpression::Reference(name) if records.contains(name))
+    }
+
+    /// The verbatim CSIL wire name for one group entry — the key as written in the
+    /// `.csil` source, which is the map key on the wire. `None` for a keyless entry
+    /// (a group spread) or a non-text key, neither of which the per-type codec can
+    /// (de)serialize field-by-field.
+    fn entry_wire_name(entry: &CsilGroupEntry) -> Option<String> {
+        match entry.key.as_ref()? {
+            CsilGroupKey::Bare(name) => Some(name.clone()),
+            CsilGroupKey::Literal(CsilLiteralValue::Text(name)) => Some(name.clone()),
+            _ => None,
+        }
+    }
+
+    /// The names of every record the codec can (de)serialize: a `GroupDef` (or a
+    /// `TypeDef` wrapping a `Group`) whose every entry carries a text wire key. A
+    /// record with a group-spread entry has a field with no wire key, so it gets no
+    /// codec and is not treated as a record reference anywhere.
+    /// The transparent type aliases the codec resolves through: a `TypeDef` whose
+    /// target is a map / array / scalar / reference / tuple / constrained (NOT a
+    /// record group or a choice, which have their own handling). A field referencing
+    /// one must encode as the underlying type rather than the `null` stub a bare
+    /// non-record reference would yield. The Rust alias is a transparent `pub type`,
+    /// so the underlying codec's value is assignable to/from the named field.
+    fn codec_aliases(&self) -> HashMap<String, CsilTypeExpression> {
+        self.input
+            .csil_spec
+            .rules
+            .iter()
+            .filter_map(|rule| match &rule.rule_type {
+                CsilRuleType::TypeDef(t) => match t {
+                    CsilTypeExpression::Group(_) | CsilTypeExpression::Choice(_) => None,
+                    other => Some((rule.name.clone(), other.clone())),
+                },
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn record_names(&self) -> HashSet<String> {
+        self.input
+            .csil_spec
+            .rules
+            .iter()
+            .filter_map(|rule| {
+                let group = match &rule.rule_type {
+                    CsilRuleType::GroupDef(g) => g,
+                    CsilRuleType::TypeDef(CsilTypeExpression::Group(g)) => g,
+                    _ => return None,
+                };
+                if group
+                    .entries
+                    .iter()
+                    .all(|e| Self::entry_wire_name(e).is_some())
+                {
+                    Some(rule.name.clone())
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    /// The CBOR encoding of a text key. Comparing these byte slices lexicographically
+    /// is exactly RFC 8949 §4.2.1 canonical key ordering, computed here at generation
+    /// time so the emitted encoder lays a record's map keys down in canonical order.
+    fn cbor_text_key_bytes(name: &str) -> Vec<u8> {
+        let bytes = name.as_bytes();
+        let n = bytes.len() as u64;
+        let mt = 3u8 << 5;
+        let mut head = Vec::new();
+        if n < 24 {
+            head.push(mt | n as u8);
+        } else if n < 0x100 {
+            head.push(mt | 24);
+            head.push(n as u8);
+        } else {
+            head.push(mt | 25);
+            head.extend_from_slice(&(n as u16).to_be_bytes());
+        }
+        head.extend_from_slice(bytes);
+        head
+    }
+
+    /// A Rust expression building a `CsilCborValue` from `expr` (a value of the
+    /// field's mapped type). `by_ref` marks `expr` as already a `&T` reference (a
+    /// closure binding); otherwise it is an owned place (`csil_v.field`) the scalar
+    /// constructors copy and the reference constructors borrow. Composites recurse
+    /// through the generic `cbor_enc_array`/`cbor_enc_map` runtime helpers.
+    fn rust_enc_value(
+        &self,
+        ty: &CsilTypeExpression,
+        expr: &str,
+        by_ref: bool,
+        records: &HashSet<String>,
+        aliases: &HashMap<String, CsilTypeExpression>,
+    ) -> String {
+        // A scalar constructor takes the value by copy; a `&T` binding is deref'd.
+        let scalar = |ctor: &str| {
+            if by_ref {
+                format!("{ctor}(*{expr})")
+            } else {
+                format!("{ctor}({expr})")
+            }
+        };
+        // A reference constructor borrows an owned place but takes a binding as-is.
+        let refed = |ctor: &str| {
+            if by_ref {
+                format!("{ctor}({expr})")
+            } else {
+                format!("{ctor}(&{expr})")
+            }
+        };
+        // The reference passed to a composite helper (already a ref, or borrowed).
+        let as_ref = || {
+            if by_ref {
+                expr.to_string()
+            } else {
+                format!("&{expr}")
+            }
+        };
+        match Self::value_base(ty) {
+            CsilTypeExpression::Builtin(name) => match name.as_str() {
+                "int" | "nint" => scalar("cbor_int"),
+                "uint" => scalar("cbor_uint"),
+                "float" | "float16" | "float32" | "float64" => scalar("cbor_float"),
+                "bool" => scalar("cbor_bool"),
+                "text" | "tstr" => refed("cbor_text"),
+                "bytes" | "bstr" => refed("cbor_bytes"),
+                "timestamp" => refed("csil_enc_timestamp"),
+                "decimal" => refed("csil_enc_decimal"),
+                "null" | "nil" => "CsilCborValue::Null".to_string(),
+                _ => "CsilCborValue::Null".to_string(),
+            },
+            CsilTypeExpression::Reference(name) if records.contains(name) => {
+                refed(&format!("csil_enc_{}", self.to_snake_case(name)))
+            }
+            // A reference to a transparent alias (`StringInt64Map = {* text => int}`,
+            // `Tags = [* text]`, `Uuid = text`) has no codec of its own; encode it as
+            // its underlying type. The Rust alias is a transparent `pub type`, so the
+            // named-typed `expr` is the underlying type and flows through unchanged.
+            CsilTypeExpression::Reference(name) if aliases.contains_key(name) => {
+                self.rust_enc_value(&aliases[name], expr, by_ref, records, aliases)
+            }
+            CsilTypeExpression::Array { element_type, .. } => {
+                let inner = self.rust_enc_value(element_type, "csil_elem", true, records, aliases);
+                format!("cbor_enc_array({}, |csil_elem| {inner})", as_ref())
+            }
+            CsilTypeExpression::Map { key, value, .. } => {
+                let kenc = self.rust_enc_value(key, "csil_mk", true, records, aliases);
+                let venc = self.rust_enc_value(value, "csil_mv", true, records, aliases);
+                format!(
+                    "cbor_enc_map({}, |csil_mk| {kenc}, |csil_mv| {venc})",
+                    as_ref()
+                )
+            }
+            // A shape the codec cannot model precisely (a non-record reference, a
+            // choice, a tuple, `any`) is carried as null rather than emitting code
+            // that would not compile.
+            _ => "CsilCborValue::Null".to_string(),
+        }
+    }
+
+    /// A Rust expression of type `impl Fn(&CsilCborValue) -> Result<T, CsilCborError>`
+    /// decoding a typed value from a `CsilCborValue`. Builtins resolve to a bare
+    /// runtime accessor path; composites wrap the generic `cbor_dec_array`/
+    /// `cbor_dec_map` helpers; an unmodelable shape errors at runtime rather than
+    /// fabricating a value of a type the codec cannot reconstruct.
+    fn rust_dec_func(
+        &self,
+        ty: &CsilTypeExpression,
+        records: &HashSet<String>,
+        aliases: &HashMap<String, CsilTypeExpression>,
+    ) -> String {
+        match Self::value_base(ty) {
+            CsilTypeExpression::Builtin(name) => match name.as_str() {
+                "int" | "nint" => "cbor_as_i64".to_string(),
+                "uint" => "cbor_as_u64".to_string(),
+                "float" | "float16" | "float32" | "float64" => "cbor_as_f64".to_string(),
+                "bool" => "cbor_as_bool".to_string(),
+                "text" | "tstr" => "cbor_as_text".to_string(),
+                "bytes" | "bstr" => "cbor_as_bytes".to_string(),
+                "timestamp" => "csil_as_timestamp".to_string(),
+                "decimal" => "csil_as_decimal".to_string(),
+                _ => Self::dec_unsupported(),
+            },
+            CsilTypeExpression::Reference(name) if records.contains(name) => {
+                format!("csil_dec_{}", self.to_snake_case(name))
+            }
+            // A reference to a transparent alias decodes as its underlying type; the
+            // Rust alias is a transparent `pub type`, so the value the underlying
+            // map/array/scalar decoder returns already is the alias-typed field.
+            CsilTypeExpression::Reference(name) if aliases.contains_key(name) => {
+                self.rust_dec_func(&aliases[name], records, aliases)
+            }
+            CsilTypeExpression::Array { element_type, .. } => {
+                let inner = self.rust_dec_func(element_type, records, aliases);
+                format!("|csil_v| cbor_dec_array(csil_v, {inner})")
+            }
+            CsilTypeExpression::Map { key, value, .. } => {
+                let kf = self.rust_dec_func(key, records, aliases);
+                let vf = self.rust_dec_func(value, records, aliases);
+                format!("|csil_v| cbor_dec_map(csil_v, {kf}, {vf})")
+            }
+            _ => Self::dec_unsupported(),
+        }
+    }
+
+    /// The decode fallback for a payload shape the codec cannot reconstruct: a
+    /// closure that errors. Its `Ok` type is inferred from the field it fills, so it
+    /// compiles against any field type without needing a `Default` to fabricate.
+    fn dec_unsupported() -> String {
+        "|_csil_v| Err(CsilCborError(\"csil cbor: unsupported field type\".to_string()))"
+            .to_string()
+    }
+
+    /// Emit the `csil_enc_<t>`/`csil_dec_<t>` pair plus the public `encode_<t>`/
+    /// `decode_<t>` byte wrappers for one record. The encoder lays keys in canonical
+    /// RFC 8949 order; the decoder reads by key in declaration order (irrelevant on
+    /// decode) and builds the struct literal directly.
+    fn emit_record_codec(
+        &self,
+        name: &str,
+        group: &CsilGroupExpression,
+        records: &HashSet<String>,
+        aliases: &HashMap<String, CsilTypeExpression>,
+    ) -> String {
+        // (member, wire, entry) in declaration order, plus a canonical-key-order copy
+        // for the encoder so the emitted map is deterministic across languages.
+        let named: Vec<(String, String, &CsilGroupEntry)> = group
+            .entries
+            .iter()
+            .filter_map(|e| {
+                let wire = Self::entry_wire_name(e)?;
+                let member = self.to_snake_case(&wire);
+                Some((member, wire, e))
+            })
+            .collect();
+        let mut canonical: Vec<&(String, String, &CsilGroupEntry)> = named.iter().collect();
+        canonical.sort_by_key(|f| Self::cbor_text_key_bytes(&f.1));
+
+        let snake = self.to_snake_case(name);
+        let mut out = String::new();
+
+        out.push_str(&format!(
+            "/// Build the canonical CBOR value tree for a {name}.\n"
+        ));
+        out.push_str(&format!(
+            "fn csil_enc_{snake}(csil_v: &{name}) -> CsilCborValue {{\n"
+        ));
+        out.push_str(&format!(
+            "    let mut csil_entries: Vec<(CsilCborValue, CsilCborValue)> = Vec::with_capacity({});\n",
+            named.len()
+        ));
+        for (member, wire, entry) in &canonical {
+            let wire_lit = format!("{wire:?}");
+            if matches!(entry.occurrence, Some(CsilOccurrence::Optional)) {
+                // An absent optional is omitted from the map entirely (wire contract).
+                let enc =
+                    self.rust_enc_value(&entry.value_type, "csil_inner", true, records, aliases);
+                out.push_str(&format!(
+                    "    if let Some(csil_inner) = &csil_v.{member} {{\n\
+                     \x20       csil_entries.push((cbor_text({wire_lit}), {enc}));\n\
+                     \x20   }}\n"
+                ));
+            } else {
+                let place = format!("csil_v.{member}");
+                let enc = self.rust_enc_value(&entry.value_type, &place, false, records, aliases);
+                out.push_str(&format!(
+                    "    csil_entries.push((cbor_text({wire_lit}), {enc}));\n"
+                ));
+            }
+        }
+        out.push_str("    CsilCborValue::Map(csil_entries)\n}\n\n");
+
+        out.push_str(&format!(
+            "/// Reconstruct a {name} from a decoded CBOR value tree.\n"
+        ));
+        out.push_str(&format!(
+            "fn csil_dec_{snake}(csil_root: &CsilCborValue) -> Result<{name}, CsilCborError> {{\n"
+        ));
+        for (member, wire, entry) in &named {
+            let wire_lit = format!("{wire:?}");
+            // The decoder is bound to a local before being called: a composite field's
+            // decoder is a closure, and calling it inline where declared would trip
+            // `clippy::redundant_closure_call`. The binding works for the bare accessor
+            // path too (a function item assigned then called).
+            let dec = self.rust_dec_func(&entry.value_type, records, aliases);
+            if matches!(entry.occurrence, Some(CsilOccurrence::Optional)) {
+                // A missing optional key leaves the field None; a present one decodes.
+                out.push_str(&format!(
+                    "    let {member} = match cbor_map_get(csil_root, {wire_lit}) {{\n\
+                     \x20       Some(csil_field) => {{\n\
+                     \x20           let csil_decode = {dec};\n\
+                     \x20           Some(csil_decode(csil_field)?)\n\
+                     \x20       }}\n\
+                     \x20       None => None,\n\
+                     \x20   }};\n"
+                ));
+            } else {
+                out.push_str(&format!(
+                    "    let {member} = {{\n\
+                     \x20       let csil_field = cbor_require(csil_root, {wire_lit})?;\n\
+                     \x20       let csil_decode = {dec};\n\
+                     \x20       csil_decode(csil_field)?\n\
+                     \x20   }};\n"
+                ));
+            }
+        }
+        out.push_str(&format!("    Ok({name} {{\n"));
+        for (member, _, _) in &named {
+            out.push_str(&format!("        {member},\n"));
+        }
+        out.push_str("    })\n}\n\n");
+
+        out.push_str(&format!(
+            "/// Encode a {name} to canonical CSIL CBOR bytes.\n"
+        ));
+        out.push_str(&format!(
+            "pub fn encode_{snake}(csil_v: &{name}) -> Vec<u8> {{\n    cbor_encode(&csil_enc_{snake}(csil_v))\n}}\n\n"
+        ));
+        out.push_str(&format!(
+            "/// Decode canonical CSIL CBOR bytes into a {name}.\n"
+        ));
+        out.push_str(&format!(
+            "pub fn decode_{snake}(csil_data: &[u8]) -> Result<{name}, CsilCborError> {{\n\
+             \x20   let csil_root = cbor_decode(csil_data)?;\n\
+             \x20   csil_dec_{snake}(&csil_root)\n}}\n\n"
+        ));
+        out
+    }
+
+    /// Build `codec.gen.rs`: the self-contained canonical-CBOR runtime plus an
+    /// `encode_`/`decode_` pair per record. `None` when the spec declares no record
+    /// the codec can model.
+    fn generate_codec(&self) -> Result<Option<String>, String> {
+        let records = self.record_names();
+        if records.is_empty() {
+            return Ok(None);
+        }
+        let aliases = self.codec_aliases();
+
+        let mut content = String::new();
+        content.push_str(
+            "//! Generated self-contained canonical-CBOR codec from CSIL specification.\n\
+             //!\n\
+             //! CSIL is the CBOR Service Interface Language; this codec owns the payload\n\
+             //! wire (a CBOR map keyed by the verbatim CSIL field name in canonical RFC\n\
+             //! 8949 order) so the generated types need no serde derive. One\n\
+             //! `encode_`/`decode_` pair is emitted per record type.\n",
+        );
+        // Not every runtime helper is exercised by every spec; the codec is a fixed
+        // self-contained block, so silence the unused-helper lint rather than prune.
+        // A record whose fields are all required builds its entry list with `push`
+        // calls after a sized `Vec` (capacity matches the field count); the
+        // optional-field case interleaves conditional pushes, so one canonical shape
+        // is kept rather than special-casing each record.
+        content.push_str("#![allow(dead_code, clippy::vec_init_then_push)]\n\n");
+        content.push_str("use super::types::*;\n\n");
+
+        content.push_str(CODEC_RUNTIME_RUST);
+        content.push_str("\n\n");
+
+        if self.spec_uses_builtin("timestamp") {
+            content.push_str(CODEC_TIMESTAMP_RUST);
+            content.push_str("\n\n");
+        }
+        if self.spec_uses_builtin("decimal") {
+            content.push_str(CODEC_BIGINT_RUST);
+            content.push_str("\n\n");
+            content.push_str(match self.decimal_mapping {
+                DecimalMapping::Csil => CODEC_DECIMAL_CSIL_RUST,
+                DecimalMapping::Library => CODEC_DECIMAL_LIBRARY_RUST,
+            });
+            content.push_str("\n\n");
+        }
+
+        for rule in &self.input.csil_spec.rules {
+            let group = match &rule.rule_type {
+                CsilRuleType::GroupDef(g) => Some(g),
+                CsilRuleType::TypeDef(CsilTypeExpression::Group(g)) => Some(g),
+                _ => None,
+            };
+            if let Some(group) = group
+                && records.contains(&rule.name)
+            {
+                content.push_str(&self.emit_record_codec(&rule.name, group, &records, &aliases));
+            }
+        }
+
+        Ok(Some(content))
     }
 
     /// Strip a trailing `Service` suffix and PascalCase the remainder, matching
@@ -1481,30 +2440,17 @@ impl<'a> RustCodeGenerator<'a> {
 
         content.push_str("//! Generated Rust code from CSIL specification\n\n");
 
-        // This generator emits no Cargo.toml, so the crates the generated code
-        // needs beyond serde are documented here for the consuming crate to add.
-        let mut deps: Vec<&str> = Vec::new();
-        if self.spec_uses_builtin("timestamp") {
-            deps.push("//! chrono = { version = \"0.4\", features = [\"serde\"] }");
-        }
-        if self.spec_uses_builtin("decimal") && self.decimal_mapping == DecimalMapping::Library {
-            deps.push("//! rust_decimal = { version = \"1\", features = [\"serde\"] }");
-        }
-        // `decimal` (tag 4) and `timestamp` (tag 0) ride CBOR semantic tags emitted
-        // through serde's tag mechanism, which only a tag-aware codec honours. This
-        // generated code targets `ciborium`; a codec that drops tags will not
-        // interoperate with the Go/TypeScript/Python parties.
-        if self.spec_uses_builtin("decimal") || self.spec_uses_builtin("timestamp") {
-            deps.push("//! ciborium = \"0.2\"  # CBOR codec assumed for decimal (tag 4) / timestamp (tag 0)");
-        }
-        if self.uses_regex {
-            deps.push("//! regex = \"1\"");
-        }
-        if !deps.is_empty() {
+        // In the default (non-package) mode this generator emits no Cargo.toml, so
+        // the crates the generated code needs are documented here for the consuming
+        // crate to add. The self-contained `codec.gen.rs` owns the CBOR wire, so no
+        // CBOR library is required; only the in-memory types for `timestamp`/`decimal`
+        // (and `regex` for validation) pull a dependency. In package mode the same
+        // list lands in the emitted `Cargo.toml` instead, so the note is suppressed.
+        let deps = self.crate_dependencies();
+        if !emit_rust_package(self.input) && !deps.is_empty() {
             content.push_str("//! ## Additional dependencies for the consuming crate\n//!\n");
-            for line in deps {
-                content.push_str(line);
-                content.push('\n');
+            for (crate_name, req) in &deps {
+                content.push_str(&format!("//! {crate_name} = \"{req}\"\n"));
             }
             content.push_str("//!\n");
         }
@@ -1513,6 +2459,15 @@ impl<'a> RustCodeGenerator<'a> {
         if files.iter().any(|f| f.path == "types.rs") {
             content.push_str("pub mod types;\n");
             content.push_str("pub use types::*;\n\n");
+        }
+
+        // The codec file carries a `.gen.rs` infix (matching the other generators'
+        // `codec.gen.*`), which is not a bare module name, so it is wired in through
+        // an explicit `#[path]`.
+        if files.iter().any(|f| f.path == "codec.gen.rs") {
+            content.push_str("#[path = \"codec.gen.rs\"]\n");
+            content.push_str("pub mod codec;\n");
+            content.push_str("pub use codec::*;\n\n");
         }
 
         if files.iter().any(|f| f.path == "services.rs") {
@@ -1666,122 +2621,6 @@ impl<'a> RustCodeGenerator<'a> {
                 "serde_json::Value".to_string()
             }
         }
-    }
-
-    fn generate_serde_attributes(
-        &self,
-        metadata: &[CsilFieldMetadata],
-        occurrence: &Option<CsilOccurrence>,
-        value_type: &CsilTypeExpression,
-    ) -> Vec<String> {
-        let mut attrs = Vec::new();
-
-        for meta in metadata {
-            match meta {
-                CsilFieldMetadata::Visibility(visibility) => {
-                    match visibility {
-                        CsilFieldVisibility::SendOnly => {
-                            attrs.push("skip_deserializing".to_string());
-                        }
-                        CsilFieldVisibility::ReceiveOnly => {
-                            attrs.push("skip_serializing".to_string());
-                        }
-                        _ => {} // Bidirectional is default
-                    }
-                }
-                CsilFieldMetadata::Custom { name, parameters } if name == "rust" => {
-                    for param in parameters {
-                        if let Some(param_name) = &param.name
-                            && let CsilLiteralValue::Text(value) = &param.value
-                        {
-                            attrs.push(format!("{param_name} = \"{value}\""));
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-
-        let optional = matches!(occurrence, Some(CsilOccurrence::Optional));
-
-        // `bytes`/`timestamp`/`decimal` each need a custom serde codec to hit their
-        // CBOR wire form (major-type-2 byte string, tag 0, tag 4); a bare derive
-        // would emit an int array / untagged string / bare array instead.
-        if let Some(module) = self.custom_with_module(value_type, optional) {
-            attrs.push(format!("with = \"{module}\""));
-        }
-
-        if optional {
-            // A custom `with` loses serde's automatic "missing -> None", so any field
-            // carrying one must also opt into `default` to keep an absent field None.
-            if self.custom_with_module(value_type, optional).is_some() {
-                attrs.push("default".to_string());
-            }
-            attrs.push("skip_serializing_if = \"Option::is_none\"".to_string());
-        }
-
-        attrs
-    }
-
-    /// The serde `with` module a field needs to reach its CBOR wire form, if any.
-    /// `bytes` uses `serde_bytes`; `timestamp` and (under `library` mapping)
-    /// `decimal` use the injected tag-0 / tag-4 adapters, which split into a bare
-    /// and an `_opt` variant because their function signatures differ by `Option`.
-    /// The default `csil` decimal mapping returns `None`: `CsilDecimal` carries its
-    /// own tag-4 `Serialize`/`Deserialize`, and serde handles `Option<CsilDecimal>`.
-    fn custom_with_module(
-        &self,
-        value_type: &CsilTypeExpression,
-        optional: bool,
-    ) -> Option<&'static str> {
-        if Self::is_bytes_type(value_type) {
-            // `serde_bytes` handles both the bare and `Option` shapes itself.
-            return Some("serde_bytes");
-        }
-        if Self::is_timestamp_type(value_type) {
-            return Some(if optional {
-                "csil_timestamp_opt"
-            } else {
-                "csil_timestamp"
-            });
-        }
-        if self.decimal_mapping == DecimalMapping::Library && Self::is_decimal_type(value_type) {
-            return Some(if optional {
-                "csil_decimal_opt"
-            } else {
-                "csil_decimal"
-            });
-        }
-        None
-    }
-
-    fn is_timestamp_type(type_expr: &CsilTypeExpression) -> bool {
-        Self::is_timestamp_shape(Self::value_base(type_expr))
-    }
-
-    fn is_decimal_type(type_expr: &CsilTypeExpression) -> bool {
-        Self::is_decimal_shape(Self::value_base(type_expr))
-    }
-
-    fn is_bytes_type(type_expr: &CsilTypeExpression) -> bool {
-        match type_expr {
-            CsilTypeExpression::Builtin(name) => matches!(name.as_str(), "bytes" | "bstr"),
-            CsilTypeExpression::Constrained { base_type, .. } => Self::is_bytes_type(base_type),
-            _ => false,
-        }
-    }
-
-    fn spec_has_bytes_fields(&self) -> bool {
-        self.input.csil_spec.rules.iter().any(|rule| {
-            if let CsilRuleType::GroupDef(group) = &rule.rule_type {
-                group
-                    .entries
-                    .iter()
-                    .any(|e| Self::is_bytes_type(&e.value_type))
-            } else {
-                false
-            }
-        })
     }
 
     /// Emit `impl Type { pub fn validate(&self) -> Result<(), ValidationError> }`
@@ -2352,7 +3191,11 @@ mod tests {
         assert!(types_content.contains("pub struct User"));
         assert!(types_content.contains("pub name: String"));
         assert!(types_content.contains("pub email: Option<String>"));
-        assert!(types_content.contains("#[serde(skip_deserializing"));
+        // The payload wire is owned by the generated codec, so the type derives no
+        // serde traits and carries no serde attribute.
+        assert!(types_content.contains("#[derive(Debug, Clone, PartialEq)]"));
+        assert!(!types_content.contains("Serialize"));
+        assert!(!types_content.contains("#[serde"));
     }
 
     #[test]
@@ -2434,9 +3277,42 @@ mod tests {
         ));
     }
 
+    /// A single-field group record rule, for fixtures that need the request/response
+    /// payloads to be real records the codec (and the typed client) can resolve.
+    fn group_rule(name: &str, field: &str, builtin: &str) -> CsilRule {
+        CsilRule {
+            name: name.to_string(),
+            rule_type: CsilRuleType::GroupDef(CsilGroupExpression {
+                entries: vec![CsilGroupEntry {
+                    key: Some(CsilGroupKey::Bare(field.to_string())),
+                    value_type: CsilTypeExpression::Builtin(builtin.to_string()),
+                    occurrence: None,
+                    metadata: vec![],
+                    doc_comments: Vec::new(),
+                }],
+            }),
+            position: CsilPosition {
+                line: 1,
+                column: 1,
+                offset: 0,
+            },
+            doc_comments: Vec::new(),
+        }
+    }
+
     fn make_unary_service_input(target: &str) -> WasmGeneratorInput {
         let mut input = create_test_input();
         input.config.target = target.to_string();
+        // The request/response payloads are real records so the typed-codec client
+        // can resolve their `encode_`/`decode_` pair.
+        input
+            .csil_spec
+            .rules
+            .push(group_rule("SubmitTaskRequest", "queue", "text"));
+        input
+            .csil_spec
+            .rules
+            .push(group_rule("SubmitTaskResponse", "uuid", "text"));
         input.csil_spec.rules.push(CsilRule {
             name: "CorndogsService".to_string(),
             rule_type: CsilRuleType::ServiceDef(CsilServiceDefinition {
@@ -2493,7 +3369,10 @@ mod tests {
             .iter()
             .find(|f| f.path == "client.rs")
             .expect("client.rs emitted");
-        assert!(client.content.contains("pub trait Transport"));
+        // The transport is now a dumb byte seam: bytes in, bytes out.
+        assert!(client.content.contains(
+            "fn call(&self, service: &str, op: &str, req: &[u8]) -> Result<Vec<u8>, ClientError>;"
+        ));
         assert!(client.content.contains("pub enum ClientError"));
         assert!(
             client
@@ -2503,11 +3382,17 @@ mod tests {
         assert!(client.content.contains(
             "pub fn submit_task(&self, req: SubmitTaskRequest) -> Result<SubmitTaskResponse, ClientError>"
         ));
+        // The client encodes the request, calls over the byte seam, then decodes.
+        assert!(client.content.contains(
+            "let csil_resp = self.transport.call(\"corndogs\", \"SubmitTask\", &encode_submit_task_request(&req))?;"
+        ));
         assert!(
             client
                 .content
-                .contains("self.transport.call(\"corndogs\", \"SubmitTask\", &req)")
+                .contains("decode_submit_task_response(&csil_resp).map_err(|e| ClientError::Transport(e.to_string()))")
         );
+        // The codec ships alongside the client.
+        assert!(files.iter().any(|f| f.path == "codec.gen.rs"));
         // The server surface must not leak into the client target.
         assert!(!files.iter().any(|f| f.path == "services.rs"));
     }
@@ -2871,7 +3756,8 @@ mod tests {
         assert!(types_content.contains("Variant0(String)"));
         assert!(types_content.contains("Variant1(i64)"));
         assert!(types_content.contains("Variant2(f64)"));
-        assert!(types_content.contains("#[serde(untagged)]"));
+        // The enum no longer derives serde; the payload wire is the codec's job.
+        assert!(!types_content.contains("#[serde"));
         assert!(
             !types_content.contains("pub type CheckValue = serde_json::Value"),
             "Should not fall back to serde_json::Value"
@@ -3024,9 +3910,9 @@ mod tests {
 
         assert!(types_content.contains("pub struct HelloRequest"));
         assert!(types_content.contains("pub name: Option<String>"));
-        assert!(types_content.contains("skip_serializing_if = \"Option::is_none\""));
-        // optional non-bytes already round-trips via serde's Option special-casing,
-        // so it must not gain `default`.
+        // No serde attribute: an optional field is just `Option<T>`, and the codec
+        // omits it from the wire map when absent.
+        assert!(!types_content.contains("#[serde"));
         assert!(
             !types_content.contains("default"),
             "optional text field must not emit serde `default`"
@@ -3058,57 +3944,46 @@ mod tests {
         let mut generator = RustCodeGenerator::new(&input);
         let types_content = generator.generate_types().unwrap();
 
+        // The payload wire is owned by `codec.gen.rs`; the type field carries no
+        // serde attribute. An optional bytes field is simply `Option<Vec<u8>>`, and
+        // the generated codec omits it when absent / decodes a present one.
         assert!(types_content.contains("pub key_signature: Option<Vec<u8>>"));
-        // A custom `with` disables serde's "missing -> None", so all three must be present.
-        let field_pos = types_content.find("pub key_signature:").unwrap();
-        let attrs = &types_content[field_pos.saturating_sub(160)..field_pos];
-        assert!(
-            attrs.contains("default"),
-            "optional bytes must emit `default`"
-        );
-        assert!(attrs.contains("with = \"serde_bytes\""));
-        assert!(attrs.contains("skip_serializing_if = \"Option::is_none\""));
-    }
-
-    // Reproduces the serde semantics behind the fix: a custom `with`/`deserialize_with`
-    // disables serde's automatic "missing Option field -> None", so the bytes-shaped
-    // module below stands in for the generated `with = "serde_bytes"`. This is the exact
-    // regression that broke linkkeys `DomainPublicKey.key_signature` deserialization.
-    mod bytes_with {
-        use serde::{Deserialize, Deserializer};
-
-        pub fn deserialize<'de, D: Deserializer<'de>>(
-            deserializer: D,
-        ) -> Result<Option<Vec<u8>>, D::Error> {
-            Option::<Vec<u8>>::deserialize(deserializer)
-        }
+        assert!(!types_content.contains("#[serde"));
+        assert!(!types_content.contains("serde_bytes"));
     }
 
     #[test]
-    fn test_optional_bytes_missing_field_round_trips_with_default() {
-        #[derive(serde::Deserialize)]
-        struct Fixed {
-            #[serde(default, with = "bytes_with", skip_serializing_if = "Option::is_none")]
-            key_signature: Option<Vec<u8>>,
-        }
-
-        #[derive(serde::Deserialize)]
-        struct WithoutDefault {
-            #[serde(with = "bytes_with", skip_serializing_if = "Option::is_none")]
-            #[allow(dead_code)]
-            key_signature: Option<Vec<u8>>,
-        }
-
-        // A signing key omits `key_signature` entirely.
-        let json = "{}";
-
-        // With `default` (what the generator now emits) the field becomes None.
-        let fixed: Fixed = serde_json::from_str(json).unwrap();
-        assert_eq!(fixed.key_signature, None);
-
-        // Without `default` the custom `with` turns a missing field into a hard error,
-        // which is precisely the production breakage the request describes.
-        assert!(serde_json::from_str::<WithoutDefault>(json).is_err());
+    fn optional_bytes_codec_omits_absent_and_uses_byte_string() {
+        // The optional bytes field's codec guards on `Some`, pushes the verbatim
+        // wire key, and routes through `cbor_bytes` (CBOR major type 2), never an
+        // integer array.
+        let input = single_field_spec(
+            "DomainPublicKey",
+            CsilTypeExpression::Builtin("bytes".to_string()),
+            vec![],
+            Some(CsilOccurrence::Optional),
+        );
+        let files = RustCodeGenerator::new(&input).generate().unwrap();
+        let codec = files
+            .iter()
+            .find(|f| f.path == "codec.gen.rs")
+            .expect("codec.gen.rs emitted");
+        assert!(
+            codec
+                .content
+                .contains("if let Some(csil_inner) = &csil_v.field")
+        );
+        assert!(
+            codec
+                .content
+                .contains("cbor_text(\"field\"), cbor_bytes(csil_inner)")
+        );
+        // The decoder leaves an absent optional as None.
+        assert!(
+            codec
+                .content
+                .contains("match cbor_map_get(csil_root, \"field\")")
+        );
     }
 
     #[test]
@@ -3160,13 +4035,9 @@ mod tests {
         assert!(types_content.contains("pub id: String"));
         assert!(types_content.contains("pub name: String"));
         assert!(types_content.contains("pub created_at: String"));
-        // id and created_at should have skip_serializing, name should not
-        let id_section = &types_content
-            [types_content.find("pub id:").unwrap() - 80..types_content.find("pub id:").unwrap()];
-        assert!(
-            id_section.contains("skip_serializing"),
-            "receive-only field 'id' should have skip_serializing"
-        );
+        // Field visibility no longer maps onto a serde attribute now that the payload
+        // wire is owned by the generated codec; the type stays attribute-free.
+        assert!(!types_content.contains("#[serde"));
     }
 
     #[test]
@@ -3240,11 +4111,14 @@ mod tests {
 
         let files = RustCodeGenerator::new(&input).generate().unwrap();
         let root = files.iter().find(|f| f.path == "mod.rs").unwrap();
-        assert!(root.content.contains("chrono = { version = \"0.4\""));
+        // `chrono` is now a plain in-memory dependency; no serde feature, no codec
+        // library (the generated codec owns the tag-0 wire).
+        assert!(root.content.contains("chrono = \"0.4\""));
+        assert!(!root.content.contains("ciborium"));
     }
 
     #[test]
-    fn timestamp_field_emits_tag0_serde_with_and_module() {
+    fn timestamp_field_codec_emits_tag0_rfc3339() {
         let input = single_field_spec(
             "Event",
             CsilTypeExpression::Builtin("timestamp".to_string()),
@@ -3253,48 +4127,53 @@ mod tests {
         );
         let files = RustCodeGenerator::new(&input).generate().unwrap();
         let types = files.iter().find(|f| f.path == "types.rs").unwrap();
+        // The type field carries no serde attribute.
+        assert!(!types.content.contains("#[serde"));
 
-        // The field carries the tag-0 adapter and the adapter module is injected.
-        assert!(
-            types
-                .content
-                .contains("#[serde(with = \"csil_timestamp\")]")
-        );
-        assert!(types.content.contains("pub mod csil_timestamp {"));
-        assert!(
-            types
-                .content
-                .contains("ciborium::tag::Required::<String, 0>")
-        );
-        assert!(types.content.contains("to_rfc3339_opts"));
-
-        // The ciborium codec assumption is documented in the dep note.
-        let root = files.iter().find(|f| f.path == "mod.rs").unwrap();
-        assert!(root.content.contains("ciborium = \"0.2\""));
+        // The tag-0 RFC3339 wire form lives in the generated codec, not the type.
+        let codec = files
+            .iter()
+            .find(|f| f.path == "codec.gen.rs")
+            .expect("codec.gen.rs emitted");
+        assert!(codec.content.contains("csil_enc_timestamp"));
+        assert!(codec.content.contains("CsilCborValue::Tag(0,"));
+        assert!(codec.content.contains("to_rfc3339_opts"));
+        // The field routes through the timestamp codec on both sides.
+        assert!(codec.content.contains("csil_enc_timestamp(&csil_v.field)"));
     }
 
     #[test]
-    fn optional_timestamp_field_uses_opt_adapter_and_default() {
+    fn optional_timestamp_field_codec_guards_and_keeps_type() {
         let input = single_field_spec(
             "Event",
             CsilTypeExpression::Builtin("timestamp".to_string()),
             vec![],
             Some(CsilOccurrence::Optional),
         );
-        let mut generator = RustCodeGenerator::new(&input);
-        let types = generator.generate_types().unwrap();
-        assert!(types.contains("pub field: Option<chrono::DateTime<chrono::Utc>>"));
-        let field_pos = types.find("pub field:").unwrap();
-        let attrs = &types[field_pos.saturating_sub(200)..field_pos];
-        // A custom `with` disables serde's missing -> None, so `default` is required.
-        assert!(attrs.contains("with = \"csil_timestamp_opt\""));
-        assert!(attrs.contains("default"));
-        assert!(attrs.contains("skip_serializing_if = \"Option::is_none\""));
-        assert!(types.contains("pub mod csil_timestamp_opt {"));
+        let files = RustCodeGenerator::new(&input).generate().unwrap();
+        let types = files.iter().find(|f| f.path == "types.rs").unwrap();
+        assert!(
+            types
+                .content
+                .contains("pub field: Option<chrono::DateTime<chrono::Utc>>")
+        );
+        assert!(!types.content.contains("#[serde"));
+
+        let codec = files
+            .iter()
+            .find(|f| f.path == "codec.gen.rs")
+            .expect("codec.gen.rs emitted");
+        // An optional timestamp is guarded on encode and routed through the codec.
+        assert!(
+            codec
+                .content
+                .contains("if let Some(csil_inner) = &csil_v.field")
+        );
+        assert!(codec.content.contains("csil_enc_timestamp(csil_inner)"));
     }
 
     #[test]
-    fn library_decimal_field_emits_tag4_serde_with_and_module() {
+    fn library_decimal_field_codec_emits_tag4_and_maps_to_rust_decimal() {
         let mut input = single_field_spec(
             "Money",
             CsilTypeExpression::Builtin("decimal".to_string()),
@@ -3309,18 +4188,25 @@ mod tests {
         let types = files.iter().find(|f| f.path == "types.rs").unwrap();
 
         assert!(types.content.contains("pub field: rust_decimal::Decimal"));
-        assert!(types.content.contains("#[serde(with = \"csil_decimal\")]"));
-        assert!(types.content.contains("pub mod csil_decimal {"));
-        assert!(
-            types
-                .content
-                .contains("ciborium::tag::Required::<(i64, i128), 4>")
-        );
+        assert!(!types.content.contains("#[serde"));
         // No `CsilDecimal` helper in library mode.
         assert!(!types.content.contains("pub struct CsilDecimal"));
 
+        // The tag-4 wire form lives in the codec, keyed off `rust_decimal::Decimal`.
+        let codec = files
+            .iter()
+            .find(|f| f.path == "codec.gen.rs")
+            .expect("codec.gen.rs emitted");
+        assert!(
+            codec
+                .content
+                .contains("fn csil_enc_decimal(d: &rust_decimal::Decimal)")
+        );
+        assert!(codec.content.contains("CsilCborValue::Tag(\n        4,"));
+
         let root = files.iter().find(|f| f.path == "mod.rs").unwrap();
-        assert!(root.content.contains("ciborium = \"0.2\""));
+        assert!(root.content.contains("rust_decimal = \"1\""));
+        assert!(!root.content.contains("ciborium"));
     }
 
     #[test]
@@ -3357,19 +4243,29 @@ mod tests {
         let types = generator.generate_types().unwrap();
         assert!(types.contains("pub field: CsilDecimal"));
         assert!(types.contains("pub struct CsilDecimal"));
-        // The helper now hand-rolls tag-4 serde rather than a bare `(i64, i128)`
-        // array, so the old `into`/`from` shorthand must be gone.
-        assert!(!types.contains("#[serde(into = \"(i64, i128)\", from = \"(i64, i128)\")]"));
-        assert!(types.contains("impl Serialize for CsilDecimal"));
-        assert!(types.contains("impl<'de> Deserialize<'de> for CsilDecimal"));
-        assert!(types.contains("ciborium::tag::Required::<(i64, i128), 4>"));
+        // The helper carries no serde impl now; its tag-4 wire form is the codec's.
+        assert!(!types.contains("impl Serialize for CsilDecimal"));
+        assert!(!types.contains("impl<'de> Deserialize<'de> for CsilDecimal"));
+        assert!(!types.contains("#[serde"));
+        // The value-string conversions remain (the lossless bridge to a decimal lib).
         assert!(types.contains("pub fn from_str"));
         assert!(types.contains("pub fn as_str"));
 
-        // The ciborium codec assumption is documented in the dep note.
+        // The tag-4 wire form lives in the codec, keyed off `CsilDecimal`.
         let files = RustCodeGenerator::new(&input).generate().unwrap();
+        let codec = files
+            .iter()
+            .find(|f| f.path == "codec.gen.rs")
+            .expect("codec.gen.rs emitted");
+        assert!(
+            codec
+                .content
+                .contains("fn csil_enc_decimal(d: &CsilDecimal)")
+        );
+        assert!(codec.content.contains("csil_enc_bigint(d.mantissa)"));
+        // No CBOR library is assumed; the codec is self-contained.
         let root = files.iter().find(|f| f.path == "mod.rs").unwrap();
-        assert!(root.content.contains("ciborium = \"0.2\""));
+        assert!(!root.content.contains("ciborium"));
 
         // Not used: no helper leaks into an unrelated spec.
         let plain = single_field_spec(
@@ -3402,7 +4298,7 @@ mod tests {
         assert!(!types.content.contains("pub struct CsilDecimal"));
 
         let root = files.iter().find(|f| f.path == "mod.rs").unwrap();
-        assert!(root.content.contains("rust_decimal = { version = \"1\""));
+        assert!(root.content.contains("rust_decimal = \"1\""));
     }
 
     #[test]
@@ -3834,148 +4730,6 @@ mod tests {
         );
     }
 
-    /// Mirrors the emitted CBOR tag wrappers — `CsilDecimal`'s hand-rolled tag-4
-    /// serde, the `csil_timestamp` tag-0 adapter, and the library-mode `csil_decimal`
-    /// tag-4 adapter — so the actual wire bytes are exercised here against the same
-    /// `ciborium` codec the generated crate assumes. Kept identical to the
-    /// `CSIL_DECIMAL` / `CSIL_TIMESTAMP` / `CSIL_DECIMAL_LIBRARY` source bodies.
-    mod cbor_tag_wire {
-        use serde::{Deserialize, Serialize};
-
-        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-        pub struct CsilDecimal {
-            pub exponent: i64,
-            pub mantissa: i128,
-        }
-
-        impl Serialize for CsilDecimal {
-            fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-                ciborium::tag::Required::<(i64, i128), 4>((self.exponent, self.mantissa))
-                    .serialize(serializer)
-            }
-        }
-
-        impl<'de> Deserialize<'de> for CsilDecimal {
-            fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-                let ciborium::tag::Required::<(i64, i128), 4>((exponent, mantissa)) =
-                    ciborium::tag::Required::<(i64, i128), 4>::deserialize(deserializer)?;
-                Ok(Self { exponent, mantissa })
-            }
-        }
-
-        pub mod csil_timestamp {
-            use serde::{Deserialize, Serialize};
-
-            pub fn serialize<S: serde::Serializer>(
-                value: &chrono::DateTime<chrono::Utc>,
-                serializer: S,
-            ) -> Result<S::Ok, S::Error> {
-                let text = value.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true);
-                ciborium::tag::Required::<String, 0>(text).serialize(serializer)
-            }
-
-            pub fn deserialize<'de, D: serde::Deserializer<'de>>(
-                deserializer: D,
-            ) -> Result<chrono::DateTime<chrono::Utc>, D::Error> {
-                let ciborium::tag::Required::<String, 0>(text) =
-                    ciborium::tag::Required::<String, 0>::deserialize(deserializer)?;
-                chrono::DateTime::parse_from_rfc3339(&text)
-                    .map(|dt| dt.with_timezone(&chrono::Utc))
-                    .map_err(serde::de::Error::custom)
-            }
-        }
-
-        pub mod csil_decimal_lib {
-            use serde::{Deserialize, Serialize};
-
-            pub fn serialize<S: serde::Serializer>(
-                value: &rust_decimal::Decimal,
-                serializer: S,
-            ) -> Result<S::Ok, S::Error> {
-                let exponent = -(value.scale() as i64);
-                let mantissa = value.mantissa();
-                ciborium::tag::Required::<(i64, i128), 4>((exponent, mantissa))
-                    .serialize(serializer)
-            }
-
-            pub fn deserialize<'de, D: serde::Deserializer<'de>>(
-                deserializer: D,
-            ) -> Result<rust_decimal::Decimal, D::Error> {
-                let ciborium::tag::Required::<(i64, i128), 4>((exponent, mantissa)) =
-                    ciborium::tag::Required::<(i64, i128), 4>::deserialize(deserializer)?;
-                if exponent >= 0 {
-                    let pow = 10i128
-                        .checked_pow(exponent as u32)
-                        .ok_or_else(|| serde::de::Error::custom("decimal exponent too large"))?;
-                    let scaled = mantissa
-                        .checked_mul(pow)
-                        .ok_or_else(|| serde::de::Error::custom("decimal mantissa overflow"))?;
-                    Ok(rust_decimal::Decimal::from_i128_with_scale(scaled, 0))
-                } else {
-                    Ok(rust_decimal::Decimal::from_i128_with_scale(
-                        mantissa,
-                        (-exponent) as u32,
-                    ))
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn csil_decimal_round_trips_as_cbor_tag4() {
-        use cbor_tag_wire::CsilDecimal;
-        let value = CsilDecimal {
-            exponent: -2,
-            mantissa: 12345,
-        };
-        let mut buf = Vec::new();
-        ciborium::into_writer(&value, &mut buf).unwrap();
-        // First byte is the CBOR tag-4 head (major type 6, tag value 4): 0xc4.
-        assert_eq!(buf[0], 0xc4, "decimal must serialize under CBOR tag 4");
-        let back: CsilDecimal = ciborium::from_reader(buf.as_slice()).unwrap();
-        assert_eq!(back, value, "decimal must survive encode -> decode");
-    }
-
-    #[test]
-    fn timestamp_round_trips_as_cbor_tag0() {
-        #[derive(serde::Serialize, serde::Deserialize, PartialEq, Debug)]
-        struct Holder(
-            #[serde(with = "cbor_tag_wire::csil_timestamp")] chrono::DateTime<chrono::Utc>,
-        );
-
-        let when = chrono::DateTime::parse_from_rfc3339("2024-01-02T03:04:05Z")
-            .unwrap()
-            .with_timezone(&chrono::Utc);
-        let holder = Holder(when);
-        let mut buf = Vec::new();
-        ciborium::into_writer(&holder, &mut buf).unwrap();
-        // First byte is the CBOR tag-0 head (major type 6, tag value 0): 0xc0.
-        assert_eq!(buf[0], 0xc0, "timestamp must serialize under CBOR tag 0");
-        let back: Holder = ciborium::from_reader(buf.as_slice()).unwrap();
-        assert_eq!(back, holder, "timestamp must survive encode -> decode");
-    }
-
-    #[test]
-    fn library_decimal_round_trips_as_cbor_tag4() {
-        #[derive(serde::Serialize, serde::Deserialize, PartialEq, Debug)]
-        struct Holder(#[serde(with = "cbor_tag_wire::csil_decimal_lib")] rust_decimal::Decimal);
-
-        // 123.45 carried as mantissa 12345 with scale 2 (exponent -2).
-        let value = rust_decimal::Decimal::from_i128_with_scale(12345, 2);
-        let holder = Holder(value);
-        let mut buf = Vec::new();
-        ciborium::into_writer(&holder, &mut buf).unwrap();
-        assert_eq!(
-            buf[0], 0xc4,
-            "library decimal must serialize under CBOR tag 4"
-        );
-        let back: Holder = ciborium::from_reader(buf.as_slice()).unwrap();
-        assert_eq!(
-            back.0, value,
-            "library decimal must survive encode -> decode"
-        );
-    }
-
     #[test]
     fn test_linkkeys_end_to_end() {
         let mut input = create_test_input();
@@ -4387,6 +5141,11 @@ mod tests {
         // `op: -> Event` parses to a Unidirectional op with a `null` input. The
         // server trait and the client must both omit the request parameter.
         let mut server_input = create_test_input();
+        // `Pong` is a real record so the typed client can decode the response.
+        server_input
+            .csil_spec
+            .rules
+            .push(group_rule("Pong", "ts", "uint"));
         server_input.csil_spec.rules.push(CsilRule {
             name: "EventsService".to_string(),
             rule_type: CsilRuleType::ServiceDef(CsilServiceDefinition {
@@ -4443,8 +5202,16 @@ mod tests {
         assert!(
             client
                 .content
-                .contains("self.transport.call(\"events\", \"Heartbeat\", &())"),
-            "null-input client must send the empty `()` payload"
+                .contains("self.transport.call(\"events\", \"Heartbeat\", &[])?;"),
+            "null-input client must send empty request bytes, got:\n{}",
+            client.content
+        );
+        assert!(
+            client.content.contains(
+                "decode_pong(&csil_resp).map_err(|e| ClientError::Transport(e.to_string()))"
+            ),
+            "null-input client must decode the typed response, got:\n{}",
+            client.content
         );
     }
 
@@ -4625,4 +5392,566 @@ mod tests {
             "no compact router without wire-ids, got:\n{services}"
         );
     }
+
+    /// The corndogs `rust-client` fixture from the wire contract: a `Task` with a
+    /// text uuid, text current_state, bytes payload, optional int priority, a
+    /// `map<text,int>` of labels and a `list<text>` of tags; a `SubmitTaskRequest`
+    /// wrapping a `Task` and a queue; a `ServiceError`; and a `CorndogsService` with
+    /// `submit-task: SubmitTaskRequest -> Task / ServiceError`.
+    fn corndogs_client_input() -> WasmGeneratorInput {
+        let task = CsilRule {
+            name: "Task".to_string(),
+            rule_type: CsilRuleType::GroupDef(CsilGroupExpression {
+                entries: vec![
+                    CsilGroupEntry {
+                        key: Some(CsilGroupKey::Bare("uuid".to_string())),
+                        value_type: CsilTypeExpression::Builtin("text".to_string()),
+                        occurrence: None,
+                        metadata: vec![],
+                        doc_comments: Vec::new(),
+                    },
+                    CsilGroupEntry {
+                        key: Some(CsilGroupKey::Bare("current_state".to_string())),
+                        value_type: CsilTypeExpression::Builtin("text".to_string()),
+                        occurrence: None,
+                        metadata: vec![],
+                        doc_comments: Vec::new(),
+                    },
+                    CsilGroupEntry {
+                        key: Some(CsilGroupKey::Bare("payload".to_string())),
+                        value_type: CsilTypeExpression::Builtin("bytes".to_string()),
+                        occurrence: None,
+                        metadata: vec![],
+                        doc_comments: Vec::new(),
+                    },
+                    CsilGroupEntry {
+                        key: Some(CsilGroupKey::Bare("priority".to_string())),
+                        value_type: CsilTypeExpression::Builtin("int".to_string()),
+                        occurrence: Some(CsilOccurrence::Optional),
+                        metadata: vec![],
+                        doc_comments: Vec::new(),
+                    },
+                    CsilGroupEntry {
+                        key: Some(CsilGroupKey::Bare("labels".to_string())),
+                        value_type: CsilTypeExpression::Map {
+                            key: Box::new(CsilTypeExpression::Builtin("text".to_string())),
+                            value: Box::new(CsilTypeExpression::Builtin("int".to_string())),
+                            occurrence: None,
+                        },
+                        occurrence: None,
+                        metadata: vec![],
+                        doc_comments: Vec::new(),
+                    },
+                    CsilGroupEntry {
+                        key: Some(CsilGroupKey::Bare("tags".to_string())),
+                        value_type: CsilTypeExpression::Array {
+                            element_type: Box::new(CsilTypeExpression::Builtin("text".to_string())),
+                            occurrence: None,
+                        },
+                        occurrence: None,
+                        metadata: vec![],
+                        doc_comments: Vec::new(),
+                    },
+                    // Fields typed as named map ALIASES — the regression: their codec
+                    // must walk the underlying map, not stub it to null. One map-of-int
+                    // and one map-of-record.
+                    CsilGroupEntry {
+                        key: Some(CsilGroupKey::Bare("queue_counts".to_string())),
+                        value_type: CsilTypeExpression::Reference("StringInt64Map".to_string()),
+                        occurrence: None,
+                        metadata: vec![],
+                        doc_comments: Vec::new(),
+                    },
+                    CsilGroupEntry {
+                        key: Some(CsilGroupKey::Bare("state_counts".to_string())),
+                        value_type: CsilTypeExpression::Reference(
+                            "QueueAndStateCountsMap".to_string(),
+                        ),
+                        occurrence: None,
+                        metadata: vec![],
+                        doc_comments: Vec::new(),
+                    },
+                ],
+            }),
+            position: CsilPosition {
+                line: 1,
+                column: 1,
+                offset: 0,
+            },
+            doc_comments: Vec::new(),
+        };
+        // A record used as a map alias value, to prove map-of-record recurses to the
+        // record codec rather than stubbing.
+        let counts = CsilRule {
+            name: "QueueAndStateCounts".to_string(),
+            rule_type: CsilRuleType::GroupDef(CsilGroupExpression {
+                entries: vec![CsilGroupEntry {
+                    key: Some(CsilGroupKey::Bare("count".to_string())),
+                    value_type: CsilTypeExpression::Builtin("int".to_string()),
+                    occurrence: None,
+                    metadata: vec![],
+                    doc_comments: Vec::new(),
+                }],
+            }),
+            position: CsilPosition {
+                line: 1,
+                column: 1,
+                offset: 0,
+            },
+            doc_comments: Vec::new(),
+        };
+        // Named map aliases (`X = {* text => …}`) parse to a TypeDef carrying a Map.
+        let map_alias = |name: &str, value: CsilTypeExpression| CsilRule {
+            name: name.to_string(),
+            rule_type: CsilRuleType::TypeDef(CsilTypeExpression::Map {
+                key: Box::new(CsilTypeExpression::Builtin("text".to_string())),
+                value: Box::new(value),
+                occurrence: None,
+            }),
+            position: CsilPosition {
+                line: 1,
+                column: 1,
+                offset: 0,
+            },
+            doc_comments: Vec::new(),
+        };
+        let str_int_map = map_alias(
+            "StringInt64Map",
+            CsilTypeExpression::Builtin("int".to_string()),
+        );
+        let state_map = map_alias(
+            "QueueAndStateCountsMap",
+            CsilTypeExpression::Reference("QueueAndStateCounts".to_string()),
+        );
+        let req = CsilRule {
+            name: "SubmitTaskRequest".to_string(),
+            rule_type: CsilRuleType::GroupDef(CsilGroupExpression {
+                entries: vec![
+                    CsilGroupEntry {
+                        key: Some(CsilGroupKey::Bare("task".to_string())),
+                        value_type: CsilTypeExpression::Reference("Task".to_string()),
+                        occurrence: None,
+                        metadata: vec![],
+                        doc_comments: Vec::new(),
+                    },
+                    CsilGroupEntry {
+                        key: Some(CsilGroupKey::Bare("queue".to_string())),
+                        value_type: CsilTypeExpression::Builtin("text".to_string()),
+                        occurrence: None,
+                        metadata: vec![],
+                        doc_comments: Vec::new(),
+                    },
+                ],
+            }),
+            position: CsilPosition {
+                line: 1,
+                column: 1,
+                offset: 0,
+            },
+            doc_comments: Vec::new(),
+        };
+        let err = group_rule("ServiceError", "message", "text");
+        let svc = CsilRule {
+            name: "CorndogsService".to_string(),
+            rule_type: CsilRuleType::ServiceDef(CsilServiceDefinition {
+                operations: vec![CsilServiceOperation {
+                    name: "submit-task".to_string(),
+                    input_type: CsilTypeExpression::Reference("SubmitTaskRequest".to_string()),
+                    output_type: CsilTypeExpression::Choice(vec![
+                        CsilTypeExpression::Reference("Task".to_string()),
+                        CsilTypeExpression::Reference("ServiceError".to_string()),
+                    ]),
+                    direction: CsilServiceDirection::Unidirectional,
+                    position: CsilPosition {
+                        line: 1,
+                        column: 1,
+                        offset: 0,
+                    },
+                    doc_comments: Vec::new(),
+                    wire_id: None,
+                }],
+                wire_id: None,
+            }),
+            position: CsilPosition {
+                line: 1,
+                column: 1,
+                offset: 0,
+            },
+            doc_comments: Vec::new(),
+        };
+
+        let mut input = create_test_input();
+        input.config.target = "rust-client".to_string();
+        input.csil_spec.rules = vec![task, counts, str_int_map, state_map, req, err, svc];
+        input.csil_spec.service_count = 1;
+        input
+    }
+
+    #[test]
+    fn corndogs_codec_emits_canonical_keys_and_typed_pairs() {
+        let files = RustCodeGenerator::new(&corndogs_client_input())
+            .generate()
+            .unwrap();
+        let codec = files
+            .iter()
+            .find(|f| f.path == "codec.gen.rs")
+            .expect("codec.gen.rs emitted");
+
+        // Public byte wrappers per record.
+        assert!(
+            codec
+                .content
+                .contains("pub fn encode_task(csil_v: &Task) -> Vec<u8>")
+        );
+        assert!(
+            codec
+                .content
+                .contains("pub fn decode_task(csil_data: &[u8]) -> Result<Task, CsilCborError>")
+        );
+        assert!(
+            codec.content.contains(
+                "pub fn encode_submit_task_request(csil_v: &SubmitTaskRequest) -> Vec<u8>"
+            )
+        );
+        // bytes -> CBOR byte string (major type 2) via the runtime's cbor_bytes.
+        assert!(
+            codec
+                .content
+                .contains("cbor_text(\"payload\"), cbor_bytes(&csil_v.payload)")
+        );
+        // A nested record reference recurses into its codec.
+        assert!(codec.content.contains("csil_enc_task(&csil_v.task)"));
+        // Optional int: guarded on encode, deref'd into the map.
+        assert!(
+            codec
+                .content
+                .contains("if let Some(csil_inner) = &csil_v.priority")
+        );
+        assert!(codec.content.contains("cbor_int(*csil_inner)"));
+        // map<text,int> and list<text> route through the generic helpers.
+        assert!(codec.content.contains("cbor_enc_map(&csil_v.labels,"));
+        assert!(codec.content.contains("cbor_enc_array(&csil_v.tags,"));
+
+        // Keys are laid down in canonical (encoded-key) order: within Task the len-4
+        // keys `tags`/`uuid` precede the longer keys, and `current_state` (len 13) is
+        // last; `tags` < `uuid` on content.
+        let enc_start = codec.content.find("fn csil_enc_task").unwrap();
+        let enc = &codec.content[enc_start..];
+        let pos_tags = enc.find("\"tags\"").unwrap();
+        let pos_uuid = enc.find("\"uuid\"").unwrap();
+        let pos_state = enc.find("\"current_state\"").unwrap();
+        assert!(
+            pos_tags < pos_uuid && pos_uuid < pos_state,
+            "fields not in canonical key order"
+        );
+
+        // The generated types carry no serde anything.
+        let types = files.iter().find(|f| f.path == "types.rs").unwrap();
+        assert!(!types.content.contains("serde"));
+        assert!(
+            !types
+                .content
+                .contains("#[derive(Debug, Clone, PartialEq, Serialize")
+        );
+    }
+
+    /// Compile the generated codec + typed client and round-trip a corndogs request
+    /// through a loopback transport with a real `cargo` build. Skips cleanly when no
+    /// cargo toolchain is on PATH; with one present, this is the real proof the
+    /// output is usable.
+    #[test]
+    fn codec_round_trips_through_cargo() {
+        let probe = std::process::Command::new("cargo")
+            .arg("--version")
+            .output();
+        if probe.map(|o| !o.status.success()).unwrap_or(true) {
+            eprintln!("skipping: no cargo toolchain on PATH");
+            return;
+        }
+
+        let mut input = corndogs_client_input();
+        // Emit the module root as `lib.rs` so the temp crate is a library the driver
+        // binary can depend on.
+        input.config.options.insert(
+            "module_root_filename".to_string(),
+            serde_json::Value::String("lib.rs".to_string()),
+        );
+        let files = RustCodeGenerator::new(&input)
+            .generate()
+            .expect("generation ok");
+
+        let dir = std::env::temp_dir().join(format!("csilgen-rust-codec-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let src = dir.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        for file in &files {
+            std::fs::write(src.join(&file.path), &file.content).unwrap();
+        }
+        // The corndogs spec uses no timestamp/decimal, so the generated codec is fully
+        // self-contained and the crate needs no third-party dependency.
+        std::fs::write(
+            dir.join("Cargo.toml"),
+            "[package]\nname = \"csilroundtrip\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\n[workspace]\n\n[dependencies]\n",
+        )
+        .unwrap();
+        std::fs::write(src.join("main.rs"), RUST_CODEC_DRIVER).unwrap();
+
+        let run = std::process::Command::new("cargo")
+            .arg("run")
+            .arg("--quiet")
+            .current_dir(&dir)
+            // Keep the build hermetic and out of the parent's target dir: the
+            // generated crate has no deps, so an isolated offline build suffices.
+            .env("CARGO_TARGET_DIR", dir.join("target"))
+            .env("CARGO_NET_OFFLINE", "true")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&run.stdout);
+        let stderr = String::from_utf8_lossy(&run.stderr);
+        assert!(
+            run.status.success(),
+            "cargo run failed:\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        assert_eq!(
+            stdout.trim(),
+            "ok",
+            "unexpected output:\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Without the `emit_packages` trigger the output is exactly as before: the
+    /// module root is `mod.rs` and no `Cargo.toml`/`lib.rs` (and no `src/` prefix)
+    /// appears. With `["rust"]` present, the directory becomes a crate: a
+    /// `Cargo.toml` plus a `src/lib.rs` entry, every `.rs` file relocated under
+    /// `src/`. A token list that omits `rust` leaves the default output intact.
+    #[test]
+    fn package_mode_emitted_iff_emit_packages_includes_rust() {
+        // Default: no package files, flat layout, `mod.rs` root.
+        let files = RustCodeGenerator::new(&corndogs_client_input())
+            .generate()
+            .expect("generation ok");
+        assert!(!files.iter().any(|f| f.path == "Cargo.toml"));
+        assert!(!files.iter().any(|f| f.path == "src/lib.rs"));
+        assert!(files.iter().any(|f| f.path == "mod.rs"));
+        assert!(files.iter().any(|f| f.path == "types.rs"));
+
+        // A token list that does not name rust must not trigger package mode.
+        let mut other = corndogs_client_input();
+        other.config.options.insert(
+            "emit_packages".to_string(),
+            serde_json::json!(["go", "python"]),
+        );
+        let files = RustCodeGenerator::new(&other)
+            .generate()
+            .expect("generation ok");
+        assert!(!files.iter().any(|f| f.path == "Cargo.toml"));
+        assert!(files.iter().any(|f| f.path == "mod.rs"));
+
+        // `["rust"]` turns the directory into a crate.
+        let mut pkg = corndogs_client_input();
+        pkg.config
+            .options
+            .insert("emit_packages".to_string(), serde_json::json!(["rust"]));
+        let files = RustCodeGenerator::new(&pkg)
+            .generate()
+            .expect("generation ok");
+        let cargo = files
+            .iter()
+            .find(|f| f.path == "Cargo.toml")
+            .expect("Cargo.toml emitted");
+        assert!(cargo.content.contains("[package]"));
+        assert!(cargo.content.contains("edition = \"2021\""));
+        // Default version, and a name derived from the service base.
+        assert!(cargo.content.contains("version = \"0.1.0\""));
+        assert!(cargo.content.contains("name = \"corndogs\""));
+        assert!(files.iter().any(|f| f.path == "src/lib.rs"));
+        assert!(files.iter().any(|f| f.path == "src/types.rs"));
+        assert!(files.iter().any(|f| f.path == "src/codec.gen.rs"));
+        assert!(files.iter().any(|f| f.path == "src/client.rs"));
+        // The flat (non-package) paths and `mod.rs` must be gone.
+        assert!(!files.iter().any(|f| f.path == "mod.rs"));
+        assert!(!files.iter().any(|f| f.path == "types.rs"));
+        // The crate root still declares the relocated modules so it compiles.
+        let lib = files.iter().find(|f| f.path == "src/lib.rs").unwrap();
+        assert!(lib.content.contains("pub mod types;"));
+        assert!(lib.content.contains("#[path = \"codec.gen.rs\"]"));
+    }
+
+    /// The dep-free corndogs spec must yield no `[dependencies]`, and the explicit
+    /// `package_name`/`package_version` options must override the derived defaults.
+    #[test]
+    fn package_mode_coordinates_and_dep_free_cargo() {
+        let mut input = corndogs_client_input();
+        input
+            .config
+            .options
+            .insert("emit_packages".to_string(), serde_json::json!(["rust"]));
+        input.config.options.insert(
+            "package_name".to_string(),
+            serde_json::Value::String("acme_client".to_string()),
+        );
+        input.config.options.insert(
+            "package_version".to_string(),
+            serde_json::Value::String("2.3.4".to_string()),
+        );
+        let files = RustCodeGenerator::new(&input)
+            .generate()
+            .expect("generation ok");
+        let cargo = files.iter().find(|f| f.path == "Cargo.toml").unwrap();
+        assert!(cargo.content.contains("name = \"acme_client\""));
+        assert!(cargo.content.contains("version = \"2.3.4\""));
+        // The self-contained codec means a dep-free crate.
+        assert!(!cargo.content.contains("[dependencies]"));
+    }
+
+    /// Generate a `rust-client` package into a temp dir and prove it is a real,
+    /// buildable crate with a hermetic offline `cargo build`. The corndogs spec is
+    /// dependency-free, so the build needs nothing from the network. Skips cleanly
+    /// when no cargo toolchain is on PATH.
+    #[test]
+    fn package_mode_crate_builds_offline() {
+        let probe = std::process::Command::new("cargo")
+            .arg("--version")
+            .output();
+        if probe.map(|o| !o.status.success()).unwrap_or(true) {
+            eprintln!("skipping: no cargo toolchain on PATH");
+            return;
+        }
+
+        let mut input = corndogs_client_input();
+        input
+            .config
+            .options
+            .insert("emit_packages".to_string(), serde_json::json!(["rust"]));
+        let files = RustCodeGenerator::new(&input)
+            .generate()
+            .expect("generation ok");
+
+        let dir = std::env::temp_dir().join(format!("csilgen-rust-pkg-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        for file in &files {
+            let path = dir.join(&file.path);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            std::fs::write(&path, &file.content).unwrap();
+        }
+
+        let build = std::process::Command::new("cargo")
+            .arg("build")
+            .arg("--quiet")
+            .current_dir(&dir)
+            // Hermetic, offline, and out of the parent's target dir: the generated
+            // crate is dep-free so an isolated offline build must succeed on its own.
+            .env("CARGO_TARGET_DIR", dir.join("target"))
+            .env("CARGO_NET_OFFLINE", "true")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&build.stdout);
+        let stderr = String::from_utf8_lossy(&build.stderr);
+        assert!(
+            build.status.success(),
+            "cargo build of generated package failed:\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Driver `main` for the round-trip crate: it round-trips a corndogs request
+    /// through the generated codec directly and through the typed client over a
+    /// loopback transport, asserting the uuid/payload/absent-optional/map/list all
+    /// survive, then prints `ok`.
+    const RUST_CODEC_DRIVER: &str = r#"use std::collections::HashMap;
+
+use csilroundtrip::*;
+
+// A "server" on the far side of the dumb byte seam: it decodes the typed request,
+// then encodes its task as the typed response, exercising decode and encode across
+// the transport boundary.
+struct Loopback;
+
+impl Transport for Loopback {
+    fn call(&self, service: &str, op: &str, req: &[u8]) -> Result<Vec<u8>, ClientError> {
+        if service != "corndogs" || op != "SubmitTask" {
+            return Err(ClientError::Transport(format!("unexpected route {service}/{op}")));
+        }
+        let in_req = decode_submit_task_request(req)
+            .map_err(|e| ClientError::Transport(e.to_string()))?;
+        Ok(encode_task(&in_req.task))
+    }
+}
+
+fn check(cond: bool, msg: &str) {
+    if !cond {
+        eprintln!("FAIL: {msg}");
+        std::process::exit(1);
+    }
+}
+
+fn sample_task() -> Task {
+    let mut labels = HashMap::new();
+    labels.insert("a".to_string(), 1);
+    labels.insert("b".to_string(), 2);
+    // Named map aliases: a map-of-int and a map-of-record. The transparent `pub type`
+    // alias is the underlying HashMap, so it is constructed and indexed in place.
+    let mut queue_counts: StringInt64Map = HashMap::new();
+    queue_counts.insert("q1".to_string(), 3);
+    queue_counts.insert("q2".to_string(), 1);
+    let mut state_counts: QueueAndStateCountsMap = HashMap::new();
+    state_counts.insert("q1".to_string(), QueueAndStateCounts { count: 5 });
+    Task {
+        uuid: "u-123".to_string(),
+        current_state: "PENDING".to_string(),
+        payload: vec![0xde, 0xad, 0xbe],
+        priority: Some(7),
+        labels,
+        tags: vec!["x".to_string(), "y".to_string()],
+        queue_counts,
+        state_counts,
+    }
+}
+
+fn main() {
+    let task = sample_task();
+    let req = SubmitTaskRequest { task: task.clone(), queue: "default".to_string() };
+
+    // Direct codec round-trip through the nested record.
+    let back = decode_submit_task_request(&encode_submit_task_request(&req)).expect("decode req");
+    check(back.task.uuid == "u-123", "uuid");
+    check(back.task.payload == vec![0xde, 0xad, 0xbe], "payload");
+    check(back.task.priority == Some(7), "priority");
+    check(back.task.labels.get("a") == Some(&1) && back.task.labels.get("b") == Some(&2), "labels");
+    check(back.task.tags == vec!["x".to_string(), "y".to_string()], "tags");
+    check(back.queue == "default", "queue");
+    // Named map aliases must round-trip their entries, not drop them (the regression).
+    check(
+        back.task.queue_counts.len() == 2
+            && back.task.queue_counts.get("q1") == Some(&3)
+            && back.task.queue_counts.get("q2") == Some(&1),
+        "queue_counts map alias",
+    );
+    check(
+        back.task.state_counts.len() == 1
+            && back.task.state_counts.get("q1").map(|c| c.count) == Some(5),
+        "state_counts map-of-record alias",
+    );
+
+    // An absent optional must round-trip to None, not a zero value.
+    let mut task2 = task.clone();
+    task2.priority = None;
+    let req2 = SubmitTaskRequest { task: task2, queue: "q".to_string() };
+    let back2 = decode_submit_task_request(&encode_submit_task_request(&req2)).expect("decode req2");
+    check(back2.task.priority.is_none(), "absent optional None");
+
+    // Typed client round-trip over the loopback carrier.
+    let client = CorndogsClient::new(Loopback);
+    let resp = client.submit_task(req).expect("client call");
+    check(resp.uuid == "u-123", "client uuid");
+    check(resp.payload == vec![0xde, 0xad, 0xbe], "client payload");
+    check(resp.priority == Some(7), "client priority");
+    check(resp.tags.len() == 2 && resp.tags[1] == "y", "client tags");
+
+    println!("ok");
+}
+"#;
 }

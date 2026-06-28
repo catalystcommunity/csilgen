@@ -14,6 +14,18 @@ fn config(target: &str) -> GeneratorConfig {
     }
 }
 
+fn config_with(target: &str, opts: &[(&str, serde_json::Value)]) -> GeneratorConfig {
+    let mut options = HashMap::new();
+    for (k, v) in opts {
+        options.insert((*k).to_string(), v.clone());
+    }
+    GeneratorConfig {
+        target: target.to_string(),
+        output_dir: "/tmp".to_string(),
+        options,
+    }
+}
+
 fn pos() -> CsilPosition {
     CsilPosition {
         line: 1,
@@ -44,6 +56,17 @@ fn record_rule(name: &str, entries: Vec<CsilGroupEntry>) -> CsilRule {
     CsilRule {
         name: name.to_string(),
         rule_type: CsilRuleType::GroupDef(CsilGroupExpression { entries }),
+        position: pos(),
+        doc_comments: Vec::new(),
+    }
+}
+
+/// A transparent type alias (`Name = <target>`), the `TypeDef` shape a named map /
+/// list / scalar alias parses to.
+fn type_rule(name: &str, target: CsilTypeExpression) -> CsilRule {
+    CsilRule {
+        name: name.to_string(),
+        rule_type: CsilRuleType::TypeDef(target),
         position: pos(),
         doc_comments: Vec::new(),
     }
@@ -131,6 +154,24 @@ fn record_emits_final_class_with_const_named_constructor() {
 }
 
 #[test]
+fn zero_field_record_emits_unnamed_const_constructor() {
+    // Dart rejects an empty named-parameter list, so a fieldless record must use a
+    // plain `const X();` constructor rather than `const X({ ... });`.
+    let rules = vec![record_rule("GetQueuesRequest", vec![])];
+    let files = generate_dart_code(&spec(rules, 0), &config("dart")).unwrap();
+    let code = types_file(&files);
+
+    assert!(
+        code.contains("const GetQueuesRequest();"),
+        "fieldless record should use an unnamed const constructor: {code}"
+    );
+    assert!(
+        !code.contains("const GetQueuesRequest({"),
+        "fieldless record must not emit an empty named-parameter list: {code}"
+    );
+}
+
+#[test]
 fn type_choice_emits_sealed_hierarchy() {
     let rules = vec![CsilRule {
         name: "Result".to_string(),
@@ -160,7 +201,7 @@ fn type_choice_emits_sealed_hierarchy() {
 }
 
 #[test]
-fn client_subtarget_emits_typed_client_with_verbatim_wire_names() {
+fn client_subtarget_emits_typed_client_with_canonical_wire_names() {
     let service = CsilServiceDefinition {
         operations: vec![CsilServiceOperation {
             name: "deposit-claim".to_string(),
@@ -173,12 +214,22 @@ fn client_subtarget_emits_typed_client_with_verbatim_wire_names() {
         }],
         wire_id: None,
     };
-    let rules = vec![CsilRule {
-        name: "AttestationService".to_string(),
-        rule_type: CsilRuleType::ServiceDef(service),
-        position: pos(),
-        doc_comments: Vec::new(),
-    }];
+    let rules = vec![
+        record_rule(
+            "DepositClaimRequest",
+            vec![entry("subject", builtin("text"), false)],
+        ),
+        record_rule(
+            "DepositClaimResponse",
+            vec![entry("ok", builtin("bool"), false)],
+        ),
+        CsilRule {
+            name: "AttestationService".to_string(),
+            rule_type: CsilRuleType::ServiceDef(service),
+            position: pos(),
+            doc_comments: Vec::new(),
+        },
+    ];
     let files = generate_dart_code(&spec(rules, 1), &config("dart-client")).unwrap();
     let code = services_file(&files);
 
@@ -186,14 +237,20 @@ fn client_subtarget_emits_typed_client_with_verbatim_wire_names() {
         code.contains("final class AttestationClient {"),
         "client class: {code}"
     );
-    // kebab-case op -> lowerCamelCase Dart method; wire op string stays verbatim.
+    // kebab-case op -> lowerCamelCase Dart method.
     assert!(
         code.contains("DepositClaimResponse depositClaim(DepositClaimRequest request)"),
         "method signature: {code}"
     );
+    // Typed seam + canonical wire strings: service is lowercased (`attestation`) and
+    // the op PascalCased (`DepositClaim`), matching the Go/Python/TS peers.
     assert!(
-        code.contains("transport.call('Attestation', 'deposit-claim', request)"),
-        "verbatim wire service+op: {code}"
+        code.contains("transport.call('attestation', 'DepositClaim', request.toCbor())"),
+        "canonical wire strings: {code}"
+    );
+    assert!(
+        code.contains("DepositClaimResponse.fromCborValue(CsilCbor.decode(csilResp))"),
+        "typed response decode: {code}"
     );
 }
 
@@ -262,8 +319,8 @@ fn channel_service_with_wire_ids_emits_both_routers_and_ordinals() {
         "compact router: {code}"
     );
     assert!(
-        code.contains("case 'chat':"),
-        "verbose dispatch by wire name: {code}"
+        code.contains("case 'Chat':"),
+        "verbose dispatch by PascalCased wire op: {code}"
     );
     assert!(
         code.contains("case 2:"),
@@ -582,4 +639,454 @@ fn min_length_one_uses_is_empty_and_min_zero_is_dropped() {
         !code.contains("bio.length < 0"),
         "vacuous min-length 0 guard dropped: {code}"
     );
+}
+
+// --- codec round-trip -------------------------------------------------------
+
+/// A corndogs-shaped spec exercising the codec: text, bytes, an optional int, a
+/// map, a list, a nested record, and a service whose output is a `Res / Error`
+/// choice.
+fn corndogs_rules() -> Vec<CsilRule> {
+    let map_ty = CsilTypeExpression::Map {
+        key: Box::new(builtin("text")),
+        value: Box::new(builtin("int")),
+        occurrence: None,
+    };
+    let list_ty = CsilTypeExpression::Array {
+        element_type: Box::new(builtin("text")),
+        occurrence: None,
+    };
+    // A named map alias of records (`RecordMap = {* text => SomeRecord}`): the
+    // regression dropped these because the bare reference fell through the codec.
+    let record_map_ty = CsilTypeExpression::Map {
+        key: Box::new(builtin("text")),
+        value: Box::new(reference("SomeRecord")),
+        occurrence: None,
+    };
+    vec![
+        record_rule(
+            "Task",
+            vec![
+                entry("uuid", builtin("text"), false),
+                entry("current_state", builtin("text"), false),
+                entry("payload", builtin("bytes"), false),
+                entry("priority", builtin("int"), true),
+                entry("labels", map_ty.clone(), false),
+                entry("tags", list_ty, false),
+            ],
+        ),
+        record_rule("SomeRecord", vec![entry("n", builtin("int"), false)]),
+        // A zero-field request record (corndogs' `GetQueuesRequest = {}`): it must
+        // emit a plain unnamed const constructor, not an empty named-parameter list
+        // (`const X({});`), or the whole library fails to compile.
+        record_rule("GetQueuesRequest", vec![]),
+        // Named map aliases: a scalar-valued one and a record-valued one. A field
+        // typed as either must round-trip its entries, not stub to null.
+        type_rule("StringInt64Map", map_ty),
+        type_rule("RecordMap", record_map_ty),
+        record_rule(
+            "SubmitTaskRequest",
+            vec![
+                entry("task", reference("Task"), false),
+                entry("queue", builtin("text"), false),
+                entry("counts", reference("StringInt64Map"), false),
+                entry("things", reference("RecordMap"), false),
+            ],
+        ),
+        record_rule(
+            "ServiceError",
+            vec![
+                entry("code", builtin("int"), false),
+                entry("message", builtin("text"), false),
+            ],
+        ),
+        CsilRule {
+            name: "CorndogsService".to_string(),
+            rule_type: CsilRuleType::ServiceDef(CsilServiceDefinition {
+                operations: vec![CsilServiceOperation {
+                    name: "submit-task".to_string(),
+                    input_type: reference("SubmitTaskRequest"),
+                    output_type: CsilTypeExpression::Choice(vec![
+                        reference("Task"),
+                        reference("ServiceError"),
+                    ]),
+                    direction: CsilServiceDirection::Unidirectional,
+                    position: pos(),
+                    doc_comments: Vec::new(),
+                    wire_id: None,
+                }],
+                wire_id: None,
+            }),
+            position: pos(),
+            doc_comments: Vec::new(),
+        },
+    ]
+}
+
+/// Compile and run the generated Dart, round-tripping a typed request/response.
+/// Skips when `dart` is not on PATH so the suite stays portable.
+#[test]
+fn codec_round_trips_through_dart() {
+    let have = std::process::Command::new("dart")
+        .arg("--version")
+        .output()
+        .is_ok();
+    if !have {
+        eprintln!("skipping: no dart on PATH");
+        return;
+    }
+    let files = generate_dart_code(&spec(corndogs_rules(), 1), &config("dart-client")).unwrap();
+
+    let dir = std::env::temp_dir().join(format!("csilgen-dart-codec-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    for f in &files {
+        std::fs::write(dir.join(&f.path), &f.content).unwrap();
+    }
+    std::fs::write(dir.join("driver.dart"), CODEC_DRIVER_DART).unwrap();
+
+    let run = std::process::Command::new("dart")
+        .arg(dir.join("driver.dart"))
+        .output()
+        .unwrap();
+    assert!(
+        run.status.success(),
+        "dart round-trip failed:\n{}{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&run.stdout).trim(), "ok");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+const CODEC_DRIVER_DART: &str = r#"import 'dart:typed_data';
+import 'models.gen.dart';
+
+class LoopbackTransport implements CsilTransport {
+  @override
+  List<int> call(String service, String op, List<int> request) {
+    // Decode the typed request, then encode its task as the typed response.
+    final req = SubmitTaskRequest.fromCbor(request);
+    return req.task.toCbor();
+  }
+}
+
+void _check(bool ok, String what) {
+  if (!ok) throw StateError('check failed: $what');
+}
+
+bool _bytesEq(List<int> a, List<int> b) {
+  if (a.length != b.length) return false;
+  for (var i = 0; i < a.length; i++) {
+    if (a[i] != b[i]) return false;
+  }
+  return true;
+}
+
+void main() {
+  final payload = Uint8List.fromList([0xde, 0xad, 0xbe]);
+  final task = Task(
+    uuid: 'u-123',
+    currentState: 'PENDING',
+    payload: payload,
+    priority: 7,
+    labels: {'a': 1, 'b': 2},
+    tags: ['x', 'y'],
+  );
+  final req = SubmitTaskRequest(
+    task: task,
+    queue: 'default',
+    counts: {'one': 1, 'two': 2},
+    things: {'r1': SomeRecord(n: 11), 'r2': SomeRecord(n: 22)},
+  );
+
+  // direct codec round-trip through the nested record
+  final back = SubmitTaskRequest.fromCbor(req.toCbor());
+  _check(back.task.uuid == 'u-123', 'uuid');
+  _check(back.task.currentState == 'PENDING', 'current_state');
+  _check(_bytesEq(back.task.payload, payload), 'payload');
+  _check(back.task.priority == 7, 'priority');
+  _check(back.task.labels['a'] == 1 && back.task.labels['b'] == 2, 'labels');
+  _check(back.task.tags.length == 2 && back.task.tags[1] == 'y', 'tags');
+  _check(back.queue == 'default', 'queue');
+
+  // a named map alias of scalars must survive, not stub to null/empty
+  _check(back.counts.length == 2, 'counts length');
+  _check(back.counts['one'] == 1 && back.counts['two'] == 2, 'counts entries');
+
+  // a named map alias of records must survive with reconstructed records
+  _check(back.things.length == 2, 'things length');
+  _check(back.things['r1']!.n == 11 && back.things['r2']!.n == 22, 'things entries');
+
+  // an absent optional must round-trip to null
+  final task2 = Task(
+    uuid: 'u',
+    currentState: 'S',
+    payload: Uint8List(0),
+    labels: const {},
+    tags: const [],
+  );
+  final back2 = SubmitTaskRequest.fromCbor(
+    SubmitTaskRequest(task: task2, queue: 'q', counts: const {}, things: const {}).toCbor(),
+  );
+  _check(back2.task.priority == null, 'absent optional');
+
+  // a zero-field record constructs, encodes, and round-trips through CBOR
+  const empty = GetQueuesRequest();
+  final emptyBack = GetQueuesRequest.fromCbor(empty.toCbor());
+  _check(emptyBack == empty, 'empty record round-trip');
+
+  // typed client over the loopback carrier
+  final client = CorndogsClient(LoopbackTransport());
+  final resp = client.submitTask(req);
+  _check(resp.uuid == 'u-123', 'resp uuid');
+  _check(_bytesEq(resp.payload, payload), 'resp payload');
+  _check(resp.priority == 7, 'resp priority');
+
+  print('ok');
+}
+"#;
+
+#[test]
+fn wire_service_is_lowercased_and_op_pascalcased() {
+    // `CorndogsService` -> wire service "corndogs" (strip Service + lowercase);
+    // `submit-task` -> wire op "SubmitTask" (the wire contract), so a Dart client
+    // hits the same route as the Go/Python/TS peers.
+    let service = CsilServiceDefinition {
+        operations: vec![CsilServiceOperation {
+            name: "submit-task".to_string(),
+            input_type: reference("SubmitTaskRequest"),
+            output_type: reference("Task"),
+            direction: CsilServiceDirection::Unidirectional,
+            position: pos(),
+            doc_comments: Vec::new(),
+            wire_id: None,
+        }],
+        wire_id: None,
+    };
+    let rules = vec![
+        record_rule(
+            "SubmitTaskRequest",
+            vec![entry("queue", builtin("text"), false)],
+        ),
+        record_rule("Task", vec![entry("uuid", builtin("text"), false)]),
+        CsilRule {
+            name: "CorndogsService".to_string(),
+            rule_type: CsilRuleType::ServiceDef(service),
+            position: pos(),
+            doc_comments: Vec::new(),
+        },
+    ];
+    let files = generate_dart_code(&spec(rules, 1), &config("dart-client")).unwrap();
+    let code = services_file(&files);
+    assert!(
+        code.contains("transport.call('corndogs', 'SubmitTask',"),
+        "wire service lowercased + op PascalCased: {code}"
+    );
+    assert!(
+        !code.contains("'Corndogs'"),
+        "service must be lowercased: {code}"
+    );
+    assert!(
+        !code.contains("'submit-task'"),
+        "op must be PascalCased: {code}"
+    );
+}
+
+// --- publishable pub package mode ------------------------------------------
+
+#[test]
+fn pubspec_emitted_iff_emit_packages_includes_dart() {
+    let rules = || {
+        vec![record_rule(
+            "User",
+            vec![entry("name", builtin("text"), false)],
+        )]
+    };
+
+    // No emit_packages: default flat layout, no pubspec.
+    let plain = generate_dart_code(&spec(rules(), 0), &config("dart")).unwrap();
+    assert!(
+        !plain.iter().any(|f| f.path == "pubspec.yaml"),
+        "no pubspec without emit_packages"
+    );
+    assert!(
+        plain.iter().any(|f| f.path == "types.gen.dart"),
+        "flat layout keeps types at root"
+    );
+
+    // emit_packages present but without "dart": still no package files.
+    let other = generate_dart_code(
+        &spec(rules(), 0),
+        &config_with(
+            "dart",
+            &[("emit_packages", serde_json::json!(["go", "python"]))],
+        ),
+    )
+    .unwrap();
+    assert!(
+        !other.iter().any(|f| f.path == "pubspec.yaml"),
+        "emit_packages without 'dart' must not emit a pubspec"
+    );
+    assert!(
+        other.iter().any(|f| f.path == "types.gen.dart"),
+        "unchanged when 'dart' is absent"
+    );
+
+    // emit_packages includes "dart": pubspec + lib/ layout + lib/<name>.dart barrel.
+    let pkg = generate_dart_code(
+        &spec(rules(), 0),
+        &config_with(
+            "dart",
+            &[
+                ("emit_packages", serde_json::json!(["dart", "go"])),
+                ("package_name", serde_json::json!("my_models")),
+                ("package_version", serde_json::json!("2.3.4")),
+            ],
+        ),
+    )
+    .unwrap();
+    let pubspec = pkg
+        .iter()
+        .find(|f| f.path == "pubspec.yaml")
+        .expect("pubspec.yaml emitted in package mode");
+    assert!(
+        pubspec.content.contains("name: my_models"),
+        "pubspec name: {}",
+        pubspec.content
+    );
+    assert!(
+        pubspec.content.contains("version: 2.3.4"),
+        "pubspec version: {}",
+        pubspec.content
+    );
+    assert!(
+        pubspec.content.contains("sdk: '>=3.0.0 <4.0.0'"),
+        "pubspec sdk constraint: {}",
+        pubspec.content
+    );
+    assert!(
+        !pubspec.content.contains("dependencies:"),
+        "no dependency block — generated code uses only dart: libs: {}",
+        pubspec.content
+    );
+    assert!(
+        pkg.iter().any(|f| f.path == "lib/types.gen.dart"),
+        "generated dart moves under lib/: {:?}",
+        pkg.iter().map(|f| &f.path).collect::<Vec<_>>()
+    );
+    assert!(
+        pkg.iter().any(|f| f.path == "lib/my_models.dart"),
+        "barrel is the lib/<name>.dart entrypoint: {:?}",
+        pkg.iter().map(|f| &f.path).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn package_name_is_normalized_to_a_valid_pub_name() {
+    // A PascalCase package_name is normalized to lowercase_with_underscores so the
+    // emitted pubspec always names a publishable package.
+    let pkg = generate_dart_code(
+        &spec(
+            vec![record_rule(
+                "User",
+                vec![entry("name", builtin("text"), false)],
+            )],
+            0,
+        ),
+        &config_with(
+            "dart",
+            &[
+                ("emit_packages", serde_json::json!(["dart"])),
+                ("package_name", serde_json::json!("MyCoolPackage")),
+            ],
+        ),
+    )
+    .unwrap();
+    let pubspec = pkg.iter().find(|f| f.path == "pubspec.yaml").unwrap();
+    assert!(
+        pubspec.content.contains("name: my_cool_package"),
+        "normalized pub name: {}",
+        pubspec.content
+    );
+    assert!(
+        pkg.iter().any(|f| f.path == "lib/my_cool_package.dart"),
+        "barrel matches the normalized name"
+    );
+}
+
+/// Generate a `dart-client` package into a temp dir and prove it's a real,
+/// analyzable pub package: resolve deps offline, then `dart analyze`. Skips when
+/// `dart` is absent; if offline resolution can't run (bare environment with no
+/// cache), falls back to analyzing the `lib/` sources directly + validating the
+/// pubspec, and notes it.
+#[test]
+fn generated_dart_package_passes_pub_get_and_analyze() {
+    let have = std::process::Command::new("dart")
+        .arg("--version")
+        .output()
+        .is_ok();
+    if !have {
+        eprintln!("skipping: no dart on PATH");
+        return;
+    }
+
+    let files = generate_dart_code(
+        &spec(corndogs_rules(), 1),
+        &config_with(
+            "dart-client",
+            &[
+                ("emit_packages", serde_json::json!(["dart"])),
+                ("package_name", serde_json::json!("csil_sample")),
+            ],
+        ),
+    )
+    .unwrap();
+
+    let dir = std::env::temp_dir().join(format!("csilgen-dart-pkg-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    for f in &files {
+        let path = dir.join(&f.path);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, &f.content).unwrap();
+    }
+
+    let get = std::process::Command::new("dart")
+        .args(["pub", "get", "--offline"])
+        .current_dir(&dir)
+        .output()
+        .unwrap();
+
+    // A resolved package analyzes as a whole; an unresolved one (no package cache)
+    // still has analyzable lib/ sources because the generated code uses only relative
+    // and `dart:` imports — no `package:` self-import that needs the package config.
+    let analyze_target = if get.status.success() {
+        dir.clone()
+    } else {
+        eprintln!(
+            "note: `dart pub get --offline` did not resolve; analyzing lib/ directly.\n{}",
+            String::from_utf8_lossy(&get.stderr)
+        );
+        let pubspec = files.iter().find(|f| f.path == "pubspec.yaml").unwrap();
+        assert!(
+            pubspec.content.contains("name: csil_sample")
+                && pubspec.content.contains("sdk: '>=3.0.0 <4.0.0'"),
+            "pubspec is still well-formed: {}",
+            pubspec.content
+        );
+        dir.join("lib")
+    };
+
+    let analyze = std::process::Command::new("dart")
+        .arg("analyze")
+        .arg(&analyze_target)
+        .output()
+        .unwrap();
+    assert!(
+        analyze.status.success(),
+        "dart analyze failed:\n{}{}",
+        String::from_utf8_lossy(&analyze.stdout),
+        String::from_utf8_lossy(&analyze.stderr)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }

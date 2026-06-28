@@ -150,6 +150,15 @@ fn generate_ocaml(
         });
     }
 
+    // Per-type CBOR (de)serializers make the generated records usable over the wire
+    // without a hand-written codec; the typed client below calls them.
+    if let Some(codec) = generate_codec(spec) {
+        files.push(GeneratedFile {
+            path: "codec.ml".to_string(),
+            content: codec,
+        });
+    }
+
     let has_services = spec
         .rules
         .iter()
@@ -172,7 +181,158 @@ fn generate_ocaml(
         _ => {}
     }
 
+    // Package mode is orthogonal to the surface: it relocates whatever the surface
+    // produced into a `lib/` directory and adds the dune/opam scaffolding so the
+    // output directory is itself a buildable, publishable package. The default
+    // (flat) output is left byte-identical when the option is absent.
+    if package_requested(config) {
+        let pkg = package_name(spec, config);
+        let version = package_version(config);
+        return Ok(wrap_as_package(files, &pkg, &version));
+    }
+
     Ok(files)
+}
+
+// ---------------------------------------------------------------------------
+// Self-contained package mode
+// ---------------------------------------------------------------------------
+
+/// Whether `config.options["emit_packages"]` requests an OCaml package. The option
+/// is a JSON array shared across generators, so it is parsed defensively: a missing
+/// key, a non-array value, or non-string elements all mean "not requested" rather
+/// than an error, and a list that names other languages but not `"ocaml"` leaves
+/// the OCaml output untouched.
+fn package_requested(config: &GeneratorConfig) -> bool {
+    config
+        .options
+        .get("emit_packages")
+        .and_then(|v| v.as_array())
+        .is_some_and(|arr| arr.iter().filter_map(|e| e.as_str()).any(|s| s == "ocaml"))
+}
+
+/// The opam/dune package and library name. Taken from `package_name` when the
+/// option is a non-empty string, else derived from the first service's name, else
+/// the `"csilgen_client"` default. Always sanitized to a valid OCaml library name
+/// because dune rejects a `name`/`public_name` that is not a lowercase,
+/// underscore-joined identifier beginning with a letter.
+fn package_name(spec: &CsilSpecSerialized, config: &GeneratorConfig) -> String {
+    let configured = config
+        .options
+        .get("package_name")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let base = match configured {
+        Some(name) => name.to_string(),
+        None => derive_package_name(spec),
+    };
+    sanitize_lib_name(&base)
+}
+
+/// A package name derived from the spec when none is configured: the first declared
+/// service's name (so a single-service spec yields a recognizable package), falling
+/// back to the conventional default for a service-less spec.
+fn derive_package_name(spec: &CsilSpecSerialized) -> String {
+    spec.rules
+        .iter()
+        .find_map(|r| match &r.rule_type {
+            CsilRuleType::ServiceDef(_) => Some(r.name.clone()),
+            _ => None,
+        })
+        .unwrap_or_else(|| "csilgen_client".to_string())
+}
+
+/// Coerce an arbitrary name into a valid OCaml library / opam package name:
+/// snake_case (lowercase, underscore-joined), stripped of any non-alphanumeric
+/// character, and forced to begin with a letter (a leading digit or empty result is
+/// prefixed) so dune accepts it as both a `public_name` and an `.opam` basename.
+fn sanitize_lib_name(name: &str) -> String {
+    let snake = name.to_case(Case::Snake);
+    let cleaned: String = snake
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '_')
+        .collect();
+    let needs_prefix = cleaned
+        .chars()
+        .next()
+        .is_none_or(|c| !c.is_ascii_alphabetic());
+    if needs_prefix {
+        format!("csil_{cleaned}")
+    } else {
+        cleaned
+    }
+}
+
+/// The package version: the `package_version` option when a non-empty string, else
+/// the conventional initial `0.1.0`.
+fn package_version(config: &GeneratorConfig) -> String {
+    config
+        .options
+        .get("package_version")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("0.1.0")
+        .to_string()
+}
+
+/// Relocate the generated modules into `lib/` and prepend the dune/opam scaffolding
+/// that turns the output directory into a standalone package. The generated codec
+/// is self-contained, so the emitted library declares no third-party dependencies.
+fn wrap_as_package(files: Vec<GeneratedFile>, pkg: &str, version: &str) -> Vec<GeneratedFile> {
+    let mut out = Vec::with_capacity(files.len() + 3);
+    out.push(GeneratedFile {
+        path: "dune-project".to_string(),
+        content: dune_project_file(pkg),
+    });
+    out.push(GeneratedFile {
+        path: format!("{pkg}.opam"),
+        content: opam_file(pkg, version),
+    });
+    out.push(GeneratedFile {
+        path: "lib/dune".to_string(),
+        content: lib_dune_file(pkg),
+    });
+    for file in files {
+        out.push(GeneratedFile {
+            path: format!("lib/{}", file.path),
+            content: file.content,
+        });
+    }
+    out
+}
+
+fn dune_project_file(pkg: &str) -> String {
+    // The `.opam` file is emitted directly (not generated by dune), so the project
+    // only declares the lang and name; the package surface comes from the opam file.
+    format!("(lang dune 3.0)\n(name {pkg})\n")
+}
+
+/// A minimal but valid opam 2.0 package file. Its basename is the package name, which
+/// is the package dune resolves the library's `public_name` against; the consumer
+/// edits the placeholder metadata before publishing.
+fn opam_file(pkg: &str, version: &str) -> String {
+    format!(
+        "opam-version: \"2.0\"\n\
+         version: \"{version}\"\n\
+         synopsis: \"Generated CSIL bindings ({pkg})\"\n\
+         description: \"OCaml types and CBOR codec generated by csilgen.\"\n\
+         maintainer: \"csilgen\"\n\
+         authors: \"csilgen\"\n\
+         license: \"Apache-2.0\"\n\
+         homepage: \"https://github.com/catalystcommunity/csilgen\"\n\
+         bug-reports: \"https://github.com/catalystcommunity/csilgen/issues\"\n\
+         depends: [\n  \"ocaml\"\n  \"dune\" {{>= \"3.0\"}}\n]\n\
+         build: [\n  [\"dune\" \"build\" \"-p\" name \"-j\" jobs]\n]\n"
+    )
+}
+
+/// The library `dune` stanza. The generated modules are the only sources in `lib/`,
+/// so dune's default module discovery covers them; the `public_name` makes the
+/// library installable under the package name.
+fn lib_dune_file(pkg: &str) -> String {
+    format!("(library\n (name {pkg})\n (public_name {pkg}))\n")
 }
 
 // ---------------------------------------------------------------------------
@@ -306,8 +466,9 @@ fn capitalize(s: &str) -> String {
     }
 }
 
-/// Strip a trailing `Service`/`-service` suffix from a service name for the wire
-/// service string, matching the other generators' convention.
+/// The wire `service` string: strip a trailing `Service` suffix and **lowercase**,
+/// per `docs/cbor-wire-contract.md` (`CorndogsService` → `"corndogs"`), so an OCaml
+/// client reaches the same endpoint as the Go/Python/Rust peers.
 fn wire_service_name(name: &str) -> String {
     let pascal = name.to_case(Case::Pascal);
     pascal
@@ -315,6 +476,22 @@ fn wire_service_name(name: &str) -> String {
         .filter(|s| !s.is_empty())
         .map(str::to_string)
         .unwrap_or(pascal)
+        .to_lowercase()
+}
+
+/// The wire `op` string: the operation name PascalCased with the simple rule
+/// (capitalize after `_`/`-`, leave the rest), matching the other generators
+/// (`submit-task` → `"SubmitTask"`).
+fn wire_op_name(name: &str) -> String {
+    let mut out = String::new();
+    for word in name.split(['_', '-']) {
+        let mut chars = word.chars();
+        if let Some(first) = chars.next() {
+            out.extend(first.to_uppercase());
+            out.push_str(chars.as_str());
+        }
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -681,6 +858,339 @@ fn type_uses_builtin(type_expr: &CsilTypeExpression, builtin: &str) -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// Codec (codec.ml)
+// ---------------------------------------------------------------------------
+
+/// The CBOR encoding of a text key (major type 3 head + bytes); comparing these
+/// byte vectors lexicographically is RFC 8949 §4.2.1 key ordering, computed once at
+/// generation time so the emitted map is canonical without a runtime sort.
+fn cbor_text_key_bytes(name: &str) -> Vec<u8> {
+    let bytes = name.as_bytes();
+    let n = bytes.len() as u64;
+    let mt = 3u8 << 5;
+    let mut head = Vec::new();
+    if n < 24 {
+        head.push(mt | n as u8);
+    } else if n < 0x100 {
+        head.push(mt | 24);
+        head.push(n as u8);
+    } else {
+        head.push(mt | 25);
+        head.extend_from_slice(&(n as u16).to_be_bytes());
+    }
+    head.extend_from_slice(bytes);
+    head
+}
+
+/// One codec field: its OCaml record label, the verbatim CBOR wire key, its value
+/// type, and whether it is optional.
+struct CodecField<'a> {
+    label: String,
+    wire: String,
+    key_bytes: Vec<u8>,
+    value_type: &'a CsilTypeExpression,
+    optional: bool,
+}
+
+/// The verbatim wire key for an entry (the raw bare/text-literal name), or `None`
+/// for a keyless/typed-key entry — kept in lockstep with `entry_field_name`.
+fn entry_wire_key(entry: &CsilGroupEntry) -> Option<String> {
+    match &entry.key {
+        Some(CsilGroupKey::Bare(name)) => Some(name.clone()),
+        Some(CsilGroupKey::Literal(CsilLiteralValue::Text(name))) => Some(name.clone()),
+        Some(_) => None,
+        None => match &entry.value_type {
+            CsilTypeExpression::Reference(name) | CsilTypeExpression::Builtin(name) => {
+                Some(name.clone())
+            }
+            _ => None,
+        },
+    }
+}
+
+fn codec_fields(group: &CsilGroupExpression) -> Vec<CodecField<'_>> {
+    let mut fields: Vec<CodecField> = group
+        .entries
+        .iter()
+        .filter_map(|entry| {
+            let label = entry_field_name(entry)?;
+            let wire = entry_wire_key(entry)?;
+            Some(CodecField {
+                key_bytes: cbor_text_key_bytes(&wire),
+                label,
+                wire,
+                value_type: &entry.value_type,
+                optional: matches!(entry.occurrence, Some(CsilOccurrence::Optional)),
+            })
+        })
+        .collect();
+    fields.sort_by(|a, b| a.key_bytes.cmp(&b.key_bytes));
+    fields
+}
+
+/// The record rules that get a generated codec, keyed by OCaml type name. Only
+/// records (a CBOR map) are covered; a field referencing a non-record type emits a
+/// `failwith` placeholder so the codec still type-checks.
+fn codec_record_names(spec: &CsilSpecSerialized) -> std::collections::HashSet<String> {
+    spec.rules
+        .iter()
+        .filter_map(|r| match &r.rule_type {
+            CsilRuleType::GroupDef(_) => Some(ocaml_type_name(&r.name)),
+            CsilRuleType::TypeDef(CsilTypeExpression::Group(_)) => Some(ocaml_type_name(&r.name)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The transparent type aliases the codec resolves through, keyed by OCaml type
+/// name: a `TypeDef` whose target is a map / array / scalar / reference / tuple
+/// (NOT a record group or a choice, which have their own handling). A field
+/// referencing one has no codec of its own, so it must encode/decode as the
+/// underlying type rather than the `failwith` stub a bare non-record reference
+/// yields — otherwise a `StringInt64Map = {* text => int}` field silently drops its
+/// data. The named alias is a transparent abbreviation (`type string_int64_map =
+/// (string * int64) list`), so the underlying map/array/scalar encoder operates on
+/// the very same value the field already holds.
+fn codec_aliases(
+    spec: &CsilSpecSerialized,
+) -> std::collections::HashMap<String, CsilTypeExpression> {
+    spec.rules
+        .iter()
+        .filter_map(|r| match &r.rule_type {
+            CsilRuleType::TypeDef(t) => match t {
+                CsilTypeExpression::Group(_) | CsilTypeExpression::Choice(_) => None,
+                other => Some((ocaml_type_name(&r.name), other.clone())),
+            },
+            _ => None,
+        })
+        .collect()
+}
+
+/// An OCaml expression encoding `expr` (a value of OCaml type for `ty`) to a
+/// `Cbor.t`. Unsupported shapes raise at runtime via `failwith` (and never on the
+/// corndogs/round-trip path), keeping the generated module well-typed.
+fn enc_value(
+    ty: &CsilTypeExpression,
+    expr: &str,
+    records: &std::collections::HashSet<String>,
+    aliases: &std::collections::HashMap<String, CsilTypeExpression>,
+) -> String {
+    match ty {
+        CsilTypeExpression::Constrained { base_type, .. } => {
+            enc_value(base_type, expr, records, aliases)
+        }
+        CsilTypeExpression::Builtin(name) => match name.as_str() {
+            "int" | "uint" => format!("(Cbor.int64 {expr})"),
+            "float" => format!("(Cbor.Float {expr})"),
+            "text" | "tstr" => format!("(Cbor.Text {expr})"),
+            "bytes" | "bstr" => format!("(Cbor.Bytes {expr})"),
+            "bool" => format!("(Cbor.Bool {expr})"),
+            "timestamp" => format!("(Cbor.Tag (0, Cbor.Text {expr}))"),
+            "nil" | "null" => format!("(ignore {expr}; Cbor.Null)"),
+            other => format!("(failwith \"csilgen: no codec for builtin {other}\")"),
+        },
+        CsilTypeExpression::Reference(name) => {
+            let tn = ocaml_type_name(name);
+            if records.contains(&tn) {
+                format!("(encode_{tn} {expr})")
+            } else if let Some(underlying) = aliases.get(&tn) {
+                // A transparent alias has no codec of its own; encode it as its
+                // underlying type. The named OCaml abbreviation is structurally the
+                // underlying type, so the field's value flows through unchanged.
+                enc_value(underlying, expr, records, aliases)
+            } else {
+                format!("(failwith \"csilgen: no codec for type {tn}\")")
+            }
+        }
+        CsilTypeExpression::Array { element_type, .. } => {
+            let inner = enc_value(element_type, "csil_e", records, aliases);
+            format!("(Cbor.Array (List.map (fun csil_e -> {inner}) {expr}))")
+        }
+        CsilTypeExpression::Map { key, value, .. } => {
+            let ek = enc_value(key, "csil_k", records, aliases);
+            let ev = enc_value(value, "csil_v", records, aliases);
+            format!("(Cbor.Map (List.map (fun (csil_k, csil_v) -> ({ek}, {ev})) {expr}))")
+        }
+        _ => "(failwith \"csilgen: no codec for this field shape\")".to_string(),
+    }
+}
+
+/// An OCaml expression decoding `expr` (a `Cbor.t`) into a value of the OCaml type
+/// for `ty`.
+fn dec_value(
+    ty: &CsilTypeExpression,
+    expr: &str,
+    records: &std::collections::HashSet<String>,
+    aliases: &std::collections::HashMap<String, CsilTypeExpression>,
+) -> String {
+    match ty {
+        CsilTypeExpression::Constrained { base_type, .. } => {
+            dec_value(base_type, expr, records, aliases)
+        }
+        CsilTypeExpression::Builtin(name) => match name.as_str() {
+            "int" | "uint" => format!("(Cbor.to_i64 {expr})"),
+            "float" => format!("(Cbor.to_float {expr})"),
+            "text" | "tstr" => format!("(Cbor.to_text {expr})"),
+            "bytes" | "bstr" => format!("(Cbor.to_bytes {expr})"),
+            "bool" => format!("(Cbor.to_bool {expr})"),
+            "timestamp" => format!(
+                "(match {expr} with Cbor.Tag (0, Cbor.Text csil_s) -> csil_s | _ -> failwith \"csilgen: bad timestamp\")"
+            ),
+            "nil" | "null" => format!("(ignore {expr}; ())"),
+            other => format!("(failwith \"csilgen: no codec for builtin {other}\")"),
+        },
+        CsilTypeExpression::Reference(name) => {
+            let tn = ocaml_type_name(name);
+            if records.contains(&tn) {
+                format!("(decode_{tn} {expr})")
+            } else if let Some(underlying) = aliases.get(&tn) {
+                // A transparent alias decodes as its underlying type; the value the
+                // map/array/scalar decoder returns is the named abbreviation's value.
+                dec_value(underlying, expr, records, aliases)
+            } else {
+                format!("(failwith \"csilgen: no codec for type {tn}\")")
+            }
+        }
+        CsilTypeExpression::Array { element_type, .. } => {
+            let inner = dec_value(element_type, "csil_e", records, aliases);
+            format!(
+                "(match {expr} with Cbor.Array csil_xs -> List.map (fun csil_e -> {inner}) csil_xs | _ -> failwith \"csilgen: expected array\")"
+            )
+        }
+        CsilTypeExpression::Map { key, value, .. } => {
+            let dk = dec_value(key, "csil_k", records, aliases);
+            let dv = dec_value(value, "csil_v", records, aliases);
+            format!(
+                "(match {expr} with Cbor.Map csil_kvs -> List.map (fun (csil_k, csil_v) -> ({dk}, {dv})) csil_kvs | _ -> failwith \"csilgen: expected map\")"
+            )
+        }
+        _ => "(failwith \"csilgen: no codec for this field shape\")".to_string(),
+    }
+}
+
+/// Emit `encode_<tn>` / `decode_<tn>` clause bodies for one record (joined into the
+/// mutually-recursive `let rec … and …` groups by the caller).
+fn emit_record_codec(
+    name: &str,
+    group: &CsilGroupExpression,
+    records: &std::collections::HashSet<String>,
+    aliases: &std::collections::HashMap<String, CsilTypeExpression>,
+) -> (String, String) {
+    let tn = ocaml_type_name(name);
+    if group.entries.is_empty() {
+        // The empty group is a `unit` alias; it round-trips as an empty CBOR map.
+        let enc = format!("encode_{tn} (_v : {tn}) : Cbor.t = Cbor.Map []");
+        let dec = format!(
+            "decode_{tn} (csil_c : Cbor.t) : {tn} =\n  match csil_c with Cbor.Map _ -> () | _ -> failwith \"csilgen: expected map for {tn}\""
+        );
+        return (enc, dec);
+    }
+    let fields = codec_fields(group);
+
+    let mut enc = String::new();
+    enc.push_str(&format!("encode_{tn} (v : {tn}) : Cbor.t =\n"));
+    enc.push_str("  Cbor.Map\n    (List.filter_map\n       (fun x -> x)\n       [\n");
+    for f in &fields {
+        if f.optional {
+            let inner = enc_value(f.value_type, "csil_x", records, aliases);
+            enc.push_str(&format!(
+                "         (match v.{} with Some csil_x -> Some (Cbor.Text \"{}\", {inner}) | None -> None);\n",
+                f.label, f.wire
+            ));
+        } else {
+            let inner = enc_value(f.value_type, &format!("v.{}", f.label), records, aliases);
+            enc.push_str(&format!(
+                "         Some (Cbor.Text \"{}\", {inner});\n",
+                f.wire
+            ));
+        }
+    }
+    enc.push_str("       ])");
+
+    let mut dec = String::new();
+    dec.push_str(&format!("decode_{tn} (csil_c : Cbor.t) : {tn} =\n"));
+    dec.push_str("  match csil_c with\n  | Cbor.Map csil_kvs ->\n");
+    dec.push_str("      let csil_field k = List.assoc_opt (Cbor.Text k) csil_kvs in\n");
+    dec.push_str("      let csil_req k =\n        match csil_field k with Some v -> v | None -> failwith (\"csilgen: missing field \" ^ k)\n      in\n");
+    dec.push_str("      ignore csil_req;\n");
+    dec.push_str("      {\n");
+    for f in &fields {
+        if f.optional {
+            let inner = dec_value(f.value_type, "csil_v", records, aliases);
+            dec.push_str(&format!(
+                "        {} = (match csil_field \"{}\" with Some csil_v -> Some {inner} | None -> None);\n",
+                f.label, f.wire
+            ));
+        } else {
+            let inner = dec_value(
+                f.value_type,
+                &format!("(csil_req \"{}\")", f.wire),
+                records,
+                aliases,
+            );
+            dec.push_str(&format!("        {} = {inner};\n", f.label));
+        }
+    }
+    dec.push_str("      }\n");
+    dec.push_str(&format!(
+        "  | _ -> failwith \"csilgen: expected map for {tn}\""
+    ));
+
+    (enc, dec)
+}
+
+/// Build `codec.ml`: a self-contained canonical-CBOR module plus per-record
+/// `encode_<t>`/`decode_<t>` and the `encode_<t>_bytes`/`decode_<t>_bytes` wrappers
+/// the typed client calls. `None` when the spec declares no record types.
+fn generate_codec(spec: &CsilSpecSerialized) -> Option<String> {
+    let records = codec_record_names(spec);
+    if records.is_empty() {
+        return None;
+    }
+    let aliases = codec_aliases(spec);
+    let mut enc_clauses: Vec<String> = Vec::new();
+    let mut dec_clauses: Vec<String> = Vec::new();
+    let mut wrappers = String::new();
+    for rule in &spec.rules {
+        let group = match &rule.rule_type {
+            CsilRuleType::GroupDef(g) => Some(g),
+            CsilRuleType::TypeDef(CsilTypeExpression::Group(g)) => Some(g),
+            _ => None,
+        };
+        if let Some(group) = group {
+            let (enc, dec) = emit_record_codec(&rule.name, group, &records, &aliases);
+            enc_clauses.push(enc);
+            dec_clauses.push(dec);
+            let tn = ocaml_type_name(&rule.name);
+            wrappers.push_str(&format!(
+                "let encode_{tn}_bytes (v : {tn}) : bytes = Cbor.encode (encode_{tn} v)\n"
+            ));
+            wrappers.push_str(&format!(
+                "let decode_{tn}_bytes (b : bytes) : {tn} =\n  match Cbor.decode b with Ok c -> decode_{tn} c | Error e -> failwith e\n\n"
+            ));
+        }
+    }
+
+    let mut out = String::new();
+    out.push_str("(* Generated CBOR (de)serializers for the CSIL value types. *)\n");
+    out.push_str("(* Code generated by csilgen; DO NOT EDIT. *)\n\n");
+    // Distinct request/response records may share a label (e.g. `queue`); the uses
+    // here are type-directed-disambiguated, so silence warning 30 as `types.ml` does.
+    out.push_str("[@@@warning \"-30\"]\n\n");
+    out.push_str("open Types\n");
+    out.push_str(CODEC_RUNTIME_OCAML);
+    out.push('\n');
+    out.push_str("let rec ");
+    out.push_str(&enc_clauses.join("\n\nand "));
+    out.push_str("\n\n");
+    out.push_str("let rec ");
+    out.push_str(&dec_clauses.join("\n\nand "));
+    out.push_str("\n\n");
+    out.push_str(&wrappers);
+    Some(format!("{}\n", out.trim_end()))
+}
+
+// ---------------------------------------------------------------------------
 // Operation helpers
 // ---------------------------------------------------------------------------
 
@@ -784,6 +1294,7 @@ fn client_uses_types(spec: &CsilSpecSerialized) -> bool {
 /// codec is the consumer's — the generator never owns serialization) and returns a
 /// `result`.
 fn generate_client(spec: &CsilSpecSerialized) -> String {
+    let records = codec_record_names(spec);
     let mut out = String::new();
     out.push_str("(* Code generated by csilgen; DO NOT EDIT. *)\n\n");
     // `open Types` only when a typed call actually names a generated type — an
@@ -795,7 +1306,7 @@ fn generate_client(spec: &CsilSpecSerialized) -> String {
 
     for rule in &spec.rules {
         if let CsilRuleType::ServiceDef(service) = &rule.rule_type {
-            out.push_str(&emit_client_module(&rule.name, service));
+            out.push_str(&emit_client_module(&rule.name, service, &records));
         }
     }
     // A single trailing newline (the formatter's end-of-file convention).
@@ -805,7 +1316,8 @@ fn generate_client(spec: &CsilSpecSerialized) -> String {
 const CLIENT_PRELUDE: &str = "\
 (* The transport seam is supplied by the consumer: [call] performs the RPC named
    by (service, op) over its carrier and returns the raw reply payload, or an
-   error string. The generator owns neither the wire nor the codec. *)
+   error string. The generated client owns serialization (it encodes the typed
+   request and decodes the typed reply via [Codec]); the carrier only moves bytes. *)
 type client = {
   call : service:string -> op:string -> payload:bytes -> (bytes, string) result;
 }
@@ -814,7 +1326,27 @@ let make_client ~call = { call }
 
 ";
 
-fn emit_client_module(name: &str, service: &CsilServiceDefinition) -> String {
+/// The `Codec.<fn>_<type>_bytes` base name for an operation input/output type, when
+/// it is a reference to a record the codec covers. `None` for a non-record type, for
+/// which the client falls back to the consumer-supplied codec closures.
+fn op_codec_type(
+    type_expr: &CsilTypeExpression,
+    records: &std::collections::HashSet<String>,
+) -> Option<String> {
+    if let CsilTypeExpression::Reference(name) = type_expr {
+        let tn = ocaml_type_name(name);
+        if records.contains(&tn) {
+            return Some(tn);
+        }
+    }
+    None
+}
+
+fn emit_client_module(
+    name: &str,
+    service: &CsilServiceDefinition,
+    records: &std::collections::HashSet<String>,
+) -> String {
     let module = ocaml_module_name(name);
     let wire_service = wire_service_name(name);
     let mut out = String::new();
@@ -834,25 +1366,65 @@ fn emit_client_module(name: &str, service: &CsilServiceDefinition) -> String {
         let fn_name = ocaml_ident(&op.name);
         let out_type = map_type(&success_type(&op.output_type));
         let null_input = op_input_is_null(&op.input_type);
-        if null_input {
-            out.push_str(&format!(
-                "  let {fn_name} (c : client)\n      ~(decode_response : bytes -> {out_type}) :\n      ({out_type}, string) result =\n"
-            ));
-            out.push_str(&format!(
-                "    match c.call ~service:\"{wire_service}\" ~op:\"{}\" ~payload:Bytes.empty with\n",
-                op.name
-            ));
-        } else {
-            let in_type = map_type(&op.input_type);
-            out.push_str(&format!(
-                "  let {fn_name} (c : client)\n      ~(encode_request : {in_type} -> bytes)\n      ~(decode_response : bytes -> {out_type})\n      (req : {in_type}) : ({out_type}, string) result =\n"
-            ));
-            out.push_str(&format!(
-                "    match c.call ~service:\"{wire_service}\" ~op:\"{}\" ~payload:(encode_request req) with\n",
-                op.name
-            ));
+        let resp_codec = op_codec_type(&success_type(&op.output_type), records);
+        let req_codec = op_codec_type(&op.input_type, records);
+
+        // The typed seam: when both ends are records the codec covers, the generated
+        // method serializes/deserializes itself. Otherwise it keeps the explicit
+        // encode/decode closures so an exotic payload stays callable.
+        let decode_call = match &resp_codec {
+            Some(tn) => format!("Codec.decode_{tn}_bytes payload"),
+            None => "decode_response payload".to_string(),
+        };
+        match (null_input, &req_codec, &resp_codec) {
+            (true, _, _) => {
+                if resp_codec.is_some() {
+                    out.push_str(&format!(
+                        "  let {fn_name} (c : client) : ({out_type}, string) result =\n"
+                    ));
+                } else {
+                    out.push_str(&format!(
+                        "  let {fn_name} (c : client)\n      ~(decode_response : bytes -> {out_type}) :\n      ({out_type}, string) result =\n"
+                    ));
+                }
+                out.push_str(&format!(
+                    "    match c.call ~service:\"{wire_service}\" ~op:\"{}\" ~payload:Bytes.empty with\n",
+                    wire_op_name(&op.name)
+                ));
+            }
+            (false, Some(req_tn), _) => {
+                let in_type = map_type(&op.input_type);
+                if resp_codec.is_some() {
+                    out.push_str(&format!(
+                        "  let {fn_name} (c : client) (req : {in_type}) : ({out_type}, string) result =\n"
+                    ));
+                } else {
+                    out.push_str(&format!(
+                        "  let {fn_name} (c : client)\n      ~(decode_response : bytes -> {out_type})\n      (req : {in_type}) : ({out_type}, string) result =\n"
+                    ));
+                }
+                out.push_str(&format!(
+                    "    match c.call ~service:\"{wire_service}\" ~op:\"{}\" ~payload:(Codec.encode_{req_tn}_bytes req) with\n",
+                    wire_op_name(&op.name)
+                ));
+            }
+            (false, None, _) => {
+                let in_type = map_type(&op.input_type);
+                let decode_param = if resp_codec.is_some() {
+                    String::new()
+                } else {
+                    format!("\n      ~(decode_response : bytes -> {out_type})")
+                };
+                out.push_str(&format!(
+                    "  let {fn_name} (c : client)\n      ~(encode_request : {in_type} -> bytes){decode_param}\n      (req : {in_type}) : ({out_type}, string) result =\n"
+                ));
+                out.push_str(&format!(
+                    "    match c.call ~service:\"{wire_service}\" ~op:\"{}\" ~payload:(encode_request req) with\n",
+                    wire_op_name(&op.name)
+                ));
+            }
         }
-        out.push_str("    | Ok payload -> Ok (decode_response payload)\n");
+        out.push_str(&format!("    | Ok payload -> Ok ({decode_call})\n"));
         out.push_str("    | Error _ as e -> e\n\n");
     }
 
@@ -986,10 +1558,13 @@ fn emit_router_verbose(service: &CsilServiceDefinition) -> String {
         if op_input_is_null(&op.input_type) {
             out.push_str(&format!(
                 "    | \"{}\" -> ignore payload; h.{field} Bytes.empty\n",
-                op.name
+                wire_op_name(&op.name)
             ));
         } else {
-            out.push_str(&format!("    | \"{}\" -> h.{field} payload\n", op.name));
+            out.push_str(&format!(
+                "    | \"{}\" -> h.{field} payload\n",
+                wire_op_name(&op.name)
+            ));
         }
     }
     out.push_str("    | other -> transport_error ~status:2L ~message:(\"unknown op: \" ^ other)\n");
@@ -1029,6 +1604,154 @@ fn emit_router_compact(service: &CsilServiceDefinition) -> String {
     out.push('\n');
     out
 }
+
+/// The self-contained canonical-CBOR module the generated codecs build on. Its
+/// `Cbor.t` carries the bool/float/null items a payload may hold (the transport's
+/// envelope codec does not), so the generated output stays standalone.
+const CODEC_RUNTIME_OCAML: &str = r#"
+module Cbor = struct
+  type t =
+    | Uint of int64
+    | Nint of int64 (* the logical (negative) value; encodes as CBOR major type 1 *)
+    | Bool of bool
+    | Float of float
+    | Null
+    | Text of string
+    | Bytes of bytes
+    | Array of t list
+    | Map of (t * t) list
+    | Tag of int * t
+
+  let int64 (n : int64) : t = if Int64.compare n 0L >= 0 then Uint n else Nint n
+
+  let add_head buf major (u : int64) =
+    let mt = major lsl 5 in
+    let byte shift = Char.chr (Int64.to_int (Int64.logand (Int64.shift_right_logical u shift) 0xffL)) in
+    if Int64.unsigned_compare u 24L < 0 then
+      Buffer.add_char buf (Char.chr (mt lor Int64.to_int u))
+    else if Int64.unsigned_compare u 0x100L < 0 then begin
+      Buffer.add_char buf (Char.chr (mt lor 24));
+      Buffer.add_char buf (byte 0)
+    end
+    else if Int64.unsigned_compare u 0x10000L < 0 then begin
+      Buffer.add_char buf (Char.chr (mt lor 25));
+      Buffer.add_char buf (byte 8);
+      Buffer.add_char buf (byte 0)
+    end
+    else if Int64.unsigned_compare u 0x100000000L < 0 then begin
+      Buffer.add_char buf (Char.chr (mt lor 26));
+      for i = 3 downto 0 do Buffer.add_char buf (byte (i * 8)) done
+    end
+    else begin
+      Buffer.add_char buf (Char.chr (mt lor 27));
+      for i = 7 downto 0 do Buffer.add_char buf (byte (i * 8)) done
+    end
+
+  let rec enc buf = function
+    | Uint n -> add_head buf 0 n
+    | Nint n -> add_head buf 1 (Int64.sub (Int64.neg n) 1L)
+    | Bool b -> Buffer.add_char buf (if b then '\xf5' else '\xf4')
+    | Null -> Buffer.add_char buf '\xf6'
+    | Float f ->
+      Buffer.add_char buf '\xfb';
+      let bits = Int64.bits_of_float f in
+      for i = 7 downto 0 do
+        Buffer.add_char buf (Char.chr (Int64.to_int (Int64.logand (Int64.shift_right_logical bits (i * 8)) 0xffL)))
+      done
+    | Text s -> add_head buf 3 (Int64.of_int (String.length s)); Buffer.add_string buf s
+    | Bytes b -> add_head buf 2 (Int64.of_int (Bytes.length b)); Buffer.add_bytes buf b
+    | Array xs -> add_head buf 4 (Int64.of_int (List.length xs)); List.iter (enc buf) xs
+    | Map kvs ->
+      add_head buf 5 (Int64.of_int (List.length kvs));
+      List.iter (fun (k, v) -> enc buf k; enc buf v) kvs
+    | Tag (t, v) -> add_head buf 6 (Int64.of_int t); enc buf v
+
+  let encode (v : t) : bytes =
+    let buf = Buffer.create 64 in
+    enc buf v;
+    Buffer.to_bytes buf
+
+  let decode (b : bytes) : (t, string) result =
+    let len = Bytes.length b in
+    let byte i = Char.code (Bytes.get b i) in
+    let read_arg pos low =
+      if low < 24 then (Int64.of_int low, pos + 1)
+      else if low = 24 then (Int64.of_int (byte (pos + 1)), pos + 2)
+      else if low = 25 then (Int64.of_int ((byte (pos + 1) lsl 8) lor byte (pos + 2)), pos + 3)
+      else if low = 26 then begin
+        let v = ref 0L in
+        for i = 1 to 4 do v := Int64.logor (Int64.shift_left !v 8) (Int64.of_int (byte (pos + i))) done;
+        (!v, pos + 5)
+      end
+      else if low = 27 then begin
+        let v = ref 0L in
+        for i = 1 to 8 do v := Int64.logor (Int64.shift_left !v 8) (Int64.of_int (byte (pos + i))) done;
+        (!v, pos + 9)
+      end
+      else failwith "csilgen: bad head"
+    in
+    let rec dec pos =
+      let ib = byte pos in
+      let major = ib lsr 5 and low = ib land 0x1f in
+      if major = 7 then
+        match low with
+        | 20 -> (Bool false, pos + 1)
+        | 21 -> (Bool true, pos + 1)
+        | 22 | 23 -> (Null, pos + 1)
+        | 26 ->
+          let arg, p = read_arg pos low in
+          (Float (Int32.float_of_bits (Int64.to_int32 arg)), p)
+        | 27 ->
+          let arg, p = read_arg pos low in
+          (Float (Int64.float_of_bits arg), p)
+        | _ -> failwith "csilgen: unsupported simple value"
+      else begin
+        let arg, p = read_arg pos low in
+        match major with
+        | 0 -> (Uint arg, p)
+        | 1 -> (Nint (Int64.sub (Int64.neg arg) 1L), p)
+        | 2 -> let n = Int64.to_int arg in (Bytes (Bytes.sub b p n), p + n)
+        | 3 -> let n = Int64.to_int arg in (Text (Bytes.sub_string b p n), p + n)
+        | 4 ->
+          let n = Int64.to_int arg in
+          let rec loop i pos acc =
+            if i = 0 then (List.rev acc, pos)
+            else let v, np = dec pos in loop (i - 1) np (v :: acc)
+          in
+          let items, np = loop n p [] in
+          (Array items, np)
+        | 5 ->
+          let n = Int64.to_int arg in
+          let rec loop i pos acc =
+            if i = 0 then (List.rev acc, pos)
+            else
+              let k, p1 = dec pos in
+              let v, p2 = dec p1 in
+              loop (i - 1) p2 ((k, v) :: acc)
+          in
+          let kvs, np = loop n p [] in
+          (Map kvs, np)
+        | 6 -> let inner, np = dec p in (Tag (Int64.to_int arg, inner), np)
+        | _ -> failwith "csilgen: bad major"
+      end
+    in
+    try
+      let v, np = dec 0 in
+      if np <> len then Error "csilgen: trailing bytes" else Ok v
+    with
+    | Failure m -> Error m
+    | _ -> Error "csilgen: malformed cbor"
+
+  let to_i64 = function Uint n | Nint n -> n | _ -> failwith "csilgen: expected int"
+  let to_text = function Text s -> s | _ -> failwith "csilgen: expected text"
+  let to_bytes = function Bytes b -> b | _ -> failwith "csilgen: expected bytes"
+  let to_bool = function Bool b -> b | _ -> failwith "csilgen: expected bool"
+  let to_float = function
+    | Float f -> f
+    | Uint n | Nint n -> Int64.to_float n
+    | _ -> failwith "csilgen: expected float"
+end
+"#;
 
 #[cfg(test)]
 mod tests;

@@ -7,7 +7,9 @@
 //! - `typescript` (aggregate) -> all three
 
 mod client;
+mod codec;
 mod common;
+mod package;
 mod server;
 mod types;
 
@@ -164,6 +166,16 @@ pub fn generate_files(input: &WasmGeneratorInput) -> Result<Vec<GeneratedFile>, 
         content: types::generate(input),
     }];
 
+    // The codec carries every record's wire (de)serializers. It rides alongside the
+    // types for every surface (a typesonly consumer still gets usable codecs, and the
+    // client imports its `to<T>Cbor`/`from<T>Cbor` directly).
+    if let Some(content) = codec::generate(input) {
+        files.push(GeneratedFile {
+            path: "codec.gen.ts".to_string(),
+            content,
+        });
+    }
+
     if want_client {
         files.push(GeneratedFile {
             path: "client.gen.ts".to_string(),
@@ -176,6 +188,10 @@ pub fn generate_files(input: &WasmGeneratorInput) -> Result<Vec<GeneratedFile>, 
             content: server::generate(input)?,
         });
     }
+
+    // When opted in, turn the output directory into a publishable npm package by
+    // appending a barrel + package.json + tsconfig.json. Default output is unchanged.
+    package::augment(input, &mut files);
 
     Ok(files)
 }

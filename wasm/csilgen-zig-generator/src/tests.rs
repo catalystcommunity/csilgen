@@ -372,13 +372,14 @@ fn client_emits_typed_struct_with_verbatim_wire_names() {
     let input = input_with_rules(vec![svc], "zig-client", HashMap::new());
     let client = generate_client(&input).expect("client emitted");
     assert!(client.contains("pub const AttestationClient = struct"));
-    // kebab -> snake for the Zig method; service base lowercased and op PascalCased
+    // Typed seam: a typed request in, a typed response out, codec called internally;
+    // kebab -> snake for the Zig method, service base lowercased and op PascalCased
     // for the wire strings.
-    assert!(
-        client.contains(
-            "pub fn deposit_claim(self: AttestationClient, req: []const u8) anyerror![]u8"
-        )
-    );
+    assert!(client.contains(
+        "pub fn deposit_claim(self: AttestationClient, alloc: std.mem.Allocator, req: *const types.DepositClaimRequest, out: *types.DepositClaimResponse) anyerror!void"
+    ));
+    assert!(client.contains("codec.encode_DepositClaimRequest(alloc, req)"));
+    assert!(client.contains("codec.decode_DepositClaimResponse(alloc, csil_respb, out)"));
     assert!(client.contains("\"attestation\", \"DepositClaim\""));
     assert!(client.contains("CsilgenTransport"));
 }
@@ -555,3 +556,379 @@ fn metadata_advertises_zig_target() {
     let meta: GeneratorMetadata = serde_json::from_slice(json).unwrap();
     assert_eq!(meta.target, "zig");
 }
+
+// ---- codec ----------------------------------------------------------------
+
+/// A corndogs-shaped spec exercising the codec's full surface: text, bytes, an
+/// optional int, an inline map, a list, a nested record, and a service whose
+/// output is a `Res / ServiceError` choice.
+fn typedef_rule(name: &str, target: CsilTypeExpression) -> CsilRule {
+    CsilRule {
+        name: name.to_string(),
+        rule_type: CsilRuleType::TypeDef(target),
+        position: pos(),
+        doc_comments: vec![],
+    }
+}
+
+fn corndogs_rules() -> Vec<CsilRule> {
+    let text = || builtin("text");
+    let optional_int = CsilGroupEntry {
+        key: Some(CsilGroupKey::Bare("priority".to_string())),
+        value_type: builtin("int"),
+        occurrence: Some(CsilOccurrence::Optional),
+        metadata: vec![],
+        doc_comments: vec![],
+    };
+    // A named map alias (`StringInt64Map = {* text => int}`) and a map-of-record alias
+    // (`TaskIndex = {* text => Task}`): both are transparent aliases a field references.
+    let string_int64_map = typedef_rule(
+        "StringInt64Map",
+        CsilTypeExpression::Map {
+            key: Box::new(text()),
+            value: Box::new(builtin("int")),
+            occurrence: None,
+        },
+    );
+    let task_index = typedef_rule(
+        "TaskIndex",
+        CsilTypeExpression::Map {
+            key: Box::new(text()),
+            value: Box::new(CsilTypeExpression::Reference("Task".to_string())),
+            occurrence: None,
+        },
+    );
+    let task = group_rule(
+        "Task",
+        vec![
+            bare_entry("uuid", text()),
+            bare_entry("current_state", text()),
+            bare_entry("payload", builtin("bytes")),
+            optional_int,
+            bare_entry(
+                "labels",
+                CsilTypeExpression::Map {
+                    key: Box::new(text()),
+                    value: Box::new(builtin("int")),
+                    occurrence: None,
+                },
+            ),
+            // A field typed as the named map alias: the regression stubbed this to an
+            // empty map, dropping its entries on the wire.
+            bare_entry(
+                "scores",
+                CsilTypeExpression::Reference("StringInt64Map".to_string()),
+            ),
+            bare_entry(
+                "tags",
+                CsilTypeExpression::Array {
+                    element_type: Box::new(text()),
+                    occurrence: None,
+                },
+            ),
+        ],
+    );
+    let req = group_rule(
+        "SubmitTaskRequest",
+        vec![
+            bare_entry("task", CsilTypeExpression::Reference("Task".to_string())),
+            bare_entry("queue", text()),
+            // A field typed as the map-of-record alias, exercising alias resolution
+            // whose value type still routes through the per-record codec.
+            bare_entry(
+                "related",
+                CsilTypeExpression::Reference("TaskIndex".to_string()),
+            ),
+        ],
+    );
+    let err = group_rule(
+        "ServiceError",
+        vec![
+            bare_entry("code", builtin("int")),
+            bare_entry("message", text()),
+        ],
+    );
+    // A zero-field request, exactly like corndogs' GetQueuesRequest: its decoder never
+    // populates `out`, so without an `_ = out;` discard Zig rejects the whole module.
+    let empty_req = group_rule("GetQueuesRequest", vec![]);
+    let svc = service_rule(
+        "CorndogsService",
+        vec![op(
+            "submit-task",
+            CsilTypeExpression::Reference("SubmitTaskRequest".to_string()),
+            CsilTypeExpression::Choice(vec![
+                CsilTypeExpression::Reference("Task".to_string()),
+                CsilTypeExpression::Reference("ServiceError".to_string()),
+            ]),
+            CsilServiceDirection::Unidirectional,
+            None,
+        )],
+        None,
+    );
+    vec![string_int64_map, task_index, task, req, err, empty_req, svc]
+}
+
+#[test]
+fn codec_emitted_with_typed_client() {
+    let input = input_with_rules(corndogs_rules(), "zig-client", HashMap::new());
+    let out = process_generation(input).unwrap();
+    let codec = out
+        .files
+        .iter()
+        .find(|f| f.path == "codec.gen.zig")
+        .expect("codec.gen.zig emitted");
+    assert!(codec.content.contains("pub fn encode_SubmitTaskRequest(alloc: std.mem.Allocator, v: *const types.SubmitTaskRequest)"));
+    assert!(codec.content.contains(
+        "pub fn decode_Task(alloc: std.mem.Allocator, bytes: []const u8, out: *types.Task)"
+    ));
+    // bytes -> CBOR byte string (major type 2) via w_bytes; text via w_text.
+    assert!(codec.content.contains("try w_bytes(out, v.payload);"));
+    assert!(codec.content.contains("try w_text(out, v.uuid);"));
+
+    let client = out
+        .files
+        .iter()
+        .find(|f| f.path == "client.gen.zig")
+        .expect("client.gen.zig emitted");
+    assert!(client.content.contains(
+        "pub fn submit_task(self: CorndogsClient, alloc: std.mem.Allocator, req: *const types.SubmitTaskRequest, out: *types.Task) anyerror!void"
+    ));
+    assert!(
+        client
+            .content
+            .contains("codec.encode_SubmitTaskRequest(alloc, req)")
+    );
+    assert!(
+        client
+            .content
+            .contains("codec.decode_Task(alloc, csil_respb, out)")
+    );
+}
+
+#[test]
+fn named_map_alias_field_codes_through_the_map_codec_not_the_stub() {
+    // Regression: a field typed as a transparent map alias (`StringInt64Map`) used to
+    // fall through to the null/default stub, silently dropping its entries. It must now
+    // resolve to the underlying map and code like an inline `{* text => int}` field.
+    let input = input_with_rules(corndogs_rules(), "zig-client", HashMap::new());
+    let out = process_generation(input).unwrap();
+    let codec = out
+        .files
+        .iter()
+        .find(|f| f.path == "codec.gen.zig")
+        .expect("codec.gen.zig emitted");
+
+    // The named alias emits a real map type, so the codec can walk it inline.
+    let types = out
+        .files
+        .iter()
+        .find(|f| f.path == "types.gen.zig")
+        .unwrap();
+    assert!(
+        types
+            .content
+            .contains("pub const StringInt64Map = std.StringHashMapUnmanaged(i64);")
+    );
+
+    // Encode side: the alias field iterates the map and writes a map head, exactly as
+    // an inline map would — not `try w_null(out)`.
+    assert!(codec.content.contains("var csil_mi = v.scores.iterator();"));
+    assert!(
+        codec
+            .content
+            .contains("try w_map_head(out, v.scores.count());")
+    );
+    // Decode side: it reads the field as a `.map` and puts entries, rather than the
+    // `_ = csil_fv;` discard the stub emitted.
+    assert!(
+        codec
+            .content
+            .contains("try out.scores.put(alloc, csil_k, csil_val);")
+    );
+
+    // The map-of-record alias resolves its value type through the per-record codec.
+    assert!(
+        codec
+            .content
+            .contains("var csil_mi = v.related.iterator();")
+    );
+    assert!(
+        codec
+            .content
+            .contains("try dec_Task(alloc, csil_kv.val, &csil_val);")
+    );
+}
+
+#[test]
+fn empty_record_decoder_discards_out() {
+    // Zig rejects an unused parameter, and a field-less record's decoder never touches
+    // `out`; the emitter must discard it the same way it already discards `alloc`.
+    let input = input_with_rules(
+        vec![group_rule("GetQueuesRequest", vec![])],
+        "zig-client",
+        HashMap::new(),
+    );
+    let out = process_generation(input).unwrap();
+    let codec = out
+        .files
+        .iter()
+        .find(|f| f.path == "codec.gen.zig")
+        .expect("codec.gen.zig emitted");
+    let dec_at = codec
+        .content
+        .find("fn dec_GetQueuesRequest(")
+        .expect("empty-record decoder emitted");
+    let body = &codec.content[dec_at..];
+    let end = body.find("\n}\n").expect("decoder body terminator");
+    assert!(
+        body[..end].contains("_ = out;"),
+        "field-less decoder must discard `out`:\n{}",
+        &body[..end]
+    );
+}
+
+/// Compile the generated Zig and round-trip a typed request/response with the `zig`
+/// toolchain. Skips cleanly when `zig` is not on PATH so the suite stays portable.
+#[test]
+fn codec_round_trips_through_zig() {
+    let have_zig = std::process::Command::new("zig")
+        .arg("version")
+        .output()
+        .is_ok();
+    if !have_zig {
+        eprintln!("skipping: no zig on PATH");
+        return;
+    }
+
+    let input = input_with_rules(corndogs_rules(), "zig-client", HashMap::new());
+    let out = process_generation(input).unwrap();
+
+    let dir = std::env::temp_dir().join(format!("csilgen-zig-codec-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    for file in &out.files {
+        std::fs::write(dir.join(&file.path), &file.content).unwrap();
+    }
+    std::fs::write(dir.join("driver.zig"), CODEC_DRIVER_ZIG).unwrap();
+
+    let run = std::process::Command::new("zig")
+        .arg("run")
+        .arg(dir.join("driver.zig"))
+        .arg("--cache-dir")
+        .arg(dir.join("zig-cache"))
+        .output()
+        .unwrap();
+    assert!(
+        run.status.success(),
+        "zig round-trip failed:\n{}{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&run.stdout).trim(), "ok");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+const CODEC_DRIVER_ZIG: &str = r#"const std = @import("std");
+const types = @import("types.gen.zig");
+const codec = @import("codec.gen.zig");
+const client = @import("client.gen.zig");
+
+// A loopback "server": decode the typed request, then encode its task as the typed
+// response, exercising decode and encode on the far side of the seam.
+fn stub_call(ptr: *anyopaque, alloc: std.mem.Allocator, service: []const u8, op: []const u8, reqb: []const u8) anyerror![]u8 {
+    _ = ptr;
+    std.debug.assert(std.mem.eql(u8, service, "corndogs"));
+    std.debug.assert(std.mem.eql(u8, op, "SubmitTask"));
+    var in: types.SubmitTaskRequest = undefined;
+    try codec.decode_SubmitTaskRequest(alloc, reqb, &in);
+    return codec.encode_Task(alloc, &in.task);
+}
+
+pub fn main() !void {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var labels = std.StringHashMapUnmanaged(i64){};
+    try labels.put(a, "a", 1);
+    try labels.put(a, "b", 2);
+
+    // A named map alias (`StringInt64Map`) field: it must carry its entries, not stub.
+    var scores = std.StringHashMapUnmanaged(i64){};
+    try scores.put(a, "alpha", 10);
+    try scores.put(a, "beta", 20);
+
+    var tags = [_][]const u8{ "x", "y" };
+    const payload = [_]u8{ 0xde, 0xad, 0xbe };
+    const prio: i64 = 7;
+
+    const task = types.Task{
+        .uuid = "u-123",
+        .current_state = "PENDING",
+        .payload = &payload,
+        .priority = prio,
+        .labels = labels,
+        .scores = scores,
+        .tags = &tags,
+    };
+
+    // A map-of-record alias (`TaskIndex`) field: its values route through dec_Task.
+    var related = std.StringHashMapUnmanaged(types.Task){};
+    try related.put(a, "t1", task);
+
+    const reqv = types.SubmitTaskRequest{ .task = task, .queue = "default", .related = related };
+
+    // direct codec round-trip through the nested record
+    const bytes = try codec.encode_SubmitTaskRequest(a, &reqv);
+    var back: types.SubmitTaskRequest = undefined;
+    try codec.decode_SubmitTaskRequest(a, bytes, &back);
+    std.debug.assert(std.mem.eql(u8, back.task.uuid, "u-123"));
+    std.debug.assert(std.mem.eql(u8, back.task.current_state, "PENDING"));
+    std.debug.assert(std.mem.eql(u8, back.task.payload, &payload));
+    std.debug.assert(back.task.priority.? == 7);
+    std.debug.assert(back.task.tags.len == 2);
+    std.debug.assert(std.mem.eql(u8, back.task.tags[1], "y"));
+    std.debug.assert(back.task.labels.get("a").? == 1);
+    std.debug.assert(back.task.labels.get("b").? == 2);
+    // the named map-alias field survived the round-trip with its entries intact
+    std.debug.assert(back.task.scores.count() == 2);
+    std.debug.assert(back.task.scores.get("alpha").? == 10);
+    std.debug.assert(back.task.scores.get("beta").? == 20);
+    // the map-of-record alias field decoded its values through the record codec
+    std.debug.assert(back.related.count() == 1);
+    std.debug.assert(std.mem.eql(u8, back.related.get("t1").?.uuid, "u-123"));
+    std.debug.assert(back.related.get("t1").?.scores.get("alpha").? == 10);
+    std.debug.assert(std.mem.eql(u8, back.queue, "default"));
+
+    // an absent optional must round-trip to null, not a zero value
+    var task2 = task;
+    task2.priority = null;
+    const reqv2 = types.SubmitTaskRequest{ .task = task2, .queue = "default", .related = related };
+    const bytes2 = try codec.encode_SubmitTaskRequest(a, &reqv2);
+    var back2: types.SubmitTaskRequest = undefined;
+    try codec.decode_SubmitTaskRequest(a, bytes2, &back2);
+    std.debug.assert(back2.task.priority == null);
+
+    // typed client round-trip over the loopback carrier
+    var dummy: u8 = 0;
+    const tr = client.CsilgenTransport{ .ptr = @ptrCast(&dummy), .call = &stub_call };
+    const c = client.CorndogsClient.init(tr);
+    var resp: types.Task = undefined;
+    try c.submit_task(a, &reqv, &resp);
+    std.debug.assert(std.mem.eql(u8, resp.uuid, "u-123"));
+    std.debug.assert(std.mem.eql(u8, resp.payload, &payload));
+    std.debug.assert(resp.priority.? == 7);
+    std.debug.assert(resp.scores.get("beta").? == 20);
+
+    // a zero-field record encodes to an empty map and decodes back, proving the
+    // field-less decoder discards its unused `out` parameter rather than failing to
+    // compile
+    const empty_req = types.GetQueuesRequest{};
+    const empty_bytes = try codec.encode_GetQueuesRequest(a, &empty_req);
+    var empty_back: types.GetQueuesRequest = undefined;
+    try codec.decode_GetQueuesRequest(a, empty_bytes, &empty_back);
+
+    const stdout = std.io.getStdOut().writer();
+    try stdout.print("ok\n", .{});
+}
+"#;

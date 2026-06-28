@@ -14,13 +14,5 @@ csilgen-common = { path = "../../crates/csilgen-common" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 
-# Test-only: the generated CBOR tag-4/tag-0 wrappers are emitted as source, so the
-# round-trip tests reconstruct those impls and exercise them against the same
-# ciborium codec / chrono / rust_decimal types the generated crate assumes.
-[dev-dependencies]
-ciborium = "0.2"
-chrono = { version = "0.4", default-features = false, features = ["alloc"] }
-rust_decimal = "1"
-
 [features]
 default = []

@@ -544,6 +544,43 @@ pub fn generate_dart_code(
         .unwrap_or("models")
         .to_string();
 
+    // Package mode (a self-contained, publishable pub package) is opt-in per target
+    // via the shared `emit_packages` array; pub scaffolding is emitted only when that
+    // array names "dart". Parsed defensively so a missing/malformed option is "off".
+    let emit_dart_package = config
+        .options
+        .get("emit_packages")
+        .and_then(|v| v.as_array())
+        .is_some_and(|arr| arr.iter().any(|e| e.as_str() == Some("dart")));
+
+    let package_version = config
+        .options
+        .get("package_version")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("0.1.0")
+        .to_string();
+
+    // The pub package name must be a valid `lowercase_with_underscores` identifier:
+    // prefer an explicit `package_name`, fall back to the library name, and normalize
+    // either so an upstream PascalCase/kebab spelling still yields a publishable name.
+    let package_name = sanitize_pub_name(
+        config
+            .options
+            .get("package_name")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .unwrap_or(&library_name),
+    );
+
+    // In package mode the barrel doubles as the package's public library entrypoint
+    // (`package:<name>/<name>.dart`), so the library name follows the package name.
+    let library_name = if emit_dart_package {
+        package_name.clone()
+    } else {
+        library_name
+    };
+
     let surface = match config.target.as_str() {
         "dart" | "dart-server" => Surface::Server,
         "dart-client" => Surface::Client,
@@ -560,7 +597,68 @@ pub fn generate_dart_code(
         library_name,
     };
     let dart = DartGenerator { cfg };
-    dart.generate(spec, surface)
+    let files = dart.generate(spec, surface)?;
+    if emit_dart_package {
+        Ok(into_dart_package(files, &package_name, &package_version))
+    } else {
+        Ok(files)
+    }
+}
+
+/// Normalize an arbitrary name into a valid pub package name
+/// (`lowercase_with_underscores`, leading letter). Snake-casing handles
+/// PascalCase/kebab inputs; the remaining map guards against any stray character a
+/// rule name might carry so the emitted `pubspec.yaml` always names a publishable
+/// package.
+fn sanitize_pub_name(raw: &str) -> String {
+    let mut name: String = raw
+        .to_case(Case::Snake)
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' {
+                c.to_ascii_lowercase()
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    // A pub name must begin with a letter; fall back rather than emit an invalid one.
+    if !name.chars().next().is_some_and(|c| c.is_ascii_alphabetic()) {
+        name = format!("pkg_{name}");
+    }
+    name
+}
+
+/// Rewrite the default flat output into a publishable pub package: the generated
+/// Dart moves under `lib/` (so imports resolve as `package:<name>/...`), the barrel
+/// becomes the package's `lib/<name>.dart` entrypoint, and a `pubspec.yaml` is added
+/// at the package root.
+fn into_dart_package(files: GeneratedFiles, package_name: &str, version: &str) -> GeneratedFiles {
+    let barrel_src = format!("{package_name}.gen.dart");
+    let mut out: GeneratedFiles = Vec::with_capacity(files.len() + 1);
+    out.push(GeneratedFile {
+        path: "pubspec.yaml".to_string(),
+        content: pubspec_yaml(package_name, version),
+    });
+    for f in files {
+        let path = if f.path == barrel_src {
+            format!("lib/{package_name}.dart")
+        } else {
+            format!("lib/{}", f.path)
+        };
+        out.push(GeneratedFile {
+            path,
+            content: f.content,
+        });
+    }
+    out
+}
+
+/// The package manifest. No `dependencies` block: the generated code uses only
+/// `dart:` libraries (`dart:typed_data`, `dart:convert`), so the package resolves
+/// against an empty dependency set and stays self-contained.
+fn pubspec_yaml(name: &str, version: &str) -> String {
+    format!("name: {name}\nversion: {version}\nenvironment:\n  sdk: '>=3.0.0 <4.0.0'\n")
 }
 
 struct DartGenerator {
@@ -571,14 +669,19 @@ impl DartGenerator {
     fn generate(&self, spec: &CsilSpecSerialized, surface: Surface) -> Result<GeneratedFiles> {
         let mut files = Vec::new();
 
+        let records = record_names(spec);
+        let aliases = codec_aliases(spec);
         let mut types_code = String::new();
         for rule in &spec.rules {
             match &rule.rule_type {
                 CsilRuleType::TypeDef(type_expr) => {
-                    types_code.push_str(&self.generate_type_def(&rule.name, type_expr));
+                    types_code.push_str(
+                        &self.generate_type_def(&rule.name, type_expr, &records, &aliases),
+                    );
                 }
                 CsilRuleType::GroupDef(group) => {
-                    types_code.push_str(&self.generate_record(&rule.name, group));
+                    types_code
+                        .push_str(&self.generate_record(&rule.name, group, &records, &aliases));
                 }
                 CsilRuleType::TypeChoice(choices) => {
                     types_code.push_str(&self.generate_sealed_choice(&rule.name, choices));
@@ -608,6 +711,15 @@ impl DartGenerator {
             });
         }
 
+        // The self-contained CBOR codec the records' toCbor/fromCbor build on; emitted
+        // whenever there are records to (de)serialize, so the output stays standalone.
+        if !records.is_empty() {
+            files.push(GeneratedFile {
+                path: "csil_cbor.gen.dart".to_string(),
+                content: CSIL_CBOR_DART.to_string(),
+            });
+        }
+
         if spec.service_count > 0 {
             let mut services_code = String::new();
             for rule in &spec.rules {
@@ -615,7 +727,9 @@ impl DartGenerator {
                     match surface {
                         Surface::TypesOnly => {}
                         Surface::Client => {
-                            services_code.push_str(&self.generate_client(&rule.name, service));
+                            services_code.push_str(
+                                &self.generate_client(&rule.name, service, &records, &aliases),
+                            );
                             services_code.push_str(&self.generate_wire_ids(&rule.name, service));
                         }
                         Surface::Server => {
@@ -680,6 +794,10 @@ impl DartGenerator {
         if let Some(dec) = self.decimal_import(body) {
             imports.push(dec.to_string());
         }
+        // The records' toCbor/fromCbor reference the generated CsilCbor codec.
+        if body.contains("CsilCbor.") {
+            imports.push("csil_cbor.gen.dart".to_string());
+        }
         imports.extend(extra.iter().cloned());
 
         let mut out = String::new();
@@ -710,11 +828,17 @@ impl DartGenerator {
 
     // -- Records ------------------------------------------------------------
 
-    fn generate_type_def(&self, name: &str, type_expr: &CsilTypeExpression) -> String {
+    fn generate_type_def(
+        &self,
+        name: &str,
+        type_expr: &CsilTypeExpression,
+        records: &std::collections::HashSet<String>,
+        aliases: &std::collections::HashMap<String, CsilTypeExpression>,
+    ) -> String {
         // `Name = { ... }` parses to a TypeDef carrying a Group: emit a real
         // record class so it keeps field-level typing, as the other generators do.
         if let CsilTypeExpression::Group(group) = type_expr {
-            return self.generate_record(name, group);
+            return self.generate_record(name, group, records, aliases);
         }
         if let CsilTypeExpression::Choice(choices) = type_expr {
             return self.generate_sealed_choice(name, choices);
@@ -724,7 +848,13 @@ impl DartGenerator {
         format!("typedef {class_name} = {dart_type};\n\n")
     }
 
-    fn generate_record(&self, name: &str, group: &CsilGroupExpression) -> String {
+    fn generate_record(
+        &self,
+        name: &str,
+        group: &CsilGroupExpression,
+        records: &std::collections::HashSet<String>,
+        aliases: &std::collections::HashMap<String, CsilTypeExpression>,
+    ) -> String {
         let class_name = dart_type_name(name);
         let decimal = self.cfg.decimal_dart_type();
         let mut out = String::new();
@@ -750,24 +880,115 @@ impl DartGenerator {
         out.push('\n');
 
         // Const constructor with required named params (optional fields are not
-        // required so a caller can omit them).
-        out.push_str(&format!("  const {class_name}({{\n"));
-        for (member, _wire, entry) in &named {
-            let optional = matches!(entry.occurrence, Some(CsilOccurrence::Optional));
-            if optional {
-                out.push_str(&format!("    this.{member},\n"));
-            } else {
-                out.push_str(&format!("    required this.{member},\n"));
+        // required so a caller can omit them). A fieldless record uses a plain
+        // unnamed constructor — Dart rejects an empty named-parameter list
+        // (`const X({});` is a syntax error), so the `({ ... })` form is only
+        // emitted when there is at least one field.
+        if named.is_empty() {
+            out.push_str(&format!("  const {class_name}();\n\n"));
+        } else {
+            out.push_str(&format!("  const {class_name}({{\n"));
+            for (member, _wire, entry) in &named {
+                let optional = matches!(entry.occurrence, Some(CsilOccurrence::Optional));
+                if optional {
+                    out.push_str(&format!("    this.{member},\n"));
+                } else {
+                    out.push_str(&format!("    required this.{member},\n"));
+                }
             }
+            out.push_str("  });\n\n");
         }
-        out.push_str("  });\n\n");
 
         out.push_str(&self.generate_to_map(&named));
         out.push_str(&self.generate_from_map(&class_name, &named));
         out.push_str(&self.generate_validate(&named));
         out.push_str(&self.generate_equality(&class_name, &named));
+        out.push_str(&self.generate_cbor(&class_name, &named, records, aliases));
 
         out.push_str("}\n\n");
+        out
+    }
+
+    /// The wire codec: `toCborValue`/`fromCborValue` map a record to/from the dynamic
+    /// tree the self-contained `CsilCbor` encoder/decoder consumes (deep — nested
+    /// records recurse), and `toCbor`/`fromCbor` are the byte-level entry points the
+    /// typed client calls. A send-only field is omitted from `toCborValue` and an
+    /// absent optional is dropped, exactly as `toMap` does.
+    fn generate_cbor(
+        &self,
+        class_name: &str,
+        named: &[(String, String, &CsilGroupEntry)],
+        records: &std::collections::HashSet<String>,
+        aliases: &std::collections::HashMap<String, CsilTypeExpression>,
+    ) -> String {
+        let decimal = self.cfg.decimal_dart_type();
+        let mut out = String::new();
+
+        out.push('\n');
+        out.push_str("  /// The CBOR-encodable dynamic tree for this record (deep).\n");
+        out.push_str("  Map<String, Object?> toCborValue() {\n");
+        out.push_str("    final map = <String, Object?>{};\n");
+        for (member, wire, entry) in named {
+            if matches!(
+                field_visibility(&entry.metadata),
+                CsilFieldVisibility::ReceiveOnly
+            ) {
+                continue;
+            }
+            let wire_lit = dart_string_lit(wire);
+            let optional = matches!(entry.occurrence, Some(CsilOccurrence::Optional));
+            let access = if optional {
+                format!("{member}!")
+            } else {
+                member.clone()
+            };
+            let value = dart_to_cbor_value(&entry.value_type, &access, records, aliases);
+            if optional {
+                out.push_str(&format!(
+                    "    if ({member} != null) map[{wire_lit}] = {value};\n"
+                ));
+            } else {
+                out.push_str(&format!("    map[{wire_lit}] = {value};\n"));
+            }
+        }
+        out.push_str("    return map;\n  }\n\n");
+
+        out.push_str("  /// Reconstruct this record from a decoded CBOR dynamic tree.\n");
+        out.push_str(&format!(
+            "  factory {class_name}.fromCborValue(Object? cbor) {{\n"
+        ));
+        // A fieldless record reads nothing, so binding `map` would land as an
+        // unused local that `dart analyze` rejects; only bind it when a field uses it.
+        if !named.is_empty() {
+            out.push_str("    final map = cbor as Map;\n");
+        }
+        out.push_str(&format!("    return {class_name}(\n"));
+        for (member, wire, entry) in named {
+            let wire_lit = dart_string_lit(wire);
+            let optional = matches!(entry.occurrence, Some(CsilOccurrence::Optional));
+            let read = dart_from_cbor_value(
+                &entry.value_type,
+                &format!("map[{wire_lit}]"),
+                records,
+                decimal,
+                aliases,
+            );
+            if optional {
+                out.push_str(&format!(
+                    "      {member}: map[{wire_lit}] == null ? null : {read},\n"
+                ));
+            } else {
+                out.push_str(&format!("      {member}: {read},\n"));
+            }
+        }
+        out.push_str("    );\n  }\n\n");
+
+        out.push_str("  /// Encode this record to canonical CSIL CBOR bytes.\n");
+        out.push_str("  Uint8List toCbor() => CsilCbor.encodeValue(toCborValue());\n\n");
+        out.push_str("  /// Decode a CSIL CBOR byte payload into this record.\n");
+        out.push_str(&format!(
+            "  factory {class_name}.fromCbor(List<int> bytes) =>\n      {class_name}.fromCborValue(CsilCbor.decode(bytes));\n"
+        ));
         out
     }
 
@@ -1223,19 +1444,26 @@ impl DartGenerator {
                 );
                 out.push_str(&format!("  final {ty} {member};\n"));
             }
-            out.push_str(&format!("  const {arm}({{"));
-            let params: Vec<String> = named
-                .iter()
-                .map(|(member, _wire, entry)| {
-                    if matches!(entry.occurrence, Some(CsilOccurrence::Optional)) {
-                        format!("this.{member}")
-                    } else {
-                        format!("required this.{member}")
-                    }
-                })
-                .collect();
-            out.push_str(&params.join(", "));
-            out.push_str("});\n}\n\n");
+            // A fieldless variant uses a plain unnamed constructor — Dart rejects
+            // an empty named-parameter list (`const X({});`), so the `({ ... })`
+            // form is only emitted when the variant carries at least one field.
+            if named.is_empty() {
+                out.push_str(&format!("  const {arm}();\n}}\n\n"));
+            } else {
+                out.push_str(&format!("  const {arm}({{"));
+                let params: Vec<String> = named
+                    .iter()
+                    .map(|(member, _wire, entry)| {
+                        if matches!(entry.occurrence, Some(CsilOccurrence::Optional)) {
+                            format!("this.{member}")
+                        } else {
+                            format!("required this.{member}")
+                        }
+                    })
+                    .collect();
+                out.push_str(&params.join(", "));
+                out.push_str("});\n}\n\n");
+            }
         }
         out
     }
@@ -1251,16 +1479,22 @@ impl DartGenerator {
             .unwrap_or(pascal)
     }
 
-    fn generate_client(&self, name: &str, service: &CsilServiceDefinition) -> String {
+    fn generate_client(
+        &self,
+        name: &str,
+        service: &CsilServiceDefinition,
+        records: &std::collections::HashSet<String>,
+        aliases: &std::collections::HashMap<String, CsilTypeExpression>,
+    ) -> String {
         let base = self.service_base(name);
         let client = format!("{base}Client");
         let decimal = self.cfg.decimal_dart_type();
-        // Wire service/op names stay verbatim — case transforms never leak onto the
-        // wire, so a Dart client and a Go/Python/TS peer agree on the strings.
-        let wire_service = self.service_base(name);
+        // The wire service is lowercased and the op PascalCased (the wire contract),
+        // so a Dart client reaches the same endpoint as a Go/Python/TS peer.
+        let wire_service = dart_string_lit(&wire_service_string(name));
         let mut out = String::new();
         out.push_str(&format!(
-            "/// A typed, transport-agnostic client for the {name} service.\nfinal class {client} {{\n"
+            "/// A typed, transport-agnostic client for the {name} service. The client owns\n/// (de)serialization; the carrier only moves bytes.\nfinal class {client} {{\n"
         ));
         out.push_str("  final CsilTransport transport;\n");
         out.push_str(&format!("  const {client}(this.transport);\n\n"));
@@ -1274,19 +1508,39 @@ impl DartGenerator {
                 continue;
             }
             let method = dart_member_name(&op.name);
-            let wire_op = dart_string_lit(&op.name);
+            let wire_op = dart_string_lit(&wire_op_string(&op.name));
             let out_type = map_type(&success_type(&op.output_type), &None, decimal);
+            let out_decode = dart_from_cbor_value(
+                &success_type(&op.output_type),
+                "CsilCbor.decode(csilResp)",
+                records,
+                decimal,
+                aliases,
+            );
             if is_null_input(&op.input_type) {
+                out.push_str(&format!("  {out_type} {method}() {{\n"));
                 out.push_str(&format!(
-                    "  {out_type} {method}() => transport.call({}, {wire_op}, const <int>[]);\n\n",
-                    dart_string_lit(&wire_service)
+                    "    final csilResp = transport.call({wire_service}, {wire_op}, const <int>[]);\n"
                 ));
+                out.push_str(&format!("    return {out_decode};\n  }}\n\n"));
             } else {
                 let in_type = map_type(&op.input_type, &None, decimal);
+                // A record request serializes itself; a scalar/list request goes
+                // through the encoder directly.
+                let req_bytes = if matches!(&op.input_type, CsilTypeExpression::Reference(n) if records.contains(&dart_type_name(n)))
+                {
+                    "request.toCbor()".to_string()
+                } else {
+                    format!(
+                        "CsilCbor.encodeValue({})",
+                        dart_to_cbor_value(&op.input_type, "request", records, aliases)
+                    )
+                };
+                out.push_str(&format!("  {out_type} {method}({in_type} request) {{\n"));
                 out.push_str(&format!(
-                    "  {out_type} {method}({in_type} request) => transport.call({}, {wire_op}, request);\n\n",
-                    dart_string_lit(&wire_service)
+                    "    final csilResp = transport.call({wire_service}, {wire_op}, {req_bytes});\n"
                 ));
+                out.push_str(&format!("    return {out_decode};\n  }}\n\n"));
             }
         }
         out.push_str("}\n\n");
@@ -1355,7 +1609,10 @@ impl DartGenerator {
             }
             let method = dart_member_name(&op.name);
             let in_type = map_type(&op.input_type, &None, decimal);
-            out.push_str(&format!("    case {}:\n", dart_string_lit(&op.name)));
+            out.push_str(&format!(
+                "    case {}:\n",
+                dart_string_lit(&wire_op_string(&op.name))
+            ));
             out.push_str(&format!(
                 "      handler.{method}(codec.decode(data) as {in_type});\n      return;\n"
             ));
@@ -1426,6 +1683,196 @@ fn is_bytes_type(type_expr: &CsilTypeExpression) -> bool {
     matches!(type_expr, CsilTypeExpression::Builtin(name) if name == "bytes" || name == "bstr")
 }
 
+/// The wire `service` string: the service base (trailing `Service` stripped),
+/// **lowercased**, per `docs/cbor-wire-contract.md`. Distinct from the Dart class
+/// name (`service_base`), which stays PascalCase — a case transform must never reach
+/// the wire differently from the other targets.
+fn wire_service_string(name: &str) -> String {
+    let pascal = name.to_case(Case::Pascal);
+    let base = pascal
+        .strip_suffix("Service")
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or(pascal);
+    base.to_lowercase()
+}
+
+/// The wire `op`/method string: the operation name PascalCased with the simple rule
+/// (capitalize after `_`/`-`, leave the rest as written so acronym runs survive),
+/// matching the other targets so a Dart client reaches the same endpoint.
+fn wire_op_string(name: &str) -> String {
+    let mut out = String::new();
+    for word in name.split(['_', '-']) {
+        let mut chars = word.chars();
+        if let Some(first) = chars.next() {
+            out.extend(first.to_uppercase());
+            out.push_str(chars.as_str());
+        }
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// Codec value transforms (deep toCbor/fromCbor)
+// ---------------------------------------------------------------------------
+
+/// The record type names (Dart class names) the codec covers — those whose CBOR
+/// form is a map and which therefore expose `toCborValue`/`fromCborValue`.
+fn record_names(spec: &CsilSpecSerialized) -> std::collections::HashSet<String> {
+    spec.rules
+        .iter()
+        .filter_map(|r| match &r.rule_type {
+            CsilRuleType::GroupDef(_) => Some(dart_type_name(&r.name)),
+            CsilRuleType::TypeDef(CsilTypeExpression::Group(_)) => Some(dart_type_name(&r.name)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The transparent type aliases the codec resolves through, keyed by the raw rule
+/// name a `Reference` carries: a `TypeDef` whose target is a map / array / scalar /
+/// reference (NOT a record group or a choice, which have their own handling). A
+/// field referencing one is typed as the alias (`typedef StringInt64Map = Map<...>`),
+/// so its value IS the underlying shape — the codec must recurse into that shape
+/// rather than pass the bare reference straight through and drop nested records.
+fn codec_aliases(
+    spec: &CsilSpecSerialized,
+) -> std::collections::HashMap<String, CsilTypeExpression> {
+    spec.rules
+        .iter()
+        .filter_map(|rule| match &rule.rule_type {
+            CsilRuleType::TypeDef(t) => match t {
+                CsilTypeExpression::Group(_) | CsilTypeExpression::Choice(_) => None,
+                other => Some((rule.name.clone(), other.clone())),
+            },
+            _ => None,
+        })
+        .collect()
+}
+
+/// Whether a type contains (anywhere) a reference to a codec'd record, so a value
+/// of it must be recursively mapped rather than passed straight to the CBOR encoder.
+fn contains_record(
+    ty: &CsilTypeExpression,
+    records: &std::collections::HashSet<String>,
+    aliases: &std::collections::HashMap<String, CsilTypeExpression>,
+) -> bool {
+    match ty {
+        // A reference is either a record directly, or a transparent alias whose
+        // underlying shape (e.g. `M = {* text => SomeRecord}`) may itself carry one.
+        CsilTypeExpression::Reference(name) if records.contains(&dart_type_name(name)) => true,
+        CsilTypeExpression::Reference(name) => aliases
+            .get(name)
+            .is_some_and(|underlying| contains_record(underlying, records, aliases)),
+        CsilTypeExpression::Array { element_type, .. } => {
+            contains_record(element_type, records, aliases)
+        }
+        CsilTypeExpression::Map { key, value, .. } => {
+            contains_record(key, records, aliases) || contains_record(value, records, aliases)
+        }
+        CsilTypeExpression::Constrained { base_type, .. } => {
+            contains_record(base_type, records, aliases)
+        }
+        _ => false,
+    }
+}
+
+/// A Dart expression turning `expr` (a typed value) into the dynamic tree the CBOR
+/// encoder consumes: scalars/bytes/DateTime pass straight through (the encoder keys
+/// on runtime type); a nested record becomes its `toCborValue()` map; lists and maps
+/// recurse only when they carry records.
+fn dart_to_cbor_value(
+    ty: &CsilTypeExpression,
+    expr: &str,
+    records: &std::collections::HashSet<String>,
+    aliases: &std::collections::HashMap<String, CsilTypeExpression>,
+) -> String {
+    match ty {
+        CsilTypeExpression::Constrained { base_type, .. } => {
+            dart_to_cbor_value(base_type, expr, records, aliases)
+        }
+        CsilTypeExpression::Reference(name) if records.contains(&dart_type_name(name)) => {
+            format!("{expr}.toCborValue()")
+        }
+        // A transparent alias is typed as its underlying shape, so the value flowing
+        // here IS that shape: recurse into it (a map-of-record alias then maps each
+        // value through `toCborValue` instead of passing the bare map straight on,
+        // which would drop the nested records).
+        CsilTypeExpression::Reference(name) if aliases.contains_key(name) => {
+            dart_to_cbor_value(&aliases[name], expr, records, aliases)
+        }
+        CsilTypeExpression::Array { element_type, .. }
+            if contains_record(element_type, records, aliases) =>
+        {
+            let inner = dart_to_cbor_value(element_type, "csilE", records, aliases);
+            format!("{expr}.map((csilE) => {inner}).toList()")
+        }
+        CsilTypeExpression::Map { key, value, .. }
+            if contains_record(key, records, aliases)
+                || contains_record(value, records, aliases) =>
+        {
+            let k = dart_to_cbor_value(key, "csilK", records, aliases);
+            let v = dart_to_cbor_value(value, "csilV", records, aliases);
+            format!("{expr}.map((csilK, csilV) => MapEntry({k}, {v}))")
+        }
+        // Scalars, bytes, DateTime, decimal, string-choices, and record-free
+        // lists/maps are already a shape the encoder handles by runtime type.
+        _ => expr.to_string(),
+    }
+}
+
+/// A Dart expression reconstructing a typed value from `expr` (the decoded dynamic
+/// tree node).
+fn dart_from_cbor_value(
+    ty: &CsilTypeExpression,
+    expr: &str,
+    records: &std::collections::HashSet<String>,
+    decimal: &str,
+    aliases: &std::collections::HashMap<String, CsilTypeExpression>,
+) -> String {
+    match ty {
+        CsilTypeExpression::Constrained { base_type, .. } => {
+            dart_from_cbor_value(base_type, expr, records, decimal, aliases)
+        }
+        CsilTypeExpression::Builtin(name) => match name.as_str() {
+            "int" | "uint" => format!("{expr} as int"),
+            "float" => format!("({expr} as num).toDouble()"),
+            "text" | "tstr" => format!("{expr} as String"),
+            "bytes" | "bstr" => format!("{expr} as Uint8List"),
+            "bool" => format!("{expr} as bool"),
+            "timestamp" => format!("{expr} as DateTime"),
+            "decimal" => format!("{expr} as {decimal}"),
+            _ => expr.to_string(),
+        },
+        CsilTypeExpression::Reference(name) if records.contains(&dart_type_name(name)) => {
+            format!("{}.fromCborValue({expr})", dart_type_name(name))
+        }
+        // A transparent alias decodes as its underlying shape (the field is typed as
+        // that shape), so a map-of-record alias reconstructs each value through
+        // `fromCborValue` and casts to the named-typed map rather than yielding the
+        // raw decoded dynamic map, which mistypes the entries and drops the records.
+        CsilTypeExpression::Reference(name) if aliases.contains_key(name) => {
+            dart_from_cbor_value(&aliases[name], expr, records, decimal, aliases)
+        }
+        CsilTypeExpression::Array { element_type, .. } => {
+            let inner = dart_from_cbor_value(element_type, "csilE", records, decimal, aliases);
+            let et = map_type(element_type, &None, decimal);
+            format!("({expr} as List).map((csilE) => {inner}).cast<{et}>().toList()")
+        }
+        CsilTypeExpression::Map { key, value, .. } => {
+            let kt = map_type(key, &None, decimal);
+            let vt = map_type(value, &None, decimal);
+            let k = dart_from_cbor_value(key, "csilK", records, decimal, aliases);
+            let v = dart_from_cbor_value(value, "csilV", records, decimal, aliases);
+            format!("({expr} as Map).map((csilK, csilV) => MapEntry({k}, {v})).cast<{kt}, {vt}>()")
+        }
+        CsilTypeExpression::Choice(choices) if is_string_choice(choices) => {
+            format!("{expr} as String")
+        }
+        _ => expr.to_string(),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Static preludes
 // ---------------------------------------------------------------------------
@@ -1434,12 +1881,13 @@ fn is_bytes_type(type_expr: &CsilTypeExpression) -> bool {
 /// The generator never owns the wire — the host injects a `CsilTransport` that
 /// encodes the request, performs the (service, op) call, and decodes the reply.
 const CLIENT_PRELUDE_DART: &str = "\
-/// The transport seam a generated client delegates to. The host implements this
-/// over `csilgen_transport` (CBOR over a frame carrier) or any other wire; the
-/// generated client never touches bytes.
+/// The carrier seam a generated client delegates to. The generated client owns
+/// (de)serialization — it encodes the typed request to CBOR and decodes the typed
+/// response — so the carrier only moves bytes for the named (service, op).
 abstract interface class CsilTransport {
-  /// Encode `request`, call `service`/`op`, and return the decoded response.
-  R call<R>(String service, String op, Object? request);
+  /// Perform the (service, op) call with the already-encoded request bytes and
+  /// return the response bytes.
+  List<int> call(String service, String op, List<int> request);
 }
 ";
 
@@ -1535,5 +1983,197 @@ final class CsilDecimal implements Comparable<CsilDecimal> {
 
   @override
   int get hashCode => toString().hashCode;
+}
+"#;
+
+/// The self-contained canonical CSIL CBOR codec the generated records' toCbor/
+/// fromCbor build on, so the output stays standalone (no third-party CBOR dep).
+const CSIL_CBOR_DART: &str = r#"// The self-contained canonical CSIL CBOR codec.
+//
+// Code generated by csilgen; DO NOT EDIT.
+
+import 'dart:convert';
+import 'dart:typed_data';
+
+/// A minimal canonical-CBOR (RFC 8949 subset) encoder/decoder over the dynamic
+/// value tree the generated records map to. Scalars, bytes (major type 2),
+/// timestamps (DateTime -> tag 0), lists, and maps are supported; the generated
+/// records call this behind their toCbor/fromCbor.
+class CsilCbor {
+  static Uint8List encodeValue(Object? value) {
+    final b = BytesBuilder();
+    _enc(b, value);
+    return b.toBytes();
+  }
+
+  static void _head(BytesBuilder b, int major, int n) {
+    final mt = major << 5;
+    if (n < 24) {
+      b.addByte(mt | n);
+    } else if (n < 0x100) {
+      b.addByte(mt | 24);
+      b.addByte(n);
+    } else if (n < 0x10000) {
+      b.addByte(mt | 25);
+      b.addByte((n >> 8) & 0xff);
+      b.addByte(n & 0xff);
+    } else if (n < 0x100000000) {
+      b.addByte(mt | 26);
+      for (var i = 3; i >= 0; i--) {
+        b.addByte((n >> (i * 8)) & 0xff);
+      }
+    } else {
+      b.addByte(mt | 27);
+      for (var i = 7; i >= 0; i--) {
+        b.addByte((n >> (i * 8)) & 0xff);
+      }
+    }
+  }
+
+  static void _enc(BytesBuilder b, Object? v) {
+    if (v == null) {
+      b.addByte(0xf6);
+    } else if (v is bool) {
+      b.addByte(v ? 0xf5 : 0xf4);
+    } else if (v is int) {
+      if (v >= 0) {
+        _head(b, 0, v);
+      } else {
+        _head(b, 1, -1 - v);
+      }
+    } else if (v is double) {
+      b.addByte(0xfb);
+      final bd = ByteData(8)..setFloat64(0, v, Endian.big);
+      b.add(bd.buffer.asUint8List());
+    } else if (v is String) {
+      final u = utf8.encode(v);
+      _head(b, 3, u.length);
+      b.add(u);
+    } else if (v is Uint8List) {
+      _head(b, 2, v.length);
+      b.add(v);
+    } else if (v is DateTime) {
+      b.addByte(0xc0);
+      final u = utf8.encode(v.toUtc().toIso8601String());
+      _head(b, 3, u.length);
+      b.add(u);
+    } else if (v is List) {
+      _head(b, 4, v.length);
+      for (final e in v) {
+        _enc(b, e);
+      }
+    } else if (v is Map) {
+      _head(b, 5, v.length);
+      v.forEach((k, val) {
+        _enc(b, k);
+        _enc(b, val);
+      });
+    } else {
+      throw ArgumentError('CsilCbor: cannot encode ${v.runtimeType}');
+    }
+  }
+
+  static Object? decode(List<int> bytes) {
+    final b = Uint8List.fromList(bytes);
+    final r = _dec(b, 0);
+    if (r.next != b.length) {
+      throw ArgumentError('CsilCbor: trailing bytes');
+    }
+    return r.value;
+  }
+
+  static _CsilRead _readArg(Uint8List b, int pos, int low) {
+    if (low < 24) return _CsilRead(low, pos + 1);
+    if (low == 24) return _CsilRead(b[pos + 1], pos + 2);
+    if (low == 25) return _CsilRead((b[pos + 1] << 8) | b[pos + 2], pos + 3);
+    if (low == 26) {
+      var v = 0;
+      for (var i = 1; i <= 4; i++) {
+        v = (v << 8) | b[pos + i];
+      }
+      return _CsilRead(v, pos + 5);
+    }
+    if (low == 27) {
+      var v = 0;
+      for (var i = 1; i <= 8; i++) {
+        v = (v << 8) | b[pos + i];
+      }
+      return _CsilRead(v, pos + 9);
+    }
+    throw ArgumentError('CsilCbor: bad head');
+  }
+
+  static _CsilDecoded _dec(Uint8List b, int pos) {
+    final ib = b[pos];
+    final major = ib >> 5;
+    final low = ib & 0x1f;
+    if (major == 7) {
+      if (low == 20) return _CsilDecoded(false, pos + 1);
+      if (low == 21) return _CsilDecoded(true, pos + 1);
+      if (low == 22 || low == 23) return _CsilDecoded(null, pos + 1);
+      if (low == 26) {
+        final bd = ByteData.sublistView(b, pos + 1, pos + 5);
+        return _CsilDecoded(bd.getFloat32(0, Endian.big), pos + 5);
+      }
+      if (low == 27) {
+        final bd = ByteData.sublistView(b, pos + 1, pos + 9);
+        return _CsilDecoded(bd.getFloat64(0, Endian.big), pos + 9);
+      }
+      throw ArgumentError('CsilCbor: unsupported simple value');
+    }
+    final a = _readArg(b, pos, low);
+    final arg = a.value;
+    final p = a.next;
+    switch (major) {
+      case 0:
+        return _CsilDecoded(arg, p);
+      case 1:
+        return _CsilDecoded(-1 - arg, p);
+      case 2:
+        return _CsilDecoded(Uint8List.sublistView(b, p, p + arg), p + arg);
+      case 3:
+        return _CsilDecoded(utf8.decode(b.sublist(p, p + arg)), p + arg);
+      case 4:
+        final list = <Object?>[];
+        var off4 = p;
+        for (var i = 0; i < arg; i++) {
+          final d = _dec(b, off4);
+          list.add(d.value);
+          off4 = d.next;
+        }
+        return _CsilDecoded(list, off4);
+      case 5:
+        final map = <Object?, Object?>{};
+        var off5 = p;
+        for (var i = 0; i < arg; i++) {
+          final k = _dec(b, off5);
+          final v = _dec(b, k.next);
+          map[k.value] = v.value;
+          off5 = v.next;
+        }
+        return _CsilDecoded(map, off5);
+      case 6:
+        final inner = _dec(b, p);
+        if (arg == 0 && inner.value is String) {
+          return _CsilDecoded(
+              DateTime.parse(inner.value as String).toUtc(), inner.next);
+        }
+        return _CsilDecoded(inner.value, inner.next);
+      default:
+        throw ArgumentError('CsilCbor: unsupported major $major');
+    }
+  }
+}
+
+class _CsilRead {
+  final int value;
+  final int next;
+  const _CsilRead(this.value, this.next);
+}
+
+class _CsilDecoded {
+  final Object? value;
+  final int next;
+  const _CsilDecoded(this.value, this.next);
 }
 "#;

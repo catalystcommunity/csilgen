@@ -213,17 +213,66 @@ fn test_client_target() {
         CsilServiceDirection::Unidirectional,
         None,
     );
-    let input = service_input("Attestation", vec![op], None, "elixir-client");
+    // The typed byte seam only emits a call when both ends are records the codec
+    // covers, so the request/response records must be declared in the spec.
+    let mut input = service_input("Attestation", vec![op], None, "elixir-client");
+    input.csil_spec.rules.insert(
+        0,
+        CsilRule {
+            name: "DepositClaimRequest".to_string(),
+            rule_type: CsilRuleType::GroupDef(CsilGroupExpression {
+                entries: vec![bare_entry(
+                    "subject",
+                    CsilTypeExpression::Builtin("text".to_string()),
+                )],
+            }),
+            position: CsilPosition {
+                line: 1,
+                column: 1,
+                offset: 0,
+            },
+            doc_comments: vec![],
+        },
+    );
+    input.csil_spec.rules.insert(
+        1,
+        CsilRule {
+            name: "DepositClaimResponse".to_string(),
+            rule_type: CsilRuleType::GroupDef(CsilGroupExpression {
+                entries: vec![bare_entry(
+                    "id",
+                    CsilTypeExpression::Builtin("text".to_string()),
+                )],
+            }),
+            position: CsilPosition {
+                line: 1,
+                column: 1,
+                offset: 0,
+            },
+            doc_comments: vec![],
+        },
+    );
     let out = process_generation(input).unwrap();
     let client = file(&out, "client.gen.ex");
     assert!(client.contains("defmodule Csilgen.Generated.Transport do"));
     assert!(client.contains("defmodule Csilgen.Generated.AttestationClient do"));
-    // ServiceError half of the union is stripped from the success type.
-    assert!(
-        client.contains(":: {:ok, Csilgen.Generated.DepositClaimResponse.t()} | {:error, term()}")
-    );
-    // Wire service is lowercased base; wire method is PascalCase verbatim.
-    assert!(client.contains("\"attestation\", \"DepositClaim\", req"));
+    // The byte seam: the transport callback takes/returns bytes, not a term.
+    assert!(client.contains(
+        "@callback call(t(), service :: String.t(), method :: String.t(), req :: binary()) ::"
+    ));
+    // ServiceError half of the union is stripped; the success type is the response.
+    assert!(client.contains(":: Csilgen.Generated.DepositClaimResponse.t()"));
+    // Request is encoded to bytes, the reply decoded from bytes; wire service is the
+    // lowercased base and the wire method is PascalCase verbatim.
+    assert!(client.contains(
+        "Csilgen.Generated.Transport.call(transport, \"attestation\", \"DepositClaim\", Csilgen.Generated.DepositClaimRequest.to_cbor(req))"
+    ));
+    assert!(client.contains("Csilgen.Generated.DepositClaimResponse.from_cbor(resp)"));
+    // The codec rides alongside; per-struct to_cbor/from_cbor are emitted.
+    let codec = file(&out, "codec.gen.ex");
+    assert!(codec.contains("defmodule Csilgen.Generated.Cbor do"));
+    let types = file(&out, "types.gen.ex");
+    assert!(types.contains("def to_cbor(v), do: Csilgen.Generated.Cbor.encode(to_cbor_value(v))"));
     // Server file must not be emitted for the client target.
     assert!(!out.files.iter().any(|f| f.path == "server.gen.ex"));
 }
@@ -511,3 +560,542 @@ fn test_type_mapping() {
         "[integer()]"
     );
 }
+
+// --- codec ------------------------------------------------------------------
+
+/// A corndogs-shaped spec: text uuid/current_state, bytes payload, an optional int
+/// priority, a map<text,int>, a list<text>, a nested request record, an error
+/// record, and a service whose output is a `Task / ServiceError` choice.
+fn corndogs_spec() -> CsilSpecSerialized {
+    let text = || CsilTypeExpression::Builtin("text".to_string());
+    let int = || CsilTypeExpression::Builtin("int".to_string());
+    let task = CsilRule {
+        name: "Task".to_string(),
+        rule_type: CsilRuleType::GroupDef(CsilGroupExpression {
+            entries: vec![
+                bare_entry("uuid", text()),
+                bare_entry("current_state", text()),
+                bare_entry("payload", CsilTypeExpression::Builtin("bytes".to_string())),
+                optional_entry("priority", int()),
+                bare_entry(
+                    "labels",
+                    CsilTypeExpression::Map {
+                        key: Box::new(text()),
+                        value: Box::new(int()),
+                        occurrence: None,
+                    },
+                ),
+                bare_entry(
+                    "tags",
+                    CsilTypeExpression::Array {
+                        element_type: Box::new(text()),
+                        occurrence: None,
+                    },
+                ),
+                // A field typed as a named map alias (a `TypeDef` carrying a `{* text
+                // => int}` map): the regression stubbed these to nil, dropping data.
+                bare_entry(
+                    "metrics",
+                    CsilTypeExpression::Reference("StringInt64Map".to_string()),
+                ),
+                // A named map alias whose values are a record: each entry must route
+                // through the referenced record module's codec.
+                bare_entry(
+                    "notes",
+                    CsilTypeExpression::Reference("NoteMap".to_string()),
+                ),
+            ],
+        }),
+        position: CsilPosition {
+            line: 1,
+            column: 1,
+            offset: 0,
+        },
+        doc_comments: vec![],
+    };
+    let req = CsilRule {
+        name: "SubmitTaskRequest".to_string(),
+        rule_type: CsilRuleType::GroupDef(CsilGroupExpression {
+            entries: vec![
+                bare_entry("task", CsilTypeExpression::Reference("Task".to_string())),
+                bare_entry("queue", text()),
+            ],
+        }),
+        position: CsilPosition {
+            line: 1,
+            column: 1,
+            offset: 0,
+        },
+        doc_comments: vec![],
+    };
+    let err = CsilRule {
+        name: "ServiceError".to_string(),
+        rule_type: CsilRuleType::GroupDef(CsilGroupExpression {
+            entries: vec![bare_entry("code", int()), bare_entry("message", text())],
+        }),
+        position: CsilPosition {
+            line: 1,
+            column: 1,
+            offset: 0,
+        },
+        doc_comments: vec![],
+    };
+    let svc = CsilRule {
+        name: "CorndogsService".to_string(),
+        rule_type: CsilRuleType::ServiceDef(CsilServiceDefinition {
+            operations: vec![make_op(
+                "submit-task",
+                "SubmitTaskRequest",
+                CsilTypeExpression::Choice(vec![
+                    CsilTypeExpression::Reference("Task".to_string()),
+                    CsilTypeExpression::Reference("ServiceError".to_string()),
+                ]),
+                CsilServiceDirection::Unidirectional,
+                None,
+            )],
+            wire_id: None,
+        }),
+        position: CsilPosition {
+            line: 1,
+            column: 1,
+            offset: 0,
+        },
+        doc_comments: vec![],
+    };
+    // `StringInt64Map = {* text => int}` — a transparent map alias (a `TypeDef`
+    // carrying a `Map`, not a group), the exact shape the codec used to stub out.
+    let string_int64_map = CsilRule {
+        name: "StringInt64Map".to_string(),
+        rule_type: CsilRuleType::TypeDef(CsilTypeExpression::Map {
+            key: Box::new(text()),
+            value: Box::new(int()),
+            occurrence: None,
+        }),
+        position: CsilPosition {
+            line: 1,
+            column: 1,
+            offset: 0,
+        },
+        doc_comments: vec![],
+    };
+    let note = CsilRule {
+        name: "Note".to_string(),
+        rule_type: CsilRuleType::GroupDef(CsilGroupExpression {
+            entries: vec![bare_entry("body", text())],
+        }),
+        position: CsilPosition {
+            line: 1,
+            column: 1,
+            offset: 0,
+        },
+        doc_comments: vec![],
+    };
+    // `NoteMap = {* text => Note}` — a named map alias of record values, which has no
+    // struct module of its own; per-entry values route to `Note`'s codec.
+    let note_map = CsilRule {
+        name: "NoteMap".to_string(),
+        rule_type: CsilRuleType::TypeDef(CsilTypeExpression::Map {
+            key: Box::new(text()),
+            value: Box::new(CsilTypeExpression::Reference("Note".to_string())),
+            occurrence: None,
+        }),
+        position: CsilPosition {
+            line: 1,
+            column: 1,
+            offset: 0,
+        },
+        doc_comments: vec![],
+    };
+    CsilSpecSerialized {
+        rules: vec![task, req, err, note, string_int64_map, note_map, svc],
+        source_content: None,
+        service_count: 1,
+        fields_with_metadata_count: 0,
+    }
+}
+
+fn corndogs_input(target: &str) -> WasmGeneratorInput {
+    WasmGeneratorInput {
+        csil_spec: corndogs_spec(),
+        config: GeneratorConfig {
+            target: target.to_string(),
+            output_dir: "/tmp".to_string(),
+            options: HashMap::new(),
+        },
+        generator_metadata: meta(),
+    }
+}
+
+#[test]
+fn test_codec_module_emitted_with_records() {
+    let out = process_generation(corndogs_input("elixir-client")).unwrap();
+    let codec = file(&out, "codec.gen.ex");
+    // The shared value codec carries text vs bytes and exposes encode/decode.
+    assert!(codec.contains("defmodule Csilgen.Generated.Cbor do"));
+    assert!(codec.contains("def encode(value)"));
+    assert!(codec.contains("def decode(bin)"));
+    // bytes -> CBOR byte string (major type 2), text -> major type 3.
+    assert!(codec.contains("defp enc({:bytes, b}), do: [head(2, byte_size(b)), b]"));
+    assert!(codec.contains("defp enc({:text, s}), do: [head(3, byte_size(s)), s]"));
+    // bool/null/float scalar heads per the wire contract.
+    assert!(codec.contains("defp enc({:bool, false}), do: <<0xF4>>"));
+    assert!(codec.contains("defp enc({:bool, true}), do: <<0xF5>>"));
+    assert!(codec.contains("defp enc(:null), do: <<0xF6>>"));
+    assert!(codec.contains("defp enc({:float, f}), do: <<0xFB, f::float-size(64)>>"));
+}
+
+#[test]
+fn test_no_codec_without_records() {
+    // A service-only spec (no record types) emits no codec file.
+    let op = make_op(
+        "ping",
+        "Nothing",
+        CsilTypeExpression::Reference("Nothing".to_string()),
+        CsilServiceDirection::Unidirectional,
+        None,
+    );
+    let input = service_input("S", vec![op], None, "elixir-client");
+    let out = process_generation(input).unwrap();
+    assert!(!out.files.iter().any(|f| f.path == "codec.gen.ex"));
+}
+
+#[test]
+fn test_struct_codec_canonical_order_and_shapes() {
+    let out = process_generation(corndogs_input("elixir-typesonly")).unwrap();
+    let types = file(&out, "types.gen.ex");
+    // Per-struct codec surface lands on the struct module itself.
+    assert!(types.contains("def to_cbor_value(%__MODULE__{} = v) do"));
+    assert!(types.contains("def from_cbor_value({:map, csil_kvs}) do"));
+    assert!(types.contains("def to_cbor(v), do: Csilgen.Generated.Cbor.encode(to_cbor_value(v))"));
+    assert!(types.contains(
+        "def from_cbor(bytes), do: from_cbor_value(Csilgen.Generated.Cbor.decode(bytes))"
+    ));
+    // Canonical RFC 8949 key order is shorter-key-first, so `tags`/`uuid` precede
+    // `payload`/`current_state`; verify `current_state` (longest) sorts last.
+    let to_v = types
+        .split("def to_cbor_value")
+        .nth(1)
+        .expect("Task to_cbor_value present");
+    let pos_tags = to_v.find("\"tags\"").unwrap();
+    let pos_uuid = to_v.find("\"uuid\"").unwrap();
+    let pos_labels = to_v.find("\"labels\"").unwrap();
+    let pos_payload = to_v.find("\"payload\"").unwrap();
+    let pos_priority = to_v.find("\"priority\"").unwrap();
+    let pos_state = to_v.find("\"current_state\"").unwrap();
+    // 4-byte keys (uuid, tags) < 6-byte (labels) < 7 (payload) < 8 (priority) < 13.
+    assert!(pos_uuid < pos_labels);
+    assert!(pos_tags < pos_labels);
+    assert!(pos_labels < pos_payload);
+    assert!(pos_payload < pos_priority);
+    assert!(pos_priority < pos_state);
+    // bytes field uses the byte-string item; the optional priority is omitted when nil.
+    assert!(types.contains("{{:text, \"payload\"}, {:bytes, v.payload}}"));
+    assert!(types.contains(
+        "(if is_nil(v.priority), do: nil, else: {{:text, \"priority\"}, {:int, v.priority}}),"
+    ));
+    // map/list encode through the value tree; a nested record delegates.
+    assert!(types.contains(
+        "{:map, Enum.map(v.labels, fn {csil_k, csil_v} -> {{:text, csil_k}, {:int, csil_v}} end)}"
+    ));
+    assert!(types.contains("{:array, Enum.map(v.tags, fn csil_e -> {:text, csil_e} end)}"));
+    assert!(types.contains("Csilgen.Generated.Task.to_cbor_value(v.task)"));
+}
+
+/// Generate the corndogs `elixir-client` spec, write a driver that loads the
+/// generated modules plus a loopback transport, round-trip via to_cbor/from_cbor
+/// and the typed client, and run it with `elixir`. Skips when elixir is absent.
+#[test]
+fn codec_round_trips_through_elixir() {
+    let have = std::process::Command::new("elixir")
+        .arg("--version")
+        .output()
+        .is_ok();
+    if !have {
+        eprintln!("skipping: no elixir on PATH");
+        return;
+    }
+    let out = process_generation(corndogs_input("elixir-client")).unwrap();
+
+    let dir = std::env::temp_dir().join(format!("csilgen-elixir-codec-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    for f in &out.files {
+        std::fs::write(dir.join(&f.path), &f.content).unwrap();
+    }
+    std::fs::write(dir.join("driver.exs"), CODEC_DRIVER_ELIXIR).unwrap();
+
+    let run = std::process::Command::new("elixir")
+        .arg(dir.join("driver.exs"))
+        .output()
+        .unwrap();
+    assert!(
+        run.status.success(),
+        "elixir round-trip failed:\n{}{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&run.stdout).trim(), "ok");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// --- publishable Mix package mode ---------------------------------------------
+
+#[test]
+fn test_package_mode_off_by_default() {
+    // Without `emit_packages`, nothing changes: flat layout, no mix.exs.
+    let input = group_input(
+        "Thing",
+        vec![bare_entry(
+            "a",
+            CsilTypeExpression::Builtin("int".to_string()),
+        )],
+        HashMap::new(),
+    );
+    let out = process_generation(input).unwrap();
+    assert!(!out.files.iter().any(|f| f.path == "mix.exs"));
+    assert!(out.files.iter().any(|f| f.path == "types.gen.ex"));
+}
+
+#[test]
+fn test_package_mode_requires_elixir_member() {
+    // An `emit_packages` array that omits "elixir" must not trigger the package.
+    let input = group_input(
+        "Thing",
+        vec![bare_entry(
+            "a",
+            CsilTypeExpression::Builtin("int".to_string()),
+        )],
+        opts(&[("emit_packages", serde_json::json!(["go", "rust"]))]),
+    );
+    let out = process_generation(input).unwrap();
+    assert!(!out.files.iter().any(|f| f.path == "mix.exs"));
+    assert!(out.files.iter().any(|f| f.path == "types.gen.ex"));
+}
+
+#[test]
+fn test_package_mode_defensive_parse() {
+    // A malformed `emit_packages` (not an array) degrades to no package, never errors.
+    let input = group_input(
+        "Thing",
+        vec![bare_entry(
+            "a",
+            CsilTypeExpression::Builtin("int".to_string()),
+        )],
+        opts(&[("emit_packages", serde_json::json!("elixir"))]),
+    );
+    let out = process_generation(input).unwrap();
+    assert!(!out.files.iter().any(|f| f.path == "mix.exs"));
+}
+
+#[test]
+fn test_package_mode_emits_mix_and_lib_layout() {
+    let input = group_input(
+        "Thing",
+        vec![bare_entry(
+            "a",
+            CsilTypeExpression::Builtin("int".to_string()),
+        )],
+        opts(&[("emit_packages", serde_json::json!(["elixir"]))]),
+    );
+    let out = process_generation(input).unwrap();
+    // mix.exs at root with the default app/version.
+    let mix = file(&out, "mix.exs");
+    assert!(mix.contains("defmodule CsilgenClient.MixProject do"));
+    assert!(mix.contains("app: :csilgen_client"));
+    assert!(mix.contains("version: \"0.1.0\""));
+    assert!(mix.contains("elixir: \"~> 1.14\""));
+    assert!(mix.contains("defp deps do\n    []\n  end"));
+    // Modules move under lib/; the flat path is gone.
+    assert!(out.files.iter().any(|f| f.path == "lib/types.gen.ex"));
+    assert!(!out.files.iter().any(|f| f.path == "types.gen.ex"));
+    // .formatter.exs stays at the root and reaches lib/.
+    let fmt = file(&out, ".formatter.exs");
+    assert!(fmt.contains("lib/**/*.ex"));
+    assert!(out.files.iter().any(|f| f.path == ".formatter.exs"));
+}
+
+#[test]
+fn test_package_mode_honors_name_and_version() {
+    let input = group_input(
+        "Thing",
+        vec![bare_entry(
+            "a",
+            CsilTypeExpression::Builtin("int".to_string()),
+        )],
+        opts(&[
+            ("emit_packages", serde_json::json!(["elixir"])),
+            ("package_name", serde_json::json!("MyCool-App")),
+            ("package_version", serde_json::json!("2.3.4")),
+        ]),
+    );
+    let out = process_generation(input).unwrap();
+    let mix = file(&out, "mix.exs");
+    // package_name is normalized to a valid snake_case atom; module is PascalCased.
+    assert!(mix.contains("app: :my_cool_app"));
+    assert!(mix.contains("defmodule MyCoolApp.MixProject do"));
+    assert!(mix.contains("version: \"2.3.4\""));
+}
+
+/// Build the corndogs `elixir-client` spec in package mode and prove the emitted Mix
+/// project compiles: `mix compile` when Mix is present (no network — deps are empty),
+/// else `elixirc` over `lib/` plus an `elixir`-side parse of `mix.exs`. Skips when no
+/// Elixir toolchain is on PATH.
+#[test]
+fn elixir_package_compiles() {
+    use std::process::Command;
+    if Command::new("elixir").arg("--version").output().is_err() {
+        eprintln!("skipping: no elixir on PATH");
+        return;
+    }
+    let input = WasmGeneratorInput {
+        csil_spec: corndogs_spec(),
+        config: GeneratorConfig {
+            target: "elixir-client".to_string(),
+            output_dir: "/tmp".to_string(),
+            options: opts(&[("emit_packages", serde_json::json!(["elixir"]))]),
+        },
+        generator_metadata: meta(),
+    };
+    let out = process_generation(input).unwrap();
+    assert!(out.files.iter().any(|f| f.path == "mix.exs"));
+    assert!(out.files.iter().all(|f| {
+        // Every Elixir module is under lib/ in package mode; config files stay at root.
+        !f.path.ends_with(".ex") || f.path.starts_with("lib/")
+    }));
+
+    let dir = std::env::temp_dir().join(format!("csilgen-elixir-pkg-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    for f in &out.files {
+        let path = dir.join(&f.path);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, &f.content).unwrap();
+    }
+
+    let have_mix = Command::new("mix")
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+
+    // Prefer the real publish path: a `mix compile` of the project. MIX_ENV=prod and
+    // empty deps keep it offline; clearing MIX_HOME/HOME-derived caches is unnecessary
+    // because nothing is fetched.
+    let compiled_via_mix = have_mix
+        && Command::new("mix")
+            .arg("compile")
+            .current_dir(&dir)
+            .env("MIX_ENV", "prod")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+
+    if !compiled_via_mix {
+        // Fallback for hosts without Mix/Hex: compile the lib modules directly and
+        // confirm mix.exs is at least syntactically valid Elixir.
+        let beam = dir.join("_beam");
+        std::fs::create_dir_all(&beam).unwrap();
+        let mut ec = Command::new("elixirc");
+        ec.arg("-o").arg(&beam);
+        for f in &out.files {
+            if f.path.ends_with(".ex") {
+                ec.arg(dir.join(&f.path));
+            }
+        }
+        let r = ec.output().unwrap();
+        assert!(
+            r.status.success(),
+            "elixirc failed:\n{}{}",
+            String::from_utf8_lossy(&r.stdout),
+            String::from_utf8_lossy(&r.stderr)
+        );
+        let parse = Command::new("elixir")
+            .arg("-e")
+            .arg("File.read!(\"mix.exs\") |> Code.string_to_quoted!()")
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        assert!(
+            parse.status.success(),
+            "mix.exs did not parse:\n{}",
+            String::from_utf8_lossy(&parse.stderr)
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// The generated structs are built with `struct/2` rather than `%Mod{}` literals:
+// a script is compiled as one unit, so a `%Mod{}` literal would expand at compile
+// time before `Code.require_file` has loaded the generated modules; `struct/2`
+// resolves the module at runtime instead.
+const CODEC_DRIVER_ELIXIR: &str = r#"# Load the codec before the types (whose to_cbor calls it) and the client.
+Code.require_file("codec.gen.ex", __DIR__)
+Code.require_file("types.gen.ex", __DIR__)
+Code.require_file("client.gen.ex", __DIR__)
+
+alias Csilgen.Generated.Task
+alias Csilgen.Generated.SubmitTaskRequest
+alias Csilgen.Generated.CorndogsClient
+alias Csilgen.Generated.Note
+
+defmodule Loopback do
+  @moduledoc "A byte-loopback transport: decode the request, re-encode its task."
+  defstruct []
+
+  def call(%Loopback{}, _service, _op, req_bytes) do
+    req = Csilgen.Generated.SubmitTaskRequest.from_cbor(req_bytes)
+    Csilgen.Generated.Task.to_cbor(req.task)
+  end
+end
+
+payload = <<0xDE, 0xAD, 0xBE>>
+
+task =
+  struct(Task,
+    uuid: "u-123",
+    current_state: "PENDING",
+    payload: payload,
+    priority: 7,
+    labels: %{"a" => 1, "b" => 2},
+    tags: ["x", "y"],
+    metrics: %{"hits" => 10, "misses" => 2},
+    notes: %{"n1" => struct(Note, body: "first"), "n2" => struct(Note, body: "second")}
+  )
+
+# Direct codec round-trip through the struct.
+back = Task.from_cbor(Task.to_cbor(task))
+true = back.uuid == "u-123"
+true = back.current_state == "PENDING"
+true = back.payload == payload
+true = back.priority == 7
+true = back.labels == %{"a" => 1, "b" => 2}
+true = back.tags == ["x", "y"]
+
+# A named map alias (StringInt64Map = {* text => int}) used to be stubbed to nil;
+# its entries must survive the round-trip intact.
+true = back.metrics == %{"hits" => 10, "misses" => 2}
+
+# A map-of-record alias (NoteMap = {* text => Note}): each value rehydrates as a
+# Note struct through the referenced record's codec.
+true = back.notes["n1"].body == "first"
+true = back.notes["n2"].body == "second"
+
+# An absent optional must round-trip to nil (omitted from the wire map).
+task2 = struct(task, priority: nil)
+back2 = Task.from_cbor(Task.to_cbor(task2))
+true = back2.priority == nil
+
+# Nested record round-trip.
+req = struct(SubmitTaskRequest, task: task, queue: "default")
+rback = SubmitTaskRequest.from_cbor(SubmitTaskRequest.to_cbor(req))
+true = rback.task.uuid == "u-123"
+true = rback.queue == "default"
+
+# Typed client over the loopback byte carrier.
+client = CorndogsClient.new(struct(Loopback, []))
+result = CorndogsClient.submit_task(client, req)
+true = result.uuid == "u-123"
+true = result.payload == payload
+true = result.priority == 7
+
+IO.puts("ok")
+"#;

@@ -57,9 +57,13 @@ fn module_is_capitalized() {
 }
 
 #[test]
-fn wire_service_strips_service_suffix() {
-    assert_eq!(wire_service_name("CorndogsService"), "Corndogs");
-    assert_eq!(wire_service_name("Attestation"), "Attestation");
+fn wire_service_and_op_match_the_contract() {
+    // The wire service strips `Service` and lowercases; the op is PascalCased (the
+    // wire contract), so an OCaml client routes to the same endpoint as its peers.
+    assert_eq!(wire_service_name("CorndogsService"), "corndogs");
+    assert_eq!(wire_service_name("Attestation"), "attestation");
+    assert_eq!(wire_op_name("deposit-claim"), "DepositClaim");
+    assert_eq!(wire_op_name("submit_task"), "SubmitTask");
 }
 
 // --- type mapping -----------------------------------------------------------
@@ -266,7 +270,7 @@ fn server_module_emits_handler_and_routers() {
     assert!(out.contains("deposit_claim : bytes -> outcome;"));
     // Verbose router dispatches by the verbatim wire op name (kebab preserved).
     assert!(out.contains("let route (h : handler) ~(op : string) ~(payload : bytes) ="));
-    assert!(out.contains("| \"deposit-claim\" -> h.deposit_claim payload"));
+    assert!(out.contains("| \"DepositClaim\" -> h.deposit_claim payload"));
     // Compact router dispatches by ordinal, emitted because the service has a wire id.
     assert!(out.contains("let route_compact (h : handler) ~(op_ord : int64)"));
     assert!(out.contains("| 1L -> h.deposit_claim payload"));
@@ -299,7 +303,7 @@ fn push_op_handler_takes_unit_payload() {
         wire_id: None,
     };
     let out = emit_service_module("Feed", &svc);
-    assert!(out.contains("| \"subscribe\" -> ignore payload; h.subscribe Bytes.empty"));
+    assert!(out.contains("| \"Subscribe\" -> ignore payload; h.subscribe Bytes.empty"));
 }
 
 // --- services: client -------------------------------------------------------
@@ -324,8 +328,8 @@ fn client_module_emits_typed_calls() {
     assert!(out.contains("decode_response : bytes -> deposit_claim_response"));
     // The wire op string is verbatim; the OCaml fn name is snake_case.
     assert!(out.contains("let deposit_claim (c : client)"));
-    assert!(out.contains("~op:\"deposit-claim\""));
-    assert!(out.contains("~service:\"Attestation\""));
+    assert!(out.contains("~op:\"DepositClaim\""));
+    assert!(out.contains("~service:\"attestation\""));
 }
 
 // --- surfaces ---------------------------------------------------------------
@@ -386,7 +390,9 @@ fn typesonly_surface_emits_only_types() {
     let input = service_input("ocaml-typesonly");
     let files = generate_ocaml(&input.csil_spec, &input.config).unwrap();
     let paths: Vec<&str> = files.iter().map(|f| f.path.as_str()).collect();
-    assert_eq!(paths, vec!["types.ml", "types.mli"]);
+    // The codec rides alongside the types (the records' (de)serializers), so a
+    // typesonly consumer gets usable types without a service surface.
+    assert_eq!(paths, vec!["types.ml", "types.mli", "codec.ml"]);
 }
 
 #[test]
@@ -449,4 +455,401 @@ fn meta() -> GeneratorMetadata {
         author: None,
         homepage: None,
     }
+}
+
+// --- codec ------------------------------------------------------------------
+
+fn optional_entry(name: &str, value_type: CsilTypeExpression) -> CsilGroupEntry {
+    CsilGroupEntry {
+        key: Some(CsilGroupKey::Bare(name.to_string())),
+        value_type,
+        occurrence: Some(CsilOccurrence::Optional),
+        metadata: vec![],
+        doc_comments: vec![],
+    }
+}
+
+/// A corndogs-shaped spec: text, bytes, an optional int, an assoc-list map, a list,
+/// a nested record, and a service whose output is a `Res / ServiceError` choice.
+fn corndogs_spec() -> CsilSpecSerialized {
+    let text = || builtin("text");
+    let task = group_rule(
+        "Task",
+        vec![
+            bare_entry("uuid", text()),
+            bare_entry("current_state", text()),
+            bare_entry("payload", builtin("bytes")),
+            optional_entry("priority", builtin("int")),
+            bare_entry(
+                "labels",
+                CsilTypeExpression::Map {
+                    key: Box::new(text()),
+                    value: Box::new(builtin("int")),
+                    occurrence: None,
+                },
+            ),
+            bare_entry(
+                "tags",
+                CsilTypeExpression::Array {
+                    element_type: Box::new(text()),
+                    occurrence: None,
+                },
+            ),
+        ],
+    );
+    let req = group_rule(
+        "SubmitTaskRequest",
+        vec![
+            bare_entry("task", CsilTypeExpression::Reference("Task".into())),
+            bare_entry("queue", text()),
+        ],
+    );
+    let err = group_rule(
+        "ServiceError",
+        vec![
+            bare_entry("code", builtin("int")),
+            bare_entry("message", text()),
+        ],
+    );
+    // A transparent map alias (`StringInt64Map = {* text => int}`) and a
+    // map-of-record alias (`M = {* text => SomeRecord}`): a field typed as either
+    // must encode/decode through its underlying shape, not the `failwith` stub.
+    let string_int64_map = CsilRule {
+        name: "StringInt64Map".into(),
+        rule_type: CsilRuleType::TypeDef(CsilTypeExpression::Map {
+            key: Box::new(text()),
+            value: Box::new(builtin("int")),
+            occurrence: None,
+        }),
+        position: pos(),
+        doc_comments: vec![],
+    };
+    let some_record = group_rule("SomeRecord", vec![bare_entry("name", text())]);
+    let m_alias = CsilRule {
+        name: "M".into(),
+        rule_type: CsilRuleType::TypeDef(CsilTypeExpression::Map {
+            key: Box::new(text()),
+            value: Box::new(CsilTypeExpression::Reference("SomeRecord".into())),
+            occurrence: None,
+        }),
+        position: pos(),
+        doc_comments: vec![],
+    };
+    let alias_holder = group_rule(
+        "AliasHolder",
+        vec![
+            bare_entry(
+                "counts",
+                CsilTypeExpression::Reference("StringInt64Map".into()),
+            ),
+            bare_entry("by_name", CsilTypeExpression::Reference("M".into())),
+        ],
+    );
+    let svc = CsilRule {
+        name: "CorndogsService".into(),
+        rule_type: CsilRuleType::ServiceDef(CsilServiceDefinition {
+            operations: vec![CsilServiceOperation {
+                name: "submit-task".into(),
+                input_type: CsilTypeExpression::Reference("SubmitTaskRequest".into()),
+                output_type: CsilTypeExpression::Choice(vec![
+                    CsilTypeExpression::Reference("Task".into()),
+                    CsilTypeExpression::Reference("ServiceError".into()),
+                ]),
+                direction: CsilServiceDirection::Unidirectional,
+                position: pos(),
+                doc_comments: vec![],
+                wire_id: None,
+            }],
+            wire_id: None,
+        }),
+        position: pos(),
+        doc_comments: vec![],
+    };
+    CsilSpecSerialized {
+        rules: vec![
+            task,
+            req,
+            err,
+            string_int64_map,
+            some_record,
+            m_alias,
+            alias_holder,
+            svc,
+        ],
+        source_content: None,
+        service_count: 1,
+        fields_with_metadata_count: 0,
+    }
+}
+
+#[test]
+fn codec_emitted_with_typed_client() {
+    let spec = corndogs_spec();
+    let codec = generate_codec(&spec).expect("codec emitted");
+    assert!(codec.contains("module Cbor = struct"));
+    assert!(codec.contains("let encode_task_bytes (v : task) : bytes"));
+    assert!(codec.contains("let decode_submit_task_request_bytes"));
+    // bytes -> Cbor.Bytes (major type 2); text -> Cbor.Text.
+    assert!(codec.contains("(Cbor.Bytes v.payload)"));
+    assert!(codec.contains("(Cbor.Text v.uuid)"));
+
+    let client = generate_client(&spec);
+    // Typed seam: a typed request in, a typed reply out, codec called internally.
+    assert!(client.contains(
+        "let submit_task (c : client) (req : submit_task_request) : (task, string) result"
+    ));
+    assert!(client.contains("Codec.encode_submit_task_request_bytes req"));
+    assert!(client.contains("Codec.decode_task_bytes payload"));
+}
+
+/// Compile the generated OCaml and round-trip a typed request/response with dune.
+/// Skips cleanly when dune/ocaml is not on PATH so the suite stays portable.
+#[test]
+fn codec_round_trips_through_dune() {
+    let have = std::process::Command::new("dune")
+        .arg("--version")
+        .output()
+        .is_ok();
+    if !have {
+        eprintln!("skipping: no dune on PATH");
+        return;
+    }
+    let spec = corndogs_spec();
+    let cfg = GeneratorConfig {
+        target: "ocaml-client".into(),
+        output_dir: "/tmp".into(),
+        options: HashMap::new(),
+    };
+    let files = generate_ocaml(&spec, &cfg).unwrap();
+
+    let dir = std::env::temp_dir().join(format!("csilgen-ocaml-codec-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    for f in &files {
+        std::fs::write(dir.join(&f.path), &f.content).unwrap();
+    }
+    std::fs::write(dir.join("dune-project"), "(lang dune 3.0)\n").unwrap();
+    std::fs::write(
+        dir.join("dune"),
+        "(executable (name test) (modules types codec client test))\n",
+    )
+    .unwrap();
+    std::fs::write(dir.join("test.ml"), CODEC_DRIVER_OCAML).unwrap();
+
+    let run = std::process::Command::new("dune")
+        .arg("exec")
+        .arg("--profile")
+        .arg("release")
+        .arg("--root")
+        .arg(&dir)
+        .arg("./test.exe")
+        .output()
+        .unwrap();
+    assert!(
+        run.status.success(),
+        "ocaml round-trip failed:\n{}{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&run.stdout).trim(), "ok");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+const CODEC_DRIVER_OCAML: &str = r#"let () =
+  let payload = Bytes.of_string "\xde\xad\xbe" in
+  let task : Types.task =
+    {
+      uuid = "u-123";
+      current_state = "PENDING";
+      payload;
+      priority = Some 7L;
+      labels = [ ("a", 1L); ("b", 2L) ];
+      tags = [ "x"; "y" ];
+    }
+  in
+  let req : Types.submit_task_request = { task; queue = "default" } in
+  (* direct codec round-trip through the nested record *)
+  let bytes = Codec.encode_submit_task_request_bytes req in
+  let back = Codec.decode_submit_task_request_bytes bytes in
+  assert (back.task.uuid = "u-123");
+  assert (back.task.current_state = "PENDING");
+  assert (Bytes.equal back.task.payload payload);
+  assert (back.task.priority = Some 7L);
+  assert (back.task.labels = [ ("a", 1L); ("b", 2L) ]);
+  assert (back.task.tags = [ "x"; "y" ]);
+  assert (back.queue = "default");
+  (* an absent optional must round-trip to None *)
+  let req2 = { req with task = { task with priority = None } } in
+  let back2 = Codec.decode_submit_task_request_bytes (Codec.encode_submit_task_request_bytes req2) in
+  assert (back2.task.priority = None);
+  (* typed client over a loopback carrier: decode the request, encode its task *)
+  let call ~service:_ ~op:_ ~payload =
+    let in_ = Codec.decode_submit_task_request_bytes payload in
+    Ok (Codec.encode_task_bytes in_.task)
+  in
+  let c = Client.make_client ~call in
+  (match Client.Corndogs_service.submit_task c req with
+   | Ok t ->
+     assert (t.uuid = "u-123");
+     assert (Bytes.equal t.payload payload);
+     assert (t.priority = Some 7L)
+   | Error e -> failwith e);
+  (* a named map alias and a map-of-record alias must survive the round-trip
+     intact rather than being stubbed to an empty list / failwith *)
+  let holder : Types.alias_holder =
+    {
+      counts = [ ("a", 1L); ("b", 2L) ];
+      by_name = [ ("first", { Types.name = "alice" }); ("second", { Types.name = "bob" }) ];
+    }
+  in
+  let holder_back =
+    Codec.decode_alias_holder_bytes (Codec.encode_alias_holder_bytes holder)
+  in
+  assert (holder_back.counts = [ ("a", 1L); ("b", 2L) ]);
+  assert (List.length holder_back.by_name = 2);
+  assert ((List.assoc "first" holder_back.by_name).name = "alice");
+  assert ((List.assoc "second" holder_back.by_name).name = "bob");
+  print_string "ok\n"
+"#;
+
+// --- self-contained package mode --------------------------------------------
+
+/// A `GeneratorConfig` for `target` whose `emit_packages` option is the given JSON
+/// array (or absent when `None`), so a test can request — or not — a package.
+fn package_config(target: &str, emit_packages: Option<serde_json::Value>) -> GeneratorConfig {
+    let mut options = HashMap::new();
+    if let Some(langs) = emit_packages {
+        options.insert("emit_packages".to_string(), langs);
+    }
+    GeneratorConfig {
+        target: target.into(),
+        output_dir: "/tmp".into(),
+        options,
+    }
+}
+
+#[test]
+fn package_files_absent_without_request() {
+    // No `emit_packages`: the output is the unchanged flat surface (no scaffolding,
+    // modules at the root rather than under `lib/`).
+    let spec = corndogs_spec();
+    let cfg = package_config("ocaml-client", None);
+    let files = generate_ocaml(&spec, &cfg).unwrap();
+    let paths: Vec<&str> = files.iter().map(|f| f.path.as_str()).collect();
+    assert!(paths.contains(&"types.ml"));
+    assert!(paths.contains(&"client.ml"));
+    assert!(!paths.contains(&"dune-project"));
+    assert!(!paths.iter().any(|p| p.ends_with(".opam")));
+    assert!(!paths.iter().any(|p| p.starts_with("lib/")));
+}
+
+#[test]
+fn package_files_absent_when_other_language_requested() {
+    // A shared `emit_packages` naming only other languages must leave OCaml output
+    // byte-identical to the no-option case.
+    let spec = corndogs_spec();
+    let cfg = package_config("ocaml-client", Some(serde_json::json!(["go", "rust"])));
+    let files = generate_ocaml(&spec, &cfg).unwrap();
+    let paths: Vec<&str> = files.iter().map(|f| f.path.as_str()).collect();
+    assert!(!paths.contains(&"dune-project"));
+    assert!(!paths.iter().any(|p| p.starts_with("lib/")));
+}
+
+#[test]
+fn package_files_emitted_when_ocaml_requested() {
+    let spec = corndogs_spec();
+    let cfg = package_config("ocaml-client", Some(serde_json::json!(["go", "ocaml"])));
+    let files = generate_ocaml(&spec, &cfg).unwrap();
+    let paths: Vec<&str> = files.iter().map(|f| f.path.as_str()).collect();
+
+    // The package name derives from the lone service (`CorndogsService`), sanitized
+    // to a valid OCaml library name.
+    assert!(paths.contains(&"dune-project"));
+    assert!(paths.contains(&"corndogs_service.opam"));
+    assert!(paths.contains(&"lib/dune"));
+    // The generated modules are relocated under `lib/`, none left at the root.
+    assert!(paths.contains(&"lib/types.ml"));
+    assert!(paths.contains(&"lib/codec.ml"));
+    assert!(paths.contains(&"lib/client.ml"));
+    assert!(!paths.contains(&"types.ml"));
+
+    let lib_dune = files.iter().find(|f| f.path == "lib/dune").unwrap();
+    assert!(lib_dune.content.contains("(name corndogs_service)"));
+    assert!(lib_dune.content.contains("(public_name corndogs_service)"));
+    let project = files.iter().find(|f| f.path == "dune-project").unwrap();
+    assert!(project.content.contains("(lang dune 3.0)"));
+    assert!(project.content.contains("(name corndogs_service)"));
+}
+
+#[test]
+fn package_name_and_version_overrides_apply() {
+    let spec = corndogs_spec();
+    let mut options = HashMap::new();
+    options.insert("emit_packages".to_string(), serde_json::json!(["ocaml"]));
+    // A non-identifier override is sanitized to a valid OCaml lib name.
+    options.insert("package_name".to_string(), serde_json::json!("My-Cool Lib"));
+    options.insert("package_version".to_string(), serde_json::json!("2.3.4"));
+    let cfg = GeneratorConfig {
+        target: "ocaml-client".into(),
+        output_dir: "/tmp".into(),
+        options,
+    };
+    let files = generate_ocaml(&spec, &cfg).unwrap();
+    let paths: Vec<&str> = files.iter().map(|f| f.path.as_str()).collect();
+    assert!(paths.contains(&"my_cool_lib.opam"));
+    assert!(paths.contains(&"lib/types.ml"));
+    let opam = files.iter().find(|f| f.path == "my_cool_lib.opam").unwrap();
+    assert!(opam.content.contains("version: \"2.3.4\""));
+}
+
+#[test]
+fn sanitize_lib_name_produces_valid_names() {
+    assert_eq!(sanitize_lib_name("CorndogsService"), "corndogs_service");
+    assert_eq!(sanitize_lib_name("My-Cool Lib"), "my_cool_lib");
+    // A leading digit is illegal for an OCaml lib name, so it gets a letter prefix.
+    assert_eq!(sanitize_lib_name("3things"), "csil_3_things");
+}
+
+/// Generate an `ocaml-client` package into a temp dir and run `dune build` to prove
+/// the emitted dune/opam scaffolding plus relocated modules form a buildable
+/// package. Skips cleanly when dune is absent so the suite stays portable.
+#[test]
+fn package_builds_with_dune() {
+    let have = std::process::Command::new("dune")
+        .arg("--version")
+        .output()
+        .is_ok();
+    if !have {
+        eprintln!("skipping: no dune on PATH");
+        return;
+    }
+    let spec = corndogs_spec();
+    let cfg = package_config("ocaml-client", Some(serde_json::json!(["ocaml"])));
+    let files = generate_ocaml(&spec, &cfg).unwrap();
+
+    let dir = std::env::temp_dir().join(format!("csilgen-ocaml-pkg-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    for f in &files {
+        let path = dir.join(&f.path);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, &f.content).unwrap();
+    }
+
+    // The release profile mirrors the codec round-trip test: the generated source is
+    // warning-clean there, so the build proves the package shape, not lint policy.
+    let run = std::process::Command::new("dune")
+        .arg("build")
+        .arg("--profile")
+        .arg("release")
+        .arg("--root")
+        .arg(&dir)
+        .output()
+        .unwrap();
+    assert!(
+        run.status.success(),
+        "dune build of generated package failed:\n{}{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }

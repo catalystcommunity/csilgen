@@ -30,8 +30,11 @@ fn client_method_is_snake_case_and_wire_strings_are_verbatim() {
     assert!(client.contains("def initialize(transport)"));
     // snake_case Ruby method name...
     assert!(client.contains("def submit_task(req)"));
-    // ...but verbatim wire service (lowercased base) + PascalCase wire method.
-    assert!(client.contains("@transport.call(\"corndogs\", \"SubmitTask\", req)"));
+    // ...but verbatim wire service (lowercased base) + PascalCase wire method, over
+    // the dumb byte seam: the request self-encodes, the reply self-decodes.
+    assert!(client.contains(
+        "SubmitTaskResponse.from_cbor(@transport.call(\"corndogs\", \"SubmitTask\", req.to_cbor))"
+    ));
     // The ServiceError arm is stripped from the documented success type.
     assert!(client.contains("-> SubmitTaskResponse"));
 }
@@ -50,7 +53,8 @@ fn null_input_op_takes_no_request_param() {
     )]);
     let client = file(&s, "ruby-client", "client.rb");
     assert!(client.contains("def ping\n"));
-    assert!(client.contains("@transport.call(\"events\", \"Ping\", nil)"));
+    // A null-input op sends an empty byte payload (no request body).
+    assert!(client.contains("@transport.call(\"events\", \"Ping\", \"\".b)"));
 }
 
 #[test]

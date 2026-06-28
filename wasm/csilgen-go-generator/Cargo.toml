@@ -8,8 +8,10 @@ description = "Go code generator for CSIL specifications"
 homepage = "https://github.com/catalystcommunity/csilgen"
 repository = "https://github.com/catalystcommunity/csilgen"
 
+# rlib alongside cdylib so the crate's own integration tests can link it and drive
+# generation (and compile the emitted Go) directly, not just through the wasm export.
 [lib]
-crate-type = ["cdylib"]
+crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 csilgen-common = { path = "../../crates/csilgen-common", version = "0.1.0" }

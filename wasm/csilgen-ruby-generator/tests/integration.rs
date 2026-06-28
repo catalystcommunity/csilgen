@@ -92,7 +92,9 @@ fn typesonly_target_emits_only_types() {
         ),
     ]);
     let p = paths(&s, "ruby-typesonly");
-    assert_eq!(p, vec!["types.rb".to_string()]);
+    // The per-type CBOR codec rides alongside the types so a typesonly consumer gets
+    // wire-ready value classes.
+    assert_eq!(p, vec!["types.rb".to_string(), "codec.rb".to_string()]);
 }
 
 #[test]
