@@ -294,6 +294,27 @@ fn default_package_token(input: &WasmGeneratorInput) -> String {
         .unwrap_or_else(|| "csilgenclient".to_string())
 }
 
+/// Reduce a module path (or any slash/dot-bearing coordinate) to a legal Go package
+/// identifier: the last path segment, lowercased, with every character outside
+/// `[a-z0-9_]` dropped. Go's `package` clause must be a bare identifier even though
+/// the module path naming that same package is a full slash path, so
+/// `github.com/org/corndogsapi` collapses to `corndogsapi`. A leading digit (illegal
+/// to start a Go identifier) is prefixed with `_`, and a segment that sanitizes to
+/// nothing falls back to `api`, so the emitted clause always compiles.
+fn go_package_ident(source: &str) -> String {
+    let segment = source.rsplit('/').next().unwrap_or(source);
+    let ident: String = segment
+        .to_lowercase()
+        .chars()
+        .filter(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == '_')
+        .collect();
+    match ident.chars().next() {
+        None => "api".to_string(),
+        Some(first) if first.is_ascii_digit() => format!("_{ident}"),
+        Some(_) => ident,
+    }
+}
+
 /// The package version. Go modules carry their version in VCS tags rather than in
 /// `go.mod`, so this feeds only the README; the accessor is kept so it matches the
 /// `package_version` option the sibling language generators read.
@@ -371,16 +392,16 @@ impl GoConfig {
     fn from_options(options: &HashMap<String, serde_json::Value>) -> Result<Self, i32> {
         let go_package = options.get("go_package").and_then(|v| v.as_str());
 
-        // Extract package name from go_package option (last path component)
-        let package_name = if let Some(pkg) = go_package {
-            pkg.split('/').next_back().unwrap_or("api").to_string()
-        } else {
-            options
-                .get("package_name")
-                .and_then(|v| v.as_str())
-                .unwrap_or("api")
-                .to_string()
-        };
+        // The Go *package clause* must be a bare identifier, yet the same coordinate
+        // doubles as the `go.mod` module path / import path, which is a slash path.
+        // Derive the clause from the last path segment of whichever coordinate was
+        // supplied (`go_package` taking precedence over `package_name`) so a single
+        // path-style value — e.g. `github.com/org/corndogsapi` — yields both a valid
+        // `module github.com/org/corndogsapi` line and a valid `package corndogsapi`.
+        let ident_source = go_package
+            .or_else(|| options.get("package_name").and_then(|v| v.as_str()))
+            .unwrap_or("api");
+        let package_name = go_package_ident(ident_source);
 
         // Optionally derive output subdirectory from go_module and go_package.
         // If go_module is provided, strip it from go_package to get the relative path.
@@ -3457,6 +3478,28 @@ mod tests {
         assert_eq!(pascal_case("openbao_installed"), "OpenbaoInstalled");
         assert_eq!(pascal_case("dns_zones_created"), "DnsZonesCreated");
         assert_eq!(pascal_case("k8s_installed"), "K8sInstalled");
+    }
+
+    #[test]
+    fn test_go_package_ident() {
+        // Bare identifiers pass through unchanged.
+        assert_eq!(go_package_ident("corndogsapi"), "corndogsapi");
+        assert_eq!(go_package_ident("echoclient"), "echoclient");
+        // A full module path collapses to its sanitized last segment.
+        assert_eq!(
+            go_package_ident("github.com/CatalystCommunity/corndogs/gen/corndogsapi"),
+            "corndogsapi"
+        );
+        // Mixed case and disallowed characters are stripped to a legal identifier.
+        assert_eq!(
+            go_package_ident("github.com/org/Corn-Dogs.API"),
+            "corndogsapi"
+        );
+        // A leading digit is illegal to start a Go identifier, so it is prefixed.
+        assert_eq!(go_package_ident("github.com/org/2fa"), "_2fa");
+        // A segment with nothing legal left falls back rather than emitting `package `.
+        assert_eq!(go_package_ident("github.com/org/---"), "api");
+        assert_eq!(go_package_ident(""), "api");
     }
 
     #[test]

@@ -211,6 +211,42 @@ fn module_path_defaults_to_example_domain_when_unset() {
     );
 }
 
+#[test]
+fn path_style_package_name_splits_module_path_from_package_clause() {
+    // The natural input for a `require`+`replace` consumer is a real module path.
+    // It must land verbatim in go.mod's module line, while every `.go` file's
+    // `package` clause uses the bare, sanitized last segment (a path there would not
+    // compile).
+    let options = opts(&[
+        (
+            "package_name",
+            serde_json::json!("github.com/CatalystCommunity/corndogs/gen/corndogsapi"),
+        ),
+        ("emit_packages", serde_json::json!(["go"])),
+    ]);
+    let files = generate_go_files(input("go-client", options)).unwrap();
+
+    let go_mod = find(&files, "go.mod").unwrap();
+    assert_eq!(
+        go_mod.content.lines().next(),
+        Some("module github.com/CatalystCommunity/corndogs/gen/corndogsapi"),
+        "module line must keep the full path: {}",
+        go_mod.content
+    );
+
+    let client = find(&files, "client.gen.go").expect("client source should be emitted");
+    assert!(
+        client.content.contains("package corndogsapi\n"),
+        "package clause must be the sanitized last segment, not the path: {}",
+        client.content
+    );
+    assert!(
+        client.content.contains("// Package corndogsapi "),
+        "package doc comment must use the bare identifier, not the path: {}",
+        client.content
+    );
+}
+
 /// Generate a `go-client` package into a temp dir and run `go build ./...` there to
 /// prove the emitted output is a genuinely valid, buildable, dependency-free module.
 /// Hermetic: no toolchain download, no module proxy, isolated build cache. Skips
@@ -226,8 +262,15 @@ fn generated_module_go_builds() {
         return;
     }
 
+    // A path-style package_name is the dogfooding case: a real module path a
+    // consumer can require+replace. The emitted go.mod must carry the full path while
+    // the package clauses use the derived bare identifier, and the whole thing must
+    // still compile.
     let options = opts(&[
-        ("package_name", serde_json::json!("echoclient")),
+        (
+            "package_name",
+            serde_json::json!("github.com/CatalystCommunity/corndogs/gen/corndogsapi"),
+        ),
         ("emit_packages", serde_json::json!(["go"])),
     ]);
     let files = generate_go_files(input("go-client", options)).unwrap();
