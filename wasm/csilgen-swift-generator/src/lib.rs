@@ -288,11 +288,15 @@ fn build_files(input: &WasmGeneratorInput) -> Result<Vec<GeneratedFile>, i32> {
     if let Some(pkg) = SwiftPackage::from_config(input) {
         files = wrap_as_package(files, &pkg);
         // The README sits at the package root (beside Package.swift), not under
-        // Sources/, so it is not a compiled source.
-        files.push(GeneratedFile {
-            path: "README.md".to_string(),
-            content: swift_readme(input, &pkg),
-        });
+        // Sources/, so it is not a compiled source. It is opt-out: an explicit
+        // `emit_readme: false` suppresses it, while an absent, non-bool, or `true`
+        // value keeps the default emission.
+        if emit_readme_enabled(&input.config.options) {
+            files.push(GeneratedFile {
+                path: "README.md".to_string(),
+                content: swift_readme(input, &pkg),
+            });
+        }
     }
 
     Ok(files)
@@ -356,6 +360,12 @@ fn emit_packages_includes(
         .get("emit_packages")
         .and_then(serde_json::Value::as_array)
         .is_some_and(|arr| arr.iter().any(|v| v.as_str() == Some(lang)))
+}
+
+/// Whether the package README should be emitted. Only an explicit `emit_readme: false`
+/// opts out; any other value (absent, non-bool, or `true`) keeps the README.
+fn emit_readme_enabled(options: &std::collections::HashMap<String, serde_json::Value>) -> bool {
+    options.get("emit_readme").and_then(|v| v.as_bool()) != Some(false)
 }
 
 /// Relocate the generated `.swift` sources under `Sources/<Target>/` (SwiftPM's

@@ -665,6 +665,42 @@ fn package_readme_has_quickstart_carrier_and_example() {
     );
 }
 
+/// In package mode the README is emitted by default, and an explicit
+/// `emit_readme: false` suppresses only the README — the rest of the package
+/// (barrel, `package.json`, `tsconfig.json`) is unaffected.
+#[test]
+fn package_readme_opt_out_suppresses_only_readme() {
+    let mut input = input_with_spec("typescript", pingpong_spec());
+    input.config.options.insert(
+        "emit_packages".to_string(),
+        serde_json::json!(["typescript"]),
+    );
+
+    // Default: README present alongside the rest of the package scaffolding.
+    let files = generate_files(&input).expect("generate");
+    assert!(
+        files.iter().any(|f| f.path == "README.md"),
+        "README must be emitted by default in package mode"
+    );
+
+    // Explicit opt-out: README gone, everything else still present.
+    input
+        .config
+        .options
+        .insert("emit_readme".to_string(), serde_json::json!(false));
+    let files = generate_files(&input).expect("generate");
+    assert!(
+        !files.iter().any(|f| f.path == "README.md"),
+        "emit_readme: false must suppress the README"
+    );
+    for path in ["index.ts", "package.json", "tsconfig.json"] {
+        assert!(
+            files.iter().any(|f| f.path == path),
+            "emit_readme: false must leave {path} untouched"
+        );
+    }
+}
+
 /// End-to-end proof the README Quickstart carrier actually works: extract the `ts`
 /// block verbatim and run it under `node` against an in-process CSIL-RPC echo (a
 /// `fetch` stub that decodes the request envelope and echoes the tag-24 inner payload

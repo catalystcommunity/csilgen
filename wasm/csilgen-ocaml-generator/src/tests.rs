@@ -857,6 +857,28 @@ fn package_readme_absent_without_request() {
 }
 
 #[test]
+fn package_readme_opt_out_suppresses_only_readme() {
+    let spec = pingpong_spec();
+
+    // By default the README is emitted alongside the package scaffolding.
+    let default_cfg = package_config("ocaml-client", Some(serde_json::json!(["ocaml"])));
+    let default_files = generate_ocaml(&spec, &default_cfg).unwrap();
+    assert!(default_files.iter().any(|f| f.path == "README.md"));
+
+    // An explicit `emit_readme: false` suppresses only the README; the dune/opam
+    // scaffolding and the relocated sources are unchanged.
+    let mut cfg = package_config("ocaml-client", Some(serde_json::json!(["ocaml"])));
+    cfg.options
+        .insert("emit_readme".to_string(), serde_json::json!(false));
+    let files = generate_ocaml(&spec, &cfg).unwrap();
+    let paths: Vec<&str> = files.iter().map(|f| f.path.as_str()).collect();
+    assert!(!paths.contains(&"README.md"));
+    assert!(paths.contains(&"dune-project"));
+    assert!(paths.iter().any(|p| p.ends_with(".opam")));
+    assert!(paths.contains(&"lib/types.ml"));
+}
+
+#[test]
 fn package_files_absent_when_other_language_requested() {
     // A shared `emit_packages` naming only other languages must leave OCaml output
     // byte-identical to the no-option case.

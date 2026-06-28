@@ -1241,6 +1241,54 @@ fn pubspec_emitted_iff_emit_packages_includes_dart() {
 }
 
 #[test]
+fn emit_readme_false_suppresses_only_the_readme() {
+    let rules = || {
+        vec![record_rule(
+            "User",
+            vec![entry("name", builtin("text"), false)],
+        )]
+    };
+
+    // Default package mode: the README rides along.
+    let with_readme = generate_dart_code(
+        &spec(rules(), 0),
+        &config_with("dart", &[("emit_packages", serde_json::json!(["dart"]))]),
+    )
+    .unwrap();
+    assert!(
+        with_readme.iter().any(|f| f.path == "README.md"),
+        "README emitted by default in package mode"
+    );
+
+    // Only an explicit `emit_readme: false` drops it; the rest of the package stays.
+    let without_readme = generate_dart_code(
+        &spec(rules(), 0),
+        &config_with(
+            "dart",
+            &[
+                ("emit_packages", serde_json::json!(["dart"])),
+                ("emit_readme", serde_json::json!(false)),
+            ],
+        ),
+    )
+    .unwrap();
+    assert!(
+        !without_readme.iter().any(|f| f.path == "README.md"),
+        "emit_readme: false suppresses the README"
+    );
+    assert!(
+        without_readme.iter().any(|f| f.path == "pubspec.yaml"),
+        "the rest of the package is untouched"
+    );
+    assert!(
+        without_readme
+            .iter()
+            .any(|f| f.path == "lib/types.gen.dart"),
+        "generated dart still moves under lib/"
+    );
+}
+
+#[test]
 fn package_name_is_normalized_to_a_valid_pub_name() {
     // A PascalCase package_name is normalized to lowercase_with_underscores so the
     // emitted pubspec always names a publishable package.

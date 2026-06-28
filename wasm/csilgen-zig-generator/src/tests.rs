@@ -985,6 +985,36 @@ fn readme_absent_without_emit_packages() {
 }
 
 #[test]
+fn package_readme_present_by_default_in_package_mode() {
+    let mut options = HashMap::new();
+    options.insert("emit_packages".to_string(), serde_json::json!(["zig"]));
+    let input = input_with_rules(pingpong_rules(), "zig-client", options);
+    let files = process_generation(input).expect("generate").files;
+    assert!(
+        files.iter().any(|f| f.path == "README.md"),
+        "README.md must be emitted by default in package mode"
+    );
+}
+
+#[test]
+fn emit_readme_false_suppresses_only_the_readme() {
+    let mut options = HashMap::new();
+    options.insert("emit_packages".to_string(), serde_json::json!(["zig"]));
+    options.insert("emit_readme".to_string(), serde_json::json!(false));
+    let input = input_with_rules(pingpong_rules(), "zig-client", options);
+    let files = process_generation(input).expect("generate").files;
+    assert!(
+        !files.iter().any(|f| f.path == "README.md"),
+        "explicit emit_readme:false must suppress README.md"
+    );
+    // Suppressing the README must not disturb any other package output.
+    assert!(
+        files.iter().any(|f| f.path != "README.md"),
+        "package output other than the README must still be emitted"
+    );
+}
+
+#[test]
 fn package_readme_has_quickstart_carrier_and_example() {
     let mut options = HashMap::new();
     options.insert("emit_packages".to_string(), serde_json::json!(["zig"]));

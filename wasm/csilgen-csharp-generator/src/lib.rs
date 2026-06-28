@@ -318,10 +318,21 @@ pub fn render(input: WasmGeneratorInput) -> Result<WasmGeneratorOutput, i32> {
             path: format!("{}.csproj", coords.package_id),
             content: csproj_file(&coords),
         });
-        files.push(GeneratedFile {
-            path: "README.md".to_string(),
-            content: readme_file(&input, &config, &coords),
-        });
+        // The README is opt-out: only an explicit `emit_readme: false` suppresses it.
+        // Absent / non-bool / `true` all keep the prior behavior so existing consumers
+        // see no change.
+        let emit_readme = input
+            .config
+            .options
+            .get("emit_readme")
+            .and_then(|v| v.as_bool())
+            != Some(false);
+        if emit_readme {
+            files.push(GeneratedFile {
+                path: "README.md".to_string(),
+                content: readme_file(&input, &config, &coords),
+            });
+        }
     }
 
     let total_size: usize = files.iter().map(|f| f.content.len()).sum();
@@ -3380,6 +3391,34 @@ mod tests {
         ))
         .expect("generation ok");
         assert!(packaged.files.iter().any(|f| f.path == "README.md"));
+    }
+
+    #[test]
+    fn emit_readme_false_suppresses_only_the_readme() {
+        // Default package mode: the README is present.
+        let with_readme = render(input_with_options(
+            "csharp-client",
+            &[("emit_packages", serde_json::json!(["csharp"]))],
+        ))
+        .expect("generation ok");
+        assert!(with_readme.files.iter().any(|f| f.path == "README.md"));
+
+        // Only an explicit `emit_readme: false` drops it; the `.csproj` stays.
+        let without_readme = render(input_with_options(
+            "csharp-client",
+            &[
+                ("emit_packages", serde_json::json!(["csharp"])),
+                ("emit_readme", serde_json::json!(false)),
+            ],
+        ))
+        .expect("generation ok");
+        assert!(!without_readme.files.iter().any(|f| f.path == "README.md"));
+        assert!(
+            without_readme
+                .files
+                .iter()
+                .any(|f| f.path.ends_with(".csproj"))
+        );
     }
 
     #[test]

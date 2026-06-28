@@ -655,10 +655,19 @@ fn process_generation(input: WasmGeneratorInput) -> Result<WasmGeneratorOutput, 
         apply_elixir_package(&mut files, &config);
         // The README rides with the publishable package only; its Quickstart names the
         // generated modules, so it stays at the root (Mix expects README.md there).
-        files.push(GeneratedFile {
-            path: "README.md".to_string(),
-            content: readme(&input, &config),
-        });
+        // Only an explicit `emit_readme: false` suppresses it; absent or non-bool keeps it.
+        if input
+            .config
+            .options
+            .get("emit_readme")
+            .and_then(|v| v.as_bool())
+            != Some(false)
+        {
+            files.push(GeneratedFile {
+                path: "README.md".to_string(),
+                content: readme(&input, &config),
+            });
+        }
     }
 
     let total_size: usize = files.iter().map(|f| f.content.len()).sum();

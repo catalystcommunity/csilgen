@@ -690,11 +690,18 @@ pub fn generate_dart_code(
             dart.cfg.decimal_mapping,
         );
         let mut pkg = into_dart_package(files, &package_name, &package_version);
-        // The README rides at the package root beside pubspec.yaml, not under lib/.
-        pkg.push(GeneratedFile {
-            path: "README.md".to_string(),
-            content: readme,
-        });
+        // The README is opt-out: only an explicit `emit_readme: false` suppresses it.
+        // Absent / non-bool / `true` all keep the prior behavior so existing consumers
+        // see no change.
+        let emit_readme =
+            config.options.get("emit_readme").and_then(|v| v.as_bool()) != Some(false);
+        if emit_readme {
+            // The README rides at the package root beside pubspec.yaml, not under lib/.
+            pkg.push(GeneratedFile {
+                path: "README.md".to_string(),
+                content: readme,
+            });
+        }
         Ok(pkg)
     } else {
         Ok(files)

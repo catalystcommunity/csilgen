@@ -688,7 +688,17 @@ fn generate_java(input: &WasmGeneratorInput) -> Result<Vec<GeneratedFile>, i32> 
     // build descriptor. Emitted after import-hoisting since the pom is not Java source.
     if config.package_mode {
         files.push(generate_pom(&config));
-        files.push(generate_readme(input, &config));
+        // Only an explicit `emit_readme: false` suppresses the README; absent or non-bool
+        // leaves the publishable package's Quickstart in place.
+        if input
+            .config
+            .options
+            .get("emit_readme")
+            .and_then(|v| v.as_bool())
+            != Some(false)
+        {
+            files.push(generate_readme(input, &config));
+        }
     }
 
     Ok(files)
@@ -3768,6 +3778,37 @@ public final class PomCheck {
         ))
         .unwrap();
         assert!(pkg.iter().any(|f| f.path == "README.md"));
+    }
+
+    /// `emit_readme: false` suppresses only the README; the rest of the package (notably the
+    /// pom and the laid-out sources) is unchanged.
+    #[test]
+    fn emit_readme_false_suppresses_only_readme() {
+        let on = generate_java(&package_input(
+            "java-client",
+            &[("emit_packages", serde_json::json!(["java"]))],
+        ))
+        .unwrap();
+        assert!(on.iter().any(|f| f.path == "README.md"));
+
+        let off = generate_java(&package_input(
+            "java-client",
+            &[
+                ("emit_packages", serde_json::json!(["java"])),
+                ("emit_readme", serde_json::json!(false)),
+            ],
+        ))
+        .unwrap();
+        assert!(!off.iter().any(|f| f.path == "README.md"));
+        // Everything other than the README is still emitted.
+        assert!(off.iter().any(|f| f.path == "pom.xml"));
+        let on_without_readme: Vec<_> = on
+            .iter()
+            .filter(|f| f.path != "README.md")
+            .map(|f| &f.path)
+            .collect();
+        let off_paths: Vec<_> = off.iter().map(|f| &f.path).collect();
+        assert_eq!(on_without_readme, off_paths);
     }
 
     /// The client README's Quickstart must be a complete, self-describing CSIL-RPC

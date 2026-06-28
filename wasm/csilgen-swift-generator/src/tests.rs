@@ -1055,6 +1055,39 @@ fn package_readme_absent_without_request() {
 }
 
 #[test]
+fn package_readme_opt_out_suppresses_only_readme() {
+    // By default the README rides at the package root in package mode.
+    let default_input = input_with_options(
+        "swift-client",
+        pingpong_rules(),
+        1,
+        vec![
+            ("emit_packages", serde_json::json!(["swift"])),
+            ("package_name", serde_json::json!("Echo")),
+        ],
+    );
+    let default_files = build_files(&default_input).expect("ok");
+    assert!(default_files.iter().any(|f| f.path == "README.md"));
+
+    // An explicit `emit_readme: false` suppresses only the README; the manifest and the
+    // relocated sources are unchanged.
+    let input = input_with_options(
+        "swift-client",
+        pingpong_rules(),
+        1,
+        vec![
+            ("emit_packages", serde_json::json!(["swift"])),
+            ("package_name", serde_json::json!("Echo")),
+            ("emit_readme", serde_json::json!(false)),
+        ],
+    );
+    let files = build_files(&input).expect("ok");
+    assert!(!files.iter().any(|f| f.path == "README.md"));
+    assert!(files.iter().any(|f| f.path == "Package.swift"));
+    assert!(files.iter().any(|f| f.path == "Sources/Echo/Types.swift"));
+}
+
+#[test]
 fn empty_package_name_falls_back_to_default() {
     let input = input_with_options(
         "swift",
