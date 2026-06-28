@@ -12,7 +12,7 @@ use csilgen_common::{
     GeneratorCapability, GeneratorConfig, GeneratorMetadata, GeneratorWarning, Result,
     WasmGeneratorInput, WasmGeneratorOutput, wasm_interface::*,
 };
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 // ---------------------------------------------------------------------------
 // WASM exports
@@ -411,6 +411,69 @@ fn wire_method_name(name: &str) -> String {
 }
 
 /// Python code generator implementation
+/// Resolved coordinates for self-contained-package emission. `dist_name` is the PEP
+/// 621 distribution name (what `pip install` resolves), while `import_name` is the
+/// on-disk package directory the modules live under and the name `import` expects.
+struct PythonPackage {
+    dist_name: String,
+    import_name: String,
+    version: String,
+}
+
+/// A distribution name may legally contain `-`/`.` (e.g. `csilgen-client`), but an
+/// importable package directory must be a valid Python identifier. We map every
+/// character that is not ASCII-alphanumeric or `_` to `_`, then guard the leading
+/// character so the result is always importable.
+fn sanitize_python_import_name(name: &str) -> String {
+    let mut out: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if out.is_empty() {
+        out.push_str("csilgen_client");
+    }
+    if out.chars().next().is_some_and(|c| c.is_ascii_digit()) {
+        out.insert(0, '_');
+    }
+    out
+}
+
+/// Escapes a value for a TOML basic string. Only `\` and `"` can break the literals
+/// we emit; package names/versions never legitimately contain control characters.
+fn toml_escape(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+/// Renders a setuptools-backed `pyproject.toml`. Package discovery is pinned to the
+/// single generated import package so the build needs no auto-discovery heuristics
+/// and the artifact stays dependency-free (no third-party runtime requirements).
+fn render_pyproject(pkg: &PythonPackage) -> String {
+    let dist = toml_escape(&pkg.dist_name);
+    let version = toml_escape(&pkg.version);
+    let import_name = toml_escape(&pkg.import_name);
+    format!(
+        "[build-system]\n\
+         requires = [\"setuptools>=61.0\"]\n\
+         build-backend = \"setuptools.build_meta\"\n\
+         \n\
+         [project]\n\
+         name = \"{dist}\"\n\
+         version = \"{version}\"\n\
+         requires-python = \">=3.9\"\n\
+         description = \"Generated CSIL client package\"\n\
+         dependencies = []\n\
+         \n\
+         [tool.setuptools]\n\
+         packages = [\"{import_name}\"]\n"
+    )
+}
+
 struct PythonGenerator {
     #[allow(dead_code)]
     config: GeneratorConfig,
@@ -473,6 +536,10 @@ impl PythonGenerator {
 
         let mut files = Vec::new();
 
+        // The codec covers every record (dataclass); the typed client below calls a
+        // record's generated `to_cbor`/`from_cbor`, so compute the record set once.
+        let records = python_record_names(spec);
+
         self.setup_imports();
         self.collect_special_imports(spec);
 
@@ -509,7 +576,8 @@ impl PythonGenerator {
                             services_code.push_str(&Self::generate_client_prelude());
                             prelude_emitted = true;
                         }
-                        services_code.push_str(&self.generate_client_class(&rule.name, service)?);
+                        services_code
+                            .push_str(&self.generate_client_class(&rule.name, service, &records)?);
                         if let Some(wire_ids) = Self::generate_wire_ids(&rule.name, service) {
                             services_code.push_str(&wire_ids);
                         }
@@ -535,9 +603,21 @@ impl PythonGenerator {
             files.push(types_file);
         }
 
+        // The codec rides alongside the types for every surface (the records'
+        // (de)serializers), so a typesonly consumer still gets usable wire codecs.
+        let has_codec = if let Some(codec_file) = generate_codec_file(spec, &records) {
+            files.push(codec_file);
+            true
+        } else {
+            false
+        };
+
         if !services_code.is_empty() {
-            let module_file =
-                self.generate_module_file(services_code, matches!(surface, Surface::Client))?;
+            let module_file = self.generate_module_file(
+                services_code,
+                matches!(surface, Surface::Client),
+                has_codec,
+            )?;
             files.push(module_file);
         }
 
@@ -546,7 +626,67 @@ impl PythonGenerator {
             files.push(init_file);
         }
 
+        // Self-contained-package mode is purely additive: the per-module files and
+        // their relative imports are identical to the default layout, so it is
+        // enough to relocate them under one import-package directory and drop a
+        // `pyproject.toml` beside it. The non-package layout is left byte-for-byte
+        // unchanged when `emit_packages` does not opt Python in.
+        if let Some(pkg) = self.resolve_package_layout() {
+            for file in &mut files {
+                file.path = format!("{}/{}", pkg.import_name, file.path);
+            }
+            files.push(GeneratedFile {
+                path: "pyproject.toml".to_string(),
+                content: render_pyproject(&pkg),
+            });
+        }
+
         Ok(files)
+    }
+
+    /// Returns the package coordinates only when `emit_packages` opts Python in.
+    /// Parsing is deliberately tolerant: a missing key, a non-array value, or an
+    /// array without `"python"` all mean "not in package mode" rather than an error,
+    /// so an unrelated `emit_packages` payload never destabilizes Python output.
+    fn resolve_package_layout(&self) -> Option<PythonPackage> {
+        let opts_in = self
+            .config
+            .options
+            .get("emit_packages")
+            .and_then(|v| v.as_array())
+            .map(|arr| arr.iter().any(|e| e.as_str() == Some("python")))
+            .unwrap_or(false);
+        if !opts_in {
+            return None;
+        }
+
+        let dist_name = self
+            .config
+            .options
+            .get("package_name")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("csilgen_client")
+            .to_string();
+
+        let version = self
+            .config
+            .options
+            .get("package_version")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("0.1.0")
+            .to_string();
+
+        let import_name = sanitize_python_import_name(&dist_name);
+
+        Some(PythonPackage {
+            dist_name,
+            import_name,
+            version,
+        })
     }
 
     fn setup_imports(&mut self) {
@@ -1518,7 +1658,7 @@ impl PythonGenerator {
     /// delegates to. The generator never owns the wire (CBOR-over-HTTP etc.).
     fn generate_client_prelude() -> String {
         let mut out = String::new();
-        out.push_str("from typing import Protocol, Any\n\n");
+        out.push_str("from typing import Protocol\n\n");
         out.push_str("class ServiceError(Exception):\n");
         out.push_str(
             "    \"\"\"Structured error a service returns; raised by the transport.\"\"\"\n",
@@ -1529,12 +1669,13 @@ impl PythonGenerator {
         out.push_str("        super().__init__(f\"service error {code}: {message}\")\n\n");
         out.push_str("class Transport(Protocol):\n");
         out.push_str(
-            "    \"\"\"Caller-supplied wire. Encodes req (CBOR over HTTP, say), performs the\n\
-             \x20   call named by (service, method), and returns the decoded response, or\n\
-             \x20   raises ServiceError. The generator never owns the wire.\n\
+            "    \"\"\"Caller-supplied byte carrier. It performs the call named by\n\
+             \x20   (service, method) with the already-encoded request bytes and returns the\n\
+             \x20   response bytes, or raises ServiceError. The generated client owns\n\
+             \x20   (de)serialization; the carrier only moves bytes.\n\
              \x20   \"\"\"\n",
         );
-        out.push_str("    def call(self, service: str, method: str, req: Any) -> Any: ...\n\n");
+        out.push_str("    def call(self, service: str, method: str, req: bytes) -> bytes: ...\n\n");
         out
     }
 
@@ -1561,8 +1702,14 @@ impl PythonGenerator {
     }
 
     /// Emit a typed client class for one service: one method per unary operation
-    /// that delegates to the `Transport`, returning the typed success response.
-    fn generate_client_class(&self, name: &str, service: &CsilServiceDefinition) -> Result<String> {
+    /// that serializes the typed request to CBOR, hands the bytes to the `Transport`,
+    /// and deserializes the typed success response. The carrier only moves bytes.
+    fn generate_client_class(
+        &self,
+        name: &str,
+        service: &CsilServiceDefinition,
+        records: &HashSet<String>,
+    ) -> Result<String> {
         let service_class = name.to_case(Case::Pascal);
         let base = service_class
             .strip_suffix("Service")
@@ -1589,15 +1736,29 @@ impl PythonGenerator {
                 ));
                 continue;
             }
+            // The typed-codec path needs a record success type (the response carries
+            // `from_cbor`) and a record-or-null request (the request carries
+            // `to_cbor`). Anything else is skipped with a note rather than emitting a
+            // call that can't (de)serialize itself.
+            let success = python_success_type(&op.output_type);
+            let resp_record = is_record_ref(&success, records);
+            let req_ok = is_null_input(&op.input_type) || is_record_ref(&op.input_type, records);
+            if !resp_record || !req_ok {
+                out.push_str(&format!(
+                    "\n    # operation {} has a non-record payload; (de)serialize it manually\n",
+                    op.name
+                ));
+                continue;
+            }
             let method_name = op.name.to_case(Case::Snake);
             // The wire method must agree byte-for-byte with the other language
             // clients, which all PascalCase the op name with the same simple
             // rule — convert_case would diverge on acronyms, so avoid it here.
             let wire_method = wire_method_name(&op.name);
-            // A `null`-input op carries no request body, so the method takes no
-            // `req` parameter and passes `None` as the payload to the transport.
+            // A `null`-input op carries no request body, so the method takes no `req`
+            // parameter and sends empty bytes as the payload.
             let has_input = !is_null_input(&op.input_type);
-            let output_type = self.map_type_expression(&python_success_type(&op.output_type))?;
+            let output_type = self.map_type_expression(&success)?;
             out.push('\n');
             if has_input {
                 let input_type = self.map_type_expression(&op.input_type)?;
@@ -1619,9 +1780,9 @@ impl PythonGenerator {
                 }
                 out.push_str("\"\"\"\n");
             }
-            let payload = if has_input { "req" } else { "None" };
+            let payload = if has_input { "req.to_cbor()" } else { "b\"\"" };
             out.push_str(&format!(
-                "        return self._transport.call(\"{wire_service}\", \"{wire_method}\", {payload})\n"
+                "        return {output_type}.from_cbor(self._transport.call(\"{wire_service}\", \"{wire_method}\", {payload}))\n"
             ));
         }
         out.push('\n');
@@ -1966,7 +2127,12 @@ impl PythonGenerator {
         })
     }
 
-    fn generate_module_file(&self, body_code: String, want_client: bool) -> Result<GeneratedFile> {
+    fn generate_module_file(
+        &self,
+        body_code: String,
+        want_client: bool,
+        has_codec: bool,
+    ) -> Result<GeneratedFile> {
         let (path, banner) = if want_client {
             (
                 "client.py",
@@ -1988,6 +2154,11 @@ impl PythonGenerator {
             content.push('\n');
         }
         content.push_str("from .types import *\n");
+        // The client calls each record's `to_cbor`/`from_cbor`, which the codec module
+        // binds onto the dataclasses on import, so the client must import the codec.
+        if want_client && has_codec {
+            content.push_str("from .codec import *\n");
+        }
 
         content.push_str("\n\n");
         content.push_str(&body_code);
@@ -2010,6 +2181,9 @@ impl PythonGenerator {
             if file.path == "types.py" {
                 content.push_str("from .types import *\n");
                 exports.push("types");
+            } else if file.path == "codec.py" {
+                content.push_str("from .codec import *\n");
+                exports.push("codec");
             } else if file.path == "services.py" {
                 content.push_str("from .services import *\n");
                 exports.push("services");
@@ -2036,6 +2210,628 @@ impl PythonGenerator {
         })
     }
 }
+
+// ---------------------------------------------------------------------------
+// Codec (codec.py)
+// ---------------------------------------------------------------------------
+//
+// C/Zig/OCaml/Dart/Swift have no reflection-driven CBOR ecosystem, so their
+// generators emit a per-type codec. Python *could* lean on a third-party CBOR
+// library, but a self-contained codec keeps the generated package dependency-free
+// and pins the exact wire bytes (canonical map key order, byte strings as major
+// type 2, tag-0 timestamps, tag-4 decimals) the cross-language contract requires.
+
+/// The function-name suffix for a record's generated codec helpers. The CSIL rule
+/// name snake-cases the same way the dataclass field/attribute names do, so a
+/// reference to a record resolves to the same `_encode_<suffix>_value` everywhere.
+fn record_suffix(name: &str) -> String {
+    name.to_case(Case::Snake)
+}
+
+/// The set of record rule suffixes — the rules whose CBOR form is a map and which
+/// therefore get a generated `to_cbor`/`from_cbor`. A `Name = { ... }` TypeDef is a
+/// record just like a bare GroupDef.
+fn python_record_names(spec: &CsilSpecSerialized) -> HashSet<String> {
+    spec.rules
+        .iter()
+        .filter_map(|r| match &r.rule_type {
+            CsilRuleType::GroupDef(_) => Some(record_suffix(&r.name)),
+            CsilRuleType::TypeDef(CsilTypeExpression::Group(_)) => Some(record_suffix(&r.name)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Whether a type expression is a reference to a record the codec covers, so the
+/// client can call the record's own `to_cbor`/`from_cbor` rather than the
+/// value-tree helpers.
+fn is_record_ref(type_expr: &CsilTypeExpression, records: &HashSet<String>) -> bool {
+    matches!(type_expr, CsilTypeExpression::Reference(name) if records.contains(&record_suffix(name)))
+}
+
+/// The verbatim CBOR map key for an entry (the raw bare/text-literal name, or the
+/// referenced type's name for a keyless spread), or `None` for a typed-key entry —
+/// kept in lockstep with `entry_field_name` so the attribute and the wire key agree.
+fn entry_wire_key(entry: &CsilGroupEntry) -> Option<String> {
+    match &entry.key {
+        Some(CsilGroupKey::Bare(name)) => Some(name.clone()),
+        Some(CsilGroupKey::Literal(CsilLiteralValue::Text(name))) => Some(name.clone()),
+        Some(_) => None,
+        None => match &entry.value_type {
+            CsilTypeExpression::Reference(name) | CsilTypeExpression::Builtin(name) => {
+                Some(name.clone())
+            }
+            _ => None,
+        },
+    }
+}
+
+/// The CBOR encoding of a text key (major type 3 head + bytes). Comparing these byte
+/// vectors lexicographically is RFC 8949 §4.2.1 canonical key ordering, computed once
+/// at generation time so the emitted map is canonical without a runtime sort.
+fn cbor_text_key_bytes(name: &str) -> Vec<u8> {
+    let bytes = name.as_bytes();
+    let n = bytes.len() as u64;
+    let mt = 3u8 << 5;
+    let mut head = Vec::new();
+    if n < 24 {
+        head.push(mt | n as u8);
+    } else if n < 0x100 {
+        head.push(mt | 24);
+        head.push(n as u8);
+    } else {
+        head.push(mt | 25);
+        head.extend_from_slice(&(n as u16).to_be_bytes());
+    }
+    head.extend_from_slice(bytes);
+    head
+}
+
+fn unwrap_constrained(type_expr: &CsilTypeExpression) -> &CsilTypeExpression {
+    match type_expr {
+        CsilTypeExpression::Constrained { base_type, .. } => base_type,
+        other => other,
+    }
+}
+
+/// Whether a value of this type is its own CBOR value-tree node already (the encode
+/// and decode are the identity), so a `[..]`/`{..}` comprehension would be pointless.
+/// Scalars are identity; `timestamp`/`decimal` (tagged) and record references are not.
+fn is_identity_type(
+    type_expr: &CsilTypeExpression,
+    records: &HashSet<String>,
+    aliases: &HashMap<String, CsilTypeExpression>,
+) -> bool {
+    match unwrap_constrained(type_expr) {
+        CsilTypeExpression::Builtin(name) => matches!(
+            name.as_str(),
+            "int"
+                | "uint"
+                | "nint"
+                | "float"
+                | "double"
+                | "float16"
+                | "float32"
+                | "float64"
+                | "text"
+                | "tstr"
+                | "bytes"
+                | "bstr"
+                | "bool"
+                | "any"
+        ),
+        // A reference to a generated record always needs a transform. A transparent
+        // alias is identity only when its underlying type is — `StringInt64Map =
+        // dict[str, int]` stays identity, but `M = {* text => SomeRecord}` does not, so
+        // an alias-typed field (or a container of one) still recurses into the record.
+        CsilTypeExpression::Reference(name) => {
+            let suffix = record_suffix(name);
+            if records.contains(&suffix) {
+                false
+            } else if let Some(underlying) = aliases.get(&suffix) {
+                is_identity_type(underlying, records, aliases)
+            } else {
+                true
+            }
+        }
+        CsilTypeExpression::Array { element_type, .. } => {
+            is_identity_type(element_type, records, aliases)
+        }
+        CsilTypeExpression::Map { key, value, .. } => {
+            is_identity_type(key, records, aliases) && is_identity_type(value, records, aliases)
+        }
+        _ => false,
+    }
+}
+
+/// A Python expression building the CBOR value tree for `expr` (a typed value). The
+/// value tree is native Python (int/float/bool/None/str/bytes/list/dict) plus
+/// `CborTag`, so a scalar field is the identity and only tagged/record/container
+/// shapes carry a transform.
+fn py_enc_value(
+    type_expr: &CsilTypeExpression,
+    expr: &str,
+    records: &HashSet<String>,
+    aliases: &HashMap<String, CsilTypeExpression>,
+) -> String {
+    match unwrap_constrained(type_expr) {
+        CsilTypeExpression::Builtin(name) => match name.as_str() {
+            "timestamp" => format!("CborTag(0, _csil_ts_to_text({expr}))"),
+            "decimal" => format!("CborTag(4, _csil_decimal_to_pair({expr}))"),
+            "null" | "nil" | "undefined" => "None".to_string(),
+            _ => expr.to_string(),
+        },
+        CsilTypeExpression::Reference(name) => {
+            let suffix = record_suffix(name);
+            if records.contains(&suffix) {
+                format!("_encode_{suffix}_value({expr})")
+            } else if let Some(underlying) = aliases.get(&suffix) {
+                // A transparent alias has no codec of its own; encode its underlying
+                // type. A scalar/structural alias resolves to the identity, but a
+                // map/array-of-record alias recurses into the record helper rather
+                // than passing the dataclass instances through raw (the regression).
+                py_enc_value(underlying, expr, records, aliases)
+            } else {
+                expr.to_string()
+            }
+        }
+        CsilTypeExpression::Array { element_type, .. } => {
+            if is_identity_type(element_type, records, aliases) {
+                expr.to_string()
+            } else {
+                let inner = py_enc_value(element_type, "csil_e", records, aliases);
+                format!("[{inner} for csil_e in {expr}]")
+            }
+        }
+        CsilTypeExpression::Map { key, value, .. } => {
+            if is_identity_type(key, records, aliases) && is_identity_type(value, records, aliases)
+            {
+                expr.to_string()
+            } else {
+                let ek = py_enc_value(key, "csil_k", records, aliases);
+                let ev = py_enc_value(value, "csil_v", records, aliases);
+                format!("{{{ek}: {ev} for csil_k, csil_v in {expr}.items()}}")
+            }
+        }
+        // A tuple/choice/opaque value already is (or is carried as) a value tree.
+        _ => expr.to_string(),
+    }
+}
+
+/// A Python expression reconstructing the typed value from `expr` (a CBOR value tree
+/// node). The inverse of `py_enc_value`.
+fn py_dec_value(
+    type_expr: &CsilTypeExpression,
+    expr: &str,
+    records: &HashSet<String>,
+    aliases: &HashMap<String, CsilTypeExpression>,
+) -> String {
+    match unwrap_constrained(type_expr) {
+        CsilTypeExpression::Builtin(name) => match name.as_str() {
+            "timestamp" => format!("_csil_ts_from_tree({expr})"),
+            "decimal" => format!("_csil_decimal_from_tree({expr})"),
+            "null" | "nil" | "undefined" => "None".to_string(),
+            _ => expr.to_string(),
+        },
+        CsilTypeExpression::Reference(name) => {
+            let suffix = record_suffix(name);
+            if records.contains(&suffix) {
+                format!("_decode_{suffix}_value({expr})")
+            } else if let Some(underlying) = aliases.get(&suffix) {
+                // The inverse of the encode: resolve a transparent alias to its
+                // underlying type so a map/array-of-record alias reconstructs the
+                // record rather than leaving raw value-tree dicts in place.
+                py_dec_value(underlying, expr, records, aliases)
+            } else {
+                expr.to_string()
+            }
+        }
+        CsilTypeExpression::Array { element_type, .. } => {
+            if is_identity_type(element_type, records, aliases) {
+                expr.to_string()
+            } else {
+                let inner = py_dec_value(element_type, "csil_e", records, aliases);
+                format!("[{inner} for csil_e in {expr}]")
+            }
+        }
+        CsilTypeExpression::Map { key, value, .. } => {
+            if is_identity_type(key, records, aliases) && is_identity_type(value, records, aliases)
+            {
+                expr.to_string()
+            } else {
+                let dk = py_dec_value(key, "csil_k", records, aliases);
+                let dv = py_dec_value(value, "csil_v", records, aliases);
+                format!("{{{dk}: {dv} for csil_k, csil_v in {expr}.items()}}")
+            }
+        }
+        _ => expr.to_string(),
+    }
+}
+
+/// One codec field: its dataclass attribute name, the verbatim wire key, the
+/// canonical-order sort key, its value type, and whether it is optional.
+struct PyCodecField<'a> {
+    attr: String,
+    wire: String,
+    key_bytes: Vec<u8>,
+    value_type: &'a CsilTypeExpression,
+    optional: bool,
+}
+
+fn py_codec_fields(group: &CsilGroupExpression) -> Vec<PyCodecField<'_>> {
+    group
+        .entries
+        .iter()
+        .filter_map(|entry| {
+            let attr = entry_field_name(entry)?;
+            let wire = entry_wire_key(entry)?;
+            Some(PyCodecField {
+                key_bytes: cbor_text_key_bytes(&wire),
+                attr,
+                wire,
+                value_type: &entry.value_type,
+                optional: matches!(entry.occurrence, Some(CsilOccurrence::Optional)),
+            })
+        })
+        .collect()
+}
+
+/// Emit the value-tree encoder/decoder pair for one record plus the `to_cbor` /
+/// `from_cbor` methods bound onto its dataclass. The encoder inserts map entries in
+/// canonical key order (computed at generation time); the decoder reads each field by
+/// its wire key, defaulting an absent optional to `None`.
+fn emit_record_codec(
+    name: &str,
+    group: &CsilGroupExpression,
+    records: &HashSet<String>,
+    aliases: &HashMap<String, CsilTypeExpression>,
+) -> String {
+    let class_name = name.to_case(Case::Pascal);
+    let suffix = record_suffix(name);
+    let fields = py_codec_fields(group);
+
+    let mut out = String::new();
+
+    // Encoder: build the wire map in canonical key order.
+    out.push_str(&format!(
+        "def _encode_{suffix}_value(v: \"{class_name}\") -> Dict[Any, Any]:\n"
+    ));
+    out.push_str("    csil_m: Dict[Any, Any] = {}\n");
+    let mut encode_fields: Vec<&PyCodecField> = fields.iter().collect();
+    encode_fields.sort_by(|a, b| a.key_bytes.cmp(&b.key_bytes));
+    for field in &encode_fields {
+        if field.optional {
+            let enc = py_enc_value(field.value_type, "csil_x", records, aliases);
+            out.push_str(&format!("    csil_x = v.{}\n", field.attr));
+            out.push_str("    if csil_x is not None:\n");
+            out.push_str(&format!("        csil_m[\"{}\"] = {enc}\n", field.wire));
+        } else {
+            let enc = py_enc_value(
+                field.value_type,
+                &format!("v.{}", field.attr),
+                records,
+                aliases,
+            );
+            out.push_str(&format!("    csil_m[\"{}\"] = {enc}\n", field.wire));
+        }
+    }
+    out.push_str("    return csil_m\n\n");
+
+    // Decoder: read by wire key in declaration order, then construct the dataclass.
+    out.push_str(&format!(
+        "def _decode_{suffix}_value(tree: Any) -> \"{class_name}\":\n"
+    ));
+    if fields.is_empty() {
+        out.push_str(&format!("    return {class_name}()\n\n\n"));
+    } else {
+        out.push_str(&format!("    return {class_name}(\n"));
+        // The decode keeps declaration order; only the encode is canonically sorted.
+        for field in &fields {
+            if field.optional {
+                let dec = py_dec_value(
+                    field.value_type,
+                    &format!("tree[\"{}\"]", field.wire),
+                    records,
+                    aliases,
+                );
+                out.push_str(&format!(
+                    "        {}=(None if tree.get(\"{}\") is None else {dec}),\n",
+                    field.attr, field.wire
+                ));
+            } else {
+                let dec = py_dec_value(
+                    field.value_type,
+                    &format!("tree[\"{}\"]", field.wire),
+                    records,
+                    aliases,
+                );
+                out.push_str(&format!("        {}={dec},\n", field.attr));
+            }
+        }
+        out.push_str("    )\n\n\n");
+    }
+
+    // Bind the byte-level entry points onto the dataclass so the typed client can call
+    // `req.to_cbor()` / `Type.from_cbor(bytes)` directly.
+    out.push_str(&format!("def _{suffix}_to_cbor(self) -> bytes:\n"));
+    out.push_str(&format!(
+        "    return cbor_encode(_encode_{suffix}_value(self))\n\n\n"
+    ));
+    out.push_str(&format!(
+        "def _{suffix}_from_cbor(data: bytes) -> \"{class_name}\":\n"
+    ));
+    out.push_str(&format!(
+        "    return _decode_{suffix}_value(cbor_decode(data))\n\n\n"
+    ));
+    out.push_str(&format!("{class_name}.to_cbor = _{suffix}_to_cbor\n"));
+    out.push_str(&format!(
+        "{class_name}.from_cbor = staticmethod(_{suffix}_from_cbor)\n\n"
+    ));
+
+    out
+}
+
+/// The transparent type aliases the codec resolves through: a `TypeDef` whose target
+/// is a map / array / scalar / reference / tuple (NOT a record group or a choice, which
+/// have their own handling), keyed the same way records are so a `Reference` resolves
+/// identically. A field referencing one must encode as the underlying type rather than
+/// passing the value through raw — which drops the records inside a map/array alias.
+fn codec_aliases(spec: &CsilSpecSerialized) -> HashMap<String, CsilTypeExpression> {
+    spec.rules
+        .iter()
+        .filter_map(|rule| match &rule.rule_type {
+            CsilRuleType::TypeDef(t) => match t {
+                CsilTypeExpression::Group(_) | CsilTypeExpression::Choice(_) => None,
+                other => Some((record_suffix(&rule.name), other.clone())),
+            },
+            _ => None,
+        })
+        .collect()
+}
+
+/// Build `codec.py`: the self-contained canonical-CBOR runtime plus per-record
+/// value-tree (de)serializers and the `to_cbor`/`from_cbor` methods bound onto each
+/// dataclass. `None` when the spec declares no record types.
+fn generate_codec_file(
+    spec: &CsilSpecSerialized,
+    records: &HashSet<String>,
+) -> Option<GeneratedFile> {
+    if records.is_empty() {
+        return None;
+    }
+
+    let aliases = codec_aliases(spec);
+
+    // Only pull `datetime`/`decimal` when a record field actually uses the tagged
+    // core type, so a plain-scalar spec's codec stays import-light.
+    let mut needs_datetime = false;
+    let mut needs_decimal = false;
+    let mut needs_re = false;
+    let mut needs_tuple = false;
+    let mut body = String::new();
+    for rule in &spec.rules {
+        let group = match &rule.rule_type {
+            CsilRuleType::GroupDef(g) => Some(g),
+            CsilRuleType::TypeDef(CsilTypeExpression::Group(g)) => Some(g),
+            _ => None,
+        };
+        if let Some(group) = group {
+            for entry in &group.entries {
+                scan_special_types(
+                    &entry.value_type,
+                    &mut needs_datetime,
+                    &mut needs_decimal,
+                    &mut needs_re,
+                    &mut needs_tuple,
+                );
+            }
+            body.push_str(&emit_record_codec(&rule.name, group, records, &aliases));
+        }
+    }
+
+    let mut content = String::new();
+    content.push_str("# Generated CBOR codec from CSIL specification\n");
+    content.push_str("# Do not edit this file manually\n\n");
+    content.push_str("import struct\n");
+    content.push_str("from typing import Any, Dict\n");
+    if needs_datetime {
+        content.push_str("from datetime import datetime, timezone\n");
+    }
+    if needs_decimal {
+        content.push_str("from decimal import Decimal\n");
+    }
+    // The records are patched in place, so the type classes must be in scope.
+    content.push_str("from .types import *\n\n\n");
+    content.push_str(CBOR_RUNTIME_PYTHON);
+    content.push_str("\n\n");
+    content.push_str(body.trim_end());
+    content.push('\n');
+
+    Some(GeneratedFile {
+        path: "codec.py".to_string(),
+        content,
+    })
+}
+
+/// The self-contained canonical-CBOR (RFC 8949 subset) value model and codec the
+/// generated per-record helpers build on. The value tree is native Python plus
+/// `CborTag`, so a record encodes as a map keyed by the verbatim CSIL field names and
+/// `bytes` ride as a CBOR byte string (major type 2) rather than an array of ints.
+const CBOR_RUNTIME_PYTHON: &str = r#"class CborTag:
+    """A CBOR tagged value (major type 6): a tag number wrapping a value tree."""
+
+    __slots__ = ("tag", "value")
+
+    def __init__(self, tag: int, value: Any) -> None:
+        self.tag = tag
+        self.value = value
+
+    def __eq__(self, other: Any) -> bool:
+        return (
+            isinstance(other, CborTag)
+            and self.tag == other.tag
+            and self.value == other.value
+        )
+
+    def __repr__(self) -> str:
+        return f"CborTag({self.tag!r}, {self.value!r})"
+
+
+def _csil_head(major: int, n: int, out: bytearray) -> None:
+    mt = major << 5
+    if n < 24:
+        out.append(mt | n)
+    elif n < 0x100:
+        out.append(mt | 24)
+        out.append(n)
+    elif n < 0x10000:
+        out.append(mt | 25)
+        out += n.to_bytes(2, "big")
+    elif n < 0x100000000:
+        out.append(mt | 26)
+        out += n.to_bytes(4, "big")
+    else:
+        out.append(mt | 27)
+        out += n.to_bytes(8, "big")
+
+
+def _csil_enc(v: Any, out: bytearray) -> None:
+    # bool is a subclass of int, so it is matched before the int branch.
+    if v is None:
+        out.append(0xF6)
+    elif v is True:
+        out.append(0xF5)
+    elif v is False:
+        out.append(0xF4)
+    elif isinstance(v, int):
+        if v >= 0:
+            _csil_head(0, v, out)
+        else:
+            _csil_head(1, -1 - v, out)
+    elif isinstance(v, float):
+        out.append(0xFB)
+        out += struct.pack(">d", v)
+    elif isinstance(v, str):
+        data = v.encode("utf-8")
+        _csil_head(3, len(data), out)
+        out += data
+    elif isinstance(v, (bytes, bytearray)):
+        _csil_head(2, len(v), out)
+        out += bytes(v)
+    elif isinstance(v, CborTag):
+        _csil_head(6, v.tag, out)
+        _csil_enc(v.value, out)
+    elif isinstance(v, dict):
+        _csil_head(5, len(v), out)
+        for key, val in v.items():
+            _csil_enc(key, out)
+            _csil_enc(val, out)
+    elif isinstance(v, (list, tuple)):
+        _csil_head(4, len(v), out)
+        for item in v:
+            _csil_enc(item, out)
+    else:
+        raise ValueError(f"csilgen: cannot encode value of type {type(v)!r}")
+
+
+def cbor_encode(value: Any) -> bytes:
+    """Encode a CBOR value tree to canonical CBOR bytes."""
+    out = bytearray()
+    _csil_enc(value, out)
+    return bytes(out)
+
+
+def _csil_read_arg(b: bytes, pos: int, low: int):
+    if low < 24:
+        return low, pos + 1
+    if low == 24:
+        return b[pos + 1], pos + 2
+    if low == 25:
+        return int.from_bytes(b[pos + 1 : pos + 3], "big"), pos + 3
+    if low == 26:
+        return int.from_bytes(b[pos + 1 : pos + 5], "big"), pos + 5
+    if low == 27:
+        return int.from_bytes(b[pos + 1 : pos + 9], "big"), pos + 9
+    raise ValueError("csilgen: bad head")
+
+
+def _csil_dec(b: bytes, pos: int):
+    ib = b[pos]
+    major = ib >> 5
+    low = ib & 0x1F
+    if major == 7:
+        if low == 20:
+            return False, pos + 1
+        if low == 21:
+            return True, pos + 1
+        if low in (22, 23):
+            return None, pos + 1
+        if low == 26:
+            return struct.unpack(">f", b[pos + 1 : pos + 5])[0], pos + 5
+        if low == 27:
+            return struct.unpack(">d", b[pos + 1 : pos + 9])[0], pos + 9
+        raise ValueError("csilgen: unsupported simple value")
+    arg, pos = _csil_read_arg(b, pos, low)
+    if major == 0:
+        return arg, pos
+    if major == 1:
+        return -1 - arg, pos
+    if major == 2:
+        return bytes(b[pos : pos + arg]), pos + arg
+    if major == 3:
+        return b[pos : pos + arg].decode("utf-8"), pos + arg
+    if major == 4:
+        items = []
+        for _ in range(arg):
+            item, pos = _csil_dec(b, pos)
+            items.append(item)
+        return items, pos
+    if major == 5:
+        result: Dict[Any, Any] = {}
+        for _ in range(arg):
+            key, pos = _csil_dec(b, pos)
+            val, pos = _csil_dec(b, pos)
+            result[key] = val
+        return result, pos
+    if major == 6:
+        inner, pos = _csil_dec(b, pos)
+        return CborTag(arg, inner), pos
+    raise ValueError("csilgen: bad major type")
+
+
+def cbor_decode(data: bytes) -> Any:
+    """Decode canonical CBOR bytes into a value tree."""
+    value, pos = _csil_dec(data, 0)
+    if pos != len(data):
+        raise ValueError("csilgen: trailing bytes")
+    return value
+
+
+def _csil_ts_to_text(dt: Any) -> str:
+    # The contract pins tag-0 timestamps to RFC3339 UTC with a `Z` offset.
+    text = dt.astimezone(timezone.utc).isoformat()
+    return text.replace("+00:00", "Z")
+
+
+def _csil_ts_from_tree(node: Any) -> Any:
+    text = node.value if isinstance(node, CborTag) else node
+    return datetime.fromisoformat(text.replace("Z", "+00:00"))
+
+
+def _csil_decimal_to_pair(d: Any) -> list:
+    # tag-4 decimal fraction: [exponent, mantissa], value = mantissa * 10**exponent.
+    sign, digits, exp = d.as_tuple()
+    mant = 0
+    for digit in digits:
+        mant = mant * 10 + digit
+    if sign:
+        mant = -mant
+    return [exp, mant]
+
+
+def _csil_decimal_from_tree(node: Any) -> Any:
+    exp, mant = node.value
+    return Decimal(mant).scaleb(exp)"#;
 
 #[cfg(test)]
 mod tests {
@@ -2113,7 +2909,7 @@ mod tests {
         let config = create_test_config(false);
         let result = generate_python_code_from_serialized(&spec, &config).unwrap();
 
-        assert_eq!(result.len(), 2); // types.py and __init__.py
+        assert_eq!(result.len(), 3); // types.py, codec.py, and __init__.py
 
         let types_file = result.iter().find(|f| f.path == "types.py").unwrap();
         assert!(types_file.content.contains("@dataclass"));
@@ -2586,16 +3382,18 @@ mod tests {
         let config = create_test_config(false);
         let result = generate_python_code_from_serialized(&spec, &config).unwrap();
 
-        // Should have types.py, services.py, and __init__.py
-        assert_eq!(result.len(), 3);
+        // Should have types.py, codec.py, services.py, and __init__.py — `User` is an
+        // (empty) record, so the codec rides alongside the types.
+        assert_eq!(result.len(), 4);
 
         let init_file = result.iter().find(|f| f.path == "__init__.py").unwrap();
         assert!(init_file.content.contains("from .types import *"));
+        assert!(init_file.content.contains("from .codec import *"));
         assert!(init_file.content.contains("from .services import *"));
         assert!(
             init_file
                 .content
-                .contains("__all__ = [\"types\", \"services\"]")
+                .contains("__all__ = [\"types\", \"codec\", \"services\"]")
         );
     }
 
@@ -2642,28 +3440,62 @@ mod tests {
         assert!(!types_file.content.contains("Task = Dict[str, Any]"));
     }
 
+    fn record_rule(name: &str, fields: Vec<(&str, CsilTypeExpression)>) -> CsilRule {
+        CsilRule {
+            name: name.to_string(),
+            rule_type: CsilRuleType::GroupDef(CsilGroupExpression {
+                entries: fields
+                    .into_iter()
+                    .map(|(key, value_type)| CsilGroupEntry {
+                        key: Some(CsilGroupKey::Bare(key.to_string())),
+                        value_type,
+                        occurrence: None,
+                        metadata: Vec::new(),
+                        doc_comments: Vec::new(),
+                    })
+                    .collect(),
+            }),
+            position: create_test_position(),
+            doc_comments: Vec::new(),
+        }
+    }
+
     fn service_spec_with_union_op() -> CsilSpecSerialized {
         CsilSpecSerialized {
-            rules: vec![CsilRule {
-                name: "CorndogsService".to_string(),
-                rule_type: CsilRuleType::ServiceDef(CsilServiceDefinition {
-                    operations: vec![CsilServiceOperation {
-                        name: "SubmitTask".to_string(),
-                        input_type: CsilTypeExpression::Reference("SubmitTaskRequest".to_string()),
-                        output_type: CsilTypeExpression::Choice(vec![
-                            CsilTypeExpression::Reference("SubmitTaskResponse".to_string()),
-                            CsilTypeExpression::Reference("ServiceError".to_string()),
-                        ]),
-                        direction: CsilServiceDirection::Unidirectional,
-                        position: create_test_position(),
-                        doc_comments: Vec::new(),
+            rules: vec![
+                // The request/response must be real records so the typed client can
+                // call their generated `to_cbor`/`from_cbor`.
+                record_rule(
+                    "SubmitTaskRequest",
+                    vec![("queue", CsilTypeExpression::Builtin("text".to_string()))],
+                ),
+                record_rule(
+                    "SubmitTaskResponse",
+                    vec![("uuid", CsilTypeExpression::Builtin("text".to_string()))],
+                ),
+                CsilRule {
+                    name: "CorndogsService".to_string(),
+                    rule_type: CsilRuleType::ServiceDef(CsilServiceDefinition {
+                        operations: vec![CsilServiceOperation {
+                            name: "SubmitTask".to_string(),
+                            input_type: CsilTypeExpression::Reference(
+                                "SubmitTaskRequest".to_string(),
+                            ),
+                            output_type: CsilTypeExpression::Choice(vec![
+                                CsilTypeExpression::Reference("SubmitTaskResponse".to_string()),
+                                CsilTypeExpression::Reference("ServiceError".to_string()),
+                            ]),
+                            direction: CsilServiceDirection::Unidirectional,
+                            position: create_test_position(),
+                            doc_comments: Vec::new(),
+                            wire_id: None,
+                        }],
                         wire_id: None,
-                    }],
-                    wire_id: None,
-                }),
-                position: create_test_position(),
-                doc_comments: Vec::new(),
-            }],
+                    }),
+                    position: create_test_position(),
+                    doc_comments: Vec::new(),
+                },
+            ],
             source_content: None,
             service_count: 1,
             fields_with_metadata_count: 0,
@@ -2682,20 +3514,31 @@ mod tests {
             .find(|f| f.path == "client.py")
             .expect("client.py emitted");
         assert!(client.content.contains("class Transport(Protocol):"));
+        // The carrier seam is a dumb byte mover: req bytes in, response bytes out.
+        assert!(
+            client
+                .content
+                .contains("def call(self, service: str, method: str, req: bytes) -> bytes: ...")
+        );
         assert!(client.content.contains("class CorndogsClient:"));
-        // Success type is stripped from the `/ ServiceError` union.
+        // The client imports the codec so the records carry to_cbor/from_cbor.
+        assert!(client.content.contains("from .codec import *"));
+        // Success type is stripped from the `/ ServiceError` union; the typed client
+        // serializes the request and deserializes the response over the byte seam.
         assert!(
             client
                 .content
                 .contains("def submit_task(self, req: SubmitTaskRequest) -> SubmitTaskResponse:")
         );
-        assert!(
-            client
-                .content
-                .contains("return self._transport.call(\"corndogs\", \"SubmitTask\", req)")
-        );
+        assert!(client.content.contains(
+            "return SubmitTaskResponse.from_cbor(self._transport.call(\"corndogs\", \"SubmitTask\", req.to_cbor()))"
+        ));
+        // The old object-passing seam must not reappear.
+        assert!(!client.content.contains("\"SubmitTask\", req)"));
         // The server handler surface must not be emitted for the client target.
         assert!(!result.iter().any(|f| f.path == "services.py"));
+        // The codec rides alongside the client.
+        assert!(result.iter().any(|f| f.path == "codec.py"));
     }
 
     #[test]
@@ -3672,7 +4515,9 @@ mod tests {
         );
         assert!(!services.contains("req: None"));
 
-        // Client method: no `req` parameter, passes `None` payload.
+        // Client method: heartbeat returns a scalar `bool`, which has no codec, so the
+        // typed-codec client skips it with a note rather than emitting a call that
+        // cannot deserialize itself.
         let mut client_config = create_test_config(false);
         client_config.target = "python-client".to_string();
         let client =
@@ -3684,11 +4529,54 @@ mod tests {
             .content
             .clone();
         assert!(
-            client_src.contains("def heartbeat(self) -> bool:"),
-            "null-input client method must take no req, got:\n{client_src}"
+            client_src.contains("# operation heartbeat has a non-record payload"),
+            "non-record op must be skipped with a note, got:\n{client_src}"
         );
-        // The transport receives `None` as the payload, not a bound `req`.
-        assert!(client_src.contains("\"ping\", \"Heartbeat\", None)"));
+        assert!(!client_src.contains("def heartbeat(self)"));
+    }
+
+    /// A null-input op with a *record* success type does get a typed client method:
+    /// no `req` parameter, empty payload bytes, response deserialized via `from_cbor`.
+    #[test]
+    fn null_input_record_output_op_emits_typed_method() {
+        let spec = CsilSpecSerialized {
+            rules: vec![
+                record_rule(
+                    "Pong",
+                    vec![("at", CsilTypeExpression::Builtin("text".to_string()))],
+                ),
+                CsilRule {
+                    name: "PingService".to_string(),
+                    rule_type: CsilRuleType::ServiceDef(CsilServiceDefinition {
+                        operations: vec![CsilServiceOperation {
+                            name: "ping".to_string(),
+                            input_type: CsilTypeExpression::Builtin("null".to_string()),
+                            output_type: CsilTypeExpression::Reference("Pong".to_string()),
+                            direction: CsilServiceDirection::Unidirectional,
+                            position: create_test_position(),
+                            doc_comments: Vec::new(),
+                            wire_id: None,
+                        }],
+                        wire_id: None,
+                    }),
+                    position: create_test_position(),
+                    doc_comments: Vec::new(),
+                },
+            ],
+            source_content: None,
+            service_count: 1,
+            fields_with_metadata_count: 0,
+        };
+        let mut config = create_test_config(false);
+        config.target = "python-client".to_string();
+        let result = generate_python_code_from_serialized(&spec, &config).unwrap();
+        let client = result.iter().find(|f| f.path == "client.py").unwrap();
+        assert!(client.content.contains("def ping(self) -> Pong:"));
+        assert!(
+            client
+                .content
+                .contains("return Pong.from_cbor(self._transport.call(\"ping\", \"Ping\", b\"\"))")
+        );
     }
 
     fn wire_id_service(service_wire: Option<u64>, op_wire: Option<u64>) -> CsilSpecSerialized {
@@ -3893,5 +4781,470 @@ mod tests {
             !content.contains("_compact"),
             "no compact router without wire-ids, got:\n{content}"
         );
+    }
+
+    // --- codec ------------------------------------------------------------------
+
+    fn opt_entry(name: &str, value_type: CsilTypeExpression) -> CsilGroupEntry {
+        CsilGroupEntry {
+            key: Some(CsilGroupKey::Bare(name.to_string())),
+            value_type,
+            occurrence: Some(CsilOccurrence::Optional),
+            metadata: Vec::new(),
+            doc_comments: Vec::new(),
+        }
+    }
+
+    fn bare(name: &str, value_type: CsilTypeExpression) -> CsilGroupEntry {
+        CsilGroupEntry {
+            key: Some(CsilGroupKey::Bare(name.to_string())),
+            value_type,
+            occurrence: None,
+            metadata: Vec::new(),
+            doc_comments: Vec::new(),
+        }
+    }
+
+    fn group_rule_entries(name: &str, entries: Vec<CsilGroupEntry>) -> CsilRule {
+        CsilRule {
+            name: name.to_string(),
+            rule_type: CsilRuleType::GroupDef(CsilGroupExpression { entries }),
+            position: create_test_position(),
+            doc_comments: Vec::new(),
+        }
+    }
+
+    /// A corndogs-shaped spec: text/bytes/optional-int/map/list fields, a nested
+    /// record, and a `submit-task: SubmitTaskRequest -> Task / ServiceError` op.
+    fn corndogs_spec() -> CsilSpecSerialized {
+        let text = || CsilTypeExpression::Builtin("text".to_string());
+        let task = group_rule_entries(
+            "Task",
+            vec![
+                bare("uuid", text()),
+                bare("current_state", text()),
+                bare("payload", CsilTypeExpression::Builtin("bytes".to_string())),
+                opt_entry("priority", CsilTypeExpression::Builtin("int".to_string())),
+                bare(
+                    "labels",
+                    CsilTypeExpression::Map {
+                        key: Box::new(text()),
+                        value: Box::new(CsilTypeExpression::Builtin("int".to_string())),
+                        occurrence: None,
+                    },
+                ),
+                bare(
+                    "tags",
+                    CsilTypeExpression::Array {
+                        element_type: Box::new(text()),
+                        occurrence: None,
+                    },
+                ),
+            ],
+        );
+        // A named map alias (`StringInt64Map = {* text => int}`) and a map-of-record
+        // alias (`TaskMap = {* text => Task}`): both are transparent `TypeDef`s the
+        // codec must resolve through, or the field's entries are dropped (the
+        // regression). `TaskMap` exercises the record-recursion path specifically.
+        let string_int_map = CsilRule {
+            name: "StringInt64Map".to_string(),
+            rule_type: CsilRuleType::TypeDef(CsilTypeExpression::Map {
+                key: Box::new(text()),
+                value: Box::new(CsilTypeExpression::Builtin("int".to_string())),
+                occurrence: None,
+            }),
+            position: create_test_position(),
+            doc_comments: Vec::new(),
+        };
+        let task_map = CsilRule {
+            name: "TaskMap".to_string(),
+            rule_type: CsilRuleType::TypeDef(CsilTypeExpression::Map {
+                key: Box::new(text()),
+                value: Box::new(CsilTypeExpression::Reference("Task".to_string())),
+                occurrence: None,
+            }),
+            position: create_test_position(),
+            doc_comments: Vec::new(),
+        };
+        let req = group_rule_entries(
+            "SubmitTaskRequest",
+            vec![
+                bare("task", CsilTypeExpression::Reference("Task".to_string())),
+                bare("queue", text()),
+                bare(
+                    "counts",
+                    CsilTypeExpression::Reference("StringInt64Map".to_string()),
+                ),
+                bare(
+                    "by_id",
+                    CsilTypeExpression::Reference("TaskMap".to_string()),
+                ),
+            ],
+        );
+        let err = group_rule_entries(
+            "ServiceError",
+            vec![
+                bare("code", CsilTypeExpression::Builtin("int".to_string())),
+                bare("message", text()),
+            ],
+        );
+        let svc = CsilRule {
+            name: "CorndogsService".to_string(),
+            rule_type: CsilRuleType::ServiceDef(CsilServiceDefinition {
+                operations: vec![CsilServiceOperation {
+                    name: "submit-task".to_string(),
+                    input_type: CsilTypeExpression::Reference("SubmitTaskRequest".to_string()),
+                    output_type: CsilTypeExpression::Choice(vec![
+                        CsilTypeExpression::Reference("Task".to_string()),
+                        CsilTypeExpression::Reference("ServiceError".to_string()),
+                    ]),
+                    direction: CsilServiceDirection::Unidirectional,
+                    position: create_test_position(),
+                    doc_comments: Vec::new(),
+                    wire_id: None,
+                }],
+                wire_id: None,
+            }),
+            position: create_test_position(),
+            doc_comments: Vec::new(),
+        };
+        CsilSpecSerialized {
+            rules: vec![task, string_int_map, task_map, req, err, svc],
+            source_content: None,
+            service_count: 1,
+            fields_with_metadata_count: 0,
+        }
+    }
+
+    fn codec_content(spec: &CsilSpecSerialized) -> String {
+        let mut config = create_test_config(false);
+        config.target = "python-client".to_string();
+        let result = generate_python_code_from_serialized(spec, &config).unwrap();
+        result
+            .iter()
+            .find(|f| f.path == "codec.py")
+            .expect("codec.py emitted")
+            .content
+            .clone()
+    }
+
+    #[test]
+    fn codec_emits_self_contained_runtime_and_per_record_entry_points() {
+        let codec = codec_content(&corndogs_spec());
+        // The self-contained value model + codec.
+        assert!(codec.contains("class CborTag:"));
+        assert!(codec.contains("def cbor_encode(value: Any) -> bytes:"));
+        assert!(codec.contains("def cbor_decode(data: bytes) -> Any:"));
+        // bytes ride as a CBOR byte string (major type 2), not an int array.
+        assert!(codec.contains("_csil_head(2, len(v), out)"));
+        // Per-record byte entry points bound onto the dataclasses.
+        assert!(codec.contains("Task.to_cbor = _task_to_cbor"));
+        assert!(codec.contains("Task.from_cbor = staticmethod(_task_from_cbor)"));
+        assert!(codec.contains("def _encode_submit_task_request_value(v: \"SubmitTaskRequest\")"));
+        // A nested record recurses through the record helper, not a raw passthrough.
+        assert!(codec.contains("csil_m[\"task\"] = _encode_task_value(v.task)"));
+        // The codec imports the dataclasses to patch them.
+        assert!(codec.contains("from .types import *"));
+    }
+
+    #[test]
+    fn codec_orders_map_keys_canonically() {
+        let codec = codec_content(&corndogs_spec());
+        let body = codec.split("def _encode_task_value").nth(1).unwrap();
+        // RFC 8949 §4.2.1: shorter keys first, then lexicographic. Among length-4
+        // keys `tags` precedes `uuid`; `current_state` (len 13) is last.
+        let pos_tags = body.find("\"tags\"").unwrap();
+        let pos_uuid = body.find("\"uuid\"").unwrap();
+        let pos_state = body.find("\"current_state\"").unwrap();
+        assert!(
+            pos_tags < pos_uuid && pos_uuid < pos_state,
+            "map keys must be canonically ordered, got:\n{body}"
+        );
+    }
+
+    #[test]
+    fn codec_omits_absent_optional_and_keeps_bytes_field() {
+        let codec = codec_content(&corndogs_spec());
+        // An optional field is conditionally inserted (absent → omitted from the map).
+        assert!(codec.contains("if csil_x is not None:"));
+        assert!(codec.contains("csil_m[\"priority\"] = csil_x"));
+        // A missing optional decodes to None.
+        assert!(
+            codec.contains(
+                "priority=(None if tree.get(\"priority\") is None else tree[\"priority\"])"
+            )
+        );
+        // `payload` stays a Python `bytes` (scalar identity in the value tree).
+        assert!(codec.contains("csil_m[\"payload\"] = v.payload"));
+    }
+
+    /// Generate the corndogs `python-client` package, round-trip a Task through both
+    /// `to_cbor`/`from_cbor` and the typed client over a loopback transport, and run it
+    /// with `python3`. Skips cleanly when python3 is not on PATH so the suite stays
+    /// portable.
+    #[test]
+    fn codec_round_trips_through_python() {
+        let have = std::process::Command::new("python3")
+            .arg("--version")
+            .output()
+            .is_ok();
+        if !have {
+            eprintln!("skipping: no python3 on PATH");
+            return;
+        }
+
+        let mut config = create_test_config(false);
+        config.target = "python-client".to_string();
+        let files = generate_python_code_from_serialized(&corndogs_spec(), &config).unwrap();
+
+        let dir = std::env::temp_dir().join(format!("csilgen-python-codec-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let pkg = dir.join("csil_gen_pkg");
+        std::fs::create_dir_all(&pkg).unwrap();
+        for f in &files {
+            std::fs::write(pkg.join(&f.path), &f.content).unwrap();
+        }
+        std::fs::write(dir.join("driver.py"), CODEC_DRIVER_PYTHON).unwrap();
+
+        let run = std::process::Command::new("python3")
+            .arg("driver.py")
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        assert!(
+            run.status.success(),
+            "python round-trip failed:\n{}{}",
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&run.stdout).trim(), "ok");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    const CODEC_DRIVER_PYTHON: &str = r#"import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from csil_gen_pkg.types import Task, SubmitTaskRequest
+from csil_gen_pkg.codec import *  # binds to_cbor/from_cbor onto the dataclasses
+from csil_gen_pkg.client import CorndogsClient
+
+
+def make_task(priority):
+    return Task(
+        uuid="u-123",
+        current_state="PENDING",
+        payload=b"\xde\xad\xbe",
+        priority=priority,
+        labels={"a": 1, "b": 2},
+        tags=["x", "y"],
+    )
+
+
+def make_req(priority, queue="default"):
+    # `counts` is a named scalar-map alias; `by_id` a map-of-record alias. Both must
+    # survive the round-trip with their entries intact.
+    return SubmitTaskRequest(
+        task=make_task(priority),
+        queue=queue,
+        counts={"pending": 3, "done": 9},
+        by_id={"first": make_task(1), "second": make_task(2)},
+    )
+
+
+# Direct codec round-trip through the nested record.
+req = make_req(7)
+back = SubmitTaskRequest.from_cbor(req.to_cbor())
+assert back.task.uuid == "u-123"
+assert back.task.current_state == "PENDING"
+assert back.task.payload == b"\xde\xad\xbe"
+assert back.task.priority == 7
+assert back.task.labels == {"a": 1, "b": 2}
+assert back.task.tags == ["x", "y"]
+assert back.queue == "default"
+
+# The named map alias keeps its entries (the regression dropped these).
+assert back.counts == {"pending": 3, "done": 9}
+
+# The map-of-record alias reconstructs each value as a Task, not a raw dict.
+assert set(back.by_id.keys()) == {"first", "second"}
+assert isinstance(back.by_id["first"], Task)
+assert back.by_id["first"].uuid == "u-123"
+assert back.by_id["first"].priority == 1
+assert back.by_id["second"].priority == 2
+assert back.by_id["first"].labels == {"a": 1, "b": 2}
+
+# An absent optional must round-trip to None.
+back2 = SubmitTaskRequest.from_cbor(make_req(None, "q").to_cbor())
+assert back2.task.priority is None
+
+
+# Typed client over a loopback carrier: decode the request, encode its task back.
+class Loopback:
+    def call(self, service, method, req):
+        assert service == "corndogs"
+        assert method == "SubmitTask"
+        decoded = SubmitTaskRequest.from_cbor(req)
+        assert decoded.counts == {"pending": 3, "done": 9}
+        assert decoded.by_id["second"].priority == 2
+        return decoded.task.to_cbor()
+
+
+result = CorndogsClient(Loopback()).submit_task(make_req(7))
+assert result.uuid == "u-123"
+assert result.payload == b"\xde\xad\xbe"
+assert result.priority == 7
+assert result.labels == {"a": 1, "b": 2}
+assert result.tags == ["x", "y"]
+
+print("ok")
+"#;
+
+    /// `emit_packages` must be the sole trigger: absent or not listing Python leaves
+    /// the default flat layout untouched; listing Python adds exactly a `pyproject.toml`
+    /// carrying the requested distribution name and version.
+    #[test]
+    fn pyproject_emitted_iff_emit_packages_includes_python() {
+        // No emit_packages at all → no pyproject, flat layout preserved.
+        let base = create_test_config(false);
+        let plain = generate_python_code_from_serialized(&corndogs_spec(), &base).unwrap();
+        assert!(plain.iter().all(|f| f.path != "pyproject.toml"));
+        assert!(plain.iter().any(|f| f.path == "types.py"));
+
+        // emit_packages present but Python not listed → still no pyproject.
+        let mut other = create_test_config(false);
+        other.options.insert(
+            "emit_packages".to_string(),
+            serde_json::json!(["go", "rust"]),
+        );
+        let other_files = generate_python_code_from_serialized(&corndogs_spec(), &other).unwrap();
+        assert!(other_files.iter().all(|f| f.path != "pyproject.toml"));
+        assert!(other_files.iter().any(|f| f.path == "types.py"));
+
+        // Python listed → pyproject emitted with the configured coordinates, and the
+        // modules relocate under the import-package directory.
+        let mut pkg = create_test_config(false);
+        pkg.target = "python-client".to_string();
+        pkg.options
+            .insert("emit_packages".to_string(), serde_json::json!(["python"]));
+        pkg.options.insert(
+            "package_name".to_string(),
+            serde_json::json!("acme-corndogs"),
+        );
+        pkg.options
+            .insert("package_version".to_string(), serde_json::json!("2.3.4"));
+        let files = generate_python_code_from_serialized(&corndogs_spec(), &pkg).unwrap();
+
+        let toml = files
+            .iter()
+            .find(|f| f.path == "pyproject.toml")
+            .expect("pyproject.toml emitted in package mode");
+        assert!(toml.content.contains("name = \"acme-corndogs\""));
+        assert!(toml.content.contains("version = \"2.3.4\""));
+        // The `-` is illegal in an import name, so discovery points at the sanitized dir.
+        assert!(toml.content.contains("packages = [\"acme_corndogs\"]"));
+        assert!(toml.content.contains("requires-python"));
+
+        // Every module now lives under the import package; nothing is left at the root
+        // except the pyproject itself.
+        for f in &files {
+            if f.path == "pyproject.toml" {
+                continue;
+            }
+            assert!(
+                f.path.starts_with("acme_corndogs/"),
+                "expected {} under import package dir",
+                f.path
+            );
+        }
+        assert!(files.iter().any(|f| f.path == "acme_corndogs/__init__.py"));
+    }
+
+    /// Defaults apply when the coordinate options are omitted entirely.
+    #[test]
+    fn package_mode_defaults_distribution_and_version() {
+        let mut cfg = create_test_config(false);
+        cfg.options
+            .insert("emit_packages".to_string(), serde_json::json!(["python"]));
+        let files = generate_python_code_from_serialized(&corndogs_spec(), &cfg).unwrap();
+        let toml = files
+            .iter()
+            .find(|f| f.path == "pyproject.toml")
+            .expect("pyproject emitted");
+        assert!(toml.content.contains("name = \"csilgen_client\""));
+        assert!(toml.content.contains("version = \"0.1.0\""));
+        assert!(files.iter().any(|f| f.path == "csilgen_client/__init__.py"));
+    }
+
+    /// Generate a real `python-client` package into a temp dir, then prove the artifact
+    /// is publishable-shaped: its `pyproject.toml` parses as TOML and the package imports
+    /// cleanly with the output dir on `sys.path`. Skips when python3 is unavailable.
+    #[test]
+    fn package_mode_pyproject_parses_and_imports() {
+        let have = std::process::Command::new("python3")
+            .arg("--version")
+            .output()
+            .is_ok();
+        if !have {
+            eprintln!("skipping: no python3 on PATH");
+            return;
+        }
+
+        let mut cfg = create_test_config(false);
+        cfg.target = "python-client".to_string();
+        cfg.options
+            .insert("emit_packages".to_string(), serde_json::json!(["python"]));
+        cfg.options.insert(
+            "package_name".to_string(),
+            serde_json::json!("corndogs-sdk"),
+        );
+        cfg.options
+            .insert("package_version".to_string(), serde_json::json!("1.2.3"));
+        let files = generate_python_code_from_serialized(&corndogs_spec(), &cfg).unwrap();
+
+        let dir = std::env::temp_dir().join(format!("csilgen-python-pkg-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        for f in &files {
+            let dest = dir.join(&f.path);
+            std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+            std::fs::write(dest, &f.content).unwrap();
+        }
+
+        // (a) The pyproject must parse as TOML and (b) the package must import with the
+        // output dir on the path. `tomllib` is stdlib from 3.11; fall back to a plain
+        // existence check on older interpreters so the test never spuriously fails.
+        let checker = r#"import os, sys
+root = os.path.dirname(os.path.abspath(__file__))
+try:
+    import tomllib
+    with open(os.path.join(root, "pyproject.toml"), "rb") as fh:
+        data = tomllib.load(fh)
+    assert data["project"]["name"] == "corndogs-sdk", data
+    assert data["project"]["version"] == "1.2.3", data
+    assert data["tool"]["setuptools"]["packages"] == ["corndogs_sdk"], data
+except ModuleNotFoundError:
+    assert os.path.exists(os.path.join(root, "pyproject.toml"))
+sys.path.insert(0, root)
+import corndogs_sdk
+import corndogs_sdk.types
+import corndogs_sdk.client
+print("ok")
+"#;
+        std::fs::write(dir.join("check.py"), checker).unwrap();
+
+        let run = std::process::Command::new("python3")
+            .arg("check.py")
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        assert!(
+            run.status.success(),
+            "package validation failed:\n{}{}",
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&run.stdout).trim(), "ok");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

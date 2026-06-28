@@ -12,8 +12,8 @@ use csilgen_common::{
     CsilControlOperator, CsilFieldMetadata, CsilGroupEntry, CsilGroupExpression, CsilGroupKey,
     CsilLiteralValue, CsilOccurrence, CsilRuleType, CsilServiceDefinition, CsilServiceDirection,
     CsilSizeConstraint, CsilTypeExpression, CsilValidationConstraint, GeneratedFile,
-    GenerationStats, GeneratorCapability, GeneratorMetadata, GeneratorWarning, WasmGeneratorInput,
-    WasmGeneratorOutput, wasm_interface::*,
+    GenerationStats, GeneratorCapability, GeneratorMetadata, GeneratorWarning, WarningLevel,
+    WasmGeneratorInput, WasmGeneratorOutput, wasm_interface::*,
 };
 use std::collections::HashMap;
 
@@ -199,6 +199,15 @@ fn process_generation(input: WasmGeneratorInput) -> Result<WasmGeneratorOutput, 
         files.push(GeneratedFile {
             path: make_path("validation.gen.zig"),
             content: validation,
+        });
+    }
+
+    // Per-type CBOR (de)serializers make the generated structs usable over the wire
+    // without a hand-written codec; the typed client below is built on them.
+    if let Some(codec) = generate_codec(&input, &config, &mut warnings) {
+        files.push(GeneratedFile {
+            path: make_path("codec.gen.zig"),
+            content: codec,
         });
     }
 
@@ -732,19 +741,759 @@ fn emit_control_check(out: &mut String, field: &str, optional: bool, op: &CsilCo
     }
 }
 
+// ---- codec ----------------------------------------------------------------
+
+/// A record field the codec emits, paired with the byte form of its CBOR text key
+/// so fields are ordered canonically (by the bytewise order of their encoded keys)
+/// at generation time rather than at runtime.
+struct CodecField<'a> {
+    name: String,
+    key_bytes: Vec<u8>,
+    value_type: &'a CsilTypeExpression,
+    optional: bool,
+}
+
+/// The CBOR encoding of a text key (major type 3 head + UTF-8 bytes). Comparing
+/// these byte vectors lexicographically is exactly RFC 8949 §4.2.1 key ordering.
+fn cbor_text_key_bytes(name: &str) -> Vec<u8> {
+    let bytes = name.as_bytes();
+    let n = bytes.len() as u64;
+    let mt = 3u8 << 5;
+    let mut head = Vec::new();
+    if n < 24 {
+        head.push(mt | n as u8);
+    } else if n < 0x100 {
+        head.push(mt | 24);
+        head.push(n as u8);
+    } else if n < 0x10000 {
+        head.push(mt | 25);
+        head.extend_from_slice(&(n as u16).to_be_bytes());
+    } else {
+        head.push(mt | 26);
+        head.extend_from_slice(&(n as u32).to_be_bytes());
+    }
+    head.extend_from_slice(bytes);
+    head
+}
+
+/// The record fields a codec emits, in canonical key order. Entries with a
+/// non-name key (a typed map key) are skipped, exactly as the struct emitter does.
+fn codec_fields(group: &CsilGroupExpression) -> Vec<CodecField<'_>> {
+    let mut fields: Vec<CodecField> = group
+        .entries
+        .iter()
+        .filter_map(|entry| {
+            entry_field_name(&entry.key).map(|name| CodecField {
+                key_bytes: cbor_text_key_bytes(&name),
+                name,
+                value_type: &entry.value_type,
+                optional: matches!(entry.occurrence, Some(CsilOccurrence::Optional)),
+            })
+        })
+        .collect();
+    fields.sort_by(|a, b| a.key_bytes.cmp(&b.key_bytes));
+    fields
+}
+
+/// Whether a referenced name has a generated codec (records and enums do).
+fn has_codec(name: &str, codec_names: &std::collections::HashSet<String>) -> bool {
+    codec_names.contains(name)
+}
+
+/// The transparent type aliases the codec resolves through: a `TypeDef` whose target
+/// is a map / array / scalar / reference (NOT a group or a choice, which are realized
+/// as records, enums, or unions with their own handling). A field referencing one of
+/// these has no codec of its own and would otherwise fall through to the null stub;
+/// resolving it to its target lets the map/array/scalar branches code it correctly.
+fn codec_aliases(input: &WasmGeneratorInput) -> HashMap<String, CsilTypeExpression> {
+    input
+        .csil_spec
+        .rules
+        .iter()
+        .filter_map(|rule| match &rule.rule_type {
+            CsilRuleType::TypeDef(t) => match t {
+                CsilTypeExpression::Group(_) | CsilTypeExpression::Choice(_) => None,
+                other => Some((rule.name.clone(), other.clone())),
+            },
+            _ => None,
+        })
+        .collect()
+}
+
+/// Follow transparent-alias references to the underlying type expression so a field or
+/// value typed as a named alias (`StringInt64Map = {* text => int}`) is coded as its
+/// target. Records/enums have a codec and are absent from `aliases`, so a reference to
+/// one is returned unchanged for the `has_codec` arms to pick up.
+fn resolve_alias<'a>(
+    ty: &'a CsilTypeExpression,
+    aliases: &'a HashMap<String, CsilTypeExpression>,
+) -> &'a CsilTypeExpression {
+    let mut cur = unwrap_constrained(ty);
+    while let CsilTypeExpression::Reference(name) = cur {
+        match aliases.get(name) {
+            Some(next) => cur = unwrap_constrained(next),
+            None => break,
+        }
+    }
+    cur
+}
+
+/// Emit a statement that encodes the scalar/reference value `expr` of type `ty`.
+fn emit_enc_value(
+    out: &mut String,
+    indent: &str,
+    ty: &CsilTypeExpression,
+    expr: &str,
+    codec_names: &std::collections::HashSet<String>,
+    aliases: &HashMap<String, CsilTypeExpression>,
+    warnings: &mut Vec<GeneratorWarning>,
+) {
+    match unwrap_constrained(ty) {
+        CsilTypeExpression::Builtin(name) => match name.as_str() {
+            "int" | "nint" => out.push_str(&format!("{indent}try w_int(out, {expr});\n")),
+            "uint" => out.push_str(&format!("{indent}try w_uint(out, {expr});\n")),
+            "bool" | "true" | "false" => {
+                out.push_str(&format!("{indent}try w_bool(out, {expr});\n"))
+            }
+            "float" | "float64" | "double" => {
+                out.push_str(&format!("{indent}try w_f64(out, {expr});\n"))
+            }
+            "float16" | "float32" => out.push_str(&format!("{indent}try w_f32(out, {expr});\n")),
+            "text" | "tstr" => out.push_str(&format!("{indent}try w_text(out, {expr});\n")),
+            "bytes" | "bstr" => out.push_str(&format!("{indent}try w_bytes(out, {expr});\n")),
+            "timestamp" => out.push_str(&format!(
+                "{indent}try w_tag(out, 0);\n{indent}try w_text(out, ({expr}).rfc3339);\n"
+            )),
+            "decimal" => out.push_str(&format!(
+                "{indent}try w_tag(out, 4);\n{indent}try w_array_head(out, 2);\n\
+                 {indent}try w_int(out, ({expr}).exponent);\n{indent}try w_int(out, ({expr}).mantissa);\n"
+            )),
+            "null" | "nil" | "undefined" | "any" => {
+                out.push_str(&format!("{indent}try w_null(out);\n"))
+            }
+            other => {
+                warnings.push(codec_warning(format!(
+                    "zig codec: unsupported builtin `{other}` encoded as null"
+                )));
+                out.push_str(&format!("{indent}try w_null(out);\n"));
+            }
+        },
+        CsilTypeExpression::Reference(name) if has_codec(name, codec_names) => {
+            out.push_str(&format!("{indent}try enc_{name}(out, &({expr}));\n"))
+        }
+        // A reference to a transparent alias (`Uuid = text`) has no codec of its own;
+        // encode it as its target. The named Zig type aliases the same underlying type
+        // the scalar encoder expects, so the same `expr` flows through.
+        CsilTypeExpression::Reference(name) if aliases.contains_key(name) => emit_enc_value(
+            out,
+            indent,
+            resolve_alias(ty, aliases),
+            expr,
+            codec_names,
+            aliases,
+            warnings,
+        ),
+        CsilTypeExpression::Reference(name) => {
+            warnings.push(codec_warning(format!(
+                "zig codec: `{name}` has no generated codec; encoded as null"
+            )));
+            out.push_str(&format!("{indent}try w_null(out);\n"));
+        }
+        // A `text / "a" / "b"` choice is just a text string on the wire.
+        CsilTypeExpression::Choice(arms) if arms.iter().all(is_text_like) => {
+            out.push_str(&format!("{indent}try w_text(out, {expr});\n"))
+        }
+        _ => {
+            warnings.push(codec_warning(
+                "zig codec: unrepresentable nested value encoded as null".to_string(),
+            ));
+            out.push_str(&format!("{indent}try w_null(out);\n"));
+        }
+    }
+}
+
+/// Emit a statement that decodes the scalar/reference value `src` (a `Value`) into
+/// the lvalue `dst` of type `ty`.
+// A buffer-writing emitter inherently carries positional context (sink, indent, the
+// source/destination expressions) on top of the type and the two codec name sets, so
+// it sits one over the lint's argument ceiling; bundling them would only obscure call
+// sites that already pass each piece explicitly.
+#[allow(clippy::too_many_arguments)]
+fn emit_dec_value(
+    out: &mut String,
+    indent: &str,
+    ty: &CsilTypeExpression,
+    src: &str,
+    dst: &str,
+    codec_names: &std::collections::HashSet<String>,
+    aliases: &HashMap<String, CsilTypeExpression>,
+    warnings: &mut Vec<GeneratorWarning>,
+) {
+    match unwrap_constrained(ty) {
+        CsilTypeExpression::Builtin(name) => match name.as_str() {
+            "int" | "nint" => out.push_str(&format!("{indent}{dst} = try as_i64({src});\n")),
+            "uint" => out.push_str(&format!("{indent}{dst} = try as_u64({src});\n")),
+            "bool" | "true" | "false" => {
+                out.push_str(&format!("{indent}{dst} = try as_bool({src});\n"))
+            }
+            "float" | "float64" | "double" => {
+                out.push_str(&format!("{indent}{dst} = try as_f64({src});\n"))
+            }
+            "float16" | "float32" => {
+                out.push_str(&format!("{indent}{dst} = @floatCast(try as_f64({src}));\n"))
+            }
+            "text" | "tstr" => out.push_str(&format!("{indent}{dst} = try as_text({src});\n")),
+            "bytes" | "bstr" => out.push_str(&format!("{indent}{dst} = try as_bytes({src});\n")),
+            "timestamp" => out.push_str(&format!(
+                "{indent}{dst} = .{{ .rfc3339 = try as_tagged_text({src}, 0), .epoch_seconds = 0 }};\n"
+            )),
+            "decimal" => out.push_str(&format!(
+                "{indent}{{\n{indent}    const csil_d = try as_decimal({src});\n\
+                 {indent}    {dst} = .{{ .exponent = csil_d.exp, .mantissa = csil_d.mant }};\n{indent}}}\n"
+            )),
+            "null" | "nil" | "undefined" | "any" => {
+                out.push_str(&format!("{indent}{dst} = null;\n"))
+            }
+            other => {
+                warnings.push(codec_warning(format!(
+                    "zig codec: unsupported builtin `{other}` left default on decode"
+                )));
+                out.push_str(&format!("{indent}_ = {src};\n"));
+            }
+        },
+        CsilTypeExpression::Reference(name) if has_codec(name, codec_names) => {
+            out.push_str(&format!("{indent}try dec_{name}(alloc, {src}, &({dst}));\n"))
+        }
+        // A reference to a transparent alias decodes as its target; the unnamed value
+        // the scalar decoder yields is assignable to the named alias-typed lvalue.
+        CsilTypeExpression::Reference(name) if aliases.contains_key(name) => emit_dec_value(
+            out,
+            indent,
+            resolve_alias(ty, aliases),
+            src,
+            dst,
+            codec_names,
+            aliases,
+            warnings,
+        ),
+        CsilTypeExpression::Reference(name) => {
+            warnings.push(codec_warning(format!(
+                "zig codec: `{name}` has no generated codec; left default on decode"
+            )));
+            out.push_str(&format!("{indent}_ = {src};\n"));
+        }
+        CsilTypeExpression::Choice(arms) if arms.iter().all(is_text_like) => {
+            out.push_str(&format!("{indent}{dst} = try as_text({src});\n"))
+        }
+        _ => {
+            warnings.push(codec_warning(
+                "zig codec: unrepresentable nested value left default on decode".to_string(),
+            ));
+            out.push_str(&format!("{indent}_ = {src};\n"));
+        }
+    }
+}
+
+/// A generation-time codec warning (an unsupported field shape degraded to a null).
+fn codec_warning(message: String) -> GeneratorWarning {
+    GeneratorWarning {
+        level: WarningLevel::Warning,
+        message,
+        location: None,
+        suggestion: None,
+    }
+}
+
+/// Emit the encode of one record field (key + value), honoring optionality and the
+/// slice/map expansion. `member` is the (possibly quoted) Zig field identifier.
+fn emit_enc_field(
+    out: &mut String,
+    field: &CodecField,
+    codec_names: &std::collections::HashSet<String>,
+    aliases: &HashMap<String, CsilTypeExpression>,
+    warnings: &mut Vec<GeneratorWarning>,
+) {
+    let member = zig_ident(&field.name);
+    let key = zig_escape(&field.name);
+    // Resolve transparent aliases so a field typed as a named map/array/scalar alias
+    // is encoded through the same branch its inline form would take, not the stub.
+    let base = resolve_alias(field.value_type, aliases);
+    match base {
+        CsilTypeExpression::Array { element_type, .. } => {
+            if field.optional {
+                out.push_str(&format!("    if (v.{member}) |csil_arr| {{\n"));
+                out.push_str(&format!("        try w_text(out, \"{key}\");\n"));
+                out.push_str("        try w_array_head(out, csil_arr.len);\n");
+                out.push_str("        for (csil_arr) |csil_it| {\n");
+                emit_enc_value(
+                    out,
+                    "            ",
+                    element_type,
+                    "csil_it",
+                    codec_names,
+                    aliases,
+                    warnings,
+                );
+                out.push_str("        }\n    }\n");
+            } else {
+                out.push_str(&format!("    try w_text(out, \"{key}\");\n"));
+                out.push_str(&format!("    try w_array_head(out, v.{member}.len);\n"));
+                out.push_str(&format!("    for (v.{member}) |csil_it| {{\n"));
+                emit_enc_value(
+                    out,
+                    "        ",
+                    element_type,
+                    "csil_it",
+                    codec_names,
+                    aliases,
+                    warnings,
+                );
+                out.push_str("    }\n");
+            }
+        }
+        CsilTypeExpression::Map { key: k, value, .. } => {
+            if field.optional {
+                out.push_str(&format!("    if (v.{member}) |csil_hm| {{\n"));
+                out.push_str(&format!("        try w_text(out, \"{key}\");\n"));
+                out.push_str("        try w_map_head(out, csil_hm.count());\n");
+                out.push_str("        var csil_mi = csil_hm.iterator();\n");
+                out.push_str("        while (csil_mi.next()) |csil_e| {\n");
+                emit_enc_value(
+                    out,
+                    "            ",
+                    k,
+                    "csil_e.key_ptr.*",
+                    codec_names,
+                    aliases,
+                    warnings,
+                );
+                emit_enc_value(
+                    out,
+                    "            ",
+                    value,
+                    "csil_e.value_ptr.*",
+                    codec_names,
+                    aliases,
+                    warnings,
+                );
+                out.push_str("        }\n    }\n");
+            } else {
+                out.push_str("    {\n");
+                out.push_str(&format!("        try w_text(out, \"{key}\");\n"));
+                out.push_str(&format!(
+                    "        try w_map_head(out, v.{member}.count());\n"
+                ));
+                out.push_str(&format!("        var csil_mi = v.{member}.iterator();\n"));
+                out.push_str("        while (csil_mi.next()) |csil_e| {\n");
+                emit_enc_value(
+                    out,
+                    "            ",
+                    k,
+                    "csil_e.key_ptr.*",
+                    codec_names,
+                    aliases,
+                    warnings,
+                );
+                emit_enc_value(
+                    out,
+                    "            ",
+                    value,
+                    "csil_e.value_ptr.*",
+                    codec_names,
+                    aliases,
+                    warnings,
+                );
+                out.push_str("        }\n    }\n");
+            }
+        }
+        _ => {
+            if field.optional {
+                out.push_str(&format!("    if (v.{member}) |csil_x| {{\n"));
+                out.push_str(&format!("        try w_text(out, \"{key}\");\n"));
+                emit_enc_value(
+                    out,
+                    "        ",
+                    base,
+                    "csil_x",
+                    codec_names,
+                    aliases,
+                    warnings,
+                );
+                out.push_str("    }\n");
+            } else {
+                out.push_str(&format!("    try w_text(out, \"{key}\");\n"));
+                emit_enc_value(
+                    out,
+                    "    ",
+                    base,
+                    &format!("v.{member}"),
+                    codec_names,
+                    aliases,
+                    warnings,
+                );
+            }
+        }
+    }
+}
+
+/// Emit the per-entry value computation for a map decode, binding `csil_val` to the
+/// decoded value of type `value` so the loop can `put` it into the hashmap.
+fn emit_map_value_decode(
+    out: &mut String,
+    indent: &str,
+    value: &CsilTypeExpression,
+    codec_names: &std::collections::HashSet<String>,
+    aliases: &HashMap<String, CsilTypeExpression>,
+    warnings: &mut Vec<GeneratorWarning>,
+) {
+    match unwrap_constrained(value) {
+        CsilTypeExpression::Reference(name) if has_codec(name, codec_names) => {
+            out.push_str(&format!(
+                "{indent}var csil_val: {} = undefined;\n",
+                map_zig_type(value, "types.")
+            ));
+            out.push_str(&format!(
+                "{indent}try dec_{name}(alloc, csil_kv.val, &csil_val);\n"
+            ));
+        }
+        _ => {
+            out.push_str(&format!(
+                "{indent}var csil_val: {} = undefined;\n",
+                map_zig_type(value, "types.")
+            ));
+            emit_dec_value(
+                out,
+                indent,
+                value,
+                "csil_kv.val",
+                "csil_val",
+                codec_names,
+                aliases,
+                warnings,
+            );
+        }
+    }
+}
+
+/// Emit the decode of one record field into `out.<member>`, each wrapped in a block
+/// so its locals (`csil_fv`, `csil_it`, `csil_kv`, …) never collide across fields.
+fn emit_dec_field(
+    out: &mut String,
+    field: &CodecField,
+    codec_names: &std::collections::HashSet<String>,
+    aliases: &HashMap<String, CsilTypeExpression>,
+    warnings: &mut Vec<GeneratorWarning>,
+) {
+    let member = zig_ident(&field.name);
+    let key = zig_escape(&field.name);
+    // Resolve transparent aliases so a field typed as a named map/array/scalar alias
+    // is decoded through the same branch its inline form would take, not the stub.
+    let base = resolve_alias(field.value_type, aliases);
+    match base {
+        CsilTypeExpression::Array { element_type, .. } => {
+            let elem = map_zig_type(element_type, "types.");
+            out.push_str("    {\n");
+            if field.optional {
+                out.push_str(&format!("        if (mget(m, \"{key}\")) |csil_fv| {{\n"));
+                out.push_str("            if (csil_fv != .array) return error.WrongType;\n");
+                out.push_str(&format!(
+                    "            const csil_tmp = try alloc.alloc({elem}, csil_fv.array.len);\n"
+                ));
+                out.push_str("            for (csil_fv.array, 0..) |csil_it, csil_i| {\n");
+                emit_dec_value(
+                    out,
+                    "                ",
+                    element_type,
+                    "csil_it",
+                    "csil_tmp[csil_i]",
+                    codec_names,
+                    aliases,
+                    warnings,
+                );
+                out.push_str("            }\n");
+                out.push_str(&format!("            out.{member} = csil_tmp;\n"));
+                out.push_str(&format!(
+                    "        }} else {{\n            out.{member} = null;\n        }}\n    }}\n"
+                ));
+            } else {
+                out.push_str(&format!("        const csil_fv = try req(m, \"{key}\");\n"));
+                out.push_str("        if (csil_fv != .array) return error.WrongType;\n");
+                out.push_str(&format!(
+                    "        out.{member} = try alloc.alloc({elem}, csil_fv.array.len);\n"
+                ));
+                out.push_str("        for (csil_fv.array, 0..) |csil_it, csil_i| {\n");
+                emit_dec_value(
+                    out,
+                    "            ",
+                    element_type,
+                    "csil_it",
+                    &format!("out.{member}[csil_i]"),
+                    codec_names,
+                    aliases,
+                    warnings,
+                );
+                out.push_str("        }\n    }\n");
+            }
+        }
+        CsilTypeExpression::Map { value, .. } => {
+            let map_ty = map_zig_type(base, "types.");
+            out.push_str("    {\n");
+            if field.optional {
+                out.push_str(&format!("        if (mget(m, \"{key}\")) |csil_fv| {{\n"));
+                out.push_str("            if (csil_fv != .map) return error.WrongType;\n");
+                out.push_str(&format!("            var csil_tmp: {map_ty} = .{{}};\n"));
+                out.push_str("            for (csil_fv.map) |csil_kv| {\n");
+                out.push_str("                const csil_k = try as_text(csil_kv.key);\n");
+                emit_map_value_decode(
+                    out,
+                    "                ",
+                    value,
+                    codec_names,
+                    aliases,
+                    warnings,
+                );
+                out.push_str("                try csil_tmp.put(alloc, csil_k, csil_val);\n");
+                out.push_str("            }\n");
+                out.push_str(&format!("            out.{member} = csil_tmp;\n"));
+                out.push_str(&format!(
+                    "        }} else {{\n            out.{member} = null;\n        }}\n    }}\n"
+                ));
+            } else {
+                out.push_str(&format!("        const csil_fv = try req(m, \"{key}\");\n"));
+                out.push_str("        if (csil_fv != .map) return error.WrongType;\n");
+                out.push_str(&format!("        out.{member} = .{{}};\n"));
+                out.push_str("        for (csil_fv.map) |csil_kv| {\n");
+                out.push_str("            const csil_k = try as_text(csil_kv.key);\n");
+                emit_map_value_decode(out, "            ", value, codec_names, aliases, warnings);
+                out.push_str(&format!(
+                    "            try out.{member}.put(alloc, csil_k, csil_val);\n"
+                ));
+                out.push_str("        }\n    }\n");
+            }
+        }
+        CsilTypeExpression::Reference(name) if field.optional && has_codec(name, codec_names) => {
+            out.push_str("    {\n");
+            out.push_str(&format!("        if (mget(m, \"{key}\")) |csil_fv| {{\n"));
+            out.push_str(&format!(
+                "            var csil_tmp: {} = undefined;\n",
+                map_zig_type(base, "types.")
+            ));
+            out.push_str(&format!(
+                "            try dec_{name}(alloc, csil_fv, &csil_tmp);\n"
+            ));
+            out.push_str(&format!("            out.{member} = csil_tmp;\n"));
+            out.push_str(&format!(
+                "        }} else {{\n            out.{member} = null;\n        }}\n    }}\n"
+            ));
+        }
+        _ => {
+            out.push_str("    {\n");
+            if field.optional {
+                out.push_str(&format!("        if (mget(m, \"{key}\")) |csil_fv| {{\n"));
+                emit_dec_value(
+                    out,
+                    "            ",
+                    base,
+                    "csil_fv",
+                    &format!("out.{member}"),
+                    codec_names,
+                    aliases,
+                    warnings,
+                );
+                out.push_str(&format!(
+                    "        }} else {{\n            out.{member} = null;\n        }}\n    }}\n"
+                ));
+            } else {
+                out.push_str(&format!("        const csil_fv = try req(m, \"{key}\");\n"));
+                emit_dec_value(
+                    out,
+                    "        ",
+                    base,
+                    "csil_fv",
+                    &format!("out.{member}"),
+                    codec_names,
+                    aliases,
+                    warnings,
+                );
+                out.push_str("    }\n");
+            }
+        }
+    }
+}
+
+/// Emit the encode + decode functions for one record type.
+fn emit_record_codec(
+    out: &mut String,
+    name: &str,
+    group: &CsilGroupExpression,
+    codec_names: &std::collections::HashSet<String>,
+    aliases: &HashMap<String, CsilTypeExpression>,
+    warnings: &mut Vec<GeneratorWarning>,
+) {
+    let fields = codec_fields(group);
+    let required = fields.iter().filter(|f| !f.optional).count();
+    let optionals: Vec<&CodecField> = fields.iter().filter(|f| f.optional).collect();
+    // Zig rejects an unused parameter: `v` is unused only for a field-less record,
+    // and `alloc` only when no field needs heap (an all-scalar record). Aliases are
+    // resolved first so a named map/array alias field is recognized as heap-using.
+    let dec_uses_alloc = fields.iter().any(|f| {
+        let resolved = resolve_alias(f.value_type, aliases);
+        matches!(
+            resolved,
+            CsilTypeExpression::Array { .. } | CsilTypeExpression::Map { .. }
+        ) || matches!(resolved, CsilTypeExpression::Reference(n) if has_codec(n, codec_names))
+    });
+
+    out.push_str(&format!(
+        "fn enc_{name}(out: *std.ArrayList(u8), v: *const types.{name}) CodecError!void {{\n"
+    ));
+    if fields.is_empty() {
+        out.push_str("    _ = v;\n");
+    }
+    if optionals.is_empty() {
+        out.push_str(&format!("    try w_map_head(out, {required});\n"));
+    } else {
+        out.push_str(&format!("    var csil_n: usize = {required};\n"));
+        for field in &optionals {
+            out.push_str(&format!(
+                "    if (v.{} != null) csil_n += 1;\n",
+                zig_ident(&field.name)
+            ));
+        }
+        out.push_str("    try w_map_head(out, csil_n);\n");
+    }
+    for field in &fields {
+        emit_enc_field(out, field, codec_names, aliases, warnings);
+    }
+    out.push_str("}\n\n");
+
+    out.push_str(&format!(
+        "fn dec_{name}(alloc: std.mem.Allocator, m: Value, out: *types.{name}) CodecError!void {{\n"
+    ));
+    if !dec_uses_alloc {
+        out.push_str("    _ = alloc;\n");
+    }
+    // A field-less record never populates `out`, and Zig rejects the unused
+    // parameter; discard it the same way `alloc` is handled above.
+    if fields.is_empty() {
+        out.push_str("    _ = out;\n");
+    }
+    out.push_str("    if (m != .map) return error.WrongType;\n");
+    for field in &fields {
+        emit_dec_field(out, field, codec_names, aliases, warnings);
+    }
+    out.push_str("}\n\n");
+}
+
+/// Emit the encode + decode for an enum type. The wire form is the variant's
+/// original literal text, mapped through the generated `wire_name` on encode and an
+/// explicit table on decode.
+fn emit_enum_codec(out: &mut String, name: &str, variants: &[String]) {
+    out.push_str(&format!(
+        "fn enc_{name}(out: *std.ArrayList(u8), v: *const types.{name}) CodecError!void {{\n"
+    ));
+    out.push_str("    try w_text(out, v.wire_name());\n}\n\n");
+    out.push_str(&format!(
+        "fn dec_{name}(alloc: std.mem.Allocator, src: Value, out: *types.{name}) CodecError!void {{\n"
+    ));
+    out.push_str("    _ = alloc;\n");
+    out.push_str("    const csil_s = try as_text(src);\n");
+    for variant in variants {
+        out.push_str(&format!(
+            "    if (std.mem.eql(u8, csil_s, \"{}\")) {{\n        out.* = .{};\n        return;\n    }}\n",
+            zig_escape(variant),
+            zig_ident(&to_snake(variant))
+        ));
+    }
+    out.push_str("    return error.WrongType;\n}\n\n");
+}
+
+fn generate_codec(
+    input: &WasmGeneratorInput,
+    config: &ZigConfig,
+    warnings: &mut Vec<GeneratorWarning>,
+) -> Option<String> {
+    let typed: Vec<(&str, TypeKind)> = input
+        .csil_spec
+        .rules
+        .iter()
+        .filter_map(|r| classify_rule(&r.rule_type).map(|k| (r.name.as_str(), k)))
+        .collect();
+    let codec_names: std::collections::HashSet<String> = typed
+        .iter()
+        .filter(|(_, k)| matches!(k, TypeKind::Struct(_) | TypeKind::Enum(_)))
+        .map(|(n, _)| n.to_string())
+        .collect();
+    if codec_names.is_empty() {
+        return None;
+    }
+    let aliases = codec_aliases(input);
+
+    let mut bodies = String::new();
+    let mut public = String::new();
+    for (name, kind) in &typed {
+        match kind {
+            TypeKind::Struct(group) => {
+                emit_record_codec(&mut bodies, name, group, &codec_names, &aliases, warnings)
+            }
+            TypeKind::Enum(variants) => emit_enum_codec(&mut bodies, name, variants),
+            _ => continue,
+        }
+        // Public, ergonomic per-type wrappers: encode to a caller-freed slice; decode
+        // into a typed value whose strings/slices live in the caller's allocator (use
+        // an arena and free everything in one shot).
+        public.push_str(&format!(
+            "/// Encode a {name} to CBOR. The returned slice is owned by the caller\n\
+             /// (free it with alloc.free).\n"
+        ));
+        public.push_str(&format!(
+            "pub fn encode_{name}(alloc: std.mem.Allocator, v: *const types.{name}) CodecError![]u8 {{\n\
+             \x20   var out = std.ArrayList(u8).init(alloc);\n\
+             \x20   errdefer out.deinit();\n\
+             \x20   try enc_{name}(&out, v);\n\
+             \x20   return out.toOwnedSlice();\n}}\n\n"
+        ));
+        public.push_str(&format!(
+            "/// Decode CBOR into a {name}. Every string/slice/map inside `out` is\n\
+             /// allocated from `alloc`; pass an arena and free it all at once.\n"
+        ));
+        public.push_str(&format!(
+            "pub fn decode_{name}(alloc: std.mem.Allocator, bytes: []const u8, out: *types.{name}) CodecError!void {{\n\
+             \x20   const root = try decode(alloc, bytes);\n\
+             \x20   try dec_{name}(alloc, root, out);\n}}\n\n"
+        ));
+    }
+
+    let mut content = String::new();
+    file_header(
+        &mut content,
+        "Generated CBOR (de)serializers for the CSIL value types.",
+    );
+    content.push_str("const std = @import(\"std\");\n");
+    content.push_str("const types = @import(\"types.gen.zig\");\n\n");
+    let _ = config;
+    content.push_str(CSIL_CODEC_RUNTIME_ZIG);
+    content.push('\n');
+    content.push_str(&bodies);
+    content.push_str(&public);
+    Some(content)
+}
+
 // ---- client ---------------------------------------------------------------
 
-/// The transport seam every generated call delegates to: the host implements
-/// `call`, performing the wire round-trip for `(service, op)`. The generator
-/// never owns the bytes.
+/// The carrier seam every generated call delegates to: the host implements `call`,
+/// performing the raw byte round-trip for `(service, op)`. The generated client
+/// owns serialization (it encodes the typed request and decodes the typed
+/// response); the carrier only moves bytes, exactly as in the other languages. The
+/// carrier allocates the response with the passed allocator so the client frees it.
 const CLIENT_PRELUDE_ZIG: &str = "\
-/// CsilgenTransport is supplied by the caller: it encodes req (CBOR over HTTP,
-/// say), performs the call named by (service, op), and returns the response
-/// bytes (the caller owns/frees them), or an error. The generator never owns the
-/// wire.
+/// CsilgenTransport is the caller-supplied byte carrier: it performs the call named
+/// by (service, op) with the already-encoded req bytes (CBOR over HTTP, say) and
+/// returns the response bytes, allocated with `alloc` so the generated client frees
+/// them. The generator owns serialization; the carrier only moves bytes.
 pub const CsilgenTransport = struct {
     ptr: *anyopaque,
-    call: *const fn (ptr: *anyopaque, service: []const u8, op: []const u8, req: []const u8) anyerror![]u8,
+    call: *const fn (ptr: *anyopaque, alloc: std.mem.Allocator, service: []const u8, op: []const u8, req: []const u8) anyerror![]u8,
 };
 ";
 
@@ -762,6 +1511,9 @@ fn generate_client(input: &WasmGeneratorInput) -> Option<String> {
     }
     let mut content = String::new();
     file_header(&mut content, "Generated typed RPC client call-sites.");
+    content.push_str("const std = @import(\"std\");\n");
+    content.push_str("const types = @import(\"types.gen.zig\");\n");
+    content.push_str("const codec = @import(\"codec.gen.zig\");\n\n");
     content.push_str(CLIENT_PRELUDE_ZIG);
     content.push('\n');
     content.push_str(&body);
@@ -794,19 +1546,50 @@ fn emit_client_struct(content: &mut String, name: &str, service: &CsilServiceDef
         }
         let method = zig_ident(&to_snake(&op.name));
         let wire_op = simple_pascal(&op.name);
+        let resp_type = map_zig_type(&success_type(&op.output_type), "types.");
+        let resp_codec = type_codec_name(&success_type(&op.output_type));
+        let has_input = !op_input_is_null(&op.input_type);
+        let req_type = map_zig_type(&op.input_type, "types.");
+        let req_codec = type_codec_name(&op.input_type);
+
         content.push_str(&format!(
-            "\n    /// Invoke {wire_service}/{wire_op}. The encoded request rides in req; the\n\
-             \x20   /// decoded response bytes are returned (caller owns).\n"
+            "\n    /// Invoke {wire_service}/{wire_op} with a typed request, returning the decoded\n\
+             \x20   /// typed response. Everything in `out` is allocated from `alloc`; pass an arena\n\
+             \x20   /// and free it once when done.\n"
         ));
+        if has_input {
+            content.push_str(&format!(
+                "    pub fn {method}(self: {client}, alloc: std.mem.Allocator, req: *const {req_type}, out: *{resp_type}) anyerror!void {{\n"
+            ));
+            content.push_str(&format!(
+                "        const csil_reqb = try codec.encode_{req_codec}(alloc, req);\n"
+            ));
+            content.push_str("        defer alloc.free(csil_reqb);\n");
+        } else {
+            content.push_str(&format!(
+                "    pub fn {method}(self: {client}, alloc: std.mem.Allocator, out: *{resp_type}) anyerror!void {{\n"
+            ));
+            content.push_str("        const csil_reqb: []const u8 = &.{};\n");
+        }
         content.push_str(&format!(
-            "    pub fn {method}(self: {client}, req: []const u8) anyerror![]u8 {{\n"
+            "        const csil_respb = try self.transport.call(self.transport.ptr, alloc, \"{wire_service}\", \"{wire_op}\", csil_reqb);\n"
         ));
+        content.push_str("        defer alloc.free(csil_respb);\n");
         content.push_str(&format!(
-            "        return self.transport.call(self.transport.ptr, \"{wire_service}\", \"{wire_op}\", req);\n"
+            "        try codec.decode_{resp_codec}(alloc, csil_respb, out);\n"
         ));
         content.push_str("    }\n");
     }
     content.push_str("};\n\n");
+}
+
+/// The codec base name for an operation input/output type reference.
+fn type_codec_name(type_expr: &CsilTypeExpression) -> String {
+    match unwrap_constrained(type_expr) {
+        CsilTypeExpression::Reference(name) => name.clone(),
+        CsilTypeExpression::Builtin(name) => name.clone(),
+        _ => "void".to_string(),
+    }
 }
 
 // ---- server ---------------------------------------------------------------
@@ -1386,6 +2169,314 @@ fn zig_escape(s: &str) -> String {
     }
     out
 }
+
+// ---- embedded codec runtime -----------------------------------------------
+
+/// The self-contained canonical-CBOR runtime the per-type codecs build on. Modeled
+/// on the conformance-tested transport codec (`transports/zig/src/cbor.zig`), it
+/// adds the float/bool/null items a payload may carry and the typed accessors the
+/// generated decoders call. Unused private decls are legal in Zig, so emitting every
+/// primitive regardless of which a spec uses costs nothing.
+const CSIL_CODEC_RUNTIME_ZIG: &str = r#"// ===== self-contained canonical CBOR codec (RFC 8949 subset) =====
+
+const CodecError = error{ Malformed, UnexpectedEof, TrailingBytes, WrongType, MissingField } || std.mem.Allocator.Error;
+
+const Pair = struct { key: Value, val: Value };
+const Tag = struct { num: u64, content: *Value };
+
+const Value = union(enum) {
+    uint: u64,
+    int: i64,
+    float: f64,
+    boolean: bool,
+    null: void,
+    bytes: []const u8,
+    text: []const u8,
+    array: []Value,
+    map: []Pair,
+    tag: Tag,
+};
+
+fn write_head(out: *std.ArrayList(u8), major: u8, n: u64) std.mem.Allocator.Error!void {
+    const mt: u8 = major << 5;
+    if (n < 24) {
+        try out.append(mt | @as(u8, @intCast(n)));
+    } else if (n < (1 << 8)) {
+        try out.append(mt | 24);
+        try out.append(@intCast(n));
+    } else if (n < (1 << 16)) {
+        try out.append(mt | 25);
+        var b: [2]u8 = undefined;
+        std.mem.writeInt(u16, &b, @intCast(n), .big);
+        try out.appendSlice(&b);
+    } else if (n < (1 << 32)) {
+        try out.append(mt | 26);
+        var b: [4]u8 = undefined;
+        std.mem.writeInt(u32, &b, @intCast(n), .big);
+        try out.appendSlice(&b);
+    } else {
+        try out.append(mt | 27);
+        var b: [8]u8 = undefined;
+        std.mem.writeInt(u64, &b, n, .big);
+        try out.appendSlice(&b);
+    }
+}
+
+fn w_uint(out: *std.ArrayList(u8), n: u64) std.mem.Allocator.Error!void {
+    try write_head(out, 0, n);
+}
+
+fn w_int(out: *std.ArrayList(u8), x: i64) std.mem.Allocator.Error!void {
+    if (x >= 0) {
+        try write_head(out, 0, @intCast(x));
+    } else {
+        const mag: u64 = @intCast(-(x + 1));
+        try write_head(out, 1, mag);
+    }
+}
+
+fn w_text(out: *std.ArrayList(u8), s: []const u8) std.mem.Allocator.Error!void {
+    try write_head(out, 3, s.len);
+    try out.appendSlice(s);
+}
+
+fn w_bytes(out: *std.ArrayList(u8), s: []const u8) std.mem.Allocator.Error!void {
+    try write_head(out, 2, s.len);
+    try out.appendSlice(s);
+}
+
+fn w_bool(out: *std.ArrayList(u8), v: bool) std.mem.Allocator.Error!void {
+    try out.append(if (v) 0xf5 else 0xf4);
+}
+
+fn w_null(out: *std.ArrayList(u8)) std.mem.Allocator.Error!void {
+    try out.append(0xf6);
+}
+
+fn w_array_head(out: *std.ArrayList(u8), n: usize) std.mem.Allocator.Error!void {
+    try write_head(out, 4, @as(u64, @intCast(n)));
+}
+
+fn w_map_head(out: *std.ArrayList(u8), n: usize) std.mem.Allocator.Error!void {
+    try write_head(out, 5, @as(u64, @intCast(n)));
+}
+
+fn w_tag(out: *std.ArrayList(u8), n: u64) std.mem.Allocator.Error!void {
+    try write_head(out, 6, n);
+}
+
+fn w_f64(out: *std.ArrayList(u8), x: f64) std.mem.Allocator.Error!void {
+    try out.append(0xfb);
+    var b: [8]u8 = undefined;
+    std.mem.writeInt(u64, &b, @bitCast(x), .big);
+    try out.appendSlice(&b);
+}
+
+fn w_f32(out: *std.ArrayList(u8), x: f32) std.mem.Allocator.Error!void {
+    try out.append(0xfa);
+    var b: [4]u8 = undefined;
+    std.mem.writeInt(u32, &b, @bitCast(x), .big);
+    try out.appendSlice(&b);
+}
+
+const Decoded = struct { value: Value, consumed: usize };
+const Arg = struct { arg: u64, head: usize };
+
+fn read_arg(b: []const u8, low: u8) CodecError!Arg {
+    if (low < 24) return .{ .arg = low, .head = 1 };
+    switch (low) {
+        24 => {
+            if (b.len < 2) return error.UnexpectedEof;
+            return .{ .arg = b[1], .head = 2 };
+        },
+        25 => {
+            if (b.len < 3) return error.UnexpectedEof;
+            return .{ .arg = std.mem.readInt(u16, b[1..][0..2], .big), .head = 3 };
+        },
+        26 => {
+            if (b.len < 5) return error.UnexpectedEof;
+            return .{ .arg = std.mem.readInt(u32, b[1..][0..4], .big), .head = 5 };
+        },
+        27 => {
+            if (b.len < 9) return error.UnexpectedEof;
+            return .{ .arg = std.mem.readInt(u64, b[1..][0..8], .big), .head = 9 };
+        },
+        else => return error.Malformed,
+    }
+}
+
+fn half_to_f64(h: u16) f64 {
+    const sign: u32 = @as(u32, h & 0x8000) << 16;
+    var exp: u32 = (h >> 10) & 0x1f;
+    var mant: u32 = h & 0x3ff;
+    var bits: u32 = undefined;
+    if (exp == 0) {
+        if (mant == 0) {
+            bits = sign;
+        } else {
+            exp = 127 - 15 + 1;
+            while ((mant & 0x400) == 0) {
+                mant <<= 1;
+                exp -= 1;
+            }
+            mant &= 0x3ff;
+            bits = sign | (exp << 23) | (mant << 13);
+        }
+    } else if (exp == 0x1f) {
+        bits = sign | 0x7f800000 | (mant << 13);
+    } else {
+        bits = sign | ((exp + (127 - 15)) << 23) | (mant << 13);
+    }
+    return @as(f64, @as(f32, @bitCast(bits)));
+}
+
+fn decode_value(alloc: std.mem.Allocator, b: []const u8) CodecError!Decoded {
+    if (b.len == 0) return error.UnexpectedEof;
+    const ib = b[0];
+    const major: u8 = ib >> 5;
+    const low: u8 = ib & 0x1f;
+    const h = try read_arg(b, low);
+    const arg = h.arg;
+    const n = h.head;
+    switch (major) {
+        0 => return .{ .value = .{ .uint = arg }, .consumed = n },
+        1 => {
+            if (arg > std.math.maxInt(i64)) return error.Malformed;
+            return .{ .value = .{ .int = -1 - @as(i64, @intCast(arg)) }, .consumed = n };
+        },
+        2, 3 => {
+            if (arg > b.len - n) return error.UnexpectedEof;
+            const end = n + @as(usize, @intCast(arg));
+            const slice = try alloc.dupe(u8, b[n..end]);
+            const value: Value = if (major == 2) .{ .bytes = slice } else .{ .text = slice };
+            return .{ .value = value, .consumed = end };
+        },
+        4 => {
+            const count: usize = @intCast(arg);
+            const items = try alloc.alloc(Value, count);
+            var off = n;
+            var i: usize = 0;
+            while (i < count) : (i += 1) {
+                const d = try decode_value(alloc, b[off..]);
+                items[i] = d.value;
+                off += d.consumed;
+            }
+            return .{ .value = .{ .array = items }, .consumed = off };
+        },
+        5 => {
+            const count: usize = @intCast(arg);
+            const pairs = try alloc.alloc(Pair, count);
+            var off = n;
+            var i: usize = 0;
+            while (i < count) : (i += 1) {
+                const k = try decode_value(alloc, b[off..]);
+                off += k.consumed;
+                const v = try decode_value(alloc, b[off..]);
+                off += v.consumed;
+                pairs[i] = .{ .key = k.value, .val = v.value };
+            }
+            return .{ .value = .{ .map = pairs }, .consumed = off };
+        },
+        6 => {
+            const inner = try decode_value(alloc, b[n..]);
+            const content = try alloc.create(Value);
+            content.* = inner.value;
+            return .{ .value = .{ .tag = .{ .num = arg, .content = content } }, .consumed = n + inner.consumed };
+        },
+        7 => switch (low) {
+            20 => return .{ .value = .{ .boolean = false }, .consumed = n },
+            21 => return .{ .value = .{ .boolean = true }, .consumed = n },
+            22, 23 => return .{ .value = .{ .null = {} }, .consumed = n },
+            25 => return .{ .value = .{ .float = half_to_f64(@intCast(arg)) }, .consumed = n },
+            26 => return .{ .value = .{ .float = @as(f64, @as(f32, @bitCast(@as(u32, @intCast(arg))))) }, .consumed = n },
+            27 => return .{ .value = .{ .float = @bitCast(arg) }, .consumed = n },
+            else => return error.Malformed,
+        },
+        else => return error.Malformed,
+    }
+}
+
+fn decode(alloc: std.mem.Allocator, b: []const u8) CodecError!Value {
+    const d = try decode_value(alloc, b);
+    if (d.consumed != b.len) return error.TrailingBytes;
+    return d.value;
+}
+
+fn mget(m: Value, key: []const u8) ?Value {
+    if (m != .map) return null;
+    for (m.map) |p| {
+        if (p.key == .text and std.mem.eql(u8, p.key.text, key)) return p.val;
+    }
+    return null;
+}
+
+fn req(m: Value, key: []const u8) CodecError!Value {
+    return mget(m, key) orelse error.MissingField;
+}
+
+fn as_i64(v: Value) CodecError!i64 {
+    return switch (v) {
+        .int => |x| x,
+        .uint => |x| if (x > std.math.maxInt(i64)) error.WrongType else @intCast(x),
+        else => error.WrongType,
+    };
+}
+
+fn as_u64(v: Value) CodecError!u64 {
+    return switch (v) {
+        .uint => |x| x,
+        .int => |x| if (x < 0) error.WrongType else @intCast(x),
+        else => error.WrongType,
+    };
+}
+
+fn as_f64(v: Value) CodecError!f64 {
+    return switch (v) {
+        .float => |x| x,
+        .int => |x| @floatFromInt(x),
+        .uint => |x| @floatFromInt(x),
+        else => error.WrongType,
+    };
+}
+
+fn as_bool(v: Value) CodecError!bool {
+    return switch (v) {
+        .boolean => |x| x,
+        else => error.WrongType,
+    };
+}
+
+fn as_text(v: Value) CodecError![]const u8 {
+    return switch (v) {
+        .text => |s| s,
+        else => error.WrongType,
+    };
+}
+
+fn as_bytes(v: Value) CodecError![]const u8 {
+    return switch (v) {
+        .bytes => |s| s,
+        else => error.WrongType,
+    };
+}
+
+fn as_tagged_text(v: Value, num: u64) CodecError![]const u8 {
+    if (v != .tag or v.tag.num != num or v.tag.content.* != .text) return error.WrongType;
+    return v.tag.content.text;
+}
+
+const Decimal = struct { exp: i64, mant: i64 };
+
+fn as_decimal(v: Value) CodecError!Decimal {
+    if (v != .tag or v.tag.num != 4 or v.tag.content.* != .array or v.tag.content.array.len != 2) {
+        return error.WrongType;
+    }
+    return .{
+        .exp = try as_i64(v.tag.content.array[0]),
+        .mant = try as_i64(v.tag.content.array[1]),
+    };
+}
+"#;
 
 // ---- embedded helper files ------------------------------------------------
 

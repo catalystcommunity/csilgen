@@ -213,7 +213,9 @@ fn file<'a>(files: &'a [GeneratedFile], path: &str) -> &'a str {
 #[test]
 fn typesonly_emits_only_types_with_service_error() {
     let files = generate_files(&input_for("typescript-typesonly")).expect("generate");
-    assert_eq!(files.len(), 1);
+    // The record codec rides alongside the types for every surface.
+    let paths: Vec<&str> = files.iter().map(|f| f.path.as_str()).collect();
+    assert_eq!(paths, vec!["types.gen.ts", "codec.gen.ts"]);
     let types = file(&files, "types.gen.ts");
 
     assert!(types.contains("export interface ServiceError {"));
@@ -232,25 +234,34 @@ fn typesonly_emits_only_types_with_service_error() {
 fn client_emits_types_and_client() {
     let files = generate_files(&input_for("typescript-client")).expect("generate");
     let paths: Vec<&str> = files.iter().map(|f| f.path.as_str()).collect();
-    assert_eq!(paths, vec!["types.gen.ts", "client.gen.ts"]);
+    assert_eq!(paths, vec!["types.gen.ts", "codec.gen.ts", "client.gen.ts"]);
 
     let client = file(&files, "client.gen.ts");
     // type-only import from the companion types module
     assert!(client.contains("import type {"));
     assert!(client.contains("} from \"./types.gen\";"));
-    // transport interface present
+    // the typed methods pull their codec helpers from the codec module
+    assert!(client.contains("} from \"./codec.gen\";"));
+    assert!(client.contains("fromLoginResponseCbor"));
+    assert!(client.contains("toLoginRequestCbor"));
+    // byte-seam transport interface present
     assert!(client.contains("export interface ServiceTransport {"));
+    assert!(client.contains("call(service: string, op: string, req: Uint8Array): Uint8Array;"));
     // per-service classes
     assert!(client.contains("export class AuthClient {"));
     assert!(client.contains("export class MemberClient {"));
-    // camelCase method + wire strings (lowercase service, PascalCase method)
-    assert!(client.contains(
-        "login(req: LoginRequest, opts?: { signal?: AbortSignal }): Promise<LoginResponse>"
-    ));
+    // camelCase method (sync byte seam): encode -> call -> decode
+    assert!(client.contains("login(req: LoginRequest): LoginResponse {"));
     assert!(
-        client.contains("this.t.call<LoginRequest, LoginResponse>(\"auth\", \"Login\", req, opts)")
+        client.contains(
+            "const csilResp = this.t.call(\"auth\", \"Login\", toLoginRequestCbor(req));"
+        )
     );
-    assert!(client.contains("this.t.call<ListMembersRequest, ListMembersResponse>(\"member\", \"ListMembers\", req, opts)"));
+    assert!(client.contains("return fromLoginResponseCbor(csilResp);"));
+    // wire strings: lowercase service, PascalCase method
+    assert!(
+        client.contains("this.t.call(\"member\", \"ListMembers\", toListMembersRequestCbor(req));")
+    );
     // aggregate class with default name
     assert!(client.contains("export class ApiClient {"));
     assert!(client.contains("this.auth = new AuthClient(t);"));
@@ -265,7 +276,7 @@ fn client_emits_types_and_client() {
 fn server_emits_types_and_server() {
     let files = generate_files(&input_for("typescript-server")).expect("generate");
     let paths: Vec<&str> = files.iter().map(|f| f.path.as_str()).collect();
-    assert_eq!(paths, vec!["types.gen.ts", "server.gen.ts"]);
+    assert_eq!(paths, vec!["types.gen.ts", "codec.gen.ts", "server.gen.ts"]);
 
     let server = file(&files, "server.gen.ts");
     assert!(server.contains("import type {"));
@@ -290,7 +301,12 @@ fn aggregate_target_emits_all_three() {
     let paths: Vec<&str> = files.iter().map(|f| f.path.as_str()).collect();
     assert_eq!(
         paths,
-        vec!["types.gen.ts", "client.gen.ts", "server.gen.ts"]
+        vec![
+            "types.gen.ts",
+            "codec.gen.ts",
+            "client.gen.ts",
+            "server.gen.ts"
+        ]
     );
 }
 
@@ -345,8 +361,10 @@ fn service_error_is_stripped_from_return_union() {
     let files = generate_files(&input).expect("generate");
     let client = file(&files, "client.gen.ts");
 
-    assert!(client.contains("Promise<LoginResponse>"));
-    assert!(!client.contains("Promise<LoginResponse | ServiceError>"));
+    // The success type is the sole record; the method returns it (sync byte seam).
+    assert!(client.contains("login(req: LoginRequest): LoginResponse {"));
+    assert!(client.contains("return fromLoginResponseCbor(csilResp);"));
+    assert!(!client.contains("ServiceError | "));
     // ServiceError is thrown, not returned, so it is not imported
     let import_line = client
         .lines()
@@ -356,8 +374,10 @@ fn service_error_is_stripped_from_return_union() {
 }
 
 #[test]
-fn domain_error_in_union_is_preserved() {
-    // A non-ServiceError member of the union is a returned value and stays.
+fn domain_error_union_success_is_a_non_record_payload() {
+    // Under the typed-codec byte seam a method's success must be a single record so
+    // it can call `from<T>Cbor`. A `Res / DomainError` union success is not a record
+    // reference, so the op is skipped with a note for the consumer to handle.
     let mut spec = sample_spec();
     if let CsilRuleType::ServiceDef(def) = &mut spec.rules[6].rule_type {
         def.operations[0].output_type =
@@ -372,7 +392,10 @@ fn domain_error_in_union_is_preserved() {
     let mut input = input_for("typescript-client");
     input.csil_spec = spec;
     let client = file(&generate_files(&input).expect("generate"), "client.gen.ts").to_string();
-    assert!(client.contains("Promise<LoginResponse | LoginError>"));
+    assert!(
+        client.contains("// operation 'Login' has a non-record payload; (de)serialize it manually")
+    );
+    assert!(!client.contains("fromLoginResponseCbor"));
 }
 
 #[test]
@@ -601,19 +624,17 @@ fn rpc_mode_emits_check_and_send_on_client() {
     assert!(!client.contains("routeMatchChannel"));
     assert!(!client.contains("encodeMatchPlay"));
 
-    // <-> gets both check + send.
-    assert!(
-        client
-            .contains("sendPlay(req: PlayerInput, opts?: { signal?: AbortSignal }): Promise<void>")
-    );
-    assert!(client.contains("\"PlaySend\""));
-    assert!(client.contains("checkPlay(opts?: { signal?: AbortSignal }): Promise<GameState[]>"));
-    assert!(client.contains("\"PlayCheck\""));
+    // <-> gets both check + send over the byte seam (sync, codec-encoded).
+    assert!(client.contains("sendPlay(req: PlayerInput): void {"));
+    assert!(client.contains("this.t.call(\"match\", \"PlaySend\", toPlayerInputCbor(req));"));
+    assert!(client.contains("checkPlay(): GameState[] {"));
+    assert!(client.contains("this.t.call(\"match\", \"PlayCheck\", new Uint8Array());"));
+    assert!(client.contains(
+        "return asArray(decode(csilResp)).map((csilE) => fromGameStateCborValue(csilE));"
+    ));
 
     // <- gets check only (no send — server pushes).
-    assert!(
-        client.contains("checkNotify(opts?: { signal?: AbortSignal }): Promise<Acknowledgment[]>")
-    );
+    assert!(client.contains("checkNotify(): Acknowledgment[] {"));
     assert!(client.contains("\"NotifyCheck\""));
     assert!(!client.contains("sendNotify"));
 }
@@ -767,9 +788,10 @@ fn invalid_decimal_mapping_fails_generation() {
 }
 
 #[test]
-fn decimal_in_operation_signature_maps_with_mapping() {
-    // An inline `decimal` in an op signature must follow the same mapping the
-    // struct fields do, in both client and server outputs.
+fn bare_decimal_op_is_a_non_record_payload_on_client() {
+    // The byte-seam client can only (de)serialize record payloads. An op over a bare
+    // inline `decimal` is therefore skipped with a note rather than emitting a method
+    // that references an undefined codec helper.
     let spec = spec_of(vec![CsilRule {
         name: "PriceService".to_string(),
         rule_type: CsilRuleType::ServiceDef(CsilServiceDefinition {
@@ -790,8 +812,10 @@ fn decimal_in_operation_signature_maps_with_mapping() {
     let mut input = input_with_spec("typescript-client", spec);
     input.csil_spec.service_count = 1;
     let client = file(&generate_files(&input).expect("generate"), "client.gen.ts").to_string();
-    assert!(client.contains("Promise<CsilDecimal>"));
-    assert!(client.contains("req: CsilDecimal"));
+    assert!(client.contains("// operation 'Quote' has a non-record payload"));
+    // No inline decimal reference leaks into the client, so no decimal import is needed.
+    assert!(!client.contains("CsilDecimal"));
+    assert!(!client.contains("decimal.js"));
 }
 
 // ---------------------------------------------------------------------------
@@ -1120,41 +1144,43 @@ fn decimal_op_spec() -> CsilSpecSerialized {
 }
 
 #[test]
-fn inline_decimal_in_op_signature_injects_import_in_client_and_server() {
-    // csil (default): `CsilDecimal` is a value, pulled from the types module so
-    // the emitted reference is not an undefined identifier.
-    for (target, path) in [
-        ("typescript-client", "client.gen.ts"),
-        ("typescript-server", "server.gen.ts"),
-    ] {
-        let src = file(
-            &generate_files(&input_with_spec(target, decimal_op_spec())).expect("generate"),
-            path,
-        )
-        .to_string();
-        assert!(
-            src.contains("import { CsilDecimal } from \"./types.gen\";"),
-            "{target} must import CsilDecimal, got:\n{src}"
-        );
-    }
+fn inline_decimal_in_op_signature_injects_import_in_server() {
+    // The server still prints an inline `decimal` straight into a signature, so it
+    // injects the value import. The byte-seam client skips such an op (non-record
+    // payload), so it references no inline decimal and imports none.
+    // csil (default): `CsilDecimal` is a value pulled from the types module.
+    let server = file(
+        &generate_files(&input_with_spec("typescript-server", decimal_op_spec()))
+            .expect("generate"),
+        "server.gen.ts",
+    )
+    .to_string();
+    assert!(
+        server.contains("import { CsilDecimal } from \"./types.gen\";"),
+        "server must import CsilDecimal, got:\n{server}"
+    );
+    let client = file(
+        &generate_files(&input_with_spec("typescript-client", decimal_op_spec()))
+            .expect("generate"),
+        "client.gen.ts",
+    )
+    .to_string();
+    assert!(
+        !client.contains("CsilDecimal"),
+        "client imports no inline decimal: {client}"
+    );
 
-    // library mode: the inline `decimal` maps to `Decimal`, imported from
-    // decimal.js directly in the client/server file.
-    for (target, path) in [
-        ("typescript-client", "client.gen.ts"),
-        ("typescript-server", "server.gen.ts"),
-    ] {
-        let mut input = input_with_spec(target, decimal_op_spec());
-        input.config.options.insert(
-            "decimal_mapping".to_string(),
-            serde_json::Value::String("library".to_string()),
-        );
-        let src = file(&generate_files(&input).expect("generate"), path).to_string();
-        assert!(
-            src.contains("import Decimal from \"decimal.js\";"),
-            "{target} library mode must import Decimal, got:\n{src}"
-        );
-    }
+    // library mode: the server's inline `decimal` maps to `Decimal` from decimal.js.
+    let mut input = input_with_spec("typescript-server", decimal_op_spec());
+    input.config.options.insert(
+        "decimal_mapping".to_string(),
+        serde_json::Value::String("library".to_string()),
+    );
+    let server = file(&generate_files(&input).expect("generate"), "server.gen.ts").to_string();
+    assert!(
+        server.contains("import Decimal from \"decimal.js\";"),
+        "server library mode must import Decimal, got:\n{server}"
+    );
 }
 
 #[test]
@@ -1536,7 +1562,7 @@ fn unidirectional_op_with_null_input_omits_request_param() {
     .to_string();
 
     assert!(
-        client.contains("pollEvent(opts?: { signal?: AbortSignal }): Promise<Event>"),
+        client.contains("pollEvent(): Event {"),
         "null input must drop the request param, got: {client}"
     );
     assert!(
@@ -1544,8 +1570,12 @@ fn unidirectional_op_with_null_input_omits_request_param() {
         "null input must not surface as a request param, got: {client}"
     );
     assert!(
-        client.contains("this.t.call<undefined, Event>(\"feed\", \"PollEvent\", undefined, opts)"),
-        "call must pass undefined for the null request, got: {client}"
+        client.contains("this.t.call(\"feed\", \"PollEvent\", new Uint8Array());"),
+        "call must send an empty payload for the null request, got: {client}"
+    );
+    assert!(
+        client.contains("return fromEventCbor(csilResp);"),
+        "null-input op still decodes its record response, got: {client}"
     );
 }
 
@@ -1830,3 +1860,712 @@ fn compact_dispatch_absent_when_unset() {
         "no compact routing without wire-ids, got: {server}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Per-type CBOR codec + typed byte-seam client
+// ---------------------------------------------------------------------------
+
+fn map_ty(key: &str, value: &str) -> CsilTypeExpression {
+    CsilTypeExpression::Map {
+        key: Box::new(builtin(key)),
+        value: Box::new(builtin(value)),
+        occurrence: None,
+    }
+}
+
+fn list_ty(elem: &str) -> CsilTypeExpression {
+    CsilTypeExpression::Array {
+        element_type: Box::new(builtin(elem)),
+        occurrence: None,
+    }
+}
+
+/// A corndogs-shaped spec exercising the codec: text, bytes, an optional int, a
+/// map, a list, a nested record, and a service whose output is a `Res / Error`
+/// choice.
+fn corndogs_spec() -> CsilSpecSerialized {
+    let mut spec = spec_of(vec![
+        group_rule(
+            "Task",
+            vec![
+                field("uuid", builtin("text"), false),
+                field("current_state", builtin("text"), false),
+                field("payload", builtin("bytes"), false),
+                field("priority", builtin("int"), true),
+                field("labels", map_ty("text", "int"), false),
+                field("tags", list_ty("text"), false),
+            ],
+            vec![],
+        ),
+        group_rule(
+            "SubmitTaskRequest",
+            vec![
+                field("task", reference("Task"), false),
+                field("queue", builtin("text"), false),
+            ],
+            vec![],
+        ),
+        CsilRule {
+            name: "CorndogsService".to_string(),
+            rule_type: CsilRuleType::ServiceDef(CsilServiceDefinition {
+                operations: vec![CsilServiceOperation {
+                    name: "submit-task".to_string(),
+                    input_type: reference("SubmitTaskRequest"),
+                    output_type: CsilTypeExpression::Choice(vec![
+                        reference("Task"),
+                        reference("ServiceError"),
+                    ]),
+                    direction: CsilServiceDirection::Unidirectional,
+                    position: pos(),
+                    doc_comments: vec![],
+                    wire_id: None,
+                }],
+                wire_id: None,
+            }),
+            position: pos(),
+            doc_comments: vec![],
+        },
+    ]);
+    spec.service_count = 1;
+    spec
+}
+
+/// Reproduces the named-map-alias regression: a field whose type is a named map
+/// alias (`StringInt64Map = {* text => int}`) and a map-of-record alias
+/// (`QueueAndStateCountsMap = {* text => QueueAndStateCounts}`). Before the codec
+/// resolved transparent aliases, such fields were stubbed and dropped every entry.
+fn map_alias_spec() -> CsilSpecSerialized {
+    spec_of(vec![
+        alias_rule("StringInt64Map", map_ty("text", "int")),
+        group_rule(
+            "QueueAndStateCounts",
+            vec![
+                field("active", builtin("int"), false),
+                field("paused", builtin("int"), false),
+            ],
+            vec![],
+        ),
+        alias_rule(
+            "QueueAndStateCountsMap",
+            CsilTypeExpression::Map {
+                key: Box::new(builtin("text")),
+                value: Box::new(reference("QueueAndStateCounts")),
+                occurrence: None,
+            },
+        ),
+        group_rule(
+            "GetCountsResponse",
+            vec![
+                field("queue_counts", reference("StringInt64Map"), false),
+                field("total_task_count", builtin("int"), false),
+                field(
+                    "queue_and_state_counts",
+                    reference("QueueAndStateCountsMap"),
+                    false,
+                ),
+            ],
+            vec![],
+        ),
+    ])
+}
+
+#[test]
+fn codec_file_emits_runtime_and_per_record_helpers() {
+    let files = generate_files(&input_with_spec("typescript-client", corndogs_spec())).unwrap();
+    let codec = file(&files, "codec.gen.ts");
+
+    // Self-contained value model + runtime entry points.
+    assert!(codec.contains("export type CborValue ="));
+    assert!(codec.contains("export function encodeValue(value: CborValue): Uint8Array {"));
+    assert!(codec.contains("export function decode(bytes: Uint8Array): CborValue {"));
+    // Per-record byte-level + value-level helpers.
+    assert!(codec.contains("export function toTaskCbor(v: Task): Uint8Array {"));
+    assert!(codec.contains("export function fromTaskCbor(bytes: Uint8Array): Task {"));
+    assert!(codec.contains("export function toTaskCborValue(v: Task): CborValue {"));
+    assert!(codec.contains("export function fromTaskCborValue(value: CborValue): Task {"));
+    // Wire keys are the verbatim CSIL field names, not the camelCase TS members.
+    assert!(codec.contains("csilMap.set(\"current_state\", v.currentState);"));
+    assert!(codec.contains("currentState: asString(requireKey(value, \"current_state\")),"));
+    // Canonical RFC 8949 key order at generation time: among Task's keys, "tags"
+    // (len 4, 't'<'u') precedes "uuid"; "current_state" (len 13) is last.
+    let tags_at = codec.find("csilMap.set(\"tags\"").unwrap();
+    let uuid_at = codec.find("csilMap.set(\"uuid\"").unwrap();
+    let state_at = codec.find("csilMap.set(\"current_state\"").unwrap();
+    assert!(
+        tags_at < uuid_at && uuid_at < state_at,
+        "non-canonical key order:\n{codec}"
+    );
+    // An absent optional is omitted from the wire map.
+    assert!(codec.contains("if (v.priority !== undefined) csilMap.set(\"priority\", v.priority);"));
+    // bytes stays a Uint8Array (CBOR byte string, major type 2).
+    assert!(codec.contains("csilMap.set(\"payload\", v.payload);"));
+    // A nested record recurses into its own codec.
+    assert!(codec.contains("csilMap.set(\"task\", toTaskCborValue(v.task));"));
+}
+
+#[test]
+fn codec_absent_without_records() {
+    // A services-only spec (no record types) emits no codec file.
+    let files = generate_files(&decimal_op_spec_input()).unwrap();
+    assert!(
+        !files.iter().any(|f| f.path == "codec.gen.ts"),
+        "no codec without records"
+    );
+}
+
+fn decimal_op_spec_input() -> WasmGeneratorInput {
+    input_with_spec("typescript-client", decimal_op_spec())
+}
+
+/// Compile (type-check) and run the generated TypeScript, round-tripping a typed
+/// request/response through both the codec and the typed client. Skips when node
+/// or npx is unavailable so the suite stays portable.
+#[test]
+fn codec_round_trips_through_typescript() {
+    let have_node = std::process::Command::new("node")
+        .arg("--version")
+        .output()
+        .is_ok();
+    let have_npx = std::process::Command::new("npx")
+        .arg("--version")
+        .output()
+        .is_ok();
+    if !have_node || !have_npx {
+        eprintln!("skipping: node/npx not on PATH");
+        return;
+    }
+
+    let files = generate_files(&input_with_spec("typescript-client", corndogs_spec())).unwrap();
+    let dir = std::env::temp_dir().join(format!("csilgen-ts-codec-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    for f in &files {
+        std::fs::write(dir.join(&f.path), &f.content).unwrap();
+    }
+    std::fs::write(dir.join("driver.ts"), CODEC_DRIVER_TS).unwrap();
+    std::fs::write(dir.join("tsconfig.json"), CODEC_TSCONFIG).unwrap();
+
+    // Type-check and transpile to CommonJS JS (there is no `tsc` binary, but a pinned
+    // `typescript@5` via npx provides one), then run the emitted driver under node.
+    let build = std::process::Command::new("npx")
+        .args(["-y", "-p", "typescript@5", "tsc", "-p", "tsconfig.json"])
+        .current_dir(&dir)
+        .output()
+        .unwrap();
+    assert!(
+        build.status.success(),
+        "tsc type-check/compile failed:\n{}{}",
+        String::from_utf8_lossy(&build.stdout),
+        String::from_utf8_lossy(&build.stderr)
+    );
+
+    let run = std::process::Command::new("node")
+        .arg(dir.join("out").join("driver.js"))
+        .current_dir(&dir)
+        .output()
+        .unwrap();
+    assert!(
+        run.status.success(),
+        "node round-trip failed:\n{}{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&run.stdout).trim(), "ok");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn codec_walks_named_map_alias_fields() {
+    // The regression: a field typed as a named map alias was stubbed. The codec must
+    // instead resolve the alias to its underlying map and walk the entries.
+    let files = generate_files(&input_with_spec("typescript-client", map_alias_spec())).unwrap();
+    let codec = file(&files, "codec.gen.ts");
+
+    // `queue_counts: StringInt64Map` (`{* text => int}`) encodes as a real CBOR map of
+    // its entries, not a `null`/identity stub, and decodes back to an object.
+    assert!(
+        codec.contains(
+            "csilMap.set(\"queue_counts\", new Map<CborValue, CborValue>(Object.entries(v.queueCounts)"
+        ),
+        "named map alias not walked on encode:\n{codec}"
+    );
+    assert!(
+        codec.contains(
+            "queueCounts: Object.fromEntries(Array.from(asMap(requireKey(value, \"queue_counts\"))"
+        ),
+        "named map alias not walked on decode:\n{codec}"
+    );
+    // A map-of-record alias recurses into the value record's own codec.
+    assert!(
+        codec.contains("toQueueAndStateCountsCborValue(csilV)"),
+        "map-of-record alias does not recurse into the record codec:\n{codec}"
+    );
+    assert!(
+        codec.contains("fromQueueAndStateCountsCborValue(csilV)"),
+        "map-of-record alias does not recurse into the record decoder:\n{codec}"
+    );
+}
+
+/// End-to-end proof the named-map-alias fix preserves data: type-check the
+/// generated codec and round-trip a populated map-alias / map-of-record record
+/// through `from*Cbor(to*Cbor(x))` under node, asserting every entry survives.
+/// Skips when node/npx is unavailable so the suite stays portable.
+#[test]
+fn codec_round_trips_named_map_aliases() {
+    let have_node = std::process::Command::new("node")
+        .arg("--version")
+        .output()
+        .is_ok();
+    let have_npx = std::process::Command::new("npx")
+        .arg("--version")
+        .output()
+        .is_ok();
+    if !have_node || !have_npx {
+        eprintln!("skipping: node/npx not on PATH");
+        return;
+    }
+
+    let files = generate_files(&input_with_spec("typescript-client", map_alias_spec())).unwrap();
+    let dir = std::env::temp_dir().join(format!("csilgen-ts-mapalias-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    for f in &files {
+        std::fs::write(dir.join(&f.path), &f.content).unwrap();
+    }
+    std::fs::write(dir.join("driver.ts"), CODEC_MAP_ALIAS_DRIVER_TS).unwrap();
+    std::fs::write(dir.join("tsconfig.json"), CODEC_TSCONFIG).unwrap();
+
+    let build = std::process::Command::new("npx")
+        .args(["-y", "-p", "typescript@5", "tsc", "-p", "tsconfig.json"])
+        .current_dir(&dir)
+        .output()
+        .unwrap();
+    assert!(
+        build.status.success(),
+        "tsc type-check/compile failed:\n{}{}",
+        String::from_utf8_lossy(&build.stdout),
+        String::from_utf8_lossy(&build.stderr)
+    );
+
+    let run = std::process::Command::new("node")
+        .arg(dir.join("out").join("driver.js"))
+        .current_dir(&dir)
+        .output()
+        .unwrap();
+    assert!(
+        run.status.success(),
+        "node round-trip failed:\n{}{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&run.stdout).trim(), "ok");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The tagged core types (`timestamp` -> tag 0 `Date`, `decimal` -> tag 4
+/// `CsilDecimal`) are not exercised by the corndogs round-trip, so type-check a
+/// money record's emitted codec to confirm those paths compile. Compile-only (csil
+/// mapping pulls in no third-party package). Skips when node/npx is unavailable.
+#[test]
+fn tagged_types_codec_type_checks() {
+    let have_node = std::process::Command::new("node")
+        .arg("--version")
+        .output()
+        .is_ok();
+    let have_npx = std::process::Command::new("npx")
+        .arg("--version")
+        .output()
+        .is_ok();
+    if !have_node || !have_npx {
+        eprintln!("skipping: node/npx not on PATH");
+        return;
+    }
+
+    let files =
+        generate_files(&input_with_spec("typescript-typesonly", money_spec())).expect("generate");
+    let dir = std::env::temp_dir().join(format!("csilgen-ts-tagged-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    for f in &files {
+        std::fs::write(dir.join(&f.path), &f.content).unwrap();
+    }
+    std::fs::write(dir.join("tsconfig.json"), CODEC_TSCONFIG_NOEMIT).unwrap();
+
+    let build = std::process::Command::new("npx")
+        .args(["-y", "-p", "typescript@5", "tsc", "-p", "tsconfig.json"])
+        .current_dir(&dir)
+        .output()
+        .unwrap();
+    assert!(
+        build.status.success(),
+        "tagged-types codec failed to type-check:\n{}{}",
+        String::from_utf8_lossy(&build.stdout),
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---------------------------------------------------------------------------
+// Self-contained publishable package (emit_packages)
+// ---------------------------------------------------------------------------
+
+fn package_input(target: &str) -> WasmGeneratorInput {
+    let mut input = input_for(target);
+    input.config.options.insert(
+        "emit_packages".to_string(),
+        serde_json::json!(["typescript"]),
+    );
+    input
+}
+
+fn package_input_with_spec(target: &str, spec: CsilSpecSerialized) -> WasmGeneratorInput {
+    let mut input = input_with_spec(target, spec);
+    input.config.options.insert(
+        "emit_packages".to_string(),
+        serde_json::json!(["typescript"]),
+    );
+    input
+}
+
+#[test]
+fn package_files_absent_by_default() {
+    let files = generate_files(&input_for("typescript-client")).expect("generate");
+    for path in ["package.json", "tsconfig.json", "index.ts"] {
+        assert!(
+            !files.iter().any(|f| f.path == path),
+            "{path} must not be emitted without emit_packages"
+        );
+    }
+}
+
+#[test]
+fn package_files_absent_when_emit_packages_excludes_typescript() {
+    let mut input = input_for("typescript-client");
+    input.config.options.insert(
+        "emit_packages".to_string(),
+        serde_json::json!(["rust", "go"]),
+    );
+    let files = generate_files(&input).expect("generate");
+    assert!(!files.iter().any(|f| f.path == "package.json"));
+    assert!(!files.iter().any(|f| f.path == "tsconfig.json"));
+}
+
+#[test]
+fn package_emit_tolerates_malformed_option() {
+    // A non-array, non-"typescript" value must not trip the parse or emit a package.
+    for bad in [
+        serde_json::json!("rust"),
+        serde_json::json!(42),
+        serde_json::json!({ "typescript": true }),
+    ] {
+        let mut input = input_for("typescript-client");
+        input
+            .config
+            .options
+            .insert("emit_packages".to_string(), bad);
+        let files = generate_files(&input).expect("generate");
+        assert!(!files.iter().any(|f| f.path == "package.json"));
+    }
+
+    // A bare string "typescript" is accepted as a convenience.
+    let mut input = input_for("typescript-client");
+    input
+        .config
+        .options
+        .insert("emit_packages".to_string(), serde_json::json!("typescript"));
+    let files = generate_files(&input).expect("generate");
+    assert!(files.iter().any(|f| f.path == "package.json"));
+}
+
+#[test]
+fn package_json_has_derived_name_and_defaults() {
+    let files = generate_files(&package_input("typescript-client")).expect("generate");
+    let pkg: serde_json::Value =
+        serde_json::from_str(file(&files, "package.json")).expect("valid package.json");
+
+    // sample_spec's first service alphabetically is AuthService -> auth-client.
+    assert_eq!(pkg["name"], "auth-client");
+    assert_eq!(pkg["version"], "0.1.0");
+    assert_eq!(pkg["type"], "commonjs");
+    assert_eq!(pkg["main"], "dist/index.js");
+    assert_eq!(pkg["types"], "dist/index.d.ts");
+    assert_eq!(pkg["scripts"]["build"], "tsc");
+    assert!(
+        pkg["devDependencies"]["typescript"].is_string(),
+        "typescript dev dependency present"
+    );
+    assert_eq!(pkg["exports"]["."]["types"], "./dist/index.d.ts");
+
+    let tsconfig: serde_json::Value =
+        serde_json::from_str(file(&files, "tsconfig.json")).expect("valid tsconfig.json");
+    assert_eq!(tsconfig["compilerOptions"]["strict"], true);
+    assert_eq!(tsconfig["compilerOptions"]["declaration"], true);
+    assert_eq!(tsconfig["compilerOptions"]["outDir"], "dist");
+
+    // The barrel re-exports the generated modules and is the package `main` source.
+    let index = file(&files, "index.ts");
+    assert!(index.contains("from \"./types.gen\""));
+    assert!(index.contains("from \"./codec.gen\""));
+    assert!(index.contains("from \"./client.gen\""));
+}
+
+#[test]
+fn package_name_falls_back_to_csilgen_client_without_services() {
+    // money_spec carries records but no service, so no base name can be derived.
+    let mut input = input_with_spec("typescript-typesonly", money_spec());
+    input.config.options.insert(
+        "emit_packages".to_string(),
+        serde_json::json!(["typescript"]),
+    );
+    let pkg: serde_json::Value = serde_json::from_str(file(
+        &generate_files(&input).expect("generate"),
+        "package.json",
+    ))
+    .expect("valid package.json");
+    assert_eq!(pkg["name"], "csilgen-client");
+}
+
+#[test]
+fn package_name_and_version_options_override() {
+    let mut input = package_input("typescript-client");
+    input.config.options.insert(
+        "package_name".to_string(),
+        serde_json::json!("@acme/longhouse"),
+    );
+    input
+        .config
+        .options
+        .insert("package_version".to_string(), serde_json::json!("2.3.4"));
+    let pkg: serde_json::Value = serde_json::from_str(file(
+        &generate_files(&input).expect("generate"),
+        "package.json",
+    ))
+    .expect("valid package.json");
+    assert_eq!(pkg["name"], "@acme/longhouse");
+    assert_eq!(pkg["version"], "2.3.4");
+}
+
+#[test]
+fn barrel_dedupes_codec_collision_for_aggregate_target() {
+    // A channel spec's aggregate target emits both client.gen and server.gen, which
+    // both export `Codec`. The barrel must star-export the first and fall back to a
+    // named re-export for the second to avoid TS2308.
+    let files =
+        generate_files(&package_input_with_spec("typescript", channel_spec())).expect("generate");
+    let index = file(&files, "index.ts");
+    assert!(index.contains("export * from \"./client.gen\";"));
+    assert!(
+        !index.contains("export * from \"./server.gen\";"),
+        "server must not be star-exported alongside client, got:\n{index}"
+    );
+    // Server still contributes its unique surface explicitly.
+    assert!(index.contains("from \"./server.gen\";"));
+    assert!(index.contains("dispatch"));
+    assert!(index.contains("ServerHandlers"));
+}
+
+/// Generate a package from `input`, write it to a temp dir, and type-check it with
+/// the pinned `typescript@5` to prove the output directory is a valid npm package.
+/// Skips when node/npx is unavailable so the suite stays portable.
+fn typecheck_emitted_package(label: &str, input: &WasmGeneratorInput) {
+    let have_node = std::process::Command::new("node")
+        .arg("--version")
+        .output()
+        .is_ok();
+    let have_npx = std::process::Command::new("npx")
+        .arg("--version")
+        .output()
+        .is_ok();
+    if !have_node || !have_npx {
+        eprintln!("skipping: node/npx not on PATH");
+        return;
+    }
+
+    let files = generate_files(input).expect("generate");
+    // Sanity: the package scaffolding is present.
+    for path in ["package.json", "tsconfig.json", "index.ts"] {
+        assert!(
+            files.iter().any(|f| f.path == path),
+            "{path} missing from emitted package"
+        );
+    }
+
+    let dir = std::env::temp_dir().join(format!("csilgen-ts-pkg-{label}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    for f in &files {
+        std::fs::write(dir.join(&f.path), &f.content).unwrap();
+    }
+
+    // `-p typescript@5` installs the compiler; `tsc -p tsconfig.json --noEmit`
+    // type-checks the package exactly as a consumer's `npm run build` would, minus
+    // the file emission.
+    let build = std::process::Command::new("npx")
+        .args([
+            "-y",
+            "-p",
+            "typescript@5",
+            "tsc",
+            "-p",
+            "tsconfig.json",
+            "--noEmit",
+        ])
+        .current_dir(&dir)
+        .output()
+        .unwrap();
+    assert!(
+        build.status.success(),
+        "emitted {label} package failed to type-check:\n{}{}",
+        String::from_utf8_lossy(&build.stdout),
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn emitted_client_package_type_checks() {
+    typecheck_emitted_package("client", &package_input("typescript-client"));
+}
+
+#[test]
+fn emitted_aggregate_package_type_checks() {
+    // A channel spec exercises the barrel's collision handling end to end: client and
+    // server both export `Codec`, so the package only type-checks if the barrel
+    // deduped them.
+    typecheck_emitted_package(
+        "aggregate",
+        &package_input_with_spec("typescript", channel_spec()),
+    );
+}
+
+const CODEC_TSCONFIG_NOEMIT: &str = r#"{
+  "compilerOptions": {
+    "target": "es2020",
+    "module": "commonjs",
+    "moduleResolution": "node",
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "lib": ["es2020", "dom"],
+    "noEmit": true
+  },
+  "include": ["*.ts"]
+}
+"#;
+
+const CODEC_TSCONFIG: &str = r#"{
+  "compilerOptions": {
+    "target": "es2020",
+    "module": "commonjs",
+    "moduleResolution": "node",
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "lib": ["es2020", "dom"],
+    "outDir": "out"
+  },
+  "include": ["*.ts"]
+}
+"#;
+
+const CODEC_MAP_ALIAS_DRIVER_TS: &str = r#"import {
+  toGetCountsResponseCbor,
+  fromGetCountsResponseCbor,
+} from "./codec.gen";
+import type { GetCountsResponse } from "./types.gen";
+
+function check(ok: boolean, what: string): void {
+  if (!ok) throw new Error("check failed: " + what);
+}
+
+const resp: GetCountsResponse = {
+  queueCounts: { q1: 3, q2: 1 },
+  totalTaskCount: 4,
+  queueAndStateCounts: {
+    q1: { active: 2, paused: 1 },
+    q2: { active: 0, paused: 5 },
+  },
+};
+
+const back = fromGetCountsResponseCbor(toGetCountsResponseCbor(resp));
+check(back.totalTaskCount === 4, "total_task_count");
+// A named map-alias field must survive the round-trip with every entry intact.
+check(Object.keys(back.queueCounts).length === 2, "queue_counts size");
+check(back.queueCounts.q1 === 3 && back.queueCounts.q2 === 1, "queue_counts entries");
+// A map-of-record alias recurses into the record codec for each value.
+check(Object.keys(back.queueAndStateCounts).length === 2, "nested size");
+check(back.queueAndStateCounts.q1.active === 2, "nested q1 active");
+check(back.queueAndStateCounts.q2.paused === 5, "nested q2 paused");
+
+console.log("ok");
+"#;
+
+const CODEC_DRIVER_TS: &str = r#"import { CorndogsClient, type ServiceTransport } from "./client.gen";
+import {
+  toSubmitTaskRequestCbor,
+  fromSubmitTaskRequestCbor,
+  toTaskCbor,
+} from "./codec.gen";
+import type { Task, SubmitTaskRequest } from "./types.gen";
+
+class Loopback implements ServiceTransport {
+  call(_service: string, _op: string, req: Uint8Array): Uint8Array {
+    // Decode the typed request, then echo its task back as the typed response.
+    const reqObj = fromSubmitTaskRequestCbor(req);
+    return toTaskCbor(reqObj.task);
+  }
+}
+
+function check(ok: boolean, what: string): void {
+  if (!ok) throw new Error("check failed: " + what);
+}
+
+function bytesEq(a: Uint8Array, b: Uint8Array): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+  return true;
+}
+
+const payload = new Uint8Array([0xde, 0xad, 0xbe]);
+const task: Task = {
+  uuid: "u-123",
+  currentState: "PENDING",
+  payload,
+  priority: 7,
+  labels: { a: 1, b: 2 },
+  tags: ["x", "y"],
+};
+const req: SubmitTaskRequest = { task, queue: "default" };
+
+// Direct codec round-trip through the nested record.
+const back = fromSubmitTaskRequestCbor(toSubmitTaskRequestCbor(req));
+check(back.task.uuid === "u-123", "uuid");
+check(back.task.currentState === "PENDING", "current_state");
+check(bytesEq(back.task.payload, payload), "payload");
+check(back.task.priority === 7, "priority");
+check(back.task.labels.a === 1 && back.task.labels.b === 2, "labels");
+check(back.task.tags.length === 2 && back.task.tags[1] === "y", "tags");
+check(back.queue === "default", "queue");
+
+// An absent optional must round-trip to undefined.
+const task2: Task = {
+  uuid: "u",
+  currentState: "S",
+  payload: new Uint8Array(),
+  labels: {},
+  tags: [],
+};
+const back2 = fromSubmitTaskRequestCbor(
+  toSubmitTaskRequestCbor({ task: task2, queue: "q" }),
+);
+check(back2.task.priority === undefined, "absent optional");
+
+// Typed client over the loopback carrier.
+const client = new CorndogsClient(new Loopback());
+const resp = client.submitTask(req);
+check(resp.uuid === "u-123", "resp uuid");
+check(bytesEq(resp.payload, payload), "resp payload");
+check(resp.priority === 7, "resp priority");
+
+console.log("ok");
+"#;

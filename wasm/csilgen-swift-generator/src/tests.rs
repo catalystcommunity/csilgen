@@ -241,7 +241,14 @@ fn error_suffixed_arms_are_stripped_from_the_returned_success_type() {
     )];
     let input = input_from_rules(
         "swift-client",
-        vec![service_rule("UserService", ops, None)],
+        vec![
+            group_rule(
+                "CreateUserRequest",
+                vec![bare_entry("name", builtin("text"))],
+            ),
+            group_rule("User", vec![bare_entry("id", builtin("int"))]),
+            service_rule("UserService", ops, None),
+        ],
         1,
     );
     let files = build_files(&input).expect("ok");
@@ -349,7 +356,7 @@ fn server_target_emits_protocol_and_routers() {
     assert!(services.contains("func play(_ msg: Move) throws"));
     // Verbose router keyed by verbatim op name.
     assert!(services.contains("public func routeMatchChannel(_ handler: Match, codec: CsilCodec, op: String, data: [UInt8]) throws"));
-    assert!(services.contains("case \"play\":"));
+    assert!(services.contains("case \"Play\":"));
     assert!(services.contains("try handler.play(msg)"));
     // Compact twin keyed by ordinal (service has a wire-id).
     assert!(services.contains("public func routeMatchChannelCompact"));
@@ -361,7 +368,7 @@ fn server_target_emits_protocol_and_routers() {
 }
 
 #[test]
-fn client_target_emits_typed_client_with_verbatim_wire_strings() {
+fn client_target_emits_typed_client_with_canonical_wire_strings() {
     let ops = vec![make_op(
         "deposit-claim",
         reference("DepositClaimRequest"),
@@ -373,7 +380,17 @@ fn client_target_emits_typed_client_with_verbatim_wire_strings() {
     )];
     let input = input_from_rules(
         "swift-client",
-        vec![service_rule("Attestation", ops, None)],
+        vec![
+            group_rule(
+                "DepositClaimRequest",
+                vec![bare_entry("subject", builtin("text"))],
+            ),
+            group_rule(
+                "DepositClaimResponse",
+                vec![bare_entry("ok", builtin("bool"))],
+            ),
+            service_rule("Attestation", ops, None),
+        ],
         1,
     );
     let files = build_files(&input).expect("ok");
@@ -386,11 +403,20 @@ fn client_target_emits_typed_client_with_verbatim_wire_strings() {
     assert!(client.content.contains(
         "public func depositClaim(_ request: DepositClaimRequest) throws -> DepositClaimResponse"
     ));
-    // Wire service + op stay verbatim (camelCase must not leak onto the wire).
+    // Typed seam: request serializes itself, the carrier moves bytes.
+    assert!(client.content.contains("request: request.toCbor()"));
     assert!(
         client
             .content
-            .contains("service: \"Attestation\", op: \"deposit-claim\"")
+            .contains("DepositClaimResponse.fromCbor(csilResp)")
+    );
+    // Canonical wire strings (the wire contract): service lowercased + `Service`
+    // stripped, op PascalCased — so a Swift client reaches the same endpoint as its
+    // peers (this was the kotlin/dart/swift routing bug).
+    assert!(
+        client
+            .content
+            .contains("service: \"attestation\", op: \"DepositClaim\"")
     );
     // No server protocol for the client sub-target.
     assert!(!files.iter().any(|f| f.path == "Services.swift"));
@@ -404,7 +430,14 @@ fn null_input_op_takes_no_request() {
         reference("RoomDelta"),
         CsilServiceDirection::Unidirectional,
     )];
-    let input = input_from_rules("swift-client", vec![service_rule("World", ops, None)], 1);
+    let input = input_from_rules(
+        "swift-client",
+        vec![
+            group_rule("RoomDelta", vec![bare_entry("seq", builtin("int"))]),
+            service_rule("World", ops, None),
+        ],
+        1,
+    );
     let files = build_files(&input).expect("ok");
     let client = files
         .iter()
@@ -415,7 +448,8 @@ fn null_input_op_takes_no_request() {
             .content
             .contains("public func roomDelta() throws -> RoomDelta")
     );
-    assert!(client.content.contains("request: nil as String?"));
+    // A null-input op sends an empty request body.
+    assert!(client.content.contains("request: [])"));
 }
 
 #[test]
@@ -456,4 +490,365 @@ fn wire_id_free_service_omits_compact_router() {
     assert!(services.contains("public func routeMatchChannel"));
     assert!(!services.contains("routeMatchChannelCompact"));
     assert!(!services.contains("MatchWireID"));
+}
+
+// --- codec ------------------------------------------------------------------
+
+/// A corndogs-shaped spec: text, bytes, an optional int, a map, a list, a nested
+/// record, and a service whose output is a `Res / ServiceError` choice.
+fn corndogs_rules() -> Vec<CsilRule> {
+    let map_ty = CsilTypeExpression::Map {
+        key: Box::new(builtin("text")),
+        value: Box::new(builtin("int")),
+        occurrence: None,
+    };
+    let list_ty = CsilTypeExpression::Array {
+        element_type: Box::new(builtin("text")),
+        occurrence: None,
+    };
+    vec![
+        group_rule(
+            "Task",
+            vec![
+                bare_entry("uuid", builtin("text")),
+                bare_entry("current_state", builtin("text")),
+                bare_entry("payload", builtin("bytes")),
+                opt_entry("priority", builtin("int")),
+                bare_entry("labels", map_ty),
+                bare_entry("tags", list_ty),
+            ],
+        ),
+        group_rule(
+            "SubmitTaskRequest",
+            vec![
+                bare_entry("task", reference("Task")),
+                bare_entry("queue", builtin("text")),
+            ],
+        ),
+        group_rule("ServiceError", vec![bare_entry("code", builtin("int"))]),
+        service_rule(
+            "CorndogsService",
+            vec![make_op(
+                "submit-task",
+                reference("SubmitTaskRequest"),
+                CsilTypeExpression::Choice(vec![reference("Task"), reference("ServiceError")]),
+                CsilServiceDirection::Unidirectional,
+            )],
+            None,
+        ),
+    ]
+}
+
+#[test]
+fn codec_emitted_with_typed_client() {
+    let input = input_from_rules("swift-client", corndogs_rules(), 1);
+    let files = build_files(&input).expect("ok");
+    let codec = files
+        .iter()
+        .find(|f| f.path == "Codec.swift")
+        .expect("Codec.swift emitted");
+    assert!(codec.content.contains("public enum CsilCbor"));
+    assert!(codec.content.contains("public extension Task {"));
+    assert!(codec.content.contains("func toCbor() -> [UInt8]"));
+    assert!(
+        codec
+            .content
+            .contains("static func fromCbor(_ bytes: [UInt8]) throws -> SubmitTaskRequest")
+    );
+    // bytes -> CBOR byte string (.bytes, major type 2); text -> .text; nested record
+    // recurses via toCborValue.
+    assert!(codec.content.contains(".bytes(self.payload)"));
+    assert!(codec.content.contains(".text(self.uuid)"));
+    assert!(codec.content.contains("self.task.toCborValue()"));
+    // Canonical key order within Task: `tags`/`uuid` (len 4) precede longer keys,
+    // `current_state` (len 13) is last.
+    let body = codec.content.split("extension Task").nth(1).unwrap();
+    let pos_tags = body.find("\"tags\"").unwrap();
+    let pos_uuid = body.find("\"uuid\"").unwrap();
+    let pos_state = body.find("\"current_state\"").unwrap();
+    assert!(pos_tags < pos_uuid && pos_uuid < pos_state);
+
+    let client = files
+        .iter()
+        .find(|f| f.path == "Client.swift")
+        .expect("Client.swift emitted");
+    assert!(
+        client
+            .content
+            .contains("public func submitTask(_ request: SubmitTaskRequest) throws -> Task")
+    );
+    assert!(client.content.contains("request: request.toCbor()"));
+    assert!(client.content.contains("Task.fromCbor(csilResp)"));
+    // The carrier seam is raw bytes.
+    assert!(
+        client
+            .content
+            .contains("func call(service: String, op: String, request: [UInt8]) throws -> [UInt8]")
+    );
+}
+
+fn typedef_rule(name: &str, ty: CsilTypeExpression) -> CsilRule {
+    CsilRule {
+        name: name.to_string(),
+        rule_type: CsilRuleType::TypeDef(ty),
+        position: pos(),
+        doc_comments: Vec::new(),
+    }
+}
+
+#[test]
+fn named_map_alias_field_roundtrips_as_a_map_not_a_stub() {
+    // Regression: a field typed as a transparent named map alias
+    // (`StringInt64Map = {* text => int}`) used to fall through the record check to
+    // the `.null` / `asText` stub, dropping the entire dictionary on the wire.
+    let map_ty = CsilTypeExpression::Map {
+        key: Box::new(builtin("text")),
+        value: Box::new(builtin("int")),
+        occurrence: None,
+    };
+    let rules = vec![
+        typedef_rule("StringInt64Map", map_ty),
+        group_rule(
+            "Holder",
+            vec![bare_entry("counts", reference("StringInt64Map"))],
+        ),
+    ];
+    let input = input_from_rules("swift", rules, 0);
+    let codec = generate_codec(&input).expect("codec emitted");
+    // Encode must build a CBOR map; decode must read one back via asMap.
+    assert!(codec.contains("CsilCborValue.map(self.counts.map {"));
+    assert!(codec.contains("try CsilCbor.asMap"));
+    assert!(codec.contains("reduce(into: [String: Int64]()"));
+    // The stub must be gone for this field.
+    let body = codec.split("extension Holder").nth(1).unwrap();
+    assert!(!body.contains("\"counts\", .null"));
+    assert!(!body.contains("CsilCbor.asText((try CsilCbor.require(cborValue, \"counts\"))"));
+}
+
+#[test]
+fn named_map_of_record_alias_recurses_into_the_record_codec() {
+    // `M = {* text => SomeRecord}`: the alias resolves to a map whose values are a
+    // record, so the value handler must recurse to the record's
+    // `toCborValue` / `init(cborValue:)` rather than stubbing.
+    let map_of_record = CsilTypeExpression::Map {
+        key: Box::new(builtin("text")),
+        value: Box::new(reference("SomeRecord")),
+        occurrence: None,
+    };
+    let rules = vec![
+        typedef_rule("M", map_of_record),
+        group_rule("SomeRecord", vec![bare_entry("id", builtin("text"))]),
+        group_rule("Holder", vec![bare_entry("items", reference("M"))]),
+    ];
+    let input = input_from_rules("swift", rules, 0);
+    let codec = generate_codec(&input).expect("codec emitted");
+    let body = codec.split("extension Holder").nth(1).unwrap();
+    // Encode recurses to the record value's codec inside a map builder.
+    assert!(body.contains("CsilCborValue.map(self.items.map {"));
+    assert!(body.contains("$0.value.toCborValue()"));
+    // Decode reads a map and reconstructs each record value.
+    assert!(body.contains("try CsilCbor.asMap"));
+    assert!(body.contains("try SomeRecord(cborValue: $1.1)"));
+    assert!(!body.contains("\"items\", .null"));
+}
+
+#[test]
+fn wire_service_strips_service_and_lowercases() {
+    // The Swift-specific bug: `CorndogsService` previously hit the wire as
+    // "CorndogsService" (Service not stripped, not lowercased). It must be
+    // "corndogs", and `submit-task` must be "SubmitTask".
+    let ops = vec![make_op(
+        "submit-task",
+        reference("SubmitTaskRequest"),
+        reference("Task"),
+        CsilServiceDirection::Unidirectional,
+    )];
+    let input = input_from_rules(
+        "swift-client",
+        vec![
+            group_rule(
+                "SubmitTaskRequest",
+                vec![bare_entry("queue", builtin("text"))],
+            ),
+            group_rule("Task", vec![bare_entry("uuid", builtin("text"))]),
+            service_rule("CorndogsService", ops, None),
+        ],
+        1,
+    );
+    let files = build_files(&input).expect("ok");
+    let client = files.iter().find(|f| f.path == "Client.swift").unwrap();
+    assert!(
+        client
+            .content
+            .contains("service: \"corndogs\", op: \"SubmitTask\"")
+    );
+    assert!(!client.content.contains("CorndogsService\""));
+    assert!(!client.content.contains("submit-task"));
+}
+
+// ---------------------------------------------------------------------------
+// Self-contained SwiftPM package mode
+// ---------------------------------------------------------------------------
+
+/// Build an input whose generator options are pre-populated, so package-mode
+/// triggers (`emit_packages`, `package_name`, `package_version`) can be exercised.
+fn input_with_options(
+    target: &str,
+    rules: Vec<CsilRule>,
+    service_count: usize,
+    options: Vec<(&str, serde_json::Value)>,
+) -> WasmGeneratorInput {
+    let mut input = input_from_rules(target, rules, service_count);
+    input.config.options = options
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect();
+    input
+}
+
+fn one_record_rules() -> Vec<CsilRule> {
+    vec![group_rule(
+        "Task",
+        vec![bare_entry("uuid", builtin("text"))],
+    )]
+}
+
+#[test]
+fn package_mode_emits_manifest_and_relocates_sources() {
+    let input = input_with_options(
+        "swift",
+        one_record_rules(),
+        0,
+        vec![("emit_packages", serde_json::json!(["swift"]))],
+    );
+    let files = build_files(&input).expect("ok");
+
+    let manifest = files
+        .iter()
+        .find(|f| f.path == "Package.swift")
+        .expect("Package.swift emitted in package mode");
+    assert!(manifest.content.contains("// swift-tools-version:5.9"));
+    assert!(manifest.content.contains("import PackageDescription"));
+    // Default coordinates: package + product + target all "CsilgenClient".
+    assert!(manifest.content.contains("name: \"CsilgenClient\""));
+    assert!(
+        manifest
+            .content
+            .contains(".library(name: \"CsilgenClient\", targets: [\"CsilgenClient\"])")
+    );
+    assert!(
+        manifest
+            .content
+            .contains(".target(name: \"CsilgenClient\")")
+    );
+
+    // Generated sources live under SwiftPM's required Sources/<Target>/ layout, and
+    // none remain at the package root.
+    assert!(
+        files
+            .iter()
+            .any(|f| f.path == "Sources/CsilgenClient/Types.swift")
+    );
+    assert!(
+        !files
+            .iter()
+            .any(|f| f.path == "Types.swift" || f.path == "Codec.swift")
+    );
+}
+
+#[test]
+fn package_name_and_version_drive_manifest_coordinates() {
+    let input = input_with_options(
+        "swift",
+        one_record_rules(),
+        0,
+        vec![
+            ("emit_packages", serde_json::json!(["swift"])),
+            // A kebab package name keeps its raw spelling for the package/product, but
+            // the target identifier is PascalCased so it is a valid Swift identifier.
+            ("package_name", serde_json::json!("my-client")),
+            ("package_version", serde_json::json!("2.4.0")),
+        ],
+    );
+    let files = build_files(&input).expect("ok");
+    let manifest = files
+        .iter()
+        .find(|f| f.path == "Package.swift")
+        .expect("Package.swift emitted");
+    assert!(manifest.content.contains("name: \"my-client\""));
+    assert!(
+        manifest
+            .content
+            .contains(".library(name: \"my-client\", targets: [\"MyClient\"])")
+    );
+    assert!(manifest.content.contains(".target(name: \"MyClient\")"));
+    // Version informs the manifest comment only (SwiftPM uses git tags).
+    assert!(manifest.content.contains("my-client 2.4.0"));
+    // Sources relocate under the PascalCased target directory.
+    assert!(
+        files
+            .iter()
+            .any(|f| f.path == "Sources/MyClient/Types.swift")
+    );
+}
+
+#[test]
+fn non_package_mode_leaves_output_unchanged() {
+    let input = input_from_rules("swift", one_record_rules(), 0);
+    let files = build_files(&input).expect("ok");
+    assert!(!files.iter().any(|f| f.path == "Package.swift"));
+    assert!(files.iter().any(|f| f.path == "Types.swift"));
+    assert!(!files.iter().any(|f| f.path.starts_with("Sources/")));
+}
+
+#[test]
+fn emit_packages_without_swift_stays_off() {
+    let input = input_with_options(
+        "swift",
+        one_record_rules(),
+        0,
+        // Other languages requested, but not Swift.
+        vec![("emit_packages", serde_json::json!(["go", "rust"]))],
+    );
+    let files = build_files(&input).expect("ok");
+    assert!(!files.iter().any(|f| f.path == "Package.swift"));
+    assert!(files.iter().any(|f| f.path == "Types.swift"));
+}
+
+#[test]
+fn emit_packages_non_array_is_parsed_defensively() {
+    // A malformed (non-array) value must not error and must not enable package mode.
+    let input = input_with_options(
+        "swift",
+        one_record_rules(),
+        0,
+        vec![("emit_packages", serde_json::json!("swift"))],
+    );
+    let files = build_files(&input).expect("ok");
+    assert!(!files.iter().any(|f| f.path == "Package.swift"));
+    assert!(files.iter().any(|f| f.path == "Types.swift"));
+}
+
+#[test]
+fn empty_package_name_falls_back_to_default() {
+    let input = input_with_options(
+        "swift",
+        one_record_rules(),
+        0,
+        vec![
+            ("emit_packages", serde_json::json!(["swift"])),
+            // A blank name must not yield an empty target; fall back to the default.
+            ("package_name", serde_json::json!("   ")),
+        ],
+    );
+    let files = build_files(&input).expect("ok");
+    let manifest = files
+        .iter()
+        .find(|f| f.path == "Package.swift")
+        .expect("Package.swift emitted");
+    assert!(
+        manifest
+            .content
+            .contains(".target(name: \"CsilgenClient\")")
+    );
 }

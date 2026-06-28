@@ -96,12 +96,31 @@ fn process_generation(input: WasmGeneratorInput) -> Result<WasmGeneratorOutput, 
     };
 
     let dir = config.package.replace('.', "/");
-    let make_path = |filename: &str| -> String { format!("{dir}/{filename}") };
+    // In package mode the sources move under Gradle's conventional `src/main/kotlin`
+    // source root so the output directory is a buildable project; otherwise they keep the
+    // default flat package-path layout unchanged.
+    let source_root = if config.emit_package {
+        format!("src/main/kotlin/{dir}")
+    } else {
+        dir
+    };
+    let make_path = |filename: &str| -> String { format!("{source_root}/{filename}") };
 
     if let Some(types_content) = generate_types(&input, &config, &mut warnings) {
         files.push(GeneratedFile {
             path: make_path("Types.kt"),
             content: types_content,
+        });
+    }
+
+    // The per-record CBOR codec lets a record cross the wire without a hand-written
+    // serializer; the typed client encodes/decodes through it. Emitted for every
+    // surface (a types-only consumer still needs to (de)serialize), whenever the spec
+    // declares record types.
+    if let Some(codec_content) = generate_codec(&input, &config) {
+        files.push(GeneratedFile {
+            path: make_path("Codec.kt"),
+            content: codec_content,
         });
     }
 
@@ -134,6 +153,19 @@ fn process_generation(input: WasmGeneratorInput) -> Result<WasmGeneratorOutput, 
         }
     }
 
+    // The Gradle manifest sits at the project root (not under the package path), so the
+    // emitted directory is itself a publishable project.
+    if config.emit_package {
+        files.push(GeneratedFile {
+            path: "build.gradle.kts".to_string(),
+            content: gradle_build_kts(&config),
+        });
+        files.push(GeneratedFile {
+            path: "settings.gradle.kts".to_string(),
+            content: gradle_settings_kts(&config),
+        });
+    }
+
     let total_size: usize = files.iter().map(|f| f.content.len()).sum();
     let stats = GenerationStats {
         files_generated: files.len(),
@@ -155,6 +187,13 @@ fn process_generation(input: WasmGeneratorInput) -> Result<WasmGeneratorOutput, 
 struct KotlinConfig {
     package: String,
     package_description: String,
+    // When true, the output directory becomes a self-contained, publishable Gradle
+    // (Kotlin/JVM) project: a build script + settings are emitted and the sources move
+    // under Gradle's conventional source root. Driven by `emit_packages` containing
+    // `"kotlin"`, so the same flag can fan a single generate across many language packages.
+    emit_package: bool,
+    package_name: String,
+    package_version: String,
 }
 
 impl KotlinConfig {
@@ -169,11 +208,86 @@ impl KotlinConfig {
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
+        // Parse defensively: a missing key, a non-array value, or an array without the
+        // `"kotlin"` string all leave package mode off, so unrelated targets in the same
+        // `emit_packages` list never accidentally turn it on.
+        let emit_package = options
+            .get("emit_packages")
+            .and_then(|v| v.as_array())
+            .map(|arr| arr.iter().any(|e| e.as_str() == Some("kotlin")))
+            .unwrap_or(false);
+        let package_name = options
+            .get("package_name")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| derive_package_name(&package));
+        let package_version = options
+            .get("package_version")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .unwrap_or("0.1.0")
+            .to_string();
         Self {
             package,
             package_description,
+            emit_package,
+            package_name,
+            package_version,
         }
     }
+}
+
+/// The artifact/root-project name when `package_name` is unset: the last dotted segment
+/// of the Kotlin package (`com.example.api` → `api`), since that segment is the most
+/// specific human-facing name already present in the coordinates.
+fn derive_package_name(package: &str) -> String {
+    package
+        .rsplit('.')
+        .find(|s| !s.is_empty())
+        .unwrap_or("generated")
+        .to_string()
+}
+
+/// The Kotlin Gradle plugin version pinned into a generated package's build script — a
+/// recent stable release so a freshly emitted project builds without further edits.
+const KOTLIN_GRADLE_PLUGIN_VERSION: &str = "2.0.21";
+
+/// The `build.gradle.kts` for a self-contained package: the Kotlin/JVM + `maven-publish`
+/// plugins, the CSIL coordinates (group/version), a pinned JVM toolchain, and a publish
+/// block — and deliberately no third-party dependencies, since the generated codec runtime
+/// is self-contained.
+fn gradle_build_kts(config: &KotlinConfig) -> String {
+    let group = kotlin_escape(&config.package);
+    let version = kotlin_escape(&config.package_version);
+    let mut out = String::new();
+    out.push_str("// Code generated by csilgen; DO NOT EDIT.\n\n");
+    out.push_str("plugins {\n");
+    out.push_str(&format!(
+        "    kotlin(\"jvm\") version \"{KOTLIN_GRADLE_PLUGIN_VERSION}\"\n"
+    ));
+    out.push_str("    `maven-publish`\n");
+    out.push_str("}\n\n");
+    out.push_str(&format!("group = \"{group}\"\n"));
+    out.push_str(&format!("version = \"{version}\"\n\n"));
+    // A toolchain pins the JVM target so the published artifact is reproducible regardless
+    // of the local JDK; 17 is the current LTS baseline.
+    out.push_str("kotlin {\n    jvmToolchain(17)\n}\n\n");
+    out.push_str("publishing {\n");
+    out.push_str("    publications {\n");
+    out.push_str("        create<MavenPublication>(\"maven\") {\n");
+    out.push_str("            from(components[\"java\"])\n");
+    out.push_str("        }\n");
+    out.push_str("    }\n");
+    out.push_str("}\n");
+    out
+}
+
+/// The `settings.gradle.kts` for a self-contained package: it names the root project after
+/// the artifact, which is what Gradle publishes as the artifact id.
+fn gradle_settings_kts(config: &KotlinConfig) -> String {
+    let name = kotlin_escape(&config.package_name);
+    format!("// Code generated by csilgen; DO NOT EDIT.\n\nrootProject.name = \"{name}\"\n")
 }
 
 /// Standard file header: the doc block, the generated-code marker, and the
@@ -440,17 +554,18 @@ class ClientError(
 ) : RuntimeException(message, cause)
 
 /**
- * Transport is supplied by the caller: it encodes the request (CBOR over some
- * carrier), performs the call named by (service, op), and returns the typed
- * response, or throws. The generator never owns the wire. Synchronous by design —
- * no coroutines; the host owns its own threads.
+ * Transport is the caller-supplied byte carrier: it performs the call named by
+ * (service, op) with the already-encoded request bytes and returns the response
+ * bytes, or throws. The generated client owns (de)serialization; the carrier only
+ * moves bytes. Synchronous by design — no coroutines; the host owns its own threads.
  */
 interface Transport {
-    fun call(service: String, op: String, request: Any?): Any?
+    fun call(service: String, op: String, request: ByteArray): ByteArray
 }
 ";
 
 fn generate_client(input: &WasmGeneratorInput, config: &KotlinConfig) -> Option<String> {
+    let records = kotlin_record_names(input);
     let mut body = String::new();
     body.push_str(CLIENT_PRELUDE_KT);
     body.push('\n');
@@ -458,7 +573,7 @@ fn generate_client(input: &WasmGeneratorInput, config: &KotlinConfig) -> Option<
     let mut emitted = false;
     for rule in &input.csil_spec.rules {
         if let CsilRuleType::ServiceDef(service) = &rule.rule_type {
-            emit_client_class(&mut body, &rule.name, service);
+            emit_client_class(&mut body, &rule.name, service, &records);
             emitted = true;
         }
     }
@@ -470,14 +585,21 @@ fn generate_client(input: &WasmGeneratorInput, config: &KotlinConfig) -> Option<
     Some(content)
 }
 
-fn emit_client_class(body: &mut String, name: &str, service: &CsilServiceDefinition) {
+fn emit_client_class(
+    body: &mut String,
+    name: &str,
+    service: &CsilServiceDefinition,
+    records: &std::collections::HashSet<String>,
+) {
     let base = service_base(name);
     let client = format!("{base}Client");
-    // The wire service string is the base name verbatim (no case transform leaks
-    // onto the wire); the host and other-language clients must agree on it.
-    let wire_service = &base;
+    // Canonical wire service (the wire contract): the base name lowercased, so a
+    // Kotlin client routes to the same endpoint as the Go/Python/TS peers.
+    let wire_service = wire_service_name(name);
 
-    body.push_str(&format!("/** Typed client for the {name} service. */\n"));
+    body.push_str(&format!(
+        "/** Typed client for the {name} service. The client owns (de)serialization;\n * the carrier only moves bytes. */\n"
+    ));
     body.push_str(&format!(
         "class {client}(private val transport: Transport) {{\n"
     ));
@@ -490,15 +612,29 @@ fn emit_client_class(body: &mut String, name: &str, service: &CsilServiceDefinit
             ));
             continue;
         }
+        let success = success_type(&operation.output_type);
+        // The typed-codec path needs a record success type (and a record or null
+        // request) so the method can encode/decode through the generated codec.
+        // Anything else is skipped with a note rather than an uncompilable call.
+        let resp_record = is_record_ref(&success, records);
+        let req_ok = op_input_is_null(&operation.input_type)
+            || is_record_ref(&operation.input_type, records);
+        if !resp_record || !req_ok {
+            body.push_str(&format!(
+                "    // operation '{}' has a non-record payload; (de)serialize it manually\n",
+                operation.name
+            ));
+            continue;
+        }
         let method = kotlin_method_name(&operation.name);
-        // The wire op name stays verbatim (kebab-case) — case transforms never
-        // reach the wire.
-        let wire_op = &operation.name;
-        let output_type = map_csil_type_to_kotlin(&success_type(&operation.output_type), &None);
+        // The wire op is PascalCased (the wire contract), matching the other targets.
+        let wire_op = wire_op_name(&operation.name);
+        let output_type = map_csil_type_to_kotlin(&success, &None);
         if op_input_is_null(&operation.input_type) {
             body.push_str(&format!("    fun {method}(): {output_type} {{\n"));
+            // A null-input op sends an empty request body.
             body.push_str(&format!(
-                "        return transport.call(\"{wire_service}\", \"{wire_op}\", null) as {output_type}\n"
+                "        return decode<{output_type}>(transport.call(\"{wire_service}\", \"{wire_op}\", ByteArray(0)))\n"
             ));
         } else {
             let input_type = map_csil_type_to_kotlin(&operation.input_type, &None);
@@ -506,12 +642,18 @@ fn emit_client_class(body: &mut String, name: &str, service: &CsilServiceDefinit
                 "    fun {method}(request: {input_type}): {output_type} {{\n"
             ));
             body.push_str(&format!(
-                "        return transport.call(\"{wire_service}\", \"{wire_op}\", request) as {output_type}\n"
+                "        return decode<{output_type}>(transport.call(\"{wire_service}\", \"{wire_op}\", encode(request)))\n"
             ));
         }
         body.push_str("    }\n");
     }
     body.push_str("}\n\n");
+}
+
+/// Whether a type is a reference to a record the codec can (de)serialize, so the
+/// typed client method can encode/decode it through the generated codec.
+fn is_record_ref(ty: &CsilTypeExpression, records: &std::collections::HashSet<String>) -> bool {
+    matches!(ty, CsilTypeExpression::Reference(n) if records.contains(&pascal_case(n)))
 }
 
 /// Codec + handler-outcome prelude emitted once at the top of `Services.kt` when any
@@ -630,8 +772,11 @@ fn emit_channel_router(body: &mut String, name: &str, service: &CsilServiceDefin
         }
         let method = kotlin_method_name(&operation.name);
         let input_type = map_csil_type_to_kotlin(&operation.input_type, &None);
-        // The wire op name is verbatim (kebab-case CSIL operation name).
-        body.push_str(&format!("        \"{}\" -> {{\n", operation.name));
+        // The wire op is PascalCased (the wire contract), matching the other targets.
+        body.push_str(&format!(
+            "        \"{}\" -> {{\n",
+            wire_op_name(&operation.name)
+        ));
         body.push_str(&format!(
             "            val message = codec.decode(data, {input_type}::class.java)\n"
         ));
@@ -708,6 +853,630 @@ fn emit_channel_encoders(body: &mut String, name: &str, service: &CsilServiceDef
         body.push_str("}\n\n");
     }
 }
+
+// ---------------------------------------------------------------------------
+// Codec (Codec.kt)
+// ---------------------------------------------------------------------------
+
+/// The Kotlin type names of the record (`data class`) rules — the types whose CBOR
+/// form is a map and which the codec covers with `toCborValue`/`fromCborValue`.
+fn kotlin_record_names(input: &WasmGeneratorInput) -> std::collections::HashSet<String> {
+    input
+        .csil_spec
+        .rules
+        .iter()
+        .filter_map(|r| match &r.rule_type {
+            CsilRuleType::GroupDef(_) => Some(pascal_case(&r.name)),
+            CsilRuleType::TypeDef(CsilTypeExpression::Group(_)) => Some(pascal_case(&r.name)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The transparent type aliases the codec resolves through: a `TypeDef` whose target
+/// is a map / array / scalar / reference / tuple (NOT a record group or a choice, which
+/// have their own handling). A field referencing one (`StringInt64Map = {* text => int}`,
+/// `Tags = [* text]`, `Uuid = text`) has no codec of its own, so it must encode/decode as
+/// its underlying type rather than fall through to the `CborValue.CNull` stub a bare
+/// non-record reference would yield. Keyed by `pascal_case` to match the reference
+/// lookups, which already `pascal_case` the referenced name like the record set does.
+fn codec_aliases(
+    input: &WasmGeneratorInput,
+) -> std::collections::HashMap<String, CsilTypeExpression> {
+    input
+        .csil_spec
+        .rules
+        .iter()
+        .filter_map(|rule| match &rule.rule_type {
+            CsilRuleType::TypeDef(t) => match t {
+                CsilTypeExpression::Group(_) | CsilTypeExpression::Choice(_) => None,
+                other => Some((pascal_case(&rule.name), other.clone())),
+            },
+            _ => None,
+        })
+        .collect()
+}
+
+/// The CBOR encoding of a text key; comparing these lexicographically is RFC 8949
+/// §4.2.1 key ordering, computed at generation time for a canonical map.
+fn cbor_text_key_bytes(name: &str) -> Vec<u8> {
+    let bytes = name.as_bytes();
+    let n = bytes.len() as u64;
+    let mt = 3u8 << 5;
+    let mut head = Vec::new();
+    if n < 24 {
+        head.push(mt | n as u8);
+    } else if n < 0x100 {
+        head.push(mt | 24);
+        head.push(n as u8);
+    } else {
+        head.push(mt | 25);
+        head.extend_from_slice(&(n as u16).to_be_bytes());
+    }
+    head.extend_from_slice(bytes);
+    head
+}
+
+fn unwrap_constrained(ty: &CsilTypeExpression) -> &CsilTypeExpression {
+    match ty {
+        CsilTypeExpression::Constrained { base_type, .. } => base_type,
+        other => other,
+    }
+}
+
+/// A Kotlin expression building a `CborValue` from `expr` (a typed value).
+fn kotlin_enc_value(
+    ty: &CsilTypeExpression,
+    expr: &str,
+    records: &std::collections::HashSet<String>,
+    aliases: &std::collections::HashMap<String, CsilTypeExpression>,
+) -> String {
+    match unwrap_constrained(ty) {
+        CsilTypeExpression::Builtin(name) => match name.as_str() {
+            "int" | "nint" => format!("CborValue.CInt({expr})"),
+            "uint" => format!("CborValue.CUint({expr})"),
+            "float" | "float64" | "double" => format!("CborValue.CFloat({expr})"),
+            "text" | "tstr" => format!("CborValue.CText({expr})"),
+            "bytes" | "bstr" => format!("CborValue.CBytes({expr})"),
+            "bool" => format!("CborValue.CBool({expr})"),
+            // timestamp is tag 0 + RFC3339 UTC text; Instant.toString() is RFC3339 with `Z`.
+            "timestamp" => format!("CborValue.CTag(0uL, CborValue.CText(({expr}).toString()))"),
+            // decimal is tag 4 [exponent, mantissa]; BigDecimal = unscaled * 10^-scale.
+            "decimal" => format!(
+                "CborValue.CTag(4uL, CborValue.CArray(listOf(CborValue.CInt((-({expr}).scale()).toLong()), CborValue.CInt(({expr}).unscaledValue().longValueExact()))))"
+            ),
+            "nil" | "null" => "CborValue.CNull".to_string(),
+            _ => "CborValue.CNull".to_string(),
+        },
+        CsilTypeExpression::Reference(name) if records.contains(&pascal_case(name)) => {
+            format!("{expr}.toCborValue()")
+        }
+        // A reference to a transparent alias (`StringInt64Map = {* text => int}`) has no
+        // codec of its own; encode it as its underlying map/array/scalar type. The Kotlin
+        // alias-typed field is the same `Map`/`List`/scalar the underlying encoder expects,
+        // so the same `expr` flows through unchanged.
+        CsilTypeExpression::Reference(name) if aliases.contains_key(&pascal_case(name)) => {
+            kotlin_enc_value(&aliases[&pascal_case(name)], expr, records, aliases)
+        }
+        CsilTypeExpression::Array { element_type, .. } => {
+            let inner = kotlin_enc_value(element_type, "csilE", records, aliases);
+            format!("CborValue.CArray(({expr}).map {{ csilE -> {inner} }})")
+        }
+        CsilTypeExpression::Map { key, value, .. } => {
+            let k = kotlin_enc_value(key, "csilK", records, aliases);
+            let v = kotlin_enc_value(value, "csilV", records, aliases);
+            format!("CborValue.CMap(({expr}).map {{ (csilK, csilV) -> {k} to {v} }})")
+        }
+        CsilTypeExpression::Choice(choices) if choice_is_stringy(choices) => {
+            format!("CborValue.CText({expr})")
+        }
+        _ => "CborValue.CNull".to_string(),
+    }
+}
+
+/// A Kotlin expression decoding a typed value from `expr` (a `CborValue`).
+fn kotlin_dec_value(
+    ty: &CsilTypeExpression,
+    expr: &str,
+    records: &std::collections::HashSet<String>,
+    aliases: &std::collections::HashMap<String, CsilTypeExpression>,
+) -> String {
+    match unwrap_constrained(ty) {
+        CsilTypeExpression::Builtin(name) => match name.as_str() {
+            "int" | "nint" => format!("CsilCbor.asLong({expr})"),
+            "uint" => format!("CsilCbor.asULong({expr})"),
+            "float" | "float64" | "double" => format!("CsilCbor.asDouble({expr})"),
+            "text" | "tstr" => format!("CsilCbor.asText({expr})"),
+            "bytes" | "bstr" => format!("CsilCbor.asBytes({expr})"),
+            "bool" => format!("CsilCbor.asBoolean({expr})"),
+            "timestamp" => format!("java.time.Instant.parse(CsilCbor.asTaggedText({expr}, 0uL))"),
+            "decimal" => format!("CsilCbor.asDecimal({expr})"),
+            _ => format!("CsilCbor.asText({expr})"),
+        },
+        CsilTypeExpression::Reference(name) if records.contains(&pascal_case(name)) => {
+            format!("{}FromCborValue({expr})", camel_case(name))
+        }
+        // A reference to a transparent alias decodes as its underlying map/array/scalar
+        // type; the resulting `Map`/`List`/scalar is assignable to the alias-typed field.
+        CsilTypeExpression::Reference(name) if aliases.contains_key(&pascal_case(name)) => {
+            kotlin_dec_value(&aliases[&pascal_case(name)], expr, records, aliases)
+        }
+        CsilTypeExpression::Array { element_type, .. } => {
+            let inner = kotlin_dec_value(element_type, "csilE", records, aliases);
+            format!("CsilCbor.asArray({expr}).map {{ csilE -> {inner} }}")
+        }
+        CsilTypeExpression::Map { key, value, .. } => {
+            let k = kotlin_dec_value(key, "csilK", records, aliases);
+            let v = kotlin_dec_value(value, "csilV", records, aliases);
+            format!("CsilCbor.asMap({expr}).associate {{ (csilK, csilV) -> {k} to {v} }}")
+        }
+        CsilTypeExpression::Choice(choices) if choice_is_stringy(choices) => {
+            format!("CsilCbor.asText({expr})")
+        }
+        _ => format!("CsilCbor.asText({expr})"),
+    }
+}
+
+/// Whether every arm of a choice is "some text" (the open `text`/`tstr` builtin or a
+/// string literal) — such a choice carries no more than a `String` on the wire, so the
+/// codec treats it as text.
+fn choice_is_stringy(choices: &[CsilTypeExpression]) -> bool {
+    !choices.is_empty()
+        && choices.iter().all(|c| match c {
+            CsilTypeExpression::Builtin(n) => n == "text" || n == "tstr",
+            CsilTypeExpression::Literal(CsilLiteralValue::Text(_)) => true,
+            _ => false,
+        })
+}
+
+/// Emit one record's codec: `toCborValue`/`toCbor` (canonical key order) plus the
+/// free `<type>FromCborValue`/`<type>FromCbor` decoders (declaration order).
+fn emit_struct_codec(
+    body: &mut String,
+    name: &str,
+    group: &CsilGroupExpression,
+    records: &std::collections::HashSet<String>,
+    aliases: &std::collections::HashMap<String, CsilTypeExpression>,
+) {
+    let type_name = pascal_case(name);
+    let decoder = camel_case(name);
+    // (prop, wire, entry) in declaration order, and a canonical-key-order copy for the
+    // encoder so the wire map is deterministic.
+    let named: Vec<(String, String, &CsilGroupEntry)> = group
+        .entries
+        .iter()
+        .filter_map(|e| {
+            let key = e.key.as_ref()?;
+            let prop = kotlin_prop_name(key, &e.metadata);
+            let wire = wire_name_from_key(key);
+            Some((prop, wire, e))
+        })
+        .collect();
+    let mut canonical: Vec<&(String, String, &CsilGroupEntry)> = named.iter().collect();
+    canonical.sort_by_key(|f| cbor_text_key_bytes(&f.1));
+
+    body.push_str(&format!(
+        "/** The CBOR value tree for a {type_name} (deep, canonical key order). */\n"
+    ));
+    body.push_str(&format!("fun {type_name}.toCborValue(): CborValue {{\n"));
+    body.push_str("    val csilEntries = ArrayList<Pair<CborValue, CborValue>>()\n");
+    for (prop, wire, entry) in &canonical {
+        let wire_lit = kotlin_escape(wire);
+        if matches!(entry.occurrence, Some(CsilOccurrence::Optional)) {
+            let enc = kotlin_enc_value(&entry.value_type, "csilV", records, aliases);
+            body.push_str(&format!(
+                "    this.{prop}?.let {{ csilV -> csilEntries.add(CborValue.CText(\"{wire_lit}\") to {enc}) }}\n"
+            ));
+        } else {
+            let enc =
+                kotlin_enc_value(&entry.value_type, &format!("this.{prop}"), records, aliases);
+            body.push_str(&format!(
+                "    csilEntries.add(CborValue.CText(\"{wire_lit}\") to {enc})\n"
+            ));
+        }
+    }
+    body.push_str("    return CborValue.CMap(csilEntries)\n}\n\n");
+
+    body.push_str(&format!(
+        "/** Encode a {type_name} to canonical CSIL CBOR bytes. */\n"
+    ));
+    body.push_str(&format!(
+        "fun {type_name}.toCbor(): ByteArray = CsilCbor.encode(this.toCborValue())\n\n"
+    ));
+
+    body.push_str(&format!(
+        "/** Reconstruct a {type_name} from a decoded CBOR value tree. */\n"
+    ));
+    body.push_str(&format!(
+        "fun {decoder}FromCborValue(cbor: CborValue): {type_name} {{\n"
+    ));
+    let mut init_args: Vec<String> = Vec::new();
+    for (prop, wire, entry) in &named {
+        let wire_lit = kotlin_escape(wire);
+        if matches!(entry.occurrence, Some(CsilOccurrence::Optional)) {
+            let dec = kotlin_dec_value(&entry.value_type, "csilV", records, aliases);
+            body.push_str(&format!(
+                "    val {prop} = CsilCbor.mapGet(cbor, \"{wire_lit}\")?.let {{ csilV -> {dec} }}\n"
+            ));
+        } else {
+            let dec = kotlin_dec_value(
+                &entry.value_type,
+                &format!("CsilCbor.require(cbor, \"{wire_lit}\")"),
+                records,
+                aliases,
+            );
+            body.push_str(&format!("    val {prop} = {dec}\n"));
+        }
+        init_args.push(format!("{prop} = {prop}"));
+    }
+    body.push_str(&format!(
+        "    return {type_name}({})\n}}\n\n",
+        init_args.join(", ")
+    ));
+
+    body.push_str(&format!(
+        "/** Decode CSIL CBOR bytes into a {type_name}. */\n"
+    ));
+    body.push_str(&format!(
+        "fun {decoder}FromCbor(bytes: ByteArray): {type_name} = {decoder}FromCborValue(CsilCbor.decode(bytes))\n\n"
+    ));
+}
+
+/// The generic `encode`/`decode` entry points and their per-record dispatch tables.
+/// The typed client calls `encode(request)` / `decode<Resp>(bytes)`; both resolve a
+/// concrete record by its runtime/`reified` type.
+fn emit_codec_dispatch(body: &mut String, records: &[(String, String)]) {
+    body.push_str(
+        "/** Encode a generated CSIL record to canonical CBOR bytes. */\nfun <T> encode(value: T): ByteArray = CsilCbor.encode(csilToCborValue(value))\n\n",
+    );
+    body.push_str("private fun csilToCborValue(value: Any?): CborValue = when (value) {\n");
+    body.push_str("    null -> CborValue.CNull\n");
+    for (type_name, _) in records {
+        body.push_str(&format!("    is {type_name} -> value.toCborValue()\n"));
+    }
+    body.push_str("    else -> throw CborError(\"no CSIL CBOR codec for ${value::class}\")\n}\n\n");
+
+    body.push_str(
+        "/** Decode canonical CBOR bytes into a generated CSIL record of type [T]. */\ninline fun <reified T> decode(bytes: ByteArray): T =\n    csilFromCborValue(T::class, CsilCbor.decode(bytes)) as T\n\n",
+    );
+    body.push_str(
+        "fun csilFromCborValue(type: kotlin.reflect.KClass<*>, cbor: CborValue): Any = when (type) {\n",
+    );
+    for (type_name, decoder) in records {
+        body.push_str(&format!(
+            "    {type_name}::class -> {decoder}FromCborValue(cbor)\n"
+        ));
+    }
+    body.push_str("    else -> throw CborError(\"no CSIL CBOR codec for $type\")\n}\n");
+}
+
+/// Build `Codec.kt`: the self-contained canonical-CBOR runtime, a codec per record,
+/// and the generic dispatch. `None` when the spec declares no record types.
+fn generate_codec(input: &WasmGeneratorInput, config: &KotlinConfig) -> Option<String> {
+    let records = kotlin_record_names(input);
+    if records.is_empty() {
+        return None;
+    }
+    let aliases = codec_aliases(input);
+    let mut body = String::new();
+    let mut dispatch: Vec<(String, String)> = Vec::new();
+    for rule in &input.csil_spec.rules {
+        let group = match &rule.rule_type {
+            CsilRuleType::GroupDef(g) => Some(g),
+            CsilRuleType::TypeDef(CsilTypeExpression::Group(g)) => Some(g),
+            _ => None,
+        };
+        if let Some(group) = group {
+            emit_struct_codec(&mut body, &rule.name, group, &records, &aliases);
+            dispatch.push((pascal_case(&rule.name), camel_case(&rule.name)));
+        }
+    }
+    emit_codec_dispatch(&mut body, &dispatch);
+
+    let mut content = file_header(
+        config,
+        "Generated CBOR (de)serializers for the CSIL value types.",
+    );
+    content.push_str(CODEC_RUNTIME_KT);
+    content.push('\n');
+    content.push_str(&body);
+    Some(content)
+}
+
+/// The self-contained canonical-CBOR runtime the generated codecs build on, so the
+/// output stays standalone (no third-party CBOR dependency). `bytes` is a `ByteArray`
+/// encoded as a CBOR byte string (major type 2) by construction.
+const CODEC_RUNTIME_KT: &str = r#"/** A minimal canonical-CBOR (RFC 8949 subset) value model. */
+sealed class CborValue {
+    data class CUint(val value: ULong) : CborValue()
+    data class CInt(val value: Long) : CborValue()
+    data class CBool(val value: Boolean) : CborValue()
+    data class CFloat(val value: Double) : CborValue()
+    data object CNull : CborValue()
+    data class CText(val value: String) : CborValue()
+    // ByteArray breaks data-class structural equality (array identity), so compare by content.
+    class CBytes(val value: ByteArray) : CborValue() {
+        override fun equals(other: Any?): Boolean =
+            this === other || (other is CBytes && value.contentEquals(other.value))
+        override fun hashCode(): Int = value.contentHashCode()
+    }
+    data class CArray(val items: List<CborValue>) : CborValue()
+    data class CMap(val entries: List<Pair<CborValue, CborValue>>) : CborValue()
+    data class CTag(val tag: ULong, val value: CborValue) : CborValue()
+}
+
+/** Raised by the CBOR runtime on malformed input or a type/field mismatch. */
+class CborError(message: String) : RuntimeException(message)
+
+/** The canonical-CBOR encoder/decoder plus typed accessors over [CborValue]. */
+object CsilCbor {
+    fun encode(value: CborValue): ByteArray {
+        val out = ArrayList<Byte>()
+        enc(value, out)
+        return out.toByteArray()
+    }
+
+    private fun head(major: Int, n: ULong, out: MutableList<Byte>) {
+        val mt = major shl 5
+        when {
+            n < 24uL -> out.add((mt or n.toInt()).toByte())
+            n < 0x100uL -> {
+                out.add((mt or 24).toByte())
+                out.add(n.toByte())
+            }
+            n < 0x10000uL -> {
+                out.add((mt or 25).toByte())
+                out.add((n shr 8).toByte())
+                out.add(n.toByte())
+            }
+            n < 0x100000000uL -> {
+                out.add((mt or 26).toByte())
+                var i = 24
+                while (i >= 0) {
+                    out.add((n shr i).toByte())
+                    i -= 8
+                }
+            }
+            else -> {
+                out.add((mt or 27).toByte())
+                var i = 56
+                while (i >= 0) {
+                    out.add((n shr i).toByte())
+                    i -= 8
+                }
+            }
+        }
+    }
+
+    private fun enc(v: CborValue, out: MutableList<Byte>) {
+        when (v) {
+            is CborValue.CUint -> head(0, v.value, out)
+            is CborValue.CInt -> {
+                val n = v.value
+                if (n >= 0) head(0, n.toULong(), out) else head(1, (-(n + 1)).toULong(), out)
+            }
+            is CborValue.CBool -> out.add((if (v.value) 0xf5 else 0xf4).toByte())
+            is CborValue.CNull -> out.add(0xf6.toByte())
+            is CborValue.CFloat -> {
+                out.add(0xfb.toByte())
+                val bits = v.value.toRawBits()
+                var i = 56
+                while (i >= 0) {
+                    out.add((bits ushr i).toByte())
+                    i -= 8
+                }
+            }
+            is CborValue.CText -> {
+                val u = v.value.toByteArray(Charsets.UTF_8)
+                head(3, u.size.toULong(), out)
+                for (b in u) out.add(b)
+            }
+            is CborValue.CBytes -> {
+                head(2, v.value.size.toULong(), out)
+                for (b in v.value) out.add(b)
+            }
+            is CborValue.CArray -> {
+                head(4, v.items.size.toULong(), out)
+                for (x in v.items) enc(x, out)
+            }
+            is CborValue.CMap -> {
+                head(5, v.entries.size.toULong(), out)
+                for ((k, value) in v.entries) {
+                    enc(k, out)
+                    enc(value, out)
+                }
+            }
+            is CborValue.CTag -> {
+                head(6, v.tag, out)
+                enc(v.value, out)
+            }
+        }
+    }
+
+    private class Cursor(val b: ByteArray) {
+        var pos = 0
+    }
+
+    fun decode(b: ByteArray): CborValue {
+        val cur = Cursor(b)
+        val v = dec(cur)
+        if (cur.pos != b.size) throw CborError("trailing bytes after CBOR value")
+        return v
+    }
+
+    private fun readArg(cur: Cursor, low: Int): ULong {
+        if (low < 24) {
+            cur.pos += 1
+            return low.toULong()
+        }
+        return when (low) {
+            24 -> {
+                val v = cur.b[cur.pos + 1].toUByte().toULong()
+                cur.pos += 2
+                v
+            }
+            25 -> {
+                val v = (cur.b[cur.pos + 1].toUByte().toULong() shl 8) or cur.b[cur.pos + 2].toUByte().toULong()
+                cur.pos += 3
+                v
+            }
+            26 -> {
+                var v = 0uL
+                for (i in 1..4) v = (v shl 8) or cur.b[cur.pos + i].toUByte().toULong()
+                cur.pos += 5
+                v
+            }
+            27 -> {
+                var v = 0uL
+                for (i in 1..8) v = (v shl 8) or cur.b[cur.pos + i].toUByte().toULong()
+                cur.pos += 9
+                v
+            }
+            else -> throw CborError("malformed CBOR additional info")
+        }
+    }
+
+    private fun dec(cur: Cursor): CborValue {
+        val ib = cur.b[cur.pos].toUByte().toInt()
+        val major = ib shr 5
+        val low = ib and 0x1f
+        if (major == 7) {
+            return when (low) {
+                20 -> {
+                    cur.pos += 1
+                    CborValue.CBool(false)
+                }
+                21 -> {
+                    cur.pos += 1
+                    CborValue.CBool(true)
+                }
+                22, 23 -> {
+                    cur.pos += 1
+                    CborValue.CNull
+                }
+                26 -> {
+                    val bits = readArg(cur, low)
+                    CborValue.CFloat(Float.fromBits((bits and 0xffffffffuL).toInt()).toDouble())
+                }
+                27 -> {
+                    val bits = readArg(cur, low)
+                    CborValue.CFloat(Double.fromBits(bits.toLong()))
+                }
+                else -> throw CborError("malformed CBOR simple/float")
+            }
+        }
+        val arg = readArg(cur, low)
+        return when (major) {
+            0 -> CborValue.CUint(arg)
+            1 -> {
+                if (arg > Long.MAX_VALUE.toULong()) throw CborError("negative integer out of range")
+                CborValue.CInt(-1L - arg.toLong())
+            }
+            2 -> {
+                val n = arg.toInt()
+                val slice = cur.b.copyOfRange(cur.pos, cur.pos + n)
+                cur.pos += n
+                CborValue.CBytes(slice)
+            }
+            3 -> {
+                val n = arg.toInt()
+                val s = String(cur.b, cur.pos, n, Charsets.UTF_8)
+                cur.pos += n
+                CborValue.CText(s)
+            }
+            4 -> {
+                val n = arg.toInt()
+                val items = ArrayList<CborValue>(n)
+                repeat(n) { items.add(dec(cur)) }
+                CborValue.CArray(items)
+            }
+            5 -> {
+                val n = arg.toInt()
+                val entries = ArrayList<Pair<CborValue, CborValue>>(n)
+                repeat(n) {
+                    val k = dec(cur)
+                    val value = dec(cur)
+                    entries.add(k to value)
+                }
+                CborValue.CMap(entries)
+            }
+            6 -> CborValue.CTag(arg, dec(cur))
+            else -> throw CborError("malformed CBOR major type")
+        }
+    }
+
+    fun mapGet(v: CborValue, key: String): CborValue? {
+        if (v is CborValue.CMap) {
+            for ((k, value) in v.entries) {
+                if (k is CborValue.CText && k.value == key) return value
+            }
+        }
+        return null
+    }
+
+    fun require(v: CborValue, key: String): CborValue =
+        mapGet(v, key) ?: throw CborError("missing field '$key'")
+
+    fun asLong(v: CborValue): Long = when (v) {
+        is CborValue.CUint -> {
+            if (v.value > Long.MAX_VALUE.toULong()) throw CborError("integer out of Long range")
+            v.value.toLong()
+        }
+        is CborValue.CInt -> v.value
+        else -> throw CborError("expected integer")
+    }
+
+    fun asULong(v: CborValue): ULong = when (v) {
+        is CborValue.CUint -> v.value
+        is CborValue.CInt -> {
+            if (v.value < 0) throw CborError("expected unsigned integer")
+            v.value.toULong()
+        }
+        else -> throw CborError("expected unsigned integer")
+    }
+
+    fun asDouble(v: CborValue): Double = when (v) {
+        is CborValue.CFloat -> v.value
+        is CborValue.CUint -> v.value.toDouble()
+        is CborValue.CInt -> v.value.toDouble()
+        else -> throw CborError("expected float")
+    }
+
+    fun asBoolean(v: CborValue): Boolean =
+        (v as? CborValue.CBool)?.value ?: throw CborError("expected bool")
+
+    fun asText(v: CborValue): String =
+        (v as? CborValue.CText)?.value ?: throw CborError("expected text")
+
+    fun asBytes(v: CborValue): ByteArray =
+        (v as? CborValue.CBytes)?.value ?: throw CborError("expected bytes")
+
+    fun asArray(v: CborValue): List<CborValue> =
+        (v as? CborValue.CArray)?.items ?: throw CborError("expected array")
+
+    fun asMap(v: CborValue): List<Pair<CborValue, CborValue>> =
+        (v as? CborValue.CMap)?.entries ?: throw CborError("expected map")
+
+    fun asTaggedText(v: CborValue, tag: ULong): String {
+        if (v is CborValue.CTag && v.tag == tag) return asText(v.value)
+        throw CborError("expected tag $tag")
+    }
+
+    // tag 4 decimal fraction [exponent, mantissa]; value = mantissa * 10^exponent, and
+    // BigDecimal(unscaled, scale) = unscaled * 10^-scale, so scale = -exponent.
+    fun asDecimal(v: CborValue): java.math.BigDecimal {
+        if (v is CborValue.CTag && v.tag == 4uL) {
+            val arr = asArray(v.value)
+            if (arr.size == 2) {
+                val exp = asLong(arr[0])
+                val mant = asLong(arr[1])
+                return java.math.BigDecimal(java.math.BigInteger.valueOf(mant), (-exp).toInt())
+            }
+        }
+        throw CborError("expected tag 4 decimal")
+    }
+}
+"#;
 
 // ---------------------------------------------------------------------------
 // Validation
@@ -1259,6 +2028,28 @@ fn service_base(name: &str) -> String {
         .unwrap_or(pascal)
 }
 
+/// The wire `service` string: the service base, **lowercased**, per
+/// `docs/cbor-wire-contract.md` (`CorndogsService` → `"corndogs"`) — distinct from
+/// the Kotlin class name, so a Kotlin client reaches the same endpoint as its peers.
+fn wire_service_name(name: &str) -> String {
+    service_base(name).to_lowercase()
+}
+
+/// The wire `op` string: the operation name PascalCased with the simple rule
+/// (capitalize after `_`/`-`, leave the rest), matching the other generators
+/// (`submit-task` → `"SubmitTask"`).
+fn wire_op_name(name: &str) -> String {
+    let mut out = String::new();
+    for word in name.split(['_', '-']) {
+        let mut chars = word.chars();
+        if let Some(first) = chars.next() {
+            out.extend(first.to_uppercase());
+            out.push_str(chars.as_str());
+        }
+    }
+    out
+}
+
 fn wire_name_from_key(key: &CsilGroupKey) -> String {
     match key {
         CsilGroupKey::Bare(name) => name.clone(),
@@ -1672,7 +2463,7 @@ mod tests {
             "fun routeMatchServiceChannel(handlers: MatchService, codec: Codec, op: String, data: ByteArray)"
         ));
         // The verbose router dispatches on the verbatim (kebab-case) wire op name.
-        assert!(services.contains("\"play\" -> {"));
+        assert!(services.contains("\"Play\" -> {"));
         assert!(services.contains("handlers.play(message)"));
         assert!(services.contains("fun routeMatchServiceChannelCompact(handlers: MatchService, codec: Codec, op: ULong, data: ByteArray)"));
         assert!(services.contains("2uL -> {"));
@@ -1697,16 +2488,41 @@ mod tests {
         };
         let out = process_generation(spec(
             "kotlin-client",
-            vec![rule("CorndogsService", CsilRuleType::ServiceDef(service))],
+            vec![
+                rule(
+                    "SubmitTaskRequest",
+                    CsilRuleType::GroupDef(CsilGroupExpression {
+                        entries: vec![entry("queue", builtin("text"), None)],
+                    }),
+                ),
+                rule(
+                    "SubmitTaskResponse",
+                    CsilRuleType::GroupDef(CsilGroupExpression {
+                        entries: vec![entry("ok", builtin("bool"), None)],
+                    }),
+                ),
+                rule("CorndogsService", CsilRuleType::ServiceDef(service)),
+            ],
         ))
         .unwrap();
         let client = content(&out, "Client.kt");
         assert!(client.contains("interface Transport"));
         assert!(client.contains("class ClientError"));
+        // The carrier seam is raw bytes.
+        assert!(
+            client.contains("fun call(service: String, op: String, request: ByteArray): ByteArray")
+        );
         assert!(client.contains("class CorndogsClient(private val transport: Transport)"));
         assert!(client.contains("fun submitTask(request: SubmitTaskRequest): SubmitTaskResponse"));
-        // Wire service base + verbatim op name stay un-cased on the wire.
-        assert!(client.contains("transport.call(\"Corndogs\", \"submit-task\", request)"));
+        // Typed byte seam: the request serializes itself, the carrier moves bytes, the
+        // response decodes back. Canonical wire strings (service lowercased, op
+        // PascalCased) so a Kotlin client reaches the same endpoint as its peers.
+        assert!(client.contains(
+            "decode<SubmitTaskResponse>(transport.call(\"corndogs\", \"SubmitTask\", encode(request)))"
+        ));
+        assert!(!client.contains(" as SubmitTaskResponse"));
+        assert!(!client.contains("\"Corndogs\""));
+        assert!(!client.contains("\"submit-task\""));
         assert!(!out.files.iter().any(|f| f.path.ends_with("Services.kt")));
     }
 
@@ -1862,5 +2678,477 @@ mod tests {
             .unwrap();
         assert_eq!(f.path, "com/example/api/Types.kt");
         assert!(f.content.contains("package com.example.api"));
+    }
+
+    // --- codec --------------------------------------------------------------
+
+    /// A corndogs-shaped spec: text, bytes, an optional int, a map, a list, a nested
+    /// record, and a service whose output is a `Task / ServiceError` choice.
+    fn corndogs_rules() -> Vec<CsilRule> {
+        let map_ty = CsilTypeExpression::Map {
+            key: Box::new(builtin("text")),
+            value: Box::new(builtin("int")),
+            occurrence: None,
+        };
+        let list_ty = CsilTypeExpression::Array {
+            element_type: Box::new(builtin("text")),
+            occurrence: None,
+        };
+        let task = CsilGroupExpression {
+            entries: vec![
+                entry("uuid", builtin("text"), None),
+                entry("current_state", builtin("text"), None),
+                entry("payload", builtin("bytes"), None),
+                entry("priority", builtin("int"), Some(CsilOccurrence::Optional)),
+                entry("labels", map_ty, None),
+                entry("tags", list_ty, None),
+            ],
+        };
+        let req = CsilGroupExpression {
+            entries: vec![
+                entry("task", reference("Task"), None),
+                entry("queue", builtin("text"), None),
+            ],
+        };
+        let svc_err = CsilGroupExpression {
+            entries: vec![entry("code", builtin("int"), None)],
+        };
+        let service = CsilServiceDefinition {
+            operations: vec![op(
+                "submit-task",
+                reference("SubmitTaskRequest"),
+                CsilTypeExpression::Choice(vec![reference("Task"), reference("ServiceError")]),
+                CsilServiceDirection::Unidirectional,
+                None,
+            )],
+            wire_id: None,
+        };
+        vec![
+            rule("Task", CsilRuleType::GroupDef(task)),
+            rule("SubmitTaskRequest", CsilRuleType::GroupDef(req)),
+            rule("ServiceError", CsilRuleType::GroupDef(svc_err)),
+            rule("CorndogsService", CsilRuleType::ServiceDef(service)),
+        ]
+    }
+
+    #[test]
+    fn codec_emitted_with_typed_client() {
+        let out = process_generation(spec("kotlin-client", corndogs_rules())).unwrap();
+        let codec = content(&out, "Codec.kt");
+        // Self-contained runtime: value model + encoder/decoder.
+        assert!(codec.contains("sealed class CborValue"));
+        assert!(codec.contains("object CsilCbor"));
+        assert!(codec.contains("fun encode(value: CborValue): ByteArray"));
+        assert!(codec.contains("fun decode(b: ByteArray): CborValue"));
+        // Per-record codec.
+        assert!(codec.contains("fun Task.toCborValue(): CborValue"));
+        assert!(codec.contains("fun Task.toCbor(): ByteArray"));
+        assert!(
+            codec
+                .contains("fun submitTaskRequestFromCborValue(cbor: CborValue): SubmitTaskRequest")
+        );
+        assert!(
+            codec.contains("fun submitTaskRequestFromCbor(bytes: ByteArray): SubmitTaskRequest")
+        );
+        // bytes -> CBOR byte string (major type 2); text -> text; nested record recurses.
+        assert!(codec.contains("CborValue.CBytes(this.payload)"));
+        assert!(codec.contains("CborValue.CText(this.uuid)"));
+        assert!(codec.contains("this.task.toCborValue()"));
+        // Optional field is omitted when absent.
+        assert!(codec.contains("this.priority?.let { csilV -> csilEntries.add(CborValue.CText(\"priority\") to CborValue.CInt(csilV)) }"));
+        // Map/list recurse into a CborValue tree.
+        assert!(
+            codec.contains("CborValue.CArray((this.tags).map { csilE -> CborValue.CText(csilE) })")
+        );
+        assert!(codec.contains("CborValue.CMap((this.labels).map { (csilK, csilV) -> CborValue.CText(csilK) to CborValue.CInt(csilV) })"));
+        // Generic dispatch the typed client uses.
+        assert!(codec.contains("fun <T> encode(value: T): ByteArray"));
+        assert!(codec.contains("inline fun <reified T> decode(bytes: ByteArray): T"));
+        assert!(codec.contains("is Task -> value.toCborValue()"));
+        assert!(codec.contains("Task::class -> taskFromCborValue(cbor)"));
+
+        // Canonical key order within Task: `tags`/`uuid` (len 4) precede longer keys,
+        // `current_state` (len 13) is last.
+        let body = codec.split("fun Task.toCborValue").nth(1).unwrap();
+        let pos_tags = body.find("\"tags\"").unwrap();
+        let pos_uuid = body.find("\"uuid\"").unwrap();
+        let pos_state = body.find("\"current_state\"").unwrap();
+        assert!(pos_tags < pos_uuid && pos_uuid < pos_state);
+
+        // Typed byte-seam client.
+        let client = content(&out, "Client.kt");
+        assert!(client.contains("fun submitTask(request: SubmitTaskRequest): Task"));
+        assert!(client.contains(
+            "decode<Task>(transport.call(\"corndogs\", \"SubmitTask\", encode(request)))"
+        ));
+        assert!(
+            client.contains("fun call(service: String, op: String, request: ByteArray): ByteArray")
+        );
+    }
+
+    // The CborValue variants are prefixed (CInt/CFloat/CArray/CMap/…) rather than named after
+    // kotlin builtins because nested members are in scope unqualified inside the sealed class;
+    // a variant named `Int` would shadow `kotlin.Int` and break the `hashCode(): Int` override
+    // (and any future bare builtin annotation in that scope). This guards against re-introducing
+    // that shadow.
+    #[test]
+    fn codec_variants_do_not_shadow_kotlin_builtins() {
+        let out = process_generation(spec("kotlin", corndogs_rules())).unwrap();
+        let codec = content(&out, "Codec.kt");
+
+        // The CBOR runtime carves out exactly the sealed-class body; the shadow can only happen
+        // there because that is the only scope where variant names are visible unqualified.
+        let sealed = codec.split("sealed class CborValue {").nth(1).unwrap();
+        let sealed_body = sealed.split("\n}\n").next().unwrap();
+
+        // No variant is named after a kotlin builtin, so an unqualified `Int`/`Float`/`Array`/…
+        // in this scope resolves to the kotlin type, not a CborValue member.
+        for shadowing in [
+            "data class Int(",
+            "data class Float(",
+            "data class Array(",
+            "data class Map(",
+            "data object Null ",
+            "class Bytes(",
+        ] {
+            assert!(
+                !sealed_body.contains(shadowing),
+                "variant `{shadowing}` shadows a kotlin builtin in the CborValue scope"
+            );
+        }
+
+        // The renamed variants are present and the `hashCode` override is a bare `Int` that now
+        // safely resolves to `kotlin.Int` (no `CInt` shadow exists).
+        assert!(sealed_body.contains("data class CInt("));
+        assert!(sealed_body.contains("class CBytes("));
+        assert!(sealed_body.contains("override fun hashCode(): Int = value.contentHashCode()"));
+
+        // Per-type codec emission uses the renamed variants end to end.
+        assert!(codec.contains("CborValue.CText(this.uuid)"));
+        assert!(codec.contains("CborValue.CBytes(this.payload)"));
+        assert!(codec.contains("CborValue.CInt("));
+        assert!(codec.contains("CborValue.CMap("));
+        assert!(codec.contains("CborValue.CArray("));
+    }
+
+    #[test]
+    fn codec_handles_timestamp_and_decimal_tags() {
+        let group = CsilGroupExpression {
+            entries: vec![
+                entry("at", builtin("timestamp"), None),
+                entry("amount", builtin("decimal"), None),
+            ],
+        };
+        let out = process_generation(spec(
+            "kotlin",
+            vec![rule("Entry", CsilRuleType::GroupDef(group))],
+        ))
+        .unwrap();
+        let codec = content(&out, "Codec.kt");
+        // timestamp -> tag 0 RFC3339 text (Instant.toString() is RFC3339 UTC).
+        assert!(codec.contains("CborValue.CTag(0uL, CborValue.CText((this.at).toString()))"));
+        assert!(codec.contains(
+            "java.time.Instant.parse(CsilCbor.asTaggedText(CsilCbor.require(cbor, \"at\"), 0uL))"
+        ));
+        // decimal -> tag 4 [exponent, mantissa].
+        assert!(codec.contains("CborValue.CTag(4uL, CborValue.CArray(listOf(CborValue.CInt((-(this.amount).scale()).toLong()), CborValue.CInt((this.amount).unscaledValue().longValueExact()))))"));
+        assert!(codec.contains("CsilCbor.asDecimal(CsilCbor.require(cbor, \"amount\"))"));
+    }
+
+    #[test]
+    fn codec_resolves_transparent_named_aliases() {
+        // A named map alias (`StringInt64Map = {* text => int}`), a named list alias
+        // (`Tags = [* text]`), a named scalar alias (`Uuid = text`), and a map-of-record
+        // alias (`Members = {* text => Member}`) all referenced from a record's fields.
+        let string_int64_map = CsilTypeExpression::Map {
+            key: Box::new(builtin("text")),
+            value: Box::new(builtin("int")),
+            occurrence: None,
+        };
+        let tags = CsilTypeExpression::Array {
+            element_type: Box::new(builtin("text")),
+            occurrence: None,
+        };
+        let members = CsilTypeExpression::Map {
+            key: Box::new(builtin("text")),
+            value: Box::new(reference("Member")),
+            occurrence: None,
+        };
+        let member = CsilGroupExpression {
+            entries: vec![entry("id", builtin("text"), None)],
+        };
+        let holder = CsilGroupExpression {
+            entries: vec![
+                entry("counts", reference("StringInt64Map"), None),
+                entry("labels", reference("Tags"), None),
+                entry("uuid", reference("Uuid"), None),
+                entry("members", reference("Members"), None),
+            ],
+        };
+        let out = process_generation(spec(
+            "kotlin",
+            vec![
+                rule("StringInt64Map", CsilRuleType::TypeDef(string_int64_map)),
+                rule("Tags", CsilRuleType::TypeDef(tags)),
+                rule("Uuid", CsilRuleType::TypeDef(builtin("text"))),
+                rule("Members", CsilRuleType::TypeDef(members)),
+                rule("Member", CsilRuleType::GroupDef(member)),
+                rule("Holder", CsilRuleType::GroupDef(holder)),
+            ],
+        ))
+        .unwrap();
+        let codec = content(&out, "Codec.kt");
+
+        // The named map alias resolves to a real CBOR map, not the `CborValue.CNull` stub.
+        assert!(codec.contains("CborValue.CMap((this.counts).map { (csilK, csilV) -> CborValue.CText(csilK) to CborValue.CInt(csilV) })"));
+        assert!(codec.contains(
+            "CsilCbor.asMap(CsilCbor.require(cbor, \"counts\")).associate { (csilK, csilV) -> CsilCbor.asText(csilK) to CsilCbor.asLong(csilV) }"
+        ));
+        // The named list alias resolves to a CBOR array.
+        assert!(
+            codec.contains(
+                "CborValue.CArray((this.labels).map { csilE -> CborValue.CText(csilE) })"
+            )
+        );
+        // The named scalar alias resolves to text.
+        assert!(codec.contains("CborValue.CText(this.uuid)"));
+        // The map-of-record alias recurses to the record codec on both seams.
+        assert!(codec.contains("CborValue.CMap((this.members).map { (csilK, csilV) -> CborValue.CText(csilK) to csilV.toCborValue() })"));
+        assert!(codec.contains(
+            "CsilCbor.asMap(CsilCbor.require(cbor, \"members\")).associate { (csilK, csilV) -> CsilCbor.asText(csilK) to memberFromCborValue(csilV) }"
+        ));
+
+        // No field above degraded to the null/text stub a bare non-record reference yields.
+        let holder_enc = codec.split("fun Holder.toCborValue").nth(1).unwrap();
+        let holder_enc = holder_enc.split("fun ").next().unwrap();
+        assert!(!holder_enc.contains("to CborValue.CNull"));
+    }
+
+    #[test]
+    fn null_input_client_sends_empty_bytes() {
+        let service = CsilServiceDefinition {
+            operations: vec![op(
+                "room-delta",
+                builtin("null"),
+                reference("RoomDelta"),
+                CsilServiceDirection::Unidirectional,
+                None,
+            )],
+            wire_id: None,
+        };
+        let out = process_generation(spec(
+            "kotlin-client",
+            vec![
+                rule(
+                    "RoomDelta",
+                    CsilRuleType::GroupDef(CsilGroupExpression {
+                        entries: vec![entry("seq", builtin("int"), None)],
+                    }),
+                ),
+                rule("WorldService", CsilRuleType::ServiceDef(service)),
+            ],
+        ))
+        .unwrap();
+        let client = content(&out, "Client.kt");
+        assert!(client.contains("fun roomDelta(): RoomDelta"));
+        // A null-input op sends an empty request body.
+        assert!(
+            client.contains(
+                "decode<RoomDelta>(transport.call(\"world\", \"RoomDelta\", ByteArray(0)))"
+            )
+        );
+    }
+
+    #[test]
+    fn wire_service_strips_service_and_lowercases() {
+        // `CorndogsService` must hit the wire as "corndogs" (Service stripped,
+        // lowercased), and `submit-task` as "SubmitTask".
+        let service = CsilServiceDefinition {
+            operations: vec![op(
+                "submit-task",
+                reference("SubmitTaskRequest"),
+                reference("Task"),
+                CsilServiceDirection::Unidirectional,
+                None,
+            )],
+            wire_id: None,
+        };
+        let out = process_generation(spec(
+            "kotlin-client",
+            vec![
+                rule(
+                    "SubmitTaskRequest",
+                    CsilRuleType::GroupDef(CsilGroupExpression {
+                        entries: vec![entry("queue", builtin("text"), None)],
+                    }),
+                ),
+                rule(
+                    "Task",
+                    CsilRuleType::GroupDef(CsilGroupExpression {
+                        entries: vec![entry("uuid", builtin("text"), None)],
+                    }),
+                ),
+                rule("CorndogsService", CsilRuleType::ServiceDef(service)),
+            ],
+        ))
+        .unwrap();
+        let client = content(&out, "Client.kt");
+        assert!(client.contains("\"corndogs\", \"SubmitTask\""));
+        assert!(!client.contains("CorndogsService\""));
+        assert!(!client.contains("submit-task"));
+    }
+
+    #[test]
+    fn no_records_means_no_codec_file() {
+        // A spec with only a service (no record types) emits no Codec.kt.
+        let service = CsilServiceDefinition {
+            operations: vec![],
+            wire_id: None,
+        };
+        let out = process_generation(spec(
+            "kotlin",
+            vec![rule("EmptyService", CsilRuleType::ServiceDef(service))],
+        ))
+        .unwrap();
+        assert!(!out.files.iter().any(|f| f.path.ends_with("Codec.kt")));
+    }
+
+    // --- self-contained package mode ----------------------------------------
+
+    /// A one-record spec carrying the given option overrides, used by the package-mode
+    /// tests so each only states the options under test.
+    fn package_input(options: Vec<(&str, serde_json::Value)>) -> WasmGeneratorInput {
+        let group = CsilGroupExpression {
+            entries: vec![entry("v", builtin("int"), None)],
+        };
+        let mut input = spec("kotlin", vec![rule("Thing", CsilRuleType::GroupDef(group))]);
+        for (k, v) in options {
+            input.config.options.insert(k.to_string(), v);
+        }
+        input
+    }
+
+    #[test]
+    fn package_mode_emits_gradle_manifest_and_source_layout() {
+        let out = process_generation(package_input(vec![
+            (
+                "kotlin_package",
+                serde_json::Value::String("com.example.api".to_string()),
+            ),
+            (
+                "package_name",
+                serde_json::Value::String("example-api".to_string()),
+            ),
+            (
+                "package_version",
+                serde_json::Value::String("1.2.3".to_string()),
+            ),
+            ("emit_packages", serde_json::json!(["kotlin"])),
+        ]))
+        .unwrap();
+
+        // Generated sources land under Gradle's standard source root (not the flat path).
+        let types = out
+            .files
+            .iter()
+            .find(|f| f.path.ends_with("Types.kt"))
+            .unwrap();
+        assert_eq!(types.path, "src/main/kotlin/com/example/api/Types.kt");
+        assert!(types.content.contains("package com.example.api"));
+
+        // build.gradle.kts carries the plugins and the CSIL coordinates.
+        let build = content(&out, "build.gradle.kts");
+        assert!(build.contains("kotlin(\"jvm\") version \"2.0.21\""));
+        assert!(build.contains("`maven-publish`"));
+        assert!(build.contains("group = \"com.example.api\""));
+        assert!(build.contains("version = \"1.2.3\""));
+        assert!(build.contains("jvmToolchain(17)"));
+        // No third-party dependency is pulled in; the codec runtime is self-contained.
+        assert!(!build.contains("dependencies {"));
+
+        // settings.gradle.kts names the root project after the artifact.
+        let settings = content(&out, "settings.gradle.kts");
+        assert!(settings.contains("rootProject.name = \"example-api\""));
+    }
+
+    #[test]
+    fn without_emit_packages_no_gradle_and_flat_layout() {
+        let out = process_generation(package_input(vec![(
+            "kotlin_package",
+            serde_json::Value::String("com.example.api".to_string()),
+        )]))
+        .unwrap();
+        let types = out
+            .files
+            .iter()
+            .find(|f| f.path.ends_with("Types.kt"))
+            .unwrap();
+        // Default output is unchanged: flat package path, no Gradle files.
+        assert_eq!(types.path, "com/example/api/Types.kt");
+        assert!(
+            !out.files
+                .iter()
+                .any(|f| f.path.ends_with("build.gradle.kts"))
+        );
+        assert!(
+            !out.files
+                .iter()
+                .any(|f| f.path.ends_with("settings.gradle.kts"))
+        );
+    }
+
+    #[test]
+    fn emit_packages_without_kotlin_is_unchanged() {
+        let out = process_generation(package_input(vec![
+            (
+                "kotlin_package",
+                serde_json::Value::String("com.example.api".to_string()),
+            ),
+            ("emit_packages", serde_json::json!(["go", "python"])),
+        ]))
+        .unwrap();
+        let types = out
+            .files
+            .iter()
+            .find(|f| f.path.ends_with("Types.kt"))
+            .unwrap();
+        assert_eq!(types.path, "com/example/api/Types.kt");
+        assert!(
+            !out.files
+                .iter()
+                .any(|f| f.path.ends_with("build.gradle.kts"))
+        );
+    }
+
+    #[test]
+    fn emit_packages_non_array_is_ignored() {
+        // A bare string (not a JSON array) must not trigger package mode.
+        let out = process_generation(package_input(vec![(
+            "emit_packages",
+            serde_json::Value::String("kotlin".to_string()),
+        )]))
+        .unwrap();
+        assert!(
+            !out.files
+                .iter()
+                .any(|f| f.path.ends_with("build.gradle.kts"))
+        );
+    }
+
+    #[test]
+    fn package_name_and_version_default_when_absent() {
+        // No package_name → derived from the last package segment; no version → "0.1.0".
+        let out = process_generation(package_input(vec![
+            (
+                "kotlin_package",
+                serde_json::Value::String("com.example.widgets".to_string()),
+            ),
+            ("emit_packages", serde_json::json!(["kotlin"])),
+        ]))
+        .unwrap();
+        let settings = content(&out, "settings.gradle.kts");
+        assert!(settings.contains("rootProject.name = \"widgets\""));
+        let build = content(&out, "build.gradle.kts");
+        assert!(build.contains("version = \"0.1.0\""));
     }
 }

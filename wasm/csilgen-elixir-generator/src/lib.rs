@@ -14,7 +14,7 @@ use csilgen_common::{
     GeneratorCapability, GeneratorMetadata, GeneratorWarning, WarningLevel, WasmGeneratorInput,
     WasmGeneratorOutput, wasm_interface::*,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 #[unsafe(no_mangle)]
 pub extern "C" fn get_metadata() -> *const u8 {
@@ -101,11 +101,27 @@ enum Surface {
     TypesOnly,
 }
 
+/// The stock module root. A custom root drives a derived package name; the stock
+/// one falls back to the documented default so the common case is stable.
+const DEFAULT_MODULE_ROOT: &str = "Csilgen.Generated";
+
+/// The package name used when nothing else can supply one (no explicit
+/// `package_name`, stock module root).
+const DEFAULT_PACKAGE_NAME: &str = "csilgen_client";
+
 struct ElixirConfig {
     /// Root module namespace, e.g. `MyApp` → `MyApp.DepositClaimRequest`.
     module_root: String,
     generate_validation: bool,
     generate_constructors: bool,
+    /// When set, the output directory is laid out as a publishable Mix project:
+    /// a `mix.exs` at the root and the generated modules under `lib/`.
+    emit_elixir_package: bool,
+    /// The Mix app/package name (a snake_case atom), resolved from `package_name`,
+    /// a derivation of the module root, or the documented fallback.
+    package_name: String,
+    /// The package version string emitted into `mix.exs`.
+    package_version: String,
 }
 
 impl ElixirConfig {
@@ -124,8 +140,35 @@ impl ElixirConfig {
             .get("elixir_module")
             .and_then(|v| v.as_str())
             .filter(|s| !s.is_empty())
-            .unwrap_or("Csilgen.Generated")
+            .unwrap_or(DEFAULT_MODULE_ROOT)
             .to_string();
+
+        // `emit_packages` is a free-form JSON array authored by the caller, so every
+        // step is fallible-but-tolerant: a missing key, a non-array, or non-string
+        // members all degrade to "no package", never an error.
+        let emit_elixir_package = options
+            .get("emit_packages")
+            .and_then(|v| v.as_array())
+            .map(|arr| arr.iter().any(|e| e.as_str() == Some("elixir")))
+            .unwrap_or(false);
+
+        let package_name = options
+            .get("package_name")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(snake_case)
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| derive_package_name(&module_root));
+
+        let package_version = options
+            .get("package_version")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("0.1.0")
+            .to_string();
+
         Ok(Self {
             module_root,
             generate_validation: options
@@ -136,6 +179,9 @@ impl ElixirConfig {
                 .get("generate_constructors")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false),
+            emit_elixir_package,
+            package_name,
+            package_version,
         })
     }
 
@@ -143,6 +189,63 @@ impl ElixirConfig {
     fn module(&self, name: &str) -> String {
         format!("{}.{}", self.module_root, pascal_case(name))
     }
+}
+
+/// Derive a Mix app name from the module root by snake_casing each dotted segment.
+/// The stock root carries no caller intent, so it maps to the documented fallback
+/// rather than the literal `csilgen_generated`.
+fn derive_package_name(module_root: &str) -> String {
+    if module_root == DEFAULT_MODULE_ROOT {
+        return DEFAULT_PACKAGE_NAME.to_string();
+    }
+    let derived = module_root
+        .split('.')
+        .map(snake_case)
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join("_");
+    if derived.is_empty() {
+        DEFAULT_PACKAGE_NAME.to_string()
+    } else {
+        derived
+    }
+}
+
+/// The `mix.exs` for the publishable package: a minimal `def project` with the app
+/// atom, version, an Elixir requirement, and empty deps (the generated tree pulls in
+/// nothing third-party — its CBOR codec is self-contained). The MixProject module is
+/// PascalCased from the app name so two packages never collide on `MixProject`.
+fn mix_exs(config: &ElixirConfig) -> String {
+    let app = &config.package_name;
+    let version = &config.package_version;
+    let project_module = pascal_case(app);
+    format!(
+        "defmodule {project_module}.MixProject do\n  \
+         use Mix.Project\n\n  \
+         def project do\n    [\n      \
+         app: :{app},\n      \
+         version: \"{version}\",\n      \
+         elixir: \"~> 1.14\",\n      \
+         deps: deps()\n    ]\n  \
+         end\n\n  \
+         defp deps do\n    []\n  end\nend\n"
+    )
+}
+
+/// Rewrite the emitted file set into a Mix project layout: generated modules move
+/// under `lib/`, a `mix.exs` lands at the root, and the `.formatter.exs` already
+/// at the root is left in place (config, not a module). Only `.ex` modules move —
+/// `.exs` scripts and `mix.exs` stay at the root where Mix expects them.
+fn apply_elixir_package(files: &mut Vec<GeneratedFile>, config: &ElixirConfig) {
+    for file in files.iter_mut() {
+        if file.path.ends_with(".ex") {
+            file.path = format!("lib/{}", file.path);
+        }
+    }
+    files.push(GeneratedFile {
+        path: "mix.exs".to_string(),
+        content: mix_exs(config),
+    });
 }
 
 fn process_generation(input: WasmGeneratorInput) -> Result<WasmGeneratorOutput, i32> {
@@ -161,6 +264,17 @@ fn process_generation(input: WasmGeneratorInput) -> Result<WasmGeneratorOutput, 
         files.push(GeneratedFile {
             path: "types.gen.ex".to_string(),
             content: types,
+        });
+    }
+
+    // The self-contained canonical-CBOR value codec rides alongside the types (like
+    // the OCaml/Go targets): emitted whenever the spec declares a record, since every
+    // payload now (de)serializes through it rather than a host-supplied reflection
+    // codec. It carries text-vs-bytes explicitly because both are Elixir binaries.
+    if let Some(codec) = generate_codec(&input, &config) {
+        files.push(GeneratedFile {
+            path: "codec.gen.ex".to_string(),
+            content: codec,
         });
     }
 
@@ -205,11 +319,25 @@ fn process_generation(input: WasmGeneratorInput) -> Result<WasmGeneratorOutput, 
     }
 
     // A `.formatter.exs` ships alongside so the generated tree runs cleanly
-    // through `mix format`, matching the gofmt-stability of the Go target.
+    // through `mix format`, matching the gofmt-stability of the Go target. In
+    // package mode the modules live under `lib/`, so the inputs glob must reach
+    // there rather than the flat-layout `*.ex`.
+    let formatter_inputs = if config.emit_elixir_package {
+        "[inputs: [\"mix.exs\", \"lib/**/*.ex\"]]\n"
+    } else {
+        "[inputs: [\"*.ex\", \"*.exs\"]]\n"
+    };
     files.push(GeneratedFile {
         path: ".formatter.exs".to_string(),
-        content: "[inputs: [\"*.ex\", \"*.exs\"]]\n".to_string(),
+        content: formatter_inputs.to_string(),
     });
+
+    // In package mode the output directory must be a valid, publishable Mix project:
+    // modules under `lib/`, a `mix.exs` at the root. The default flat layout is left
+    // untouched otherwise.
+    if config.emit_elixir_package {
+        apply_elixir_package(&mut files, &config);
+    }
 
     let total_size: usize = files.iter().map(|f| f.content.len()).sum();
     let stats = GenerationStats {
@@ -241,6 +369,8 @@ fn generate_types(
     let mut content = String::new();
     content.push_str(GEN_HEADER);
     let mut emitted = false;
+    let records = record_csil_names(input);
+    let aliases = codec_aliases(input);
 
     for rule in &input.csil_spec.rules {
         let group = match &rule.rule_type {
@@ -249,7 +379,15 @@ fn generate_types(
             _ => None,
         };
         if let Some(group) = group {
-            emit_struct_module(&mut content, &rule.name, group, config, warnings);
+            emit_struct_module(
+                &mut content,
+                &rule.name,
+                group,
+                config,
+                &records,
+                &aliases,
+                warnings,
+            );
             emitted = true;
         } else if let CsilRuleType::TypeDef(type_expr) = &rule.rule_type {
             // A bare type alias has no struct, but a `@type` keeps the name visible
@@ -272,6 +410,8 @@ fn emit_struct_module(
     name: &str,
     group: &CsilGroupExpression,
     config: &ElixirConfig,
+    records: &HashSet<String>,
+    aliases: &HashMap<String, CsilTypeExpression>,
     warnings: &mut Vec<GeneratorWarning>,
 ) {
     let module = config.module(name);
@@ -350,7 +490,327 @@ fn emit_struct_module(
     content.push_str("  @spec wire_keys() :: keyword()\n");
     content.push_str("  def wire_keys, do: @wire_keys\n");
 
+    emit_struct_codec(content, group, config, records, aliases);
+
     content.push_str("end\n\n");
+}
+
+// ---------------------------------------------------------------------------
+// Per-type CBOR codec (codec.gen.ex + per-struct to_cbor/from_cbor)
+// ---------------------------------------------------------------------------
+
+/// The set of CSIL record (group) names — references to these get a generated
+/// codec call, anything else falls back to a runtime `raise` in the codec body.
+fn record_csil_names(input: &WasmGeneratorInput) -> HashSet<String> {
+    input
+        .csil_spec
+        .rules
+        .iter()
+        .filter_map(|r| match &r.rule_type {
+            CsilRuleType::GroupDef(_) => Some(r.name.clone()),
+            CsilRuleType::TypeDef(CsilTypeExpression::Group(_)) => Some(r.name.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The transparent type aliases the codec resolves through: a `TypeDef` whose target
+/// is a map / array / scalar / reference / tuple / constrained (NOT a record group or
+/// a choice, which have their own handling). A field referencing one has no codec of
+/// its own, so it must encode/decode as the underlying type rather than the runtime
+/// `raise` a bare non-record reference would otherwise yield.
+fn codec_aliases(input: &WasmGeneratorInput) -> HashMap<String, CsilTypeExpression> {
+    input
+        .csil_spec
+        .rules
+        .iter()
+        .filter_map(|rule| match &rule.rule_type {
+            CsilRuleType::TypeDef(t) => match t {
+                CsilTypeExpression::Group(_) | CsilTypeExpression::Choice(_) => None,
+                other => Some((rule.name.clone(), other.clone())),
+            },
+            _ => None,
+        })
+        .collect()
+}
+
+/// The CBOR encoding of a text key (major type 3 head + bytes); comparing these
+/// byte vectors lexicographically is RFC 8949 §4.2.1 canonical key ordering,
+/// computed once at generation time so a record's map is canonical without a
+/// runtime sort.
+fn cbor_text_key_bytes(name: &str) -> Vec<u8> {
+    let bytes = name.as_bytes();
+    let n = bytes.len() as u64;
+    let mt = 3u8 << 5;
+    let mut head = Vec::new();
+    if n < 24 {
+        head.push(mt | n as u8);
+    } else if n < 0x100 {
+        head.push(mt | 24);
+        head.push(n as u8);
+    } else {
+        head.push(mt | 25);
+        head.extend_from_slice(&(n as u16).to_be_bytes());
+    }
+    head.extend_from_slice(bytes);
+    head
+}
+
+/// One codec field: its struct atom, the verbatim CBOR wire key, its value type,
+/// and whether it is optional. `key_bytes` drives the canonical sort.
+struct CodecField<'a> {
+    atom: String,
+    wire: String,
+    key_bytes: Vec<u8>,
+    value_type: &'a CsilTypeExpression,
+    optional: bool,
+}
+
+/// The codec fields of a record, sorted into canonical CBOR map-key order so the
+/// emitted map matches the wire contract byte-for-byte without a runtime sort.
+fn codec_fields(group: &CsilGroupExpression) -> Vec<CodecField<'_>> {
+    let mut fields: Vec<CodecField> = group
+        .entries
+        .iter()
+        .filter_map(|entry| {
+            let atom = field_atom(entry)?;
+            let wire = match entry.key.as_ref()? {
+                CsilGroupKey::Bare(name) => name.clone(),
+                CsilGroupKey::Literal(CsilLiteralValue::Text(name)) => name.clone(),
+                _ => return None,
+            };
+            Some(CodecField {
+                key_bytes: cbor_text_key_bytes(&wire),
+                atom,
+                wire,
+                value_type: &entry.value_type,
+                optional: is_optional(entry),
+            })
+        })
+        .collect();
+    fields.sort_by(|a, b| a.key_bytes.cmp(&b.key_bytes));
+    fields
+}
+
+/// An Elixir expression building the CBOR value tree for `expr` (a value of the
+/// field's in-memory type). A shape the codec cannot model (a non-record reference,
+/// a decimal whose host type is unknown) raises at runtime so the module still
+/// compiles and the supported paths stay total.
+fn enc_value(
+    ty: &CsilTypeExpression,
+    expr: &str,
+    config: &ElixirConfig,
+    records: &HashSet<String>,
+    aliases: &HashMap<String, CsilTypeExpression>,
+) -> String {
+    match ty {
+        CsilTypeExpression::Constrained { base_type, .. } => {
+            enc_value(base_type, expr, config, records, aliases)
+        }
+        CsilTypeExpression::Builtin(name) => match name.as_str() {
+            "int" | "uint" | "nint" => format!("{{:int, {expr}}}"),
+            "float" | "double" | "float16" | "float32" | "float64" => {
+                format!("{{:float, {expr}}}")
+            }
+            "text" | "tstr" => format!("{{:text, {expr}}}"),
+            "bytes" | "bstr" => format!("{{:bytes, {expr}}}"),
+            "bool" | "true" | "false" => format!("{{:bool, {expr}}}"),
+            // CBOR tag 0 RFC3339 UTC instant; normalize through ISO 8601 text.
+            "timestamp" => format!("{{:tag, 0, {{:text, DateTime.to_iso8601({expr})}}}}"),
+            // The decimal in-memory type is host-supplied, so tag 4 encoding needs
+            // host wiring the generator cannot assume; raise rather than guess.
+            "decimal" => "raise(\"csilgen: decimal codec needs host wiring\")".to_string(),
+            "null" | "nil" | "undefined" => format!("(_ = {expr}; :null)"),
+            other => enc_named(other, expr, config, records, aliases),
+        },
+        CsilTypeExpression::Reference(name) => enc_named(name, expr, config, records, aliases),
+        CsilTypeExpression::Array { element_type, .. } => {
+            let inner = enc_value(element_type, "csil_e", config, records, aliases);
+            format!("{{:array, Enum.map({expr}, fn csil_e -> {inner} end)}}")
+        }
+        CsilTypeExpression::Map { key, value, .. } => {
+            let ek = enc_value(key, "csil_k", config, records, aliases);
+            let ev = enc_value(value, "csil_v", config, records, aliases);
+            format!("{{:map, Enum.map({expr}, fn {{csil_k, csil_v}} -> {{{ek}, {ev}}} end)}}")
+        }
+        _ => "raise(\"csilgen: no codec for this field shape\")".to_string(),
+    }
+}
+
+/// Encode a reference to a named type: a record delegates to its generated
+/// `to_cbor_value/1`. A transparent alias (`StringInt64Map = {* text => int}`,
+/// `Tags = [* text]`, `Uuid = text`) has no codec of its own, so its underlying
+/// type drives the encoding — the in-memory value (a map/list/scalar) flows through
+/// unchanged. A named map alias `{* text => Rec}` thus routes each entry value to
+/// the referenced record module's `to_cbor_value/1`. Anything else raises.
+fn enc_named(
+    name: &str,
+    expr: &str,
+    config: &ElixirConfig,
+    records: &HashSet<String>,
+    aliases: &HashMap<String, CsilTypeExpression>,
+) -> String {
+    if records.contains(name) {
+        format!("{}.to_cbor_value({expr})", config.module(name))
+    } else if let Some(underlying) = aliases.get(name) {
+        enc_value(underlying, expr, config, records, aliases)
+    } else {
+        format!("raise(\"csilgen: no codec for type {name}\")")
+    }
+}
+
+/// An Elixir expression decoding `expr` (a CBOR value tree) into the field's
+/// in-memory value.
+fn dec_value(
+    ty: &CsilTypeExpression,
+    expr: &str,
+    config: &ElixirConfig,
+    records: &HashSet<String>,
+    aliases: &HashMap<String, CsilTypeExpression>,
+) -> String {
+    let root = &config.module_root;
+    match ty {
+        CsilTypeExpression::Constrained { base_type, .. } => {
+            dec_value(base_type, expr, config, records, aliases)
+        }
+        CsilTypeExpression::Builtin(name) => match name.as_str() {
+            "int" | "uint" | "nint" => format!("{root}.Cbor.to_int({expr})"),
+            "float" | "double" | "float16" | "float32" | "float64" => {
+                format!("{root}.Cbor.to_float({expr})")
+            }
+            "text" | "tstr" => format!("{root}.Cbor.to_text({expr})"),
+            "bytes" | "bstr" => format!("{root}.Cbor.to_bytes({expr})"),
+            "bool" | "true" | "false" => format!("{root}.Cbor.to_bool({expr})"),
+            "timestamp" => format!(
+                "(case {expr} do {{:tag, 0, {{:text, csil_s}}}} -> elem(DateTime.from_iso8601(csil_s), 1) end)"
+            ),
+            "decimal" => "raise(\"csilgen: decimal codec needs host wiring\")".to_string(),
+            "null" | "nil" | "undefined" => format!("(_ = {expr}; nil)"),
+            other => dec_named(other, expr, config, records, aliases),
+        },
+        CsilTypeExpression::Reference(name) => dec_named(name, expr, config, records, aliases),
+        CsilTypeExpression::Array { element_type, .. } => {
+            let inner = dec_value(element_type, "csil_e", config, records, aliases);
+            format!(
+                "(case {expr} do {{:array, csil_xs}} -> Enum.map(csil_xs, fn csil_e -> {inner} end) end)"
+            )
+        }
+        CsilTypeExpression::Map { key, value, .. } => {
+            let dk = dec_value(key, "csil_k", config, records, aliases);
+            let dv = dec_value(value, "csil_v", config, records, aliases);
+            format!(
+                "(case {expr} do {{:map, csil_kvs}} -> Map.new(csil_kvs, fn {{csil_k, csil_v}} -> {{{dk}, {dv}}} end) end)"
+            )
+        }
+        _ => "raise(\"csilgen: no codec for this field shape\")".to_string(),
+    }
+}
+
+/// Decode a reference to a named type: a record delegates to its generated
+/// `from_cbor_value/1`. A transparent alias decodes as its underlying type — the
+/// reconstructed map/list/scalar is the alias-typed field value. A named map alias
+/// `{* text => Rec}` thus routes each entry value through the referenced record
+/// module's `from_cbor_value/1`. Anything else raises.
+fn dec_named(
+    name: &str,
+    expr: &str,
+    config: &ElixirConfig,
+    records: &HashSet<String>,
+    aliases: &HashMap<String, CsilTypeExpression>,
+) -> String {
+    if records.contains(name) {
+        format!("{}.from_cbor_value({expr})", config.module(name))
+    } else if let Some(underlying) = aliases.get(name) {
+        dec_value(underlying, expr, config, records, aliases)
+    } else {
+        format!("raise(\"csilgen: no codec for type {name}\")")
+    }
+}
+
+/// Emit the per-struct codec surface inside a record's module: `to_cbor_value/1`
+/// and `from_cbor_value/1` over the shared CBOR value tree, plus the
+/// `to_cbor/1`/`from_cbor/1` byte wrappers the typed client calls.
+fn emit_struct_codec(
+    content: &mut String,
+    group: &CsilGroupExpression,
+    config: &ElixirConfig,
+    records: &HashSet<String>,
+    aliases: &HashMap<String, CsilTypeExpression>,
+) {
+    let root = &config.module_root;
+    let fields = codec_fields(group);
+
+    content.push_str("\n  @doc \"Builds the canonical CBOR value tree for this struct.\"\n");
+    content.push_str(&format!(
+        "  @spec to_cbor_value(t()) :: {root}.Cbor.value()\n"
+    ));
+    content.push_str("  def to_cbor_value(%__MODULE__{} = v) do\n");
+    content.push_str("    {:map,\n     Enum.reject(\n       [\n");
+    for f in &fields {
+        let access = format!("v.{}", f.atom);
+        let enc = enc_value(f.value_type, &access, config, records, aliases);
+        if f.optional {
+            // An absent optional is omitted from the map, never present-with-null.
+            content.push_str(&format!(
+                "         (if is_nil({access}), do: nil, else: {{{{:text, \"{wire}\"}}, {enc}}}),\n",
+                wire = f.wire
+            ));
+        } else {
+            content.push_str(&format!(
+                "         {{{{:text, \"{wire}\"}}, {enc}}},\n",
+                wire = f.wire
+            ));
+        }
+    }
+    content.push_str("       ],\n       &is_nil/1\n     )}\n  end\n");
+
+    content.push_str("\n  @doc \"Reconstructs this struct from a decoded CBOR value tree.\"\n");
+    content.push_str("  @spec from_cbor_value(term()) :: t()\n");
+    content.push_str("  def from_cbor_value({:map, csil_kvs}) do\n");
+    content.push_str("    csil_fields = Map.new(csil_kvs)\n");
+    content.push_str("    %__MODULE__{\n");
+    for f in &fields {
+        if f.optional {
+            let dec = dec_value(f.value_type, "csil_v", config, records, aliases);
+            content.push_str(&format!(
+                "      {atom}: (case Map.get(csil_fields, {{:text, \"{wire}\"}}) do nil -> nil; csil_v -> {dec} end),\n",
+                atom = f.atom,
+                wire = f.wire
+            ));
+        } else {
+            let fetch = format!("Map.fetch!(csil_fields, {{:text, \"{}\"}})", f.wire);
+            let dec = dec_value(f.value_type, &fetch, config, records, aliases);
+            content.push_str(&format!("      {atom}: {dec},\n", atom = f.atom));
+        }
+    }
+    content.push_str("    }\n  end\n");
+
+    content.push_str("\n  @doc \"Encodes this struct to canonical CBOR bytes.\"\n");
+    content.push_str("  @spec to_cbor(t()) :: binary()\n");
+    content.push_str(&format!(
+        "  def to_cbor(v), do: {root}.Cbor.encode(to_cbor_value(v))\n"
+    ));
+
+    content.push_str("\n  @doc \"Decodes canonical CBOR bytes into this struct.\"\n");
+    content.push_str("  @spec from_cbor(binary()) :: t()\n");
+    content.push_str(&format!(
+        "  def from_cbor(bytes), do: from_cbor_value({root}.Cbor.decode(bytes))\n"
+    ));
+}
+
+/// Build `codec.gen.ex`: the shared self-contained canonical-CBOR value codec the
+/// per-struct `to_cbor`/`from_cbor` build on. `None` when the spec declares no
+/// record types (nothing references the codec).
+fn generate_codec(input: &WasmGeneratorInput, config: &ElixirConfig) -> Option<String> {
+    if record_csil_names(input).is_empty() {
+        return None;
+    }
+    let mut content = String::new();
+    content.push_str(GEN_HEADER);
+    content.push_str(&format!("defmodule {}.Cbor do\n", config.module_root));
+    content.push_str(CODEC_RUNTIME_ELIXIR);
+    content.push_str("end\n");
+    Some(content)
 }
 
 // ---------------------------------------------------------------------------
@@ -366,16 +826,14 @@ fn client_prelude(config: &ElixirConfig) -> String {
     let mut out = String::new();
     out.push_str(&format!("defmodule {root}.Transport do\n"));
     out.push_str(
-        "  @moduledoc \"\"\"\n  Caller-supplied transport seam. The host implements this behaviour for its\n  carrier (CBOR over HTTP/WebSocket/etc.); the generated clients only call it.\n  \"\"\"\n\n",
+        "  @moduledoc \"\"\"\n  Caller-supplied byte carrier. The host implements this behaviour for its\n  carrier (CBOR over HTTP/WebSocket/etc.): `call/4` takes the already-encoded\n  request bytes and returns the response bytes. The generated client owns\n  (de)serialization via the codec; the carrier only moves bytes.\n  \"\"\"\n\n",
     );
     out.push_str("  @type t :: struct()\n\n");
     out.push_str(
-        "  @callback call(t(), service :: String.t(), method :: String.t(), req :: term()) ::\n              {:ok, term()} | {:error, term()}\n\n",
+        "  @callback call(t(), service :: String.t(), method :: String.t(), req :: binary()) ::\n              binary()\n\n",
     );
     out.push_str("  @doc \"Dispatches to the transport struct's implementing module.\"\n");
-    out.push_str(
-        "  @spec call(t(), String.t(), String.t(), term()) :: {:ok, term()} | {:error, term()}\n",
-    );
+    out.push_str("  @spec call(t(), String.t(), String.t(), binary()) :: binary()\n");
     out.push_str("  def call(%mod{} = transport, service, method, req) do\n");
     out.push_str("    mod.call(transport, service, method, req)\n");
     out.push_str("  end\nend\n\n");
@@ -387,14 +845,30 @@ fn generate_clients(input: &WasmGeneratorInput, config: &ElixirConfig) -> Option
     content.push_str(GEN_HEADER);
     content.push_str(&client_prelude(config));
 
+    let records = record_csil_names(input);
     let mut emitted = false;
     for rule in &input.csil_spec.rules {
         if let CsilRuleType::ServiceDef(service) = &rule.rule_type {
-            emit_client_module(&mut content, &rule.name, service, config);
+            emit_client_module(&mut content, &rule.name, service, config, &records);
             emitted = true;
         }
     }
     if emitted { Some(content) } else { None }
+}
+
+/// Whether a type is a reference to a record the codec can (de)serialize, so a
+/// typed client method can call the generated `to_cbor`/`from_cbor` directly.
+fn is_record_ref(ty: &CsilTypeExpression, records: &HashSet<String>) -> bool {
+    matches!(ty, CsilTypeExpression::Reference(name) if records.contains(name))
+}
+
+/// The bare CSIL name of a record reference. Only called after `is_record_ref`
+/// confirmed the type is one, so the fallback is never reached.
+fn ref_name(ty: &CsilTypeExpression) -> String {
+    match ty {
+        CsilTypeExpression::Reference(name) => name.clone(),
+        _ => String::new(),
+    }
 }
 
 fn emit_client_module(
@@ -402,25 +876,24 @@ fn emit_client_module(
     name: &str,
     service: &CsilServiceDefinition,
     config: &ElixirConfig,
+    records: &HashSet<String>,
 ) {
     let base = service_base(name);
     let module = format!("{}.{base}Client", config.module_root);
+    let root = &config.module_root;
+    // Canonical wire strings (the wire contract): service lowercased, op PascalCased.
     let wire_service = base.to_lowercase();
 
     content.push_str(&format!("defmodule {module} do\n"));
     content.push_str(&format!(
-        "  @moduledoc \"Typed client for the {name} service.\"\n\n"
+        "  @moduledoc \"Typed client for the {name} service. The client owns (de)serialization via the codec; the transport only moves bytes.\"\n\n"
     ));
     content.push_str("  @enforce_keys [:transport]\n");
     content.push_str("  defstruct [:transport]\n");
     content.push_str(&format!(
-        "  @type t :: %__MODULE__{{transport: {}.Transport.t()}}\n\n",
-        config.module_root
+        "  @type t :: %__MODULE__{{transport: {root}.Transport.t()}}\n\n"
     ));
-    content.push_str(&format!(
-        "  @spec new({}.Transport.t()) :: t()\n",
-        config.module_root
-    ));
+    content.push_str(&format!("  @spec new({root}.Transport.t()) :: t()\n"));
     content.push_str("  def new(transport), do: %__MODULE__{transport: transport}\n");
 
     for op in &service.operations {
@@ -433,35 +906,45 @@ fn emit_client_module(
             ));
             continue;
         }
+        let success = success_type(&op.output_type);
+        let null_input = is_null_input(&op.input_type);
+        // The typed seam needs a record success type (and a record or null request)
+        // so the method can call the generated codec. Anything else is skipped with a
+        // note rather than emitting an uncompilable call.
+        if !is_record_ref(&success, records)
+            || !(null_input || is_record_ref(&op.input_type, records))
+        {
+            content.push_str(&format!(
+                "\n  # operation {} has a non-record payload; (de)serialize it manually\n",
+                op.name
+            ));
+            continue;
+        }
         let func = snake_case(&op.name);
         let wire_method = wire_method_name(&op.name);
-        let out_ty = map_type(&success_type(&op.output_type), config);
-        let has_input = !is_null_input(&op.input_type);
+        let resp_mod = config.module(&ref_name(&success));
+        let out_ty = format!("{resp_mod}.t()");
         content.push('\n');
-        if has_input {
-            let in_ty = map_type(&op.input_type, config);
-            content.push_str(&format!(
-                "  @spec {func}(t(), {in_ty}) :: {{:ok, {out_ty}}} | {{:error, term()}}\n"
-            ));
-            content.push_str(&format!(
-                "  def {func}(%__MODULE__{{transport: transport}}, req) do\n"
-            ));
-            content.push_str(&format!(
-                "    {}.Transport.call(transport, \"{wire_service}\", \"{wire_method}\", req)\n",
-                config.module_root
-            ));
-        } else {
-            content.push_str(&format!(
-                "  @spec {func}(t()) :: {{:ok, {out_ty}}} | {{:error, term()}}\n"
-            ));
+        if null_input {
+            content.push_str(&format!("  @spec {func}(t()) :: {out_ty}\n"));
             content.push_str(&format!(
                 "  def {func}(%__MODULE__{{transport: transport}}) do\n"
             ));
             content.push_str(&format!(
-                "    {}.Transport.call(transport, \"{wire_service}\", \"{wire_method}\", nil)\n",
-                config.module_root
+                "    resp = {root}.Transport.call(transport, \"{wire_service}\", \"{wire_method}\", <<>>)\n"
+            ));
+        } else {
+            let req_mod = config.module(&ref_name(&op.input_type));
+            let in_ty = format!("{req_mod}.t()");
+            content.push_str(&format!("  @spec {func}(t(), {in_ty}) :: {out_ty}\n"));
+            content.push_str(&format!(
+                "  def {func}(%__MODULE__{{transport: transport}}, req) do\n"
+            ));
+            content.push_str(&format!(
+                "    resp = {root}.Transport.call(transport, \"{wire_service}\", \"{wire_method}\", {req_mod}.to_cbor(req))\n"
             ));
         }
+        content.push_str(&format!("    {resp_mod}.from_cbor(resp)\n"));
         content.push_str("  end\n");
     }
     content.push_str("end\n\n");
@@ -1293,6 +1776,148 @@ fn escape_msg(s: &str) -> String {
     }
     out
 }
+
+/// The self-contained canonical-CBOR value codec injected as the body of the
+/// generated `<Root>.Cbor` module. Its value tree carries the bool/float/null items
+/// a payload may hold and keeps text distinct from bytes (both are Elixir binaries),
+/// so the generated output round-trips without any third-party CBOR dependency.
+const CODEC_RUNTIME_ELIXIR: &str = r#"  @moduledoc """
+  Self-contained canonical-CBOR value codec. The value tree carries text vs bytes
+  explicitly (both are Elixir binaries), so a record's fields encode to the exact
+  wire bytes the CSIL contract requires with no third-party dependency.
+  """
+
+  import Bitwise
+
+  @type value ::
+          {:int, integer()}
+          | {:float, float()}
+          | {:bool, boolean()}
+          | :null
+          | {:text, binary()}
+          | {:bytes, binary()}
+          | {:array, [value()]}
+          | {:map, [{value(), value()}]}
+          | {:tag, non_neg_integer(), value()}
+
+  @doc "Encodes a CBOR value tree to canonical bytes."
+  @spec encode(value()) :: binary()
+  def encode(value), do: IO.iodata_to_binary(enc(value))
+
+  defp enc({:int, n}) when n >= 0, do: head(0, n)
+  defp enc({:int, n}), do: head(1, -n - 1)
+  defp enc({:bool, false}), do: <<0xF4>>
+  defp enc({:bool, true}), do: <<0xF5>>
+  defp enc(:null), do: <<0xF6>>
+  defp enc({:float, f}), do: <<0xFB, f::float-size(64)>>
+  defp enc({:text, s}), do: [head(3, byte_size(s)), s]
+  defp enc({:bytes, b}), do: [head(2, byte_size(b)), b]
+  defp enc({:array, xs}), do: [head(4, length(xs)) | Enum.map(xs, &enc/1)]
+
+  defp enc({:map, kvs}),
+    do: [head(5, length(kvs)) | Enum.map(kvs, fn {k, v} -> [enc(k), enc(v)] end)]
+
+  defp enc({:tag, t, v}), do: [head(6, t), enc(v)]
+
+  # Shortest-length argument head per RFC 8949 §3 (the canonical encoding).
+  defp head(major, n) do
+    mt = bsl(major, 5)
+
+    cond do
+      n < 24 -> <<bor(mt, n)>>
+      n < 0x100 -> <<bor(mt, 24), n::size(8)>>
+      n < 0x10000 -> <<bor(mt, 25), n::size(16)>>
+      n < 0x100000000 -> <<bor(mt, 26), n::size(32)>>
+      true -> <<bor(mt, 27), n::size(64)>>
+    end
+  end
+
+  @doc "Decodes canonical CBOR bytes into a value tree."
+  @spec decode(binary()) :: value()
+  def decode(bin) do
+    {value, rest} = dec(bin)
+    if rest != <<>>, do: raise("csilgen: trailing bytes after CBOR value")
+    value
+  end
+
+  defp dec(<<7::size(3), 20::size(5), rest::binary>>), do: {{:bool, false}, rest}
+  defp dec(<<7::size(3), 21::size(5), rest::binary>>), do: {{:bool, true}, rest}
+  defp dec(<<7::size(3), low::size(5), rest::binary>>) when low in [22, 23], do: {:null, rest}
+  defp dec(<<7::size(3), 26::size(5), f::float-size(32), rest::binary>>), do: {{:float, f}, rest}
+  defp dec(<<7::size(3), 27::size(5), f::float-size(64), rest::binary>>), do: {{:float, f}, rest}
+
+  defp dec(<<major::size(3), low::size(5), rest::binary>>) do
+    {arg, rest} = read_arg(low, rest)
+
+    case major do
+      0 ->
+        {{:int, arg}, rest}
+
+      1 ->
+        {{:int, -arg - 1}, rest}
+
+      2 ->
+        <<b::binary-size(arg), r::binary>> = rest
+        {{:bytes, b}, r}
+
+      3 ->
+        <<s::binary-size(arg), r::binary>> = rest
+        {{:text, s}, r}
+
+      4 ->
+        dec_array(arg, rest, [])
+
+      5 ->
+        dec_map(arg, rest, [])
+
+      6 ->
+        {inner, r} = dec(rest)
+        {{:tag, arg, inner}, r}
+    end
+  end
+
+  defp read_arg(low, rest) when low < 24, do: {low, rest}
+  defp read_arg(24, <<a::size(8), rest::binary>>), do: {a, rest}
+  defp read_arg(25, <<a::size(16), rest::binary>>), do: {a, rest}
+  defp read_arg(26, <<a::size(32), rest::binary>>), do: {a, rest}
+  defp read_arg(27, <<a::size(64), rest::binary>>), do: {a, rest}
+
+  defp dec_array(0, rest, acc), do: {{:array, Enum.reverse(acc)}, rest}
+
+  defp dec_array(n, rest, acc) do
+    {v, r} = dec(rest)
+    dec_array(n - 1, r, [v | acc])
+  end
+
+  defp dec_map(0, rest, acc), do: {{:map, Enum.reverse(acc)}, rest}
+
+  defp dec_map(n, rest, acc) do
+    {k, r1} = dec(rest)
+    {v, r2} = dec(r1)
+    dec_map(n - 1, r2, [{k, v} | acc])
+  end
+
+  @doc "Unwraps a CBOR integer item."
+  @spec to_int(value()) :: integer()
+  def to_int({:int, n}), do: n
+
+  @doc "Unwraps a CBOR text item."
+  @spec to_text(value()) :: binary()
+  def to_text({:text, s}), do: s
+
+  @doc "Unwraps a CBOR byte-string item."
+  @spec to_bytes(value()) :: binary()
+  def to_bytes({:bytes, b}), do: b
+
+  @doc "Unwraps a CBOR boolean item."
+  @spec to_bool(value()) :: boolean()
+  def to_bool({:bool, b}), do: b
+
+  @doc "Unwraps a CBOR float item, widening an integer item when present."
+  @spec to_float(value()) :: float()
+  def to_float({:float, f}), do: f
+  def to_float({:int, n}), do: n * 1.0
+"#;
 
 #[cfg(test)]
 mod tests;

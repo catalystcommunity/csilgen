@@ -648,8 +648,23 @@ Common options:
 - `package`: Package/module name for generated code
 - `version`: API version
 - `namespace`: Namespace for generated types
-- `*_package`: Language-specific package names
+- `*_package`: Language-specific package names (`go_package`, `java_package`,
+  `kotlin_package`), `go_module` for the Go module path
+- `package_name` / `package_version`: package coordinates (name and version)
+  used when emitting publishable packages (see `emit_packages` below)
+- `emit_packages`: a **per-language list** of target languages that should emit a
+  self-contained, publishable package — not just source — e.g.
+  `emit_packages: ["go", "typescript"]`. A target emits its native package
+  manifest(s) and layout (go.mod, Cargo.toml, package.json, pyproject.toml,
+  `*.gemspec`, mix.exs, pom.xml, build.gradle.kts, `*.csproj`, dune-project,
+  Package.swift, pubspec.yaml) only when its language is in the list; otherwise its
+  output is unchanged (source only). See
+  [Self-contained packages](./self-contained-packages.md) for the full per-language
+  table and coordinates.
 - Custom generator-specific options
+
+Option values may be strings, numbers, booleans, or **arrays** (e.g.
+`emit_packages: ["go", "rust"]`); entries in the block are comma-separated.
 
 ## Code Generation
 

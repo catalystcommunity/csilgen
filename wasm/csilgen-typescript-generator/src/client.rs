@@ -1,9 +1,15 @@
-//! Emits `client.gen.ts`: a transport-agnostic, typed client.
+//! Emits `client.gen.ts`: a typed client over a dumb byte transport seam.
+//!
+//! The client owns (de)serialization via the generated codec; the caller-supplied
+//! `ServiceTransport` only moves bytes (`call(service, op, req) -> bytes`). A
+//! unary method encodes its request record, calls the transport, and decodes the
+//! response record — synchronous and blocking, no async. Ops whose request or
+//! response is not a record the codec can (de)serialize are skipped with a note.
 //!
 //! Per-direction emission shape:
 //!
 //! - `->` (unidirectional): a method on the per-service `XxxClient` class that
-//!   calls `transport.call(...)` and returns `Promise<Output>`.
+//!   encodes -> `transport.call(...)` -> decodes, returning the success record.
 //! - `<->` (bidirectional) — connection mode (default): the service grows a
 //!   `XxxChannelHandlers` interface (one method per inbound op), a
 //!   `routeXxxChannel` router that decodes inbound frames and dispatches, and
@@ -12,27 +18,29 @@
 //!   and routing.
 //! - `<-` (reverse) — connection mode: receive-only. Inbound handler entry +
 //!   router case, no encoder (server pushes; client only receives).
-//! - `<->`/`<-` — rpc mode: degraded poll model. `checkXxxOp(): Promise<Out[]>`
-//!   (drain) and (for `<->`) `sendXxxOp(req): Promise<void>` (post). Both ride
-//!   `transport.call`.
+//! - `<->`/`<-` — rpc mode: degraded poll model. `checkXxxOp(): Out[]` (drain,
+//!   decoding the returned CBOR array) and (for `<->`) `sendXxxOp(req): void`
+//!   (post, codec-encoded). Both ride the byte-seam `transport.call`.
 
 use crate::{
+    codec,
     common::{self, BidiTransport, DecimalMapping},
     types,
 };
 use csilgen_common::{CsilServiceDefinition, CsilServiceOperation, WasmGeneratorInput};
+use std::collections::{BTreeSet, HashSet};
 
 const DEFAULT_TYPES_MODULE: &str = "./types.gen";
+const DEFAULT_CODEC_MODULE: &str = "./codec.gen";
 const DEFAULT_AGGREGATE: &str = "ApiClient";
 
+// The dumb byte transport seam: the caller-owned carrier performs the call named by
+// `(service, op)` with the already-encoded request bytes and returns the response
+// bytes. The generated client owns (de)serialization via the codec; the carrier only
+// moves bytes. Synchronous and blocking — the host owns the I/O loop (no async).
 const TRANSPORT: &str = "\
 export interface ServiceTransport {
-  call<TReq, TRes>(
-    service: string,
-    method: string,
-    req: TReq,
-    opts?: { signal?: AbortSignal },
-  ): Promise<TRes>;
+  call(service: string, op: string, req: Uint8Array): Uint8Array;
 }
 ";
 
@@ -51,8 +59,24 @@ pub fn generate(input: &WasmGeneratorInput) -> Result<String, String> {
     let mapping = common::decimal_mapping(input)?;
     let spec = &input.csil_spec;
     let services = common::sorted_services(spec);
+    let records = codec::record_names(spec);
 
     let mut out = common::header(input, "typescript-client");
+
+    // Emit the per-service classes (and any channel blocks) first so the import
+    // headers can name exactly the types and codec helpers actually referenced.
+    let mut codec_imports: BTreeSet<String> = BTreeSet::new();
+    let mut body = String::new();
+    for (name, def) in &services {
+        if let Some(class) = service_class(name, def, mode, mapping, &records, &mut codec_imports) {
+            body.push_str(&class);
+            body.push('\n');
+        }
+        if mode == BidiTransport::Connection && common::service_has_channel_ops(def) {
+            body.push_str(&channel_block(name, def, mapping));
+            body.push('\n');
+        }
+    }
 
     let declared = types::declared_type_names(spec);
     let mut imports: Vec<String> = common::referenced_types(&services)
@@ -68,28 +92,27 @@ pub fn generate(input: &WasmGeneratorInput) -> Result<String, String> {
     }
     imports.sort();
     imports.dedup();
+    let mut any_import = false;
     if !imports.is_empty() {
         let module = string_option(input, "client_types_module", DEFAULT_TYPES_MODULE);
         out.push_str(&format!(
-            "import type {{ {} }} from \"{module}\";\n\n",
+            "import type {{ {} }} from \"{module}\";\n",
             imports.join(", ")
         ));
+        any_import = true;
     }
-
-    // An inline `decimal` in an op signature makes `ts_type` print
-    // `CsilDecimal`/`Decimal` straight into this file. The type-import block
-    // above carries only named refs (never a builtin), so the value import is
-    // injected here or the file references an undefined identifier.
-    if common::services_use_decimal_inline(&services) {
-        match mapping {
-            DecimalMapping::Csil => {
-                let module = string_option(input, "client_types_module", DEFAULT_TYPES_MODULE);
-                out.push_str(&format!("import {{ CsilDecimal }} from \"{module}\";\n\n"));
-            }
-            DecimalMapping::Library => {
-                out.push_str("import Decimal from \"decimal.js\";\n\n");
-            }
-        }
+    // The typed methods call the generated `to<T>Cbor`/`from<T>Cbor` (and, for the
+    // rpc-mode poll path, the value-tree helpers); import exactly those from the codec.
+    if !codec_imports.is_empty() {
+        let module = string_option(input, "client_codec_module", DEFAULT_CODEC_MODULE);
+        out.push_str(&format!(
+            "import {{ {} }} from \"{module}\";\n",
+            codec_imports.into_iter().collect::<Vec<_>>().join(", ")
+        ));
+        any_import = true;
+    }
+    if any_import {
+        out.push('\n');
     }
 
     if let Some(url) = string_option_opt(input, "ts_ws_base_url") {
@@ -110,16 +133,7 @@ pub fn generate(input: &WasmGeneratorInput) -> Result<String, String> {
         out.push('\n');
     }
 
-    for (name, def) in &services {
-        if let Some(class) = service_class(name, def, mode, mapping) {
-            out.push_str(&class);
-            out.push('\n');
-        }
-        if mode == BidiTransport::Connection && common::service_has_channel_ops(def) {
-            out.push_str(&channel_block(name, def, mapping));
-            out.push('\n');
-        }
-    }
+    out.push_str(&body);
 
     let aggregate = string_option(input, "aggregate_class_name", DEFAULT_AGGREGATE);
     let services_with_class: Vec<&(&str, &CsilServiceDefinition)> = services
@@ -148,6 +162,8 @@ fn service_class(
     def: &CsilServiceDefinition,
     mode: BidiTransport,
     mapping: DecimalMapping,
+    records: &HashSet<String>,
+    codec_imports: &mut BTreeSet<String>,
 ) -> Option<String> {
     if !service_class_has_methods(def, mode) {
         return None;
@@ -162,17 +178,35 @@ fn service_class(
         match (mode, &op.direction) {
             (_, csilgen_common::CsilServiceDirection::Unidirectional) => {
                 out.push('\n');
-                out.push_str(&unary_method(op, &wire_service, mapping));
+                out.push_str(&unary_method(
+                    op,
+                    &wire_service,
+                    mapping,
+                    records,
+                    codec_imports,
+                ));
             }
             (BidiTransport::Rpc, csilgen_common::CsilServiceDirection::Bidirectional) => {
                 out.push('\n');
-                out.push_str(&rpc_send(op, &wire_service, mapping));
+                out.push_str(&rpc_send(op, &wire_service, records, codec_imports));
                 out.push('\n');
-                out.push_str(&rpc_check(op, &wire_service, mapping));
+                out.push_str(&rpc_check(
+                    op,
+                    &wire_service,
+                    mapping,
+                    records,
+                    codec_imports,
+                ));
             }
             (BidiTransport::Rpc, csilgen_common::CsilServiceDirection::Reverse) => {
                 out.push('\n');
-                out.push_str(&rpc_check(op, &wire_service, mapping));
+                out.push_str(&rpc_check(
+                    op,
+                    &wire_service,
+                    mapping,
+                    records,
+                    codec_imports,
+                ));
             }
             // Connection-mode bidi/reverse are emitted in channel_block instead
             (BidiTransport::Connection, _) => {}
@@ -183,68 +217,121 @@ fn service_class(
     Some(out)
 }
 
-fn unary_method(op: &CsilServiceOperation, wire_service: &str, mapping: DecimalMapping) -> String {
+/// A note emitted in place of a method whose request/response is not a record the
+/// codec can (de)serialize — mirrors the Go/Swift/Python clients. The carrier moves
+/// bytes, so a non-record payload must be handled by the consumer.
+fn non_record_note(op: &CsilServiceOperation) -> String {
+    format!(
+        "\n  // operation '{}' has a non-record payload; (de)serialize it manually\n",
+        op.name
+    )
+}
+
+fn unary_method(
+    op: &CsilServiceOperation,
+    wire_service: &str,
+    mapping: DecimalMapping,
+    records: &HashSet<String>,
+    codec_imports: &mut BTreeSet<String>,
+) -> String {
+    let success = common::success_type(&op.output_type);
+    let null_input = common::is_null_type(&op.input_type);
+    // The typed-codec path needs a record success type (the response carries
+    // `from<T>Cbor`) and a record-or-null request (the request carries `to<T>Cbor`).
+    if !codec::is_record_ref(&success, records)
+        || !(null_input || codec::is_record_ref(&op.input_type, records))
+    {
+        return non_record_note(op);
+    }
     let method = common::to_camel(&op.name);
     let wire_method = common::method_wire(op);
-    let res = common::ts_type(&common::success_type(&op.output_type), mapping);
+    let res = codec::record_ref_name(&success);
+    let from_res = format!("from{res}Cbor");
+    codec_imports.insert(from_res.clone());
+
     let throws = vec![
         "@throws {ServiceError} when the API returns an error response".to_string(),
-        "@throws transport errors (network, timeout) defined by the transport".to_string(),
+        "@throws transport errors (network, timeout) raised by the transport".to_string(),
     ];
     let mut out = common::jsdoc(&op.doc_comments, &throws, "  ");
     // A push op (`-> Event`) has a `null` input: there is no request body, so the
-    // request parameter is omitted rather than emitted as `req: null`, which would
-    // force callers to pass a meaningless `null`.
-    if common::is_null_type(&op.input_type) {
+    // request parameter is omitted and an empty payload is sent.
+    if null_input {
+        out.push_str(&format!("  {method}(): {res} {{\n"));
         out.push_str(&format!(
-            "  {method}(opts?: {{ signal?: AbortSignal }}): Promise<{res}> {{\n"
+            "    const csilResp = this.t.call(\"{wire_service}\", \"{wire_method}\", new Uint8Array());\n"
         ));
+    } else {
+        let req = common::ts_type(&op.input_type, mapping);
+        let to_req = format!("to{}Cbor", codec::record_ref_name(&op.input_type));
+        codec_imports.insert(to_req.clone());
+        out.push_str(&format!("  {method}(req: {req}): {res} {{\n"));
         out.push_str(&format!(
-            "    return this.t.call<undefined, {res}>(\"{wire_service}\", \"{wire_method}\", undefined, opts);\n"
+            "    const csilResp = this.t.call(\"{wire_service}\", \"{wire_method}\", {to_req}(req));\n"
         ));
-        out.push_str("  }\n");
-        return out;
     }
-    let req = common::ts_type(&op.input_type, mapping);
-    out.push_str(&format!(
-        "  {method}(req: {req}, opts?: {{ signal?: AbortSignal }}): Promise<{res}> {{\n"
-    ));
-    out.push_str(&format!(
-        "    return this.t.call<{req}, {res}>(\"{wire_service}\", \"{wire_method}\", req, opts);\n"
-    ));
+    out.push_str(&format!("    return {from_res}(csilResp);\n"));
     out.push_str("  }\n");
     out
 }
 
-/// rpc-mode outbound: `send<Op>` posts an input over a synthetic method name.
-fn rpc_send(op: &CsilServiceOperation, wire_service: &str, mapping: DecimalMapping) -> String {
+/// rpc-mode outbound: `send<Op>` posts an input record over a synthetic op name.
+fn rpc_send(
+    op: &CsilServiceOperation,
+    wire_service: &str,
+    records: &HashSet<String>,
+    codec_imports: &mut BTreeSet<String>,
+) -> String {
+    if !codec::is_record_ref(&op.input_type, records) {
+        return non_record_note(op);
+    }
     let camel = common::to_camel(&op.name);
     let wire_method = format!("{}Send", common::method_wire(op));
-    let req = common::ts_type(&op.input_type, mapping);
+    let req = common::ts_type(&op.input_type, DecimalMapping::Csil);
+    let to_req = format!("to{}Cbor", codec::record_ref_name(&op.input_type));
+    codec_imports.insert(to_req.clone());
     let mut out = String::new();
     out.push_str(&format!(
-        "  send{}(req: {req}, opts?: {{ signal?: AbortSignal }}): Promise<void> {{\n",
+        "  send{}(req: {req}): void {{\n",
         pascal_from_camel(&camel)
     ));
     out.push_str(&format!(
-        "    return this.t.call<{req}, void>(\"{wire_service}\", \"{wire_method}\", req, opts);\n"
+        "    this.t.call(\"{wire_service}\", \"{wire_method}\", {to_req}(req));\n"
     ));
     out.push_str("  }\n");
     out
 }
 
-/// rpc-mode inbound: `check<Op>` drains the server's pending outbound queue.
-fn rpc_check(op: &CsilServiceOperation, wire_service: &str, mapping: DecimalMapping) -> String {
+/// rpc-mode inbound: `check<Op>` drains the server's pending outbound queue, decoding
+/// the CBOR array of records the poll returns.
+fn rpc_check(
+    op: &CsilServiceOperation,
+    wire_service: &str,
+    mapping: DecimalMapping,
+    records: &HashSet<String>,
+    codec_imports: &mut BTreeSet<String>,
+) -> String {
+    let success = common::success_type(&op.output_type);
+    if !codec::is_record_ref(&success, records) {
+        return non_record_note(op);
+    }
     let camel = common::to_camel(&op.name);
     let wire_method = format!("{}Check", common::method_wire(op));
-    let res = common::ts_type(&common::success_type(&op.output_type), mapping);
+    let res = common::ts_type(&success, mapping);
+    let from_value = format!("from{}CborValue", codec::record_ref_name(&success));
+    codec_imports.insert("decode".to_string());
+    codec_imports.insert("asArray".to_string());
+    codec_imports.insert(from_value.clone());
     let mut out = String::new();
     out.push_str(&format!(
-        "  check{}(opts?: {{ signal?: AbortSignal }}): Promise<{res}[]> {{\n",
+        "  check{}(): {res}[] {{\n",
         pascal_from_camel(&camel)
     ));
     out.push_str(&format!(
-        "    return this.t.call<undefined, {res}[]>(\"{wire_service}\", \"{wire_method}\", undefined, opts);\n"
+        "    const csilResp = this.t.call(\"{wire_service}\", \"{wire_method}\", new Uint8Array());\n"
+    ));
+    out.push_str(&format!(
+        "    return asArray(decode(csilResp)).map((csilE) => {from_value}(csilE));\n"
     ));
     out.push_str("  }\n");
     out
