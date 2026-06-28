@@ -71,6 +71,94 @@ pub fn decimal_mapping(input: &WasmGeneratorInput) -> Result<DecimalMapping, Str
     }
 }
 
+/// Which client surface(s) to emit. The transport seam is the only thing that
+/// turns async (it owns the I/O round-trip); the codec stays synchronous because
+/// it never does I/O. `Both` is the default: every consumer gets the blocking
+/// client they had plus an async twin, and can opt down to one shape explicitly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClientStyle {
+    /// Blocking-only client at `client.gen.ts`. The host owns the I/O loop.
+    Sync,
+    /// Promise-returning client, a drop-in replacement at `client.gen.ts` (same
+    /// symbol names). For hosts whose carrier is async (a browser `fetch`, etc.).
+    Async,
+    /// Emit both — the sync client at `client.gen.ts` and an async twin at
+    /// `client.async.gen.ts` whose symbols carry an `Async` marker so the two
+    /// coexist in one package (and one barrel) without name collisions. Default.
+    Both,
+}
+
+/// Read & validate `client_style` from the CSIL options block. Mirrors
+/// `bidi_transport`/`decimal_mapping`: any value other than `sync`/`async`/`both`
+/// is rejected at generation time instead of silently degrading. Absent ->
+/// `Both`, so the blocking client is preserved and the async twin comes for free.
+pub fn client_style(input: &WasmGeneratorInput) -> Result<ClientStyle, String> {
+    match input.config.options.get("client_style") {
+        None => Ok(ClientStyle::Both),
+        Some(v) => match v.as_str() {
+            Some("sync") => Ok(ClientStyle::Sync),
+            Some("async") => Ok(ClientStyle::Async),
+            Some("both") => Ok(ClientStyle::Both),
+            Some(other) => Err(format!(
+                "client_style must be \"sync\", \"async\", or \"both\", got {other:?}"
+            )),
+            None => Err(format!("client_style must be a string, got {v:?}")),
+        },
+    }
+}
+
+/// The shape of one emitted client file: whether its methods are async and the
+/// symbol marker that keeps an async twin distinct from the sync client when both
+/// are emitted into the same package. `marker` is empty for a stand-alone client
+/// (sync, or async-as-drop-in) and `"Async"` for the twin in `Both` mode.
+#[derive(Debug, Clone, Copy)]
+pub struct ClientShape {
+    pub is_async: bool,
+    pub marker: &'static str,
+}
+
+impl ClientShape {
+    /// `async ` keyword (with trailing space) for method declarations, else empty.
+    pub fn async_kw(&self) -> &'static str {
+        if self.is_async { "async " } else { "" }
+    }
+
+    /// `await ` keyword (with trailing space) for transport calls, else empty.
+    pub fn await_kw(&self) -> &'static str {
+        if self.is_async { "await " } else { "" }
+    }
+
+    /// Wrap a method's return type in `Promise<...>` when async.
+    pub fn ret(&self, ty: &str) -> String {
+        if self.is_async {
+            format!("Promise<{ty}>")
+        } else {
+            ty.to_string()
+        }
+    }
+
+    /// The byte-transport interface name (`ServiceTransport`, or `AsyncServiceTransport`
+    /// for the twin).
+    pub fn transport_name(&self) -> String {
+        format!("{}ServiceTransport", self.marker)
+    }
+
+    /// The structural `Codec` interface name used by connection-mode channels.
+    pub fn codec_name(&self) -> String {
+        format!("{}Codec", self.marker)
+    }
+
+    /// A per-service client class name (`FooClient`, or `FooAsyncClient` for the twin).
+    pub fn class_name(&self, base: &str) -> String {
+        format!("{base}{}Client", self.marker)
+    }
+
+    /// The aggregate client class name, marker-prefixed so the twin is distinct.
+    pub fn aggregate_name(&self, configured: &str) -> String {
+        format!("{}{configured}", self.marker)
+    }
+}
+
 pub fn is_unidirectional(op: &CsilServiceOperation) -> bool {
     matches!(op.direction, CsilServiceDirection::Unidirectional)
 }

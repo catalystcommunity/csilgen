@@ -234,7 +234,17 @@ fn typesonly_emits_only_types_with_service_error() {
 fn client_emits_types_and_client() {
     let files = generate_files(&input_for("typescript-client")).expect("generate");
     let paths: Vec<&str> = files.iter().map(|f| f.path.as_str()).collect();
-    assert_eq!(paths, vec!["types.gen.ts", "codec.gen.ts", "client.gen.ts"]);
+    // `client_style` defaults to `both`, so the async twin rides alongside the sync
+    // client. The blocking `client.gen.ts` below is unchanged from sync-only output.
+    assert_eq!(
+        paths,
+        vec![
+            "types.gen.ts",
+            "codec.gen.ts",
+            "client.gen.ts",
+            "client.async.gen.ts"
+        ]
+    );
 
     let client = file(&files, "client.gen.ts");
     // type-only import from the companion types module
@@ -273,6 +283,98 @@ fn client_emits_types_and_client() {
 }
 
 #[test]
+fn async_twin_emitted_by_default_with_marked_symbols() {
+    // Default `client_style` is `both`: the async twin lives at `client.async.gen.ts`
+    // and carries an `Async` marker on every exported symbol so it coexists with the
+    // sync client in one package/barrel.
+    let files = generate_files(&input_for("typescript-client")).expect("generate");
+    let twin = file(&files, "client.async.gen.ts");
+
+    // Transport seam returns a Promise; its interface name is marked.
+    assert!(twin.contains("export interface AsyncServiceTransport {"));
+    assert!(
+        twin.contains("call(service: string, op: string, req: Uint8Array): Promise<Uint8Array>;")
+    );
+    // Marked per-service + aggregate class names.
+    assert!(twin.contains("export class AuthAsyncClient {"));
+    assert!(twin.contains("export class MemberAsyncClient {"));
+    assert!(twin.contains("export class AsyncApiClient {"));
+    assert!(twin.contains("constructor(private readonly t: AsyncServiceTransport) {}"));
+    // Methods are async and Promise-returning, awaiting the byte seam.
+    assert!(twin.contains("async login(req: LoginRequest): Promise<LoginResponse> {"));
+    assert!(twin.contains(
+        "const csilResp = await this.t.call(\"auth\", \"Login\", toLoginRequestCbor(req));"
+    ));
+    assert!(twin.contains("return fromLoginResponseCbor(csilResp);"));
+    // The aggregate wires the marked per-service clients.
+    assert!(twin.contains("this.auth = new AuthAsyncClient(t);"));
+
+    // The sync client is untouched (no Promise, no await, original names).
+    let sync = file(&files, "client.gen.ts");
+    assert!(sync.contains("login(req: LoginRequest): LoginResponse {"));
+    assert!(!sync.contains("Promise<"));
+    assert!(!sync.contains("await "));
+}
+
+#[test]
+fn client_style_async_is_drop_in_at_canonical_path() {
+    // `client_style: async` yields a single async client at the canonical path with
+    // the original symbol names — a drop-in replacement for a sync consumer.
+    let mut input = input_for("typescript-client");
+    input
+        .config
+        .options
+        .insert("client_style".to_string(), serde_json::json!("async"));
+    let files = generate_files(&input).expect("generate");
+    let paths: Vec<&str> = files.iter().map(|f| f.path.as_str()).collect();
+    assert_eq!(
+        paths,
+        vec!["types.gen.ts", "codec.gen.ts", "client.gen.ts"],
+        "async drop-in emits no separate twin"
+    );
+
+    let client = file(&files, "client.gen.ts");
+    // Canonical (unmarked) names, but async + Promise.
+    assert!(client.contains("export interface ServiceTransport {"));
+    assert!(
+        client.contains("call(service: string, op: string, req: Uint8Array): Promise<Uint8Array>;")
+    );
+    assert!(client.contains("export class AuthClient {"));
+    assert!(client.contains("export class ApiClient {"));
+    assert!(client.contains("async login(req: LoginRequest): Promise<LoginResponse> {"));
+    assert!(client.contains("const csilResp = await this.t.call("));
+}
+
+#[test]
+fn client_style_sync_suppresses_the_twin() {
+    let mut input = input_for("typescript-client");
+    input
+        .config
+        .options
+        .insert("client_style".to_string(), serde_json::json!("sync"));
+    let files = generate_files(&input).expect("generate");
+    let paths: Vec<&str> = files.iter().map(|f| f.path.as_str()).collect();
+    assert_eq!(paths, vec!["types.gen.ts", "codec.gen.ts", "client.gen.ts"]);
+    let client = file(&files, "client.gen.ts");
+    assert!(!client.contains("Promise<"));
+    assert!(!client.contains("await "));
+}
+
+#[test]
+fn client_style_invalid_value_is_rejected() {
+    let mut input = input_for("typescript-client");
+    input
+        .config
+        .options
+        .insert("client_style".to_string(), serde_json::json!("blocking"));
+    let err = generate_files(&input).expect_err("invalid client_style must fail generation");
+    assert!(
+        err.contains("client_style"),
+        "error should name the offending option: {err}"
+    );
+}
+
+#[test]
 fn server_emits_types_and_server() {
     let files = generate_files(&input_for("typescript-server")).expect("generate");
     let paths: Vec<&str> = files.iter().map(|f| f.path.as_str()).collect();
@@ -305,6 +407,7 @@ fn aggregate_target_emits_all_three() {
             "types.gen.ts",
             "codec.gen.ts",
             "client.gen.ts",
+            "client.async.gen.ts",
             "server.gen.ts"
         ]
     );
@@ -496,6 +599,179 @@ fn input_with_spec(target: &str, spec: CsilSpecSerialized) -> WasmGeneratorInput
     let mut input = input_for(target);
     input.csil_spec = spec;
     input
+}
+
+// `Name = { ... }` parses to `TypeDef(Group(..))` (not `GroupDef`), so build the
+// records that way here to guard the sample-literal path against the real parser.
+fn record_typedef(name: &str, entries: Vec<CsilGroupEntry>) -> CsilRule {
+    CsilRule {
+        name: name.to_string(),
+        rule_type: CsilRuleType::TypeDef(CsilTypeExpression::Group(CsilGroupExpression {
+            entries,
+        })),
+        position: pos(),
+        doc_comments: vec![],
+    }
+}
+
+fn pingpong_spec() -> CsilSpecSerialized {
+    spec_of(vec![
+        record_typedef("Ping", vec![field("msg", builtin("text"), false)]),
+        record_typedef("Pong", vec![field("msg", builtin("text"), false)]),
+        CsilRule {
+            name: "Echo".to_string(),
+            rule_type: CsilRuleType::ServiceDef(CsilServiceDefinition {
+                operations: vec![op("ping", "Ping", "Pong", vec![])],
+                wire_id: None,
+            }),
+            position: pos(),
+            doc_comments: vec![],
+        },
+    ])
+}
+
+#[test]
+fn package_readme_has_quickstart_carrier_and_example() {
+    let mut input = input_with_spec("typescript", pingpong_spec());
+    input.config.options.insert(
+        "emit_packages".to_string(),
+        serde_json::json!(["typescript"]),
+    );
+    let files = generate_files(&input).expect("generate");
+    let readme = file(&files, "README.md");
+
+    // The carrier (the must-have) is present and implements the async seam.
+    assert!(
+        readme.contains("class CsilRpcTransport implements AsyncServiceTransport"),
+        "README must embed the async CSIL-RPC carrier:\n{readme}"
+    );
+    assert!(
+        readme.contains("/csil/v1/rpc"),
+        "carrier must POST the canonical mount"
+    );
+    assert!(
+        readme.contains("{ tag: 24, value: req }"),
+        "request payload must be tag-24 wrapped"
+    );
+    // The example call constructs the async aggregate and calls the first op with a
+    // compiling sample literal (not the `undefined as any` escape).
+    assert!(
+        readme.contains("new AsyncApiClient(new CsilRpcTransport("),
+        "example must construct the typed client over the carrier:\n{readme}"
+    );
+    assert!(
+        readme.contains("client.echo.ping({ msg: \"example\" })"),
+        "example call must pass a generated sample request literal:\n{readme}"
+    );
+}
+
+/// End-to-end proof the README Quickstart carrier actually works: extract the `ts`
+/// block verbatim and run it under `node` against an in-process CSIL-RPC echo (a
+/// `fetch` stub that decodes the request envelope and echoes the tag-24 inner payload
+/// — exactly the bytes `tools/csil-rpc-echo-mock.py` returns over real HTTP). A green
+/// run proves the carrier builds the envelope, drives `fetch`, and decodes the typed
+/// reply round-trip. The stub avoids cross-process sockets so the test is hermetic;
+/// the standalone mock script verifies the same carrier against real HTTP in a normal
+/// environment. Skips when node/npx are unavailable so the suite stays portable.
+#[test]
+fn readme_quickstart_carrier_round_trips_under_node() {
+    let have = |bin: &str| {
+        std::process::Command::new(bin)
+            .arg("--version")
+            .output()
+            .is_ok()
+    };
+    if !have("node") || !have("npx") {
+        eprintln!("skipping: node/npx not on PATH");
+        return;
+    }
+
+    let mut input = input_with_spec("typescript", pingpong_spec());
+    input.config.options.insert(
+        "emit_packages".to_string(),
+        serde_json::json!(["typescript"]),
+    );
+    let files = generate_files(&input).expect("generate");
+
+    let dir = std::env::temp_dir().join(format!("csilgen-ts-readme-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    for f in &files {
+        std::fs::write(dir.join(&f.path), &f.content).unwrap();
+    }
+
+    // The README's `ts` block verbatim, repointed at the local barrel, preceded by an
+    // in-process echo installed as `globalThis.fetch` so the carrier runs unchanged.
+    let readme = file(&files, "README.md");
+    let block = extract_ts_block(readme)
+        .expect("README must contain a ts code block")
+        .replace("from \"echo-client\"", "from \"./index\"");
+    let driver = format!("{ECHO_FETCH_STUB_TS}\n{block}");
+    std::fs::write(dir.join("driver.ts"), driver).unwrap();
+    std::fs::write(dir.join("tsconfig.json"), CODEC_TSCONFIG).unwrap();
+
+    let build = std::process::Command::new("npx")
+        .args(["-y", "-p", "typescript@5", "tsc", "-p", "tsconfig.json"])
+        .current_dir(&dir)
+        .output()
+        .unwrap();
+    assert!(
+        build.status.success(),
+        "tsc failed on the README carrier:\n{}{}",
+        String::from_utf8_lossy(&build.stdout),
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let run = std::process::Command::new("node")
+        .arg(dir.join("out").join("driver.js"))
+        .current_dir(&dir)
+        .output()
+        .unwrap();
+    assert!(
+        run.status.success(),
+        "node run of the README carrier failed:\n{}{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    // The echo returns the request fields, so the printed Pong carries the sent value.
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("example"),
+        "round-trip did not return the sent field: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// An in-process CSIL-RPC echo installed as `globalThis.fetch`: it decodes the request
+/// envelope with the package's own codec and echoes the tag-24 inner payload back in a
+/// `status: 0` response — byte-identical to what the standalone mock returns over HTTP.
+const ECHO_FETCH_STUB_TS: &str = r#"import {
+  encodeValue as _enc,
+  decode as _dec,
+  requireKey as _rk,
+  asBytes as _ab,
+  type CborValue as _CV,
+} from "./index";
+(globalThis as any).fetch = async (_url: string, init: { body: Uint8Array }): Promise<Response> => {
+  const env = _dec(new Uint8Array(init.body));
+  const payload = _rk(env, "payload") as { value: _CV };
+  const inner = _ab(payload.value);
+  const resp = _enc(
+    new Map<_CV, _CV>([
+      ["v", 1],
+      ["status", 0],
+      ["payload", { tag: 24, value: inner }],
+    ]),
+  );
+  return new Response(resp as BodyInit, { status: 200 });
+};
+"#;
+
+/// The contents of the first ```` ```ts ```` fenced block in `md`.
+fn extract_ts_block(md: &str) -> Option<String> {
+    let start = md.find("```ts\n")? + "```ts\n".len();
+    let rest = &md[start..];
+    let end = rest.find("\n```")?;
+    Some(rest[..end].to_string())
 }
 
 #[test]
@@ -2074,6 +2350,63 @@ fn codec_round_trips_through_typescript() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Compile and run the generated **async** client against an async loopback
+/// transport (one that returns a `Promise<Uint8Array>`), proving the Promise-
+/// returning surface type-checks and round-trips a typed request/response under
+/// node. Skips when node/npx is unavailable so the suite stays portable.
+#[test]
+fn async_client_round_trips_through_typescript() {
+    let have_node = std::process::Command::new("node")
+        .arg("--version")
+        .output()
+        .is_ok();
+    let have_npx = std::process::Command::new("npx")
+        .arg("--version")
+        .output()
+        .is_ok();
+    if !have_node || !have_npx {
+        eprintln!("skipping: node/npx not on PATH");
+        return;
+    }
+
+    // Default style is `both`, so the corndogs package carries `client.async.gen.ts`.
+    let files = generate_files(&input_with_spec("typescript-client", corndogs_spec())).unwrap();
+    let dir = std::env::temp_dir().join(format!("csilgen-ts-async-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    for f in &files {
+        std::fs::write(dir.join(&f.path), &f.content).unwrap();
+    }
+    std::fs::write(dir.join("driver.ts"), ASYNC_CLIENT_DRIVER_TS).unwrap();
+    std::fs::write(dir.join("tsconfig.json"), CODEC_TSCONFIG).unwrap();
+
+    let build = std::process::Command::new("npx")
+        .args(["-y", "-p", "typescript@5", "tsc", "-p", "tsconfig.json"])
+        .current_dir(&dir)
+        .output()
+        .unwrap();
+    assert!(
+        build.status.success(),
+        "tsc type-check/compile failed:\n{}{}",
+        String::from_utf8_lossy(&build.stdout),
+        String::from_utf8_lossy(&build.stderr)
+    );
+
+    let run = std::process::Command::new("node")
+        .arg(dir.join("out").join("driver.js"))
+        .current_dir(&dir)
+        .output()
+        .unwrap();
+    assert!(
+        run.status.success(),
+        "node async round-trip failed:\n{}{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&run.stdout).trim(), "ok");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn codec_walks_named_map_alias_fields() {
     // The regression: a field typed as a named map alias was stubbed. The codec must
@@ -2498,6 +2831,56 @@ check(back.queueAndStateCounts.q1.active === 2, "nested q1 active");
 check(back.queueAndStateCounts.q2.paused === 5, "nested q2 paused");
 
 console.log("ok");
+"#;
+
+const ASYNC_CLIENT_DRIVER_TS: &str = r#"import { CorndogsAsyncClient, type AsyncServiceTransport } from "./client.async.gen";
+import { fromSubmitTaskRequestCbor, toTaskCbor } from "./codec.gen";
+import type { Task, SubmitTaskRequest } from "./types.gen";
+
+// An async carrier: returns a Promise of the response bytes, exactly the shape a
+// browser `fetch` adapter would. The microtask hop proves `await` really threads
+// through the generated client.
+class AsyncLoopback implements AsyncServiceTransport {
+  async call(_service: string, _op: string, req: Uint8Array): Promise<Uint8Array> {
+    await Promise.resolve();
+    const reqObj = fromSubmitTaskRequestCbor(req);
+    return toTaskCbor(reqObj.task);
+  }
+}
+
+function check(ok: boolean, what: string): void {
+  if (!ok) throw new Error("check failed: " + what);
+}
+
+function bytesEq(a: Uint8Array, b: Uint8Array): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+  return true;
+}
+
+async function main(): Promise<void> {
+  const payload = new Uint8Array([0xde, 0xad, 0xbe]);
+  const task: Task = {
+    uuid: "u-123",
+    currentState: "PENDING",
+    payload,
+    priority: 7,
+    labels: { a: 1, b: 2 },
+    tags: ["x", "y"],
+  };
+  const req: SubmitTaskRequest = { task, queue: "default" };
+
+  const client = new CorndogsAsyncClient(new AsyncLoopback());
+  const resp = await client.submitTask(req);
+  check(resp.uuid === "u-123", "resp uuid");
+  check(bytesEq(resp.payload, payload), "resp payload");
+  check(resp.priority === 7, "resp priority");
+
+  console.log("ok");
+}
+
+// A rejected top-level promise exits node non-zero, which the test treats as failure.
+void main();
 "#;
 
 const CODEC_DRIVER_TS: &str = r#"import { CorndogsClient, type ServiceTransport } from "./client.gen";

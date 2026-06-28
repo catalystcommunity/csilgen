@@ -77,14 +77,83 @@ fn deserialize_input(input_ptr: *const u8, input_len: usize) -> Result<WasmGener
 }
 
 /// Which surface a (sub-)target selects, parallel to the Go generator's dispatch.
+#[derive(Clone, Copy)]
 enum Surface {
     Server,
     Client,
     TypesOnly,
 }
 
+/// Which client surface(s) to emit. Only the transport seam (the byte carrier that
+/// performs the network round-trip) turns into a `suspend fun`; the generated codec
+/// never does I/O and stays synchronous. `Both` is the default so every consumer keeps
+/// their blocking client and gains a coroutine-friendly twin for free.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClientStyle {
+    /// Blocking-only client at `Client.kt`. The host owns its own threads.
+    Sync,
+    /// Suspending client, a drop-in at `Client.kt` with the canonical symbol names
+    /// (just `suspend`). For hosts whose carrier is a coroutine.
+    Async,
+    /// Emit both — the blocking client at `Client.kt` plus a suspending twin at
+    /// `ClientAsync.kt` whose symbols carry an `Async` marker so the two coexist in
+    /// one package without name collisions. Default.
+    Both,
+}
+
+/// Read & validate `client_style` from the generation options. Any value other than
+/// `sync`/`async`/`both` is rejected so misconfiguration fails at generation time
+/// instead of silently degrading; absent defaults to `Both`. Returns a message that
+/// names the offending option, mirroring how a typed-enum option is validated.
+fn client_style(options: &HashMap<String, serde_json::Value>) -> Result<ClientStyle, String> {
+    match options.get("client_style") {
+        None => Ok(ClientStyle::Both),
+        Some(v) => match v.as_str() {
+            Some("sync") => Ok(ClientStyle::Sync),
+            Some("async") => Ok(ClientStyle::Async),
+            Some("both") => Ok(ClientStyle::Both),
+            Some(other) => Err(format!(
+                "client_style must be \"sync\", \"async\", or \"both\", got {other:?}"
+            )),
+            None => Err(format!("client_style must be a string, got {v:?}")),
+        },
+    }
+}
+
+/// The shape of one emitted client file: whether its methods/seam suspend and the
+/// symbol marker that keeps a suspending twin distinct from the blocking client when
+/// both land in the same package. `marker` is empty for a stand-alone client (sync, or
+/// async-as-drop-in) and `"Async"` for the twin in `Both` mode.
+#[derive(Debug, Clone, Copy)]
+struct ClientShape {
+    is_async: bool,
+    marker: &'static str,
+}
+
+impl ClientShape {
+    /// `suspend ` keyword (trailing space) for method/seam declarations, else empty.
+    /// Kotlin coroutines need no `await` at the call site, so this is the only token
+    /// that turns the client suspending.
+    fn suspend_kw(&self) -> &'static str {
+        if self.is_async { "suspend " } else { "" }
+    }
+
+    /// The byte-transport interface name (`Transport`, or `AsyncTransport` for the twin).
+    fn transport_name(&self) -> String {
+        format!("{}Transport", self.marker)
+    }
+
+    /// A per-service client class name (`FooClient`, or `FooAsyncClient` for the twin).
+    fn client_name(&self, base: &str) -> String {
+        format!("{base}{}Client", self.marker)
+    }
+}
+
 fn process_generation(input: WasmGeneratorInput) -> Result<WasmGeneratorOutput, i32> {
     let config = KotlinConfig::from_options(&input.config.options);
+    // Validate `client_style` early so a bad value fails the whole run regardless of the
+    // requested surface, mirroring the TypeScript generator's option validation.
+    let style = client_style(&input.config.options).map_err(|_| error_codes::GENERATION_ERROR)?;
     let mut warnings = Vec::new();
     let mut files = Vec::new();
 
@@ -134,11 +203,52 @@ fn process_generation(input: WasmGeneratorInput) -> Result<WasmGeneratorOutput, 
     if input.csil_spec.service_count > 0 {
         match surface {
             Surface::Client => {
-                if let Some(client_content) = generate_client(&input, &config) {
-                    files.push(GeneratedFile {
-                        path: make_path("Client.kt"),
-                        content: client_content,
-                    });
+                // `Both` (the default) ships the blocking client at `Client.kt` and a
+                // suspending twin at `ClientAsync.kt`; `Async` makes the suspending client
+                // a drop-in at `Client.kt` (canonical names); `Sync` is today's output.
+                let sync = ClientShape {
+                    is_async: false,
+                    marker: "",
+                };
+                let async_drop_in = ClientShape {
+                    is_async: true,
+                    marker: "",
+                };
+                let async_twin = ClientShape {
+                    is_async: true,
+                    marker: "Async",
+                };
+                match style {
+                    ClientStyle::Sync => {
+                        if let Some(c) = generate_client(&input, &config, sync) {
+                            files.push(GeneratedFile {
+                                path: make_path("Client.kt"),
+                                content: c,
+                            });
+                        }
+                    }
+                    ClientStyle::Async => {
+                        if let Some(c) = generate_client(&input, &config, async_drop_in) {
+                            files.push(GeneratedFile {
+                                path: make_path("Client.kt"),
+                                content: c,
+                            });
+                        }
+                    }
+                    ClientStyle::Both => {
+                        if let Some(c) = generate_client(&input, &config, sync) {
+                            files.push(GeneratedFile {
+                                path: make_path("Client.kt"),
+                                content: c,
+                            });
+                        }
+                        if let Some(c) = generate_client(&input, &config, async_twin) {
+                            files.push(GeneratedFile {
+                                path: make_path("ClientAsync.kt"),
+                                content: c,
+                            });
+                        }
+                    }
                 }
             }
             Surface::Server => {
@@ -163,6 +273,10 @@ fn process_generation(input: WasmGeneratorInput) -> Result<WasmGeneratorOutput, 
         files.push(GeneratedFile {
             path: "settings.gradle.kts".to_string(),
             content: gradle_settings_kts(&config),
+        });
+        files.push(GeneratedFile {
+            path: "README.md".to_string(),
+            content: generate_readme(&input, &config, surface),
         });
     }
 
@@ -288,6 +402,279 @@ fn gradle_build_kts(config: &KotlinConfig) -> String {
 fn gradle_settings_kts(config: &KotlinConfig) -> String {
     let name = kotlin_escape(&config.package_name);
     format!("// Code generated by csilgen; DO NOT EDIT.\n\nrootProject.name = \"{name}\"\n")
+}
+
+/// The package `README.md` with a copy-paste **Quickstart**. For a client package the
+/// Quickstart is a complete, dependency-free CSIL-RPC carrier — it reuses this package's
+/// own generated `CsilCbor` codec to build/parse the envelope, so it adds no third-party
+/// dependency (the hybrid posture's path 1) — the typed (sync) client constructed over
+/// it, and one example call. A serviceless / types-only package gets a shorter
+/// consume-the-types section without a carrier.
+fn generate_readme(input: &WasmGeneratorInput, config: &KotlinConfig, surface: Surface) -> String {
+    let artifact = &config.package_name;
+    let mut out = format!(
+        "# {artifact}\n\n\
+         Generated by csilgen. A typed, transport-agnostic CSIL-RPC client: the generated\n\
+         codec owns CBOR (de)serialization; you supply a *carrier* that only moves bytes.\n\n\
+         ## Install\n\n\
+         This package builds to a standard Gradle (Kotlin/JVM) artifact. Publish it to your\n\
+         local Maven repository with `./gradlew publishToMavenLocal` — TODO: publish it to a\n\
+         shared repository — then depend on it:\n\n\
+         ```kotlin\n\
+         dependencies {{\n\
+         \x20   implementation(\"{}:{artifact}:{}\")\n\
+         }}\n\
+         ```\n\n",
+        config.package, config.package_version,
+    );
+
+    // The carrier+example only makes sense for the client surface, whose `Transport` seam
+    // and per-service client the snippet wires together; a server / types-only package has
+    // no such classes, so it gets the consume-the-types section.
+    let example = match surface {
+        Surface::Client => first_unary_example(input),
+        _ => None,
+    };
+    match example {
+        Some(example) => out.push_str(&readme_quickstart(config, &example)),
+        None => out.push_str(
+            "## Quickstart\n\n\
+             This package has no service operations — import its generated record types and\n\
+             the `CsilCbor` codec directly:\n\n\
+             ```kotlin\n\
+             // val bytes: ByteArray = yourRecord.toCbor()\n\
+             // val back: YourRecord = yourRecordFromCbor(bytes)\n\
+             ```\n",
+        ),
+    }
+    out
+}
+
+/// The client Quickstart: the dependency-free blocking CSIL-RPC carrier over
+/// `java.net.http.HttpClient`, the typed (sync) client constructed on it, and the first
+/// service's first unary call with a generated sample request literal.
+fn readme_quickstart(config: &KotlinConfig, ex: &UnaryExample) -> String {
+    let mut out = String::from("## Quickstart\n\n");
+    out.push_str(
+        "A complete CSIL-RPC carrier (no third-party deps — it reuses this package's\n\
+         generated `CsilCbor` codec for the envelope) plus the typed client. Change the one\n\
+         base-URL string.\n\n",
+    );
+    out.push_str("```kotlin\n");
+    out.push_str(&format!("package {}\n\n", config.package));
+    out.push_str(
+        "import java.net.URI\n\
+         import java.net.http.HttpClient\n\
+         import java.net.http.HttpRequest\n\
+         import java.net.http.HttpResponse\n\n",
+    );
+    out.push_str(CARRIER_KT);
+    out.push('\n');
+    out.push_str("fun main() {\n");
+    out.push_str(&format!(
+        "    val client = {0}(CsilRpcTransport(\"http://localhost:5080\"))\n",
+        ex.client_class
+    ));
+    if ex.has_request {
+        out.push_str(&format!(
+            "    val resp = client.{}({})\n",
+            ex.method, ex.sample
+        ));
+    } else {
+        out.push_str(&format!("    val resp = client.{}()\n", ex.method));
+    }
+    out.push_str("    println(resp)\n}\n");
+    out.push_str("```\n");
+    out
+}
+
+/// The CSIL-RPC carrier body, identical for every spec, so it is a constant. It builds a
+/// `CsilRpcRequest` envelope (tag-24 payload) from the generated `CborValue` model, POSTs
+/// it to `{baseUrl}/csil/v1/rpc` with the JDK's blocking `HttpClient`, and returns the
+/// unwrapped response payload bytes for the generated client to decode. A non-zero
+/// transport `status` or a typed `ServiceError` arm becomes a `ClientError`.
+const CARRIER_KT: &str = r#"// The carrier owns only the CSIL-RPC envelope + HTTP; it never touches your types.
+// Hybrid posture path 1: it reuses the generated CsilCbor value model to build/parse the
+// envelope, so it adds no third-party dependency.
+class CsilRpcTransport(baseUrl: String) : Transport {
+    private val http: HttpClient = HttpClient.newHttpClient()
+
+    // Trim any trailing slash so the joined path is exactly one "/csil/v1/rpc".
+    private val baseUrl: String = baseUrl.trimEnd('/')
+
+    override fun call(service: String, op: String, request: ByteArray): ByteArray {
+        // CsilRpcRequest = { v, service, op, payload: #6.24(bstr) }. The payload is the
+        // already-encoded request wrapped in CBOR tag 24 (embedded CBOR); keys are laid
+        // down in canonical (length-then-bytewise) order.
+        val envelope = CborValue.CMap(listOf(
+            CborValue.CText("v") to CborValue.CUint(1uL),
+            CborValue.CText("op") to CborValue.CText(op),
+            CborValue.CText("service") to CborValue.CText(service),
+            CborValue.CText("payload") to CborValue.CTag(24uL, CborValue.CBytes(request)),
+        ))
+
+        val httpReq = HttpRequest.newBuilder()
+            .uri(URI.create("$baseUrl/csil/v1/rpc"))
+            .header("Content-Type", "application/cbor")
+            .header("Accept", "application/cbor")
+            .POST(HttpRequest.BodyPublishers.ofByteArray(CsilCbor.encode(envelope)))
+            .build()
+        val httpResp = http.send(httpReq, HttpResponse.BodyHandlers.ofByteArray())
+        if (httpResp.statusCode() != 200) {
+            throw ClientError(message = "csil-rpc $service/$op: http ${httpResp.statusCode()}")
+        }
+
+        val env = CsilCbor.decode(httpResp.body())
+        val status = CsilCbor.asLong(CsilCbor.require(env, "status"))
+        if (status != 0L) {
+            throw ClientError(message = "csil-rpc $service/$op: transport status $status")
+        }
+
+        val payload = CsilCbor.require(env, "payload")
+        if (payload !is CborValue.CTag || payload.tag != 24uL || payload.value !is CborValue.CBytes) {
+            throw ClientError(message = "csil-rpc: response payload is not a tag-24 byte string")
+        }
+        val inner = (payload.value as CborValue.CBytes).value
+
+        // A typed ServiceError arm (variant "ServiceError") is an application error,
+        // distinct from a transport failure: decode { code, message } and surface it.
+        val variant = CsilCbor.mapGet(env, "variant")
+        if (variant is CborValue.CText && variant.value == "ServiceError") {
+            val e = CsilCbor.decode(inner)
+            val code = CsilCbor.asLong(CsilCbor.require(e, "code"))
+            val msg = CsilCbor.asText(CsilCbor.require(e, "message"))
+            throw ClientError(code = code, message = "service error $code: $msg")
+        }
+        return inner
+    }
+}
+"#;
+
+/// The pieces the README's example call needs: which client class + method to call, the
+/// typed response type to print, and a compiling sample request literal (empty when the
+/// op takes no request).
+struct UnaryExample {
+    client_class: String,
+    method: String,
+    has_request: bool,
+    sample: String,
+}
+
+/// The first service (in rule order, matching the emitted client) that has a unary `->`
+/// operation the typed client actually exposes — success and request both records (or a
+/// null request) — reduced to an example call. `None` for a serviceless package.
+fn first_unary_example(input: &WasmGeneratorInput) -> Option<UnaryExample> {
+    let records = kotlin_record_names(input);
+    for rule in &input.csil_spec.rules {
+        let CsilRuleType::ServiceDef(def) = &rule.rule_type else {
+            continue;
+        };
+        for op in &def.operations {
+            if !matches!(op.direction, CsilServiceDirection::Unidirectional) {
+                continue;
+            }
+            let success = success_type(&op.output_type);
+            let null_input = op_input_is_null(&op.input_type);
+            if !is_record_ref(&success, &records)
+                || !(null_input || is_record_ref(&op.input_type, &records))
+            {
+                continue;
+            }
+            return Some(UnaryExample {
+                client_class: format!("{}Client", service_base(&rule.name)),
+                method: kotlin_method_name(&op.name),
+                has_request: !null_input,
+                sample: if null_input {
+                    String::new()
+                } else {
+                    kotlin_sample(input, &op.input_type)
+                },
+            });
+        }
+    }
+    None
+}
+
+/// A compiling Kotlin expression producing a sample value of `ty` for the README example.
+/// Records recurse into their constructor (only required, non-defaulted fields, by name);
+/// scalars get a representative literal; maps/lists use the empty factories; shapes a
+/// generic sample can't fabricate fall back to `TODO()`, which type-checks anywhere.
+fn kotlin_sample(input: &WasmGeneratorInput, ty: &CsilTypeExpression) -> String {
+    match ty {
+        CsilTypeExpression::Builtin(name) => match name.as_str() {
+            "text" | "tstr" => "\"example\"".to_string(),
+            "bool" => "false".to_string(),
+            "bytes" | "bstr" => "ByteArray(0)".to_string(),
+            "int" => "0L".to_string(),
+            "uint" => "0uL".to_string(),
+            "float" => "0.0".to_string(),
+            "timestamp" => "java.time.Instant.now()".to_string(),
+            "decimal" => "java.math.BigDecimal.ZERO".to_string(),
+            _ => "TODO()".to_string(),
+        },
+        CsilTypeExpression::Array { .. } => "emptyList()".to_string(),
+        CsilTypeExpression::Map { .. } => "emptyMap()".to_string(),
+        CsilTypeExpression::Constrained { base_type, .. } => kotlin_sample(input, base_type),
+        CsilTypeExpression::Reference(name) => match find_record(input, name) {
+            Some(group) => record_literal(input, name, group),
+            // A transparent alias is a `typealias` to its target, so a value of the alias is
+            // just a value of the underlying type.
+            None => match find_alias(input, name) {
+                Some(underlying) => kotlin_sample(input, &underlying),
+                None => "TODO()".to_string(),
+            },
+        },
+        _ => "TODO()".to_string(),
+    }
+}
+
+/// `Class(field = arg, ...)` over a record's constructor: every required field (no
+/// optional / `@default`, which the data class already defaults) by name, in declared
+/// order, with a typed sample value.
+fn record_literal(input: &WasmGeneratorInput, name: &str, group: &CsilGroupExpression) -> String {
+    let args: Vec<String> = group
+        .entries
+        .iter()
+        .filter(|e| e.key.is_some() && field_default(e).is_none())
+        .map(|e| {
+            let key = e.key.as_ref().unwrap();
+            let prop = kotlin_prop_name(key, &e.metadata);
+            format!("{prop} = {}", kotlin_sample(input, &e.value_type))
+        })
+        .collect();
+    format!("{}({})", pascal_case(name), args.join(", "))
+}
+
+/// The record group a reference names, if any: a `Name = { ... }` rule (`TypeDef(Group)`)
+/// or a bare group rule (`GroupDef`).
+fn find_record<'a>(input: &'a WasmGeneratorInput, name: &str) -> Option<&'a CsilGroupExpression> {
+    input.csil_spec.rules.iter().find_map(|r| {
+        if r.name != name {
+            return None;
+        }
+        match &r.rule_type {
+            CsilRuleType::GroupDef(g) => Some(g),
+            CsilRuleType::TypeDef(CsilTypeExpression::Group(g)) => Some(g),
+            _ => None,
+        }
+    })
+}
+
+/// The underlying type of a transparent `typealias` a reference names, or `None` when the
+/// name is not such an alias (a record group / choice has its own type).
+fn find_alias(input: &WasmGeneratorInput, name: &str) -> Option<CsilTypeExpression> {
+    input.csil_spec.rules.iter().find_map(|r| {
+        if r.name != name {
+            return None;
+        }
+        match &r.rule_type {
+            CsilRuleType::TypeDef(t) => match t {
+                CsilTypeExpression::Group(_) | CsilTypeExpression::Choice(_) => None,
+                other => Some(other.clone()),
+            },
+            _ => None,
+        }
+    })
 }
 
 /// Standard file header: the doc block, the generated-code marker, and the
@@ -540,9 +927,10 @@ fn emit_data_class_impl(
     body.push_str(&format!(") : {iface}\n\n"));
 }
 
-/// Client scaffolding emitted once at the top of `Client.kt`: the error type and
-/// the caller-supplied `Transport` every generated client delegates to.
-const CLIENT_PRELUDE_KT: &str = "\
+/// The `ClientError` type, shared by the blocking client and its suspending twin. Only
+/// the primary file (the sync/drop-in client) declares it; the twin rides in the same
+/// package and reuses it, so it is never redeclared.
+const CLIENT_ERROR_KT: &str = "\
 /**
  * ClientError is thrown by a generated client call: a structured error the service
  * returned (code/message), or a transport-level failure (cause).
@@ -552,28 +940,53 @@ class ClientError(
     override val message: String = \"\",
     cause: Throwable? = null,
 ) : RuntimeException(message, cause)
-
-/**
- * Transport is the caller-supplied byte carrier: it performs the call named by
- * (service, op) with the already-encoded request bytes and returns the response
- * bytes, or throws. The generated client owns (de)serialization; the carrier only
- * moves bytes. Synchronous by design — no coroutines; the host owns its own threads.
- */
-interface Transport {
-    fun call(service: String, op: String, request: ByteArray): ByteArray
-}
 ";
 
-fn generate_client(input: &WasmGeneratorInput, config: &KotlinConfig) -> Option<String> {
+/// The caller-supplied byte carrier the generated client delegates to. The seam is a
+/// `suspend fun` for the async shape (it owns the network round-trip); the blocking shape
+/// keeps the plain `fun`. The interface name is marked (`AsyncTransport`) only for the
+/// twin so it coexists with the blocking `Transport` in one package.
+fn transport_interface_kt(shape: ClientShape) -> String {
+    let name = shape.transport_name();
+    let suspend = shape.suspend_kw();
+    // The carrier note tracks the seam's concurrency model so a reader of the generated
+    // source knows whether to supply a thread-blocking or coroutine-aware implementation.
+    let carrier_note = if shape.is_async {
+        "Suspending by design — the seam performs the network round-trip on a coroutine; the host supplies a coroutine-aware carrier."
+    } else {
+        "Synchronous by design — no coroutines; the host owns its own threads."
+    };
+    format!(
+        "/**\n * {name} is the caller-supplied byte carrier: it performs the call named by\n * (service, op) with the already-encoded request bytes and returns the response\n * bytes, or throws. The generated client owns (de)serialization; the carrier only\n * moves bytes. {carrier_note}\n */\ninterface {name} {{\n    {suspend}fun call(service: String, op: String, request: ByteArray): ByteArray\n}}\n"
+    )
+}
+
+/// Client scaffolding emitted once at the top of the client file: the shared error type
+/// (primary file only) and the caller-supplied transport seam for this shape.
+fn client_prelude_kt(shape: ClientShape) -> String {
+    let mut out = String::new();
+    if shape.marker.is_empty() {
+        out.push_str(CLIENT_ERROR_KT);
+        out.push('\n');
+    }
+    out.push_str(&transport_interface_kt(shape));
+    out
+}
+
+fn generate_client(
+    input: &WasmGeneratorInput,
+    config: &KotlinConfig,
+    shape: ClientShape,
+) -> Option<String> {
     let records = kotlin_record_names(input);
     let mut body = String::new();
-    body.push_str(CLIENT_PRELUDE_KT);
+    body.push_str(&client_prelude_kt(shape));
     body.push('\n');
 
     let mut emitted = false;
     for rule in &input.csil_spec.rules {
         if let CsilRuleType::ServiceDef(service) = &rule.rule_type {
-            emit_client_class(&mut body, &rule.name, service, &records);
+            emit_client_class(&mut body, &rule.name, service, &records, shape);
             emitted = true;
         }
     }
@@ -590,9 +1003,12 @@ fn emit_client_class(
     name: &str,
     service: &CsilServiceDefinition,
     records: &std::collections::HashSet<String>,
+    shape: ClientShape,
 ) {
     let base = service_base(name);
-    let client = format!("{base}Client");
+    let client = shape.client_name(&base);
+    let transport = shape.transport_name();
+    let suspend = shape.suspend_kw();
     // Canonical wire service (the wire contract): the base name lowercased, so a
     // Kotlin client routes to the same endpoint as the Go/Python/TS peers.
     let wire_service = wire_service_name(name);
@@ -601,7 +1017,7 @@ fn emit_client_class(
         "/** Typed client for the {name} service. The client owns (de)serialization;\n * the carrier only moves bytes. */\n"
     ));
     body.push_str(&format!(
-        "class {client}(private val transport: Transport) {{\n"
+        "class {client}(private val transport: {transport}) {{\n"
     ));
 
     for operation in &service.operations {
@@ -631,7 +1047,7 @@ fn emit_client_class(
         let wire_op = wire_op_name(&operation.name);
         let output_type = map_csil_type_to_kotlin(&success, &None);
         if op_input_is_null(&operation.input_type) {
-            body.push_str(&format!("    fun {method}(): {output_type} {{\n"));
+            body.push_str(&format!("    {suspend}fun {method}(): {output_type} {{\n"));
             // A null-input op sends an empty request body.
             body.push_str(&format!(
                 "        return decode<{output_type}>(transport.call(\"{wire_service}\", \"{wire_op}\", ByteArray(0)))\n"
@@ -639,7 +1055,7 @@ fn emit_client_class(
         } else {
             let input_type = map_csil_type_to_kotlin(&operation.input_type, &None);
             body.push_str(&format!(
-                "    fun {method}(request: {input_type}): {output_type} {{\n"
+                "    {suspend}fun {method}(request: {input_type}): {output_type} {{\n"
             ));
             body.push_str(&format!(
                 "        return decode<{output_type}>(transport.call(\"{wire_service}\", \"{wire_op}\", encode(request)))\n"
@@ -2786,6 +3202,104 @@ mod tests {
         );
     }
 
+    #[test]
+    fn async_twin_emitted_by_default_with_marked_symbols() {
+        // Default client_style is `both`: a suspending twin at ClientAsync.kt whose symbols
+        // carry an `Async` marker so it coexists with the blocking client in one package.
+        let out = process_generation(spec("kotlin-client", corndogs_rules())).unwrap();
+        let twin = content(&out, "ClientAsync.kt");
+
+        // Suspending transport seam, marked interface name.
+        assert!(twin.contains("interface AsyncTransport {"));
+        assert!(twin.contains(
+            "suspend fun call(service: String, op: String, request: ByteArray): ByteArray"
+        ));
+        // Marked per-service client over the marked seam.
+        assert!(
+            twin.contains("class CorndogsAsyncClient(private val transport: AsyncTransport) {")
+        );
+        // Methods suspend and route through the byte seam (no `await` in Kotlin coroutines).
+        assert!(twin.contains("suspend fun submitTask(request: SubmitTaskRequest): Task {"));
+        assert!(twin.contains(
+            "decode<Task>(transport.call(\"corndogs\", \"SubmitTask\", encode(request)))"
+        ));
+        // The twin reuses the package's ClientError (declared in Client.kt), never redeclares it.
+        assert!(!twin.contains("class ClientError("));
+
+        // The sync client is untouched: blocking seam + canonical names, no `suspend`.
+        let sync = content(&out, "Client.kt");
+        assert!(sync.contains("class CorndogsClient(private val transport: Transport) {"));
+        assert!(sync.contains("fun submitTask(request: SubmitTaskRequest): Task {"));
+        assert!(!sync.contains("suspend "));
+        assert!(!sync.contains("AsyncTransport"));
+        assert!(sync.contains("class ClientError("));
+    }
+
+    #[test]
+    fn client_style_async_is_drop_in_at_canonical_path() {
+        // `client_style: async` yields a single suspending client at the canonical path
+        // with the canonical symbol names — a drop-in for a blocking consumer.
+        let mut input = spec("kotlin-client", corndogs_rules());
+        input
+            .config
+            .options
+            .insert("client_style".to_string(), serde_json::json!("async"));
+        let out = process_generation(input).unwrap();
+        let paths: Vec<&str> = out.files.iter().map(|f| f.path.as_str()).collect();
+        assert!(paths.iter().any(|p| p.ends_with("Client.kt")));
+        assert!(
+            !paths.iter().any(|p| p.ends_with("ClientAsync.kt")),
+            "async drop-in emits no separate twin"
+        );
+
+        let client = content(&out, "Client.kt");
+        // Canonical (unmarked) names, but suspending.
+        assert!(client.contains("interface Transport {"));
+        assert!(client.contains(
+            "suspend fun call(service: String, op: String, request: ByteArray): ByteArray"
+        ));
+        assert!(client.contains("class CorndogsClient(private val transport: Transport) {"));
+        assert!(client.contains("suspend fun submitTask(request: SubmitTaskRequest): Task {"));
+        // The drop-in is the primary file, so it still declares the shared ClientError.
+        assert!(client.contains("class ClientError("));
+    }
+
+    #[test]
+    fn client_style_sync_suppresses_the_twin() {
+        let mut input = spec("kotlin-client", corndogs_rules());
+        input
+            .config
+            .options
+            .insert("client_style".to_string(), serde_json::json!("sync"));
+        let out = process_generation(input).unwrap();
+        let paths: Vec<&str> = out.files.iter().map(|f| f.path.as_str()).collect();
+        assert!(paths.iter().any(|p| p.ends_with("Client.kt")));
+        assert!(!paths.iter().any(|p| p.ends_with("ClientAsync.kt")));
+        let client = content(&out, "Client.kt");
+        assert!(!client.contains("suspend "));
+        assert!(!client.contains("AsyncTransport"));
+    }
+
+    #[test]
+    fn client_style_invalid_value_is_rejected() {
+        // A bad value fails the whole run regardless of surface.
+        let mut input = spec("kotlin-client", corndogs_rules());
+        input
+            .config
+            .options
+            .insert("client_style".to_string(), serde_json::json!("blocking"));
+        assert!(process_generation(input).is_err());
+
+        // The validator names the offending option so the failure is actionable.
+        let mut opts = HashMap::new();
+        opts.insert("client_style".to_string(), serde_json::json!("blocking"));
+        let err = client_style(&opts).expect_err("invalid client_style must be rejected");
+        assert!(
+            err.contains("client_style"),
+            "error should name the option: {err}"
+        );
+    }
+
     // The CborValue variants are prefixed (CInt/CFloat/CArray/CMap/…) rather than named after
     // kotlin builtins because nested members are in scope unqualified inside the sealed class;
     // a variant named `Int` would shadow `kotlin.Int` and break the `hashCode(): Int` override
@@ -3150,5 +3664,139 @@ mod tests {
         assert!(settings.contains("rootProject.name = \"widgets\""));
         let build = content(&out, "build.gradle.kts");
         assert!(build.contains("version = \"0.1.0\""));
+    }
+
+    /// A corndogs `kotlin-client` package input with the given options overlaid.
+    fn corndogs_package_input(options: Vec<(&str, serde_json::Value)>) -> WasmGeneratorInput {
+        let mut input = spec("kotlin-client", corndogs_rules());
+        for (k, v) in options {
+            input.config.options.insert(k.to_string(), v);
+        }
+        input
+    }
+
+    #[test]
+    fn readme_emitted_only_in_package_mode() {
+        // No emit_packages: no README (the flat default output).
+        let plain = process_generation(spec("kotlin-client", corndogs_rules())).unwrap();
+        assert!(!plain.files.iter().any(|f| f.path == "README.md"));
+
+        let pkg = process_generation(corndogs_package_input(vec![(
+            "emit_packages",
+            serde_json::json!(["kotlin"]),
+        )]))
+        .unwrap();
+        assert!(pkg.files.iter().any(|f| f.path == "README.md"));
+    }
+
+    /// The client README's Quickstart must be a complete, self-describing CSIL-RPC
+    /// carrier: the seam implementation, the canonical endpoint POST, the tag-24 payload
+    /// wrap, the status + ServiceError handling, client construction over the carrier, and
+    /// an example call with a generated sample literal. (No kotlin toolchain is available
+    /// here, so the carrier is asserted by content, not compiled — runtime verify skipped.)
+    #[test]
+    fn readme_quickstart_has_carrier_and_example() {
+        let out = process_generation(corndogs_package_input(vec![
+            (
+                "kotlin_package",
+                serde_json::Value::String("community.catalyst.demo".to_string()),
+            ),
+            (
+                "package_name",
+                serde_json::Value::String("corndogs-client".to_string()),
+            ),
+            (
+                "package_version",
+                serde_json::Value::String("1.2.3".to_string()),
+            ),
+            ("emit_packages", serde_json::json!(["kotlin"])),
+        ]))
+        .unwrap();
+        let c = content(&out, "README.md");
+
+        // Title + Gradle consume coordinates (the resolved coordinates).
+        assert!(c.starts_with("# corndogs-client\n"));
+        assert!(c.contains("implementation(\"community.catalyst.demo:corndogs-client:1.2.3\")"));
+
+        // The carrier is in this package and implements the generated transport seam.
+        assert!(c.contains("package community.catalyst.demo"));
+        assert!(c.contains("class CsilRpcTransport(baseUrl: String) : Transport"));
+        assert!(c.contains(
+            "override fun call(service: String, op: String, request: ByteArray): ByteArray"
+        ));
+        // Hybrid path 1: it reuses the generated CsilCbor model — no third-party dep.
+        assert!(c.contains("no third-party dep"));
+        assert!(c.contains("CborValue.CMap(listOf("));
+
+        // Stdlib blocking HTTP POST to the canonical endpoint.
+        assert!(c.contains("import java.net.http.HttpClient"));
+        assert!(c.contains("/csil/v1/rpc"));
+        assert!(c.contains(".POST(HttpRequest.BodyPublishers.ofByteArray("));
+
+        // The tag-24 embedded-CBOR payload wrap.
+        assert!(c.contains("CborValue.CTag(24uL, CborValue.CBytes(request))"));
+
+        // Transport status gate + typed ServiceError arm handling.
+        assert!(c.contains("val status = CsilCbor.asLong(CsilCbor.require(env, \"status\"))"));
+        assert!(c.contains("if (status != 0L)"));
+        assert!(c.contains("variant.value == \"ServiceError\""));
+        assert!(c.contains("throw ClientError(code = code, message = \"service error"));
+
+        // Client construction over the carrier + the example call with a sample literal.
+        assert!(c.contains("val client = CorndogsClient(CsilRpcTransport("));
+        // submit-task takes SubmitTaskRequest { task: Task, queue: text }; the sample
+        // fabricates the nested record (optional priority omitted -> defaults to null).
+        assert!(c.contains("client.submitTask(SubmitTaskRequest(task = Task("));
+        assert!(c.contains("queue = \"example\""));
+        assert!(c.contains("println(resp)"));
+        // The carrier snippet is space-indented like the rest of the surface.
+        let snippet = c.split("```kotlin").nth(1).unwrap();
+        assert!(!snippet.contains('\t'));
+    }
+
+    /// A null-input op yields a no-argument example call, and a serviceless package falls
+    /// back to the types-only consume section rather than a carrier.
+    #[test]
+    fn readme_handles_null_input_and_serviceless() {
+        let pong = CsilGroupExpression {
+            entries: vec![entry("ok", builtin("bool"), None)],
+        };
+        let svc = CsilServiceDefinition {
+            operations: vec![op(
+                "ping",
+                builtin("null"),
+                reference("Pong"),
+                CsilServiceDirection::Unidirectional,
+                None,
+            )],
+            wire_id: None,
+        };
+        let mut input = spec(
+            "kotlin-client",
+            vec![
+                rule("Pong", CsilRuleType::GroupDef(pong)),
+                rule("HealthService", CsilRuleType::ServiceDef(svc)),
+            ],
+        );
+        input
+            .config
+            .options
+            .insert("emit_packages".to_string(), serde_json::json!(["kotlin"]));
+        let out = process_generation(input).unwrap();
+        let c = content(&out, "README.md");
+        assert!(
+            c.contains("val resp = client.ping()"),
+            "null-input op should call with no args"
+        );
+
+        // A types-only spec (no services) gets the consume-the-types section, no carrier.
+        let typed = process_generation(package_input(vec![(
+            "emit_packages",
+            serde_json::json!(["kotlin"]),
+        )]))
+        .unwrap();
+        let tc = content(&typed, "README.md");
+        assert!(tc.contains("has no service operations"));
+        assert!(!tc.contains(": Transport"));
     }
 }

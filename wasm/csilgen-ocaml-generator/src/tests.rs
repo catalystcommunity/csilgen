@@ -740,7 +740,120 @@ fn package_files_absent_without_request() {
     assert!(paths.contains(&"client.ml"));
     assert!(!paths.contains(&"dune-project"));
     assert!(!paths.iter().any(|p| p.ends_with(".opam")));
+    assert!(!paths.contains(&"README.md"));
     assert!(!paths.iter().any(|p| p.starts_with("lib/")));
+}
+
+// --- package README + CSIL-RPC Quickstart -----------------------------------
+
+/// `Name = { .. }` parses to `TypeDef(Group(..))` (not `GroupDef`), so build the
+/// pingpong records that way to guard the README path against the real parser.
+fn record_typedef(name: &str, entries: Vec<CsilGroupEntry>) -> CsilRule {
+    CsilRule {
+        name: name.to_string(),
+        rule_type: CsilRuleType::TypeDef(CsilTypeExpression::Group(CsilGroupExpression {
+            entries,
+        })),
+        position: pos(),
+        doc_comments: vec![],
+    }
+}
+
+/// A minimal `ping: Ping -> Pong` service over two single-field records — the canonical
+/// Quickstart shape, with records as `TypeDef(Group)` per the real parser.
+fn pingpong_spec() -> CsilSpecSerialized {
+    CsilSpecSerialized {
+        rules: vec![
+            record_typedef("Ping", vec![bare_entry("msg", builtin("text"))]),
+            record_typedef("Pong", vec![bare_entry("msg", builtin("text"))]),
+            CsilRule {
+                name: "Echo".into(),
+                rule_type: CsilRuleType::ServiceDef(CsilServiceDefinition {
+                    operations: vec![CsilServiceOperation {
+                        name: "ping".into(),
+                        input_type: CsilTypeExpression::Reference("Ping".into()),
+                        output_type: CsilTypeExpression::Reference("Pong".into()),
+                        direction: CsilServiceDirection::Unidirectional,
+                        position: pos(),
+                        doc_comments: vec![],
+                        wire_id: None,
+                    }],
+                    wire_id: None,
+                }),
+                position: pos(),
+                doc_comments: vec![],
+            },
+        ],
+        source_content: None,
+        service_count: 1,
+        fields_with_metadata_count: 0,
+    }
+}
+
+#[test]
+fn package_readme_has_quickstart_carrier_and_example() {
+    // No OCaml toolchain is available here, so the README carrier cannot be compiled
+    // or run; this asserts the structural contract instead (runtime verify skipped).
+    let spec = pingpong_spec();
+    let cfg = package_config("ocaml-client", Some(serde_json::json!(["ocaml"])));
+    let files = generate_ocaml(&spec, &cfg).unwrap();
+    let readme = files
+        .iter()
+        .find(|f| f.path == "README.md")
+        .expect("README.md emitted at the package root");
+    let c = &readme.content;
+
+    // The carrier implements the generated transport seam (the `client.call` record).
+    assert!(
+        c.contains("Client.make_client ~call"),
+        "carrier must build the generated client over a `call` seam:\n{c}"
+    );
+    // It POSTs the canonical mount with the stdlib HTTP carrier.
+    assert!(
+        c.contains("/csil/v1/rpc"),
+        "carrier must POST the canonical mount"
+    );
+    assert!(
+        c.contains("POST %s HTTP/1.1"),
+        "carrier must speak HTTP/1.1"
+    );
+    // The request payload is tag-24 wrapped (embedded CBOR).
+    assert!(
+        c.contains("Cbor.Tag (24, Cbor.Bytes payload)"),
+        "request payload must be tag-24 wrapped"
+    );
+    // Both response arms are handled: transport status and the typed ServiceError arm.
+    assert!(
+        c.contains("transport status"),
+        "must surface a non-zero transport status"
+    );
+    assert!(
+        c.contains("\"ServiceError\""),
+        "must handle the typed ServiceError arm"
+    );
+    // The typed client is constructed over the carrier with a base URL.
+    assert!(
+        c.contains("make_rpc_client \"http://localhost:5080\""),
+        "example must construct the client over the carrier:\n{c}"
+    );
+    // The example call passes a generated sample request literal (not the failwith
+    // escape) and names the typed request binding.
+    assert!(
+        c.contains("Client.Echo.ping client req"),
+        "example call must invoke the first op over the carrier:\n{c}"
+    );
+    assert!(
+        c.contains("let req : Types.ping = { msg = \"example\" }"),
+        "example must pass a generated sample literal:\n{c}"
+    );
+}
+
+#[test]
+fn package_readme_absent_without_request() {
+    let spec = pingpong_spec();
+    let cfg = package_config("ocaml-client", None);
+    let files = generate_ocaml(&spec, &cfg).unwrap();
+    assert!(!files.iter().any(|f| f.path == "README.md"));
 }
 
 #[test]
@@ -766,6 +879,7 @@ fn package_files_emitted_when_ocaml_requested() {
     // to a valid OCaml library name.
     assert!(paths.contains(&"dune-project"));
     assert!(paths.contains(&"corndogs_service.opam"));
+    assert!(paths.contains(&"README.md"));
     assert!(paths.contains(&"lib/dune"));
     // The generated modules are relocated under `lib/`, none left at the root.
     assert!(paths.contains(&"lib/types.ml"));

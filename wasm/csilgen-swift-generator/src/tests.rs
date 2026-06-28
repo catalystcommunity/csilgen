@@ -587,6 +587,130 @@ fn codec_emitted_with_typed_client() {
     );
 }
 
+#[test]
+fn async_twin_emitted_by_default_with_marked_symbols() {
+    // Default client_style is `both`: an `async` twin at ClientAsync.swift whose symbols
+    // carry an `Async` marker so it coexists with the blocking client in one module.
+    let input = input_from_rules("swift-client", corndogs_rules(), 1);
+    let files = build_files(&input).expect("ok");
+    let twin = files
+        .iter()
+        .find(|f| f.path == "ClientAsync.swift")
+        .expect("ClientAsync.swift emitted");
+
+    // `async` transport seam, marked protocol name.
+    assert!(
+        twin.content
+            .contains("public protocol AsyncCsilTransport {")
+    );
+    assert!(twin.content.contains(
+        "func call(service: String, op: String, request: [UInt8]) async throws -> [UInt8]"
+    ));
+    // Marked per-service client over the marked seam.
+    assert!(twin.content.contains("public struct CorndogsAsyncClient {"));
+    assert!(
+        twin.content
+            .contains("public let transport: AsyncCsilTransport")
+    );
+    // Methods are `async throws` and `await` the byte seam.
+    assert!(
+        twin.content
+            .contains("public func submitTask(_ request: SubmitTaskRequest) async throws -> Task")
+    );
+    assert!(twin.content.contains("try await transport.call("));
+    assert!(twin.content.contains("Task.fromCbor(csilResp)"));
+    // The twin reuses the module's CsilClientError (declared in Client.swift).
+    assert!(!twin.content.contains("public struct CsilClientError"));
+
+    // The sync client is untouched: blocking seam + canonical names, no `async`.
+    let sync = files
+        .iter()
+        .find(|f| f.path == "Client.swift")
+        .expect("Client.swift emitted");
+    assert!(sync.content.contains("public struct CorndogsClient {"));
+    assert!(
+        sync.content
+            .contains("public func submitTask(_ request: SubmitTaskRequest) throws -> Task")
+    );
+    assert!(!sync.content.contains("async"));
+    assert!(!sync.content.contains("await"));
+    assert!(sync.content.contains("public struct CsilClientError"));
+}
+
+#[test]
+fn client_style_async_is_drop_in_at_canonical_path() {
+    // `client_style: async` yields a single `async` client at the canonical path with
+    // the canonical symbol names — a drop-in for a blocking consumer.
+    let mut input = input_from_rules("swift-client", corndogs_rules(), 1);
+    input
+        .config
+        .options
+        .insert("client_style".to_string(), serde_json::json!("async"));
+    let files = build_files(&input).expect("ok");
+    assert!(files.iter().any(|f| f.path == "Client.swift"));
+    assert!(
+        !files.iter().any(|f| f.path == "ClientAsync.swift"),
+        "async drop-in emits no separate twin"
+    );
+
+    let client = files.iter().find(|f| f.path == "Client.swift").unwrap();
+    // Canonical (unmarked) names, but `async`.
+    assert!(client.content.contains("public protocol CsilTransport {"));
+    assert!(client.content.contains(
+        "func call(service: String, op: String, request: [UInt8]) async throws -> [UInt8]"
+    ));
+    assert!(client.content.contains("public struct CorndogsClient {"));
+    assert!(
+        client
+            .content
+            .contains("public let transport: CsilTransport")
+    );
+    assert!(
+        client
+            .content
+            .contains("public func submitTask(_ request: SubmitTaskRequest) async throws -> Task")
+    );
+    assert!(client.content.contains("try await transport.call("));
+    // The drop-in is the primary file, so it still declares the shared error.
+    assert!(client.content.contains("public struct CsilClientError"));
+}
+
+#[test]
+fn client_style_sync_suppresses_the_twin() {
+    let mut input = input_from_rules("swift-client", corndogs_rules(), 1);
+    input
+        .config
+        .options
+        .insert("client_style".to_string(), serde_json::json!("sync"));
+    let files = build_files(&input).expect("ok");
+    assert!(files.iter().any(|f| f.path == "Client.swift"));
+    assert!(!files.iter().any(|f| f.path == "ClientAsync.swift"));
+    let client = files.iter().find(|f| f.path == "Client.swift").unwrap();
+    assert!(!client.content.contains("async"));
+    assert!(!client.content.contains("await"));
+    assert!(!client.content.contains("AsyncCsilTransport"));
+}
+
+#[test]
+fn client_style_invalid_value_is_rejected() {
+    // A bad value fails the whole run regardless of surface.
+    let mut input = input_from_rules("swift-client", corndogs_rules(), 1);
+    input
+        .config
+        .options
+        .insert("client_style".to_string(), serde_json::json!("blocking"));
+    assert!(build_files(&input).is_err());
+
+    // The validator names the offending option so the failure is actionable.
+    let mut opts = HashMap::new();
+    opts.insert("client_style".to_string(), serde_json::json!("blocking"));
+    let err = client_style(&opts).expect_err("invalid client_style must be rejected");
+    assert!(
+        err.contains("client_style"),
+        "error should name the option: {err}"
+    );
+}
+
 fn typedef_rule(name: &str, ty: CsilTypeExpression) -> CsilRule {
     CsilRule {
         name: name.to_string(),
@@ -742,6 +866,9 @@ fn package_mode_emits_manifest_and_relocates_sources() {
             .contains(".target(name: \"CsilgenClient\")")
     );
 
+    // The package README rides at the root, beside the manifest (never under Sources/).
+    assert!(files.iter().any(|f| f.path == "README.md"));
+
     // Generated sources live under SwiftPM's required Sources/<Target>/ layout, and
     // none remain at the package root.
     assert!(
@@ -827,6 +954,104 @@ fn emit_packages_non_array_is_parsed_defensively() {
     let files = build_files(&input).expect("ok");
     assert!(!files.iter().any(|f| f.path == "Package.swift"));
     assert!(files.iter().any(|f| f.path == "Types.swift"));
+}
+
+// --- package README + CSIL-RPC Quickstart -----------------------------------
+
+/// A minimal `ping: Ping -> Pong` service over two single-field records — the canonical
+/// Quickstart shape.
+fn pingpong_rules() -> Vec<CsilRule> {
+    vec![
+        group_rule("Ping", vec![bare_entry("msg", builtin("text"))]),
+        group_rule("Pong", vec![bare_entry("msg", builtin("text"))]),
+        service_rule(
+            "Echo",
+            vec![make_op(
+                "ping",
+                reference("Ping"),
+                reference("Pong"),
+                CsilServiceDirection::Unidirectional,
+            )],
+            None,
+        ),
+    ]
+}
+
+#[test]
+fn package_readme_has_quickstart_carrier_and_example() {
+    // No Swift toolchain is available here, so the README carrier cannot be compiled
+    // or run; this asserts the structural contract instead (runtime verify skipped).
+    let input = input_with_options(
+        "swift-client",
+        pingpong_rules(),
+        1,
+        vec![
+            ("emit_packages", serde_json::json!(["swift"])),
+            ("package_name", serde_json::json!("Echo")),
+        ],
+    );
+    let files = build_files(&input).expect("ok");
+    let readme = files
+        .iter()
+        .find(|f| f.path == "README.md")
+        .expect("README.md emitted at the package root");
+    let c = &readme.content;
+
+    // The carrier implements the generated (sync) transport seam.
+    assert!(
+        c.contains("struct CsilRpcTransport: CsilTransport"),
+        "README must embed the CSIL-RPC carrier:\n{c}"
+    );
+    assert!(
+        c.contains("func call(service: String, op: String, request: [UInt8]) throws -> [UInt8]"),
+        "carrier must implement the byte seam"
+    );
+    // It POSTs the canonical mount over the stdlib (Foundation) HTTP client.
+    assert!(
+        c.contains("/csil/v1/rpc"),
+        "carrier must POST the canonical mount"
+    );
+    assert!(c.contains("httpMethod = \"POST\""), "carrier must POST");
+    assert!(
+        c.contains("URLSession.shared.dataTask"),
+        "carrier must use URLSession"
+    );
+    // The request payload is tag-24 wrapped (embedded CBOR).
+    assert!(
+        c.contains(".tag(24, .bytes(request))"),
+        "request payload must be tag-24 wrapped"
+    );
+    // Both response arms are handled: transport status and the typed ServiceError arm.
+    assert!(
+        c.contains("transport status"),
+        "must surface a non-zero transport status"
+    );
+    assert!(
+        c.contains("variant == \"ServiceError\""),
+        "must handle the typed ServiceError arm"
+    );
+    // The typed sync client is constructed over the carrier with a base URL.
+    assert!(
+        c.contains("EchoClient(transport: CsilRpcTransport(baseURL: \"http://localhost:5080\"))"),
+        "example must construct the typed client over the carrier:\n{c}"
+    );
+    // The example call passes a generated sample request literal.
+    assert!(
+        c.contains("try client.ping(Ping(msg: \"example\"))"),
+        "example call must pass a generated sample literal:\n{c}"
+    );
+    // The example imports the generated package module by its target name.
+    assert!(
+        c.contains("import Echo"),
+        "example must import the package module"
+    );
+}
+
+#[test]
+fn package_readme_absent_without_request() {
+    let input = input_from_rules("swift-client", pingpong_rules(), 1);
+    let files = build_files(&input).expect("ok");
+    assert!(!files.iter().any(|f| f.path == "README.md"));
 }
 
 #[test]

@@ -113,6 +113,82 @@ enum Surface {
     TypesOnly,
 }
 
+/// Which client surface(s) to emit. Only the transport seam (the byte carrier that
+/// performs the network round-trip) and the per-method signatures turn `async`; the
+/// generated codec never does I/O and stays synchronous. `Both` is the default so every
+/// consumer keeps their blocking client and gains an `async` twin for free.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClientStyle {
+    /// Blocking-only client at `Client.swift`. The host owns its own I/O loop.
+    Sync,
+    /// `async` client, a drop-in at `Client.swift` with the canonical symbol names
+    /// (just `async`). For hosts whose carrier suspends.
+    Async,
+    /// Emit both — the blocking client at `Client.swift` plus an `async` twin at
+    /// `ClientAsync.swift` whose symbols carry an `Async` marker so the two coexist in
+    /// one module without name collisions. Default.
+    Both,
+}
+
+/// Read & validate `client_style` from the generation options. Any value other than
+/// `sync`/`async`/`both` is rejected so misconfiguration fails at generation time
+/// instead of silently degrading; absent defaults to `Both`. Returns a message that
+/// names the offending option, mirroring how a typed-enum option is validated.
+fn client_style(
+    options: &std::collections::HashMap<String, serde_json::Value>,
+) -> Result<ClientStyle, String> {
+    match options.get("client_style") {
+        None => Ok(ClientStyle::Both),
+        Some(v) => match v.as_str() {
+            Some("sync") => Ok(ClientStyle::Sync),
+            Some("async") => Ok(ClientStyle::Async),
+            Some("both") => Ok(ClientStyle::Both),
+            Some(other) => Err(format!(
+                "client_style must be \"sync\", \"async\", or \"both\", got {other:?}"
+            )),
+            None => Err(format!("client_style must be a string, got {v:?}")),
+        },
+    }
+}
+
+/// The shape of one emitted client file: whether its methods/seam are `async` and the
+/// symbol marker that keeps an `async` twin distinct from the blocking client when both
+/// land in the same module. `marker` is empty for a stand-alone client (sync, or
+/// async-as-drop-in) and `"Async"` for the twin in `Both` mode.
+#[derive(Debug, Clone, Copy)]
+struct ClientShape {
+    is_async: bool,
+    marker: &'static str,
+}
+
+impl ClientShape {
+    /// The effect clause for a method/seam signature: `async throws` when async, else
+    /// `throws` — matching the blocking client's existing error idiom.
+    fn effects(&self) -> &'static str {
+        if self.is_async {
+            "async throws"
+        } else {
+            "throws"
+        }
+    }
+
+    /// `await ` keyword (trailing space) for the seam call site, else empty.
+    fn await_kw(&self) -> &'static str {
+        if self.is_async { "await " } else { "" }
+    }
+
+    /// The byte-transport protocol name (`CsilTransport`, or `AsyncCsilTransport` for the
+    /// twin), per the `Async{TransportName}` marker convention.
+    fn transport_name(&self) -> String {
+        format!("{}CsilTransport", self.marker)
+    }
+
+    /// A per-service client struct name (`FooClient`, or `FooAsyncClient` for the twin).
+    fn client_name(&self, base: &str) -> String {
+        format!("{base}{}Client", self.marker)
+    }
+}
+
 fn build_files(input: &WasmGeneratorInput) -> Result<Vec<GeneratedFile>, i32> {
     let surface = match input.config.target.as_str() {
         "swift" | "swift-server" => Surface::Server,
@@ -120,6 +196,10 @@ fn build_files(input: &WasmGeneratorInput) -> Result<Vec<GeneratedFile>, i32> {
         "swift-typesonly" => Surface::TypesOnly,
         _ => return Err(error_codes::GENERATION_ERROR),
     };
+
+    // Validate `client_style` early so a bad value fails the whole run regardless of the
+    // requested surface, mirroring the TypeScript generator's option validation.
+    let style = client_style(&input.config.options).map_err(|_| error_codes::GENERATION_ERROR)?;
 
     let mut files = Vec::new();
 
@@ -142,11 +222,52 @@ fn build_files(input: &WasmGeneratorInput) -> Result<Vec<GeneratedFile>, i32> {
     if input.csil_spec.service_count > 0 {
         match surface {
             Surface::Client => {
-                if let Some(client) = generate_client(input) {
-                    files.push(GeneratedFile {
-                        path: "Client.swift".to_string(),
-                        content: client,
-                    });
+                // `Both` (the default) ships the blocking client at `Client.swift` and an
+                // `async` twin at `ClientAsync.swift`; `Async` makes the `async` client a
+                // drop-in at `Client.swift` (canonical names); `Sync` is today's output.
+                let sync = ClientShape {
+                    is_async: false,
+                    marker: "",
+                };
+                let async_drop_in = ClientShape {
+                    is_async: true,
+                    marker: "",
+                };
+                let async_twin = ClientShape {
+                    is_async: true,
+                    marker: "Async",
+                };
+                match style {
+                    ClientStyle::Sync => {
+                        if let Some(client) = generate_client(input, sync) {
+                            files.push(GeneratedFile {
+                                path: "Client.swift".to_string(),
+                                content: client,
+                            });
+                        }
+                    }
+                    ClientStyle::Async => {
+                        if let Some(client) = generate_client(input, async_drop_in) {
+                            files.push(GeneratedFile {
+                                path: "Client.swift".to_string(),
+                                content: client,
+                            });
+                        }
+                    }
+                    ClientStyle::Both => {
+                        if let Some(client) = generate_client(input, sync) {
+                            files.push(GeneratedFile {
+                                path: "Client.swift".to_string(),
+                                content: client,
+                            });
+                        }
+                        if let Some(client) = generate_client(input, async_twin) {
+                            files.push(GeneratedFile {
+                                path: "ClientAsync.swift".to_string(),
+                                content: client,
+                            });
+                        }
+                    }
                 }
             }
             Surface::Server => {
@@ -166,6 +287,12 @@ fn build_files(input: &WasmGeneratorInput) -> Result<Vec<GeneratedFile>, i32> {
     // `Sources/<Target>/` layout and add a manifest; otherwise output is unchanged.
     if let Some(pkg) = SwiftPackage::from_config(input) {
         files = wrap_as_package(files, &pkg);
+        // The README sits at the package root (beside Package.swift), not under
+        // Sources/, so it is not a compiled source.
+        files.push(GeneratedFile {
+            path: "README.md".to_string(),
+            content: swift_readme(input, &pkg),
+        });
     }
 
     Ok(files)
@@ -277,6 +404,264 @@ let package = Package(\n\
 )\n"
     )
 }
+
+// ---------------------------------------------------------------------------
+// Package README + CSIL-RPC Quickstart
+// ---------------------------------------------------------------------------
+
+/// The package README, with a copy-paste **Quickstart**. For a client package the
+/// Quickstart is a complete CSIL-RPC carrier (it reuses this package's own generated
+/// `CsilCbor`/`CsilCborValue` for the envelope, so it adds no third-party CBOR
+/// dependency; HTTP is Foundation's blocking `URLSession`), the typed sync client built
+/// over it, and one example call — a user changes only the base-URL string. A spec with
+/// no usable unary operation gets the import-the-types section without a carrier.
+fn swift_readme(input: &WasmGeneratorInput, pkg: &SwiftPackage) -> String {
+    let module = &pkg.target;
+    let name = &pkg.name;
+    let mut out = format!(
+        "# {name}\n\n\
+         Generated by csilgen. A typed, transport-agnostic CSIL-RPC client: the\n\
+         generated codec owns CBOR (de)serialization; you supply a *carrier* that only\n\
+         moves bytes.\n\n\
+         ## Consume\n\n\
+         Add this package to your `Package.swift` dependencies and list the `{name}`\n\
+         library product in your target's `dependencies`:\n\n\
+         ```swift\n\
+         // TODO: point at the published git URL + version once tagged.\n\
+         .package(path: \"./{name}\"),\n\
+         ```\n\n"
+    );
+    match first_swift_example(input) {
+        Some(example) => out.push_str(&swift_quickstart(module, &example)),
+        None => out.push_str(&format!(
+            "## Quickstart\n\n\
+             This package has no unary service operations — import the module and use\n\
+             its generated types and codec directly:\n\n\
+             ```swift\n\
+             import {module}\n\
+             // Foo.fromCbor(bytes) decodes; value.toCbor() encodes.\n\
+             ```\n"
+        )),
+    }
+    out
+}
+
+/// The pieces the Quickstart's example call needs: the sync client struct to construct,
+/// the method to call, and a compiling sample request literal (`None` for a request-less
+/// push-style op).
+struct SwiftExample {
+    client_struct: String,
+    method: String,
+    sample: Option<String>,
+}
+
+/// The first service (declared order) with a unary op whose success type — and, when
+/// present, request type — is a record the generated codec covers, so the example can
+/// call the clean typed sync client form. `None` for a serviceless / non-record-op spec.
+fn first_swift_example(input: &WasmGeneratorInput) -> Option<SwiftExample> {
+    let records = swift_record_names(input);
+    for rule in &input.csil_spec.rules {
+        let CsilRuleType::ServiceDef(service) = &rule.rule_type else {
+            continue;
+        };
+        for op in &service.operations {
+            if !matches!(op.direction, CsilServiceDirection::Unidirectional) {
+                continue;
+            }
+            if !is_record_ref(&success_type(&op.output_type), &records) {
+                continue;
+            }
+            let null_in = is_null_input(&op.input_type);
+            if !null_in && !is_record_ref(&op.input_type, &records) {
+                continue;
+            }
+            let sample = if null_in {
+                None
+            } else if let CsilTypeExpression::Reference(name) = &op.input_type {
+                Some(swift_record_literal(
+                    input,
+                    name,
+                    swift_find_record(input, name)?,
+                ))
+            } else {
+                None
+            };
+            if !null_in && sample.is_none() {
+                continue;
+            }
+            return Some(SwiftExample {
+                // The blocking client is the unmarked `<Base>Client` (sync shape).
+                client_struct: format!("{}Client", service_base(&rule.name)),
+                method: swift_ident(&op.name),
+                sample,
+            });
+        }
+    }
+    None
+}
+
+fn swift_quickstart(module: &str, ex: &SwiftExample) -> String {
+    let mut out = String::from("## Quickstart\n\n");
+    out.push_str(
+        "A complete CSIL-RPC carrier (no third-party deps — it reuses this package's\n\
+         generated CBOR codec for the envelope) plus the typed client over Foundation's\n\
+         blocking `URLSession`. Change the one base-URL string.\n\n",
+    );
+    out.push_str("```swift\n");
+    out.push_str("import Foundation\n");
+    out.push_str(&format!("import {module}\n\n"));
+    out.push_str(SWIFT_CARRIER);
+    out.push('\n');
+    out.push_str(&format!(
+        "let client = {}(transport: CsilRpcTransport(baseURL: \"http://localhost:5080\"))\n",
+        ex.client_struct
+    ));
+    match &ex.sample {
+        Some(literal) => out.push_str(&format!(
+            "let result = try client.{}({literal})\n",
+            ex.method
+        )),
+        None => out.push_str(&format!("let result = try client.{}()\n", ex.method)),
+    }
+    out.push_str("print(result)\n");
+    out.push_str("```\n");
+    out
+}
+
+/// The record a type reference names, if any — both `Name = { .. }` (`TypeDef(Group)`)
+/// and a bare group rule (`GroupDef`) are records.
+fn swift_find_record<'a>(
+    input: &'a WasmGeneratorInput,
+    name: &str,
+) -> Option<&'a CsilGroupExpression> {
+    input
+        .csil_spec
+        .rules
+        .iter()
+        .filter(|r| r.name == name)
+        .find_map(|r| match &r.rule_type {
+            CsilRuleType::GroupDef(g) => Some(g),
+            CsilRuleType::TypeDef(CsilTypeExpression::Group(g)) => Some(g),
+            _ => None,
+        })
+}
+
+/// `TypeName(label: <sample>, ...)` over a record's required (non-optional) named
+/// fields, keyed by the camelCase init labels the generated struct uses (optionals
+/// default to `nil` in the memberwise init, so they are omitted).
+fn swift_record_literal(
+    input: &WasmGeneratorInput,
+    name: &str,
+    group: &CsilGroupExpression,
+) -> String {
+    let type_name = swift_type_name(name);
+    let args: Vec<String> = group
+        .entries
+        .iter()
+        .filter(|e| !matches!(e.occurrence, Some(CsilOccurrence::Optional)))
+        .filter_map(|e| {
+            let field = entry_field_name(e)?;
+            Some(format!("{field}: {}", swift_sample(input, &e.value_type)))
+        })
+        .collect();
+    format!("{type_name}({})", args.join(", "))
+}
+
+/// A compiling Swift literal for `ty`: real values for scalars/collections and nested
+/// records (required fields only). A shape a generic sample cannot fabricate falls back
+/// to an empty-collection / default-init best effort the consumer edits.
+fn swift_sample(input: &WasmGeneratorInput, ty: &CsilTypeExpression) -> String {
+    match ty {
+        CsilTypeExpression::Builtin(name) => match name.as_str() {
+            "text" | "tstr" => "\"example\"".to_string(),
+            "bool" => "false".to_string(),
+            "float" => "0.0".to_string(),
+            "int" | "uint" => "0".to_string(),
+            "bytes" | "bstr" => "[]".to_string(),
+            "timestamp" => "\"1970-01-01T00:00:00Z\"".to_string(),
+            "decimal" => "\"0\"".to_string(),
+            _ => "[]".to_string(),
+        },
+        CsilTypeExpression::Array { .. } => "[]".to_string(),
+        CsilTypeExpression::Map { .. } => "[:]".to_string(),
+        CsilTypeExpression::Reference(name) => match swift_find_record(input, name) {
+            Some(group) => swift_record_literal(input, name, group),
+            None => format!("{}()", swift_type_name(name)),
+        },
+        _ => "[]".to_string(),
+    }
+}
+
+/// The carrier body — identical for every spec, so it is a constant. It wraps the
+/// already-encoded request in a `CsilRpcRequest` envelope (tag-24 payload) using this
+/// package's generated `CsilCbor`, POSTs it to `{baseURL}/csil/v1/rpc` with a blocking
+/// `URLSession`, and unwraps the `CsilRpcResponse` — surfacing a non-zero transport
+/// `status` or a typed `ServiceError` arm as a thrown `CsilClientError`.
+const SWIFT_CARRIER: &str = r#"// The carrier owns only the CSIL-RPC envelope + HTTP; it never touches your types.
+// Hybrid posture, path 1: the envelope reuses this package's generated CsilCbor /
+// CsilCborValue, so it adds no third-party CBOR dependency. HTTP is Foundation's
+// URLSession driven synchronously to satisfy the blocking `CsilTransport` seam.
+struct CsilRpcTransport: CsilTransport {
+    let baseURL: String
+
+    func call(service: String, op: String, request: [UInt8]) throws -> [UInt8] {
+        // CsilRpcRequest = { v, service, op, payload: #6.24(bstr) }; the payload is the
+        // encoded request wrapped in CBOR tag 24 (embedded CBOR).
+        let envelope = CsilCborValue.map([
+            (.text("v"), .uint(1)),
+            (.text("op"), .text(op)),
+            (.text("service"), .text(service)),
+            (.text("payload"), .tag(24, .bytes(request))),
+        ])
+        let mount = baseURL.hasSuffix("/") ? baseURL + "csil/v1/rpc" : baseURL + "/csil/v1/rpc"
+        var http = URLRequest(url: URL(string: mount)!)
+        http.httpMethod = "POST"
+        http.setValue("application/cbor", forHTTPHeaderField: "Content-Type")
+        http.setValue("application/cbor", forHTTPHeaderField: "Accept")
+        http.httpBody = Data(CsilCbor.encode(envelope))
+
+        // Block the calling thread on the async URLSession task — the seam is sync.
+        let semaphore = DispatchSemaphore(value: 0)
+        var outcome: Result<[UInt8], Error> =
+            .failure(CsilClientError(code: -1, message: "csil-rpc: no response"))
+        URLSession.shared.dataTask(with: http) { data, response, error in
+            defer { semaphore.signal() }
+            if let error { outcome = .failure(error); return }
+            guard let status = (response as? HTTPURLResponse)?.statusCode, status == 200,
+                  let data
+            else {
+                outcome = .failure(
+                    CsilClientError(code: -1, message: "csil-rpc: bad HTTP response"))
+                return
+            }
+            outcome = .success([UInt8](data))
+        }.resume()
+        semaphore.wait()
+        let responseBytes = try outcome.get()
+
+        let env = try CsilCbor.decode(responseBytes)
+        let status = try CsilCbor.asI64(CsilCbor.require(env, "status"))
+        // status != 0 is a transport failure: no typed payload.
+        if status != 0 {
+            throw CsilClientError(code: status, message: "csil-rpc: transport status \(status)")
+        }
+        let payloadValue = try CsilCbor.require(env, "payload")
+        guard case .tag(24, let innerValue) = payloadValue, case .bytes(let inner) = innerValue
+        else {
+            throw CsilClientError(
+                code: -1, message: "csil-rpc: response payload is not a tag-24 byte string")
+        }
+        // A typed ServiceError arm is an application error, not a transport one.
+        if case .text(let variant)? = CsilCbor.mapGet(env, "variant"), variant == "ServiceError" {
+            let e = try CsilCbor.decode(inner)
+            let code = try CsilCbor.asI64(CsilCbor.require(e, "code"))
+            let message = try CsilCbor.asText(CsilCbor.require(e, "message"))
+            throw CsilClientError(code: code, message: message)
+        }
+        return inner
+    }
+}
+"#;
 
 // ---------------------------------------------------------------------------
 // Identifier + literal helpers
@@ -1355,14 +1740,49 @@ fn is_record_ref(ty: &CsilTypeExpression, records: &std::collections::HashSet<St
     matches!(ty, CsilTypeExpression::Reference(n) if records.contains(&swift_type_name(n)))
 }
 
-fn generate_client(input: &WasmGeneratorInput) -> Option<String> {
+/// The caller-supplied byte carrier the generated client delegates to. The seam's `call`
+/// is `async throws` for the async shape (it owns the network round-trip); the blocking
+/// shape keeps the plain `throws`. The protocol name is marked (`AsyncCsilTransport`)
+/// only for the twin so it coexists with the blocking `CsilTransport` in one module.
+fn transport_protocol_swift(shape: ClientShape) -> String {
+    let name = shape.transport_name();
+    let effects = shape.effects();
+    // The carrier note tracks the seam's concurrency model so a reader of the generated
+    // source knows whether to supply a blocking or suspending implementation.
+    let carrier_note = if shape.is_async {
+        "Asynchronous — the seam suspends on the I/O round-trip."
+    } else {
+        "Synchronous and blocking — the host owns the I/O loop."
+    };
+    format!(
+        "/// The caller-supplied byte carrier: it performs the call named by (service, op)\n/// with the already-encoded request bytes and returns the response bytes, or\n/// throws. {carrier_note} The generated\n/// client owns (de)serialization; the carrier only moves bytes.\npublic protocol {name} {{\n    func call(service: String, op: String, request: [UInt8]) {effects} -> [UInt8]\n}}\n"
+    )
+}
+
+/// Client scaffolding emitted once at the top of the client file: the shared error type
+/// (primary file only) and the caller-supplied transport seam for this shape.
+fn client_prelude_swift(shape: ClientShape) -> String {
+    let mut out = String::new();
+    if shape.marker.is_empty() {
+        out.push_str(CLIENT_ERROR_SWIFT);
+        out.push('\n');
+    }
+    out.push_str(&transport_protocol_swift(shape));
+    out
+}
+
+fn generate_client(input: &WasmGeneratorInput, shape: ClientShape) -> Option<String> {
     let records = swift_record_names(input);
     let mut body = String::new();
     let mut any = false;
     for rule in &input.csil_spec.rules {
         if let CsilRuleType::ServiceDef(service) = &rule.rule_type {
-            body.push_str(&emit_client_struct(&rule.name, service, &records));
-            body.push_str(&emit_wire_ids(&rule.name, service));
+            body.push_str(&emit_client_struct(&rule.name, service, &records, shape));
+            // Wire-id ordinals are a module-level `enum` shared across both client shapes;
+            // only the primary file emits them so the twin never redeclares the enum.
+            if shape.marker.is_empty() {
+                body.push_str(&emit_wire_ids(&rule.name, service));
+            }
             any = true;
         }
     }
@@ -1370,7 +1790,7 @@ fn generate_client(input: &WasmGeneratorInput) -> Option<String> {
         return None;
     }
     let mut content = header("Generated CSIL service clients.");
-    content.push_str(CLIENT_PRELUDE_SWIFT);
+    content.push_str(&client_prelude_swift(shape));
     content.push('\n');
     content.push_str(&body);
     Some(content)
@@ -1380,9 +1800,13 @@ fn emit_client_struct(
     name: &str,
     service: &CsilServiceDefinition,
     records: &std::collections::HashSet<String>,
+    shape: ClientShape,
 ) -> String {
     let base = service_base(name);
-    let client = format!("{base}Client");
+    let client = shape.client_name(&base);
+    let transport = shape.transport_name();
+    let effects = shape.effects();
+    let await_kw = shape.await_kw();
     // Canonical wire strings (the wire contract): service lowercased, op PascalCased.
     let wire_service = wire_service_string(name);
     let mut out = String::new();
@@ -1390,8 +1814,8 @@ fn emit_client_struct(
         "/// {client} is a typed client for the {name} service. The client owns\n/// (de)serialization; the carrier only moves bytes.\n"
     ));
     out.push_str(&format!("public struct {client} {{\n"));
-    out.push_str("    public let transport: CsilTransport\n");
-    out.push_str("    public init(transport: CsilTransport) {\n");
+    out.push_str(&format!("    public let transport: {transport}\n"));
+    out.push_str(&format!("    public init(transport: {transport}) {{\n"));
     out.push_str("        self.transport = transport\n");
     out.push_str("    }\n\n");
 
@@ -1421,20 +1845,20 @@ fn emit_client_struct(
         let wire_op = wire_op_string(&op.name);
         if is_null_input(&op.input_type) {
             out.push_str(&format!(
-                "    public func {method}() throws -> {output} {{\n"
+                "    public func {method}() {effects} -> {output} {{\n"
             ));
             out.push_str(&format!(
-                "        let csilResp = try transport.call(service: {}, op: {}, request: [])\n",
+                "        let csilResp = try {await_kw}transport.call(service: {}, op: {}, request: [])\n",
                 swift_string_lit(&wire_service),
                 swift_string_lit(&wire_op),
             ));
         } else {
             let input = map_type(&op.input_type, false);
             out.push_str(&format!(
-                "    public func {method}(_ request: {input}) throws -> {output} {{\n"
+                "    public func {method}(_ request: {input}) {effects} -> {output} {{\n"
             ));
             out.push_str(&format!(
-                "        let csilResp = try transport.call(service: {}, op: {}, request: request.toCbor())\n",
+                "        let csilResp = try {await_kw}transport.call(service: {}, op: {}, request: request.toCbor())\n",
                 swift_string_lit(&wire_service),
                 swift_string_lit(&wire_op),
             ));
@@ -1704,7 +2128,10 @@ const ANY_VALUE_SWIFT: &str = "\
 public typealias AnyCsilValue = [UInt8]
 ";
 
-const CLIENT_PRELUDE_SWIFT: &str = "\
+/// The `CsilClientError` type, shared by the blocking client and its `async` twin. Only
+/// the primary file (the sync/drop-in client) declares it; the twin rides in the same
+/// module and reuses it, so it is never redeclared.
+const CLIENT_ERROR_SWIFT: &str = "\
 /// A structured error from a generated client call: a service-returned error
 /// (code/message), or a transport-level failure.
 public struct CsilClientError: Error, Equatable {
@@ -1714,14 +2141,6 @@ public struct CsilClientError: Error, Equatable {
         self.code = code
         self.message = message
     }
-}
-
-/// The caller-supplied byte carrier: it performs the call named by (service, op)
-/// with the already-encoded request bytes and returns the response bytes, or
-/// throws. Synchronous and blocking — the host owns the I/O loop. The generated
-/// client owns (de)serialization; the carrier only moves bytes.
-public protocol CsilTransport {
-    func call(service: String, op: String, request: [UInt8]) throws -> [UInt8]
 }
 ";
 

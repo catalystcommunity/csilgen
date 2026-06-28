@@ -134,11 +134,73 @@ impl CsharpConfig {
     }
 }
 
+/// Which client variant(s) to emit. `Both` is the default so every consumer keeps the
+/// blocking client they had AND gets an async twin for free; a consumer can opt down to a
+/// single shape explicitly. Only the transport seam and the per-method return types turn
+/// async — the generated codec never does I/O and stays synchronous.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClientStyle {
+    /// Blocking-only client at `Client.gen.cs` (today's output, unchanged).
+    Sync,
+    /// `Task`-returning client, a drop-in at `Client.gen.cs` with the canonical symbol
+    /// names — a consumer swapping sync for async changes nothing but the `await`.
+    Async,
+    /// Emit both — the sync client at `Client.gen.cs` plus an async twin at
+    /// `ClientAsync.gen.cs` whose symbols carry an `Async` marker so the two coexist in
+    /// one namespace without collisions. Default.
+    Both,
+}
+
+/// Read & validate `client_style` from the options block. Mirrors `decimal_mapping`: any
+/// value other than `sync`/`async`/`both` is rejected at generation time rather than
+/// silently degrading. Absent -> `Both`, so the blocking client is preserved and the
+/// async twin comes for free.
+fn client_style(options: &HashMap<String, serde_json::Value>) -> Result<ClientStyle, i32> {
+    match options.get("client_style") {
+        None => Ok(ClientStyle::Both),
+        Some(v) => match v.as_str() {
+            Some("sync") => Ok(ClientStyle::Sync),
+            Some("async") => Ok(ClientStyle::Async),
+            Some("both") => Ok(ClientStyle::Both),
+            _ => Err(error_codes::GENERATION_ERROR),
+        },
+    }
+}
+
+/// The shape of one emitted client file: whether its methods are async and the symbol
+/// marker that keeps an async twin distinct from the sync client when both land in one
+/// namespace. `marker` is empty for a stand-alone client (sync, or async-as-drop-in) and
+/// `"Async"` for the twin in `Both` mode. Per .NET convention the marker is ALSO the
+/// method-name suffix, so a twin method is `SubmitTaskAsync` while a drop-in keeps the
+/// canonical `SubmitTask` (true drop-in: same names, just awaited).
+#[derive(Debug, Clone, Copy)]
+struct ClientShape {
+    is_async: bool,
+    marker: &'static str,
+}
+
+impl ClientShape {
+    /// The byte-transport interface name: `ICsilTransport`, or `ICsilAsyncTransport` for
+    /// the twin (the `Async` marker is inserted after the `I` so the C# `I`-prefix idiom
+    /// is preserved rather than producing `AsyncICsilTransport`).
+    fn transport_name(&self) -> String {
+        format!("ICsil{}Transport", self.marker)
+    }
+
+    /// A per-service client class name: `FooClient`, or `FooAsyncClient` for the twin.
+    fn class_name(&self, base: &str) -> String {
+        format!("{base}{}Client", self.marker)
+    }
+}
+
 /// The single typed entry point used by both the WASM `generate` export and the
 /// integration tests. Kept `pub` so the `rlib` crate-type lets tests drive real
 /// generation (a `cdylib`-only crate cannot be linked by integration tests).
 pub fn render(input: WasmGeneratorInput) -> Result<WasmGeneratorOutput, i32> {
     let config = CsharpConfig::from_options(&input.config.options)?;
+    // Validate client_style up front (before emitting any file) so a bad value fails the
+    // whole run regardless of which target is requested.
+    let style = client_style(&input.config.options)?;
     let warnings: Vec<GeneratorWarning> = Vec::new();
     let mut files = Vec::new();
 
@@ -186,11 +248,52 @@ pub fn render(input: WasmGeneratorInput) -> Result<WasmGeneratorOutput, i32> {
     if input.csil_spec.service_count > 0 {
         match surface {
             Surface::Client => {
-                if let Some(client) = generate_client(&input, &config) {
-                    files.push(GeneratedFile {
-                        path: "Client.gen.cs".to_string(),
-                        content: client,
-                    });
+                // The sync client and the async drop-in share the canonical filename and
+                // symbol names; the async twin (Both mode) takes a separate file and the
+                // `Async` marker so the two coexist in one namespace.
+                let sync = ClientShape {
+                    is_async: false,
+                    marker: "",
+                };
+                let async_drop_in = ClientShape {
+                    is_async: true,
+                    marker: "",
+                };
+                let async_twin = ClientShape {
+                    is_async: true,
+                    marker: "Async",
+                };
+                match style {
+                    ClientStyle::Sync => {
+                        if let Some(client) = generate_client(&input, &config, sync) {
+                            files.push(GeneratedFile {
+                                path: "Client.gen.cs".to_string(),
+                                content: client,
+                            });
+                        }
+                    }
+                    ClientStyle::Async => {
+                        if let Some(client) = generate_client(&input, &config, async_drop_in) {
+                            files.push(GeneratedFile {
+                                path: "Client.gen.cs".to_string(),
+                                content: client,
+                            });
+                        }
+                    }
+                    ClientStyle::Both => {
+                        if let Some(client) = generate_client(&input, &config, sync) {
+                            files.push(GeneratedFile {
+                                path: "Client.gen.cs".to_string(),
+                                content: client,
+                            });
+                        }
+                        if let Some(client) = generate_client(&input, &config, async_twin) {
+                            files.push(GeneratedFile {
+                                path: "ClientAsync.gen.cs".to_string(),
+                                content: client,
+                            });
+                        }
+                    }
                 }
             }
             Surface::Server => {
@@ -214,6 +317,10 @@ pub fn render(input: WasmGeneratorInput) -> Result<WasmGeneratorOutput, i32> {
         files.push(GeneratedFile {
             path: format!("{}.csproj", coords.package_id),
             content: csproj_file(&coords),
+        });
+        files.push(GeneratedFile {
+            path: "README.md".to_string(),
+            content: readme_file(&input, &config, &coords),
         });
     }
 
@@ -319,6 +426,357 @@ fn csproj_file(coords: &PackageCoords) -> String {
     format!(
         "<Project Sdk=\"Microsoft.NET.Sdk\">\n  <PropertyGroup>\n    <TargetFramework>net8.0</TargetFramework>\n    <LangVersion>12.0</LangVersion>\n    <Nullable>enable</Nullable>\n    <ImplicitUsings>disable</ImplicitUsings>\n    <Deterministic>true</Deterministic>\n    <PackageId>{id}</PackageId>\n    <Version>{version}</Version>\n    <RootNamespace>{id}</RootNamespace>\n{generate}  </PropertyGroup>\n</Project>\n"
     )
+}
+
+// ---------------------------------------------------------------------------
+// Package README (with a copy-paste CSIL-RPC Quickstart)
+// ---------------------------------------------------------------------------
+
+/// The package README. For a client package it carries a copy-paste **Quickstart**: a
+/// complete, dependency-free CSIL-RPC carrier (it reuses this package's own generated
+/// CBOR codec for the envelope, so it adds no third-party dependency — not even the
+/// in-box `System.Formats.Cbor`), the typed client over it, and one example call. A
+/// serviceless / server package gets the consume-the-types section instead.
+fn readme_file(
+    input: &WasmGeneratorInput,
+    config: &CsharpConfig,
+    coords: &PackageCoords,
+) -> String {
+    let title = &coords.package_id;
+    let mut out = format!(
+        "# {title}\n\n\
+         Generated by csilgen. A typed, transport-agnostic CSIL-RPC client: the generated\n\
+         codec owns CBOR (de)serialization; you supply a *carrier* that only moves bytes.\n\n\
+         ## Install\n\n\
+         ```sh\n\
+         # TODO: a published NuGet artifact is pending. Until then, reference the generated\n\
+         # project directly from your app:\n\
+         dotnet add reference path/to/{title}.csproj\n\
+         ```\n\n"
+    );
+
+    let records = record_names(input);
+    // The carrier implements the sync `ICsilTransport` seam, which only the client surface
+    // emits — so the full Quickstart is client-only; everything else gets the types section.
+    let example = if input.config.target == "csharp-client" {
+        first_readme_example(input, &records, config)
+    } else {
+        None
+    };
+    match example {
+        Some(ex) => out.push_str(&readme_quickstart(config, &records, &ex)),
+        None => out.push_str(&format!(
+            "## Quickstart\n\n\
+             This package exposes generated types and a self-contained CBOR codec. Encode\n\
+             and decode them with the generated `Codec`:\n\n\
+             ```csharp\n\
+             using {ns};\n\n\
+             // byte[] bytes = Codec.Encode(value);\n\
+             // var value = Codec.Decode<YourType>(bytes);\n\
+             ```\n",
+            ns = config.namespace
+        )),
+    }
+    out
+}
+
+/// The client Quickstart section: prose + a single fenced C# block containing the carrier
+/// and the example call.
+fn readme_quickstart(
+    config: &CsharpConfig,
+    records: &std::collections::HashSet<String>,
+    ex: &ReadmeExample,
+) -> String {
+    let carrier = readme_carrier(&config.namespace, records.contains("ServiceError"));
+    let example = readme_example(ex);
+    format!(
+        "## Quickstart\n\n\
+         A complete CSIL-RPC carrier — **no third-party dependency**, it reuses this\n\
+         package's own generated CBOR codec (`CborValue`/`Cbor`) to build and parse the\n\
+         envelope. It POSTs to `{{baseUrl}}/csil/v1/rpc` with the stdlib `HttpClient` and\n\
+         hands the response payload bytes back to the generated client to decode. Change\n\
+         the one base-URL string.\n\n\
+         ```csharp\n{carrier}\n{example}```\n"
+    )
+}
+
+/// The CSIL-RPC carrier source. The generated codec exports a generic CBOR value tree
+/// (`CborValue`, with tag support) and a `Cbor.Encode`/`Cbor.Decode` pair, so the carrier
+/// builds the fixed envelope with those rather than pulling `System.Formats.Cbor` — path 1
+/// of the README hybrid rule (zero third-party deps). `__SERVICE_ERROR_ARM__` is filled
+/// with the typed decode only when the spec actually declares a `ServiceError` record.
+fn readme_carrier(namespace: &str, has_service_error: bool) -> String {
+    let arm = if has_service_error {
+        "            ServiceError se = Codec.Decode<ServiceError>(inner);\n            throw new CsilClientException(se.Code, se.Message);"
+    } else {
+        "            throw new CsilClientException(0, $\"csil-rpc {service}/{op}: service error\");"
+    };
+    CARRIER_CSHARP
+        .replace("__NAMESPACE__", namespace)
+        .replace("__SERVICE_ERROR_ARM__", arm)
+}
+
+/// The carrier body. A constant with two placeholders (the package namespace and the
+/// `ServiceError` arm) so its many C# braces need no `format!` escaping.
+const CARRIER_CSHARP: &str = r#"// CSIL-RPC carrier — DEPENDENCY-FREE. It reuses THIS package's generated CBOR
+// (CborValue/Cbor, from Codec.gen.cs) to build and parse the envelope, so it needs no
+// third-party CBOR library — not even the in-box System.Formats.Cbor. The generated Codec
+// owns your types' (de)serialization; this carrier only moves bytes over stdlib HttpClient.
+using System;
+using System.Net.Http;
+using System.Net.Http.Headers;
+using __NAMESPACE__;
+
+public sealed class CsilRpcHttpTransport : ICsilTransport, IDisposable
+{
+    private const ulong TagEncodedCbor = 24; // RFC 8949 §3.4.5.1 embedded CBOR
+    private readonly string _url;
+    private readonly HttpClient _http;
+
+    public CsilRpcHttpTransport(string baseUrl) : this(baseUrl, new HttpClientHandler()) { }
+
+    // The handler seam keeps the carrier testable: inject a stub HttpMessageHandler to
+    // exercise it in-process with no sockets.
+    public CsilRpcHttpTransport(string baseUrl, HttpMessageHandler handler)
+    {
+        _url = baseUrl.TrimEnd('/') + "/csil/v1/rpc";
+        _http = new HttpClient(handler);
+    }
+
+    public byte[] Call(string service, string op, byte[] request)
+    {
+        // CsilRpcRequest = { v, service, op, payload: #6.24(bstr) }. The payload is the
+        // already-encoded request wrapped in CBOR tag 24 (embedded CBOR).
+        var envelope = new CborValue.Map(new (CborValue, CborValue)[]
+        {
+            (new CborValue.Text("v"), new CborValue.Uint(1)),
+            (new CborValue.Text("service"), new CborValue.Text(service)),
+            (new CborValue.Text("op"), new CborValue.Text(op)),
+            (new CborValue.Text("payload"), new CborValue.Tag(TagEncodedCbor, new CborValue.Bytes(request))),
+        });
+
+        using var msg = new HttpRequestMessage(HttpMethod.Post, _url)
+        {
+            Content = new ByteArrayContent(Cbor.Encode(envelope)),
+        };
+        msg.Content.Headers.ContentType = new MediaTypeHeaderValue("application/cbor");
+        msg.Headers.Accept.ParseAdd("application/cbor");
+
+        using HttpResponseMessage resp = _http.Send(msg);
+        byte[] body = resp.Content.ReadAsByteArrayAsync().GetAwaiter().GetResult();
+        if (!resp.IsSuccessStatusCode)
+            throw new CsilClientException(0, $"csil-rpc {service}/{op}: http {(int)resp.StatusCode}");
+
+        // CsilRpcResponse = { v, status, ? variant, ? error, payload: #6.24(bstr) }.
+        var env = (CborValue.Map)Cbor.Decode(body);
+        long status = EnvInt(env, "status");
+        if (status != 0)
+            throw new CsilClientException(status, EnvText(env, "error") ?? $"transport status {status}");
+
+        byte[] inner = EnvPayload(env);
+        // A typed "ServiceError" arm is an application error, distinct from a transport failure.
+        if (EnvText(env, "variant") == "ServiceError")
+        {
+__SERVICE_ERROR_ARM__
+        }
+        return inner;
+    }
+
+    public void Dispose() => _http.Dispose();
+
+    private static CborValue? EnvLookup(CborValue.Map map, string key)
+    {
+        foreach (var (k, v) in map.Entries)
+            if (k is CborValue.Text t && t.Value == key) return v;
+        return null;
+    }
+
+    private static long EnvInt(CborValue.Map map, string key) => EnvLookup(map, key) switch
+    {
+        CborValue.Uint u => (long)u.Value,
+        CborValue.Int i => i.Value,
+        _ => 0,
+    };
+
+    private static string? EnvText(CborValue.Map map, string key) =>
+        EnvLookup(map, key) is CborValue.Text t ? t.Value : null;
+
+    // The response payload is a tag-24 byte string; hand its raw inner bytes to the codec.
+    private static byte[] EnvPayload(CborValue.Map map) =>
+        EnvLookup(map, "payload") is CborValue.Tag { Inner: CborValue.Bytes b }
+            ? b.Value
+            : throw new CsilClientException(0, "csil-rpc: response payload is not a tag-24 byte string");
+}
+"#;
+
+/// The example call: construct the typed client over the carrier and invoke the first
+/// unary op with a generated sample request literal.
+fn readme_example(ex: &ReadmeExample) -> String {
+    let call = match &ex.sample {
+        Some(sample) => format!("client.{}({sample})", ex.method),
+        None => format!("client.{}()", ex.method),
+    };
+    format!(
+        "// Construct the client over the carrier and make one call. Change the URL only.\n\
+         public static class Example\n{{\n    \
+         public static void Run()\n    {{\n        \
+         var client = new {client}(new CsilRpcHttpTransport(\"http://localhost:5080\"));\n        \
+         var response = {call};\n        \
+         System.Console.WriteLine(response);\n    }}\n}}\n",
+        client = ex.client_class,
+        call = call
+    )
+}
+
+/// The pieces the Quickstart's example call needs: the client class to construct, the
+/// method to call, and a compiling C# request literal (`None` when the op takes no input).
+struct ReadmeExample {
+    client_class: String,
+    method: String,
+    sample: Option<String>,
+}
+
+/// The first service (in rule order, matching the generated client) with a unary op the
+/// client emits a typed method for: a record (or null) request and a record success type.
+/// `None` for a serviceless package.
+fn first_readme_example(
+    input: &WasmGeneratorInput,
+    records: &std::collections::HashSet<String>,
+    config: &CsharpConfig,
+) -> Option<ReadmeExample> {
+    for rule in &input.csil_spec.rules {
+        let CsilRuleType::ServiceDef(service) = &rule.rule_type else {
+            continue;
+        };
+        for op in &service.operations {
+            if !matches!(op.direction, CsilServiceDirection::Unidirectional) {
+                continue;
+            }
+            let success = success_type(&op.output_type);
+            let req_null = op_input_is_null(&op.input_type);
+            if !is_record_ref(&success, records)
+                || !(req_null || is_record_ref(&op.input_type, records))
+            {
+                continue;
+            }
+            return Some(ReadmeExample {
+                client_class: format!("{}Client", service_base(&rule.name)),
+                method: pascal_ident(&op.name),
+                sample: if req_null {
+                    None
+                } else {
+                    Some(csharp_request_literal(
+                        input,
+                        &op.input_type,
+                        records,
+                        config,
+                    ))
+                },
+            });
+        }
+    }
+    None
+}
+
+/// A compiling `new Record { ... }` literal for a record-typed request. Always wraps the
+/// reference in a `new` so the call site is unambiguous.
+fn csharp_request_literal(
+    input: &WasmGeneratorInput,
+    ty: &CsilTypeExpression,
+    records: &std::collections::HashSet<String>,
+    config: &CsharpConfig,
+) -> String {
+    let mut visited = std::collections::HashSet::new();
+    csharp_sample(input, ty, records, config, &mut visited)
+}
+
+/// A compiling C# value for `ty`: real values for scalars, a `new Record { required... }`
+/// for a record reference (recursively), and `default!` for any shape a generic sample
+/// can't safely fabricate (maps, arrays, choices, decimal, timestamp, aliases) — `default!`
+/// type-checks against any target type, so the snippet always compiles even where the user
+/// must fill a value in. `visited` breaks self-referential record cycles.
+fn csharp_sample(
+    input: &WasmGeneratorInput,
+    ty: &CsilTypeExpression,
+    records: &std::collections::HashSet<String>,
+    config: &CsharpConfig,
+    visited: &mut std::collections::HashSet<String>,
+) -> String {
+    match ty {
+        CsilTypeExpression::Builtin(name) => match name.as_str() {
+            "text" | "tstr" | "string" => "\"example\"".to_string(),
+            "bool" => "false".to_string(),
+            "bytes" | "bstr" => "System.Array.Empty<byte>()".to_string(),
+            "int" | "uint" | "integer" | "number" | "float" | "float16" | "float32" | "float64"
+            | "int8" | "int16" | "int32" | "int64" | "uint8" | "uint16" | "uint32" | "uint64"
+            | "nint" | "double" => "0".to_string(),
+            _ => "default!".to_string(),
+        },
+        CsilTypeExpression::Reference(name) => {
+            let pascal = pascal_ident(name);
+            match find_record_group(input, name) {
+                Some(group) if !visited.contains(&pascal) => {
+                    visited.insert(pascal.clone());
+                    let literal = record_literal(input, &pascal, group, records, config, visited);
+                    visited.remove(&pascal);
+                    literal
+                }
+                // A non-record reference (scalar/collection alias) or a recursive cycle:
+                // `default!` is the always-compiling escape.
+                _ => "default!".to_string(),
+            }
+        }
+        _ => "default!".to_string(),
+    }
+}
+
+/// `new Pascal { Prop = <sample>, ... }` over a record's required fields (optional fields
+/// are nullable `init` properties and may be omitted).
+fn record_literal(
+    input: &WasmGeneratorInput,
+    pascal: &str,
+    group: &CsilGroupExpression,
+    records: &std::collections::HashSet<String>,
+    config: &CsharpConfig,
+    visited: &mut std::collections::HashSet<String>,
+) -> String {
+    let fields: Vec<String> = group
+        .entries
+        .iter()
+        .filter(|e| !matches!(e.occurrence, Some(CsilOccurrence::Optional)))
+        .filter_map(|e| {
+            e.key.as_ref().map(|key| {
+                format!(
+                    "{} = {}",
+                    pascal_ident(&wire_key(key)),
+                    csharp_sample(input, &e.value_type, records, config, visited)
+                )
+            })
+        })
+        .collect();
+    if fields.is_empty() {
+        format!("new {pascal} {{ }}")
+    } else {
+        format!("new {pascal} {{ {} }}", fields.join(", "))
+    }
+}
+
+/// The record group a type name refers to, if it names a record (`Name = { ... }` parses as
+/// `TypeDef(Group)`; a bare group rule is `GroupDef`).
+fn find_record_group<'a>(
+    input: &'a WasmGeneratorInput,
+    name: &str,
+) -> Option<&'a CsilGroupExpression> {
+    input.csil_spec.rules.iter().find_map(|r| {
+        if r.name != name {
+            return None;
+        }
+        match &r.rule_type {
+            CsilRuleType::GroupDef(g) => Some(g),
+            CsilRuleType::TypeDef(CsilTypeExpression::Group(g)) => Some(g),
+            _ => None,
+        }
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -561,7 +1019,9 @@ fn is_literal_choice(choice: &CsilTypeExpression) -> bool {
 // Client
 // ---------------------------------------------------------------------------
 
-const CLIENT_PRELUDE: &str = "\
+/// The synchronous byte transport seam. Kept byte-identical to its original form so a
+/// `sync` (or default-`both`) client's output never changes.
+const CLIENT_TRANSPORT_SYNC: &str = "\
 /// <summary>The caller-supplied dumb byte transport seam. The generated client owns
 /// (de)serialization (canonical CBOR via the generated codec); the transport only
 /// moves bytes — it performs the call named by (service, op) with the already-encoded
@@ -570,7 +1030,11 @@ public interface ICsilTransport
 {
     byte[] Call(string service, string op, byte[] request);
 }
+";
 
+/// The shared client exception. Emitted only by the canonical (unmarked) prelude so that
+/// when an async twin shares the namespace with the sync client it does not redefine it.
+const CLIENT_EXCEPTION: &str = "\
 /// <summary>Raised by a generated client when the transport reports a failure.</summary>
 public sealed class CsilClientException : System.Exception
 {
@@ -583,14 +1047,44 @@ public sealed class CsilClientException : System.Exception
 }
 ";
 
-fn generate_client(input: &WasmGeneratorInput, config: &CsharpConfig) -> Option<String> {
+/// The async byte transport seam, parameterized by interface name so the drop-in can reuse
+/// the canonical `ICsilTransport` while the twin takes `ICsilAsyncTransport`. The seam owns
+/// the I/O round-trip and so returns a `Task<byte[]>`; the generated codec stays synchronous.
+fn client_transport_async(transport: &str) -> String {
+    format!(
+        "/// <summary>The caller-supplied dumb byte transport seam (async variant). The generated\n/// client owns (de)serialization (canonical CBOR via the generated codec); the transport\n/// only moves bytes — it performs the call named by (service, op) with the already-encoded\n/// request and returns a Task of the response bytes. The generated codec stays synchronous.</summary>\npublic interface {transport}\n{{\n    System.Threading.Tasks.Task<byte[]> Call(string service, string op, byte[] request);\n}}\n"
+    )
+}
+
+/// The prelude (transport interface + shared exception) for one client file. The exception
+/// rides only with the canonical (unmarked) prelude; the marked twin reuses the sync file's
+/// copy since both compile into one namespace.
+fn client_prelude(shape: &ClientShape) -> String {
+    let mut prelude = String::new();
+    if shape.is_async {
+        prelude.push_str(&client_transport_async(&shape.transport_name()));
+    } else {
+        prelude.push_str(CLIENT_TRANSPORT_SYNC);
+    }
+    if shape.marker.is_empty() {
+        prelude.push('\n');
+        prelude.push_str(CLIENT_EXCEPTION);
+    }
+    prelude
+}
+
+fn generate_client(
+    input: &WasmGeneratorInput,
+    config: &CsharpConfig,
+    shape: ClientShape,
+) -> Option<String> {
     let mut body = String::new();
     let mut emitted = false;
     let records = record_names(input);
 
     for rule in &input.csil_spec.rules {
         if let CsilRuleType::ServiceDef(service) = &rule.rule_type {
-            emit_client_class(&mut body, &rule.name, service, config, &records);
+            emit_client_class(&mut body, &rule.name, service, config, &records, shape);
             emitted = true;
         }
     }
@@ -603,7 +1097,7 @@ fn generate_client(input: &WasmGeneratorInput, config: &CsharpConfig) -> Option<
     content.push_str(FILE_HEADER);
     content.push('\n');
     content.push_str(&format!("namespace {};\n\n", config.namespace));
-    content.push_str(CLIENT_PRELUDE);
+    content.push_str(&client_prelude(&shape));
     content.push('\n');
     content.push_str(&body);
     Some(content)
@@ -615,17 +1109,20 @@ fn emit_client_class(
     service: &CsilServiceDefinition,
     config: &CsharpConfig,
     records: &std::collections::HashSet<String>,
+    shape: ClientShape,
 ) {
     let base = service_base(name);
-    let client = format!("{base}Client");
+    let client = shape.class_name(&base);
+    let transport = shape.transport_name();
     // Canonical wire strings (the wire contract): service lowercased, op PascalCased.
+    // These never change with the client shape — the async twin rides the same wire.
     let wire_service = base.to_lowercase();
 
     body.push_str(&format!(
         "/// <summary>Typed RPC client for the {name} service. The client owns\n/// (de)serialization via the generated codec; the transport only moves bytes.</summary>\n"
     ));
     body.push_str(&format!(
-        "public sealed class {client}(ICsilTransport transport)\n{{\n"
+        "public sealed class {client}({transport} transport)\n{{\n"
     ));
 
     for operation in &service.operations {
@@ -652,19 +1149,32 @@ fn emit_client_class(
             ));
             continue;
         }
-        let method = pascal_ident(&operation.name);
+        // The `Async` suffix rides the marker so the twin's `SubmitTaskAsync` coexists with
+        // the sync `SubmitTask`, while the drop-in keeps the canonical name.
+        let method = format!("{}{}", pascal_ident(&operation.name), shape.marker);
         let wire_op = wire_op_string(&operation.name);
         let output = map_csil_type(&success, config);
+        // Only the seam round-trip and the return type turn async; `System.Threading.Tasks`
+        // is fully qualified so a record literally named `Task` never shadows the future.
+        let (async_kw, await_kw, ret) = if shape.is_async {
+            (
+                "async ",
+                "await ",
+                format!("System.Threading.Tasks.Task<{output}>"),
+            )
+        } else {
+            ("", "", output.clone())
+        };
         match op_param(&operation.input_type) {
             None => {
                 body.push_str(&format!(
-                    "    public {output} {method}() =>\n        Codec.Decode<{output}>(transport.Call(\"{wire_service}\", \"{wire_op}\", System.Array.Empty<byte>()));\n"
+                    "    public {async_kw}{ret} {method}() =>\n        Codec.Decode<{output}>({await_kw}transport.Call(\"{wire_service}\", \"{wire_op}\", System.Array.Empty<byte>()));\n"
                 ));
             }
             Some(param) => {
                 let input = map_csil_type(&operation.input_type, config);
                 body.push_str(&format!(
-                    "    public {output} {method}({input} {param}) =>\n        Codec.Decode<{output}>(transport.Call(\"{wire_service}\", \"{wire_op}\", Codec.Encode({param})));\n"
+                    "    public {async_kw}{ret} {method}({input} {param}) =>\n        Codec.Decode<{output}>({await_kw}transport.Call(\"{wire_service}\", \"{wire_op}\", Codec.Encode({param})));\n"
                 ));
             }
         }
@@ -2737,6 +3247,155 @@ mod tests {
             .unwrap_or_else(|| panic!("expected file {path}"))
     }
 
+    /// A minimal ping/pong spec: `PingRequest`/`PongResponse` share a single `message`
+    /// field (so an echo of the request bytes decodes cleanly as the response), a
+    /// `ServiceError`, and `PingService.ping: PingRequest -> PongResponse / ServiceError`.
+    /// Used to verify the README carrier hermetically.
+    fn pingpong_input(target: &str) -> WasmGeneratorInput {
+        let text = || CsilTypeExpression::Builtin("text".to_string());
+        let pos = || CsilPosition {
+            line: 1,
+            column: 1,
+            offset: 0,
+        };
+        let group_rule = |name: &str, entries: Vec<CsilGroupEntry>| CsilRule {
+            name: name.to_string(),
+            rule_type: CsilRuleType::GroupDef(CsilGroupExpression { entries }),
+            position: pos(),
+            doc_comments: Vec::new(),
+        };
+        let req = group_rule("PingRequest", vec![bare_entry("message", text())]);
+        let resp = group_rule("PongResponse", vec![bare_entry("message", text())]);
+        let err = group_rule(
+            "ServiceError",
+            vec![
+                bare_entry("code", CsilTypeExpression::Builtin("int".to_string())),
+                bare_entry("message", text()),
+            ],
+        );
+        let svc = CsilRule {
+            name: "PingService".to_string(),
+            rule_type: CsilRuleType::ServiceDef(CsilServiceDefinition {
+                operations: vec![CsilServiceOperation {
+                    name: "ping".to_string(),
+                    input_type: CsilTypeExpression::Reference("PingRequest".to_string()),
+                    output_type: CsilTypeExpression::Choice(vec![
+                        CsilTypeExpression::Reference("PongResponse".to_string()),
+                        CsilTypeExpression::Reference("ServiceError".to_string()),
+                    ]),
+                    direction: CsilServiceDirection::Unidirectional,
+                    position: pos(),
+                    doc_comments: Vec::new(),
+                    wire_id: None,
+                }],
+                wire_id: None,
+            }),
+            position: pos(),
+            doc_comments: Vec::new(),
+        };
+        WasmGeneratorInput {
+            csil_spec: CsilSpecSerialized {
+                rules: vec![req, resp, err, svc],
+                source_content: None,
+                service_count: 1,
+                fields_with_metadata_count: 0,
+            },
+            config: GeneratorConfig {
+                target: target.to_string(),
+                output_dir: "/tmp".to_string(),
+                options: HashMap::new(),
+            },
+            generator_metadata: GeneratorMetadata {
+                name: "csharp".to_string(),
+                version: "1.0.0".to_string(),
+                description: String::new(),
+                target: "csharp".to_string(),
+                capabilities: vec![],
+                author: None,
+                homepage: None,
+            },
+        }
+    }
+
+    /// Extract the body of the first ```csharp fenced block in a README.
+    fn csharp_block(readme: &str) -> &str {
+        let start = readme
+            .find("```csharp\n")
+            .map(|i| i + "```csharp\n".len())
+            .expect("README has a ```csharp block");
+        let rest = &readme[start..];
+        let end = rest.find("\n```").expect("the ```csharp block is closed");
+        &rest[..end]
+    }
+
+    #[test]
+    fn package_readme_has_quickstart_carrier_and_example() {
+        let mut input = pingpong_input("csharp-client");
+        input
+            .config
+            .options
+            .insert("emit_packages".to_string(), serde_json::json!(["csharp"]));
+        input
+            .config
+            .options
+            .insert("package_name".to_string(), serde_json::json!("Acme.Ping"));
+        let output = render(input).expect("generation ok");
+        let readme = file_content(&output, "README.md");
+
+        // Title + install one-liner for the language's package manager.
+        assert!(readme.starts_with("# Acme.Ping\n"));
+        assert!(readme.contains("dotnet add reference"));
+        // The hybrid posture is stated: dependency-free, reusing the generated CBOR codec.
+        assert!(readme.contains("no third-party dependency"));
+
+        let block = csharp_block(readme);
+        // The carrier: a type implementing the generated sync transport seam, building the
+        // CSIL-RPC envelope and POSTing it.
+        assert!(block.contains("public sealed class CsilRpcHttpTransport : ICsilTransport"));
+        assert!(block.contains("byte[] Call(string service, string op, byte[] request)"));
+        assert!(block.contains("\"/csil/v1/rpc\""));
+        assert!(block.contains("application/cbor"));
+        assert!(block.contains("_http.Send(msg)"));
+        // It reuses the generated generic CBOR (no System.Formats.Cbor) for the envelope,
+        // wrapping the payload in tag 24.
+        assert!(block.contains("Cbor.Encode(envelope)"));
+        assert!(block.contains("new CborValue.Tag(TagEncodedCbor, new CborValue.Bytes(request))"));
+        assert!(!block.contains("using System.Formats.Cbor"));
+        // status / ServiceError handling.
+        assert!(block.contains("if (status != 0)"));
+        assert!(block.contains("EnvText(env, \"variant\") == \"ServiceError\""));
+        assert!(block.contains("Codec.Decode<ServiceError>(inner)"));
+        // Client construction over the carrier + the one example call with a sample literal.
+        assert!(block.contains("new PingClient(new CsilRpcHttpTransport("));
+        assert!(block.contains("client.Ping(new PingRequest { Message = \"example\" })"));
+    }
+
+    #[test]
+    fn readme_emitted_only_in_package_mode() {
+        let plain = render(corndogs_input("csharp-client")).expect("generation ok");
+        assert!(!plain.files.iter().any(|f| f.path == "README.md"));
+        let packaged = render(input_with_options(
+            "csharp-client",
+            &[("emit_packages", serde_json::json!(["csharp"]))],
+        ))
+        .expect("generation ok");
+        assert!(packaged.files.iter().any(|f| f.path == "README.md"));
+    }
+
+    #[test]
+    fn server_package_readme_has_no_carrier() {
+        // The carrier implements the client-only sync seam; a server package must not emit
+        // it, falling back to the types/codec section instead.
+        let output = render(input_with_options(
+            "csharp",
+            &[("emit_packages", serde_json::json!(["csharp"]))],
+        ))
+        .expect("generation ok");
+        let readme = file_content(&output, "README.md");
+        assert!(!readme.contains("ICsilTransport"));
+        assert!(readme.contains("Codec.Decode<YourType>"));
+    }
+
     #[test]
     fn client_uses_dumb_byte_seam() {
         let output = render(corndogs_input("csharp-client")).expect("generation ok");
@@ -2757,6 +3416,92 @@ mod tests {
         assert!(client.contains(
             "public Task SubmitTask(SubmitTaskRequest submitTaskRequest) =>\n        Codec.Decode<Task>(transport.Call(\"corndogs\", \"SubmitTask\", Codec.Encode(submitTaskRequest)));"
         ));
+    }
+
+    #[test]
+    fn async_twin_emitted_by_default_with_marked_symbols() {
+        // Default `client_style` is `both`: the async twin lives at `ClientAsync.gen.cs`
+        // and carries an `Async` marker on its transport, class, and method names so it
+        // coexists with the sync client in one namespace.
+        let output = render(corndogs_input("csharp-client")).expect("generation ok");
+        let twin = file_content(&output, "ClientAsync.gen.cs");
+
+        // The transport seam returns a Task; its interface name is marked.
+        assert!(twin.contains("public interface ICsilAsyncTransport"));
+        assert!(twin.contains(
+            "System.Threading.Tasks.Task<byte[]> Call(string service, string op, byte[] request);"
+        ));
+        // Marked class + Async-suffixed, Task-returning method awaiting the byte seam.
+        assert!(
+            twin.contains("public sealed class CorndogsAsyncClient(ICsilAsyncTransport transport)")
+        );
+        assert!(twin.contains(
+            "public async System.Threading.Tasks.Task<Task> SubmitTaskAsync(SubmitTaskRequest submitTaskRequest) =>\n        Codec.Decode<Task>(await transport.Call(\"corndogs\", \"SubmitTask\", Codec.Encode(submitTaskRequest)));"
+        ));
+        // The shared exception is NOT redefined in the twin (the sync file owns it).
+        assert!(!twin.contains("class CsilClientException"));
+
+        // The sync client is untouched: blocking, canonical names, no Task/await.
+        let sync = file_content(&output, "Client.gen.cs");
+        assert!(sync.contains("public sealed class CorndogsClient(ICsilTransport transport)"));
+        assert!(sync.contains("public Task SubmitTask(SubmitTaskRequest submitTaskRequest) =>"));
+        assert!(!sync.contains("await "));
+        assert!(!sync.contains("System.Threading.Tasks.Task<"));
+        assert!(sync.contains("class CsilClientException"));
+    }
+
+    #[test]
+    fn client_style_async_is_drop_in_at_canonical_path() {
+        // `client_style: async` yields a single async client at the canonical filename
+        // with the canonical symbol names — a drop-in for a sync consumer.
+        let output = render(input_with_options(
+            "csharp-client",
+            &[("client_style", serde_json::json!("async"))],
+        ))
+        .expect("generation ok");
+        let paths: Vec<&str> = output.files.iter().map(|f| f.path.as_str()).collect();
+        assert!(
+            !paths.contains(&"ClientAsync.gen.cs"),
+            "async drop-in emits no separate twin"
+        );
+        assert!(paths.contains(&"Client.gen.cs"));
+
+        let client = file_content(&output, "Client.gen.cs");
+        // Canonical (unmarked) names, but async + Task-returning.
+        assert!(client.contains("public interface ICsilTransport"));
+        assert!(client.contains(
+            "System.Threading.Tasks.Task<byte[]> Call(string service, string op, byte[] request);"
+        ));
+        assert!(client.contains("public sealed class CorndogsClient(ICsilTransport transport)"));
+        assert!(client.contains(
+            "public async System.Threading.Tasks.Task<Task> SubmitTask(SubmitTaskRequest submitTaskRequest) =>\n        Codec.Decode<Task>(await transport.Call(\"corndogs\", \"SubmitTask\", Codec.Encode(submitTaskRequest)));"
+        ));
+        // A standalone drop-in still defines the shared exception.
+        assert!(client.contains("class CsilClientException"));
+    }
+
+    #[test]
+    fn client_style_sync_suppresses_the_twin() {
+        let output = render(input_with_options(
+            "csharp-client",
+            &[("client_style", serde_json::json!("sync"))],
+        ))
+        .expect("generation ok");
+        let paths: Vec<&str> = output.files.iter().map(|f| f.path.as_str()).collect();
+        assert!(!paths.contains(&"ClientAsync.gen.cs"));
+        let client = file_content(&output, "Client.gen.cs");
+        assert!(!client.contains("await "));
+        assert!(!client.contains("System.Threading.Tasks.Task<"));
+    }
+
+    #[test]
+    fn client_style_invalid_value_is_rejected() {
+        // An unknown value fails the whole run (mirrors decimal_mapping's hard error).
+        let result = render(input_with_options(
+            "csharp-client",
+            &[("client_style", serde_json::json!("blocking"))],
+        ));
+        assert!(result.is_err(), "invalid client_style must fail generation");
     }
 
     #[test]
@@ -3018,6 +3763,194 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Compile the default (`both`) output — sync client, async twin, and codec all in one
+    /// project — and round-trip a corndogs request through an async loopback transport via
+    /// `await`-ing the twin's `SubmitTaskAsync`. This also proves the sync and async symbols
+    /// coexist in one namespace. Skips cleanly when no dotnet toolchain is on PATH.
+    #[test]
+    fn async_client_round_trips_through_dotnet() {
+        let probe = std::process::Command::new("dotnet")
+            .arg("--version")
+            .output();
+        if probe.map(|o| !o.status.success()).unwrap_or(true) {
+            eprintln!("skipping: no dotnet toolchain on PATH");
+            return;
+        }
+
+        // Default style is `both`, so the package carries both Client.gen.cs and
+        // ClientAsync.gen.cs; the async twin is what the driver exercises.
+        let output = render(corndogs_input("csharp-client")).expect("generation ok");
+        assert!(
+            output.files.iter().any(|f| f.path == "ClientAsync.gen.cs"),
+            "default `both` emits an async twin"
+        );
+
+        let dir = std::env::temp_dir().join(format!("csilgen-csharp-async-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for file in &output.files {
+            std::fs::write(dir.join(&file.path), &file.content).unwrap();
+        }
+        std::fs::write(dir.join("Program.cs"), CSHARP_ASYNC_DRIVER).unwrap();
+        std::fs::write(dir.join("roundtrip.csproj"), CSHARP_CSPROJ).unwrap();
+
+        let mut cmd = std::process::Command::new("dotnet");
+        cmd.arg("run")
+            .arg("--project")
+            .arg(&dir)
+            .current_dir(&dir)
+            // Keep the build self-contained: confine the NuGet/MSBuild state to the temp
+            // dir and never block on telemetry/first-run noise.
+            .env("DOTNET_NOLOGO", "1")
+            .env("DOTNET_CLI_TELEMETRY_OPTOUT", "1")
+            .env("DOTNET_SKIP_FIRST_TIME_EXPERIENCE", "1")
+            .env("NUGET_PACKAGES", dir.join(".nuget"));
+        if let Ok(home) = std::env::var("DOTNET_CLI_HOME") {
+            cmd.env("DOTNET_CLI_HOME", home);
+        }
+        let run = cmd.output().unwrap();
+        let stdout = String::from_utf8_lossy(&run.stdout);
+        let stderr = String::from_utf8_lossy(&run.stderr);
+        assert!(
+            run.status.success(),
+            "dotnet run failed:\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        assert_eq!(
+            stdout.trim(),
+            "ok",
+            "unexpected output:\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Compile the README's Quickstart carrier against the real generated ping/pong
+    /// package and round-trip a request through it with NO cross-process socket: a custom
+    /// HttpMessageHandler echoes the tag-24 inner payload in-process, so the typed client's
+    /// field must survive the envelope build/parse the carrier performs. Skips cleanly when
+    /// no dotnet toolchain is on PATH; the first restore/build can be slow.
+    #[test]
+    fn readme_carrier_compiles_and_round_trips_through_dotnet() {
+        let probe = std::process::Command::new("dotnet")
+            .arg("--version")
+            .output();
+        if probe.map(|o| !o.status.success()).unwrap_or(true) {
+            eprintln!("skipping: no dotnet toolchain on PATH");
+            return;
+        }
+
+        // Generate the ping/pong package (so the README is emitted), then extract its
+        // carrier. Ping/pong shares the `message` field across request and response so the
+        // echo of the request bytes decodes cleanly as the response.
+        let mut input = pingpong_input("csharp-client");
+        input
+            .config
+            .options
+            .insert("emit_packages".to_string(), serde_json::json!(["csharp"]));
+        let output = render(input).expect("generation ok");
+        let readme = file_content(&output, "README.md").to_string();
+        let carrier = csharp_block(&readme).to_string();
+
+        let dir =
+            std::env::temp_dir().join(format!("csilgen-csharp-readme-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // Write every generated source except the library `.csproj` (a single Exe project
+        // owns the dir for `dotnet run`) and the README (markdown, not compiled).
+        for file in &output.files {
+            if file.path.ends_with(".csproj") || file.path == "README.md" {
+                continue;
+            }
+            std::fs::write(dir.join(&file.path), &file.content).unwrap();
+        }
+        std::fs::write(dir.join("Carrier.cs"), &carrier).unwrap();
+        std::fs::write(dir.join("Program.cs"), CSHARP_README_ECHO_DRIVER).unwrap();
+        std::fs::write(dir.join("roundtrip.csproj"), CSHARP_CSPROJ).unwrap();
+
+        let mut cmd = std::process::Command::new("dotnet");
+        cmd.arg("run")
+            .arg("--project")
+            .arg(&dir)
+            .current_dir(&dir)
+            .env("DOTNET_NOLOGO", "1")
+            .env("DOTNET_CLI_TELEMETRY_OPTOUT", "1")
+            .env("DOTNET_SKIP_FIRST_TIME_EXPERIENCE", "1")
+            .env("NUGET_PACKAGES", dir.join(".nuget"));
+        if let Ok(home) = std::env::var("DOTNET_CLI_HOME") {
+            cmd.env("DOTNET_CLI_HOME", home);
+        }
+        let run = cmd.output().unwrap();
+        let stdout = String::from_utf8_lossy(&run.stdout);
+        let stderr = String::from_utf8_lossy(&run.stderr);
+        assert!(
+            run.status.success(),
+            "dotnet run failed:\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        assert_eq!(
+            stdout.trim(),
+            "ok",
+            "unexpected output:\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The driver for the README round-trip: an in-process `HttpMessageHandler` that decodes
+    /// the CSIL-RPC request the carrier built and echoes its tag-24 inner payload back in a
+    /// `status:0` response, then calls the typed client over the README carrier. The
+    /// ping/pong `message` field round-trips through the real carrier + codec with no socket.
+    const CSHARP_README_ECHO_DRIVER: &str = r#"using System.Net;
+using System.Net.Http;
+using Csilgen.Transport;
+
+internal sealed class EchoHandler : HttpMessageHandler
+{
+    protected override HttpResponseMessage Send(HttpRequestMessage request, System.Threading.CancellationToken ct)
+    {
+        byte[] reqBytes = request.Content!.ReadAsByteArrayAsync().GetAwaiter().GetResult();
+        var reqEnv = (CborValue.Map)Cbor.Decode(reqBytes);
+        byte[] inner = Inner(reqEnv);
+        var respEnv = new CborValue.Map(new (CborValue, CborValue)[]
+        {
+            (new CborValue.Text("v"), new CborValue.Uint(1)),
+            (new CborValue.Text("status"), new CborValue.Uint(0)),
+            (new CborValue.Text("payload"), new CborValue.Tag(24, new CborValue.Bytes(inner))),
+        });
+        return new HttpResponseMessage(HttpStatusCode.OK)
+        {
+            Content = new ByteArrayContent(Cbor.Encode(respEnv)),
+        };
+    }
+
+    // SendAsync is abstract on HttpMessageHandler; the carrier only calls the sync Send,
+    // but the override is required to compile.
+    protected override System.Threading.Tasks.Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, System.Threading.CancellationToken ct) =>
+        System.Threading.Tasks.Task.FromResult(Send(request, ct));
+
+    private static byte[] Inner(CborValue.Map map)
+    {
+        foreach (var (k, v) in map.Entries)
+            if (k is CborValue.Text { Value: "payload" } && v is CborValue.Tag { Inner: CborValue.Bytes b })
+                return b.Value;
+        throw new System.Exception("no tag-24 payload in request envelope");
+    }
+}
+
+internal static class Program
+{
+    private static void Main()
+    {
+        var transport = new CsilRpcHttpTransport("http://csil.invalid", new EchoHandler());
+        var client = new PingClient(transport);
+        var resp = client.Ping(new PingRequest { Message = "hello" });
+        if (resp.Message != "hello")
+        {
+            System.Console.WriteLine("FAIL: " + resp.Message);
+            System.Environment.Exit(1);
+        }
+        System.Console.WriteLine("ok");
+    }
+}
+"#;
+
     const CSHARP_CSPROJ: &str = r#"<Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
     <OutputType>Exe</OutputType>
@@ -3103,6 +4036,76 @@ internal static class Program
         Check(resp.Tags.Count == 2 && resp.Tags[1] == "y", "client tags");
 
         System.Console.WriteLine("ok");
+    }
+}
+"#;
+
+    const CSHARP_ASYNC_DRIVER: &str = r#"using Csilgen.Transport;
+
+// The async loopback rides the same dumb byte seam as the sync one (same wire op string),
+// but satisfies the async transport interface by returning a completed Task.
+internal sealed class AsyncLoopback : ICsilAsyncTransport
+{
+    public System.Threading.Tasks.Task<byte[]> Call(string service, string op, byte[] request)
+    {
+        if (service != "corndogs" || op != "SubmitTask")
+        {
+            throw new System.Exception($"unexpected route {service}/{op}");
+        }
+        var req = Codec.Decode<SubmitTaskRequest>(request);
+        return System.Threading.Tasks.Task.FromResult(Codec.Encode(req.Task));
+    }
+}
+
+internal static class Program
+{
+    private static void Check(bool cond, string msg)
+    {
+        if (!cond)
+        {
+            System.Console.WriteLine("FAIL: " + msg);
+            System.Environment.Exit(1);
+        }
+    }
+
+    private static async System.Threading.Tasks.Task Main()
+    {
+        var task = new Task
+        {
+            Uuid = "u-123",
+            CurrentState = "PENDING",
+            Payload = new byte[] { 0xde, 0xad, 0xbe },
+            Priority = 7,
+            Labels = new System.Collections.Generic.Dictionary<string, long> { ["a"] = 1, ["b"] = 2 },
+            Tags = new System.Collections.Generic.List<string> { "x", "y" },
+        };
+        var counts = new StringInt64Map { ["alpha"] = 11, ["beta"] = 22 };
+        var tasksById = new TaskMap { ["t1"] = task };
+        var req = new SubmitTaskRequest { Task = task, Queue = "default", Counts = counts, TasksById = tasksById };
+
+        // The async twin's method is Async-suffixed and awaited over the async byte seam.
+        var client = new CorndogsAsyncClient(new AsyncLoopback());
+        var resp = await client.SubmitTaskAsync(req);
+        Check(resp.Uuid == "u-123", "client uuid");
+        Check(System.Linq.Enumerable.SequenceEqual(resp.Payload, new byte[] { 0xde, 0xad, 0xbe }), "client payload");
+        Check(resp.Priority == 7, "client priority");
+        Check(resp.Tags.Count == 2 && resp.Tags[1] == "y", "client tags");
+
+        // The sync client compiles and runs in the same namespace, proving coexistence.
+        var sync = new CorndogsClient(new SyncLoopback());
+        var syncResp = sync.SubmitTask(req);
+        Check(syncResp.Uuid == "u-123", "sync client uuid");
+
+        System.Console.WriteLine("ok");
+    }
+}
+
+internal sealed class SyncLoopback : ICsilTransport
+{
+    public byte[] Call(string service, string op, byte[] request)
+    {
+        var req = Codec.Decode<SubmitTaskRequest>(request);
+        return Codec.Encode(req.Task);
     }
 }
 "#;

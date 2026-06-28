@@ -936,6 +936,115 @@ fn test_package_mode_honors_name_and_version() {
     assert!(mix.contains("version: \"2.3.4\""));
 }
 
+/// An input with a `user` record and a `user_service` with a unary `get-user` op, in
+/// `elixir-client` package mode — so the README's full carrier Quickstart is exercised.
+fn readme_package_input() -> WasmGeneratorInput {
+    let user = CsilRule {
+        name: "user".to_string(),
+        rule_type: CsilRuleType::GroupDef(CsilGroupExpression {
+            entries: vec![
+                bare_entry("name", CsilTypeExpression::Builtin("text".to_string())),
+                bare_entry("id", CsilTypeExpression::Builtin("int".to_string())),
+            ],
+        }),
+        position: CsilPosition {
+            line: 1,
+            column: 1,
+            offset: 0,
+        },
+        doc_comments: vec![],
+    };
+    let service = CsilRule {
+        name: "user_service".to_string(),
+        rule_type: CsilRuleType::ServiceDef(CsilServiceDefinition {
+            operations: vec![CsilServiceOperation {
+                name: "get-user".to_string(),
+                input_type: CsilTypeExpression::Reference("user".to_string()),
+                output_type: CsilTypeExpression::Choice(vec![
+                    CsilTypeExpression::Reference("user".to_string()),
+                    CsilTypeExpression::Reference("ServiceError".to_string()),
+                ]),
+                direction: CsilServiceDirection::Unidirectional,
+                position: CsilPosition {
+                    line: 1,
+                    column: 1,
+                    offset: 0,
+                },
+                doc_comments: vec![],
+                wire_id: None,
+            }],
+            wire_id: None,
+        }),
+        position: CsilPosition {
+            line: 1,
+            column: 1,
+            offset: 0,
+        },
+        doc_comments: vec![],
+    };
+    WasmGeneratorInput {
+        csil_spec: CsilSpecSerialized {
+            rules: vec![user, service],
+            source_content: None,
+            service_count: 1,
+            fields_with_metadata_count: 0,
+        },
+        config: GeneratorConfig {
+            target: "elixir-client".to_string(),
+            output_dir: "/tmp".to_string(),
+            options: opts(&[("emit_packages", serde_json::json!(["elixir"]))]),
+        },
+        generator_metadata: meta(),
+    }
+}
+
+#[test]
+fn package_readme_has_quickstart_carrier_and_example() {
+    let out = process_generation(readme_package_input()).unwrap();
+    // The README rides with the package, at the root.
+    assert!(out.files.iter().any(|f| f.path == "README.md"));
+    let body = file(&out, "README.md");
+
+    // Title + a deps install hint naming this package.
+    assert!(body.starts_with("# csilgen_client\n"));
+    assert!(body.contains("{:csilgen_client,"));
+
+    // The carrier implements the generated transport seam (the behaviour).
+    assert!(body.contains("defmodule CsilRpcTransport do"));
+    assert!(body.contains("@behaviour Csilgen.Generated.Transport"));
+    assert!(body.contains("def call(%__MODULE__{rpc_url: url}, service, op, req)"));
+
+    // It POSTs to the CSIL-RPC endpoint, wraps the payload in CBOR tag 24, and reuses
+    // the generated codec (no third-party dep).
+    assert!(body.contains("/csil/v1/rpc"));
+    assert!(body.contains("POST "));
+    assert!(body.contains("{{:text, \"payload\"}, {:tag, 24, {:bytes, req}}}"));
+    assert!(body.contains("Cbor.encode(envelope)"));
+    assert!(body.contains("Cbor.decode(body)"));
+
+    // The status / typed ServiceError arms are handled.
+    assert!(body.contains("transport status"));
+    assert!(body.contains("{:text, \"ServiceError\"} ->"));
+    assert!(body.contains("raise \"service error"));
+
+    // Client construction over the carrier + the first unary call with a generated
+    // sample struct literal (required fields only, struct field atoms).
+    assert!(body.contains("transport = CsilRpcTransport.new(\"http://localhost:5080\")"));
+    assert!(body.contains("client = Csilgen.Generated.UserClient.new(transport)"));
+    assert!(body.contains(
+        "resp = Csilgen.Generated.UserClient.get_user(client, %Csilgen.Generated.User{name: \"example\", id: 0})"
+    ));
+}
+
+#[test]
+fn package_readme_absent_without_package_mode() {
+    // The flat (non-package) layout never ships a README.
+    let mut input = readme_package_input();
+    input.config.options = HashMap::new();
+    let out = process_generation(input).unwrap();
+    assert!(!out.files.iter().any(|f| f.path == "README.md"));
+}
+
 /// Build the corndogs `elixir-client` spec in package mode and prove the emitted Mix
 /// project compiles: `mix compile` when Mix is present (no network — deps are empty),
 /// else `elixirc` over `lib/` plus an `elixir`-side parse of `mix.exs`. Skips when no

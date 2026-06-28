@@ -233,6 +233,16 @@ fn process_generation(input: WasmGeneratorInput) -> Result<WasmGeneratorOutput, 
         }
     }
 
+    // Self-contained publishable-package mode: when `emit_packages` includes "zig",
+    // emit a README with a copy-paste CSIL-RPC Quickstart alongside the source, so the
+    // OUTPUT directory documents how to drive the generated client end to end.
+    if emit_packages_includes_zig(&input.config.options) {
+        files.push(GeneratedFile {
+            path: "README.md".to_string(),
+            content: package_readme(&input),
+        });
+    }
+
     // `zig fmt` keeps exactly one trailing newline; emit that so the output is
     // already formatter-clean and a `zig fmt --check` in CI stays quiet.
     for file in &mut files {
@@ -1870,6 +1880,486 @@ fn unwrap_constrained(type_expr: &CsilTypeExpression) -> &CsilTypeExpression {
         other => other,
     }
 }
+
+// ---- self-contained package (README + Quickstart) -------------------------
+
+/// True only when the `emit_packages` generation option is an array containing the
+/// `"zig"` token. Parsed defensively against an arbitrary `serde_json::Value`: a
+/// missing option, a non-array value, or an array without `"zig"` all leave the
+/// output as source-only. The match is case-insensitive to be forgiving.
+fn emit_packages_includes_zig(options: &HashMap<String, serde_json::Value>) -> bool {
+    options
+        .get("emit_packages")
+        .and_then(|v| v.as_array())
+        .is_some_and(|tokens| {
+            tokens
+                .iter()
+                .filter_map(|v| v.as_str())
+                .any(|token| token.eq_ignore_ascii_case("zig"))
+        })
+}
+
+/// The package display name: an explicit `package_name` option wins; otherwise it
+/// is derived from the first service's wire base (`AuthService` -> `auth-client`),
+/// falling back to a generic client name for a service-less spec.
+fn package_name(input: &WasmGeneratorInput) -> String {
+    if let Some(name) = input
+        .config
+        .options
+        .get("package_name")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        return name.to_string();
+    }
+    for rule in &input.csil_spec.rules {
+        if let CsilRuleType::ServiceDef(_) = &rule.rule_type {
+            let base = service_base(&rule.name).to_lowercase();
+            if !base.is_empty() {
+                return format!("{base}-client");
+            }
+        }
+    }
+    "csilgen-client".to_string()
+}
+
+/// The pieces the Quickstart's example call needs.
+struct ZigUnaryExample {
+    client_type: String,
+    method: String,
+    wire_service: String,
+    wire_op: String,
+    resp_type: String,
+    has_request: bool,
+    req_literal: String,
+    resp_print_field: Option<String>,
+}
+
+/// The first service (in declaration order) that has a `->` operation, reduced to an
+/// example call. `None` for a serviceless / types-only package.
+fn first_unary_example(input: &WasmGeneratorInput) -> Option<ZigUnaryExample> {
+    for rule in &input.csil_spec.rules {
+        let CsilRuleType::ServiceDef(service) = &rule.rule_type else {
+            continue;
+        };
+        let Some(op) = service
+            .operations
+            .iter()
+            .find(|op| matches!(op.direction, CsilServiceDirection::Unidirectional))
+        else {
+            continue;
+        };
+        let base = service_base(&rule.name);
+        let success = success_type(&op.output_type);
+        let has_request = !op_input_is_null(&op.input_type);
+        return Some(ZigUnaryExample {
+            client_type: format!("{base}Client"),
+            method: zig_ident(&to_snake(&op.name)),
+            wire_service: base.to_lowercase(),
+            wire_op: simple_pascal(&op.name),
+            resp_type: map_zig_type(&success, "types."),
+            has_request,
+            req_literal: if has_request {
+                zig_request_literal(input, &op.input_type)
+            } else {
+                String::new()
+            },
+            resp_print_field: first_text_field(input, &success),
+        });
+    }
+    None
+}
+
+/// A compiling Zig struct literal for the request record's required fields: real
+/// values for scalars, `"example"` for text, and `undefined` for shapes a generic
+/// sample can't fabricate, so the snippet always compiles even where a user must
+/// fill a value in.
+fn zig_request_literal(input: &WasmGeneratorInput, ty: &CsilTypeExpression) -> String {
+    let CsilTypeExpression::Reference(name) = unwrap_constrained(ty) else {
+        return format!("{} = undefined", map_zig_type(ty, "types."));
+    };
+    let type_name = map_zig_type(ty, "types.");
+    let Some(group) = find_record(input, name) else {
+        return format!("{type_name}{{}}");
+    };
+    let fields: Vec<String> = group
+        .entries
+        .iter()
+        .filter(|e| !matches!(e.occurrence, Some(CsilOccurrence::Optional)))
+        .filter_map(|e| {
+            entry_field_name(&e.key).map(|field| {
+                format!(
+                    ".{} = {}",
+                    zig_ident(&field),
+                    zig_sample_value(&e.value_type)
+                )
+            })
+        })
+        .collect();
+    if fields.is_empty() {
+        format!("{type_name}{{}}")
+    } else {
+        format!("{type_name}{{ {} }}", fields.join(", "))
+    }
+}
+
+/// A single Zig value literal for `ty`, used inside a request struct literal.
+fn zig_sample_value(ty: &CsilTypeExpression) -> String {
+    match unwrap_constrained(ty) {
+        CsilTypeExpression::Builtin(name) => match name.as_str() {
+            "text" | "tstr" => "\"example\"".to_string(),
+            "bool" | "true" | "false" => "false".to_string(),
+            "int" | "nint" | "uint" => "0".to_string(),
+            "float" | "float16" | "float32" | "float64" | "double" => "0.0".to_string(),
+            _ => "undefined".to_string(),
+        },
+        _ => "undefined".to_string(),
+    }
+}
+
+/// The first required text field of a record type reference, so the example can print
+/// a typed response value rather than just announcing success.
+fn first_text_field(input: &WasmGeneratorInput, ty: &CsilTypeExpression) -> Option<String> {
+    let CsilTypeExpression::Reference(name) = unwrap_constrained(ty) else {
+        return None;
+    };
+    let group = find_record(input, name)?;
+    group.entries.iter().find_map(|e| {
+        let is_text = matches!(unwrap_constrained(&e.value_type), CsilTypeExpression::Builtin(n) if n == "text" || n == "tstr");
+        if is_text && !matches!(e.occurrence, Some(CsilOccurrence::Optional)) {
+            entry_field_name(&e.key).map(|f| zig_ident(&f))
+        } else {
+            None
+        }
+    })
+}
+
+/// The record a type reference names, if any. A `Name = { ... }` rule parses as
+/// `TypeDef(Group(..))`, while a bare group rule is `GroupDef(..)`; both are records.
+fn find_record<'a>(input: &'a WasmGeneratorInput, name: &str) -> Option<&'a CsilGroupExpression> {
+    input
+        .csil_spec
+        .rules
+        .iter()
+        .filter(|r| r.name == name)
+        .find_map(|r| match &r.rule_type {
+            CsilRuleType::GroupDef(g) => Some(g),
+            CsilRuleType::TypeDef(CsilTypeExpression::Group(g)) => Some(g),
+            _ => None,
+        })
+}
+
+/// The package README, with a copy-paste **Quickstart**. For a client package the
+/// Quickstart hand-rolls the tiny CSIL-RPC envelope (the generated codec's generic CBOR
+/// helpers are private to `codec.gen.zig`, so there is no third-party CBOR dependency)
+/// and POSTs it with the Zig stdlib HTTP client, then makes one typed call. A
+/// serviceless package gets a shorter types-only section.
+fn package_readme(input: &WasmGeneratorInput) -> String {
+    let name = package_name(input);
+    let mut out = format!(
+        "# {name}\n\n\
+         Generated by csilgen. A typed, transport-agnostic CSIL-RPC client in Zig: the\n\
+         generated codec owns CBOR (de)serialization; you supply a *carrier* that only\n\
+         moves bytes.\n\n\
+         ## Consume\n\n\
+         Vendor the generated `.zig` files into your project (or expose them as a module),\n\
+         then `@import` them. A single file that imports `client.gen.zig` pulls in the\n\
+         types and the self-contained CBOR codec. Build with Zig 0.14:\n\n\
+         ```sh\n\
+         zig build-exe main.zig\n\
+         ```\n\n\
+         > Generate the client surface with `--target zig-client` so `client.gen.zig` is\n\
+         > emitted alongside the codec.\n\n"
+    );
+
+    match first_unary_example(input) {
+        Some(example) => out.push_str(&quickstart(&example)),
+        None => out.push_str(
+            "## Quickstart\n\n\
+             This package has no service operations — `@import(\"types.gen.zig\")` and\n\
+             `@import(\"codec.gen.zig\")` and use the generated `encode_*` / `decode_*`\n\
+             helpers directly.\n",
+        ),
+    }
+    out
+}
+
+/// The client Quickstart: a CSIL-RPC carrier that hand-rolls the envelope (no
+/// third-party CBOR dependency) and POSTs over `std.http` (no third-party HTTP
+/// dependency), the transport seam wired to it, and the typed call. A user changes
+/// only the base-URL string.
+fn quickstart(ex: &ZigUnaryExample) -> String {
+    let mut out = String::from("## Quickstart\n\n");
+    out.push_str(
+        "A complete CSIL-RPC carrier (no third-party dependency — the envelope is\n\
+         hand-rolled CBOR and the POST uses `std.http`) plus the typed client. Change the\n\
+         one base-URL string.\n\n",
+    );
+    out.push_str("```zig\n");
+    out.push_str(CARRIER_ZIG);
+    out.push('\n');
+    // The example call: build the carrier, wire the seam, call the first op.
+    out.push_str("pub fn main() !void {\n");
+    out.push_str("    var gpa = std.heap.GeneralPurposeAllocator(.{}){};\n");
+    out.push_str("    defer _ = gpa.deinit();\n");
+    out.push_str("    const alloc = gpa.allocator();\n\n");
+    out.push_str("    var carrier = CsilRpcCarrier{ .base_url = \"http://127.0.0.1:5080\" };\n");
+    out.push_str(&format!(
+        "    const svc = client.{}.init(carrier.transport());\n\n",
+        ex.client_type
+    ));
+    out.push_str("    // Everything in `resp` is allocated from the arena; free it all at once.\n");
+    out.push_str("    var arena = std.heap.ArenaAllocator.init(alloc);\n");
+    out.push_str("    defer arena.deinit();\n\n");
+    out.push_str(&format!("    var resp: {} = undefined;\n", ex.resp_type));
+    if ex.has_request {
+        out.push_str(&format!("    const req = {};\n", ex.req_literal));
+        out.push_str(&format!(
+            "    try svc.{}(arena.allocator(), &req, &resp);\n",
+            ex.method
+        ));
+    } else {
+        out.push_str(&format!(
+            "    try svc.{}(arena.allocator(), &resp);\n",
+            ex.method
+        ));
+    }
+    match &ex.resp_print_field {
+        Some(field) => out.push_str(&format!(
+            "    std.debug.print(\"{}/{} -> {{s}}\\n\", .{{resp.{field}}});\n",
+            ex.wire_service, ex.wire_op
+        )),
+        None => out.push_str(&format!(
+            "    std.debug.print(\"{}/{} ok\\n\", .{{}});\n",
+            ex.wire_service, ex.wire_op
+        )),
+    }
+    out.push_str("}\n");
+    out.push_str("```\n");
+    out
+}
+
+/// The carrier body — identical for every spec, so it is a constant. It hand-rolls the
+/// `CsilRpcRequest` envelope (tag-24 payload), POSTs it to `{base_url}/csil/v1/rpc` with
+/// `std.http.Client`, and returns the tag-24 inner bytes for the generated client to
+/// decode. A non-zero transport `status` or a typed `ServiceError` arm becomes an error.
+const CARRIER_ZIG: &str = r#"const std = @import("std");
+const client = @import("client.gen.zig");
+const types = @import("types.gen.zig");
+
+// Quickstart carrier — CSIL-RPC over HTTP.
+//
+// Dependency posture (path 2 + stdlib HTTP): the generated codec's generic CBOR
+// helpers are private to codec.gen.zig, so the tiny fixed envelope (a 4-entry map
+// plus a tag-24 payload, and reading three known keys back) is hand-rolled here —
+// no third-party CBOR dependency. The POST uses std.http.Client — no third-party
+// HTTP dependency. Drop this in a .zig file next to the generated source.
+const CsilRpcCarrier = struct {
+    base_url: []const u8, // e.g. "http://127.0.0.1:5080"
+
+    fn transport(self: *CsilRpcCarrier) client.CsilgenTransport {
+        return .{ .ptr = self, .call = call };
+    }
+
+    // The CsilgenTransport seam: build the envelope, POST it, unwrap the reply.
+    fn call(ptr: *anyopaque, alloc: std.mem.Allocator, service: []const u8, op: []const u8, req: []const u8) anyerror![]u8 {
+        const self: *CsilRpcCarrier = @ptrCast(@alignCast(ptr));
+
+        // 1. CsilRpcRequest = { v, op, payload: #6.24(bstr), service }.
+        const body = try buildEnvelope(alloc, service, op, req);
+        defer alloc.free(body);
+
+        // 2. POST it to {base_url}/csil/v1/rpc with the stdlib HTTP client.
+        var http = std.http.Client{ .allocator = alloc };
+        defer http.deinit();
+        var url_buf: [512]u8 = undefined;
+        const url = try std.fmt.bufPrint(&url_buf, "{s}/csil/v1/rpc", .{self.base_url});
+        var resp = std.ArrayList(u8).init(alloc);
+        defer resp.deinit();
+        const result = try http.fetch(.{
+            .location = .{ .url = url },
+            .method = .POST,
+            .payload = body,
+            .extra_headers = &.{.{ .name = "content-type", .value = "application/cbor" }},
+            .response_storage = .{ .dynamic = &resp },
+        });
+        if (result.status != .ok) return error.CsilRpcHttpStatus;
+
+        // 3. Decode the CsilRpcResponse envelope; surface the status / ServiceError
+        //    arms, else hand the tag-24 inner bytes back to the generated client.
+        return unwrap(alloc, resp.items);
+    }
+};
+
+fn buildEnvelope(alloc: std.mem.Allocator, service: []const u8, op: []const u8, req: []const u8) ![]u8 {
+    var out = std.ArrayList(u8).init(alloc);
+    errdefer out.deinit();
+    try writeHead(&out, 5, 4); // map(4); keys in length-then-bytewise order
+    try writeText(&out, "v");
+    try writeHead(&out, 0, 1);
+    try writeText(&out, "op");
+    try writeText(&out, op);
+    try writeText(&out, "payload");
+    try writeHead(&out, 6, 24); // tag 24 (embedded CBOR)
+    try writeBytes(&out, req);
+    try writeText(&out, "service");
+    try writeText(&out, service);
+    return out.toOwnedSlice();
+}
+
+fn writeHead(out: *std.ArrayList(u8), major: u8, n: u64) !void {
+    const mt: u8 = major << 5;
+    if (n < 24) {
+        try out.append(mt | @as(u8, @intCast(n)));
+    } else if (n < 0x100) {
+        try out.append(mt | 24);
+        try out.append(@intCast(n));
+    } else if (n < 0x10000) {
+        try out.append(mt | 25);
+        var b: [2]u8 = undefined;
+        std.mem.writeInt(u16, &b, @intCast(n), .big);
+        try out.appendSlice(&b);
+    } else if (n < 0x100000000) {
+        try out.append(mt | 26);
+        var b: [4]u8 = undefined;
+        std.mem.writeInt(u32, &b, @intCast(n), .big);
+        try out.appendSlice(&b);
+    } else {
+        try out.append(mt | 27);
+        var b: [8]u8 = undefined;
+        std.mem.writeInt(u64, &b, n, .big);
+        try out.appendSlice(&b);
+    }
+}
+
+fn writeText(out: *std.ArrayList(u8), s: []const u8) !void {
+    try writeHead(out, 3, s.len);
+    try out.appendSlice(s);
+}
+
+fn writeBytes(out: *std.ArrayList(u8), s: []const u8) !void {
+    try writeHead(out, 2, s.len);
+    try out.appendSlice(s);
+}
+
+// A minimal read cursor over the response envelope — just enough to find the three
+// known keys; unknown values are skipped generically.
+const Cursor = struct {
+    b: []const u8,
+    i: usize = 0,
+
+    const Head = struct { major: u8, arg: u64 };
+
+    fn need(self: *Cursor, n: usize) !void {
+        if (self.i + n > self.b.len) return error.CsilRpcEof;
+    }
+
+    fn head(self: *Cursor) !Head {
+        try self.need(1);
+        const ib = self.b[self.i];
+        self.i += 1;
+        const major: u8 = ib >> 5;
+        const low: u8 = ib & 0x1f;
+        if (low < 24) return .{ .major = major, .arg = low };
+        switch (low) {
+            24 => {
+                try self.need(1);
+                const v = self.b[self.i];
+                self.i += 1;
+                return .{ .major = major, .arg = v };
+            },
+            25 => {
+                try self.need(2);
+                const v = std.mem.readInt(u16, self.b[self.i..][0..2], .big);
+                self.i += 2;
+                return .{ .major = major, .arg = v };
+            },
+            26 => {
+                try self.need(4);
+                const v = std.mem.readInt(u32, self.b[self.i..][0..4], .big);
+                self.i += 4;
+                return .{ .major = major, .arg = v };
+            },
+            27 => {
+                try self.need(8);
+                const v = std.mem.readInt(u64, self.b[self.i..][0..8], .big);
+                self.i += 8;
+                return .{ .major = major, .arg = v };
+            },
+            else => return error.CsilRpcMalformed,
+        }
+    }
+
+    fn str(self: *Cursor, want_major: u8) ![]const u8 {
+        const h = try self.head();
+        if (h.major != want_major) return error.CsilRpcWrongType;
+        const n: usize = @intCast(h.arg);
+        try self.need(n);
+        const s = self.b[self.i .. self.i + n];
+        self.i += n;
+        return s;
+    }
+
+    fn skip(self: *Cursor) anyerror!void {
+        const h = try self.head();
+        switch (h.major) {
+            0, 1, 7 => {},
+            2, 3 => {
+                const n: usize = @intCast(h.arg);
+                try self.need(n);
+                self.i += n;
+            },
+            4 => {
+                var k: u64 = 0;
+                while (k < h.arg) : (k += 1) try self.skip();
+            },
+            5 => {
+                var k: u64 = 0;
+                while (k < h.arg * 2) : (k += 1) try self.skip();
+            },
+            6 => try self.skip(),
+            else => return error.CsilRpcMalformed,
+        }
+    }
+};
+
+fn unwrap(alloc: std.mem.Allocator, body: []const u8) ![]u8 {
+    var c = Cursor{ .b = body };
+    const top = try c.head();
+    if (top.major != 5) return error.CsilRpcMalformed; // CsilRpcResponse is a map
+    var status: i64 = 0;
+    var service_error = false;
+    var payload: ?[]const u8 = null;
+    var k: u64 = 0;
+    while (k < top.arg) : (k += 1) {
+        const key = try c.str(3);
+        if (std.mem.eql(u8, key, "status")) {
+            const h = try c.head();
+            status = switch (h.major) {
+                0 => @intCast(h.arg),
+                1 => -1 - @as(i64, @intCast(h.arg)),
+                else => return error.CsilRpcWrongType,
+            };
+        } else if (std.mem.eql(u8, key, "variant")) {
+            const v = try c.str(3);
+            if (std.mem.eql(u8, v, "ServiceError")) service_error = true;
+        } else if (std.mem.eql(u8, key, "payload")) {
+            const tag = try c.head();
+            if (tag.major != 6 or tag.arg != 24) return error.CsilRpcWrongType;
+            payload = try c.str(2); // the tag-24 inner byte string
+        } else {
+            try c.skip();
+        }
+    }
+    // status != 0 is a transport failure (no typed payload); a ServiceError arm is a
+    // typed application error, distinct from a transport failure.
+    if (status != 0) return error.CsilRpcTransportStatus;
+    if (service_error) return error.CsilRpcServiceError;
+    const inner = payload orelse return error.CsilRpcMissingPayload;
+    return alloc.dupe(u8, inner); // the generated client frees this with alloc.free
+}
+"#;
 
 // ---- spec scans -----------------------------------------------------------
 

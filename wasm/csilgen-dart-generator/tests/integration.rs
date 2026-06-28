@@ -893,6 +893,264 @@ fn wire_service_is_lowercased_and_op_pascalcased() {
     );
 }
 
+// --- async client style ----------------------------------------------------
+
+fn async_services_file(files: &[GeneratedFile]) -> &str {
+    &files
+        .iter()
+        .find(|f| f.path == "services.async.gen.dart")
+        .expect("services.async.gen.dart should be generated")
+        .content
+}
+
+#[test]
+fn async_twin_emitted_by_default_with_marked_symbols() {
+    // Absent `client_style` defaults to `both`: the canonical sync client is
+    // unchanged AND an async twin lands beside it, every public symbol marked so the
+    // two coexist in one package/barrel without collisions.
+    let files = generate_dart_code(&spec(corndogs_rules(), 1), &config("dart-client")).unwrap();
+
+    // Sync client at the canonical path, with the canonical (unmarked) symbols.
+    let sync = services_file(&files);
+    assert!(
+        sync.contains("final class CorndogsClient {"),
+        "canonical sync client: {sync}"
+    );
+    assert!(
+        sync.contains("abstract interface class CsilTransport {"),
+        "canonical sync transport: {sync}"
+    );
+    assert!(
+        sync.contains("Task submitTask(SubmitTaskRequest request) {"),
+        "sync method stays blocking: {sync}"
+    );
+
+    // Async twin in a separate file, every symbol carrying the `Async` marker.
+    let twin = async_services_file(&files);
+    assert!(
+        twin.contains("final class CorndogsAsyncClient {"),
+        "marked async client class: {twin}"
+    );
+    assert!(
+        twin.contains("abstract interface class AsyncCsilTransport {"),
+        "marked async transport type: {twin}"
+    );
+    assert!(
+        twin.contains("Future<Uint8List> call(String service, String op, List<int> request);"),
+        "async transport seam returns Future<Uint8List>: {twin}"
+    );
+    assert!(
+        twin.contains("Future<Task> submitTask(SubmitTaskRequest request) async {"),
+        "async method returns a Future and is async: {twin}"
+    );
+    assert!(
+        twin.contains("final csilResp = await transport.call("),
+        "async method awaits the seam: {twin}"
+    );
+    assert!(
+        twin.contains("final AsyncCsilTransport transport;"),
+        "twin holds the marked transport: {twin}"
+    );
+
+    // The barrel registers the twin so a single import surfaces both clients.
+    let barrel = files
+        .iter()
+        .find(|f| f.path == "models.gen.dart")
+        .expect("barrel file");
+    assert!(
+        barrel.content.contains("export 'services.async.gen.dart';"),
+        "barrel re-exports the async twin: {}",
+        barrel.content
+    );
+}
+
+#[test]
+fn client_style_async_is_drop_in_at_canonical_path() {
+    // `async` is a drop-in: the async client sits at the SAME canonical filename with
+    // the SAME canonical symbol names (just async), so swapping sync for async changes
+    // nothing but the await. No marked twin is emitted.
+    let files = generate_dart_code(
+        &spec(corndogs_rules(), 1),
+        &config_with(
+            "dart-client",
+            &[("client_style", serde_json::json!("async"))],
+        ),
+    )
+    .unwrap();
+    let code = services_file(&files);
+    assert!(
+        code.contains("final class CorndogsClient {"),
+        "canonical class name preserved: {code}"
+    );
+    assert!(
+        code.contains("abstract interface class CsilTransport {"),
+        "canonical transport name preserved: {code}"
+    );
+    assert!(
+        code.contains("Future<Uint8List> call(String service, String op, List<int> request);"),
+        "drop-in seam turns async: {code}"
+    );
+    assert!(
+        code.contains("Future<Task> submitTask(SubmitTaskRequest request) async {"),
+        "drop-in method turns async: {code}"
+    );
+    assert!(
+        code.contains("final csilResp = await transport.call("),
+        "drop-in awaits the seam: {code}"
+    );
+    assert!(
+        !files.iter().any(|f| f.path == "services.async.gen.dart"),
+        "drop-in mode emits no separate twin file"
+    );
+    assert!(
+        !code.contains("Async"),
+        "drop-in carries no Async marker: {code}"
+    );
+}
+
+#[test]
+fn client_style_sync_suppresses_the_twin() {
+    // `sync` is today's output verbatim: blocking client at the canonical path, and
+    // crucially NO async twin file.
+    let files = generate_dart_code(
+        &spec(corndogs_rules(), 1),
+        &config_with(
+            "dart-client",
+            &[("client_style", serde_json::json!("sync"))],
+        ),
+    )
+    .unwrap();
+    let code = services_file(&files);
+    assert!(
+        code.contains("Task submitTask(SubmitTaskRequest request) {"),
+        "sync method stays blocking: {code}"
+    );
+    assert!(
+        code.contains("final csilResp = transport.call("),
+        "sync method calls the seam directly (no await): {code}"
+    );
+    assert!(
+        !code.contains("Future<"),
+        "sync client returns no futures: {code}"
+    );
+    assert!(
+        !files.iter().any(|f| f.path == "services.async.gen.dart"),
+        "sync style emits no async twin"
+    );
+}
+
+#[test]
+fn client_style_invalid_value_is_rejected() {
+    let err = generate_dart_code(
+        &spec(corndogs_rules(), 1),
+        &config_with(
+            "dart-client",
+            &[("client_style", serde_json::json!("eventually"))],
+        ),
+    );
+    let msg = format!("{:?}", err.expect_err("invalid client_style must fail"));
+    assert!(
+        msg.contains("client_style"),
+        "error must name the offending option: {msg}"
+    );
+}
+
+/// Compile and run the generated async client, awaiting a typed response through an
+/// async loopback transport. Skips when `dart` is not on PATH so the suite stays
+/// portable. Mirrors `codec_round_trips_through_dart` but exercises the `both`-mode
+/// async twin over `AsyncCsilTransport`.
+#[test]
+fn async_client_round_trips_through_dart() {
+    let have = std::process::Command::new("dart")
+        .arg("--version")
+        .output()
+        .is_ok();
+    if !have {
+        eprintln!("skipping: no dart on PATH");
+        return;
+    }
+    // Default `both` mode: the barrel exports both the sync client and the async twin.
+    let files = generate_dart_code(&spec(corndogs_rules(), 1), &config("dart-client")).unwrap();
+
+    let dir = std::env::temp_dir().join(format!("csilgen-dart-async-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    for f in &files {
+        std::fs::write(dir.join(&f.path), &f.content).unwrap();
+    }
+    std::fs::write(dir.join("driver.dart"), ASYNC_DRIVER_DART).unwrap();
+
+    let run = std::process::Command::new("dart")
+        .arg(dir.join("driver.dart"))
+        .output()
+        .unwrap();
+    assert!(
+        run.status.success(),
+        "dart async round-trip failed:\n{}{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&run.stdout).trim(), "ok");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+const ASYNC_DRIVER_DART: &str = r#"import 'dart:typed_data';
+import 'models.gen.dart';
+
+/// An async carrier: the seam returns a Future the generated client awaits.
+class AsyncLoopback implements AsyncCsilTransport {
+  @override
+  Future<Uint8List> call(String service, String op, List<int> request) async {
+    // Decode the typed request, then encode its task as the typed response.
+    final req = SubmitTaskRequest.fromCbor(request);
+    return req.task.toCbor();
+  }
+}
+
+void _check(bool ok, String what) {
+  if (!ok) throw StateError('check failed: $what');
+}
+
+bool _bytesEq(List<int> a, List<int> b) {
+  if (a.length != b.length) return false;
+  for (var i = 0; i < a.length; i++) {
+    if (a[i] != b[i]) return false;
+  }
+  return true;
+}
+
+Future<void> main() async {
+  final payload = Uint8List.fromList([0xde, 0xad, 0xbe]);
+  final task = Task(
+    uuid: 'u-123',
+    currentState: 'PENDING',
+    payload: payload,
+    priority: 7,
+    labels: {'a': 1, 'b': 2},
+    tags: ['x', 'y'],
+  );
+  final req = SubmitTaskRequest(
+    task: task,
+    queue: 'default',
+    counts: {'one': 1, 'two': 2},
+    things: {'r1': SomeRecord(n: 11), 'r2': SomeRecord(n: 22)},
+  );
+
+  // typed async client over the async loopback carrier: the response survives the
+  // await with its decoded fields intact.
+  final client = CorndogsAsyncClient(AsyncLoopback());
+  final resp = await client.submitTask(req);
+  _check(resp.uuid == 'u-123', 'resp uuid');
+  _check(resp.currentState == 'PENDING', 'resp current_state');
+  _check(_bytesEq(resp.payload, payload), 'resp payload');
+  _check(resp.priority == 7, 'resp priority');
+  _check(resp.labels['a'] == 1 && resp.labels['b'] == 2, 'resp labels');
+  _check(resp.tags.length == 2 && resp.tags[1] == 'y', 'resp tags');
+
+  print('ok');
+}
+"#;
+
 // --- publishable pub package mode ------------------------------------------
 
 #[test]
@@ -1051,6 +1309,15 @@ fn generated_dart_package_passes_pub_get_and_analyze() {
         std::fs::write(&path, &f.content).unwrap();
     }
 
+    // Drop the README's Quickstart carrier (the real shipped artifact) into lib/ so
+    // `dart analyze` proves it — and its sample example call — compile against the
+    // generated codec + client. The `package:` self-import is rewritten to a relative
+    // one so analysis resolves it even on the no-cache fallback path below.
+    let readme = files.iter().find(|f| f.path == "README.md").unwrap();
+    let carrier = extract_dart_block(&readme.content)
+        .replace("package:csil_sample/csil_sample.dart", "csil_sample.dart");
+    std::fs::write(dir.join("lib/quickstart_carrier.dart"), carrier).unwrap();
+
     let get = std::process::Command::new("dart")
         .args(["pub", "get", "--offline"])
         .current_dir(&dir)
@@ -1090,3 +1357,198 @@ fn generated_dart_package_passes_pub_get_and_analyze() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// --- README Quickstart carrier ---------------------------------------------
+
+/// The body of the README's first fenced ```dart block — the shipped Quickstart.
+fn extract_dart_block(readme: &str) -> String {
+    const FENCE: &str = "```dart\n";
+    let start = readme.find(FENCE).expect("README has a dart code block") + FENCE.len();
+    let rest = &readme[start..];
+    let end = rest.find("```").expect("dart code block is closed");
+    rest[..end].to_string()
+}
+
+/// A ping/pong spec whose op echoes its request type as its response type, so the
+/// echo server's tag-24 payload decodes cleanly back into the typed result.
+fn pingpong_rules() -> Vec<CsilRule> {
+    vec![
+        record_rule(
+            "Ping",
+            vec![
+                entry("message", builtin("text"), false),
+                entry("nonce", builtin("int"), false),
+            ],
+        ),
+        CsilRule {
+            name: "EchoService".to_string(),
+            rule_type: CsilRuleType::ServiceDef(CsilServiceDefinition {
+                operations: vec![CsilServiceOperation {
+                    name: "ping".to_string(),
+                    input_type: reference("Ping"),
+                    output_type: reference("Ping"),
+                    direction: CsilServiceDirection::Unidirectional,
+                    position: pos(),
+                    doc_comments: Vec::new(),
+                    wire_id: None,
+                }],
+                wire_id: None,
+            }),
+            position: pos(),
+            doc_comments: Vec::new(),
+        },
+    ]
+}
+
+#[test]
+fn package_readme_has_quickstart_carrier_and_example() {
+    let files = generate_dart_code(
+        &spec(corndogs_rules(), 1),
+        &config_with(
+            "dart-client",
+            &[
+                ("emit_packages", serde_json::json!(["dart"])),
+                ("package_name", serde_json::json!("csil_sample")),
+            ],
+        ),
+    )
+    .unwrap();
+    let readme = &files
+        .iter()
+        .find(|f| f.path == "README.md")
+        .expect("README.md emitted in package mode")
+        .content;
+
+    // The carrier implements the generated async transport seam.
+    assert!(
+        readme.contains("class CsilRpcTransport implements AsyncCsilTransport {"),
+        "carrier implements the transport seam: {readme}"
+    );
+    // It POSTs the CSIL-RPC envelope to the canonical path.
+    assert!(
+        readme.contains("/csil/v1/rpc"),
+        "carrier posts to /csil/v1/rpc: {readme}"
+    );
+    // The payload is wrapped in CBOR tag 24 (0xd8 0x18) — the embedded-CBOR head.
+    assert!(
+        readme.contains("0xd8") && readme.contains("0x18"),
+        "payload wrapped in CBOR tag 24: {readme}"
+    );
+    // Transport-status and typed ServiceError arms are both handled.
+    assert!(
+        readme.contains("transport status") && readme.contains("ServiceError"),
+        "status / ServiceError handling: {readme}"
+    );
+    // It reuses the package's own codec for the envelope — no third-party dep.
+    assert!(
+        readme.contains("CsilCbor.encodeValue") && readme.contains("CsilCbor.decode"),
+        "envelope reuses the generated CsilCbor codec: {readme}"
+    );
+    // The example call constructs the async client and calls the first op with a
+    // generated sample literal.
+    assert!(
+        readme.contains("final client = CorndogsAsyncClient(CsilRpcTransport("),
+        "example constructs the typed client: {readme}"
+    );
+    assert!(
+        readme.contains("await client.submitTask(SubmitTaskRequest("),
+        "example calls the first unary op with a sample literal: {readme}"
+    );
+    assert!(
+        readme.contains("import 'package:csil_sample/csil_sample.dart';"),
+        "example imports the package barrel: {readme}"
+    );
+}
+
+/// Hermetically round-trips the shipped README carrier: it injects an in-process
+/// echo `sender` (no socket — the sandbox kills cross-process loopback), so the real
+/// carrier's envelope encode/decode and the typed client are exercised end to end.
+/// Skips when `dart` is not on PATH so the suite stays portable.
+#[test]
+fn readme_quickstart_carrier_round_trips_through_an_injected_echo() {
+    let have = std::process::Command::new("dart")
+        .arg("--version")
+        .output()
+        .is_ok();
+    if !have {
+        eprintln!("skipping: no dart on PATH");
+        return;
+    }
+    let files = generate_dart_code(
+        &spec(pingpong_rules(), 1),
+        &config_with(
+            "dart-client",
+            &[
+                ("emit_packages", serde_json::json!(["dart"])),
+                ("package_name", serde_json::json!("csil_echo")),
+            ],
+        ),
+    )
+    .unwrap();
+
+    let dir = std::env::temp_dir().join(format!("csilgen-dart-readme-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    for f in &files {
+        let path = dir.join(&f.path);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, &f.content).unwrap();
+    }
+
+    // The carrier only (the README block up to its example `main`), with the package
+    // self-import rewritten relative so the driver resolves it without pub.
+    let readme = files.iter().find(|f| f.path == "README.md").unwrap();
+    let block = extract_dart_block(&readme.content);
+    let carrier = block[..block.find("Future<void> main").unwrap()]
+        .replace("package:csil_echo/csil_echo.dart", "csil_echo.dart");
+    std::fs::write(dir.join("lib/quickstart_carrier.dart"), carrier).unwrap();
+    std::fs::write(dir.join("driver.dart"), README_ECHO_DRIVER_DART).unwrap();
+
+    let run = std::process::Command::new("dart")
+        .arg(dir.join("driver.dart"))
+        .output()
+        .unwrap();
+    assert!(
+        run.status.success(),
+        "readme carrier round-trip failed:\n{}{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&run.stdout).trim(), "ok");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Drives the shipped carrier with an injected sender that echoes the tag-24 inner
+/// payload back in a `status: 0` CsilRpcResponse — the same contract the shared echo
+/// mock implements, but in-process so no socket is opened.
+const README_ECHO_DRIVER_DART: &str = r#"import 'dart:typed_data';
+
+import 'lib/csil_echo.dart';
+import 'lib/quickstart_carrier.dart';
+
+Future<Uint8List> echo(Uri uri, Uint8List body) async {
+  // Unwrap the request envelope's tag-24 payload (CsilCbor.decode does this for us).
+  final reqEnv = CsilCbor.decode(body) as Map;
+  final inner = reqEnv['payload'] as Uint8List;
+  // Build CsilRpcResponse = { v: 1, status: 0, payload: #6.24(inner) }.
+  final b = BytesBuilder();
+  b.addByte(0xa3);
+  b.add(CsilCbor.encodeValue('v'));
+  b.add(CsilCbor.encodeValue(1));
+  b.add(CsilCbor.encodeValue('status'));
+  b.add(CsilCbor.encodeValue(0));
+  b.add(CsilCbor.encodeValue('payload'));
+  b.addByte(0xd8);
+  b.addByte(0x18);
+  b.add(CsilCbor.encodeValue(inner));
+  return b.toBytes();
+}
+
+Future<void> main() async {
+  final client = EchoAsyncClient(CsilRpcTransport('http://unused', sender: echo));
+  final resp = await client.ping(Ping(message: 'hi', nonce: 7));
+  if (resp.message != 'hi' || resp.nonce != 7) {
+    throw StateError('round-trip mismatch: ${resp.message}/${resp.nonce}');
+  }
+  print('ok');
+}
+"#;

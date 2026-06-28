@@ -152,6 +152,7 @@ pub fn generate_files(input: &WasmGeneratorInput) -> Result<Vec<GeneratedFile>, 
     // fails the entire run, regardless of which target is requested.
     let _mode = common::bidi_transport(input)?;
     let _decimal = common::decimal_mapping(input)?;
+    let style = common::client_style(input)?;
 
     let (want_client, want_server) = match input.config.target.as_str() {
         "typescript-typesonly" => (false, false),
@@ -176,11 +177,43 @@ pub fn generate_files(input: &WasmGeneratorInput) -> Result<Vec<GeneratedFile>, 
         });
     }
 
+    // `Both` (the default) ships the blocking client at `client.gen.ts` and an async
+    // twin at `client.async.gen.ts`; `Async` makes the async client a drop-in at
+    // `client.gen.ts`; `Sync` is the original blocking-only output. The async twin
+    // carries an `Async` marker on its symbols so both coexist in one barrel.
     if want_client {
-        files.push(GeneratedFile {
-            path: "client.gen.ts".to_string(),
-            content: client::generate(input)?,
-        });
+        let sync = common::ClientShape {
+            is_async: false,
+            marker: "",
+        };
+        let async_drop_in = common::ClientShape {
+            is_async: true,
+            marker: "",
+        };
+        let async_twin = common::ClientShape {
+            is_async: true,
+            marker: "Async",
+        };
+        match style {
+            common::ClientStyle::Sync => files.push(GeneratedFile {
+                path: "client.gen.ts".to_string(),
+                content: client::generate(input, sync)?,
+            }),
+            common::ClientStyle::Async => files.push(GeneratedFile {
+                path: "client.gen.ts".to_string(),
+                content: client::generate(input, async_drop_in)?,
+            }),
+            common::ClientStyle::Both => {
+                files.push(GeneratedFile {
+                    path: "client.gen.ts".to_string(),
+                    content: client::generate(input, sync)?,
+                });
+                files.push(GeneratedFile {
+                    path: "client.async.gen.ts".to_string(),
+                    content: client::generate(input, async_twin)?,
+                });
+            }
+        }
     }
     if want_server {
         files.push(GeneratedFile {
