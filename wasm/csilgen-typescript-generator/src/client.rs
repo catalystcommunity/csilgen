@@ -3,8 +3,11 @@
 //! The client owns (de)serialization via the generated codec; the caller-supplied
 //! `ServiceTransport` only moves bytes (`call(service, op, req) -> bytes`). A
 //! unary method encodes its request record, calls the transport, and decodes the
-//! response record — synchronous and blocking, no async. Ops whose request or
-//! response is not a record the codec can (de)serialize are skipped with a note.
+//! response record. The `ClientShape` selects the seam: a sync client returns the
+//! decoded record directly (the host owns the I/O loop), an async client `await`s a
+//! `Promise`-returning seam and returns a `Promise` (for a `fetch`/WebSocket host).
+//! Ops whose request or response is not a record the codec can (de)serialize are
+//! skipped with a note.
 //!
 //! Per-direction emission shape:
 //!
@@ -24,7 +27,7 @@
 
 use crate::{
     codec,
-    common::{self, BidiTransport, DecimalMapping},
+    common::{self, BidiTransport, ClientShape, DecimalMapping},
     types,
 };
 use csilgen_common::{CsilServiceDefinition, CsilServiceOperation, WasmGeneratorInput};
@@ -37,24 +40,32 @@ const DEFAULT_AGGREGATE: &str = "ApiClient";
 // The dumb byte transport seam: the caller-owned carrier performs the call named by
 // `(service, op)` with the already-encoded request bytes and returns the response
 // bytes. The generated client owns (de)serialization via the codec; the carrier only
-// moves bytes. Synchronous and blocking — the host owns the I/O loop (no async).
-const TRANSPORT: &str = "\
-export interface ServiceTransport {
-  call(service: string, op: string, req: Uint8Array): Uint8Array;
+// moves bytes. The sync seam returns the bytes directly (the host owns the I/O loop);
+// the async seam returns a `Promise` so a `fetch`/WebSocket carrier fits unchanged.
+fn transport_iface(shape: ClientShape) -> String {
+    let name = shape.transport_name();
+    let ret = if shape.is_async {
+        "Promise<Uint8Array>"
+    } else {
+        "Uint8Array"
+    };
+    format!(
+        "export interface {name} {{\n  call(service: string, op: string, req: Uint8Array): {ret};\n}}\n"
+    )
 }
-";
 
 // Connection mode emits a Codec interface so the channel router can decode raw
 // inbound frames. The server's Codec interface is structurally identical, so a
-// single implementation satisfies both files.
-const CODEC: &str = "\
-export interface Codec {
-  decode<T>(bytes: Uint8Array): T;
-  encode(value: unknown): Uint8Array;
+// single implementation satisfies both files. The codec never does I/O, so it stays
+// synchronous in both client shapes — only the transport seam turns async.
+fn codec_iface(shape: ClientShape) -> String {
+    let name = shape.codec_name();
+    format!(
+        "export interface {name} {{\n  decode<T>(bytes: Uint8Array): T;\n  encode(value: unknown): Uint8Array;\n}}\n"
+    )
 }
-";
 
-pub fn generate(input: &WasmGeneratorInput) -> Result<String, String> {
+pub fn generate(input: &WasmGeneratorInput, shape: ClientShape) -> Result<String, String> {
     let mode = common::bidi_transport(input)?;
     let mapping = common::decimal_mapping(input)?;
     let spec = &input.csil_spec;
@@ -68,12 +79,20 @@ pub fn generate(input: &WasmGeneratorInput) -> Result<String, String> {
     let mut codec_imports: BTreeSet<String> = BTreeSet::new();
     let mut body = String::new();
     for (name, def) in &services {
-        if let Some(class) = service_class(name, def, mode, mapping, &records, &mut codec_imports) {
+        if let Some(class) = service_class(
+            name,
+            def,
+            mode,
+            mapping,
+            shape,
+            &records,
+            &mut codec_imports,
+        ) {
             body.push_str(&class);
             body.push('\n');
         }
         if mode == BidiTransport::Connection && common::service_has_channel_ops(def) {
-            body.push_str(&channel_block(name, def, mapping));
+            body.push_str(&channel_block(name, def, mapping, shape));
             body.push('\n');
         }
     }
@@ -115,13 +134,20 @@ pub fn generate(input: &WasmGeneratorInput) -> Result<String, String> {
         out.push('\n');
     }
 
-    if let Some(url) = string_option_opt(input, "ts_ws_base_url") {
+    // Emitted by the sync (or async drop-in) client only; the `Both`-mode twin
+    // carries a marker, and the unmarked sibling already exports this hint.
+    let ws_base_url = shape
+        .marker
+        .is_empty()
+        .then(|| string_option_opt(input, "ts_ws_base_url"))
+        .flatten();
+    if let Some(url) = ws_base_url {
         // Pure hint: signals the implementer's intent to ride a WebSocket here.
         // The generator never opens this connection itself.
         out.push_str(&format!("export const WS_BASE_URL = {url:?};\n\n"));
     }
 
-    out.push_str(TRANSPORT);
+    out.push_str(&transport_iface(shape));
     out.push('\n');
 
     if mode == BidiTransport::Connection
@@ -129,7 +155,7 @@ pub fn generate(input: &WasmGeneratorInput) -> Result<String, String> {
             .iter()
             .any(|(_, def)| common::service_has_channel_ops(def))
     {
-        out.push_str(CODEC);
+        out.push_str(&codec_iface(shape));
         out.push('\n');
     }
 
@@ -141,7 +167,7 @@ pub fn generate(input: &WasmGeneratorInput) -> Result<String, String> {
         .filter(|(_, def)| service_class_has_methods(def, mode))
         .collect();
     if !aggregate.is_empty() && !services_with_class.is_empty() {
-        out.push_str(&aggregate_class(&aggregate, &services_with_class));
+        out.push_str(&aggregate_class(&aggregate, &services_with_class, shape));
     }
 
     Ok(out)
@@ -162,17 +188,21 @@ fn service_class(
     def: &CsilServiceDefinition,
     mode: BidiTransport,
     mapping: DecimalMapping,
+    shape: ClientShape,
     records: &HashSet<String>,
     codec_imports: &mut BTreeSet<String>,
 ) -> Option<String> {
     if !service_class_has_methods(def, mode) {
         return None;
     }
-    let class = format!("{}Client", common::service_base(name));
+    let class = shape.class_name(&common::service_base(name));
+    let transport = shape.transport_name();
     let wire_service = common::service_wire(name);
 
     let mut out = format!("export class {class} {{\n");
-    out.push_str("  constructor(private readonly t: ServiceTransport) {}\n");
+    out.push_str(&format!(
+        "  constructor(private readonly t: {transport}) {{}}\n"
+    ));
 
     for op in &def.operations {
         match (mode, &op.direction) {
@@ -182,18 +212,20 @@ fn service_class(
                     op,
                     &wire_service,
                     mapping,
+                    shape,
                     records,
                     codec_imports,
                 ));
             }
             (BidiTransport::Rpc, csilgen_common::CsilServiceDirection::Bidirectional) => {
                 out.push('\n');
-                out.push_str(&rpc_send(op, &wire_service, records, codec_imports));
+                out.push_str(&rpc_send(op, &wire_service, shape, records, codec_imports));
                 out.push('\n');
                 out.push_str(&rpc_check(
                     op,
                     &wire_service,
                     mapping,
+                    shape,
                     records,
                     codec_imports,
                 ));
@@ -204,6 +236,7 @@ fn service_class(
                     op,
                     &wire_service,
                     mapping,
+                    shape,
                     records,
                     codec_imports,
                 ));
@@ -231,6 +264,7 @@ fn unary_method(
     op: &CsilServiceOperation,
     wire_service: &str,
     mapping: DecimalMapping,
+    shape: ClientShape,
     records: &HashSet<String>,
     codec_imports: &mut BTreeSet<String>,
 ) -> String {
@@ -249,6 +283,8 @@ fn unary_method(
     let from_res = format!("from{res}Cbor");
     codec_imports.insert(from_res.clone());
 
+    let (async_kw, await_kw) = (shape.async_kw(), shape.await_kw());
+    let ret = shape.ret(&res);
     let throws = vec![
         "@throws {ServiceError} when the API returns an error response".to_string(),
         "@throws transport errors (network, timeout) raised by the transport".to_string(),
@@ -257,17 +293,17 @@ fn unary_method(
     // A push op (`-> Event`) has a `null` input: there is no request body, so the
     // request parameter is omitted and an empty payload is sent.
     if null_input {
-        out.push_str(&format!("  {method}(): {res} {{\n"));
+        out.push_str(&format!("  {async_kw}{method}(): {ret} {{\n"));
         out.push_str(&format!(
-            "    const csilResp = this.t.call(\"{wire_service}\", \"{wire_method}\", new Uint8Array());\n"
+            "    const csilResp = {await_kw}this.t.call(\"{wire_service}\", \"{wire_method}\", new Uint8Array());\n"
         ));
     } else {
         let req = common::ts_type(&op.input_type, mapping);
         let to_req = format!("to{}Cbor", codec::record_ref_name(&op.input_type));
         codec_imports.insert(to_req.clone());
-        out.push_str(&format!("  {method}(req: {req}): {res} {{\n"));
+        out.push_str(&format!("  {async_kw}{method}(req: {req}): {ret} {{\n"));
         out.push_str(&format!(
-            "    const csilResp = this.t.call(\"{wire_service}\", \"{wire_method}\", {to_req}(req));\n"
+            "    const csilResp = {await_kw}this.t.call(\"{wire_service}\", \"{wire_method}\", {to_req}(req));\n"
         ));
     }
     out.push_str(&format!("    return {from_res}(csilResp);\n"));
@@ -279,6 +315,7 @@ fn unary_method(
 fn rpc_send(
     op: &CsilServiceOperation,
     wire_service: &str,
+    shape: ClientShape,
     records: &HashSet<String>,
     codec_imports: &mut BTreeSet<String>,
 ) -> String {
@@ -290,13 +327,15 @@ fn rpc_send(
     let req = common::ts_type(&op.input_type, DecimalMapping::Csil);
     let to_req = format!("to{}Cbor", codec::record_ref_name(&op.input_type));
     codec_imports.insert(to_req.clone());
+    let (async_kw, await_kw) = (shape.async_kw(), shape.await_kw());
+    let ret = shape.ret("void");
     let mut out = String::new();
     out.push_str(&format!(
-        "  send{}(req: {req}): void {{\n",
+        "  {async_kw}send{}(req: {req}): {ret} {{\n",
         pascal_from_camel(&camel)
     ));
     out.push_str(&format!(
-        "    this.t.call(\"{wire_service}\", \"{wire_method}\", {to_req}(req));\n"
+        "    {await_kw}this.t.call(\"{wire_service}\", \"{wire_method}\", {to_req}(req));\n"
     ));
     out.push_str("  }\n");
     out
@@ -308,6 +347,7 @@ fn rpc_check(
     op: &CsilServiceOperation,
     wire_service: &str,
     mapping: DecimalMapping,
+    shape: ClientShape,
     records: &HashSet<String>,
     codec_imports: &mut BTreeSet<String>,
 ) -> String {
@@ -322,13 +362,15 @@ fn rpc_check(
     codec_imports.insert("decode".to_string());
     codec_imports.insert("asArray".to_string());
     codec_imports.insert(from_value.clone());
+    let (async_kw, await_kw) = (shape.async_kw(), shape.await_kw());
+    let ret = shape.ret(&format!("{res}[]"));
     let mut out = String::new();
     out.push_str(&format!(
-        "  check{}(): {res}[] {{\n",
+        "  {async_kw}check{}(): {ret} {{\n",
         pascal_from_camel(&camel)
     ));
     out.push_str(&format!(
-        "    const csilResp = this.t.call(\"{wire_service}\", \"{wire_method}\", new Uint8Array());\n"
+        "    const csilResp = {await_kw}this.t.call(\"{wire_service}\", \"{wire_method}\", new Uint8Array());\n"
     ));
     out.push_str(&format!(
         "    return asArray(decode(csilResp)).map((csilE) => {from_value}(csilE));\n"
@@ -347,9 +389,15 @@ fn pascal_from_camel(s: &str) -> String {
 
 /// Connection-mode emission for the channel ops of a single service:
 /// inbound handler interface, router, and per-`<->`-op outbound encoders.
-fn channel_block(name: &str, def: &CsilServiceDefinition, mapping: DecimalMapping) -> String {
+fn channel_block(
+    name: &str,
+    def: &CsilServiceDefinition,
+    mapping: DecimalMapping,
+    shape: ClientShape,
+) -> String {
     let base = common::service_base(name);
-    let handlers_iface = format!("{base}ChannelHandlers");
+    let handlers_iface = format!("{base}{}ChannelHandlers", shape.marker);
+    let codec_name = shape.codec_name();
     let wire_service = common::service_wire(name);
 
     let channel_ops: Vec<&CsilServiceOperation> = def
@@ -360,30 +408,39 @@ fn channel_block(name: &str, def: &CsilServiceDefinition, mapping: DecimalMappin
 
     let mut out = String::new();
 
-    // Handler interface: client receives output_type for both <-> and <-.
+    // Handler interface: client receives output_type for both <-> and <-. An async
+    // router awaits the handler, so the async shape lets a handler return either a
+    // value or a `Promise` (`void | Promise<void>`).
+    let handler_ret = if shape.is_async {
+        "void | Promise<void>"
+    } else {
+        "void"
+    };
     out.push_str(&format!("export interface {handlers_iface} {{\n"));
     for op in &channel_ops {
         let method = common::to_camel(&op.name);
         let inbound = common::ts_type(&common::success_type(&op.output_type), mapping);
         out.push_str(&common::jsdoc(&op.doc_comments, &[], "  "));
-        out.push_str(&format!("  {method}(msg: {inbound}): void;\n"));
+        out.push_str(&format!("  {method}(msg: {inbound}): {handler_ret};\n"));
     }
     out.push_str("}\n\n");
 
     // Router: feed inbound frames (method + bytes) in; we decode + dispatch.
-    let route_fn = format!("route{}Channel", base);
+    let route_fn = format!("route{base}{}Channel", shape.marker);
+    let (async_kw, await_kw) = (shape.async_kw(), shape.await_kw());
+    let route_ret = shape.ret("void");
     out.push_str(&format!(
         "/**\n\
          \x20* Dispatch one inbound frame for the {wire_service} channel. The implementer\n\
          \x20* (WebSocket adapter etc.) calls this for each message it pulls off the wire;\n\
          \x20* this generator never owns the connection itself.\n\
          \x20*/\n\
-         export function {route_fn}(\n\
+         export {async_kw}function {route_fn}(\n\
          \x20 handlers: {handlers_iface},\n\
-         \x20 codec: Codec,\n\
+         \x20 codec: {codec_name},\n\
          \x20 method: string,\n\
          \x20 bytes: Uint8Array,\n\
-         ): void {{\n\
+         ): {route_ret} {{\n\
          \x20 switch (method) {{\n"
     ));
     for op in &channel_ops {
@@ -392,7 +449,7 @@ fn channel_block(name: &str, def: &CsilServiceDefinition, mapping: DecimalMappin
         let inbound = common::ts_type(&common::success_type(&op.output_type), mapping);
         out.push_str(&format!("    case \"{wire_method}\":\n"));
         out.push_str(&format!(
-            "      handlers.{method}(codec.decode<{inbound}>(bytes));\n"
+            "      {await_kw}handlers.{method}(codec.decode<{inbound}>(bytes));\n"
         ));
         out.push_str("      return;\n");
     }
@@ -403,7 +460,8 @@ fn channel_block(name: &str, def: &CsilServiceDefinition, mapping: DecimalMappin
     out.push_str("  }\n}\n");
 
     // Outbound encoders: only `<->` ops have a client-side outbound; reverse is
-    // server-pushed and gets no encoder here.
+    // server-pushed and gets no encoder here. Encoders are pure (no I/O), so they
+    // stay synchronous in both shapes — only the marker keeps the names distinct.
     for op in &channel_ops {
         if !common::is_bidirectional(op) {
             continue;
@@ -411,7 +469,7 @@ fn channel_block(name: &str, def: &CsilServiceDefinition, mapping: DecimalMappin
         let camel = common::to_camel(&op.name);
         let wire_method = common::method_wire(op);
         let outbound = common::ts_type(&op.input_type, mapping);
-        let fn_name = format!("encode{base}{}", pascal_from_camel(&camel));
+        let fn_name = format!("encode{base}{}{}", shape.marker, pascal_from_camel(&camel));
         out.push_str(&format!(
             "\n\
              /**\n\
@@ -419,7 +477,7 @@ fn channel_block(name: &str, def: &CsilServiceDefinition, mapping: DecimalMappin
              \x20* your connection. Returns `{{method, bytes}}` so the implementer can frame\n\
              \x20* both pieces however its protocol requires.\n\
              \x20*/\n\
-             export function {fn_name}(codec: Codec, msg: {outbound}): {{ method: string; bytes: Uint8Array }} {{\n\
+             export function {fn_name}(codec: {codec_name}, msg: {outbound}): {{ method: string; bytes: Uint8Array }} {{\n\
              \x20 return {{ method: \"{wire_method}\", bytes: codec.encode(msg) }};\n\
              }}\n"
         ));
@@ -428,17 +486,23 @@ fn channel_block(name: &str, def: &CsilServiceDefinition, mapping: DecimalMappin
     out
 }
 
-fn aggregate_class(name: &str, services: &[&(&str, &CsilServiceDefinition)]) -> String {
-    let mut out = format!("export class {name} {{\n");
+fn aggregate_class(
+    name: &str,
+    services: &[&(&str, &CsilServiceDefinition)],
+    shape: ClientShape,
+) -> String {
+    let aggregate = shape.aggregate_name(name);
+    let transport = shape.transport_name();
+    let mut out = format!("export class {aggregate} {{\n");
     for (svc, _) in services {
         let field = common::to_camel(&common::service_base(svc));
-        let class = format!("{}Client", common::service_base(svc));
+        let class = shape.class_name(&common::service_base(svc));
         out.push_str(&format!("  readonly {field}: {class};\n"));
     }
-    out.push_str("  constructor(t: ServiceTransport) {\n");
+    out.push_str(&format!("  constructor(t: {transport}) {{\n"));
     for (svc, _) in services {
         let field = common::to_camel(&common::service_base(svc));
-        let class = format!("{}Client", common::service_base(svc));
+        let class = shape.class_name(&common::service_base(svc));
         out.push_str(&format!("    this.{field} = new {class}(t);\n"));
     }
     out.push_str("  }\n}\n");

@@ -240,6 +240,16 @@ fn process_generation(input: WasmGeneratorInput) -> Result<WasmGeneratorOutput, 
         }
     }
 
+    // Self-contained publishable-package mode: when `emit_packages` includes "c",
+    // emit a README with a copy-paste CSIL-RPC Quickstart alongside the headers, so
+    // the OUTPUT directory documents how to drive the generated client end to end.
+    if emit_packages_includes_c(&input.config.options) {
+        files.push(GeneratedFile {
+            path: "README.md".to_string(),
+            content: package_readme(&input, &config),
+        });
+    }
+
     let total_size: usize = files.iter().map(|f| f.content.len()).sum();
     Ok(WasmGeneratorOutput {
         stats: GenerationStats {
@@ -2359,6 +2369,432 @@ fn service_base(name: &str) -> String {
         .map(str::to_string)
         .unwrap_or(pascal)
 }
+
+// ---- self-contained package (README + Quickstart) -------------------------
+
+/// True only when the `emit_packages` generation option is an array containing the
+/// `"c"` token. Parsed defensively against an arbitrary `serde_json::Value`: a
+/// missing option, a non-array value, or an array without `"c"` all leave the
+/// output as source-only. The match is case-insensitive to be forgiving.
+fn emit_packages_includes_c(options: &HashMap<String, serde_json::Value>) -> bool {
+    options
+        .get("emit_packages")
+        .and_then(|v| v.as_array())
+        .is_some_and(|tokens| {
+            tokens
+                .iter()
+                .filter_map(|v| v.as_str())
+                .any(|token| token.eq_ignore_ascii_case("c"))
+        })
+}
+
+/// The package display name: an explicit `package_name` option wins; otherwise it
+/// is derived from the first service's wire base (`AuthService` -> `auth-client`),
+/// falling back to a generic client name for a service-less spec.
+fn package_name(input: &WasmGeneratorInput) -> String {
+    if let Some(name) = input
+        .config
+        .options
+        .get("package_name")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        return name.to_string();
+    }
+    for rule in &input.csil_spec.rules {
+        if let CsilRuleType::ServiceDef(_) = &rule.rule_type {
+            let base = service_base(&rule.name).to_lowercase();
+            if !base.is_empty() {
+                return format!("{base}-client");
+            }
+        }
+    }
+    "csilgen-client".to_string()
+}
+
+/// The first service (in declaration order) that has a `->` operation, reduced to
+/// an example call. `None` for a serviceless / types-only package.
+struct CUnaryExample {
+    fn_name: String,
+    wire_service: String,
+    wire_op: String,
+    req_type: String,
+    resp_type: String,
+    has_request: bool,
+    req_literal: String,
+    resp_print_field: Option<String>,
+}
+
+fn first_unary_example(input: &WasmGeneratorInput, config: &CConfig) -> Option<CUnaryExample> {
+    for rule in &input.csil_spec.rules {
+        let CsilRuleType::ServiceDef(service) = &rule.rule_type else {
+            continue;
+        };
+        let Some(op) = service
+            .operations
+            .iter()
+            .find(|op| matches!(op.direction, CsilServiceDirection::Unidirectional))
+        else {
+            continue;
+        };
+        let base = service_base(&rule.name);
+        let prefix = to_snake(&base);
+        let success = success_type(&op.output_type);
+        let has_request = !op_input_is_null(&op.input_type);
+        return Some(CUnaryExample {
+            fn_name: format!("csil_{prefix}_{}", to_snake(&op.name)),
+            wire_service: base.to_lowercase(),
+            wire_op: simple_pascal(&op.name),
+            req_type: base_c_type(&op.input_type, config),
+            resp_type: base_c_type(&success, config),
+            has_request,
+            req_literal: if has_request {
+                c_request_literal(input, &op.input_type, config)
+            } else {
+                String::new()
+            },
+            resp_print_field: first_text_field(input, &success),
+        });
+    }
+    None
+}
+
+/// A compiling C designated-initializer for the request record's required fields:
+/// real values for scalars, `"example"` for text, and `{0}` for shapes a generic
+/// sample can't fabricate, so the snippet always compiles even where a user must
+/// fill a value in.
+fn c_request_literal(
+    input: &WasmGeneratorInput,
+    ty: &CsilTypeExpression,
+    config: &CConfig,
+) -> String {
+    let CsilTypeExpression::Reference(name) = unwrap_constrained(ty) else {
+        return "{0}".to_string();
+    };
+    let Some(group) = find_record(input, name) else {
+        return "{0}".to_string();
+    };
+    let fields: Vec<String> = group
+        .entries
+        .iter()
+        .filter(|e| !matches!(e.occurrence, Some(CsilOccurrence::Optional)))
+        .filter_map(|e| {
+            entry_field_name(&e.key)
+                .map(|field| format!(".{field} = {}", c_sample_value(&e.value_type, config)))
+        })
+        .collect();
+    if fields.is_empty() {
+        "{0}".to_string()
+    } else {
+        format!("{{ {} }}", fields.join(", "))
+    }
+}
+
+/// A single C value literal for `ty`, used inside a request initializer.
+fn c_sample_value(ty: &CsilTypeExpression, config: &CConfig) -> String {
+    match unwrap_constrained(ty) {
+        CsilTypeExpression::Builtin(name) => match name.as_str() {
+            "text" | "tstr" => "\"example\"".to_string(),
+            "bool" | "true" | "false" => "false".to_string(),
+            "int" | "nint" | "uint" => "0".to_string(),
+            "float" | "float16" | "float32" | "float64" | "double" => "0.0".to_string(),
+            _ => "{0}".to_string(),
+        },
+        _ => {
+            let _ = config;
+            "{0}".to_string()
+        }
+    }
+}
+
+/// The first required text field of a record type reference, so the example can
+/// print a typed response value rather than just announcing success.
+fn first_text_field(input: &WasmGeneratorInput, ty: &CsilTypeExpression) -> Option<String> {
+    let CsilTypeExpression::Reference(name) = unwrap_constrained(ty) else {
+        return None;
+    };
+    let group = find_record(input, name)?;
+    group.entries.iter().find_map(|e| {
+        let is_text = matches!(unwrap_constrained(&e.value_type), CsilTypeExpression::Builtin(n) if n == "text" || n == "tstr");
+        if is_text && !matches!(e.occurrence, Some(CsilOccurrence::Optional)) {
+            entry_field_name(&e.key)
+        } else {
+            None
+        }
+    })
+}
+
+/// The record a type reference names, if any. A `Name = { ... }` rule parses as
+/// `TypeDef(Group(..))`, while a bare group rule is `GroupDef(..)`; both are records.
+fn find_record<'a>(input: &'a WasmGeneratorInput, name: &str) -> Option<&'a CsilGroupExpression> {
+    input
+        .csil_spec
+        .rules
+        .iter()
+        .filter(|r| r.name == name)
+        .find_map(|r| match &r.rule_type {
+            CsilRuleType::GroupDef(g) => Some(g),
+            CsilRuleType::TypeDef(CsilTypeExpression::Group(g)) => Some(g),
+            _ => None,
+        })
+}
+
+/// The package README, with a copy-paste **Quickstart**. For a client package the
+/// Quickstart is a complete CSIL-RPC carrier (it reuses this package's own generated
+/// CBOR codec for the envelope, adding no third-party CBOR dependency, and POSTs over
+/// raw POSIX sockets so the whole snippet is libc-only), the transport seam wired to
+/// it, and one example call. A serviceless package gets a shorter types-only section.
+fn package_readme(input: &WasmGeneratorInput, config: &CConfig) -> String {
+    let name = package_name(input);
+    let mut out = format!(
+        "# {name}\n\n\
+         Generated by csilgen. A typed, transport-agnostic CSIL-RPC client in C: the\n\
+         generated codec owns CBOR (de)serialization; you supply a *carrier* that only\n\
+         moves bytes.\n\n\
+         ## Consume\n\n\
+         C has no package manager, so vendor the generated headers into your project and\n\
+         put this directory on your include path. The headers are header-only; a single\n\
+         translation unit that `#include`s `client.gen.h` pulls in the types and the\n\
+         self-contained CBOR codec. Build with any C11 compiler:\n\n\
+         ```sh\n\
+         cc main.c -o demo\n\
+         ```\n\n\
+         > Generate the client surface with `--target c-client` so `client.gen.h` is\n\
+         > emitted alongside the codec.\n\n"
+    );
+
+    match first_unary_example(input, config) {
+        Some(example) => out.push_str(&quickstart(&example)),
+        None => out.push_str(
+            "## Quickstart\n\n\
+             This package has no service operations — `#include \"types.gen.h\"` and\n\
+             `#include \"codec.gen.h\"` and use the generated `csil_encode_*` /\n\
+             `csil_decode_*` helpers directly.\n",
+        ),
+    }
+    out
+}
+
+/// The client Quickstart: a dependency-free blocking CSIL-RPC carrier (reuses the
+/// generated codec for the envelope, raw POSIX sockets for HTTP), the transport seam
+/// wired to it, and the typed call. A user changes only the host/port strings.
+fn quickstart(ex: &CUnaryExample) -> String {
+    let mut out = String::from("## Quickstart\n\n");
+    out.push_str(
+        "A complete CSIL-RPC carrier (no third-party dependency — the envelope reuses\n\
+         this package's generated CBOR codec, and the HTTP POST is hand-rolled over POSIX\n\
+         sockets) plus the typed client. Change the one host/port pair.\n\n",
+    );
+    out.push_str("```c\n");
+    out.push_str(CARRIER_C);
+    out.push('\n');
+    // The example call: build the carrier, wire the seam, call the first op.
+    out.push_str("int main(void) {\n");
+    out.push_str("    CsilRpcCarrier carrier = { .host = \"127.0.0.1\", .port = \"5080\" };\n");
+    out.push_str(
+        "    CsilgenTransport transport = { .call = csil_rpc_call, .self = &carrier };\n\n",
+    );
+    out.push_str("    CsilCodecArena *owner = NULL;\n");
+    let resp_decl = declarator(&ex.resp_type, 0, "resp");
+    out.push_str(&format!("    {resp_decl};\n"));
+    if ex.has_request {
+        let req_decl = declarator(&ex.req_type, 0, "req");
+        out.push_str(&format!("    {req_decl} = {};\n", ex.req_literal));
+        out.push_str(&format!(
+            "    if ({}(&transport, &req, &resp, &owner) != 0) {{\n",
+            ex.fn_name
+        ));
+    } else {
+        out.push_str(&format!(
+            "    if ({}(&transport, &resp, &owner) != 0) {{\n",
+            ex.fn_name
+        ));
+    }
+    out.push_str(&format!(
+        "        fprintf(stderr, \"csil-rpc {}/{} failed\\n\");\n",
+        ex.wire_service, ex.wire_op
+    ));
+    out.push_str("        return 1;\n    }\n");
+    match &ex.resp_print_field {
+        Some(field) => out.push_str(&format!(
+            "    printf(\"{}/{} -> %s\\n\", resp.{field});\n",
+            ex.wire_service, ex.wire_op
+        )),
+        None => out.push_str(&format!(
+            "    printf(\"{}/{} ok\\n\");\n",
+            ex.wire_service, ex.wire_op
+        )),
+    }
+    out.push_str("    csil_codec_arena_free(owner); // frees everything `resp` borrows\n");
+    out.push_str("    return 0;\n}\n");
+    out.push_str("```\n");
+    out
+}
+
+/// The carrier body — identical for every spec, so it is a constant. It wraps the
+/// already-encoded request in a `CsilRpcRequest` envelope (tag-24 payload) using the
+/// generated codec's writer, POSTs it to `{host}:{port}/csil/v1/rpc` over a raw
+/// socket, and returns the response payload bytes for the generated client to decode.
+/// A non-zero transport `status` or a typed `ServiceError` arm becomes a non-zero rc.
+const CARRIER_C: &str = r##"// Quickstart carrier — CSIL-RPC over HTTP.
+//
+// Dependency posture (path 1 + libc): the CBOR envelope reuses THIS package's own
+// generated codec primitives (csilc_buf / csilc_w_* / csilc_decode from
+// codec.gen.h), so there is no third-party CBOR dependency; the HTTP POST is
+// hand-rolled over POSIX sockets, so there is no third-party HTTP dependency either.
+// Drop this in a .c file next to the generated headers.
+//
+// The feature-test macro exposes getaddrinfo/socket under a strict `-std=c11`; it
+// must precede the first system header, so it leads the file.
+#define _POSIX_C_SOURCE 200112L
+#include "client.gen.h"
+
+#include <netdb.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+typedef struct CsilRpcCarrier {
+    const char *host; // e.g. "127.0.0.1"
+    const char *port; // e.g. "5080"
+} CsilRpcCarrier;
+
+// Read the whole socket to EOF (the server replies with Connection: close).
+static int csil_read_all(int fd, uint8_t **out, size_t *out_len) {
+    size_t cap = 4096, len = 0;
+    uint8_t *buf = (uint8_t *)malloc(cap);
+    if (!buf) return -1;
+    for (;;) {
+        if (len == cap) {
+            uint8_t *grown = (uint8_t *)realloc(buf, cap * 2);
+            if (!grown) { free(buf); return -1; }
+            buf = grown;
+            cap *= 2;
+        }
+        ssize_t n = read(fd, buf + len, cap - len);
+        if (n < 0) { free(buf); return -1; }
+        if (n == 0) break;
+        len += (size_t)n;
+    }
+    *out = buf;
+    *out_len = len;
+    return 0;
+}
+
+// The CsilgenTransport seam: build the CSIL-RPC envelope, POST it, unwrap the reply.
+static int csil_rpc_call(void *self, const char *service, const char *op,
+                         const uint8_t *req, size_t req_len,
+                         uint8_t **resp, size_t *resp_len) {
+    CsilRpcCarrier *c = (CsilRpcCarrier *)self;
+
+    // 1. CsilRpcRequest = { v, op, payload: #6.24(bstr), service } via the package's
+    //    own canonical-CBOR writer (keys in length-then-bytewise order).
+    csilc_buf env;
+    csilc_buf_init(&env);
+    int w = csilc_w_map_head(&env, 4)
+            || csilc_w_text(&env, "v", 1) || csilc_w_uint(&env, 1)
+            || csilc_w_text(&env, "op", 2) || csilc_w_text(&env, op, strlen(op))
+            || csilc_w_text(&env, "payload", 7) || csilc_w_tag(&env, 24)
+            || csilc_w_bytes(&env, req, req_len)
+            || csilc_w_text(&env, "service", 7)
+            || csilc_w_text(&env, service, strlen(service));
+    if (w) { csilc_buf_dispose(&env); return -1; }
+
+    // 2. POST it to {host}:{port}/csil/v1/rpc over a raw socket (libc only).
+    struct addrinfo hints, *ai;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    if (getaddrinfo(c->host, c->port, &hints, &ai)) { csilc_buf_dispose(&env); return -1; }
+    int fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+    if (fd < 0 || connect(fd, ai->ai_addr, ai->ai_addrlen)) {
+        if (fd >= 0) close(fd);
+        freeaddrinfo(ai);
+        csilc_buf_dispose(&env);
+        return -1;
+    }
+    freeaddrinfo(ai);
+
+    char header[256];
+    int hn = snprintf(header, sizeof(header),
+                      "POST /csil/v1/rpc HTTP/1.1\r\nHost: %s\r\n"
+                      "Content-Type: application/cbor\r\nContent-Length: %zu\r\n"
+                      "Connection: close\r\n\r\n",
+                      c->host, env.len);
+    if (hn < 0 || hn >= (int)sizeof(header)
+        || write(fd, header, (size_t)hn) < 0
+        || (env.len && write(fd, env.data, env.len) < 0)) {
+        close(fd);
+        csilc_buf_dispose(&env);
+        return -1;
+    }
+    csilc_buf_dispose(&env);
+
+    uint8_t *raw = NULL;
+    size_t raw_len = 0;
+    if (csil_read_all(fd, &raw, &raw_len)) { close(fd); return -1; }
+    close(fd);
+
+    // 3. Split HTTP headers from the CBOR body; require a 200 status line.
+    uint8_t *body = NULL;
+    size_t body_len = 0;
+    for (size_t i = 0; i + 4 <= raw_len; i++) {
+        if (memcmp(raw + i, "\r\n\r\n", 4) == 0) {
+            body = raw + i + 4;
+            body_len = raw_len - i - 4;
+            break;
+        }
+    }
+    if (!body || raw_len < 12 || memcmp(raw + 9, "200", 3) != 0) { free(raw); return -1; }
+
+    // 4. Decode the CsilRpcResponse envelope with the generated reader.
+    CsilCodecArena *a;
+    const csilc_value *root;
+    if (csilc_decode(body, body_len, &a, &root)) { free(raw); return -1; }
+
+    int64_t status = 0;
+    const csilc_value *sv = csilc_map_get(root, "status");
+    if (!sv || !csilc_as_i64(sv, &status) || status != 0) {
+        // status != 0 is a transport failure: there is no typed payload to unwrap.
+        csil_codec_arena_free(a);
+        free(raw);
+        return -1;
+    }
+
+    // status == 0 + variant "ServiceError" is a typed application error, distinct
+    // from a transport failure; surface it as a non-zero return.
+    const csilc_value *var = csilc_map_get(root, "variant");
+    if (var && var->kind == CSILC_TEXT
+        && strcmp((const char *)var->as.bytes.ptr, "ServiceError") == 0) {
+        fprintf(stderr, "csil-rpc %s/%s: service error\n", service, op);
+        csil_codec_arena_free(a);
+        free(raw);
+        return 1;
+    }
+
+    // 5. Unwrap the tag-24 inner bytes and hand a malloc'd copy to the generated
+    //    client, which frees it with free().
+    const csilc_value *pl = csilc_map_get(root, "payload");
+    if (!pl || pl->kind != CSILC_TAG || pl->as.tag.num != 24
+        || pl->as.tag.content->kind != CSILC_BYTES) {
+        csil_codec_arena_free(a);
+        free(raw);
+        return -1;
+    }
+    const csilc_value *inner = pl->as.tag.content;
+    *resp = (uint8_t *)malloc(inner->as.bytes.len ? inner->as.bytes.len : 1);
+    if (!*resp) { csil_codec_arena_free(a); free(raw); return -1; }
+    memcpy(*resp, inner->as.bytes.ptr, inner->as.bytes.len);
+    *resp_len = inner->as.bytes.len;
+
+    csil_codec_arena_free(a);
+    free(raw);
+    return 0;
+}
+"##;
 
 // ---- embedded codec runtime -----------------------------------------------
 

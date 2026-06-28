@@ -50,6 +50,8 @@ fn gemspec_emitted_only_when_emit_packages_includes_ruby() {
             .expect("generation succeeded");
     assert!(!plain.iter().any(|f| f.path.ends_with(".gemspec")));
     assert!(plain.iter().any(|f| f.path == "types.rb"));
+    // The README rides with the gem packaging, never the flat layout.
+    assert!(!plain.iter().any(|f| f.path == "README.md"));
 
     // emit_packages present but without "ruby": still unchanged.
     let mut other = HashMap::new();
@@ -78,6 +80,14 @@ fn gemspec_emitted_only_when_emit_packages_includes_ruby() {
     // Generated sources relocate under lib/, and the entry point requires them.
     assert!(pkg.iter().any(|f| f.path == "lib/types.rb"));
     assert!(pkg.iter().any(|f| f.path == "lib/client.rb"));
+
+    // Package mode also ships a root README with the copy-paste Quickstart carrier.
+    let readme = pkg
+        .iter()
+        .find(|f| f.path == "README.md")
+        .expect("README.md emitted in package mode");
+    assert!(readme.content.contains("class CsilRpcTransport"));
+    assert!(readme.content.contains("/csil/v1/rpc"));
     let entry = pkg
         .iter()
         .find(|f| f.path == "lib/acme_client.rb")

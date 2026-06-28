@@ -932,3 +932,187 @@ fn named_map_and_list_aliases_are_faithful_codecd_structs() {
         "map/list alias was treated as un-codec'd: {warnings:?}"
     );
 }
+
+// ---- self-contained package (README + Quickstart) -------------------------
+
+// `Name = { ... }` parses to `TypeDef(Group(..))` (not `GroupDef`), so build the
+// records that way here to guard the README/example path against the real parser.
+fn record_typedef(name: &str, entries: Vec<CsilGroupEntry>) -> CsilRule {
+    CsilRule {
+        name: name.to_string(),
+        rule_type: CsilRuleType::TypeDef(CsilTypeExpression::Group(CsilGroupExpression {
+            entries,
+        })),
+        position: pos(),
+        doc_comments: vec![],
+    }
+}
+
+fn pingpong_rules() -> Vec<CsilRule> {
+    vec![
+        record_typedef("Ping", vec![bare_entry("msg", builtin("text"))]),
+        record_typedef("Pong", vec![bare_entry("msg", builtin("text"))]),
+        service_rule(
+            "Echo",
+            vec![op(
+                "ping",
+                CsilTypeExpression::Reference("Ping".to_string()),
+                CsilTypeExpression::Reference("Pong".to_string()),
+                CsilServiceDirection::Unidirectional,
+                None,
+            )],
+            None,
+        ),
+    ]
+}
+
+fn file_named<'a>(files: &'a [GeneratedFile], path: &str) -> &'a str {
+    files
+        .iter()
+        .find(|f| f.path == path)
+        .map(|f| f.content.as_str())
+        .unwrap_or_else(|| panic!("missing emitted file: {path}"))
+}
+
+#[test]
+fn readme_absent_without_emit_packages() {
+    let input = input_with_rules(pingpong_rules(), "c-client", HashMap::new());
+    let files = process_generation(input).expect("generate").files;
+    assert!(
+        !files.iter().any(|f| f.path == "README.md"),
+        "README.md must not be emitted without emit_packages"
+    );
+}
+
+#[test]
+fn package_readme_has_quickstart_carrier_and_example() {
+    let mut options = HashMap::new();
+    options.insert("emit_packages".to_string(), serde_json::json!(["c"]));
+    let input = input_with_rules(pingpong_rules(), "c-client", options);
+    let files = process_generation(input).expect("generate").files;
+    let readme = file_named(&files, "README.md");
+
+    // The carrier (the must-have) implements the generated transport seam.
+    assert!(
+        readme
+            .contains("static int csil_rpc_call(void *self, const char *service, const char *op,"),
+        "README must embed the CSIL-RPC carrier seam:\n{readme}"
+    );
+    assert!(
+        readme.contains("CsilgenTransport transport = { .call = csil_rpc_call, .self = &carrier }"),
+        "example must wire the carrier into the transport seam:\n{readme}"
+    );
+    // The canonical mount + method.
+    assert!(
+        readme.contains("POST /csil/v1/rpc HTTP/1.1"),
+        "carrier must POST the canonical mount:\n{readme}"
+    );
+    // The request payload is tag-24 wrapped, built with the package's own codec.
+    assert!(
+        readme.contains("csilc_w_tag(&env, 24)")
+            && readme.contains("csilc_w_bytes(&env, req, req_len)"),
+        "request payload must be a tag-24 byte string built with the generated codec:\n{readme}"
+    );
+    // Both transport-status and typed ServiceError arms are handled.
+    assert!(
+        readme.contains("status != 0") && readme.contains("\"ServiceError\""),
+        "carrier must handle the status and ServiceError arms:\n{readme}"
+    );
+    // The example call hits the first op with a generated sample literal and prints
+    // the typed response field.
+    assert!(
+        readme.contains("Ping req = { .msg = \"example\" }"),
+        "example must pass a generated sample request literal:\n{readme}"
+    );
+    assert!(
+        readme.contains("csil_echo_ping(&transport, &req, &resp, &owner)"),
+        "example must call the first service op over the carrier:\n{readme}"
+    );
+    assert!(
+        readme.contains("resp.msg"),
+        "example must print the typed response field:\n{readme}"
+    );
+}
+
+#[test]
+fn serviceless_package_readme_is_types_only() {
+    let mut options = HashMap::new();
+    options.insert("emit_packages".to_string(), serde_json::json!(["c"]));
+    let input = input_with_rules(
+        vec![record_typedef(
+            "Thing",
+            vec![bare_entry("id", builtin("uint"))],
+        )],
+        "c-typesonly",
+        options,
+    );
+    let files = process_generation(input).expect("generate").files;
+    let readme = file_named(&files, "README.md");
+    assert!(
+        readme.contains("has no service operations"),
+        "a serviceless package must get the types-only section:\n{readme}"
+    );
+    assert!(
+        !readme.contains("csil_rpc_call"),
+        "a serviceless package must not embed a client carrier:\n{readme}"
+    );
+}
+
+/// End-to-end proof the README Quickstart carrier compiles against the real generated
+/// package: emit the ping/pong client package, write every file, extract the README's
+/// `c` block as `main.c`, and compile it with `cc`. A clean compile proves the carrier
+/// is valid against the generated codec + client. The sandbox kills cross-process
+/// loopback sockets, so this compiles (does not run) the carrier; the standalone
+/// `tools/csil-rpc-echo-mock.py` verifies the same carrier against real HTTP normally.
+/// Skips when no C compiler is on PATH so the suite stays portable.
+#[test]
+fn readme_quickstart_carrier_compiles_with_cc() {
+    let cc = ["cc", "gcc", "clang"].into_iter().find(|bin| {
+        std::process::Command::new(bin)
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    });
+    let Some(cc) = cc else {
+        eprintln!("skipping: no C compiler on PATH");
+        return;
+    };
+
+    let mut options = HashMap::new();
+    options.insert("emit_packages".to_string(), serde_json::json!(["c"]));
+    let input = input_with_rules(pingpong_rules(), "c-client", options);
+    let files = process_generation(input).expect("generate").files;
+
+    let dir = std::env::temp_dir().join(format!("csilgen-c-readme-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    for f in &files {
+        std::fs::write(dir.join(&f.path), &f.content).unwrap();
+    }
+
+    let readme = file_named(&files, "README.md");
+    let block = extract_c_block(readme).expect("README must contain a c code block");
+    std::fs::write(dir.join("main.c"), &block).unwrap();
+
+    let out = std::process::Command::new(cc)
+        .args(["-std=c11", "-Wall", "-Wextra", "-c", "main.c", "-o"])
+        .arg(dir.join("main.o"))
+        .current_dir(&dir)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{cc} failed on the README carrier:\n{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The contents of the first ```` ```c ```` fenced block in `md`.
+fn extract_c_block(md: &str) -> Option<String> {
+    let start = md.find("```c\n")? + "```c\n".len();
+    let end = md[start..].find("\n```")? + start;
+    Some(md[start..end].to_string())
+}

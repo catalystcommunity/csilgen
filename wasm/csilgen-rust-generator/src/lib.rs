@@ -327,11 +327,12 @@ impl std::fmt::Display for ValidationError {
 
 impl std::error::Error for ValidationError {}"#;
 
-/// Shared client scaffolding emitted at the top of `client.rs`: the error type
-/// and the caller-supplied `Transport` abstraction every per-service client
-/// delegates to. The generator never owns the wire (CBOR-over-HTTP etc.).
-const CLIENT_PRELUDE: &str = "\
-/// Error from a generated client call: a structured error the service returned,
+/// The shared client error type emitted at the top of the sync/async-drop-in
+/// `client.rs`. The async twin reuses this type (imported from the sync module)
+/// rather than redefining it, so both clients coexist in one module tree. The
+/// transport trait is emitted separately by `client_prelude` because only its
+/// `call` method differs between the sync and async shapes.
+const CLIENT_ERROR: &str = r#"/// Error from a generated client call: a structured error the service returned,
 /// or a transport-level failure. The caller-supplied `Transport` decides how an
 /// error response maps onto `Service`.
 #[derive(Debug, Clone)]
@@ -343,22 +344,340 @@ pub enum ClientError {
 impl std::fmt::Display for ClientError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ClientError::Service { code, message } => write!(f, \"service error {code}: {message}\"),
-            ClientError::Transport(msg) => write!(f, \"transport error: {msg}\"),
+            ClientError::Service { code, message } => write!(f, "service error {code}: {message}"),
+            ClientError::Transport(msg) => write!(f, "transport error: {msg}"),
         }
     }
 }
 
-impl std::error::Error for ClientError {}
+impl std::error::Error for ClientError {}"#;
 
-/// The caller-supplied byte carrier: it performs the call named by `(service, op)`
-/// with the already-encoded request bytes and returns the response bytes, or an
-/// error. The generated client owns (de)serialization via the codec; the carrier
-/// only moves bytes, so it can be HTTP, a queue, or an in-process loop.
-pub trait Transport {
-    fn call(&self, service: &str, op: &str, req: &[u8]) -> Result<Vec<u8>, ClientError>;
+/// The pieces the README Quickstart's example call needs: the client struct to
+/// construct, the method to call, whether that method takes a request, and a
+/// compiling sample request literal (empty when the op takes none).
+struct RustExample {
+    client_struct: String,
+    method: String,
+    null_input: bool,
+    sample: String,
 }
-";
+
+/// The Quickstart carrier body, identical for every spec, so it is a constant. It
+/// implements the generated sync `Transport`: it wraps the already-encoded request in
+/// a `CsilRpcRequest` envelope (tag-24 payload), POSTs it to `{base_url}/csil/v1/rpc`
+/// with `ureq`, and returns the response payload bytes for the generated client to
+/// decode. A non-zero transport `status` or a typed `ServiceError` arm is surfaced as
+/// a `ClientError`.
+///
+/// Dependency posture follows the csilgen "hybrid" rule. The preferred path — reusing
+/// this package's own codec to build the envelope — is unavailable here: the generated
+/// codec keeps its generic CBOR encode/decode private (only the `CsilCborValue` *type*
+/// is public), so a downstream carrier cannot reach them. So the carrier takes the
+/// next path and **hand-rolls the tiny fixed envelope** with stdlib bytes only — no
+/// CBOR dependency. HTTP is `ureq` (a small blocking client) because Rust's std has no
+/// HTTP client; everything else is `std`.
+const CARRIER_RUST: &str = r#"use std::io::Read;
+
+const CSIL_RPC_PATH: &str = "/csil/v1/rpc";
+const CSIL_TAG_EMBEDDED_CBOR: u64 = 24; // RFC 8949 §3.4.5.1: an encoded CBOR data item.
+
+// The carrier owns only the CSIL-RPC envelope + HTTP; it never touches your types.
+pub struct CsilRpcTransport {
+    base_url: String,
+}
+
+impl CsilRpcTransport {
+    pub fn new(base_url: impl Into<String>) -> Self {
+        Self {
+            base_url: base_url.into().trim_end_matches('/').to_string(),
+        }
+    }
+}
+
+impl Transport for CsilRpcTransport {
+    fn call(&self, service: &str, op: &str, req: &[u8]) -> Result<Vec<u8>, ClientError> {
+        // CsilRpcRequest = { v, service, op, payload: #6.24(bstr) }, keys laid down in
+        // canonical (length-then-bytewise) order. `payload` is the already-encoded
+        // request wrapped in tag 24; the codec, not the carrier, produced those bytes.
+        let mut body = Vec::new();
+        csil_enc_head(5, 4, &mut body); // map of 4 pairs
+        csil_enc_text("v", &mut body);
+        csil_enc_head(0, 1, &mut body); // value: 1
+        csil_enc_text("op", &mut body);
+        csil_enc_text(op, &mut body);
+        csil_enc_text("payload", &mut body);
+        csil_enc_head(6, CSIL_TAG_EMBEDDED_CBOR, &mut body);
+        csil_enc_bytes(req, &mut body);
+        csil_enc_text("service", &mut body);
+        csil_enc_text(service, &mut body);
+
+        let url = format!("{}{CSIL_RPC_PATH}", self.base_url);
+        let resp = ureq::post(&url)
+            .set("Content-Type", "application/cbor")
+            .set("Accept", "application/cbor")
+            .send_bytes(&body)
+            .map_err(|e| ClientError::Transport(e.to_string()))?;
+        let mut bytes = Vec::new();
+        resp.into_reader()
+            .read_to_end(&mut bytes)
+            .map_err(|e| ClientError::Transport(e.to_string()))?;
+
+        // CsilRpcResponse = { v, status, ? variant, ? error, payload: #6.24(bstr) }.
+        let env = csil_dec_value(&mut &bytes[..]).map_err(ClientError::Transport)?;
+        let status = env.get("status").and_then(Cbor::as_i64).unwrap_or(0);
+        if status != 0 {
+            let msg = env.get("error").and_then(Cbor::as_text).unwrap_or_default();
+            return Err(ClientError::Transport(format!(
+                "csil-rpc {service}/{op}: transport status {status}: {msg}"
+            )));
+        }
+        let inner = match env.get("payload") {
+            Some(Cbor::Tag(CSIL_TAG_EMBEDDED_CBOR, boxed)) => match boxed.as_ref() {
+                Cbor::Bytes(v) => v.clone(),
+                _ => return Err(ClientError::Transport("tag-24 payload is not a byte string".into())),
+            },
+            _ => return Err(ClientError::Transport("response is missing its tag-24 payload".into())),
+        };
+
+        // A typed `ServiceError` arm (variant == "ServiceError") is an application
+        // error, surfaced as `ClientError::Service`, distinct from a transport failure.
+        if env.get("variant").and_then(Cbor::as_text).as_deref() == Some("ServiceError") {
+            let e = csil_dec_value(&mut &inner[..]).map_err(ClientError::Transport)?;
+            return Err(ClientError::Service {
+                code: e.get("code").and_then(Cbor::as_i64).unwrap_or(0),
+                message: e.get("message").and_then(Cbor::as_text).unwrap_or_default(),
+            });
+        }
+        Ok(inner)
+    }
+}
+
+// --- A tiny self-contained CBOR codec for the fixed envelope (no third-party dep) ---
+
+fn csil_enc_head(major: u8, n: u64, out: &mut Vec<u8>) {
+    let mt = major << 5;
+    if n < 24 {
+        out.push(mt | n as u8);
+    } else if n <= u8::MAX as u64 {
+        out.push(mt | 24);
+        out.push(n as u8);
+    } else if n <= u16::MAX as u64 {
+        out.push(mt | 25);
+        out.extend_from_slice(&(n as u16).to_be_bytes());
+    } else if n <= u32::MAX as u64 {
+        out.push(mt | 26);
+        out.extend_from_slice(&(n as u32).to_be_bytes());
+    } else {
+        out.push(mt | 27);
+        out.extend_from_slice(&n.to_be_bytes());
+    }
+}
+
+fn csil_enc_text(s: &str, out: &mut Vec<u8>) {
+    csil_enc_head(3, s.len() as u64, out);
+    out.extend_from_slice(s.as_bytes());
+}
+
+fn csil_enc_bytes(b: &[u8], out: &mut Vec<u8>) {
+    csil_enc_head(2, b.len() as u64, out);
+    out.extend_from_slice(b);
+}
+
+// Only the CBOR shapes a CSIL-RPC response uses are kept; any other value decodes to
+// `Other` (its bytes still consumed, so the cursor stays aligned) since the carrier
+// never inspects it.
+enum Cbor {
+    Uint(u64),
+    Int(i64),
+    Text(String),
+    Bytes(Vec<u8>),
+    Map(Vec<(Cbor, Cbor)>),
+    Tag(u64, Box<Cbor>),
+    Other,
+}
+
+impl Cbor {
+    fn as_i64(&self) -> Option<i64> {
+        match self {
+            Cbor::Uint(u) => i64::try_from(*u).ok(),
+            Cbor::Int(i) => Some(*i),
+            _ => None,
+        }
+    }
+    fn as_text(&self) -> Option<String> {
+        match self {
+            Cbor::Text(s) => Some(s.clone()),
+            _ => None,
+        }
+    }
+    fn get(&self, key: &str) -> Option<&Cbor> {
+        match self {
+            Cbor::Map(pairs) => pairs.iter().find_map(|(k, v)| match k {
+                Cbor::Text(s) if s == key => Some(v),
+                _ => None,
+            }),
+            _ => None,
+        }
+    }
+}
+
+fn csil_read_be(b: &mut &[u8], n: usize) -> Result<u64, String> {
+    if b.len() < n {
+        return Err("truncated CBOR integer".into());
+    }
+    let mut v = 0u64;
+    for &byte in &b[..n] {
+        v = (v << 8) | byte as u64;
+    }
+    *b = &b[n..];
+    Ok(v)
+}
+
+fn csil_dec_head(b: &mut &[u8]) -> Result<(u8, u64), String> {
+    let first = *b.first().ok_or("unexpected end of CBOR")?;
+    *b = &b[1..];
+    let info = first & 0x1f;
+    let n = match info {
+        0..=23 => info as u64,
+        24 => csil_read_be(b, 1)?,
+        25 => csil_read_be(b, 2)?,
+        26 => csil_read_be(b, 4)?,
+        27 => csil_read_be(b, 8)?,
+        _ => return Err("unsupported CBOR additional info".into()),
+    };
+    Ok((first >> 5, n))
+}
+
+fn csil_take(b: &mut &[u8], n: usize) -> Result<Vec<u8>, String> {
+    if b.len() < n {
+        return Err("truncated CBOR string".into());
+    }
+    let v = b[..n].to_vec();
+    *b = &b[n..];
+    Ok(v)
+}
+
+fn csil_dec_value(b: &mut &[u8]) -> Result<Cbor, String> {
+    let (major, n) = csil_dec_head(b)?;
+    Ok(match major {
+        0 => Cbor::Uint(n),
+        1 => Cbor::Int(-1 - n as i64),
+        2 => Cbor::Bytes(csil_take(b, n as usize)?),
+        3 => Cbor::Text(String::from_utf8(csil_take(b, n as usize)?).map_err(|_| "invalid UTF-8")?),
+        4 => {
+            for _ in 0..n {
+                csil_dec_value(b)?;
+            }
+            Cbor::Other
+        }
+        5 => {
+            let mut pairs = Vec::new();
+            for _ in 0..n {
+                let k = csil_dec_value(b)?;
+                let v = csil_dec_value(b)?;
+                pairs.push((k, v));
+            }
+            Cbor::Map(pairs)
+        }
+        6 => Cbor::Tag(n, Box::new(csil_dec_value(b)?)),
+        // Simple/float: the header (and its 1/2/4/8 payload bytes) is already consumed.
+        7 => Cbor::Other,
+        _ => return Err("unsupported CBOR major type".into()),
+    })
+}
+"#;
+
+/// Whether a generated client run emits the blocking client, the async client, or
+/// both, selected by the `client_style` option. The default is `Both`: every
+/// consumer keeps their existing blocking client and gains an async twin alongside.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClientStyle {
+    Sync,
+    Async,
+    Both,
+}
+
+/// Read & validate the `client_style` option. Validated early (before any file is
+/// emitted) so a misconfiguration fails the run rather than producing output, the
+/// same validate-early idiom this generator uses for `decimal_mapping`. Absent
+/// value defaults to `Both`.
+fn client_style(input: &WasmGeneratorInput) -> Result<ClientStyle, String> {
+    match input.config.options.get("client_style") {
+        None => Ok(ClientStyle::Both),
+        Some(v) => match v.as_str() {
+            Some("sync") => Ok(ClientStyle::Sync),
+            Some("async") => Ok(ClientStyle::Async),
+            Some("both") => Ok(ClientStyle::Both),
+            Some(other) => Err(format!(
+                "client_style must be \"sync\", \"async\", or \"both\", got {other:?}"
+            )),
+            None => Err(format!("client_style must be a string, got {v:?}")),
+        },
+    }
+}
+
+/// Per-file shape of a generated client: whether its methods/transport seam are
+/// async, plus the `Async` symbol marker that keeps the async twin distinct from
+/// the sync client when both land in one module tree. `marker` is empty for a
+/// stand-alone client (sync, or the async drop-in) that owns the canonical names.
+#[derive(Clone, Copy)]
+struct ClientShape {
+    is_async: bool,
+    marker: &'static str,
+}
+
+impl ClientShape {
+    /// `async ` (trailing space) for the async shapes, empty for sync, so it drops
+    /// straight into `pub {kw}fn` / `{kw}fn` without disturbing spacing.
+    fn async_kw(self) -> &'static str {
+        if self.is_async { "async " } else { "" }
+    }
+
+    /// `.await` spliced before the transport call's `?`, empty for sync, so the call
+    /// site reads `…call(…).await?` for async vs `…call(…)?` for sync.
+    fn dot_await(self) -> &'static str {
+        if self.is_async { ".await" } else { "" }
+    }
+
+    /// The transport trait name: `Transport` for the sync/async drop-in clients,
+    /// `AsyncTransport` for the marked twin so it coexists with the sync trait.
+    fn transport_trait(self) -> String {
+        format!("{}Transport", self.marker)
+    }
+
+    /// A per-service client struct name (`FooClient`, or `FooAsyncClient` for the twin).
+    fn client_name(self, base: &str) -> String {
+        format!("{base}{}Client", self.marker)
+    }
+}
+
+/// The client prelude: the shared `ClientError` (only for the canonical-name
+/// clients; the marked twin imports it from the sync module) plus the
+/// caller-supplied byte-carrier trait, whose `call` is `async fn` for the async
+/// shapes. The generator never owns the wire (CBOR-over-HTTP etc.).
+fn client_prelude(shape: ClientShape) -> String {
+    let mut out = String::new();
+    // A marked twin shares the sync module's `ClientError`; redefining it would
+    // collide when both clients are re-exported from the module root.
+    if shape.marker.is_empty() {
+        out.push_str(CLIENT_ERROR);
+        out.push_str("\n\n");
+    }
+    let trait_name = shape.transport_trait();
+    let async_kw = shape.async_kw();
+    out.push_str(
+        "/// The caller-supplied byte carrier: it performs the call named by `(service, op)`\n\
+         /// with the already-encoded request bytes and returns the response bytes, or an\n\
+         /// error. The generated client owns (de)serialization via the codec; the carrier\n\
+         /// only moves bytes, so it can be HTTP, a queue, or an in-process loop.\n",
+    );
+    out.push_str(&format!("pub trait {trait_name} {{\n"));
+    out.push_str(&format!(
+        "    {async_kw}fn call(&self, service: &str, op: &str, req: &[u8]) -> Result<Vec<u8>, ClientError>;\n"
+    ));
+    out.push_str("}\n");
+    out
+}
 
 /// The self-contained canonical-CBOR (RFC 8949 subset) value model, encoder,
 /// decoder, generic composite helpers, and accessors every generated per-type codec
@@ -1083,6 +1402,10 @@ impl<'a> RustCodeGenerator<'a> {
         // fails the run rather than producing code referencing a missing type.
         self.decimal_mapping = decimal_mapping(self.input)?;
 
+        // Validate `client_style` for every target (not just the client surface) so
+        // a misconfiguration fails the run early, before any file is emitted.
+        let style = client_style(self.input)?;
+
         let mut files = Vec::new();
 
         // Generate types.rs for structs and enums
@@ -1108,10 +1431,42 @@ impl<'a> RustCodeGenerator<'a> {
         if self.input.csil_spec.service_count > 0 {
             match surface {
                 Surface::Client => {
-                    files.push(GeneratedFile {
-                        path: "client.rs".to_string(),
-                        content: self.generate_client()?,
-                    });
+                    // `Both` (default) ships the blocking client at the canonical
+                    // `client.rs` plus an async twin (marked symbols) at
+                    // `client_async.rs`; `Async` makes the async client a drop-in at
+                    // `client.rs` with canonical names; `Sync` is the original output.
+                    let sync = ClientShape {
+                        is_async: false,
+                        marker: "",
+                    };
+                    let async_drop_in = ClientShape {
+                        is_async: true,
+                        marker: "",
+                    };
+                    let async_twin = ClientShape {
+                        is_async: true,
+                        marker: "Async",
+                    };
+                    match style {
+                        ClientStyle::Sync => files.push(GeneratedFile {
+                            path: "client.rs".to_string(),
+                            content: self.generate_client(sync)?,
+                        }),
+                        ClientStyle::Async => files.push(GeneratedFile {
+                            path: "client.rs".to_string(),
+                            content: self.generate_client(async_drop_in)?,
+                        }),
+                        ClientStyle::Both => {
+                            files.push(GeneratedFile {
+                                path: "client.rs".to_string(),
+                                content: self.generate_client(sync)?,
+                            });
+                            files.push(GeneratedFile {
+                                path: "client_async.rs".to_string(),
+                                content: self.generate_client(async_twin)?,
+                            });
+                        }
+                    }
                 }
                 Surface::Server => {
                     files.push(GeneratedFile {
@@ -1159,6 +1514,17 @@ impl<'a> RustCodeGenerator<'a> {
                 path: "Cargo.toml".to_string(),
                 content: self.generate_cargo_toml(),
             });
+            // The README (at the crate root, beside `Cargo.toml`, not under `src/`)
+            // carries a copy-paste Quickstart only when this run emits a *sync* client
+            // for a carrier to ride on — the canonical blocking `client.rs` exists
+            // under `Sync`/`Both` style and the `Client` surface. Otherwise it falls
+            // back to a types/codec section, mirroring the TypeScript generator.
+            let client_quickstart = matches!(surface, Surface::Client)
+                && matches!(style, ClientStyle::Sync | ClientStyle::Both);
+            files.push(GeneratedFile {
+                path: "README.md".to_string(),
+                content: self.generate_readme(client_quickstart),
+            });
         }
 
         Ok(files)
@@ -1204,6 +1570,202 @@ impl<'a> RustCodeGenerator<'a> {
             deps.push(("regex", "1"));
         }
         deps
+    }
+
+    /// The package README, with a copy-paste **Quickstart**. For a client package the
+    /// Quickstart is a complete CSIL-RPC carrier — the generated codec owns CBOR
+    /// (de)serialization of your types; the carrier only moves the envelope bytes — the
+    /// typed client constructed over it, and one example call a user adapts by changing
+    /// the base URL. A server/types-only package gets a shorter consume-the-types
+    /// section instead.
+    fn generate_readme(&self, client_quickstart: bool) -> String {
+        let name = package_name(self.input);
+        // The crate is referenced in Rust paths by its identifier form (hyphens become
+        // underscores), so `use` lines and the example resolve regardless of the name.
+        let krate = name.replace('-', "_");
+        let mut out = format!(
+            "# {name}\n\n\
+             Generated by csilgen. A typed, transport-agnostic CSIL-RPC client: the\n\
+             generated codec owns CBOR (de)serialization; you supply a *carrier* that\n\
+             only moves bytes.\n\n\
+             ## Add to your project\n\n\
+             ```toml\n\
+             [dependencies]\n\
+             {name} = {{ path = \"./{name}\" }} # TODO: point at the published/vendored crate\n\
+             ureq = \"2\"                       # the Quickstart carrier's blocking HTTP client\n\
+             ```\n\n"
+        );
+
+        match (client_quickstart, self.first_unary_example()) {
+            (true, Some(example)) => out.push_str(&self.readme_quickstart(&krate, &example)),
+            _ => {
+                out.push_str(&format!(
+                    "## Quickstart\n\n\
+                     This package has no sync RPC client surface — import its generated\n\
+                     types and codec directly:\n\n\
+                     ```rust\n\
+                     use {krate}::*;\n\
+                     ```\n"
+                ));
+            }
+        }
+        out
+    }
+
+    /// The client Quickstart: the dependency-light sync CSIL-RPC carrier, the typed
+    /// client constructed over it, and the first `->` op called with a generated
+    /// sample request literal.
+    fn readme_quickstart(&self, krate: &str, ex: &RustExample) -> String {
+        let mut out = String::from("## Quickstart\n\n");
+        out.push_str(
+            "A complete blocking CSIL-RPC carrier plus the typed client. Change the one\n\
+             base-URL string.\n\n",
+        );
+        out.push_str("```rust\n");
+        out.push_str(&format!("use {krate}::*;\n"));
+        out.push_str(CARRIER_RUST);
+        out.push('\n');
+        out.push_str("fn main() {\n");
+        out.push_str(&format!(
+            "    let client = {}::new(CsilRpcTransport::new(\"http://localhost:5080\"));\n",
+            ex.client_struct
+        ));
+        if ex.null_input {
+            out.push_str(&format!("    let resp = client.{}();\n", ex.method));
+        } else {
+            out.push_str(&format!(
+                "    let resp = client.{}({});\n",
+                ex.method, ex.sample
+            ));
+        }
+        out.push_str("    match resp {\n");
+        out.push_str("        Ok(value) => println!(\"{value:?}\"),\n");
+        out.push_str("        Err(err) => eprintln!(\"call failed: {err}\"),\n");
+        out.push_str("    }\n");
+        out.push_str("}\n");
+        out.push_str("```\n");
+        out
+    }
+
+    /// The first service operation the typed sync client actually exposes, reduced to
+    /// an example call: which client struct + method to invoke and a compiling sample
+    /// request literal. `None` when no operation qualifies (so the README falls back to
+    /// the types-only section). The filter mirrors `generate_client_struct` exactly so
+    /// the example never names a method the client did not emit.
+    fn first_unary_example(&self) -> Option<RustExample> {
+        let records = self.record_names();
+        for rule in &self.input.csil_spec.rules {
+            let CsilRuleType::ServiceDef(service) = &rule.rule_type else {
+                continue;
+            };
+            for op in &service.operations {
+                if !matches!(op.direction, CsilServiceDirection::Unidirectional) {
+                    continue;
+                }
+                let success = success_type(&op.output_type);
+                let null_input = is_null_input(&op.input_type);
+                if !Self::is_record_ref(&success, &records)
+                    || !(null_input || Self::is_record_ref(&op.input_type, &records))
+                {
+                    continue;
+                }
+                let base = Self::service_base(&rule.name);
+                return Some(RustExample {
+                    client_struct: format!("{base}Client"),
+                    method: self.to_snake_case(&op.name),
+                    null_input,
+                    sample: if null_input {
+                        String::new()
+                    } else {
+                        self.rust_sample(&op.input_type)
+                    },
+                });
+            }
+        }
+        None
+    }
+
+    /// A compiling Rust literal for a value of `ty`: real values for scalars and
+    /// collections and a recursive literal for a nested record (every field present —
+    /// required fields sampled, optionals `None`). Anything a generic sample can't
+    /// fabricate (a choice/enum, a tuple, decimal, timestamp) becomes `todo!()`, whose
+    /// `!` type unifies with the field's type so the snippet always compiles while
+    /// flagging the spot a user must fill in.
+    fn rust_sample(&self, ty: &CsilTypeExpression) -> String {
+        match ty {
+            CsilTypeExpression::Builtin(name) => match name.as_str() {
+                "text" | "tstr" | "string" => "\"example\".to_string()".to_string(),
+                "bool" | "boolean" => "false".to_string(),
+                "bytes" | "bstr" => "Vec::new()".to_string(),
+                "float" | "float16" | "float32" | "float64" => "0.0".to_string(),
+                "int" | "uint" | "integer" | "number" | "int8" | "int16" | "int32" | "int64"
+                | "uint8" | "uint16" | "uint32" | "uint64" => "0".to_string(),
+                _ => "todo!()".to_string(),
+            },
+            CsilTypeExpression::Array { .. } => "Vec::new()".to_string(),
+            CsilTypeExpression::Map { .. } => "std::collections::HashMap::new()".to_string(),
+            CsilTypeExpression::Constrained { base_type, .. } => self.rust_sample(base_type),
+            CsilTypeExpression::Reference(name) => {
+                if let Some(group) = self.find_record(name) {
+                    self.rust_record_literal(name, group)
+                } else if let Some(alias) = self.codec_aliases().get(name) {
+                    // A transparent alias maps to its underlying type, so a map/array
+                    // alias still gets a real empty literal rather than `todo!()`.
+                    match alias {
+                        CsilTypeExpression::Map { .. } => {
+                            "std::collections::HashMap::new()".to_string()
+                        }
+                        CsilTypeExpression::Array { .. } => "Vec::new()".to_string(),
+                        other => self.rust_sample(other),
+                    }
+                } else {
+                    "todo!()".to_string()
+                }
+            }
+            _ => "todo!()".to_string(),
+        }
+    }
+
+    /// `Name { field: <sample>, ... }` over every field of a record: required fields
+    /// get a sampled value, optionals get `None`, and a group-spread entry gets the
+    /// referenced record — matching `generate_struct`'s field set so the literal names
+    /// exactly the fields the generated struct declares.
+    fn rust_record_literal(&self, name: &str, group: &CsilGroupExpression) -> String {
+        let mut fields: Vec<String> = Vec::new();
+        for entry in &group.entries {
+            if let Some(field_name) = self.extract_field_name(&entry.key) {
+                let value = if matches!(entry.occurrence, Some(CsilOccurrence::Optional)) {
+                    "None".to_string()
+                } else {
+                    self.rust_sample(&entry.value_type)
+                };
+                fields.push(format!("{field_name}: {value}"));
+            } else if let Some(spread) = Self::group_spread_reference(&entry.value_type) {
+                let field_name = self.to_snake_case(&spread);
+                let value = self.rust_sample(&CsilTypeExpression::Reference(spread));
+                fields.push(format!("{field_name}: {value}"));
+            }
+        }
+        if fields.is_empty() {
+            format!("{name} {{}}")
+        } else {
+            format!("{name} {{ {} }}", fields.join(", "))
+        }
+    }
+
+    /// The record a type reference names, if any. `Name = {{ ... }}` parses as a
+    /// `TypeDef(Group)` while a bare group rule is a `GroupDef`; both are records.
+    fn find_record(&self, name: &str) -> Option<&CsilGroupExpression> {
+        self.input
+            .csil_spec
+            .rules
+            .iter()
+            .filter(|r| r.name == name)
+            .find_map(|r| match &r.rule_type {
+                CsilRuleType::GroupDef(g) => Some(g),
+                CsilRuleType::TypeDef(CsilTypeExpression::Group(g)) => Some(g),
+                _ => None,
+            })
     }
 
     fn generate_types(&mut self) -> Result<String, String> {
@@ -1568,22 +2130,33 @@ impl<'a> RustCodeGenerator<'a> {
     /// unary operation becomes a method that hands `(service, method, req)` to a
     /// caller-supplied `Transport` and returns the typed success response, with
     /// the `/ ServiceError` half surfaced through `ClientError`.
-    fn generate_client(&mut self) -> Result<String, String> {
+    fn generate_client(&mut self, shape: ClientShape) -> Result<String, String> {
         let mut content = String::new();
 
         content.push_str(
             "//! Generated transport-agnostic service clients from CSIL specification\n\n",
         );
+        // `async fn` in a public trait is intentional here (the consumer drives the
+        // returned future); silence the discouragement lint in the emitted crate.
+        if shape.is_async {
+            content.push_str("#![allow(async_fn_in_trait)]\n\n");
+        }
         content.push_str("use super::types::*;\n");
         // The client owns (de)serialization through the generated per-type codec.
-        content.push_str("use super::codec::*;\n\n");
+        content.push_str("use super::codec::*;\n");
+        // The marked twin shares the sync client's `ClientError`; import it rather
+        // than redefine it so both clients re-export cleanly from the module root.
+        if !shape.marker.is_empty() {
+            content.push_str("use super::client::ClientError;\n");
+        }
+        content.push('\n');
 
-        content.push_str(CLIENT_PRELUDE);
+        content.push_str(&client_prelude(shape));
         content.push('\n');
 
         for rule in &self.input.csil_spec.rules {
             if let CsilRuleType::ServiceDef(service) = &rule.rule_type {
-                let client_code = self.generate_client_struct(&rule.name, service)?;
+                let client_code = self.generate_client_struct(&rule.name, service, shape)?;
                 content.push_str(&client_code);
                 content.push_str("\n\n");
             }
@@ -1596,17 +2169,19 @@ impl<'a> RustCodeGenerator<'a> {
         &mut self,
         name: &str,
         service: &CsilServiceDefinition,
+        shape: ClientShape,
     ) -> Result<String, String> {
         let base = Self::service_base(name);
-        let client = format!("{base}Client");
+        let client = shape.client_name(&base);
+        let transport = shape.transport_trait();
 
         let mut content = String::new();
         content.push_str(&format!("/// Typed client for the {name} service.\n"));
-        content.push_str(&format!("pub struct {client}<T: Transport> {{\n"));
+        content.push_str(&format!("pub struct {client}<T: {transport}> {{\n"));
         content.push_str("    transport: T,\n");
         content.push_str("}\n\n");
 
-        content.push_str(&format!("impl<T: Transport> {client}<T> {{\n"));
+        content.push_str(&format!("impl<T: {transport}> {client}<T> {{\n"));
         content.push_str("    pub fn new(transport: T) -> Self {\n");
         content.push_str("        Self { transport }\n");
         content.push_str("    }\n");
@@ -1650,12 +2225,14 @@ impl<'a> RustCodeGenerator<'a> {
             Self::write_op_doc(&mut content, operation, "request/response");
             // A push-style op (`op: -> Event`) takes no request payload: emit a
             // parameterless method and send empty request bytes on the wire.
+            let async_kw = shape.async_kw();
+            let dot_await = shape.dot_await();
             if null_input {
                 content.push_str(&format!(
-                    "    pub fn {method}(&self) -> Result<{output_type}, ClientError> {{\n"
+                    "    pub {async_kw}fn {method}(&self) -> Result<{output_type}, ClientError> {{\n"
                 ));
                 content.push_str(&format!(
-                    "        let csil_resp = self.transport.call(\"{wire_service}\", \"{wire_method}\", &[])?;\n"
+                    "        let csil_resp = self.transport.call(\"{wire_service}\", \"{wire_method}\", &[]){dot_await}?;\n"
                 ));
             } else {
                 let input_type = self.map_type_to_rust(&operation.input_type, &None)?;
@@ -1664,10 +2241,10 @@ impl<'a> RustCodeGenerator<'a> {
                     self.to_snake_case(&Self::type_ref_name(&operation.input_type))
                 );
                 content.push_str(&format!(
-                    "    pub fn {method}(&self, req: {input_type}) -> Result<{output_type}, ClientError> {{\n"
+                    "    pub {async_kw}fn {method}(&self, req: {input_type}) -> Result<{output_type}, ClientError> {{\n"
                 ));
                 content.push_str(&format!(
-                    "        let csil_resp = self.transport.call(\"{wire_service}\", \"{wire_method}\", &{req_enc}(&req))?;\n"
+                    "        let csil_resp = self.transport.call(\"{wire_service}\", \"{wire_method}\", &{req_enc}(&req)){dot_await}?;\n"
                 ));
             }
             content.push_str(&format!(
@@ -2478,6 +3055,13 @@ impl<'a> RustCodeGenerator<'a> {
         if files.iter().any(|f| f.path == "client.rs") {
             content.push_str("pub mod client;\n");
             content.push_str("pub use client::*;\n\n");
+        }
+
+        // The async twin (emitted under the default `both` style) is a sibling module
+        // whose `Async`-marked symbols coexist with the sync client's in one glob.
+        if files.iter().any(|f| f.path == "client_async.rs") {
+            content.push_str("pub mod client_async;\n");
+            content.push_str("pub use client_async::*;\n\n");
         }
 
         Ok(content)
@@ -3395,6 +3979,139 @@ mod tests {
         assert!(files.iter().any(|f| f.path == "codec.gen.rs"));
         // The server surface must not leak into the client target.
         assert!(!files.iter().any(|f| f.path == "services.rs"));
+    }
+
+    #[test]
+    fn async_twin_emitted_by_default_with_marked_symbols() {
+        // Default (`both`): the sync client is unchanged and an async twin rides
+        // alongside it in a separate file with `Async`-marked public symbols.
+        let input = make_unary_service_input("rust-client");
+        let files = RustCodeGenerator::new(&input).generate().unwrap();
+
+        let sync = files
+            .iter()
+            .find(|f| f.path == "client.rs")
+            .expect("sync client.rs emitted");
+        // The sync client keeps the canonical names and stays blocking.
+        assert!(
+            sync.content
+                .contains("pub struct CorndogsClient<T: Transport>")
+        );
+        assert!(sync.content.contains(
+            "pub fn submit_task(&self, req: SubmitTaskRequest) -> Result<SubmitTaskResponse, ClientError>"
+        ));
+        assert!(!sync.content.contains("async"));
+
+        let twin = files
+            .iter()
+            .find(|f| f.path == "client_async.rs")
+            .expect("async twin client_async.rs emitted");
+        // The twin's symbols all carry the `Async` marker so it coexists with the
+        // sync client, and it reuses the sync module's `ClientError`.
+        assert!(twin.content.contains("use super::client::ClientError;"));
+        assert!(twin.content.contains("pub trait AsyncTransport"));
+        assert!(twin.content.contains(
+            "async fn call(&self, service: &str, op: &str, req: &[u8]) -> Result<Vec<u8>, ClientError>;"
+        ));
+        assert!(
+            twin.content
+                .contains("pub struct CorndogsAsyncClient<T: AsyncTransport>")
+        );
+        assert!(twin.content.contains(
+            "pub async fn submit_task(&self, req: SubmitTaskRequest) -> Result<SubmitTaskResponse, ClientError>"
+        ));
+        // The seam is awaited before its `?`.
+        assert!(twin.content.contains(
+            "let csil_resp = self.transport.call(\"corndogs\", \"SubmitTask\", &encode_submit_task_request(&req)).await?;"
+        ));
+        // The twin must not redefine the shared error type.
+        assert!(!twin.content.contains("pub enum ClientError"));
+
+        // The module root registers both clients so both re-export cleanly.
+        let root = files
+            .iter()
+            .find(|f| f.path == "mod.rs")
+            .expect("mod.rs emitted");
+        assert!(root.content.contains("pub mod client;"));
+        assert!(root.content.contains("pub mod client_async;"));
+    }
+
+    #[test]
+    fn client_style_async_is_drop_in_at_canonical_path() {
+        // `async`: the async client takes the canonical filename AND the canonical
+        // symbol names — a drop-in a consumer swaps in by adding `.await`.
+        let mut input = make_unary_service_input("rust-client");
+        input.config.options.insert(
+            "client_style".to_string(),
+            serde_json::Value::String("async".to_string()),
+        );
+        let files = RustCodeGenerator::new(&input).generate().unwrap();
+
+        assert!(!files.iter().any(|f| f.path == "client_async.rs"));
+        let client = files
+            .iter()
+            .find(|f| f.path == "client.rs")
+            .expect("client.rs emitted");
+        // Canonical names, owns its own `ClientError`, async seam + methods.
+        assert!(client.content.contains("pub enum ClientError"));
+        assert!(client.content.contains("pub trait Transport"));
+        assert!(client.content.contains(
+            "async fn call(&self, service: &str, op: &str, req: &[u8]) -> Result<Vec<u8>, ClientError>;"
+        ));
+        assert!(
+            client
+                .content
+                .contains("pub struct CorndogsClient<T: Transport>")
+        );
+        assert!(client.content.contains(
+            "pub async fn submit_task(&self, req: SubmitTaskRequest) -> Result<SubmitTaskResponse, ClientError>"
+        ));
+        assert!(client.content.contains(").await?;"));
+        // No `Async`-marked symbols in the drop-in shape.
+        assert!(!client.content.contains("AsyncClient"));
+        assert!(!client.content.contains("AsyncTransport"));
+    }
+
+    #[test]
+    fn client_style_sync_suppresses_the_twin() {
+        // `sync`: today's output, byte-identical, with no twin.
+        let mut input = make_unary_service_input("rust-client");
+        input.config.options.insert(
+            "client_style".to_string(),
+            serde_json::Value::String("sync".to_string()),
+        );
+        let files = RustCodeGenerator::new(&input).generate().unwrap();
+
+        assert!(!files.iter().any(|f| f.path == "client_async.rs"));
+        let client = files
+            .iter()
+            .find(|f| f.path == "client.rs")
+            .expect("client.rs emitted");
+        assert!(
+            client
+                .content
+                .contains("pub struct CorndogsClient<T: Transport>")
+        );
+        assert!(client.content.contains(
+            "pub fn submit_task(&self, req: SubmitTaskRequest) -> Result<SubmitTaskResponse, ClientError>"
+        ));
+        assert!(!client.content.contains("async"));
+    }
+
+    #[test]
+    fn client_style_invalid_value_is_rejected() {
+        let mut input = make_unary_service_input("rust-client");
+        input.config.options.insert(
+            "client_style".to_string(),
+            serde_json::Value::String("eventual".to_string()),
+        );
+        let err = RustCodeGenerator::new(&input)
+            .generate()
+            .expect_err("invalid client_style must fail generation");
+        assert!(
+            err.contains("client_style"),
+            "error must mention the option: {err}"
+        );
     }
 
     #[test]
@@ -5720,6 +6437,70 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Compile the default-style output (sync client + async twin) and round-trip a
+    /// corndogs request through the async `CorndogsAsyncClient` over an async loopback
+    /// transport, driven by a from-scratch dependency-free `block_on`. This proves the
+    /// emitted async code is well-formed AND actually awaits to a result — not just a
+    /// compile check. Skips cleanly when no cargo toolchain is on PATH.
+    #[test]
+    fn async_client_round_trips_through_cargo() {
+        let probe = std::process::Command::new("cargo")
+            .arg("--version")
+            .output();
+        if probe.map(|o| !o.status.success()).unwrap_or(true) {
+            eprintln!("skipping: no cargo toolchain on PATH");
+            return;
+        }
+
+        let mut input = corndogs_client_input();
+        // The default `both` style emits the async twin alongside the sync client, so
+        // this crate exercises both clients coexisting in one module tree.
+        input.config.options.insert(
+            "module_root_filename".to_string(),
+            serde_json::Value::String("lib.rs".to_string()),
+        );
+        let files = RustCodeGenerator::new(&input)
+            .generate()
+            .expect("generation ok");
+        // Guard the premise: the twin must actually be present under the default style.
+        assert!(files.iter().any(|f| f.path == "client_async.rs"));
+
+        let dir = std::env::temp_dir().join(format!("csilgen-rust-async-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let src = dir.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        for file in &files {
+            std::fs::write(src.join(&file.path), &file.content).unwrap();
+        }
+        std::fs::write(
+            dir.join("Cargo.toml"),
+            "[package]\nname = \"csilroundtrip\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\n[workspace]\n\n[dependencies]\n",
+        )
+        .unwrap();
+        std::fs::write(src.join("main.rs"), RUST_ASYNC_DRIVER).unwrap();
+
+        let run = std::process::Command::new("cargo")
+            .arg("run")
+            .arg("--quiet")
+            .current_dir(&dir)
+            .env("CARGO_TARGET_DIR", dir.join("target"))
+            .env("CARGO_NET_OFFLINE", "true")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&run.stdout);
+        let stderr = String::from_utf8_lossy(&run.stderr);
+        assert!(
+            run.status.success(),
+            "cargo run failed:\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        assert_eq!(
+            stdout.trim(),
+            "ok",
+            "unexpected output:\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Without the `emit_packages` trigger the output is exactly as before: the
     /// module root is `mod.rs` and no `Cargo.toml`/`lib.rs` (and no `src/` prefix)
     /// appears. With `["rust"]` present, the directory becomes a crate: a
@@ -5735,6 +6516,8 @@ mod tests {
         assert!(!files.iter().any(|f| f.path == "src/lib.rs"));
         assert!(files.iter().any(|f| f.path == "mod.rs"));
         assert!(files.iter().any(|f| f.path == "types.rs"));
+        // The README rides only with the package; the default output has none.
+        assert!(!files.iter().any(|f| f.path == "README.md"));
 
         // A token list that does not name rust must not trigger package mode.
         let mut other = corndogs_client_input();
@@ -5769,6 +6552,9 @@ mod tests {
         assert!(files.iter().any(|f| f.path == "src/types.rs"));
         assert!(files.iter().any(|f| f.path == "src/codec.gen.rs"));
         assert!(files.iter().any(|f| f.path == "src/client.rs"));
+        // The README sits at the crate root beside `Cargo.toml`, not under `src/`.
+        assert!(files.iter().any(|f| f.path == "README.md"));
+        assert!(!files.iter().any(|f| f.path == "src/README.md"));
         // The flat (non-package) paths and `mod.rs` must be gone.
         assert!(!files.iter().any(|f| f.path == "mod.rs"));
         assert!(!files.iter().any(|f| f.path == "types.rs"));
@@ -5853,6 +6639,149 @@ mod tests {
         assert!(
             build.status.success(),
             "cargo build of generated package failed:\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The package README must carry a copy-paste Quickstart: the carrier (a sync
+    /// `Transport` impl), the CSIL-RPC envelope contract (the `/csil/v1/rpc` POST and
+    /// the tag-24 payload), the `status` / `ServiceError` arms, and the typed example
+    /// call with a sample request literal. Asserted without a toolchain so it guards
+    /// the emitted text everywhere, even where cargo is absent.
+    #[test]
+    fn package_readme_has_quickstart_carrier_and_example() {
+        let mut input = corndogs_client_input();
+        input
+            .config
+            .options
+            .insert("emit_packages".to_string(), serde_json::json!(["rust"]));
+        let files = RustCodeGenerator::new(&input).generate().unwrap();
+        let readme = files
+            .iter()
+            .find(|f| f.path == "README.md")
+            .expect("README.md emitted");
+        let c = &readme.content;
+
+        // The package title and the carrier's HTTP dependency are spelled out.
+        assert!(c.contains("# corndogs"));
+        assert!(c.contains("ureq = \"2\""));
+
+        // The carrier: a sync `Transport` impl that speaks the CSIL-RPC envelope.
+        assert!(c.contains("impl Transport for CsilRpcTransport"));
+        assert!(c.contains("/csil/v1/rpc"));
+        assert!(c.contains("CSIL_TAG_EMBEDDED_CBOR: u64 = 24"));
+        assert!(c.contains("ureq::post"));
+
+        // Both response arms are handled: a non-zero transport status and the typed
+        // ServiceError variant mapped to `ClientError::Service`.
+        assert!(c.contains("transport status"));
+        assert!(c.contains("== Some(\"ServiceError\")"));
+        assert!(c.contains("ClientError::Service"));
+
+        // The example constructs the typed client over the carrier and calls the first
+        // op with a generated sample literal naming the real request type + fields.
+        assert!(c.contains("CorndogsClient::new(CsilRpcTransport::new("));
+        assert!(c.contains("client.submit_task(SubmitTaskRequest {"));
+        assert!(c.contains("queue: \"example\".to_string()"));
+        // Every field of the nested record is present (optionals as `None`).
+        assert!(c.contains("Task {"));
+        assert!(c.contains("priority: None"));
+    }
+
+    /// A server-surface (or types-only) package gets no carrier Quickstart — there is
+    /// no sync client to ride on — so it falls back to the import-the-types section.
+    #[test]
+    fn package_readme_falls_back_without_a_sync_client() {
+        let mut input = corndogs_client_input();
+        input.config.target = "rust".to_string(); // server surface, no client struct
+        input
+            .config
+            .options
+            .insert("emit_packages".to_string(), serde_json::json!(["rust"]));
+        let files = RustCodeGenerator::new(&input).generate().unwrap();
+        let readme = files
+            .iter()
+            .find(|f| f.path == "README.md")
+            .expect("README.md emitted");
+        assert!(
+            !readme
+                .content
+                .contains("impl Transport for CsilRpcTransport")
+        );
+        assert!(
+            readme
+                .content
+                .contains("import its generated\ntypes and codec")
+        );
+    }
+
+    /// Generate the client package, drop the README's Quickstart in as an `examples/`
+    /// binary, and compile it with a hermetic offline `cargo build --examples`. A clean
+    /// compile proves the carrier is valid Rust against the *real* generated `Transport`,
+    /// `ClientError`, typed client, and codec — socket-free (the build never runs the
+    /// example, so it opens no socket; the sandbox kills cross-process loopback). `ureq`
+    /// is added as a dev-dependency from the local cargo cache. Skips when no cargo.
+    #[test]
+    fn readme_quickstart_compiles_against_generated_package() {
+        let probe = std::process::Command::new("cargo")
+            .arg("--version")
+            .output();
+        if probe.map(|o| !o.status.success()).unwrap_or(true) {
+            eprintln!("skipping: no cargo toolchain on PATH");
+            return;
+        }
+
+        let mut input = corndogs_client_input();
+        input
+            .config
+            .options
+            .insert("emit_packages".to_string(), serde_json::json!(["rust"]));
+        let files = RustCodeGenerator::new(&input).generate().unwrap();
+
+        // Extract the single fenced ```rust block from the README — exactly the code a
+        // user would copy — and compile that, not a hand-massaged variant.
+        let readme = &files
+            .iter()
+            .find(|f| f.path == "README.md")
+            .unwrap()
+            .content;
+        let after = readme.split("```rust\n").nth(1).expect("a rust code block");
+        let snippet = after.split("\n```").next().expect("a closed code block");
+
+        let dir = std::env::temp_dir().join(format!("csilgen-rust-readme-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        for file in &files {
+            let path = dir.join(&file.path);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            if file.path == "Cargo.toml" {
+                // Examples may use dev-dependencies; the carrier's only one is `ureq`.
+                let mut cargo = file.content.clone();
+                cargo.push_str("\n[dev-dependencies]\nureq = \"2\"\n");
+                std::fs::write(&path, cargo).unwrap();
+            } else {
+                std::fs::write(&path, &file.content).unwrap();
+            }
+        }
+        let examples = dir.join("examples");
+        std::fs::create_dir_all(&examples).unwrap();
+        std::fs::write(examples.join("quickstart.rs"), snippet).unwrap();
+
+        let build = std::process::Command::new("cargo")
+            .arg("build")
+            .arg("--examples")
+            .arg("--quiet")
+            .current_dir(&dir)
+            .env("CARGO_TARGET_DIR", dir.join("target"))
+            .env("CARGO_NET_OFFLINE", "true")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&build.stdout);
+        let stderr = String::from_utf8_lossy(&build.stderr);
+        assert!(
+            build.status.success(),
+            "cargo build of README quickstart failed:\nstdout:\n{stdout}\nstderr:\n{stderr}"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -5946,6 +6875,97 @@ fn main() {
     // Typed client round-trip over the loopback carrier.
     let client = CorndogsClient::new(Loopback);
     let resp = client.submit_task(req).expect("client call");
+    check(resp.uuid == "u-123", "client uuid");
+    check(resp.payload == vec![0xde, 0xad, 0xbe], "client payload");
+    check(resp.priority == Some(7), "client priority");
+    check(resp.tags.len() == 2 && resp.tags[1] == "y", "client tags");
+
+    println!("ok");
+}
+"#;
+
+    /// Async driver `main` for the round-trip crate: it drives the generated
+    /// `CorndogsAsyncClient` over an async loopback transport using a from-scratch,
+    /// dependency-free `block_on`. The async seam completes without real I/O, so a
+    /// no-op waker and a poll-to-ready loop suffice to await the future to a value.
+    const RUST_ASYNC_DRIVER: &str = r#"use std::collections::HashMap;
+use std::future::Future;
+use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+
+use csilroundtrip::*;
+
+// A no-op waker: the generated async transport resolves without registering real
+// wakeups, so cloning/waking it need do nothing.
+fn noop_raw_waker() -> RawWaker {
+    fn no_op(_: *const ()) {}
+    fn clone(_: *const ()) -> RawWaker {
+        noop_raw_waker()
+    }
+    let vtable = &RawWakerVTable::new(clone, no_op, no_op, no_op);
+    RawWaker::new(std::ptr::null(), vtable)
+}
+
+// A minimal executor: poll the future to completion. The loopback seam is always
+// immediately ready, so this returns on the first poll without any runtime crate.
+fn block_on<F: Future>(fut: F) -> F::Output {
+    let waker = unsafe { Waker::from_raw(noop_raw_waker()) };
+    let mut cx = Context::from_waker(&waker);
+    let mut fut = Box::pin(fut);
+    loop {
+        if let Poll::Ready(v) = fut.as_mut().poll(&mut cx) {
+            return v;
+        }
+    }
+}
+
+// The async transport seam: decode the typed request, then re-encode its task as
+// the typed response across the dumb byte boundary — the sync loopback, but async.
+struct Loopback;
+
+impl AsyncTransport for Loopback {
+    async fn call(&self, service: &str, op: &str, req: &[u8]) -> Result<Vec<u8>, ClientError> {
+        if service != "corndogs" || op != "SubmitTask" {
+            return Err(ClientError::Transport(format!("unexpected route {service}/{op}")));
+        }
+        let in_req = decode_submit_task_request(req)
+            .map_err(|e| ClientError::Transport(e.to_string()))?;
+        Ok(encode_task(&in_req.task))
+    }
+}
+
+fn check(cond: bool, msg: &str) {
+    if !cond {
+        eprintln!("FAIL: {msg}");
+        std::process::exit(1);
+    }
+}
+
+fn sample_task() -> Task {
+    let mut labels = HashMap::new();
+    labels.insert("a".to_string(), 1);
+    let mut queue_counts: StringInt64Map = HashMap::new();
+    queue_counts.insert("q1".to_string(), 3);
+    let mut state_counts: QueueAndStateCountsMap = HashMap::new();
+    state_counts.insert("q1".to_string(), QueueAndStateCounts { count: 5 });
+    Task {
+        uuid: "u-123".to_string(),
+        current_state: "PENDING".to_string(),
+        payload: vec![0xde, 0xad, 0xbe],
+        priority: Some(7),
+        labels,
+        tags: vec!["x".to_string(), "y".to_string()],
+        queue_counts,
+        state_counts,
+    }
+}
+
+fn main() {
+    let req = SubmitTaskRequest { task: sample_task(), queue: "default".to_string() };
+
+    // Typed async client round-trip over the async loopback carrier, awaited to a
+    // value by the hand-written executor.
+    let client = CorndogsAsyncClient::new(Loopback);
+    let resp = block_on(client.submit_task(req)).expect("client call");
     check(resp.uuid == "u-123", "client uuid");
     check(resp.payload == vec![0xde, 0xad, 0xbe], "client payload");
     check(resp.priority == Some(7), "client priority");

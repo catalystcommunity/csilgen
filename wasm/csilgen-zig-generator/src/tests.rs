@@ -932,3 +932,185 @@ pub fn main() !void {
     try stdout.print("ok\n", .{});
 }
 "#;
+
+// ---- self-contained package (README + Quickstart) -------------------------
+
+// `Name = { ... }` parses to `TypeDef(Group(..))` (not `GroupDef`), so build the
+// records that way here to guard the README/example path against the real parser.
+fn record_typedef(name: &str, entries: Vec<CsilGroupEntry>) -> CsilRule {
+    CsilRule {
+        name: name.to_string(),
+        rule_type: CsilRuleType::TypeDef(CsilTypeExpression::Group(CsilGroupExpression {
+            entries,
+        })),
+        position: pos(),
+        doc_comments: vec![],
+    }
+}
+
+fn pingpong_rules() -> Vec<CsilRule> {
+    vec![
+        record_typedef("Ping", vec![bare_entry("msg", builtin("text"))]),
+        record_typedef("Pong", vec![bare_entry("msg", builtin("text"))]),
+        service_rule(
+            "Echo",
+            vec![op(
+                "ping",
+                CsilTypeExpression::Reference("Ping".to_string()),
+                CsilTypeExpression::Reference("Pong".to_string()),
+                CsilServiceDirection::Unidirectional,
+                None,
+            )],
+            None,
+        ),
+    ]
+}
+
+fn file_named<'a>(files: &'a [GeneratedFile], path: &str) -> &'a str {
+    files
+        .iter()
+        .find(|f| f.path == path)
+        .map(|f| f.content.as_str())
+        .unwrap_or_else(|| panic!("missing emitted file: {path}"))
+}
+
+#[test]
+fn readme_absent_without_emit_packages() {
+    let input = input_with_rules(pingpong_rules(), "zig-client", HashMap::new());
+    let files = process_generation(input).expect("generate").files;
+    assert!(
+        !files.iter().any(|f| f.path == "README.md"),
+        "README.md must not be emitted without emit_packages"
+    );
+}
+
+#[test]
+fn package_readme_has_quickstart_carrier_and_example() {
+    let mut options = HashMap::new();
+    options.insert("emit_packages".to_string(), serde_json::json!(["zig"]));
+    let input = input_with_rules(pingpong_rules(), "zig-client", options);
+    let files = process_generation(input).expect("generate").files;
+    let readme = file_named(&files, "README.md");
+
+    // The carrier (the must-have) implements the generated transport seam.
+    assert!(
+        readme.contains("fn transport(self: *CsilRpcCarrier) client.CsilgenTransport"),
+        "README must embed the CSIL-RPC carrier seam:\n{readme}"
+    );
+    assert!(
+        readme.contains("const svc = client.EchoClient.init(carrier.transport());"),
+        "example must wire the carrier into the transport seam:\n{readme}"
+    );
+    // The canonical mount + method.
+    assert!(
+        readme.contains("/csil/v1/rpc") && readme.contains(".method = .POST,"),
+        "carrier must POST the canonical mount:\n{readme}"
+    );
+    // The request payload is a tag-24 byte string.
+    assert!(
+        readme.contains("try writeHead(&out, 6, 24);")
+            && readme.contains("try writeBytes(&out, req);"),
+        "request payload must be a tag-24 byte string:\n{readme}"
+    );
+    // Both transport-status and typed ServiceError arms are handled.
+    assert!(
+        readme.contains("if (status != 0)") && readme.contains("\"ServiceError\""),
+        "carrier must handle the status and ServiceError arms:\n{readme}"
+    );
+    // The example call hits the first op with a generated sample literal and prints
+    // the typed response field.
+    assert!(
+        readme.contains("const req = types.Ping{ .msg = \"example\" };"),
+        "example must pass a generated sample request literal:\n{readme}"
+    );
+    assert!(
+        readme.contains("try svc.ping(arena.allocator(), &req, &resp);"),
+        "example must call the first service op over the carrier:\n{readme}"
+    );
+    assert!(
+        readme.contains("resp.msg"),
+        "example must print the typed response field:\n{readme}"
+    );
+}
+
+#[test]
+fn serviceless_package_readme_is_types_only() {
+    let mut options = HashMap::new();
+    options.insert("emit_packages".to_string(), serde_json::json!(["zig"]));
+    let input = input_with_rules(
+        vec![record_typedef(
+            "Thing",
+            vec![bare_entry("id", builtin("uint"))],
+        )],
+        "zig-typesonly",
+        options,
+    );
+    let files = process_generation(input).expect("generate").files;
+    let readme = file_named(&files, "README.md");
+    assert!(
+        readme.contains("has no service operations"),
+        "a serviceless package must get the types-only section:\n{readme}"
+    );
+    assert!(
+        !readme.contains("CsilRpcCarrier"),
+        "a serviceless package must not embed a client carrier:\n{readme}"
+    );
+}
+
+/// End-to-end proof the README Quickstart carrier compiles against the real generated
+/// package: emit the ping/pong client package, write every file, extract the README's
+/// `zig` block as `main.zig`, and type-check it with `zig build-exe` (compile only — the
+/// sandbox kills cross-process loopback sockets, so the carrier is built but not run; the
+/// standalone `tools/csil-rpc-echo-mock.py` verifies the same carrier against real HTTP
+/// normally). A clean build proves the carrier is valid against the generated codec +
+/// client and `std.http`. Skips when `zig` is not on PATH so the suite stays portable.
+#[test]
+fn readme_quickstart_carrier_compiles_with_zig() {
+    let have_zig = std::process::Command::new("zig")
+        .arg("version")
+        .output()
+        .is_ok();
+    if !have_zig {
+        eprintln!("skipping: no zig on PATH");
+        return;
+    }
+
+    let mut options = HashMap::new();
+    options.insert("emit_packages".to_string(), serde_json::json!(["zig"]));
+    let input = input_with_rules(pingpong_rules(), "zig-client", options);
+    let files = process_generation(input).expect("generate").files;
+
+    let dir = std::env::temp_dir().join(format!("csilgen-zig-readme-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    for f in &files {
+        std::fs::write(dir.join(&f.path), &f.content).unwrap();
+    }
+
+    let readme = file_named(&files, "README.md");
+    let block = extract_zig_block(readme).expect("README must contain a zig code block");
+    std::fs::write(dir.join("main.zig"), &block).unwrap();
+
+    let out = std::process::Command::new("zig")
+        .arg("build-exe")
+        .arg("main.zig")
+        .arg("--cache-dir")
+        .arg(dir.join("zig-cache"))
+        .current_dir(&dir)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "zig build-exe failed on the README carrier:\n{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The contents of the first ```` ```zig ```` fenced block in `md`.
+fn extract_zig_block(md: &str) -> Option<String> {
+    let start = md.find("```zig\n")? + "```zig\n".len();
+    let end = md[start..].find("\n```")? + start;
+    Some(md[start..end].to_string())
+}
