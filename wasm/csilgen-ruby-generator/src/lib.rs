@@ -158,25 +158,29 @@ pub fn generate_ruby_code_from_serialized(
         });
     }
 
+    // A package's `genquickstart.md` demonstrates both the calling side (the RPC and
+    // Datagrams sections, over the `<Service>Client`) and the handling side (the Events
+    // section, over the `<Service>Router` that lives in `server.rb`), so a package must
+    // carry both surfaces for its own quickstart to load/run — regardless of which surface
+    // was requested. A flat (non-package) build stays byte-identical: it emits only the
+    // requested surface.
+    let pkg_mode = emit_packages_includes(config, "ruby");
     if spec.service_count > 0 {
-        match surface {
-            Surface::Client => {
-                if let Some(client) = generate_client_file(spec) {
-                    files.push(GeneratedFile {
-                        path: "client.rb".to_string(),
-                        content: client,
-                    });
-                }
-            }
-            Surface::Server => {
-                if let Some(server) = generate_server_file(spec) {
-                    files.push(GeneratedFile {
-                        path: "server.rb".to_string(),
-                        content: server,
-                    });
-                }
-            }
-            Surface::TypesOnly => {}
+        let want_client = matches!(surface, Surface::Client)
+            || (pkg_mode && !matches!(surface, Surface::TypesOnly));
+        let want_server = matches!(surface, Surface::Server)
+            || (pkg_mode && !matches!(surface, Surface::TypesOnly));
+        if want_client && let Some(client) = generate_client_file(spec) {
+            files.push(GeneratedFile {
+                path: "client.rb".to_string(),
+                content: client,
+            });
+        }
+        if want_server && let Some(server) = generate_server_file(spec) {
+            files.push(GeneratedFile {
+                path: "server.rb".to_string(),
+                content: server,
+            });
         }
     }
 
@@ -317,9 +321,11 @@ fn wrap_as_ruby_gem(
     // The README is opt-out: an explicit `emit_readme: false` suppresses it, while an
     // absent, non-bool, or `true` value keeps the default emission.
     if emit_readme_enabled(config) {
+        // Named `genquickstart.md` rather than `README.md` so it never collides with a
+        // consumer's own hand-written `README.md`; the consumer supplies that themselves.
         out.push(GeneratedFile {
-            path: "README.md".to_string(),
-            content: emit_readme(&gem_name, spec),
+            path: "genquickstart.md".to_string(),
+            content: emit_readme(&gem_name, spec, config),
         });
     }
     out
@@ -339,64 +345,105 @@ fn emit_readme_enabled(config: &GeneratorConfig) -> bool {
 // Package README with a copy-paste CSIL-RPC Quickstart
 // ---------------------------------------------------------------------------
 
-/// The package README, with a copy-paste **Quickstart**. For a client package the
-/// Quickstart is a complete, dependency-free CSIL-RPC carrier — it reuses this gem's
-/// own generated `CsilCbor` codec to build/parse the envelope, so it adds no
-/// third-party gem (hybrid posture path 1) — plus the typed client and one example
-/// call. A spec with no unary operations falls back to a types-only consume section.
-fn emit_readme(gem_name: &str, spec: &CsilSpecSerialized) -> String {
+/// Which transport sections the `genquickstart.md` should carry. The
+/// `genquickstart_transports` option is a JSON array subset of
+/// `["rpc","events","datagrams"]`; unknown entries are ignored, and an absent or empty
+/// value means "all three". The CLI sets this from its `--readme-csil-*` flags.
+fn wanted_transports(config: &GeneratorConfig) -> (bool, bool, bool) {
+    let listed = match config.options.get("genquickstart_transports") {
+        Some(serde_json::Value::Array(items)) => {
+            let names: std::collections::BTreeSet<&str> =
+                items.iter().filter_map(|v| v.as_str()).collect();
+            // An array naming none of the known transports (all unknown, or empty) falls
+            // back to all three rather than rendering an empty document.
+            let any_known = ["rpc", "events", "datagrams"]
+                .iter()
+                .any(|t| names.contains(t));
+            if any_known {
+                Some((
+                    names.contains("rpc"),
+                    names.contains("events"),
+                    names.contains("datagrams"),
+                ))
+            } else {
+                None
+            }
+        }
+        _ => None,
+    };
+    listed.unwrap_or((true, true, true))
+}
+
+/// The package README: a transport-by-transport Quickstart built on the official
+/// `csilgen-transport` gem. The generated codec owns CBOR (de)serialization; the library
+/// owns the envelope, framing, and connection lifecycle; the consumer supplies only a
+/// *carrier* that moves bytes. Each requested section (CSIL-RPC over HTTP, CSIL-Events
+/// over TLS, CSIL-Datagrams over UDP) is a complete example built on the library, so the
+/// same typed surface rides HTTP/TLS/WebSocket/QUIC/UDP unchanged.
+fn emit_readme(gem_name: &str, spec: &CsilSpecSerialized, config: &GeneratorConfig) -> String {
     let mut out = format!(
         "# {gem_name}\n\n\
-         Generated by csilgen. A typed, transport-agnostic CSIL-RPC client: the\n\
-         generated codec owns CBOR (de)serialization; you supply a *carrier* that only\n\
-         moves bytes.\n\n\
+         Generated by csilgen. A typed CSIL client: the generated codec owns CBOR\n\
+         (de)serialization and the `csilgen-transport` gem owns the envelope, framing, and\n\
+         connection lifecycle. You supply only a *carrier* that moves bytes, so the same\n\
+         typed surface rides HTTP, TLS, a WebSocket, QUIC, or raw UDP unchanged.\n\n\
          ## Install\n\n\
          ```sh\n\
          # TODO: publish {gem_name} to rubygems.org, then:\n\
          gem install {gem_name}\n\
          # or, from a local checkout, in your Gemfile:\n\
          #   gem \"{gem_name}\", path: \".\"\n\
+         ```\n\n\
+         This client builds on the `csilgen-transport` gem (not yet published — vendor it\n\
+         or use a Bundler git source for now):\n\n\
+         ```ruby\n\
+         # Gemfile\n\
+         gem \"csilgen-transport\", git: \"https://github.com/catalystcommunity/csilgen\"\n\
          ```\n\n"
     );
 
-    match first_unary_example(spec) {
-        Some(example) => out.push_str(&readme_quickstart(gem_name, &example)),
-        None => {
-            out.push_str(&format!(
-                "## Quickstart\n\n\
-                 This package has no service operations — require its generated value\n\
-                 types and codec directly:\n\n\
-                 ```ruby\n\
-                 require \"{gem_name}\"\n\
-                 # build a value object and serialize it with the generated codec:\n\
-                 #   bytes = MyType.new(...).to_cbor\n\
-                 #   value = MyType.from_cbor(bytes)\n\
-                 ```\n"
-            ));
-        }
+    let (rpc, events, datagrams) = wanted_transports(config);
+    let unary = first_unary_example(spec);
+    let channel = first_channel_example(spec);
+    if rpc {
+        out.push_str(&rpc_section(gem_name, unary.as_ref()));
+    }
+    if events {
+        out.push_str(&events_section(gem_name, channel.as_ref()));
+    }
+    if datagrams {
+        out.push_str(&datagrams_section(gem_name, unary.as_ref()));
     }
     finalize(out)
 }
 
-/// The client Quickstart: a dependency-free CSIL-RPC carrier (it reuses this gem's
-/// generated `CsilCbor` codec for the envelope), the typed client built over it, and
-/// the first unary call with a generated sample request literal.
-fn readme_quickstart(gem_name: &str, ex: &UnaryExample) -> String {
-    let mut out = String::from("## Quickstart\n\n");
+/// CSIL-RPC over HTTP: a carrier implementing the generated `call` byte seam that builds
+/// the envelope with the library's `RpcRequest` and parses the library's `RpcResponse`
+/// (never hand-rolled), POSTing to `{base_url}/csil/v1/rpc` with stdlib `net/http`. A
+/// non-zero transport status (`into_transport_error` raises `StatusError`) and the typed
+/// `ServiceError` application arm are surfaced distinctly; the typed client decodes success.
+fn rpc_section(gem_name: &str, ex: Option<&UnaryExample>) -> String {
+    let mut out = String::from("## CSIL-RPC (HTTP)\n\n");
     out.push_str(
-        "A complete CSIL-RPC carrier (no third-party gems — it reuses this package's\n\
-         generated `CsilCbor` codec for the envelope) plus the typed client. Change the\n\
-         one base-URL string.\n\n",
+        "Request/response. The library owns the envelope (`RpcRequest`/`RpcResponse`); you\n\
+         bring a carrier that moves bytes. The HTTP carrier below is just one example — swap\n\
+         `net/http` for any client (it implements the generated `call` byte seam).\n\n",
     );
+    let Some(ex) = ex else {
+        out.push_str(
+            "This package declares no `->` operations, so there is no RPC call to make.\n\n",
+        );
+        return out;
+    };
     out.push_str("```ruby\n");
+    out.push_str("require \"csilgen/transport\"\n");
     out.push_str("require \"net/http\"\n");
     out.push_str("require \"uri\"\n");
     out.push_str(&format!("require {}\n\n", ruby_string_literal(gem_name)));
-    out.push_str(CARRIER_RUBY);
+    out.push_str(RPC_CARRIER_RUBY);
     out.push('\n');
-    // The example: construct the typed client over the carrier and call the first op.
     out.push_str(&format!(
-        "client = {}.new(CsilRpcTransport.new(\"http://localhost:5080\"))\n",
+        "client = {}.new(HttpRpcTransport.new(\"http://localhost:5080\"))\n",
         ex.client_class
     ));
     if ex.has_request {
@@ -404,77 +451,257 @@ fn readme_quickstart(gem_name: &str, ex: &UnaryExample) -> String {
     } else {
         out.push_str(&format!("resp = client.{}\n", ex.method));
     }
-    out.push_str("puts resp.inspect\n");
-    out.push_str("```\n");
+    out.push_str("puts resp.inspect\n```\n\n");
     out
 }
 
-/// The carrier body — identical for every spec, so it is a constant. It implements the
-/// generated client's transport seam (`call(service, op, req_bytes) -> resp_bytes`),
-/// wraps the already-encoded request in a `CsilRpcRequest` envelope (tag-24 payload),
-/// POSTs it to `{base_url}/csil/v1/rpc` with stdlib `net/http`, and returns the
-/// response payload bytes for the generated client to decode. A non-2xx HTTP status, a
-/// non-zero transport `status`, or a typed `ServiceError` arm is raised as an error.
-const CARRIER_RUBY: &str = r##"# Dependency path 1: reuse the generated `CsilCbor` codec (encode/decode/Tag) to
-# build and parse the CSIL-RPC envelope, so this carrier adds no third-party gem.
-# It owns only the CSIL-RPC envelope + HTTP; it never touches your typed values.
-class CsilRpcTransport
+/// The HTTP carrier body — spec-independent, so a constant. It encodes the request with
+/// the library's `RpcRequest`, POSTs it to `{base_url}/csil/v1/rpc`, and returns the
+/// success payload bytes the typed client decodes. `into_transport_error` raises on a
+/// non-zero transport status; the typed `ServiceError` arm (a status-0 variant) is
+/// surfaced separately so the typed client only ever decodes a success payload.
+const RPC_CARRIER_RUBY: &str = r##"# One example carrier: CSIL-RPC over an HTTP POST. The library owns the RpcRequest/
+# RpcResponse envelope; the carrier owns only the transport. Swap net/http for any client.
+RPC = Csilgen::Transport::RPC
+
+class HttpRpcTransport
   def initialize(base_url)
     @uri = URI("#{base_url.chomp("/")}/csil/v1/rpc")
   end
 
   # The generated client calls this seam with the already-encoded request bytes.
   def call(service, op, req_bytes)
-    # CsilRpcRequest = { v, service, op, payload: #6.24(bstr) }: the payload is the
-    # encoded request wrapped in CBOR tag 24 (embedded CBOR).
-    envelope = {
-      "v" => 1,
-      "service" => service,
-      "op" => op,
-      "payload" => CsilCbor::Tag.new(24, req_bytes.b)
-    }
+    # The library builds the envelope from the already-encoded request bytes; we never
+    # hand-roll the wire form.
+    envelope = RPC::RpcRequest.new(service: service, op: op, payload: req_bytes.b).encode
     http = Net::HTTP.new(@uri.host, @uri.port)
     http.use_ssl = (@uri.scheme == "https")
     post = Net::HTTP::Post.new(@uri.request_uri)
     post["content-type"] = "application/cbor"
     post["accept"] = "application/cbor"
-    post.body = CsilCbor.encode(envelope)
+    post.body = envelope
     res = http.request(post)
     raise "csil-rpc #{service}/#{op}: http #{res.code}" unless res.code.to_i.between?(200, 299)
 
-    reply = CsilCbor.decode((res.body || "").b)
-    status = reply["status"]
-    raise "csil-rpc #{service}/#{op}: transport status #{status}" if status != 0
-
-    payload = reply["payload"]
-    unless payload.is_a?(CsilCbor::Tag) && payload.tag == 24
-      raise "csil-rpc: response payload is not a tag-24 byte string"
-    end
-    inner = payload.value
-
-    # A typed `ServiceError` arm (variant "ServiceError") is an application error,
-    # distinct from a transport failure.
-    if reply["variant"] == "ServiceError"
-      err = CsilCbor.decode(inner)
-      raise "service error #{err["code"]}: #{err["message"]}"
-    end
-    inner
+    # The library parses the envelope and raises StatusError on a non-zero transport status.
+    reply = RPC::RpcResponse.decode((res.body || "").b).into_transport_error
+    # A typed ServiceError arm rides as a status-0 variant, distinct from a transport
+    # failure; surface it so the typed client decodes a success payload only.
+    raise "csil-rpc #{service}/#{op}: ServiceError" if reply.variant == "ServiceError"
+    reply.payload
   end
 end
 "##;
 
-/// The pieces the Quickstart's example call needs: which client class + method to
-/// call and a constructible sample request literal (empty when the op takes no input).
+/// CSIL-Events over TLS: a full session example. Opens a TLS byte stream wrapped as the
+/// library's `StreamCarrier` (CSIL length-prefix framing), performs the
+/// `$hello`/`$hello-ack` handshake, sends one outbound event via the generated
+/// `<Service>Router.encode_<op>`, and runs a recv loop that decodes each frame to an
+/// `Event`, answers `$ping` with `$pong`, and dispatches typed events to the generated
+/// `<Service>Router.route_channel`. When the spec has no usable channel op the dispatch
+/// wiring is replaced with a note (the handshake + heartbeat still apply to any connection).
+fn events_section(gem_name: &str, ch: Option<&ChannelExample>) -> String {
+    let mut out = String::from("## CSIL-Events (TLS)\n\n");
+    out.push_str(
+        "Typed, bidirectional event streams over a long-lived connection. The library owns\n\
+         the `$hello`/`$hello-ack` handshake, the `$ping`/`$pong` heartbeat, and framing; the\n\
+         generated router dispatches typed events. The TLS carrier below is just one example —\n\
+         a WebSocket/WebTransport/QUIC carrier drops in unchanged.\n\n",
+    );
+    out.push_str("```ruby\n");
+    out.push_str("require \"csilgen/transport\"\n");
+    out.push_str("require \"openssl\"\n");
+    out.push_str("require \"socket\"\n");
+    out.push_str(&format!("require {}\n\n", ruby_string_literal(gem_name)));
+    out.push_str(EVENTS_CARRIER_RUBY);
+    out.push('\n');
+    match ch {
+        Some(ch) => out.push_str(&events_session(ch)),
+        None => out.push_str(EVENTS_NO_CHANNEL_SESSION_RUBY),
+    }
+    out.push_str("```\n\n");
+    out
+}
+
+/// The TLS `StreamCarrier` adapter — spec-independent. The library's `StreamCarrier` owns
+/// the 4-byte length-prefix framing over the TLS socket, so the session logic stays
+/// transport-agnostic.
+const EVENTS_CARRIER_RUBY: &str = r#"# One example carrier: a TLS byte stream framed with CSIL's 4-byte length prefix. The
+# library's StreamCarrier owns the framing; we own only the socket.
+Events = Csilgen::Transport::Events
+
+def open_tls_carrier(host, port)
+  socket = TCPSocket.new(host, port)
+  ssl = OpenSSL::SSL::SSLSocket.new(socket)
+  ssl.connect
+  Csilgen::Transport::StreamCarrier.new(ssl)
+end
+"#;
+
+/// The channel session body for an Events connection that has a record-typed `<->` op: a
+/// duck-typed codec backed by the generated per-type helpers, the handshake, one outbound
+/// event via the generated encoder, and the recv loop that heartbeats and dispatches into
+/// the generated router. `handlers` is a parameter (the host's `<Service>Handlers`) so the
+/// snippet need not stub every operation inline.
+fn events_session(ch: &ChannelExample) -> String {
+    format!(
+        r#"
+# Back the generated router's codec with this gem's per-type CBOR helpers (inbound
+# {inbound}, outbound {outbound}).
+channel_codec = Object.new
+def channel_codec.encode(value) = value.to_cbor
+def channel_codec.decode(bytes, type) = type.from_cbor(bytes)
+
+# `handlers` is your {handlers} instance; the generated router dispatches typed events into
+# it. Run the session with e.g. `session({handlers}.new, channel_codec)`.
+def session(handlers, codec)
+  carrier = open_tls_carrier("localhost", 7443)
+
+  # $hello / $hello-ack handshake. The peer's $hello-ack pins the wire profile for the
+  # connection's lifetime.
+  carrier.send_frame(Events::Hello.new(versions: [1], profiles: ["verbose"], service: "{service}").encode)
+  ack = carrier.recv_frame or raise "connection closed during handshake"
+  profile = Events::Profile.parse(Events::HelloAck.decode(ack).profile) || Events::Profile::VERBOSE
+
+  # Send one outbound event via the generated encoder, framed under the negotiated profile.
+  event, bytes = {router}.{encode}(codec, {sample})
+  carrier.send_frame(Events::Event.verbose("{service}", event, bytes).encode(profile))
+
+  # Recv loop: decode each frame to an Event, answer $ping with $pong, dispatch the rest to
+  # the generated router.
+  while (frame = carrier.recv_frame)
+    ev = Events::Event.decode(frame, profile)
+    if ev.event == Events::Control::PING_NAME
+      ping = Events::Heartbeat.decode(ev.payload)
+      pong = Events::Event.verbose("{service}", Events::Control::PONG_NAME, Events::Heartbeat.new(nonce: ping.nonce).encode)
+      carrier.send_frame(pong.encode(profile))
+    else
+      {router}.route_channel(handlers, codec, ev.event, ev.payload)
+    end
+  end
+end
+"#,
+        inbound = ch.inbound_class,
+        outbound = ch.outbound_class,
+        handlers = ch.handlers_class,
+        service = ch.wire_service,
+        router = ch.router_module,
+        encode = ch.encode_fn,
+        sample = ch.outbound_sample,
+    )
+}
+
+/// The Events session body when the spec declares no usable channel op: the handshake and
+/// heartbeat still apply to any connection, so they are shown, with a note where the
+/// generated channel dispatch would otherwise wire in.
+const EVENTS_NO_CHANNEL_SESSION_RUBY: &str = r#"
+def session
+  carrier = open_tls_carrier("localhost", 7443)
+
+  # $hello / $hello-ack handshake (control plane).
+  carrier.send_frame(Events::Hello.new(versions: [1], profiles: ["verbose"]).encode)
+  ack = carrier.recv_frame or raise "connection closed during handshake"
+  profile = Events::Profile.parse(Events::HelloAck.decode(ack).profile) || Events::Profile::VERBOSE
+
+  # Recv loop: answer $ping with $pong. This package declares no <->/<- operations, so there
+  # is no generated channel router to dispatch typed events into.
+  while (frame = carrier.recv_frame)
+    ev = Events::Event.decode(frame, profile)
+    if ev.event == Events::Control::PING_NAME
+      ping = Events::Heartbeat.decode(ev.payload)
+      pong = Events::Event.verbose(nil, Events::Control::PONG_NAME, Events::Heartbeat.new(nonce: ping.nonce).encode)
+      carrier.send_frame(pong.encode(profile))
+    end
+  end
+end
+"#;
+
+/// CSIL-Datagrams over UDP: encode a `->` request with the generated codec, wrap it in the
+/// library's `Datagram`, and `send_datagram` it fire-and-forget. The recv path
+/// `Datagram.decode`s an inbound datagram and decodes its payload with the generated codec
+/// into the RESPONSE type — there is NO synchronous response.
+fn datagrams_section(gem_name: &str, ex: Option<&UnaryExample>) -> String {
+    let mut out = String::from("## CSIL-Datagrams (UDP)\n\n");
+    out.push_str(
+        "Unreliable, unordered, message-oriented. The library owns the `Datagram` envelope;\n\
+         you bring a datagram carrier. The UDP carrier below is one example — a WebRTC\n\
+         unreliable DataChannel or QUIC datagrams drop in unchanged.\n\n",
+    );
+    let Some(ex) = ex else {
+        out.push_str(
+            "This package declares no record `->` operations, so there is no datagram payload to encode.\n\n",
+        );
+        return out;
+    };
+    let (Some(_req_class), Some(res_class)) = (&ex.req_class, &ex.res_class) else {
+        out.push_str(
+            "This package's `->` operations have non-record payloads; (de)serialize them manually before framing.\n\n",
+        );
+        return out;
+    };
+    out.push_str("```ruby\n");
+    out.push_str("require \"csilgen/transport\"\n");
+    out.push_str("require \"socket\"\n");
+    out.push_str(&format!("require {}\n\n", ruby_string_literal(gem_name)));
+    out.push_str(DATAGRAMS_CARRIER_RUBY);
+    out.push('\n');
+    out.push_str(&format!(
+        r##"# The operation's datagram ordinal — its @wire-id, or a channel-agreed number.
+OP_ORD = {op_ord}
+
+carrier = open_udp_carrier("localhost", 9000)
+
+# Fire-and-forget: encode the `->` request and send it. seq 0 marks an unsequenced datagram.
+req = {sample}
+carrier.send_datagram(Datagrams::Datagram.new(op_ord: OP_ORD, seq: 0, payload: req.to_cbor).encode)
+
+# Recv path: a datagram of the RESPONSE type MAY arrive later — or never. There is NO
+# synchronous response; the caller must tolerate loss and reordering and handle a reply
+# whenever (if ever) it shows up.
+inbound = carrier.recv_datagram
+unless inbound.nil?
+  dg = Datagrams::Datagram.decode(inbound)
+  resp = {res_class}.from_cbor(dg.payload)
+  puts "late response: #{{resp.inspect}}"
+end
+"##,
+        op_ord = ex.op_ord,
+        sample = ex.sample,
+        res_class = res_class,
+    ));
+    out.push_str("```\n\n");
+    out
+}
+
+/// The UDP datagram carrier adapter — spec-independent. It wraps a connected `UDPSocket`
+/// as the library's `UdpDatagramCarrier`. Datagrams are unreliable and unordered, so the
+/// carrier never waits for or correlates a reply.
+const DATAGRAMS_CARRIER_RUBY: &str = r#"# One example carrier: a UDP socket wrapped as the library's UdpDatagramCarrier.
+# Datagrams are unreliable and unordered, so the carrier never correlates a reply.
+Datagrams = Csilgen::Transport::Datagrams
+
+def open_udp_carrier(host, port)
+  socket = UDPSocket.new
+  socket.connect(host, port)
+  Csilgen::Transport::UdpDatagramCarrier.new(socket)
+end
+"#;
+
+/// The pieces a unary (`->`) example call needs: the client class + method to call, a
+/// constructible sample request literal, the request/response record class names (so the
+/// datagram section can name `req.to_cbor`/`<Res>.from_cbor`), and the op's datagram ordinal.
 struct UnaryExample {
     client_class: String,
     method: String,
     has_request: bool,
     sample: String,
+    req_class: Option<String>,
+    res_class: Option<String>,
+    op_ord: u64,
 }
 
-/// The first service (in rule order, matching the emitted client order) that has a
-/// unary `->` operation, reduced to an example call. `None` for a serviceless /
-/// no-unary spec, which falls back to the types-only README.
+/// The first service (in rule order, matching the emitted client order) that has a unary
+/// `->` operation, reduced to an example call. `None` for a serviceless / no-unary spec.
 fn first_unary_example(spec: &CsilSpecSerialized) -> Option<UnaryExample> {
     for rule in &spec.rules {
         let CsilRuleType::ServiceDef(service) = &rule.rule_type else {
@@ -488,6 +715,7 @@ fn first_unary_example(spec: &CsilSpecSerialized) -> Option<UnaryExample> {
             continue;
         };
         let has_request = !op_input_is_null(&op.input_type);
+        let success = success_type(&op.output_type);
         return Some(UnaryExample {
             client_class: format!("{}Client", wire_service_base(&rule.name)),
             method: ruby_method_name(&op.name),
@@ -497,7 +725,78 @@ fn first_unary_example(spec: &CsilSpecSerialized) -> Option<UnaryExample> {
             } else {
                 String::new()
             },
+            // The datagram section needs record class names; a null-input or non-record
+            // payload leaves the class absent (and that section then shows its note).
+            req_class: if has_request {
+                record_class(spec, &op.input_type)
+            } else {
+                None
+            },
+            res_class: record_class(spec, &success),
+            // The datagram ordinal is the op's @wire-id when present; otherwise a
+            // channel-agreed placeholder the user fills in.
+            op_ord: op.wire_id.unwrap_or(1),
         });
+    }
+    None
+}
+
+/// The Ruby class name a type expression names *iff* it references a generated record;
+/// `None` for any other type (so the datagram/events sections only fire for records).
+fn record_class(spec: &CsilSpecSerialized, ty: &CsilTypeExpression) -> Option<String> {
+    match ty {
+        CsilTypeExpression::Reference(name) if find_record(spec, name).is_some() => {
+            Some(ruby_class_name(name))
+        }
+        _ => None,
+    }
+}
+
+/// The pieces the Events session needs: the generated router module, its outbound encoder,
+/// the handler class, the wire service, the inbound/outbound record class names, and a
+/// constructible outbound record literal.
+struct ChannelExample {
+    router_module: String,
+    wire_service: String,
+    encode_fn: String,
+    handlers_class: String,
+    inbound_class: String,
+    outbound_class: String,
+    outbound_sample: String,
+}
+
+/// The first service (in rule order) with a `<->` op whose inbound (input) and outbound
+/// (success output) are both record references, so the generated router + encoder + per-type
+/// codec helpers all exist. `None` when no service has a usable channel op — the Events
+/// section then shows the handshake/heartbeat without dispatch wiring.
+fn first_channel_example(spec: &CsilSpecSerialized) -> Option<ChannelExample> {
+    for rule in &spec.rules {
+        let CsilRuleType::ServiceDef(service) = &rule.rule_type else {
+            continue;
+        };
+        for op in &service.operations {
+            if !matches!(op.direction, CsilServiceDirection::Bidirectional) {
+                continue;
+            }
+            let success = success_type(&op.output_type);
+            let (Some(inbound), Some(outbound)) = (
+                record_class(spec, &op.input_type),
+                record_class(spec, &success),
+            ) else {
+                continue;
+            };
+            let base = wire_service_base(&rule.name);
+            let method = ruby_method_name(&op.name);
+            return Some(ChannelExample {
+                router_module: format!("{base}Router"),
+                wire_service: base.to_lowercase(),
+                encode_fn: format!("encode_{method}"),
+                handlers_class: format!("{base}Handlers"),
+                inbound_class: inbound,
+                outbound_class: outbound,
+                outbound_sample: ruby_sample(spec, &success),
+            });
+        }
     }
     None
 }
@@ -2454,45 +2753,177 @@ mod tests {
         }
     }
 
+    /// The pingpong records plus a record-typed `<->` channel op (`watch-users`), so the
+    /// genquickstart exercises all three transport sections (the unary `get-user` drives
+    /// RPC + Datagrams; the channel op drives Events).
+    fn three_transport_spec() -> CsilSpecSerialized {
+        let watch_request = CsilRule {
+            name: "watch_request".to_string(),
+            rule_type: CsilRuleType::GroupDef(CsilGroupExpression {
+                entries: vec![bare("uuid", builtin("text"))],
+            }),
+            position: CsilPosition {
+                line: 1,
+                column: 1,
+                offset: 0,
+            },
+            doc_comments: vec![],
+        };
+        let status_update = CsilRule {
+            name: "status_update".to_string(),
+            rule_type: CsilRuleType::GroupDef(CsilGroupExpression {
+                entries: vec![bare("state", builtin("text"))],
+            }),
+            position: CsilPosition {
+                line: 1,
+                column: 1,
+                offset: 0,
+            },
+            doc_comments: vec![],
+        };
+        let mut spec = pingpong_spec();
+        spec.rules.insert(0, watch_request);
+        spec.rules.insert(1, status_update);
+        // Append the channel op to the user_service.
+        if let Some(rule) = spec
+            .rules
+            .iter_mut()
+            .find(|r| matches!(r.rule_type, CsilRuleType::ServiceDef(_)))
+            && let CsilRuleType::ServiceDef(def) = &mut rule.rule_type
+        {
+            def.operations.push(CsilServiceOperation {
+                name: "watch-users".to_string(),
+                input_type: CsilTypeExpression::Reference("watch_request".to_string()),
+                output_type: CsilTypeExpression::Reference("status_update".to_string()),
+                direction: CsilServiceDirection::Bidirectional,
+                position: CsilPosition {
+                    line: 1,
+                    column: 1,
+                    offset: 0,
+                },
+                doc_comments: vec![],
+                wire_id: None,
+            });
+        }
+        spec
+    }
+
+    /// The genquickstart is a three-transport, library-based Quickstart: CSIL-RPC over an
+    /// HTTP carrier (lib `RpcRequest`/`RpcResponse`), CSIL-Events over a TLS frame carrier
+    /// (lib `$hello` handshake + heartbeat + the generated router), and CSIL-Datagrams over
+    /// UDP (lib `Datagram`). No Ruby toolchain is available here, so each section is asserted
+    /// by content, not compiled or run — runtime verify is not possible.
     #[test]
-    fn package_readme_has_quickstart_carrier_and_example() {
-        let files = generate_ruby_code_from_serialized(&pingpong_spec(), &package_config())
+    fn genquickstart_has_three_lib_based_sections() {
+        let files = generate_ruby_code_from_serialized(&three_transport_spec(), &package_config())
             .expect("package generation succeeded");
         let readme = files
             .iter()
-            .find(|f| f.path == "README.md")
-            .expect("README.md emitted in package mode");
+            .find(|f| f.path == "genquickstart.md")
+            .expect("genquickstart.md emitted in package mode");
         let body = &readme.content;
 
-        // Title + the require for this gem.
+        // Title + the transport gem in Install.
         assert!(body.starts_with("# user_client\n"));
-        assert!(body.contains("require \"user_client\""));
+        assert!(body.contains("`csilgen-transport` gem owns the envelope"));
+        assert!(body.contains("gem \"csilgen-transport\", git:"));
 
-        // The carrier implements the generated transport seam.
-        assert!(body.contains("class CsilRpcTransport"));
+        // --- CSIL-RPC (HTTP) ------------------------------------------------------------
+        assert!(body.contains("## CSIL-RPC (HTTP)"));
+        assert!(body.contains("require \"csilgen/transport\""));
+        assert!(body.contains("RPC = Csilgen::Transport::RPC"));
+        assert!(body.contains("class HttpRpcTransport"));
         assert!(body.contains("def call(service, op, req_bytes)"));
-
-        // It POSTs to the CSIL-RPC endpoint, wraps the payload in CBOR tag 24, and
-        // reuses the generated codec (no third-party gem).
+        assert!(body.contains(
+            "RPC::RpcRequest.new(service: service, op: op, payload: req_bytes.b).encode"
+        ));
         assert!(body.contains("/csil/v1/rpc"));
         assert!(body.contains("Net::HTTP::Post"));
-        assert!(body.contains("CsilCbor::Tag.new(24, req_bytes.b)"));
-        assert!(body.contains("CsilCbor.encode(envelope)"));
-        assert!(body.contains("CsilCbor.decode"));
-
-        // The status / typed ServiceError arms are handled.
-        assert!(body.contains("transport status"));
-        assert!(body.contains("if reply[\"variant\"] == \"ServiceError\""));
-        assert!(body.contains("service error #{err[\"code\"]}"));
-
-        // Client construction over the carrier + the first unary call with a generated
-        // sample literal (required fields only, verbatim CSIL field names).
-        assert!(body.contains("UserClient.new(CsilRpcTransport.new(\"http://localhost:5080\"))"));
+        // Non-zero transport status + typed ServiceError arm handled distinctly.
+        assert!(
+            body.contains("RPC::RpcResponse.decode((res.body || \"\").b).into_transport_error")
+        );
+        assert!(body.contains("if reply.variant == \"ServiceError\""));
+        // Typed client + the first `->` call with a generated sample literal.
+        assert!(body.contains("UserClient.new(HttpRpcTransport.new(\"http://localhost:5080\"))"));
         assert!(body.contains("resp = client.get_user(User.new(name: \"example\", id: 0))"));
+
+        // --- CSIL-Events (TLS) ----------------------------------------------------------
+        assert!(body.contains("## CSIL-Events (TLS)"));
+        assert!(body.contains("Events = Csilgen::Transport::Events"));
+        assert!(body.contains("def open_tls_carrier(host, port)"));
+        assert!(body.contains("Csilgen::Transport::StreamCarrier.new(ssl)"));
+        // The $hello handshake + the $ping/$pong heartbeat from the lib.
+        assert!(body.contains(
+            "Events::Hello.new(versions: [1], profiles: [\"verbose\"], service: \"user\").encode"
+        ));
+        assert!(body.contains("Events::HelloAck.decode(ack).profile"));
+        assert!(body.contains("if ev.event == Events::Control::PING_NAME"));
+        assert!(
+            body.contains("Events::Control::PONG_NAME, Events::Heartbeat.new(nonce: ping.nonce)")
+        );
+        // One outbound event via the generated encoder + dispatch into the generated router.
+        assert!(body.contains(
+            "UserRouter.encode_watch_users(codec, StatusUpdate.new(state: \"example\"))"
+        ));
+        assert!(body.contains("UserRouter.route_channel(handlers, codec, ev.event, ev.payload)"));
+
+        // --- CSIL-Datagrams (UDP) -------------------------------------------------------
+        assert!(body.contains("## CSIL-Datagrams (UDP)"));
+        assert!(body.contains("Datagrams = Csilgen::Transport::Datagrams"));
+        assert!(body.contains("Csilgen::Transport::UdpDatagramCarrier.new(socket)"));
+        // Encode the `->` request via the generated codec, wrap in the lib's Datagram, send.
+        assert!(body.contains("req = User.new(name: \"example\", id: 0)"));
+        assert!(body.contains(
+            "carrier.send_datagram(Datagrams::Datagram.new(op_ord: OP_ORD, seq: 0, payload: req.to_cbor).encode)"
+        ));
+        // The recv path decodes the RESPONSE type, with the explicit "may arrive later" note.
+        assert!(body.contains("resp = User.from_cbor(dg.payload)"));
+        assert!(body.contains("MAY arrive later — or never"));
     }
 
+    /// `genquickstart_transports` selects a subset of sections; an absent value renders all
+    /// three.
     #[test]
-    fn serviceless_package_readme_falls_back_to_types_only() {
+    fn genquickstart_transports_subset_selects_sections() {
+        let mut config = package_config();
+        config.options.insert(
+            "genquickstart_transports".to_string(),
+            serde_json::json!(["datagrams"]),
+        );
+        let files = generate_ruby_code_from_serialized(&three_transport_spec(), &config)
+            .expect("package generation succeeded");
+        let body = &files
+            .iter()
+            .find(|f| f.path == "genquickstart.md")
+            .unwrap()
+            .content;
+        assert!(body.contains("## CSIL-Datagrams (UDP)"));
+        assert!(!body.contains("## CSIL-RPC (HTTP)"));
+        assert!(!body.contains("## CSIL-Events (TLS)"));
+
+        // An empty array falls back to all three.
+        let mut config = package_config();
+        config.options.insert(
+            "genquickstart_transports".to_string(),
+            serde_json::json!([]),
+        );
+        let files = generate_ruby_code_from_serialized(&three_transport_spec(), &config)
+            .expect("package generation succeeded");
+        let body = &files
+            .iter()
+            .find(|f| f.path == "genquickstart.md")
+            .unwrap()
+            .content;
+        assert!(body.contains("## CSIL-RPC (HTTP)"));
+        assert!(body.contains("## CSIL-Events (TLS)"));
+        assert!(body.contains("## CSIL-Datagrams (UDP)"));
+    }
+
+    /// A serviceless package degrades each section to its note, and the no-channel Events
+    /// section still shows the handshake/heartbeat — referencing no missing client/router.
+    #[test]
+    fn serviceless_package_readme_falls_back_to_notes() {
         let spec = CsilSpecSerialized {
             rules: vec![CsilRule {
                 name: "user".to_string(),
@@ -2516,11 +2947,13 @@ mod tests {
             .expect("package generation succeeded");
         let readme = files
             .iter()
-            .find(|f| f.path == "README.md")
-            .expect("README.md emitted");
-        // No carrier for a types-only package; the consume section appears instead.
-        assert!(!readme.content.contains("class CsilRpcTransport"));
-        assert!(readme.content.contains("require its generated value"));
+            .find(|f| f.path == "genquickstart.md")
+            .expect("genquickstart.md emitted");
+        let body = &readme.content;
+        // No carrier classes; each section degrades to its note.
+        assert!(!body.contains("class HttpRpcTransport"));
+        assert!(body.contains("no `->` operations"));
+        assert!(body.contains("generated channel router to dispatch typed events into"));
     }
 
     #[test]
@@ -2528,7 +2961,7 @@ mod tests {
         // By default the README is emitted alongside the rest of the gem.
         let default_files = generate_ruby_code_from_serialized(&pingpong_spec(), &package_config())
             .expect("package generation succeeded");
-        assert!(default_files.iter().any(|f| f.path == "README.md"));
+        assert!(default_files.iter().any(|f| f.path == "genquickstart.md"));
 
         // An explicit `emit_readme: false` suppresses only the README; everything else
         // the package emits is unchanged.
@@ -2538,7 +2971,7 @@ mod tests {
             .insert("emit_readme".to_string(), serde_json::json!(false));
         let opted_out = generate_ruby_code_from_serialized(&pingpong_spec(), &config)
             .expect("package generation succeeded");
-        assert!(!opted_out.iter().any(|f| f.path == "README.md"));
+        assert!(!opted_out.iter().any(|f| f.path == "genquickstart.md"));
         assert!(opted_out.iter().any(|f| f.path == "user_client.gemspec"));
         assert!(opted_out.iter().any(|f| f.path == "lib/user_client.rb"));
         assert!(opted_out.iter().any(|f| f.path == "lib/types.rb"));

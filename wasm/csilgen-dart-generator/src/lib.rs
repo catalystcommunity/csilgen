@@ -675,19 +675,29 @@ pub fn generate_dart_code(
         library_name,
         client_style,
     };
-    // Captured before `surface` is consumed: the README only emits a live CSIL-RPC
-    // carrier for a client package; a server/types-only package gets the shorter
-    // "import the codec" section instead.
-    let client_surface = matches!(surface, Surface::Client);
+    // Captured before `surface` is consumed: the RPC section emits a live carrier +
+    // typed client only for a client surface, and the Events section emits router
+    // dispatch only for a server surface (where the generated router lives).
+    // In package mode the genquickstart demonstrates both the calling side (RPC +
+    // Datagrams, over the client) and the handling side (Events, over the router), so a
+    // package carries BOTH surfaces and the README shows both as live examples regardless
+    // of which surface the requested target named. A flat build keeps the per-surface
+    // gating. TypesOnly carries no services either way.
+    let both_surfaces = emit_dart_package && !matches!(surface, Surface::TypesOnly);
+    let client_surface = matches!(surface, Surface::Client) || both_surfaces;
+    let server_surface = matches!(surface, Surface::Server) || both_surfaces;
+    let wanted_transports = dart_wanted_transports(config);
     let dart = DartGenerator { cfg };
-    let files = dart.generate(spec, surface)?;
+    let files = dart.generate(spec, surface, emit_dart_package)?;
     if emit_dart_package {
         let readme = dart_readme(
             spec,
             &package_name,
             client_surface,
+            server_surface,
             dart.cfg.client_style,
             dart.cfg.decimal_mapping,
+            wanted_transports,
         );
         let mut pkg = into_dart_package(files, &package_name, &package_version);
         // The README is opt-out: only an explicit `emit_readme: false` suppresses it.
@@ -696,9 +706,11 @@ pub fn generate_dart_code(
         let emit_readme =
             config.options.get("emit_readme").and_then(|v| v.as_bool()) != Some(false);
         if emit_readme {
-            // The README rides at the package root beside pubspec.yaml, not under lib/.
+            // The Quickstart carrier rides at the package root beside pubspec.yaml, not
+            // under lib/. It is named `genquickstart.md` rather than `README.md` so it
+            // never collides with a consumer's own hand-written `README.md`.
             pkg.push(GeneratedFile {
-                path: "README.md".to_string(),
+                path: "genquickstart.md".to_string(),
                 content: readme,
             });
         }
@@ -780,25 +792,46 @@ fn service_base_name(name: &str) -> String {
         .unwrap_or(pascal)
 }
 
-/// The pieces the Quickstart's example call needs: the client class to construct,
-/// the method to call, and a compiling sample request literal (empty when the op
-/// takes no request).
-struct DartUnaryExample {
-    client_class: String,
-    method: String,
-    has_request: bool,
-    sample: String,
+/// Which transport sections the consumer wants in `genquickstart.md`. The
+/// `genquickstart_transports` option is a JSON array subset of
+/// `["rpc","events","datagrams"]`; unknown entries are ignored, and an absent or
+/// empty value means "all three" so the document never renders empty.
+fn dart_wanted_transports(config: &GeneratorConfig) -> (bool, bool, bool) {
+    match config.options.get("genquickstart_transports") {
+        Some(serde_json::Value::Array(items)) => {
+            let names: std::collections::BTreeSet<&str> =
+                items.iter().filter_map(|v| v.as_str()).collect();
+            let any_known = ["rpc", "events", "datagrams"]
+                .iter()
+                .any(|t| names.contains(t));
+            if any_known {
+                (
+                    names.contains("rpc"),
+                    names.contains("events"),
+                    names.contains("datagrams"),
+                )
+            } else {
+                (true, true, true)
+            }
+        }
+        _ => (true, true, true),
+    }
 }
 
-/// The first service (in sorted order) that has a `->` operation, reduced to an
-/// example call. `None` for a serviceless package. `marker` is the client-name
-/// marker (`Async` for the default `both` twin, empty for the async drop-in) so the
-/// example names the client that actually exists in the emitted package.
-fn dart_first_unary_example(
-    spec: &CsilSpecSerialized,
-    marker: &str,
-    decimal: DecimalMapping,
-) -> Option<DartUnaryExample> {
+/// The record (Dart class) name a type reference resolves to, or `None` when the
+/// type is not a reference to a generated record — so the datagram/channel sections
+/// only name `Type.toCbor`/`Type.fromCbor` for shapes that actually expose them.
+fn dart_record_ref(spec: &CsilSpecSerialized, ty: &CsilTypeExpression) -> Option<String> {
+    match ty {
+        CsilTypeExpression::Reference(name) if dart_find_record(spec, name).is_some() => {
+            Some(dart_type_name(name))
+        }
+        _ => None,
+    }
+}
+
+/// Services sorted by name, so every "first example" helper picks deterministically.
+fn dart_sorted_services(spec: &CsilSpecSerialized) -> Vec<(&str, &CsilServiceDefinition)> {
     let mut services: Vec<(&str, &CsilServiceDefinition)> = spec
         .rules
         .iter()
@@ -808,7 +841,33 @@ fn dart_first_unary_example(
         })
         .collect();
     services.sort_by_key(|(n, _)| *n);
-    for (name, def) in services {
+    services
+}
+
+/// The pieces the RPC + Datagram examples need: the client class to construct, the
+/// method to call, a compiling sample request literal (empty when the op takes no
+/// request), the request/response record type names (so the datagram section can name
+/// `Type.toCbor`/`Type.fromCbor`), and the op's datagram ordinal.
+struct DartUnaryExample {
+    client_class: String,
+    method: String,
+    has_request: bool,
+    sample: String,
+    req_type: Option<String>,
+    res_type: Option<String>,
+    op_ord: u32,
+}
+
+/// The first service (sorted) that has a `->` operation, reduced to an example call.
+/// `None` for a serviceless package. `marker` is the client-name marker (`Async` for
+/// the default `both` twin, empty for the async drop-in) so the example names the
+/// client that actually exists in the emitted package.
+fn dart_first_unary_example(
+    spec: &CsilSpecSerialized,
+    marker: &str,
+    decimal: DecimalMapping,
+) -> Option<DartUnaryExample> {
+    for (name, def) in dart_sorted_services(spec) {
         if let Some(op) = def
             .operations
             .iter()
@@ -816,6 +875,7 @@ fn dart_first_unary_example(
         {
             let base = service_base_name(name);
             let has_request = !is_null_input(&op.input_type);
+            let success = success_type(&op.output_type);
             return Some(DartUnaryExample {
                 client_class: format!("{base}{marker}Client"),
                 method: dart_member_name(&op.name),
@@ -825,6 +885,104 @@ fn dart_first_unary_example(
                 } else {
                     String::new()
                 },
+                req_type: dart_record_ref(spec, &op.input_type),
+                res_type: dart_record_ref(spec, &success),
+                // The datagram ordinal is the op's @wire-id when present; otherwise a
+                // channel-agreed placeholder the user fills in.
+                op_ord: op.wire_id.map(|id| id as u32).unwrap_or(1),
+            });
+        }
+    }
+    None
+}
+
+/// The in-memory Dart type name for the chosen `decimal` mapping — the free-fn twin of
+/// `DartConfig::decimal_dart_type` for the README helpers, which have no `DartConfig`.
+fn dart_decimal_str(decimal: DecimalMapping) -> &'static str {
+    match decimal {
+        DecimalMapping::Csil => "CsilDecimal",
+        DecimalMapping::Library => "Decimal",
+    }
+}
+
+/// The `@override` method bodies a `_Handlers` class needs to satisfy the *whole*
+/// generated service handler interface (the router dispatches into one handler that
+/// must implement every op): a unary op is a one-line `throw UnimplementedError()`
+/// stub (so any return type type-checks), a `<->` op prints, and a `<-` op contributes
+/// no inbound method.
+fn dart_handler_stub_methods(def: &CsilServiceDefinition, decimal: DecimalMapping) -> String {
+    let dec = dart_decimal_str(decimal);
+    let mut out = String::new();
+    for op in &def.operations {
+        let method = dart_member_name(&op.name);
+        match op.direction {
+            CsilServiceDirection::Unidirectional => {
+                let out_type = map_type(&success_type(&op.output_type), &None, dec);
+                if is_null_input(&op.input_type) {
+                    out.push_str(&format!(
+                        "  @override\n  {out_type} {method}() => throw UnimplementedError();\n"
+                    ));
+                } else {
+                    let in_type = map_type(&op.input_type, &None, dec);
+                    out.push_str(&format!(
+                        "  @override\n  {out_type} {method}({in_type} request) => throw UnimplementedError();\n"
+                    ));
+                }
+            }
+            CsilServiceDirection::Bidirectional => {
+                let in_type = map_type(&op.input_type, &None, dec);
+                out.push_str(&format!(
+                    "  @override\n  void {method}({in_type} message) {{\n    print('event {method} $message');\n  }}\n"
+                ));
+            }
+            CsilServiceDirection::Reverse => {}
+        }
+    }
+    out
+}
+
+/// The pieces the Events session needs: the generated handler interface + verbose
+/// router names, the channel message record type, the full handler stub bodies, a
+/// sample message literal, and the wire service/op strings.
+struct DartChannelExample {
+    service_wire: String,
+    op_wire: String,
+    handler_iface: String,
+    route_fn: String,
+    message_type: String,
+    handler_methods: String,
+    sample: String,
+}
+
+/// The first service (sorted) with a `<->` op whose input and output are both records
+/// (so the generated router + per-type codec helpers exist). `None` when no service
+/// has a usable channel op — the Events section then shows the handshake/heartbeat
+/// without dispatch wiring. The router dispatches the op's input type (matching the
+/// generated `route<Service>Channel`), so that is the message record.
+fn dart_first_channel_example(
+    spec: &CsilSpecSerialized,
+    decimal: DecimalMapping,
+) -> Option<DartChannelExample> {
+    for (name, def) in dart_sorted_services(spec) {
+        for op in &def.operations {
+            if !matches!(op.direction, CsilServiceDirection::Bidirectional) {
+                continue;
+            }
+            let success = success_type(&op.output_type);
+            let Some(message_type) = dart_record_ref(spec, &op.input_type) else {
+                continue;
+            };
+            if dart_record_ref(spec, &success).is_none() {
+                continue;
+            }
+            return Some(DartChannelExample {
+                service_wire: wire_service_string(name),
+                op_wire: wire_op_string(&op.name),
+                handler_iface: format!("{}Handler", dart_type_name(name)),
+                route_fn: format!("route{}Channel", dart_type_name(name)),
+                message_type,
+                handler_methods: dart_handler_stub_methods(def, decimal),
+                sample: dart_sample(spec, &op.input_type, decimal),
             });
         }
     }
@@ -925,95 +1083,128 @@ fn dart_record_sample(
     format!("{class_name}({})", fields.join(", "))
 }
 
-/// The package README, with a copy-paste **Quickstart**. For a client package the
-/// Quickstart is a complete CSIL-RPC carrier (it reuses this package's own generated
-/// `CsilCbor` codec for the envelope, so it adds no third-party dependency), the typed
-/// client over it, and one example call. A server/types-only package gets the shorter
-/// "import the codec" section instead.
+/// The package README: a transport-by-transport Quickstart over the official
+/// `csilgen_transport` package. The generated codec owns CBOR (de)serialization and
+/// the library owns the envelope/framing/lifecycle; you supply only a *carrier* that
+/// moves bytes. Each requested section (CSIL-RPC over HTTP, CSIL-Events over TLS,
+/// CSIL-Datagrams over UDP) is a complete, copy-paste example built on the library.
+/// Sections adapt to the emitted surface: RPC needs the typed client (`dart-client`),
+/// Events' router needs the server surface (`dart`); Datagrams ride any surface.
 fn dart_readme(
     spec: &CsilSpecSerialized,
     package_name: &str,
     client_surface: bool,
+    server_surface: bool,
     client_style: ClientStyle,
     decimal: DecimalMapping,
+    wanted: (bool, bool, bool),
 ) -> String {
     let mut out = format!(
         "# {package_name}\n\n\
-         Generated by csilgen. A typed, transport-agnostic CSIL-RPC client: the\n\
-         generated codec owns CBOR (de)serialization; you supply a *carrier* that only\n\
-         moves bytes.\n\n\
-         ## Install / Consume\n\n\
-         Consume straight from your repo via a pub git dependency (no publishing\n\
-         needed):\n\n\
+         Generated by csilgen. A typed CSIL client: the generated codec owns CBOR\n\
+         (de)serialization and the `csilgen_transport` package owns the envelope, framing,\n\
+         and connection lifecycle. You supply only a *carrier* that moves bytes, so the\n\
+         same typed surface rides HTTP, TLS, a WebSocket, WebTransport, QUIC, or raw UDP\n\
+         unchanged.\n\n\
+         ## Install\n\n\
+         Add this package and the transport library. `csilgen_transport` is not yet\n\
+         published to pub.dev, so consume it (and this package) straight from git:\n\n\
          ```yaml\n\
          dependencies:\n  \
          {package_name}:\n    \
-         git:\n      \
-         url: https://github.com/your-org/your-repo.git\n      \
-         path: path/to/{package_name}\n      \
-         ref: main\n\
-         ```\n\n\
-         <!-- TODO: publish to pub.dev for `{package_name}: ^x.y.z` once an artifact exists. -->\n\n"
+         git:\n      url: https://github.com/your-org/your-repo.git\n      \
+         path: path/to/{package_name}\n      ref: main\n  \
+         csilgen_transport:\n    \
+         git:\n      url: https://github.com/catalystcommunity/csilgen.git\n      \
+         path: transports/dart\n      ref: main\n\
+         ```\n\n"
     );
 
     // Only an async client surface can host a real Dart HTTP carrier (Dart has no
-    // blocking HTTP — see the carrier comment), so a sync-only package gets the
-    // shorter section. `both` (default) exposes the marked `Async` twin; `async`
-    // makes the canonical client a drop-in async one.
+    // blocking HTTP). `both` (default) exposes the marked `Async` twin; `async` makes
+    // the canonical client a drop-in async one; `sync` has no async seam.
     let async_seam = match client_style {
         ClientStyle::Both => Some(("AsyncCsilTransport", "Async")),
         ClientStyle::Async => Some(("CsilTransport", "")),
         ClientStyle::Sync => None,
     };
+    let marker = async_seam.map(|(_, m)| m).unwrap_or("");
+    let unary = dart_first_unary_example(spec, marker, decimal);
+    let channel = dart_first_channel_example(spec, decimal);
 
-    let example =
-        async_seam.and_then(|(_, marker)| dart_first_unary_example(spec, marker, decimal));
-
-    match (client_surface, async_seam, example) {
-        (true, Some((transport, _)), Some(ex)) => {
-            out.push_str(&dart_quickstart(package_name, transport, &ex));
-        }
-        _ => {
-            out.push_str(&format!(
-                "## Quickstart\n\n\
-                 Import the generated types and codec directly:\n\n\
-                 ```dart\n\
-                 import 'package:{package_name}/{package_name}.dart';\n\
-                 ```\n"
-            ));
-            if client_surface && async_seam.is_none() {
-                out.push_str(
-                    "\n> Generated with `client_style: sync`. Dart has no blocking HTTP, so an\n\
-                     > HTTP carrier needs the async client — regenerate with `client_style: both`\n\
-                     > (the default) for a ready-to-use CSIL-RPC carrier.\n",
-                );
-            }
-        }
+    let (rpc, events, datagrams) = wanted;
+    if rpc {
+        out.push_str(&dart_rpc_section(
+            package_name,
+            client_surface,
+            async_seam.map(|(seam, _)| seam),
+            unary.as_ref(),
+        ));
+    }
+    if events {
+        out.push_str(&dart_events_section(
+            package_name,
+            server_surface,
+            channel.as_ref(),
+        ));
+    }
+    if datagrams {
+        out.push_str(&dart_datagrams_section(package_name, unary.as_ref()));
     }
     out
 }
 
-/// The client Quickstart: the dependency-free async CSIL-RPC carrier, the typed
-/// client constructed over it, and one example call.
-fn dart_quickstart(package_name: &str, transport: &str, ex: &DartUnaryExample) -> String {
-    let mut out = String::from("## Quickstart\n\n");
+/// CSIL-RPC over HTTP: a carrier implementing the generated async byte seam that
+/// builds/parses the envelope with the library's `RpcRequest`/`RpcResponse` (never
+/// hand-rolled) and POSTs it to `{baseUrl}/csil/v1/rpc`. Live only for a client
+/// surface with an async seam; otherwise a note.
+fn dart_rpc_section(
+    package_name: &str,
+    client_surface: bool,
+    async_seam: Option<&str>,
+    ex: Option<&DartUnaryExample>,
+) -> String {
+    let mut out = String::from("## CSIL-RPC (HTTP)\n\n");
     out.push_str(
-        "A complete CSIL-RPC carrier (no third-party deps — it reuses this package's\n\
-         generated `CsilCbor` codec for the envelope) plus the typed client. Change the\n\
-         one base-URL string.\n\n",
+        "Request/response. The library owns the envelope (`RpcRequest`/`RpcResponse`); you\n\
+         bring a carrier that moves bytes. The HTTP carrier below is just one example —\n\
+         swap `HttpClient` for any client (it implements the generated byte seam).\n\n",
     );
+    let Some(seam) = async_seam else {
+        out.push_str(
+            "> Generated with `client_style: sync`. Dart has no blocking HTTP, so the\n\
+             > CSIL-RPC carrier needs the async client — regenerate with `client_style: both`\n\
+             > (the default) or `async`.\n\n",
+        );
+        return out;
+    };
+    if !client_surface {
+        out.push_str(
+            "This package was generated as a server/types-only surface, so it ships no typed\n\
+             client to call. Regenerate with `--target dart-client` for the RPC carrier and\n\
+             client.\n\n",
+        );
+        return out;
+    }
+    let Some(ex) = ex else {
+        out.push_str(
+            "This package declares no `->` operations, so there is no RPC call to make.\n\n",
+        );
+        return out;
+    };
     out.push_str("```dart\n");
-    out.push_str("import 'dart:io';\n");
+    out.push_str("import 'dart:io' as io;\n");
     out.push_str("import 'dart:typed_data';\n\n");
+    out.push_str("import 'package:csilgen_transport/csilgen_transport.dart';\n");
     out.push_str(&format!(
         "import 'package:{package_name}/{package_name}.dart';\n\n"
     ));
-    out.push_str(&quickstart_carrier_dart(transport));
+    out.push_str(&DART_RPC_CARRIER.replace("__SEAM__", seam));
     out.push('\n');
     out.push_str("Future<void> main() async {\n");
     out.push_str(&format!(
-        "  // Point this at your CSIL-RPC server.\n  \
-         final client = {}(CsilRpcTransport('http://localhost:5080'));\n",
+        "  // Point this at your CSIL-RPC server. The HTTP carrier is one example.\n  \
+         final client = {}(HttpRpcCarrier('http://localhost:5080'));\n",
         ex.client_class
     ));
     if ex.has_request {
@@ -1024,97 +1215,249 @@ fn dart_quickstart(package_name: &str, transport: &str, ex: &DartUnaryExample) -
     } else {
         out.push_str(&format!("  final resp = await client.{}();\n", ex.method));
     }
-    out.push_str("  print(resp);\n}\n```\n");
+    out.push_str("  print(resp);\n}\n```\n\n");
     out
 }
 
-/// The carrier body parameterized by the async transport seam it implements
-/// (`AsyncCsilTransport` for the default twin, `CsilTransport` for the async
-/// drop-in). Identical otherwise, so it lives as one template.
-fn quickstart_carrier_dart(transport: &str) -> String {
-    DART_CARRIER.replace("__TRANSPORT__", transport)
+/// CSIL-Events over TLS: a full session over the library's `FrameCarrier` (length-
+/// prefix framing), the `$hello`/`$hello-ack` handshake, the `$ping`/`$pong`
+/// heartbeat, and — on a server surface with a record `<->` op — dispatch into the
+/// generated `route<Service>Channel`. Without a router the handshake + heartbeat are
+/// still shown, with a note where the dispatch wiring would go.
+fn dart_events_section(
+    package_name: &str,
+    server_surface: bool,
+    ch: Option<&DartChannelExample>,
+) -> String {
+    let mut out = String::from("## CSIL-Events (TLS)\n\n");
+    out.push_str(
+        "Typed, bidirectional event streams over a long-lived connection. The library owns\n\
+         the `$hello`/`$hello-ack` handshake, the `$ping`/`$pong` heartbeat, and length-\n\
+         prefix framing; the generated router dispatches typed events. The TLS carrier\n\
+         below is just one example — a WebSocket/WebTransport/QUIC carrier drops in\n\
+         unchanged.\n\n",
+    );
+    // The router is a server-surface symbol, so dispatch wiring is only shown when a
+    // server package actually emits a usable channel router.
+    let dispatch = if server_surface { ch } else { None };
+    out.push_str("```dart\n");
+    out.push_str("import 'dart:io' as io;\n");
+    out.push_str("import 'dart:typed_data';\n\n");
+    out.push_str("import 'package:csilgen_transport/csilgen_transport.dart';\n");
+    if dispatch.is_some() {
+        out.push_str(&format!(
+            "import 'package:{package_name}/{package_name}.dart';\n"
+        ));
+    }
+    out.push('\n');
+    out.push_str(DART_EVENTS_CARRIER);
+    out.push('\n');
+    match dispatch {
+        Some(ch) => out.push_str(&dart_events_session(ch)),
+        None => {
+            if server_surface {
+                out.push_str(
+                    "// This package declares no record `<->`/`<-` channel operations, so there is\n\
+                     // no generated router to dispatch typed events into; the handshake + heartbeat\n\
+                     // below still apply to any connection.\n",
+                );
+            } else {
+                out.push_str(
+                    "// This package ships no generated channel router (it is not a server surface).\n\
+                     // Regenerate with `--target dart` for route<Service>Channel + a handler\n\
+                     // interface; the handshake + heartbeat below apply to any connection.\n",
+                );
+            }
+            out.push_str(DART_EVENTS_NO_CHANNEL_SESSION);
+        }
+    }
+    out.push_str("```\n\n");
+    out
 }
 
-/// The carrier: it owns only the CSIL-RPC envelope + HTTP, never the typed payload.
-/// Dependency posture is the hybrid path — it reuses this package's exported
-/// `CsilCbor` codec to (en/de)code every envelope value and hand-writes only the
-/// three framing bytes the codec's encoder has no API for (the 4-entry map head and
-/// the CBOR tag-24 head), so it adds no third-party dependency. The default sender is
-/// dart:io's `HttpClient`; an injected one lets a test echo in-process with no socket.
-const DART_CARRIER: &str = r#"/// Maps `(uri, body) -> response bytes`. The default carries over dart:io's
-/// HttpClient; a test injects an in-process echo so verification needs no live socket.
+/// The channel session body for an Events connection with a record `<->` op: a
+/// handler + a `CsilCodec` backed by the message record's per-type helpers, the
+/// handshake, one outbound event via the generated codec, and the recv loop that
+/// heartbeats and dispatches into the generated router.
+fn dart_events_session(ch: &DartChannelExample) -> String {
+    format!(
+        r#"/// A handler for the {service} channel; the generated router dispatches decoded
+/// events to it. The interface bundles every service op, so the unary ops are stubbed.
+class _Handlers implements {handler} {{
+{handler_methods}}}
+
+/// Back the generated router's codec seam with this package's per-type helpers.
+class _Codec implements CsilCodec {{
+  @override
+  List<int> encode(Object? value) => (value as {message}).toCbor();
+  @override
+  Object? decode(List<int> data) => {message}.fromCbor(data);
+}}
+
+Future<void> session() async {{
+  final carrier = await TlsFrameCarrier.connect('localhost', 7443);
+  final handlers = _Handlers();
+  final codec = _Codec();
+
+  // $hello / $hello-ack handshake (control plane). The peer's $hello-ack pins the
+  // wire profile for the connection's lifetime.
+  carrier.sendFrame(Hello([version], ['verbose'], service: '{service}').encode());
+  final ackFrame = carrier.recvFrame();
+  if (ackFrame == null) throw StateError('connection closed during handshake');
+  final profile = parseProfile(HelloAck.decode(ackFrame).profile) ?? Profile.verbose;
+
+  // Send one outbound event via the generated codec, framed as a verbose Event.
+  final outbound = {sample};
+  carrier
+      .sendFrame(Event.verbose('{service}', '{op}', outbound.toCbor()).encode(profile));
+
+  // Recv loop: decode each frame to an Event, answer $ping with $pong, and dispatch
+  // the rest to the generated router. A production host drives this drain from the
+  // socket's event loop as frames arrive.
+  for (var frame = carrier.recvFrame(); frame != null; frame = carrier.recvFrame()) {{
+    final ev = Event.decode(frame, profile);
+    if (ev.event == Control.pingName) {{
+      final ping = Heartbeat.decode(ev.payload);
+      carrier.sendFrame(
+          Event.verbose('{service}', Control.pongName, Heartbeat(ping.nonce).encode())
+              .encode(profile));
+      continue;
+    }}
+    {route}(handlers, codec, ev.event!, ev.payload);
+  }}
+}}
+
+Future<void> main() => session();
+"#,
+        service = ch.service_wire,
+        op = ch.op_wire,
+        handler = ch.handler_iface,
+        handler_methods = ch.handler_methods,
+        route = ch.route_fn,
+        message = ch.message_type,
+        sample = ch.sample,
+    )
+}
+
+/// CSIL-Datagrams over UDP: encode a `->` request with the generated codec, wrap it in
+/// the library's `Datagram`, and send it fire-and-forget; a recv path decodes an
+/// inbound datagram's payload into the RESPONSE type. Live when the first `->` op has
+/// record request and response types; otherwise a note.
+fn dart_datagrams_section(package_name: &str, ex: Option<&DartUnaryExample>) -> String {
+    let mut out = String::from("## CSIL-Datagrams (UDP)\n\n");
+    out.push_str(
+        "Unreliable, unordered, message-oriented. The library owns the `Datagram` envelope;\n\
+         you bring a datagram carrier. The UDP carrier below is one example — a WebRTC\n\
+         unreliable DataChannel or QUIC datagrams drop in unchanged.\n\n",
+    );
+    let Some(ex) = ex else {
+        out.push_str(
+            "This package declares no `->` operations, so there is no datagram payload to encode.\n\n",
+        );
+        return out;
+    };
+    let (Some(req), Some(res)) = (&ex.req_type, &ex.res_type) else {
+        out.push_str(
+            "This package's `->` operations have non-record payloads; (de)serialize them manually before framing.\n\n",
+        );
+        return out;
+    };
+    out.push_str("```dart\n");
+    out.push_str("import 'dart:io' as io;\n");
+    out.push_str("import 'dart:typed_data';\n\n");
+    out.push_str("import 'package:csilgen_transport/csilgen_transport.dart';\n");
+    out.push_str(&format!(
+        "import 'package:{package_name}/{package_name}.dart';\n\n"
+    ));
+    out.push_str(&format!(
+        "// The operation's datagram ordinal — its @wire-id, or a channel-agreed number.\n\
+         const int opOrd = {};\n\n",
+        ex.op_ord
+    ));
+    out.push_str(&format!(
+        r#"// Fire-and-forget: encode the `->` request via the generated codec, wrap it in the
+// library's Datagram, and send. seq 0 marks an unsequenced datagram.
+void sendRequest(DatagramCarrier carrier, {req} request) {{
+  carrier.sendDatagram(Datagram(opOrd, 0, request.toCbor()).encode());
+}}
+
+// Recv path: a datagram of the RESPONSE type MAY arrive later — or never. There is
+// NO synchronous response; the caller must tolerate loss and reordering and handle a
+// reply whenever (if ever) it shows up.
+{res}? recvResponse(DatagramCarrier carrier) {{
+  final inbound = carrier.recvDatagram();
+  if (inbound == null) return null;
+  final dg = Datagram.decode(inbound);
+  return {res}.fromCbor(dg.payload);
+}}
+"#
+    ));
+    out.push('\n');
+    out.push_str(DART_DATAGRAMS_CARRIER);
+    out.push('\n');
+    out.push_str(&format!(
+        r#"Future<void> main() async {{
+  final carrier = await UdpDatagramCarrier.bind('localhost', 9000);
+  sendRequest(carrier, {sample});
+  // No synchronous reply: a response datagram may arrive later, or never.
+  final resp = recvResponse(carrier);
+  print(resp);
+}}
+"#,
+        sample = ex.sample
+    ));
+    out.push_str("```\n\n");
+    out
+}
+
+/// The HTTP carrier body — spec-independent (the op seam name is the only variable),
+/// so a constant with a `__SEAM__` placeholder. It encodes the request with the
+/// library's `RpcRequest`, POSTs it to `{baseUrl}/csil/v1/rpc`, and returns the
+/// success payload bytes the typed client decodes. The default sender is dart:io's
+/// `HttpClient`; an injected one lets a test echo in-process with no socket.
+const DART_RPC_CARRIER: &str = r#"/// Maps `(uri, body) -> response bytes`. Defaults to dart:io's HttpClient; a test
+/// injects an in-process echo so verification needs no live socket.
 typedef CsilRpcSender = Future<Uint8List> Function(Uri uri, Uint8List body);
 
-/// A CSIL-RPC carrier over dart:io's HttpClient. Dart has no blocking HTTP (Dart 3
-/// removed `waitFor`), so — exactly like the TypeScript reference's `fetch` — the
-/// carrier is async and pairs with the generated async client. It reuses this
-/// package's generated CsilCbor codec for the envelope, adding no third-party dep.
-class CsilRpcTransport implements __TRANSPORT__ {
-  CsilRpcTransport(this.baseUrl, {CsilRpcSender? sender})
-      : _send = sender ?? _httpSend;
+/// One example carrier: CSIL-RPC over an HTTP POST. The library owns the envelope
+/// (RpcRequest/RpcResponse); the carrier owns only the transport. Dart has no blocking
+/// HTTP, so the carrier is async and pairs with the generated async client.
+class HttpRpcCarrier implements __SEAM__ {
+  HttpRpcCarrier(this.baseUrl, {CsilRpcSender? sender}) : _send = sender ?? _httpSend;
 
   final String baseUrl;
   final CsilRpcSender _send;
 
   @override
   Future<Uint8List> call(String service, String op, List<int> request) async {
-    final uri =
-        Uri.parse('${baseUrl.replaceAll(RegExp(r'/+$'), '')}/csil/v1/rpc');
-    final bytes = await _send(uri, _encodeRequest(service, op, request));
-    return _decodeResponse(service, op, bytes);
-  }
-
-  // CsilRpcRequest = { v, service, op, payload: #6.24(bstr) }. Only the map head
-  // (0xa4) and the tag-24 head (0xd8 0x18) are hand-written; every value rides the
-  // generated CsilCbor encoder, whose runtime-type dispatch frames each scalar/bstr.
-  Uint8List _encodeRequest(String service, String op, List<int> request) {
-    final b = BytesBuilder();
-    b.addByte(0xa4); // CBOR map, 4 entries
-    b.add(CsilCbor.encodeValue('v'));
-    b.add(CsilCbor.encodeValue(1));
-    b.add(CsilCbor.encodeValue('service'));
-    b.add(CsilCbor.encodeValue(service));
-    b.add(CsilCbor.encodeValue('op'));
-    b.add(CsilCbor.encodeValue(op));
-    b.add(CsilCbor.encodeValue('payload'));
-    b.addByte(0xd8); // CBOR tag, one-byte argument follows
-    b.addByte(0x18); // tag 24: embedded CBOR (the request payload bytes)
-    b.add(CsilCbor.encodeValue(Uint8List.fromList(request)));
-    return b.toBytes();
-  }
-
-  // CsilRpcResponse = { v, status, ? variant, ? error, payload: #6.24(bstr) }.
-  // CsilCbor.decode natively unwraps a tag-24 value to its inner bytes, so the whole
-  // response parse rides the generated codec — no hand-rolled byte reader.
-  Uint8List _decodeResponse(String service, String op, Uint8List bytes) {
-    final env = CsilCbor.decode(bytes) as Map;
-    final status = env['status'] as int;
-    if (status != 0) {
-      throw StateError('csil-rpc $service/$op: transport status $status');
+    final uri = Uri.parse('${baseUrl.replaceAll(RegExp(r'/+$'), '')}/csil/v1/rpc');
+    // The library builds the request envelope; the carrier never hand-rolls CBOR.
+    final envelope = RpcRequest(service, op, Uint8List.fromList(request)).encode();
+    final bytes = await _send(uri, envelope);
+    // RpcResponse.decode + intoTransportError throws a StatusException for any non-zero
+    // transport status, distinct from an application error.
+    final resp = RpcResponse.decode(bytes).intoTransportError();
+    // A typed application error rides as a status-0 `ServiceError` variant; surface it
+    // so the typed client decodes success only.
+    if (resp.variant == 'ServiceError') {
+      throw StateError('csil-rpc $service/$op: ServiceError');
     }
-    final inner = env['payload'] as Uint8List;
-    // A typed ServiceError arm (variant == "ServiceError") is an application error,
-    // distinct from a transport failure; surface it as such.
-    if (env['variant'] == 'ServiceError') {
-      final e = CsilCbor.decode(inner) as Map;
-      throw StateError('service error ${e['code']}: ${e['message']}');
-    }
-    return inner;
+    return resp.payload;
   }
 
   static Future<Uint8List> _httpSend(Uri uri, Uint8List body) async {
-    final http = HttpClient();
+    final http = io.HttpClient();
     try {
       final req = await http.postUrl(uri);
-      req.headers.set(HttpHeaders.contentTypeHeader, 'application/cbor');
-      req.headers.set(HttpHeaders.acceptHeader, 'application/cbor');
+      req.headers.set(io.HttpHeaders.contentTypeHeader, 'application/cbor');
+      req.headers.set(io.HttpHeaders.acceptHeader, 'application/cbor');
       req.add(body);
-      final resp = await req.close();
-      if (resp.statusCode != HttpStatus.ok) {
-        throw StateError('csil-rpc: http ${resp.statusCode}');
+      final httpResp = await req.close();
+      if (httpResp.statusCode != io.HttpStatus.ok) {
+        throw StateError('csil-rpc: http ${httpResp.statusCode}');
       }
       final out = BytesBuilder();
-      await for (final chunk in resp) {
+      await for (final chunk in httpResp) {
         out.add(chunk);
       }
       return out.toBytes();
@@ -1125,12 +1468,112 @@ class CsilRpcTransport implements __TRANSPORT__ {
 }
 "#;
 
+/// The TLS `FrameCarrier` adapter — spec-independent. It length-prefixes each outbound
+/// frame and feeds inbound socket chunks through a `LengthPrefixedDeframer`, exposing
+/// the library's `sendFrame`/`recvFrame` seam so the session logic is transport-
+/// agnostic. The async socket is bridged to the synchronous seam by buffering inbound
+/// frames in an inbox the recv loop drains.
+const DART_EVENTS_CARRIER: &str = r#"// One example carrier: a TLS byte stream framed with CSIL's 4-byte length prefix.
+class TlsFrameCarrier implements FrameCarrier {
+  TlsFrameCarrier(this._socket) {
+    _socket.listen((chunk) {
+      _deframer.push(Uint8List.fromList(chunk));
+      for (var f = _deframer.next(); f != null; f = _deframer.next()) {
+        _inbox.add(f);
+      }
+    });
+  }
+
+  final io.Socket _socket;
+  final LengthPrefixedDeframer _deframer = LengthPrefixedDeframer();
+  final List<Uint8List> _inbox = [];
+
+  static Future<TlsFrameCarrier> connect(String host, int port) async {
+    final socket = await io.SecureSocket.connect(host, port);
+    return TlsFrameCarrier(socket);
+  }
+
+  @override
+  void sendFrame(Uint8List frame) => _socket.add(frameLengthPrefixed(frame));
+
+  @override
+  Uint8List? recvFrame() => _inbox.isEmpty ? null : _inbox.removeAt(0);
+}
+"#;
+
+/// The Events session body when the spec declares no record channel op (or the surface
+/// has no router): the handshake and heartbeat still apply, so they are shown, with a
+/// note where the dispatch would go. Imports only the transport library.
+const DART_EVENTS_NO_CHANNEL_SESSION: &str = r#"Future<void> session() async {
+  final carrier = await TlsFrameCarrier.connect('localhost', 7443);
+
+  // $hello / $hello-ack handshake (control plane).
+  carrier.sendFrame(Hello([version], ['verbose']).encode());
+  final ackFrame = carrier.recvFrame();
+  if (ackFrame == null) throw StateError('connection closed during handshake');
+  final profile = parseProfile(HelloAck.decode(ackFrame).profile) ?? Profile.verbose;
+
+  // Recv loop: answer $ping with $pong. A production host drives this drain from the
+  // socket's event loop as frames arrive.
+  for (var frame = carrier.recvFrame(); frame != null; frame = carrier.recvFrame()) {
+    final ev = Event.decode(frame, profile);
+    if (ev.event == Control.pingName) {
+      final ping = Heartbeat.decode(ev.payload);
+      carrier.sendFrame(
+          Event.verbose(null, Control.pongName, Heartbeat(ping.nonce).encode())
+              .encode(profile));
+    }
+  }
+}
+
+Future<void> main() => session();
+"#;
+
+/// The UDP `DatagramCarrier` adapter — spec-independent. `sendDatagram` writes one UDP
+/// packet; `recvDatagram` drains the next buffered inbound packet (or `null`). Inbound
+/// packets are buffered in an inbox because the library's seam is synchronous.
+const DART_DATAGRAMS_CARRIER: &str = r#"// One example carrier: UDP via dart:io's RawDatagramSocket. Datagrams are unreliable
+// and unordered, so the carrier never waits for or correlates a reply.
+class UdpDatagramCarrier implements DatagramCarrier {
+  UdpDatagramCarrier(this._socket, this._host, this._port) {
+    _socket.listen((event) {
+      if (event == io.RawSocketEvent.read) {
+        final dg = _socket.receive();
+        if (dg != null) _inbox.add(dg.data);
+      }
+    });
+  }
+
+  final io.RawDatagramSocket _socket;
+  final io.InternetAddress _host;
+  final int _port;
+  final List<Uint8List> _inbox = [];
+
+  static Future<UdpDatagramCarrier> bind(String host, int port) async {
+    final socket = await io.RawDatagramSocket.bind(io.InternetAddress.anyIPv4, 0);
+    final addr = (await io.InternetAddress.lookup(host)).first;
+    return UdpDatagramCarrier(socket, addr, port);
+  }
+
+  @override
+  void sendDatagram(Uint8List datagram) => _socket.send(datagram, _host, _port);
+
+  @override
+  Uint8List? recvDatagram() => _inbox.isEmpty ? null : _inbox.removeAt(0);
+}
+"#;
+
 struct DartGenerator {
     cfg: DartConfig,
 }
 
 impl DartGenerator {
-    fn generate(&self, spec: &CsilSpecSerialized, surface: Surface) -> Result<GeneratedFiles> {
+    fn generate(
+        &self,
+        spec: &CsilSpecSerialized,
+        surface: Surface,
+        pkg_mode: bool,
+    ) -> Result<GeneratedFiles> {
         let mut files = Vec::new();
 
         let records = record_names(spec);
@@ -1185,109 +1628,121 @@ impl DartGenerator {
         }
 
         if spec.service_count > 0 {
-            match surface {
-                Surface::TypesOnly => {}
-                Surface::Server => {
-                    let mut services_code = String::new();
-                    for rule in &spec.rules {
-                        if let CsilRuleType::ServiceDef(service) = &rule.rule_type {
-                            services_code.push_str(&self.generate_server(&rule.name, service));
-                            services_code.push_str(&self.generate_wire_ids(&rule.name, service));
-                        }
-                    }
-                    if !services_code.is_empty() {
-                        let mut body = String::new();
-                        body.push_str(SERVER_PRELUDE_DART);
-                        body.push('\n');
-                        body.push_str(&services_code);
-                        // The routers/handlers name the generated request/response
-                        // types, so the services file must import the types library.
-                        let extra = if has_types {
-                            vec!["types.gen.dart".to_string()]
-                        } else {
-                            Vec::new()
-                        };
-                        files.push(GeneratedFile {
-                            path: "services.gen.dart".to_string(),
-                            content: self.file_header(
-                                "Generated service handlers and routers.",
-                                &extra,
-                                &body,
-                            ),
-                        });
+            // A package's `genquickstart.md` exercises both the calling side (the RPC and
+            // Datagrams sections, over the client) and the handling side (the Events section,
+            // over the generated `route<Service>Channel` router), so a package must carry BOTH
+            // surfaces for its own quickstart to compile — regardless of which surface the
+            // requested target names. A flat (non-package) build stays byte-identical: it emits
+            // only the requested surface. This mirrors the OCaml generator's
+            // all-surfaces-in-package-mode rule.
+            let want_client = matches!(surface, Surface::Client)
+                || (pkg_mode && !matches!(surface, Surface::TypesOnly));
+            let want_server = matches!(surface, Surface::Server)
+                || (pkg_mode && !matches!(surface, Surface::TypesOnly));
+
+            if want_server {
+                let mut services_code = String::new();
+                for rule in &spec.rules {
+                    if let CsilRuleType::ServiceDef(service) = &rule.rule_type {
+                        services_code.push_str(&self.generate_server(&rule.name, service));
+                        services_code.push_str(&self.generate_wire_ids(&rule.name, service));
                     }
                 }
-                Surface::Client => {
-                    // The transport seam owns the I/O round-trip, so it is the only
-                    // surface that turns async; `client_style` selects which shape(s)
-                    // to emit. The async twin carries the wire-id consts in neither
-                    // file but the sync one, so the two coexist without const clashes.
-                    match self.cfg.client_style {
-                        ClientStyle::Sync => {
-                            let shape = ClientShape {
-                                is_async: false,
-                                marker: "",
-                            };
-                            if let Some(f) = self.build_client_file(
-                                spec,
-                                shape,
-                                "services.gen.dart",
-                                true,
-                                &records,
-                                &aliases,
-                                has_types,
-                            ) {
-                                files.push(f);
-                            }
+                if !services_code.is_empty() {
+                    let mut body = String::new();
+                    body.push_str(SERVER_PRELUDE_DART);
+                    body.push('\n');
+                    body.push_str(&services_code);
+                    // The routers/handlers name the generated request/response
+                    // types, so the services file must import the types library.
+                    let extra = if has_types {
+                        vec!["types.gen.dart".to_string()]
+                    } else {
+                        Vec::new()
+                    };
+                    files.push(GeneratedFile {
+                        path: "services.gen.dart".to_string(),
+                        content: self.file_header(
+                            "Generated service handlers and routers.",
+                            &extra,
+                            &body,
+                        ),
+                    });
+                }
+            }
+
+            if want_client {
+                // The transport seam owns the I/O round-trip, so it is the only surface that
+                // turns async; `client_style` selects which shape(s) to emit. When the server
+                // surface is also emitted (package mode), the client lands on its own filenames
+                // so it never collides with `services.gen.dart`, and it omits the wire-id consts
+                // (the server file owns the single copy, so the two coexist in one barrel
+                // without const clashes). A flat client surface keeps the canonical
+                // `services.gen.dart` names + the wire-ids, so its byte output is unchanged.
+                let (sync_path, async_path, client_wire_ids) = if want_server {
+                    ("client.gen.dart", "client.async.gen.dart", false)
+                } else {
+                    ("services.gen.dart", "services.async.gen.dart", true)
+                };
+                match self.cfg.client_style {
+                    ClientStyle::Sync => {
+                        let shape = ClientShape {
+                            is_async: false,
+                            marker: "",
+                        };
+                        if let Some(f) = self.build_client_file(
+                            spec,
+                            shape,
+                            sync_path,
+                            client_wire_ids,
+                            &records,
+                            &aliases,
+                            has_types,
+                        ) {
+                            files.push(f);
                         }
-                        ClientStyle::Async => {
-                            let shape = ClientShape {
-                                is_async: true,
-                                marker: "",
-                            };
-                            if let Some(f) = self.build_client_file(
-                                spec,
-                                shape,
-                                "services.gen.dart",
-                                true,
-                                &records,
-                                &aliases,
-                                has_types,
-                            ) {
-                                files.push(f);
-                            }
+                    }
+                    ClientStyle::Async => {
+                        let shape = ClientShape {
+                            is_async: true,
+                            marker: "",
+                        };
+                        if let Some(f) = self.build_client_file(
+                            spec,
+                            shape,
+                            sync_path,
+                            client_wire_ids,
+                            &records,
+                            &aliases,
+                            has_types,
+                        ) {
+                            files.push(f);
                         }
-                        ClientStyle::Both => {
-                            let sync = ClientShape {
-                                is_async: false,
-                                marker: "",
-                            };
-                            if let Some(f) = self.build_client_file(
-                                spec,
-                                sync,
-                                "services.gen.dart",
-                                true,
-                                &records,
-                                &aliases,
-                                has_types,
-                            ) {
-                                files.push(f);
-                            }
-                            let twin = ClientShape {
-                                is_async: true,
-                                marker: "Async",
-                            };
-                            if let Some(f) = self.build_client_file(
-                                spec,
-                                twin,
-                                "services.async.gen.dart",
-                                false,
-                                &records,
-                                &aliases,
-                                has_types,
-                            ) {
-                                files.push(f);
-                            }
+                    }
+                    ClientStyle::Both => {
+                        let sync = ClientShape {
+                            is_async: false,
+                            marker: "",
+                        };
+                        if let Some(f) = self.build_client_file(
+                            spec,
+                            sync,
+                            sync_path,
+                            client_wire_ids,
+                            &records,
+                            &aliases,
+                            has_types,
+                        ) {
+                            files.push(f);
+                        }
+                        let twin = ClientShape {
+                            is_async: true,
+                            marker: "Async",
+                        };
+                        if let Some(f) = self.build_client_file(
+                            spec, twin, async_path, false, &records, &aliases, has_types,
+                        ) {
+                            files.push(f);
                         }
                     }
                 }

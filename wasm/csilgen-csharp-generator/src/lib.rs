@@ -245,65 +245,71 @@ pub fn render(input: WasmGeneratorInput) -> Result<WasmGeneratorOutput, i32> {
         });
     }
 
+    // A package's `genquickstart.md` demonstrates both the calling side (the RPC and
+    // Datagrams sections, over the client) and the handling side (the Events section, over
+    // the generated router in `Services.gen.cs`), so a package must carry BOTH surfaces for
+    // its own quickstart to compile — regardless of which surface the requested target
+    // names. A flat (non-package) build stays byte-identical: it emits only the requested
+    // surface. This mirrors the OCaml generator's all-surfaces-in-package-mode rule.
+    let pkg_mode = package_requested(&input.config.options, "csharp");
+    let want_client = matches!(surface, Surface::Client) || pkg_mode;
+    let want_server = matches!(surface, Surface::Server) || pkg_mode;
+
     if input.csil_spec.service_count > 0 {
-        match surface {
-            Surface::Client => {
-                // The sync client and the async drop-in share the canonical filename and
-                // symbol names; the async twin (Both mode) takes a separate file and the
-                // `Async` marker so the two coexist in one namespace.
-                let sync = ClientShape {
-                    is_async: false,
-                    marker: "",
-                };
-                let async_drop_in = ClientShape {
-                    is_async: true,
-                    marker: "",
-                };
-                let async_twin = ClientShape {
-                    is_async: true,
-                    marker: "Async",
-                };
-                match style {
-                    ClientStyle::Sync => {
-                        if let Some(client) = generate_client(&input, &config, sync) {
-                            files.push(GeneratedFile {
-                                path: "Client.gen.cs".to_string(),
-                                content: client,
-                            });
-                        }
+        if want_client {
+            // The sync client and the async drop-in share the canonical filename and
+            // symbol names; the async twin (Both mode) takes a separate file and the
+            // `Async` marker so the two coexist in one namespace.
+            let sync = ClientShape {
+                is_async: false,
+                marker: "",
+            };
+            let async_drop_in = ClientShape {
+                is_async: true,
+                marker: "",
+            };
+            let async_twin = ClientShape {
+                is_async: true,
+                marker: "Async",
+            };
+            match style {
+                ClientStyle::Sync => {
+                    if let Some(client) = generate_client(&input, &config, sync) {
+                        files.push(GeneratedFile {
+                            path: "Client.gen.cs".to_string(),
+                            content: client,
+                        });
                     }
-                    ClientStyle::Async => {
-                        if let Some(client) = generate_client(&input, &config, async_drop_in) {
-                            files.push(GeneratedFile {
-                                path: "Client.gen.cs".to_string(),
-                                content: client,
-                            });
-                        }
+                }
+                ClientStyle::Async => {
+                    if let Some(client) = generate_client(&input, &config, async_drop_in) {
+                        files.push(GeneratedFile {
+                            path: "Client.gen.cs".to_string(),
+                            content: client,
+                        });
                     }
-                    ClientStyle::Both => {
-                        if let Some(client) = generate_client(&input, &config, sync) {
-                            files.push(GeneratedFile {
-                                path: "Client.gen.cs".to_string(),
-                                content: client,
-                            });
-                        }
-                        if let Some(client) = generate_client(&input, &config, async_twin) {
-                            files.push(GeneratedFile {
-                                path: "ClientAsync.gen.cs".to_string(),
-                                content: client,
-                            });
-                        }
+                }
+                ClientStyle::Both => {
+                    if let Some(client) = generate_client(&input, &config, sync) {
+                        files.push(GeneratedFile {
+                            path: "Client.gen.cs".to_string(),
+                            content: client,
+                        });
+                    }
+                    if let Some(client) = generate_client(&input, &config, async_twin) {
+                        files.push(GeneratedFile {
+                            path: "ClientAsync.gen.cs".to_string(),
+                            content: client,
+                        });
                     }
                 }
             }
-            Surface::Server => {
-                if let Some(services) = generate_services(&input, &config) {
-                    files.push(GeneratedFile {
-                        path: "Services.gen.cs".to_string(),
-                        content: services,
-                    });
-                }
-            }
+        }
+        if want_server && let Some(services) = generate_services(&input, &config) {
+            files.push(GeneratedFile {
+                path: "Services.gen.cs".to_string(),
+                content: services,
+            });
         }
     }
 
@@ -312,7 +318,7 @@ pub fn render(input: WasmGeneratorInput) -> Result<WasmGeneratorOutput, i32> {
     // directory itself is a valid, NuGet-packable .NET project. SDK-style projects glob
     // `**/*.cs` by default, so the flat generated files compile in with no extra wiring.
     // The default (non-package) output is otherwise byte-identical.
-    if package_requested(&input.config.options, "csharp") {
+    if pkg_mode {
         let coords = PackageCoords::from_options(&config, &input.config.options);
         files.push(GeneratedFile {
             path: format!("{}.csproj", coords.package_id),
@@ -329,7 +335,7 @@ pub fn render(input: WasmGeneratorInput) -> Result<WasmGeneratorOutput, i32> {
             != Some(false);
         if emit_readme {
             files.push(GeneratedFile {
-                path: "README.md".to_string(),
+                path: "genquickstart.md".to_string(),
                 content: readme_file(&input, &config, &coords),
             });
         }
@@ -440,14 +446,41 @@ fn csproj_file(coords: &PackageCoords) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// Package README (with a copy-paste CSIL-RPC Quickstart)
+// Package README (a 3-transport Quickstart over the Csilgen.Transport library)
 // ---------------------------------------------------------------------------
 
-/// The package README. For a client package it carries a copy-paste **Quickstart**: a
-/// complete, dependency-free CSIL-RPC carrier (it reuses this package's own generated
-/// CBOR codec for the envelope, so it adds no third-party dependency — not even the
-/// in-box `System.Formats.Cbor`), the typed client over it, and one example call. A
-/// serviceless / server package gets the consume-the-types section instead.
+/// Which transport sections a consumer wants in `genquickstart.md`. The
+/// `genquickstart_transports` option is a JSON array subset of `["rpc","events","datagrams"]`;
+/// unknown entries are ignored, and an absent or empty value means "all three". The three
+/// sections always render in a fixed order so the document reads the same regardless of how
+/// the subset was written.
+fn wanted_transports(options: &HashMap<String, serde_json::Value>) -> (bool, bool, bool) {
+    let listed = match options.get("genquickstart_transports") {
+        Some(serde_json::Value::Array(items)) => {
+            let names: std::collections::BTreeSet<&str> =
+                items.iter().filter_map(|v| v.as_str()).collect();
+            let any_known = ["rpc", "events", "datagrams"]
+                .iter()
+                .any(|t| names.contains(t));
+            any_known.then(|| {
+                (
+                    names.contains("rpc"),
+                    names.contains("events"),
+                    names.contains("datagrams"),
+                )
+            })
+        }
+        _ => None,
+    };
+    listed.unwrap_or((true, true, true))
+}
+
+/// The package README: a transport-by-transport Quickstart over the official
+/// `Csilgen.Transport` library. The generated codec owns CBOR (de)serialization and the
+/// library owns the envelope/framing/lifecycle; the consumer supplies only a *carrier* that
+/// moves bytes, so the same typed surface rides HTTP, TLS, a WebSocket, QUIC, or raw UDP
+/// unchanged. Each requested section (CSIL-RPC over HTTP, CSIL-Events over TLS, CSIL-Datagrams
+/// over UDP) is a complete, copy-paste example on the library.
 fn readme_file(
     input: &WasmGeneratorInput,
     config: &CsharpConfig,
@@ -456,99 +489,96 @@ fn readme_file(
     let title = &coords.package_id;
     let mut out = format!(
         "# {title}\n\n\
-         Generated by csilgen. A typed, transport-agnostic CSIL-RPC client: the generated\n\
-         codec owns CBOR (de)serialization; you supply a *carrier* that only moves bytes.\n\n\
+         Generated by csilgen. A typed CSIL client: the generated codec owns CBOR\n\
+         (de)serialization and the `Csilgen.Transport` library owns the envelope, framing,\n\
+         and connection lifecycle. You supply only a *carrier* that moves bytes, so the same\n\
+         typed surface rides HTTP, TLS, a WebSocket, QUIC, or raw UDP unchanged.\n\n\
          ## Install\n\n\
          ```sh\n\
-         # TODO: a published NuGet artifact is pending. Until then, reference the generated\n\
-         # project directly from your app:\n\
+         # The Csilgen.Transport library is not yet published to NuGet; reference its project\n\
+         # (or a vendored copy) until it ships. Reference the generated project directly:\n\
          dotnet add reference path/to/{title}.csproj\n\
-         ```\n\n"
+         dotnet add reference path/to/Csilgen.Transport.csproj\n\
+         ```\n\n\
+         > Generate this package under a namespace **other than** `Csilgen.Transport` (set\n\
+         > the `namespace` option) so the generated codec types don't collide with the library.\n\n"
     );
 
     let records = record_names(input);
-    // The carrier implements the sync `ICsilTransport` seam, which only the client surface
-    // emits — so the full Quickstart is client-only; everything else gets the types section.
-    let example = if input.config.target == "csharp-client" {
-        first_readme_example(input, &records, config)
-    } else {
-        None
-    };
-    match example {
-        Some(ex) => out.push_str(&readme_quickstart(config, &records, &ex)),
-        None => out.push_str(&format!(
-            "## Quickstart\n\n\
-             This package exposes generated types and a self-contained CBOR codec. Encode\n\
-             and decode them with the generated `Codec`:\n\n\
-             ```csharp\n\
-             using {ns};\n\n\
-             // byte[] bytes = Codec.Encode(value);\n\
-             // var value = Codec.Decode<YourType>(bytes);\n\
-             ```\n",
-            ns = config.namespace
-        )),
+    let (rpc, events, datagrams) = wanted_transports(&input.config.options);
+    let unary = first_readme_example(input, &records, config);
+    let channel = first_channel_example(input, &records, config);
+    if rpc {
+        out.push_str(&rpc_section(config, unary.as_ref()));
+    }
+    if events {
+        out.push_str(&events_section(config, channel.as_ref()));
+    }
+    if datagrams {
+        out.push_str(&datagrams_section(config, unary.as_ref()));
     }
     out
 }
 
-/// The client Quickstart section: prose + a single fenced C# block containing the carrier
-/// and the example call.
-fn readme_quickstart(
-    config: &CsharpConfig,
-    records: &std::collections::HashSet<String>,
-    ex: &ReadmeExample,
-) -> String {
-    let carrier = readme_carrier(&config.namespace, records.contains("ServiceError"));
-    let example = readme_example(ex);
-    format!(
-        "## Quickstart\n\n\
-         A complete CSIL-RPC carrier — **no third-party dependency**, it reuses this\n\
-         package's own generated CBOR codec (`CborValue`/`Cbor`) to build and parse the\n\
-         envelope. It POSTs to `{{baseUrl}}/csil/v1/rpc` with the stdlib `HttpClient` and\n\
-         hands the response payload bytes back to the generated client to decode. Change\n\
-         the one base-URL string.\n\n\
-         ```csharp\n{carrier}\n{example}```\n"
-    )
-}
-
-/// The CSIL-RPC carrier source. The generated codec exports a generic CBOR value tree
-/// (`CborValue`, with tag support) and a `Cbor.Encode`/`Cbor.Decode` pair, so the carrier
-/// builds the fixed envelope with those rather than pulling `System.Formats.Cbor` — path 1
-/// of the README hybrid rule (zero third-party deps). `__SERVICE_ERROR_ARM__` is filled
-/// with the typed decode only when the spec actually declares a `ServiceError` record.
-fn readme_carrier(namespace: &str, has_service_error: bool) -> String {
-    let arm = if has_service_error {
-        "            ServiceError se = Codec.Decode<ServiceError>(inner);\n            throw new CsilClientException(se.Code, se.Message);"
-    } else {
-        "            throw new CsilClientException(0, $\"csil-rpc {service}/{op}: service error\");"
+/// CSIL-RPC over HTTP: a carrier implementing the generated `ICsilTransport` byte seam that
+/// encodes the request with the library's `RpcRequest` and decodes its `RpcResponse` (never
+/// hand-rolled), POSTing to `{baseUrl}/csil/v1/rpc` with the stdlib `HttpClient`. A non-zero
+/// transport status (via `AsTransportError`) and the typed `ServiceError` arm are surfaced
+/// distinctly. Then the typed client calls the first `->` op.
+fn rpc_section(config: &CsharpConfig, ex: Option<&ReadmeExample>) -> String {
+    let mut out = String::from("## CSIL-RPC (HTTP)\n\n");
+    out.push_str(
+        "Request/response. The library owns the envelope (`RpcRequest`/`RpcResponse`); you\n\
+         bring a carrier that moves bytes. The HTTP carrier below is just one example — swap\n\
+         `HttpClient` for any client (it implements the generated `ICsilTransport` seam).\n\n",
+    );
+    let Some(ex) = ex else {
+        out.push_str(
+            "This package declares no `->` operations, so there is no RPC call to make.\n\n",
+        );
+        return out;
     };
-    CARRIER_CSHARP
-        .replace("__NAMESPACE__", namespace)
-        .replace("__SERVICE_ERROR_ARM__", arm)
+    let carrier = RPC_CARRIER_CSHARP.replace("__NAMESPACE__", &config.namespace);
+    let call = match &ex.sample {
+        Some(sample) => format!("client.{}({sample})", ex.method),
+        None => format!("client.{}()", ex.method),
+    };
+    let example = format!(
+        "// Construct the client over the carrier and make one call. Change the URL only.\n\
+         public static class CsilRpcExample\n{{\n    \
+         public static void Run()\n    {{\n        \
+         var client = new {client}(new HttpRpcCarrier(\"http://localhost:5080\"));\n        \
+         var response = {call};\n        \
+         System.Console.WriteLine(response);\n    }}\n}}\n",
+        client = ex.client_class,
+    );
+    out.push_str(&format!("```csharp\n{carrier}\n{example}```\n\n"));
+    out
 }
 
-/// The carrier body. A constant with two placeholders (the package namespace and the
-/// `ServiceError` arm) so its many C# braces need no `format!` escaping.
-const CARRIER_CSHARP: &str = r#"// CSIL-RPC carrier — DEPENDENCY-FREE. It reuses THIS package's generated CBOR
-// (CborValue/Cbor, from Codec.gen.cs) to build and parse the envelope, so it needs no
-// third-party CBOR library — not even the in-box System.Formats.Cbor. The generated Codec
-// owns your types' (de)serialization; this carrier only moves bytes over stdlib HttpClient.
+/// The HTTP carrier body — spec-independent, so a constant with a `__NAMESPACE__` placeholder.
+/// It builds the request envelope with the library's `RpcRequest`, POSTs it to
+/// `{baseUrl}/csil/v1/rpc`, and returns the success payload bytes the typed client decodes.
+/// `RpcResponse.AsTransportError()` surfaces any non-zero transport status; the typed
+/// `ServiceError` arm (a status-0 variant) is surfaced separately.
+const RPC_CARRIER_CSHARP: &str = r#"// One example carrier: CSIL-RPC over an HTTP POST. The library owns the envelope
+// (RpcRequest/RpcResponse); the carrier owns only the transport. Swap HttpClient for any client.
 using System;
 using System.Net.Http;
 using System.Net.Http.Headers;
+using Csilgen.Transport;
 using __NAMESPACE__;
 
-public sealed class CsilRpcHttpTransport : ICsilTransport, IDisposable
+public sealed class HttpRpcCarrier : ICsilTransport, IDisposable
 {
-    private const ulong TagEncodedCbor = 24; // RFC 8949 §3.4.5.1 embedded CBOR
     private readonly string _url;
     private readonly HttpClient _http;
 
-    public CsilRpcHttpTransport(string baseUrl) : this(baseUrl, new HttpClientHandler()) { }
+    public HttpRpcCarrier(string baseUrl) : this(baseUrl, new HttpClientHandler()) { }
 
     // The handler seam keeps the carrier testable: inject a stub HttpMessageHandler to
     // exercise it in-process with no sockets.
-    public CsilRpcHttpTransport(string baseUrl, HttpMessageHandler handler)
+    public HttpRpcCarrier(string baseUrl, HttpMessageHandler handler)
     {
         _url = baseUrl.TrimEnd('/') + "/csil/v1/rpc";
         _http = new HttpClient(handler);
@@ -556,95 +586,271 @@ public sealed class CsilRpcHttpTransport : ICsilTransport, IDisposable
 
     public byte[] Call(string service, string op, byte[] request)
     {
-        // CsilRpcRequest = { v, service, op, payload: #6.24(bstr) }. The payload is the
-        // already-encoded request wrapped in CBOR tag 24 (embedded CBOR).
-        var envelope = new CborValue.Map(new (CborValue, CborValue)[]
-        {
-            (new CborValue.Text("v"), new CborValue.Uint(1)),
-            (new CborValue.Text("service"), new CborValue.Text(service)),
-            (new CborValue.Text("op"), new CborValue.Text(op)),
-            (new CborValue.Text("payload"), new CborValue.Tag(TagEncodedCbor, new CborValue.Bytes(request))),
-        });
-
+        // The library owns the envelope; hand it the already-encoded request bytes.
+        byte[] envelope = new RpcRequest(service, op, request).Encode();
         using var msg = new HttpRequestMessage(HttpMethod.Post, _url)
         {
-            Content = new ByteArrayContent(Cbor.Encode(envelope)),
+            Content = new ByteArrayContent(envelope),
         };
         msg.Content.Headers.ContentType = new MediaTypeHeaderValue("application/cbor");
         msg.Headers.Accept.ParseAdd("application/cbor");
 
-        using HttpResponseMessage resp = _http.Send(msg);
-        byte[] body = resp.Content.ReadAsByteArrayAsync().GetAwaiter().GetResult();
-        if (!resp.IsSuccessStatusCode)
-            throw new CsilClientException(0, $"csil-rpc {service}/{op}: http {(int)resp.StatusCode}");
+        using HttpResponseMessage http = _http.Send(msg);
+        byte[] body = http.Content.ReadAsByteArrayAsync().GetAwaiter().GetResult();
+        if (!http.IsSuccessStatusCode)
+            throw new System.Exception($"csil-rpc {service}/{op}: http {(int)http.StatusCode}");
 
-        // CsilRpcResponse = { v, status, ? variant, ? error, payload: #6.24(bstr) }.
-        var env = (CborValue.Map)Cbor.Decode(body);
-        long status = EnvInt(env, "status");
-        if (status != 0)
-            throw new CsilClientException(status, EnvText(env, "error") ?? $"transport status {status}");
-
-        byte[] inner = EnvPayload(env);
-        // A typed "ServiceError" arm is an application error, distinct from a transport failure.
-        if (EnvText(env, "variant") == "ServiceError")
-        {
-__SERVICE_ERROR_ARM__
-        }
-        return inner;
+        // AsTransportError() surfaces any non-zero transport status as a StatusException.
+        RpcResponse resp = RpcResponse.Decode(body);
+        if (resp.AsTransportError() is StatusException ex)
+            throw ex;
+        // A typed application error rides as a status-0 "ServiceError" variant — distinct
+        // from a transport failure. Surface it so the typed client decodes success only.
+        if (resp.Variant == "ServiceError")
+            throw new System.Exception($"csil-rpc {service}/{op}: ServiceError");
+        return resp.Payload;
     }
 
     public void Dispose() => _http.Dispose();
-
-    private static CborValue? EnvLookup(CborValue.Map map, string key)
-    {
-        foreach (var (k, v) in map.Entries)
-            if (k is CborValue.Text t && t.Value == key) return v;
-        return null;
-    }
-
-    private static long EnvInt(CborValue.Map map, string key) => EnvLookup(map, key) switch
-    {
-        CborValue.Uint u => (long)u.Value,
-        CborValue.Int i => i.Value,
-        _ => 0,
-    };
-
-    private static string? EnvText(CborValue.Map map, string key) =>
-        EnvLookup(map, key) is CborValue.Text t ? t.Value : null;
-
-    // The response payload is a tag-24 byte string; hand its raw inner bytes to the codec.
-    private static byte[] EnvPayload(CborValue.Map map) =>
-        EnvLookup(map, "payload") is CborValue.Tag { Inner: CborValue.Bytes b }
-            ? b.Value
-            : throw new CsilClientException(0, "csil-rpc: response payload is not a tag-24 byte string");
 }
 "#;
 
-/// The example call: construct the typed client over the carrier and invoke the first
-/// unary op with a generated sample request literal.
-fn readme_example(ex: &ReadmeExample) -> String {
-    let call = match &ex.sample {
-        Some(sample) => format!("client.{}({sample})", ex.method),
-        None => format!("client.{}()", ex.method),
+/// CSIL-Events over TLS: a full session example. Opens a TLS byte stream wrapped as the
+/// library's `StreamCarrier` (CSIL length-prefix framing), performs the `$hello`/`$hello-ack`
+/// handshake, sends one outbound event via the generated `<Base>Router.Encode<Op>`, and runs a
+/// recv loop that decodes each frame to an `Event`, answers `$ping` with `$pong`, and dispatches
+/// typed events to the generated `<Base>Router.RouteChannel`. When the spec has no channel ops the
+/// dispatch wiring is replaced with a note (the handshake + heartbeat still apply).
+fn events_section(config: &CsharpConfig, ch: Option<&ChannelExample>) -> String {
+    let mut out = String::from("## CSIL-Events (TLS)\n\n");
+    out.push_str(
+        "Typed, bidirectional event streams over a long-lived connection. The library owns the\n\
+         `$hello`/`$hello-ack` handshake, the `$ping`/`$pong` heartbeat, and framing; the\n\
+         generated router dispatches typed events. The TLS carrier below is just one example —\n\
+         a WebSocket/WebTransport/QUIC carrier drops in unchanged.\n\n",
+    );
+    let block = match ch {
+        Some(ch) => EVENTS_SESSION_CSHARP
+            .replace("__NAMESPACE__", &config.namespace)
+            .replace("__ROUTER__", &ch.router)
+            .replace("__IFACE__", &ch.iface)
+            .replace("__HANDLER_BODY__", &ch.handler_body)
+            .replace("__ENCODE__", &ch.encode_method)
+            .replace("__OUTBOUND_SAMPLE__", &ch.outbound_sample)
+            .replace("__OUTBOUND__", &ch.outbound_type)
+            .replace("__INBOUND__", &ch.inbound_type)
+            .replace("__SERVICE__", &ch.service_wire),
+        None => EVENTS_NO_CHANNEL_CSHARP.to_string(),
     };
-    format!(
-        "// Construct the client over the carrier and make one call. Change the URL only.\n\
-         public static class Example\n{{\n    \
-         public static void Run()\n    {{\n        \
-         var client = new {client}(new CsilRpcHttpTransport(\"http://localhost:5080\"));\n        \
-         var response = {call};\n        \
-         System.Console.WriteLine(response);\n    }}\n}}\n",
-        client = ex.client_class,
-        call = call
-    )
+    out.push_str(&format!("```csharp\n{block}```\n\n"));
+    out
 }
 
-/// The pieces the Quickstart's example call needs: the client class to construct, the
-/// method to call, and a compiling C# request literal (`None` when the op takes no input).
+/// The full Events session for a connection with a `<->` op: a TLS `StreamCarrier`, the
+/// `ICsilCodec` bridge to the generated static `Codec`, the handshake, one outbound event via
+/// the generated encoder, and the recv loop that heartbeats and dispatches into the generated
+/// router. Placeholders (router/iface/encoder names, the inbound/outbound types, the handler
+/// stubs, the wire service, the namespace) are filled per-spec.
+const EVENTS_SESSION_CSHARP: &str = r#"// One example carrier: a TLS byte stream framed with CSIL's 4-byte length prefix.
+using System;
+using System.Net.Security;
+using System.Net.Sockets;
+using Csilgen.Transport;
+using __NAMESPACE__;
+
+public static class CsilEventsExample
+{
+    static IFrameCarrier OpenTlsCarrier(string host, int port)
+    {
+        var tcp = new TcpClient(host, port);
+        var tls = new SslStream(tcp.GetStream());
+        tls.AuthenticateAsClient(host);
+        // StreamCarrier owns the length-prefix framing over any duplex stream.
+        return new StreamCarrier(tls);
+    }
+
+    // Bridges the library's byte seam to the generated static Codec. Codec.Decode is
+    // generic-static, so the router-supplied runtime type is bound by reflection.
+    private sealed class GenCodec : ICsilCodec
+    {
+        public byte[] Encode(object value) => Codec.Encode(value);
+
+        public object Decode(byte[] data, System.Type targetType) =>
+            typeof(Codec).GetMethod("Decode")!.MakeGenericMethod(targetType).Invoke(null, new object[] { data })!;
+    }
+
+    // A handler implementing __IFACE__'s methods; __ROUTER__.RouteChannel dispatches each
+    // decoded inbound channel message (inbound __INBOUND__) here.
+    private sealed class ChannelHandlers : __IFACE__
+    {
+__HANDLER_BODY__
+    }
+
+    public static void Run()
+    {
+        IFrameCarrier carrier = OpenTlsCarrier("localhost", 7443);
+
+        // $hello / $hello-ack handshake (control plane). The peer's $hello-ack pins the
+        // wire profile for the connection's lifetime.
+        carrier.SendFrame(new Hello(new ulong[] { Conventions.Version }, new[] { "verbose" }) { Service = "__SERVICE__" }.Encode());
+        byte[]? ack = carrier.RecvFrame();
+        if (ack is null) throw new System.Exception("connection closed during handshake");
+        ProfileExtensions.TryParse(HelloAck.Decode(ack).Profile, out Profile profile);
+
+        var codec = new GenCodec();
+        var handlers = new ChannelHandlers();
+
+        // Send one outbound event via the generated encoder (outbound __OUTBOUND__).
+        var (method, body) = __ROUTER__.__ENCODE__(codec, __OUTBOUND_SAMPLE__);
+        carrier.SendFrame(Event.Verbose("__SERVICE__", method, body).Encode(profile));
+
+        // Recv loop: decode each frame to an Event, answer $ping with $pong, dispatch the
+        // rest to the generated router.
+        for (byte[]? frame = carrier.RecvFrame(); frame is not null; frame = carrier.RecvFrame())
+        {
+            Event ev = Event.Decode(frame, profile);
+            if (ev.EventName == Control.PingName)
+            {
+                Heartbeat ping = Heartbeat.Decode(ev.Payload);
+                carrier.SendFrame(Event.Verbose("__SERVICE__", Control.PongName, new Heartbeat(ping.Nonce).Encode()).Encode(profile));
+                continue;
+            }
+            __ROUTER__.RouteChannel(handlers, codec, ev.EventName!, ev.Payload);
+        }
+    }
+}
+"#;
+
+/// The Events session when the spec declares no channel ops: the handshake and heartbeat still
+/// apply, so they are shown, with a note where the dispatch would go. References only library
+/// types (no generated router), so it needs no package `using`.
+const EVENTS_NO_CHANNEL_CSHARP: &str = r#"// One example carrier: a TLS byte stream framed with CSIL's 4-byte length prefix.
+using System;
+using System.Net.Security;
+using System.Net.Sockets;
+using Csilgen.Transport;
+
+public static class CsilEventsExample
+{
+    static IFrameCarrier OpenTlsCarrier(string host, int port)
+    {
+        var tcp = new TcpClient(host, port);
+        var tls = new SslStream(tcp.GetStream());
+        tls.AuthenticateAsClient(host);
+        return new StreamCarrier(tls);
+    }
+
+    public static void Run()
+    {
+        IFrameCarrier carrier = OpenTlsCarrier("localhost", 7443);
+
+        // $hello / $hello-ack handshake (control plane).
+        carrier.SendFrame(new Hello(new ulong[] { Conventions.Version }, new[] { "verbose" }).Encode());
+        byte[]? ack = carrier.RecvFrame();
+        if (ack is null) throw new System.Exception("connection closed during handshake");
+        ProfileExtensions.TryParse(HelloAck.Decode(ack).Profile, out Profile profile);
+
+        // Recv loop: answer $ping with $pong. This package declares no <->/<- operations,
+        // so there is no generated channel router to dispatch typed events into.
+        for (byte[]? frame = carrier.RecvFrame(); frame is not null; frame = carrier.RecvFrame())
+        {
+            Event ev = Event.Decode(frame, profile);
+            if (ev.EventName == Control.PingName)
+            {
+                Heartbeat ping = Heartbeat.Decode(ev.Payload);
+                carrier.SendFrame(Event.Verbose(null, Control.PongName, new Heartbeat(ping.Nonce).Encode()).Encode(profile));
+            }
+        }
+    }
+}
+"#;
+
+/// CSIL-Datagrams over UDP: encode a `->` request with the generated codec, wrap it in the
+/// library's `Datagram`, and `SendDatagram` it fire-and-forget. The recv path `Datagram.Decode`s
+/// an inbound datagram and decodes its payload with the generated codec — there is NO synchronous
+/// response.
+fn datagrams_section(config: &CsharpConfig, ex: Option<&ReadmeExample>) -> String {
+    let mut out = String::from("## CSIL-Datagrams (UDP)\n\n");
+    out.push_str(
+        "Unreliable, unordered, message-oriented. The library owns the `Datagram` envelope; you\n\
+         bring a datagram carrier. The UDP carrier below is one example — a WebRTC unreliable\n\
+         DataChannel or QUIC datagrams drop in unchanged.\n\n",
+    );
+    let Some(ex) = ex else {
+        out.push_str(
+            "This package declares no record `->` operations, so there is no datagram payload to encode.\n\n",
+        );
+        return out;
+    };
+    let (Some(req_sample), Some(res_type)) = (&ex.sample, &ex.res_type) else {
+        out.push_str(
+            "This package's `->` operations have non-record payloads; (de)serialize them manually before framing.\n\n",
+        );
+        return out;
+    };
+    let block = DATAGRAMS_EXAMPLE_CSHARP
+        .replace("__NAMESPACE__", &config.namespace)
+        .replace("__OP_ORD__", &ex.op_ord.to_string())
+        .replace("__REQ_SAMPLE__", req_sample)
+        .replace("__RES_TYPE__", res_type);
+    out.push_str(&format!("```csharp\n{block}```\n\n"));
+    out
+}
+
+/// The UDP datagram example body — spec-independent but for the op ordinal, request literal, and
+/// response type. It connects a UDP `Socket`, wraps it in the library's `UdpDatagramCarrier`,
+/// sends one `Datagram`-framed request, and decodes a (possibly never-arriving) response datagram.
+const DATAGRAMS_EXAMPLE_CSHARP: &str = r#"// One example carrier: UDP via a connected stdlib Socket. Datagrams are unreliable and
+// unordered, so the carrier never waits for or correlates a reply.
+using System;
+using System.Net.Sockets;
+using Csilgen.Transport;
+using __NAMESPACE__;
+
+public static class CsilDatagramsExample
+{
+    // The operation's datagram ordinal — its @wire-id, or a channel-agreed number.
+    private const ulong OpOrd = __OP_ORD__;
+
+    static IDatagramCarrier OpenUdpCarrier(string host, int port)
+    {
+        var sock = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
+        sock.Connect(host, port);
+        return new UdpDatagramCarrier(sock);
+    }
+
+    public static void Run()
+    {
+        IDatagramCarrier carrier = OpenUdpCarrier("localhost", 9000);
+
+        // Fire-and-forget: encode the `->` request via the generated codec and send it.
+        // seq 0 marks an unsequenced datagram.
+        var req = __REQ_SAMPLE__;
+        carrier.SendDatagram(new Datagram(OpOrd, 0, Codec.Encode(req)).Encode());
+
+        // Recv path: a datagram of the RESPONSE type MAY arrive later — or never. There is
+        // NO synchronous response; the caller must tolerate loss and reordering and handle a
+        // reply whenever (if ever) it shows up.
+        byte[]? inbound = carrier.RecvDatagram();
+        if (inbound is not null)
+        {
+            Datagram dg = Datagram.Decode(inbound);
+            __RES_TYPE__ resp = Codec.Decode<__RES_TYPE__>(dg.Payload);
+            System.Console.WriteLine($"late response {resp}");
+        }
+    }
+}
+"#;
+
+/// The pieces the RPC + datagram examples need: the client class to construct, the method to
+/// call, a compiling C# request literal (`None` when the op takes no input), the response record
+/// class name (for the datagram codec), and the op's datagram ordinal.
 struct ReadmeExample {
     client_class: String,
     method: String,
     sample: Option<String>,
+    res_type: Option<String>,
+    op_ord: u32,
 }
 
 /// The first service (in rule order, matching the generated client) with a unary op the
@@ -683,10 +889,116 @@ fn first_readme_example(
                         config,
                     ))
                 },
+                res_type: record_ref_pascal(&success),
+                // The datagram ordinal is the op's @wire-id when present; otherwise a
+                // channel-agreed placeholder the user fills in.
+                op_ord: op.wire_id.map(|id| id as u32).unwrap_or(1),
             });
         }
     }
     None
+}
+
+/// The pieces the Events session needs: the generated router class + handler interface +
+/// outbound encoder method names, the inbound (router-decoded input) and outbound (encoder
+/// output) record class names, a constructible outbound literal, the wire service, and the
+/// handler-stub body that implements the full service interface.
+struct ChannelExample {
+    service_wire: String,
+    router: String,
+    iface: String,
+    encode_method: String,
+    inbound_type: String,
+    outbound_type: String,
+    outbound_sample: String,
+    handler_body: String,
+}
+
+/// The first service (in rule order) with a `<->` op whose input and output are both records,
+/// so the generated router, handler interface, and outbound encoder all exist with codec-backed
+/// (de)serialization. `None` when no service has a usable channel op — the Events section then
+/// shows the handshake/heartbeat without dispatch wiring.
+fn first_channel_example(
+    input: &WasmGeneratorInput,
+    records: &std::collections::HashSet<String>,
+    config: &CsharpConfig,
+) -> Option<ChannelExample> {
+    for rule in &input.csil_spec.rules {
+        let CsilRuleType::ServiceDef(service) = &rule.rule_type else {
+            continue;
+        };
+        let chan = service
+            .operations
+            .iter()
+            .find(|op| matches!(op.direction, CsilServiceDirection::Bidirectional))?;
+        if !is_record_ref(&chan.input_type, records) || !is_record_ref(&chan.output_type, records) {
+            continue;
+        }
+        let (Some(inbound_type), Some(outbound_type)) = (
+            record_ref_pascal(&chan.input_type),
+            record_ref_pascal(&chan.output_type),
+        ) else {
+            continue;
+        };
+        let base = service_base(&rule.name);
+        return Some(ChannelExample {
+            service_wire: base.to_lowercase(),
+            router: format!("{base}Router"),
+            iface: service_interface_name(&rule.name),
+            encode_method: format!("Encode{}", pascal_ident(&chan.name)),
+            inbound_type,
+            outbound_type,
+            outbound_sample: csharp_request_literal(input, &chan.output_type, records, config),
+            handler_body: csharp_handler_stubs(service, config),
+        });
+    }
+    None
+}
+
+/// The `ChannelHandlers` body implementing every method of the service interface: unary ops
+/// throw `NotImplementedException` (the Events example only drives the channel path), and each
+/// bidirectional channel op prints what it received. Reverse ops contribute no inbound method.
+fn csharp_handler_stubs(service: &CsilServiceDefinition, config: &CsharpConfig) -> String {
+    let mut out = String::new();
+    for op in &service.operations {
+        let method = pascal_ident(&op.name);
+        match op.direction {
+            CsilServiceDirection::Unidirectional => {
+                let output = map_csil_type(&success_type(&op.output_type), config);
+                if op_input_is_null(&op.input_type) {
+                    out.push_str(&format!(
+                        "        public {output} {method}() => throw new System.NotImplementedException();\n"
+                    ));
+                } else {
+                    let input = map_csil_type(&op.input_type, config);
+                    out.push_str(&format!(
+                        "        public {output} {method}({input} value) => throw new System.NotImplementedException();\n"
+                    ));
+                }
+            }
+            CsilServiceDirection::Bidirectional => {
+                let input = map_csil_type(&op.input_type, config);
+                out.push_str(&format!(
+                    "        public void {method}({input} message) => System.Console.WriteLine($\"event {method}\");\n"
+                ));
+            }
+            CsilServiceDirection::Reverse => {}
+        }
+    }
+    // Trim the trailing newline so the placeholder substitutes cleanly inside the class body.
+    if out.ends_with('\n') {
+        out.pop();
+    }
+    out
+}
+
+/// The Pascal-case class name a record reference names, if it is a reference. Records emit a
+/// generated type by this name, so the datagram codec and channel example refer to it directly.
+fn record_ref_pascal(ty: &CsilTypeExpression) -> Option<String> {
+    match ty {
+        CsilTypeExpression::Reference(name) => Some(pascal_ident(name)),
+        _ => None,
+    }
 }
 
 /// A compiling `new Record { ... }` literal for a record-typed request. Always wraps the
@@ -3328,69 +3640,200 @@ mod tests {
         }
     }
 
-    /// Extract the body of the first ```csharp fenced block in a README.
-    fn csharp_block(readme: &str) -> &str {
-        let start = readme
-            .find("```csharp\n")
-            .map(|i| i + "```csharp\n".len())
-            .expect("README has a ```csharp block");
-        let rest = &readme[start..];
-        let end = rest.find("\n```").expect("the ```csharp block is closed");
-        &rest[..end]
+    /// The 3-transport verification spec: an `Echo` service with a `->` op (`ping`) and a
+    /// record-typed `<->` op (`pulse`), both over `Ping`/`Pong` records, generated under a
+    /// distinct namespace so the codec types don't collide with the transport library.
+    fn transports_input(target: &str) -> WasmGeneratorInput {
+        let text = || CsilTypeExpression::Builtin("text".to_string());
+        let pos = || CsilPosition {
+            line: 1,
+            column: 1,
+            offset: 0,
+        };
+        let group_rule = |name: &str, entries: Vec<CsilGroupEntry>| CsilRule {
+            name: name.to_string(),
+            rule_type: CsilRuleType::GroupDef(CsilGroupExpression { entries }),
+            position: pos(),
+            doc_comments: Vec::new(),
+        };
+        let ping = group_rule("Ping", vec![bare_entry("msg", text())]);
+        let pong = group_rule("Pong", vec![bare_entry("msg", text())]);
+        let op = |name: &str, dir: CsilServiceDirection| CsilServiceOperation {
+            name: name.to_string(),
+            input_type: CsilTypeExpression::Reference("Ping".to_string()),
+            output_type: CsilTypeExpression::Reference("Pong".to_string()),
+            direction: dir,
+            position: pos(),
+            doc_comments: Vec::new(),
+            wire_id: None,
+        };
+        let svc = CsilRule {
+            name: "Echo".to_string(),
+            rule_type: CsilRuleType::ServiceDef(CsilServiceDefinition {
+                operations: vec![
+                    op("ping", CsilServiceDirection::Unidirectional),
+                    op("pulse", CsilServiceDirection::Bidirectional),
+                ],
+                wire_id: None,
+            }),
+            position: pos(),
+            doc_comments: Vec::new(),
+        };
+        let mut options = HashMap::new();
+        options.insert("emit_packages".to_string(), serde_json::json!(["csharp"]));
+        options.insert("namespace".to_string(), serde_json::json!("EchoSdk"));
+        options.insert("package_name".to_string(), serde_json::json!("EchoSdk"));
+        WasmGeneratorInput {
+            csil_spec: CsilSpecSerialized {
+                rules: vec![ping, pong, svc],
+                source_content: None,
+                service_count: 1,
+                fields_with_metadata_count: 0,
+            },
+            config: GeneratorConfig {
+                target: target.to_string(),
+                output_dir: "/tmp".to_string(),
+                options,
+            },
+            generator_metadata: GeneratorMetadata {
+                name: "csharp".to_string(),
+                version: "1.0.0".to_string(),
+                description: String::new(),
+                target: "csharp".to_string(),
+                capabilities: vec![],
+                author: None,
+                homepage: None,
+            },
+        }
+    }
+
+    /// The slice of `md` from `heading` up to the next `## ` heading (or end).
+    fn section<'a>(md: &'a str, heading: &str) -> &'a str {
+        let start = md.find(heading).expect("section heading present");
+        let rest = &md[start..];
+        match rest[heading.len()..].find("\n## ") {
+            Some(off) => &rest[..heading.len() + off],
+            None => rest,
+        }
+    }
+
+    /// The `csharp` block under `heading` (the section's first fenced block).
+    fn section_block(md: &str, heading: &str) -> String {
+        let sec = section(md, heading);
+        let start =
+            sec.find("```csharp\n").expect("section has a csharp block") + "```csharp\n".len();
+        let rest = &sec[start..];
+        let end = rest.find("\n```").expect("csharp block is closed");
+        rest[..end].to_string()
     }
 
     #[test]
-    fn package_readme_has_quickstart_carrier_and_example() {
+    fn package_readme_has_all_three_sections() {
+        let output = render(transports_input("csharp-client")).expect("generation ok");
+        let readme = file_content(&output, "genquickstart.md");
+
+        assert!(readme.starts_with("# EchoSdk\n"));
+        assert!(readme.contains("dotnet add reference"));
+        for heading in [
+            "## CSIL-RPC (HTTP)",
+            "## CSIL-Events (TLS)",
+            "## CSIL-Datagrams (UDP)",
+        ] {
+            assert!(readme.contains(heading), "README must contain {heading}");
+        }
+
+        let rpc = section(readme, "## CSIL-RPC (HTTP)");
+        // RPC: the library envelope types + the canonical HTTP mount, no hand-rolled map.
+        assert!(rpc.contains("using Csilgen.Transport;"));
+        assert!(rpc.contains("public sealed class HttpRpcCarrier : ICsilTransport"));
+        assert!(rpc.contains("\"/csil/v1/rpc\""));
+        assert!(rpc.contains("new RpcRequest(service, op, request).Encode()"));
+        assert!(rpc.contains("RpcResponse.Decode(body)"));
+        assert!(rpc.contains("resp.AsTransportError() is StatusException"));
+        assert!(rpc.contains("resp.Variant == \"ServiceError\""));
+        assert!(rpc.contains("new EchoClient(new HttpRpcCarrier("));
+        assert!(rpc.contains("client.Ping(new Ping { Msg = \"example\" })"));
+
+        let events = section(readme, "## CSIL-Events (TLS)");
+        // Events: the lib's handshake/framing/heartbeat surface + the generated router.
+        assert!(events.contains("new StreamCarrier(tls)"));
+        assert!(events.contains("new Hello("));
+        assert!(events.contains("HelloAck.Decode(ack)"));
+        assert!(events.contains("ChannelHandlers : IEchoService"));
+        assert!(events.contains("EchoRouter.EncodePulse(codec, new Pong { Msg = \"example\" })"));
+        assert!(
+            events.contains("EchoRouter.RouteChannel(handlers, codec, ev.EventName!, ev.Payload)")
+        );
+        assert!(events.contains("Control.PingName"));
+
+        let datagrams = section(readme, "## CSIL-Datagrams (UDP)");
+        // Datagrams: the lib's Datagram + UDP carrier seam, and the no-sync-response warning.
+        assert!(datagrams.contains("new UdpDatagramCarrier(sock)"));
+        assert!(datagrams.contains("new Datagram(OpOrd, 0, Codec.Encode(req)).Encode()"));
+        assert!(datagrams.contains("Codec.Decode<Pong>(dg.Payload)"));
+        assert!(datagrams.contains("NO synchronous response"));
+    }
+
+    #[test]
+    fn genquickstart_transports_subset_emits_only_listed_sections() {
+        let mut input = transports_input("csharp-client");
+        input.config.options.insert(
+            "genquickstart_transports".to_string(),
+            serde_json::json!(["rpc"]),
+        );
+        let output = render(input).expect("generation ok");
+        let readme = file_content(&output, "genquickstart.md");
+        assert!(readme.contains("## CSIL-RPC (HTTP)"));
+        assert!(!readme.contains("## CSIL-Events (TLS)"));
+        assert!(!readme.contains("## CSIL-Datagrams (UDP)"));
+    }
+
+    #[test]
+    fn genquickstart_transports_unknown_or_empty_falls_back_to_all() {
+        for opt in [serde_json::json!([]), serde_json::json!(["bogus"])] {
+            let mut input = transports_input("csharp-client");
+            input
+                .config
+                .options
+                .insert("genquickstart_transports".to_string(), opt.clone());
+            let output = render(input).expect("generation ok");
+            let readme = file_content(&output, "genquickstart.md");
+            assert!(
+                readme.contains("## CSIL-RPC (HTTP)")
+                    && readme.contains("## CSIL-Events (TLS)")
+                    && readme.contains("## CSIL-Datagrams (UDP)"),
+                "{opt} must fall back to all three sections"
+            );
+        }
+    }
+
+    #[test]
+    fn events_section_without_channel_ops_emits_a_note() {
+        // pingpong has only a `->` op, so the Events section keeps the handshake but replaces
+        // the dispatch wiring with a note (no generated router reference).
         let mut input = pingpong_input("csharp-client");
         input
             .config
             .options
             .insert("emit_packages".to_string(), serde_json::json!(["csharp"]));
-        input
-            .config
-            .options
-            .insert("package_name".to_string(), serde_json::json!("Acme.Ping"));
         let output = render(input).expect("generation ok");
-        let readme = file_content(&output, "README.md");
-
-        // Title + install one-liner for the language's package manager.
-        assert!(readme.starts_with("# Acme.Ping\n"));
-        assert!(readme.contains("dotnet add reference"));
-        // The hybrid posture is stated: dependency-free, reusing the generated CBOR codec.
-        assert!(readme.contains("no third-party dependency"));
-
-        let block = csharp_block(readme);
-        // The carrier: a type implementing the generated sync transport seam, building the
-        // CSIL-RPC envelope and POSTing it.
-        assert!(block.contains("public sealed class CsilRpcHttpTransport : ICsilTransport"));
-        assert!(block.contains("byte[] Call(string service, string op, byte[] request)"));
-        assert!(block.contains("\"/csil/v1/rpc\""));
-        assert!(block.contains("application/cbor"));
-        assert!(block.contains("_http.Send(msg)"));
-        // It reuses the generated generic CBOR (no System.Formats.Cbor) for the envelope,
-        // wrapping the payload in tag 24.
-        assert!(block.contains("Cbor.Encode(envelope)"));
-        assert!(block.contains("new CborValue.Tag(TagEncodedCbor, new CborValue.Bytes(request))"));
-        assert!(!block.contains("using System.Formats.Cbor"));
-        // status / ServiceError handling.
-        assert!(block.contains("if (status != 0)"));
-        assert!(block.contains("EnvText(env, \"variant\") == \"ServiceError\""));
-        assert!(block.contains("Codec.Decode<ServiceError>(inner)"));
-        // Client construction over the carrier + the one example call with a sample literal.
-        assert!(block.contains("new PingClient(new CsilRpcHttpTransport("));
-        assert!(block.contains("client.Ping(new PingRequest { Message = \"example\" })"));
+        let readme = file_content(&output, "genquickstart.md");
+        let events = section(readme, "## CSIL-Events (TLS)");
+        assert!(events.contains("new Hello("));
+        assert!(events.contains("no <->/<- operations"));
+        assert!(!events.contains("RouteChannel"));
     }
 
     #[test]
     fn readme_emitted_only_in_package_mode() {
         let plain = render(corndogs_input("csharp-client")).expect("generation ok");
-        assert!(!plain.files.iter().any(|f| f.path == "README.md"));
+        assert!(!plain.files.iter().any(|f| f.path == "genquickstart.md"));
         let packaged = render(input_with_options(
             "csharp-client",
             &[("emit_packages", serde_json::json!(["csharp"]))],
         ))
         .expect("generation ok");
-        assert!(packaged.files.iter().any(|f| f.path == "README.md"));
+        assert!(packaged.files.iter().any(|f| f.path == "genquickstart.md"));
     }
 
     #[test]
@@ -3401,7 +3844,12 @@ mod tests {
             &[("emit_packages", serde_json::json!(["csharp"]))],
         ))
         .expect("generation ok");
-        assert!(with_readme.files.iter().any(|f| f.path == "README.md"));
+        assert!(
+            with_readme
+                .files
+                .iter()
+                .any(|f| f.path == "genquickstart.md")
+        );
 
         // Only an explicit `emit_readme: false` drops it; the `.csproj` stays.
         let without_readme = render(input_with_options(
@@ -3412,7 +3860,12 @@ mod tests {
             ],
         ))
         .expect("generation ok");
-        assert!(!without_readme.files.iter().any(|f| f.path == "README.md"));
+        assert!(
+            !without_readme
+                .files
+                .iter()
+                .any(|f| f.path == "genquickstart.md")
+        );
         assert!(
             without_readme
                 .files
@@ -3422,17 +3875,16 @@ mod tests {
     }
 
     #[test]
-    fn server_package_readme_has_no_carrier() {
-        // The carrier implements the client-only sync seam; a server package must not emit
-        // it, falling back to the types/codec section instead.
-        let output = render(input_with_options(
-            "csharp",
-            &[("emit_packages", serde_json::json!(["csharp"]))],
-        ))
-        .expect("generation ok");
-        let readme = file_content(&output, "README.md");
-        assert!(!readme.contains("ICsilTransport"));
-        assert!(readme.contains("Codec.Decode<YourType>"));
+    fn server_package_readme_has_all_three_sections() {
+        // The README is surface-independent: a server package still documents all three
+        // transports (the RPC client + Events router live on their respective surfaces, but
+        // the genquickstart is one doc). The Events section names the generated server router.
+        let output = render(transports_input("csharp-server")).expect("generation ok");
+        let readme = file_content(&output, "genquickstart.md");
+        assert!(readme.contains("## CSIL-RPC (HTTP)"));
+        assert!(readme.contains("## CSIL-Events (TLS)"));
+        assert!(readme.contains("## CSIL-Datagrams (UDP)"));
+        assert!(readme.contains("EchoRouter.RouteChannel"));
     }
 
     #[test]
@@ -3862,54 +4314,81 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Compile the README's Quickstart carrier against the real generated ping/pong
-    /// package and round-trip a request through it with NO cross-process socket: a custom
-    /// HttpMessageHandler echoes the tag-24 inner payload in-process, so the typed client's
-    /// field must survive the envelope build/parse the carrier performs. Skips cleanly when
-    /// no dotnet toolchain is on PATH; the first restore/build can be slow.
-    #[test]
-    fn readme_carrier_compiles_and_round_trips_through_dotnet() {
-        let probe = std::process::Command::new("dotnet")
+    /// Whether a dotnet toolchain is on PATH (the harness sources it via env.sh).
+    fn have_dotnet() -> bool {
+        std::process::Command::new("dotnet")
             .arg("--version")
-            .output();
-        if probe.map(|o| !o.status.success()).unwrap_or(true) {
-            eprintln!("skipping: no dotnet toolchain on PATH");
-            return;
-        }
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
 
-        // Generate the ping/pong package (so the README is emitted), then extract its
-        // carrier. Ping/pong shares the `message` field across request and response so the
-        // echo of the request bytes decodes cleanly as the response.
-        let mut input = pingpong_input("csharp-client");
-        input
-            .config
-            .options
-            .insert("emit_packages".to_string(), serde_json::json!(["csharp"]));
-        let output = render(input).expect("generation ok");
-        let readme = file_content(&output, "README.md").to_string();
-        let carrier = csharp_block(&readme).to_string();
+    /// Absolute path to the in-repo `Csilgen.Transport` library project, for a ProjectReference.
+    fn transport_lib_csproj() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../transports/csharp/src/Csilgen.Transport/Csilgen.Transport.csproj")
+            .canonicalize()
+            .expect("transport lib csproj path")
+    }
 
-        let dir =
-            std::env::temp_dir().join(format!("csilgen-csharp-readme-{}", std::process::id()));
+    /// A project that globs the generated `.cs` plus the dropped-in driver and references the
+    /// real transport library. `__OUTPUT_TYPE__`/`__LIBREF__` are filled per test (Exe to run,
+    /// Library to compile-only).
+    const TRANSPORTS_CSPROJ_TEMPLATE: &str = r#"<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>__OUTPUT_TYPE__</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <AssemblyName>transports_check</AssemblyName>
+    <RootNamespace>TransportsCheck</RootNamespace>
+    <Deterministic>true</Deterministic>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="__LIBREF__" />
+  </ItemGroup>
+</Project>
+"#;
+
+    /// Stage a transports package (minus its own `.csproj` and the markdown README) into a
+    /// fresh temp dir alongside a project referencing the real transport library.
+    fn stage_transports_package(
+        label: &str,
+        target: &str,
+        output_type: &str,
+    ) -> std::path::PathBuf {
+        let output = render(transports_input(target)).expect("generation ok");
+        let dir = std::env::temp_dir().join(format!("csilgen-cs-{label}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        // Write every generated source except the library `.csproj` (a single Exe project
-        // owns the dir for `dotnet run`) and the README (markdown, not compiled).
         for file in &output.files {
-            if file.path.ends_with(".csproj") || file.path == "README.md" {
+            if file.path.ends_with(".csproj") || file.path == "genquickstart.md" {
                 continue;
             }
             std::fs::write(dir.join(&file.path), &file.content).unwrap();
         }
-        std::fs::write(dir.join("Carrier.cs"), &carrier).unwrap();
-        std::fs::write(dir.join("Program.cs"), CSHARP_README_ECHO_DRIVER).unwrap();
-        std::fs::write(dir.join("roundtrip.csproj"), CSHARP_CSPROJ).unwrap();
+        let csproj = TRANSPORTS_CSPROJ_TEMPLATE
+            .replace("__OUTPUT_TYPE__", output_type)
+            .replace("__LIBREF__", transport_lib_csproj().to_str().unwrap());
+        std::fs::write(dir.join("transports_check.csproj"), csproj).unwrap();
+        dir
+    }
+
+    /// Run `dotnet <verb>` in `dir` with the self-contained env the package tests use.
+    fn run_dotnet(dir: &std::path::Path, verb: &str) -> std::process::Output {
+        // Every staged project `ProjectReference`s the single in-repo transport lib,
+        // whose build output (`bin/obj`, including `deps.json`) is shared; running the
+        // dotnet tests in parallel makes two builds race on those files. Serialize all
+        // dotnet invocations so the shared lib build never overlaps itself.
+        static DOTNET_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = DOTNET_LOCK.lock().unwrap_or_else(|p| p.into_inner());
 
         let mut cmd = std::process::Command::new("dotnet");
-        cmd.arg("run")
-            .arg("--project")
-            .arg(&dir)
-            .current_dir(&dir)
+        cmd.arg(verb);
+        if verb == "run" {
+            cmd.arg("--project").arg(dir);
+        }
+        cmd.current_dir(dir)
             .env("DOTNET_NOLOGO", "1")
             .env("DOTNET_CLI_TELEMETRY_OPTOUT", "1")
             .env("DOTNET_SKIP_FIRST_TIME_EXPERIENCE", "1")
@@ -3917,59 +4396,88 @@ mod tests {
         if let Ok(home) = std::env::var("DOTNET_CLI_HOME") {
             cmd.env("DOTNET_CLI_HOME", home);
         }
-        let run = cmd.output().unwrap();
+        cmd.output().unwrap()
+    }
+
+    /// The definitive package-consistency check: generate the SINGLE `csharp` package a user
+    /// actually publishes (the base `csharp` target, which in package mode now carries BOTH the
+    /// client surface and the server/router surface), then compile all three `genquickstart.md`
+    /// sections together against that one package + the transport library. This is the seam the
+    /// pass guards: the RPC section needs the typed *client*, the Events section needs the
+    /// generated *router* (`EchoRouter.RouteChannel`), and every section needs the *codec* — all
+    /// of which must resolve from the single package. The RPC and Datagrams examples are
+    /// additionally *run* over hermetic in-process carriers; the Events TLS session is a
+    /// socket-driven loop, so it is compiled in (its router dispatch type-checks) but not driven.
+    /// Skips when no dotnet toolchain is present.
+    #[test]
+    fn genquickstart_all_sections_compile_against_one_package() {
+        if !have_dotnet() {
+            eprintln!("skipping: no dotnet toolchain on PATH");
+            return;
+        }
+        // The package a user publishes: the base `csharp` target in package mode.
+        let output = render(transports_input("csharp")).expect("generation ok");
+        let readme = file_content(&output, "genquickstart.md").to_string();
+        let rpc = section_block(&readme, "## CSIL-RPC (HTTP)");
+        let events = section_block(&readme, "## CSIL-Events (TLS)");
+        // Swap the real UDP carrier for a seeded loopback (sockets are killed in the sandbox;
+        // the lib loopback exercises the same send/recv codec path in-process).
+        let datagrams = section_block(&readme, "## CSIL-Datagrams (UDP)").replace(
+            "IDatagramCarrier carrier = OpenUdpCarrier(\"localhost\", 9000);",
+            "IDatagramCarrier carrier = Seed.Make();",
+        );
+
+        let dir = stage_transports_package("all", "csharp", "Exe");
+        std::fs::write(dir.join("Rpc.cs"), &rpc).unwrap();
+        std::fs::write(dir.join("Events.cs"), &events).unwrap();
+        std::fs::write(dir.join("Datagrams.cs"), &datagrams).unwrap();
+        std::fs::write(dir.join("Program.cs"), CSHARP_ALL_SECTIONS_DRIVER).unwrap();
+
+        let run = run_dotnet(&dir, "run");
         let stdout = String::from_utf8_lossy(&run.stdout);
         let stderr = String::from_utf8_lossy(&run.stderr);
         assert!(
-            run.status.success(),
-            "dotnet run failed:\nstdout:\n{stdout}\nstderr:\n{stderr}"
-        );
-        assert_eq!(
-            stdout.trim(),
-            "ok",
-            "unexpected output:\nstdout:\n{stdout}\nstderr:\n{stderr}"
+            run.status.success() && stdout.contains("late response") && stdout.contains("ok"),
+            "dotnet run of the combined genquickstart sections failed:\nstdout:\n{stdout}\nstderr:\n{stderr}"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The driver for the README round-trip: an in-process `HttpMessageHandler` that decodes
-    /// the CSIL-RPC request the carrier built and echoes its tag-24 inner payload back in a
-    /// `status:0` response, then calls the typed client over the README carrier. The
-    /// ping/pong `message` field round-trips through the real carrier + codec with no socket.
-    const CSHARP_README_ECHO_DRIVER: &str = r#"using System.Net;
+    /// Drives the combined single-package check: an in-process `HttpMessageHandler` echoes the
+    /// CSIL-RPC request as a status-0 `Pong` (Ping/Pong share `Msg`, so the echo decodes), the
+    /// typed client (client surface) calls it, then the Datagrams example runs over a seeded
+    /// loopback. The Events section (server/router surface) is compiled in alongside but its
+    /// socket session is not driven here. All three surfaces resolve from the one package.
+    const CSHARP_ALL_SECTIONS_DRIVER: &str = r#"using System.Net;
 using System.Net.Http;
 using Csilgen.Transport;
+using EchoSdk;
 
 internal sealed class EchoHandler : HttpMessageHandler
 {
     protected override HttpResponseMessage Send(HttpRequestMessage request, System.Threading.CancellationToken ct)
     {
         byte[] reqBytes = request.Content!.ReadAsByteArrayAsync().GetAwaiter().GetResult();
-        var reqEnv = (CborValue.Map)Cbor.Decode(reqBytes);
-        byte[] inner = Inner(reqEnv);
-        var respEnv = new CborValue.Map(new (CborValue, CborValue)[]
-        {
-            (new CborValue.Text("v"), new CborValue.Uint(1)),
-            (new CborValue.Text("status"), new CborValue.Uint(0)),
-            (new CborValue.Text("payload"), new CborValue.Tag(24, new CborValue.Bytes(inner))),
-        });
+        RpcRequest req = RpcRequest.Decode(reqBytes);
+        byte[] body = RpcResponse.Ok("Pong", req.Payload).Encode();
         return new HttpResponseMessage(HttpStatusCode.OK)
         {
-            Content = new ByteArrayContent(Cbor.Encode(respEnv)),
+            Content = new ByteArrayContent(body),
         };
     }
 
-    // SendAsync is abstract on HttpMessageHandler; the carrier only calls the sync Send,
-    // but the override is required to compile.
+    // SendAsync is abstract; the carrier only calls the sync Send, but the override compiles.
     protected override System.Threading.Tasks.Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, System.Threading.CancellationToken ct) =>
         System.Threading.Tasks.Task.FromResult(Send(request, ct));
+}
 
-    private static byte[] Inner(CborValue.Map map)
+internal static class Seed
+{
+    public static IDatagramCarrier Make()
     {
-        foreach (var (k, v) in map.Entries)
-            if (k is CborValue.Text { Value: "payload" } && v is CborValue.Tag { Inner: CborValue.Bytes b })
-                return b.Value;
-        throw new System.Exception("no tag-24 payload in request envelope");
+        var lb = new LoopbackDatagramCarrier();
+        lb.PushInbound(new Datagram(1, 0, Codec.Encode(new Pong { Msg = "example" })).Encode());
+        return lb;
     }
 }
 
@@ -3977,14 +4485,18 @@ internal static class Program
 {
     private static void Main()
     {
-        var transport = new CsilRpcHttpTransport("http://csil.invalid", new EchoHandler());
-        var client = new PingClient(transport);
-        var resp = client.Ping(new PingRequest { Message = "hello" });
-        if (resp.Message != "hello")
+        // RPC: the typed client (client surface) over the in-process echo handler.
+        var client = new EchoClient(new HttpRpcCarrier("http://csil.invalid", new EchoHandler()));
+        Pong resp = client.Ping(new Ping { Msg = "hello" });
+        if (resp.Msg != "hello")
         {
-            System.Console.WriteLine("FAIL: " + resp.Message);
+            System.Console.WriteLine("FAIL: " + resp.Msg);
             System.Environment.Exit(1);
         }
+
+        // Datagrams: the generated codec over the seeded loopback carrier (prints "late response").
+        CsilDatagramsExample.Run();
+
         System.Console.WriteLine("ok");
     }
 }

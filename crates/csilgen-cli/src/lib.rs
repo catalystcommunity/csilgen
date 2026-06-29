@@ -78,25 +78,58 @@ pub fn generate_code(
     target: &str,
     output_dir: &Path,
 ) -> CliResult<GenerationResult> {
-    generate_code_with_progress(input_pattern, target, output_dir, None)
+    generate_code_with_progress(input_pattern, target, output_dir, None, None)
 }
 
-/// Generate code with optional progress bar
+/// Generate code with optional progress bar.
+///
+/// `readme_transports`, when `Some`, restricts the generated `genquickstart.md`
+/// transport sections (CSIL-RPC / Events / Datagrams) to the named subset; `None`
+/// leaves every generator at its default (all three). It is surfaced to generators
+/// as the `genquickstart_transports` option.
 pub fn generate_code_with_progress(
     input_pattern: &str,
     target: &str,
     output_dir: &Path,
     progress_bar: Option<ProgressBar>,
+    readme_transports: Option<Vec<String>>,
 ) -> CliResult<GenerationResult> {
     let input_files = discover_input_files(input_pattern)?;
 
     // Determine processing strategy based on input
     if input_files.len() == 1 {
         // Single file - process normally
-        process_single_file(&input_files[0], target, output_dir, progress_bar)
+        process_single_file(
+            &input_files[0],
+            target,
+            output_dir,
+            progress_bar,
+            readme_transports.as_deref(),
+        )
     } else {
         // Multiple files - use dependency analysis
-        process_multiple_files_with_dependencies(input_files, target, output_dir, progress_bar)
+        process_multiple_files_with_dependencies(
+            input_files,
+            target,
+            output_dir,
+            progress_bar,
+            readme_transports.as_deref(),
+        )
+    }
+}
+
+/// Merge the CLI-selected transport subset into the per-spec generator options.
+/// A no-op when no `--readme-csil-*` flag was passed, so generators keep their
+/// default of emitting all three transport sections.
+fn apply_readme_transports(
+    options: &mut HashMap<String, serde_json::Value>,
+    readme_transports: Option<&[String]>,
+) {
+    if let Some(transports) = readme_transports {
+        options.insert(
+            "genquickstart_transports".to_string(),
+            serde_json::json!(transports),
+        );
     }
 }
 
@@ -143,6 +176,7 @@ fn process_single_file(
     target: &str,
     output_dir: &Path,
     progress_bar: Option<ProgressBar>,
+    readme_transports: Option<&[String]>,
 ) -> CliResult<GenerationResult> {
     // Create output directories as needed
     fs::create_dir_all(output_dir).map_err(|e| {
@@ -187,7 +221,8 @@ fn process_single_file(
     }
 
     // Extract options from CSIL file
-    let options = extract_options_from_spec(&spec);
+    let mut options = extract_options_from_spec(&spec);
+    apply_readme_transports(&mut options, readme_transports);
 
     // Create generator configuration
     let config = GeneratorConfig {
@@ -238,6 +273,7 @@ fn process_multiple_files_with_dependencies(
     target: &str,
     output_dir: &Path,
     progress_bar: Option<ProgressBar>,
+    readme_transports: Option<&[String]>,
 ) -> CliResult<GenerationResult> {
     // Create output directories as needed
     fs::create_dir_all(output_dir).map_err(|e| {
@@ -270,7 +306,13 @@ fn process_multiple_files_with_dependencies(
     report_generation_summary(input_files.len(), &entry_points, &dependency_files);
 
     // Process only entry points (each gets fully resolved with imports)
-    process_entry_points(entry_points, target, output_dir, progress_bar)
+    process_entry_points(
+        entry_points,
+        target,
+        output_dir,
+        progress_bar,
+        readme_transports,
+    )
 }
 
 /// Process entry point files only
@@ -279,6 +321,7 @@ fn process_entry_points(
     target: &str,
     output_dir: &Path,
     progress_bar: Option<ProgressBar>,
+    readme_transports: Option<&[String]>,
 ) -> CliResult<GenerationResult> {
     // Initialize progress bar if provided
     if let Some(pb) = &progress_bar {
@@ -333,7 +376,8 @@ fn process_entry_points(
         }
 
         // Extract options from CSIL file
-        let options = extract_options_from_spec(&spec);
+        let mut options = extract_options_from_spec(&spec);
+        apply_readme_transports(&mut options, readme_transports);
 
         // Create generator configuration for this file
         let config = GeneratorConfig {
@@ -793,6 +837,7 @@ mod tests {
             "noop",
             &output_dir,
             Some(pb),
+            None,
         );
 
         // This test might fail if WASM runtime is not available, which is expected in test environment

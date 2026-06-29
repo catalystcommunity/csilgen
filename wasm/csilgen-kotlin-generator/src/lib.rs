@@ -201,65 +201,72 @@ fn process_generation(input: WasmGeneratorInput) -> Result<WasmGeneratorOutput, 
     }
 
     if input.csil_spec.service_count > 0 {
-        match surface {
-            Surface::Client => {
-                // `Both` (the default) ships the blocking client at `Client.kt` and a
-                // suspending twin at `ClientAsync.kt`; `Async` makes the suspending client
-                // a drop-in at `Client.kt` (canonical names); `Sync` is today's output.
-                let sync = ClientShape {
-                    is_async: false,
-                    marker: "",
-                };
-                let async_drop_in = ClientShape {
-                    is_async: true,
-                    marker: "",
-                };
-                let async_twin = ClientShape {
-                    is_async: true,
-                    marker: "Async",
-                };
-                match style {
-                    ClientStyle::Sync => {
-                        if let Some(c) = generate_client(&input, &config, sync) {
-                            files.push(GeneratedFile {
-                                path: make_path("Client.kt"),
-                                content: c,
-                            });
-                        }
+        // A package's `genquickstart.md` demonstrates the calling side (the CSIL-RPC and
+        // CSIL-Datagrams sections, over the typed client) AND the handling side (the
+        // CSIL-Events section, over the channel router + handler interface), so a package
+        // must carry BOTH surfaces for its own quickstart to compile — regardless of which
+        // (sub-)target was requested. A flat (non-package) build stays byte-identical: it
+        // emits only the requested surface. Mirrors the OCaml generator.
+        let want_client = matches!(surface, Surface::Client)
+            || (config.emit_package && !matches!(surface, Surface::TypesOnly));
+        let want_server = matches!(surface, Surface::Server)
+            || (config.emit_package && !matches!(surface, Surface::TypesOnly));
+
+        if want_client {
+            // `Both` (the default) ships the blocking client at `Client.kt` and a
+            // suspending twin at `ClientAsync.kt`; `Async` makes the suspending client
+            // a drop-in at `Client.kt` (canonical names); `Sync` is today's output.
+            let sync = ClientShape {
+                is_async: false,
+                marker: "",
+            };
+            let async_drop_in = ClientShape {
+                is_async: true,
+                marker: "",
+            };
+            let async_twin = ClientShape {
+                is_async: true,
+                marker: "Async",
+            };
+            match style {
+                ClientStyle::Sync => {
+                    if let Some(c) = generate_client(&input, &config, sync) {
+                        files.push(GeneratedFile {
+                            path: make_path("Client.kt"),
+                            content: c,
+                        });
                     }
-                    ClientStyle::Async => {
-                        if let Some(c) = generate_client(&input, &config, async_drop_in) {
-                            files.push(GeneratedFile {
-                                path: make_path("Client.kt"),
-                                content: c,
-                            });
-                        }
+                }
+                ClientStyle::Async => {
+                    if let Some(c) = generate_client(&input, &config, async_drop_in) {
+                        files.push(GeneratedFile {
+                            path: make_path("Client.kt"),
+                            content: c,
+                        });
                     }
-                    ClientStyle::Both => {
-                        if let Some(c) = generate_client(&input, &config, sync) {
-                            files.push(GeneratedFile {
-                                path: make_path("Client.kt"),
-                                content: c,
-                            });
-                        }
-                        if let Some(c) = generate_client(&input, &config, async_twin) {
-                            files.push(GeneratedFile {
-                                path: make_path("ClientAsync.kt"),
-                                content: c,
-                            });
-                        }
+                }
+                ClientStyle::Both => {
+                    if let Some(c) = generate_client(&input, &config, sync) {
+                        files.push(GeneratedFile {
+                            path: make_path("Client.kt"),
+                            content: c,
+                        });
+                    }
+                    if let Some(c) = generate_client(&input, &config, async_twin) {
+                        files.push(GeneratedFile {
+                            path: make_path("ClientAsync.kt"),
+                            content: c,
+                        });
                     }
                 }
             }
-            Surface::Server => {
-                if let Some(services_content) = generate_services(&input, &config) {
-                    files.push(GeneratedFile {
-                        path: make_path("Services.kt"),
-                        content: services_content,
-                    });
-                }
-            }
-            Surface::TypesOnly => {}
+        }
+
+        if want_server && let Some(services_content) = generate_services(&input, &config) {
+            files.push(GeneratedFile {
+                path: make_path("Services.kt"),
+                content: services_content,
+            });
         }
     }
 
@@ -283,9 +290,11 @@ fn process_generation(input: WasmGeneratorInput) -> Result<WasmGeneratorOutput, 
             .and_then(|v| v.as_bool())
             != Some(false)
         {
+            // Named `genquickstart.md` rather than `README.md` so it never collides with a
+            // consumer's own hand-written `README.md`; the consumer supplies that themselves.
             files.push(GeneratedFile {
-                path: "README.md".to_string(),
-                content: generate_readme(&input, &config, surface),
+                path: "genquickstart.md".to_string(),
+                content: generate_readme(&input, &config),
             });
         }
     }
@@ -414,75 +423,115 @@ fn gradle_settings_kts(config: &KotlinConfig) -> String {
     format!("// Code generated by csilgen; DO NOT EDIT.\n\nrootProject.name = \"{name}\"\n")
 }
 
-/// The package `README.md` with a copy-paste **Quickstart**. For a client package the
-/// Quickstart is a complete, dependency-free CSIL-RPC carrier — it reuses this package's
-/// own generated `CsilCbor` codec to build/parse the envelope, so it adds no third-party
-/// dependency (the hybrid posture's path 1) — the typed (sync) client constructed over
-/// it, and one example call. A serviceless / types-only package gets a shorter
-/// consume-the-types section without a carrier.
-fn generate_readme(input: &WasmGeneratorInput, config: &KotlinConfig, surface: Surface) -> String {
+/// The version of the `csilgen-transport` (Kotlin/JVM) reference library a generated
+/// package's Quickstart depends on. Pinned here so the Install block names a concrete
+/// coordinate the consumer can resolve.
+const TRANSPORT_LIB_COORD: &str = "community.catalyst.csilgen:csilgen-transport:0.1.0";
+
+/// Which transport sections the `genquickstart.md` should carry. The
+/// `genquickstart_transports` option is a JSON array subset of
+/// `["rpc","events","datagrams"]`; unknown entries are ignored, and an absent or empty
+/// value means "all three". The CLI sets this from its `--readme-csil-*` flags.
+fn wanted_transports(input: &WasmGeneratorInput) -> (bool, bool, bool) {
+    let listed = match input.config.options.get("genquickstart_transports") {
+        Some(serde_json::Value::Array(items)) => {
+            let names: std::collections::BTreeSet<&str> =
+                items.iter().filter_map(|v| v.as_str()).collect();
+            // An array naming none of the known transports (all unknown, or empty) falls
+            // back to all three rather than rendering an empty document.
+            let any_known = ["rpc", "events", "datagrams"]
+                .iter()
+                .any(|t| names.contains(t));
+            if any_known {
+                Some((
+                    names.contains("rpc"),
+                    names.contains("events"),
+                    names.contains("datagrams"),
+                ))
+            } else {
+                None
+            }
+        }
+        _ => None,
+    };
+    listed.unwrap_or((true, true, true))
+}
+
+/// The package `genquickstart.md`: a transport-by-transport Quickstart built on the
+/// official `csilgen-transport` library. The generated codec owns CBOR (de)serialization;
+/// the library owns the envelope, framing, and connection lifecycle; the consumer supplies
+/// only a *carrier* that moves bytes. Each requested section (CSIL-RPC over HTTP,
+/// CSIL-Events over TLS, CSIL-Datagrams over UDP) is a complete example built on the
+/// library, so the same typed surface rides HTTP/TLS/WebSocket/QUIC/UDP unchanged.
+fn generate_readme(input: &WasmGeneratorInput, config: &KotlinConfig) -> String {
     let artifact = &config.package_name;
     let mut out = format!(
         "# {artifact}\n\n\
-         Generated by csilgen. A typed, transport-agnostic CSIL-RPC client: the generated\n\
-         codec owns CBOR (de)serialization; you supply a *carrier* that only moves bytes.\n\n\
+         Generated by csilgen. A typed CSIL client: the generated codec owns CBOR\n\
+         (de)serialization and the `csilgen-transport` library owns the envelope, framing,\n\
+         and connection lifecycle. You supply only a *carrier* that moves bytes, so the same\n\
+         typed surface rides HTTP, TLS, a WebSocket, QUIC, or raw UDP unchanged.\n\n\
          ## Install\n\n\
          This package builds to a standard Gradle (Kotlin/JVM) artifact. Publish it to your\n\
          local Maven repository with `./gradlew publishToMavenLocal` — TODO: publish it to a\n\
-         shared repository — then depend on it:\n\n\
+         shared repository — then depend on it alongside the transport library:\n\n\
          ```kotlin\n\
          dependencies {{\n\
          \x20   implementation(\"{}:{artifact}:{}\")\n\
+         \x20   implementation(\"{TRANSPORT_LIB_COORD}\")\n\
          }}\n\
          ```\n\n",
         config.package, config.package_version,
     );
 
-    // The carrier+example only makes sense for the client surface, whose `Transport` seam
-    // and per-service client the snippet wires together; a server / types-only package has
-    // no such classes, so it gets the consume-the-types section.
-    let example = match surface {
-        Surface::Client => first_unary_example(input),
-        _ => None,
-    };
-    match example {
-        Some(example) => out.push_str(&readme_quickstart(config, &example)),
-        None => out.push_str(
-            "## Quickstart\n\n\
-             This package has no service operations — import its generated record types and\n\
-             the `CsilCbor` codec directly:\n\n\
-             ```kotlin\n\
-             // val bytes: ByteArray = yourRecord.toCbor()\n\
-             // val back: YourRecord = yourRecordFromCbor(bytes)\n\
-             ```\n",
-        ),
+    let (rpc, events, datagrams) = wanted_transports(input);
+    let unary = first_unary_example(input);
+    let channel = first_channel_example(input);
+    if rpc {
+        out.push_str(&rpc_section(config, unary.as_ref()));
+    }
+    if events {
+        out.push_str(&events_section(config, channel.as_ref()));
+    }
+    if datagrams {
+        out.push_str(&datagrams_section(config, unary.as_ref()));
     }
     out
 }
 
-/// The client Quickstart: the dependency-free blocking CSIL-RPC carrier over
-/// `java.net.http.HttpClient`, the typed (sync) client constructed on it, and the first
-/// service's first unary call with a generated sample request literal.
-fn readme_quickstart(config: &KotlinConfig, ex: &UnaryExample) -> String {
-    let mut out = String::from("## Quickstart\n\n");
+/// CSIL-RPC over HTTP: a carrier implementing the generated `Transport` byte seam that
+/// builds the envelope with the library's `RpcRequest` and parses the library's
+/// `RpcResponse` (never hand-rolled), POSTing to `{baseUrl}/csil/v1/rpc` with the JDK's
+/// blocking `HttpClient`. A non-zero transport status (`asTransportError`) and the typed
+/// `ServiceError` application arm are surfaced distinctly; the typed client decodes success.
+fn rpc_section(config: &KotlinConfig, ex: Option<&UnaryExample>) -> String {
+    let mut out = String::from("## CSIL-RPC (HTTP)\n\n");
     out.push_str(
-        "A complete CSIL-RPC carrier (no third-party deps — it reuses this package's\n\
-         generated `CsilCbor` codec for the envelope) plus the typed client. Change the one\n\
-         base-URL string.\n\n",
+        "Request/response. The library owns the envelope (`RpcRequest`/`RpcResponse`); you\n\
+         bring a carrier that moves bytes. The HTTP carrier below is just one example — swap\n\
+         `HttpClient` for any client (it implements the generated `Transport` byte seam).\n\n",
     );
+    let Some(ex) = ex else {
+        out.push_str(
+            "This package declares no `->` operations, so there is no RPC call to make.\n\n",
+        );
+        return out;
+    };
     out.push_str("```kotlin\n");
     out.push_str(&format!("package {}\n\n", config.package));
     out.push_str(
-        "import java.net.URI\n\
+        "import community.catalyst.csilgen.transport.RpcRequest\n\
+         import community.catalyst.csilgen.transport.RpcResponse\n\
+         import java.net.URI\n\
          import java.net.http.HttpClient\n\
          import java.net.http.HttpRequest\n\
          import java.net.http.HttpResponse\n\n",
     );
-    out.push_str(CARRIER_KT);
+    out.push_str(RPC_CARRIER_KT);
     out.push('\n');
     out.push_str("fun main() {\n");
     out.push_str(&format!(
-        "    val client = {0}(CsilRpcTransport(\"http://localhost:5080\"))\n",
+        "    val client = {}(HttpRpcTransport(\"http://localhost:5080\"))\n",
         ex.client_class
     ));
     if ex.has_request {
@@ -494,80 +543,290 @@ fn readme_quickstart(config: &KotlinConfig, ex: &UnaryExample) -> String {
         out.push_str(&format!("    val resp = client.{}()\n", ex.method));
     }
     out.push_str("    println(resp)\n}\n");
-    out.push_str("```\n");
+    out.push_str("```\n\n");
     out
 }
 
-/// The CSIL-RPC carrier body, identical for every spec, so it is a constant. It builds a
-/// `CsilRpcRequest` envelope (tag-24 payload) from the generated `CborValue` model, POSTs
-/// it to `{baseUrl}/csil/v1/rpc` with the JDK's blocking `HttpClient`, and returns the
-/// unwrapped response payload bytes for the generated client to decode. A non-zero
-/// transport `status` or a typed `ServiceError` arm becomes a `ClientError`.
-const CARRIER_KT: &str = r#"// The carrier owns only the CSIL-RPC envelope + HTTP; it never touches your types.
-// Hybrid posture path 1: it reuses the generated CsilCbor value model to build/parse the
-// envelope, so it adds no third-party dependency.
-class CsilRpcTransport(baseUrl: String) : Transport {
+/// The HTTP carrier body — spec-independent, so a constant. It encodes the request with the
+/// library's `RpcRequest`, POSTs it to `{baseUrl}/csil/v1/rpc`, and returns the success
+/// payload bytes the typed client decodes. `RpcResponse.asTransportError()` raises on a
+/// non-zero transport status; the typed `ServiceError` arm (a status-0 variant) is surfaced
+/// separately so the typed client only ever decodes a success payload.
+const RPC_CARRIER_KT: &str = r#"// One example carrier: CSIL-RPC over an HTTP POST. The library owns the RpcRequest/
+// RpcResponse envelope; the carrier owns only the transport. Swap HttpClient for any client.
+class HttpRpcTransport(baseUrl: String) : Transport {
     private val http: HttpClient = HttpClient.newHttpClient()
 
     // Trim any trailing slash so the joined path is exactly one "/csil/v1/rpc".
     private val baseUrl: String = baseUrl.trimEnd('/')
 
     override fun call(service: String, op: String, request: ByteArray): ByteArray {
-        // CsilRpcRequest = { v, service, op, payload: #6.24(bstr) }. The payload is the
-        // already-encoded request wrapped in CBOR tag 24 (embedded CBOR); keys are laid
-        // down in canonical (length-then-bytewise) order.
-        val envelope = CborValue.CMap(listOf(
-            CborValue.CText("v") to CborValue.CUint(1uL),
-            CborValue.CText("op") to CborValue.CText(op),
-            CborValue.CText("service") to CborValue.CText(service),
-            CborValue.CText("payload") to CborValue.CTag(24uL, CborValue.CBytes(request)),
-        ))
-
+        // The library builds the envelope from the already-encoded request bytes; we never
+        // hand-roll the wire form.
+        val envelope = RpcRequest(service, op, request).encode()
         val httpReq = HttpRequest.newBuilder()
             .uri(URI.create("$baseUrl/csil/v1/rpc"))
             .header("Content-Type", "application/cbor")
             .header("Accept", "application/cbor")
-            .POST(HttpRequest.BodyPublishers.ofByteArray(CsilCbor.encode(envelope)))
+            .POST(HttpRequest.BodyPublishers.ofByteArray(envelope))
             .build()
         val httpResp = http.send(httpReq, HttpResponse.BodyHandlers.ofByteArray())
         if (httpResp.statusCode() != 200) {
             throw ClientError(message = "csil-rpc $service/$op: http ${httpResp.statusCode()}")
         }
 
-        val env = CsilCbor.decode(httpResp.body())
-        val status = CsilCbor.asLong(CsilCbor.require(env, "status"))
-        if (status != 0L) {
-            throw ClientError(message = "csil-rpc $service/$op: transport status $status")
+        val resp = RpcResponse.decode(httpResp.body())
+        // A non-zero transport status is a StatusException, distinct from an application error.
+        resp.asTransportError()?.let { throw ClientError(message = "csil-rpc $service/$op: ${it.message}") }
+        // A typed ServiceError arm rides as a status-0 variant; surface it so the typed
+        // client decodes a success payload only.
+        if (resp.variant == "ServiceError") {
+            throw ClientError(message = "csil-rpc $service/$op: ServiceError")
         }
-
-        val payload = CsilCbor.require(env, "payload")
-        if (payload !is CborValue.CTag || payload.tag != 24uL || payload.value !is CborValue.CBytes) {
-            throw ClientError(message = "csil-rpc: response payload is not a tag-24 byte string")
-        }
-        val inner = (payload.value as CborValue.CBytes).value
-
-        // A typed ServiceError arm (variant "ServiceError") is an application error,
-        // distinct from a transport failure: decode { code, message } and surface it.
-        val variant = CsilCbor.mapGet(env, "variant")
-        if (variant is CborValue.CText && variant.value == "ServiceError") {
-            val e = CsilCbor.decode(inner)
-            val code = CsilCbor.asLong(CsilCbor.require(e, "code"))
-            val msg = CsilCbor.asText(CsilCbor.require(e, "message"))
-            throw ClientError(code = code, message = "service error $code: $msg")
-        }
-        return inner
+        return resp.payload
     }
 }
 "#;
 
-/// The pieces the README's example call needs: which client class + method to call, the
-/// typed response type to print, and a compiling sample request literal (empty when the
-/// op takes no request).
+/// CSIL-Events over TLS: a full session example. Opens a TLS byte stream wrapped as the
+/// library's `StreamCarrier` (CSIL length-prefix framing), performs the
+/// `$hello`/`$hello-ack` handshake, sends one outbound event via the generated
+/// `encode<Service><Op>`, and runs a recv loop that decodes each frame to an `Event`,
+/// answers `$ping` with `$pong`, and dispatches typed events to the generated
+/// `route<Service>Channel`. When the spec has no usable channel op the dispatch wiring is
+/// replaced with a note (the handshake + heartbeat still apply to any connection).
+fn events_section(config: &KotlinConfig, ch: Option<&ChannelExample>) -> String {
+    let mut out = String::from("## CSIL-Events (TLS)\n\n");
+    out.push_str(
+        "Typed, bidirectional event streams over a long-lived connection. The library owns\n\
+         the `$hello`/`$hello-ack` handshake, the `$ping`/`$pong` heartbeat, and framing; the\n\
+         generated router dispatches typed events. The TLS carrier below is just one example —\n\
+         a WebSocket/WebTransport/QUIC carrier drops in unchanged.\n\n",
+    );
+    out.push_str("```kotlin\n");
+    out.push_str(&format!("package {}\n\n", config.package));
+    out.push_str(
+        "import community.catalyst.csilgen.transport.Control\n\
+         import community.catalyst.csilgen.transport.Event\n\
+         import community.catalyst.csilgen.transport.FrameCarrier\n\
+         import community.catalyst.csilgen.transport.Heartbeat\n\
+         import community.catalyst.csilgen.transport.Hello\n\
+         import community.catalyst.csilgen.transport.HelloAck\n\
+         import community.catalyst.csilgen.transport.Profile\n\
+         import community.catalyst.csilgen.transport.StreamCarrier\n\
+         import javax.net.ssl.SSLSocketFactory\n\n",
+    );
+    out.push_str(EVENTS_CARRIER_KT);
+    out.push('\n');
+    match ch {
+        Some(ch) => out.push_str(&events_session(config, ch)),
+        None => out.push_str(EVENTS_NO_CHANNEL_SESSION_KT),
+    }
+    out.push_str("```\n\n");
+    out
+}
+
+/// The TLS `StreamCarrier` adapter — spec-independent. The library's `StreamCarrier` owns
+/// the 4-byte length-prefix framing over the socket's streams, so the session logic stays
+/// transport-agnostic.
+const EVENTS_CARRIER_KT: &str = r#"// One example carrier: a TLS byte stream framed with CSIL's 4-byte length prefix. The
+// library's StreamCarrier owns the framing; we own only the socket.
+fun openTlsCarrier(host: String, port: Int): FrameCarrier {
+    val socket = SSLSocketFactory.getDefault().createSocket(host, port)
+    return StreamCarrier(socket.getInputStream(), socket.getOutputStream())
+}
+"#;
+
+/// The channel session body for an Events connection that has a record-typed `<->` op:
+/// a `Codec` backed by the generated per-type helpers, the handshake, one outbound event
+/// via the generated encoder, and the recv loop that heartbeats and dispatches into the
+/// generated router. `handlers` is a parameter (the host's `<Service>` implementation) so
+/// the snippet need not stub every operation inline.
+fn events_session(config: &KotlinConfig, ch: &ChannelExample) -> String {
+    format!(
+        r#"
+// Back the generated router's Codec with this package's per-type CBOR helpers (inbound
+// {inbound}, outbound {outbound}).
+private val channelCodec = object : Codec {{
+    override fun encode(value: Any?): ByteArray = {pkg}.encode(value)
+    override fun <T> decode(data: ByteArray, type: Class<T>): T =
+        csilFromCborValue(type.kotlin, CsilCbor.decode(data)) as T
+}}
+
+// `handlers` is your {iface} implementation; the generated router dispatches typed events
+// into it.
+fun session(handlers: {iface}) {{
+    val carrier = openTlsCarrier("localhost", 7443)
+
+    // $hello / $hello-ack handshake. The peer's $hello-ack pins the wire profile for the
+    // connection's lifetime.
+    carrier.sendFrame(Hello(listOf(1uL), listOf("verbose"), "{service}").encode())
+    val ackFrame = carrier.recvFrame() ?: throw ClientError(message = "connection closed during handshake")
+    val profile = Profile.parse(HelloAck.decode(ackFrame).profile) ?: Profile.VERBOSE
+
+    // Send one outbound event via the generated encoder, framed under the negotiated profile.
+    val (event, bytes) = {encode}(channelCodec, {sample})
+    carrier.sendFrame(Event.verbose("{service}", event, bytes).encode(profile))
+
+    // Recv loop: decode each frame to an Event, answer $ping with $pong, dispatch the rest
+    // to the generated router.
+    var frame = carrier.recvFrame()
+    while (frame != null) {{
+        val ev = Event.decode(frame, profile)
+        if (ev.event == Control.PING_NAME) {{
+            val ping = Heartbeat.decode(ev.payload)
+            carrier.sendFrame(
+                Event.verbose("{service}", Control.PONG_NAME, Heartbeat(ping.nonce).encode()).encode(profile),
+            )
+        }} else {{
+            {route}(handlers, channelCodec, ev.event!!, ev.payload)
+        }}
+        frame = carrier.recvFrame()
+    }}
+}}
+"#,
+        pkg = config.package,
+        iface = ch.iface,
+        service = ch.service_wire,
+        inbound = ch.inbound_type,
+        outbound = ch.outbound_type,
+        encode = ch.encode_fn,
+        route = ch.route_fn,
+        sample = ch.outbound_sample,
+    )
+}
+
+/// The Events session body when the spec declares no usable channel op: the handshake and
+/// heartbeat still apply to any connection, so they are shown, with a note where the
+/// generated channel dispatch would otherwise wire in.
+const EVENTS_NO_CHANNEL_SESSION_KT: &str = r#"
+fun session() {
+    val carrier = openTlsCarrier("localhost", 7443)
+
+    // $hello / $hello-ack handshake (control plane).
+    carrier.sendFrame(Hello(listOf(1uL), listOf("verbose")).encode())
+    val ackFrame = carrier.recvFrame() ?: error("connection closed during handshake")
+    val profile = Profile.parse(HelloAck.decode(ackFrame).profile) ?: Profile.VERBOSE
+
+    // Recv loop: answer $ping with $pong. This package declares no <->/<- operations, so
+    // there is no generated channel router to dispatch typed events into.
+    var frame = carrier.recvFrame()
+    while (frame != null) {
+        val ev = Event.decode(frame, profile)
+        if (ev.event == Control.PING_NAME) {
+            val ping = Heartbeat.decode(ev.payload)
+            carrier.sendFrame(
+                Event.verbose(null, Control.PONG_NAME, Heartbeat(ping.nonce).encode()).encode(profile),
+            )
+        }
+        frame = carrier.recvFrame()
+    }
+}
+"#;
+
+/// CSIL-Datagrams over UDP: encode a `->` request with the generated codec, wrap it in the
+/// library's `Datagram`, and `sendDatagram` it fire-and-forget. The recv path
+/// `Datagram.decode`s an inbound datagram and decodes its payload with the generated codec
+/// into the RESPONSE type — there is NO synchronous response.
+fn datagrams_section(config: &KotlinConfig, ex: Option<&UnaryExample>) -> String {
+    let mut out = String::from("## CSIL-Datagrams (UDP)\n\n");
+    out.push_str(
+        "Unreliable, unordered, message-oriented. The library owns the `Datagram` envelope;\n\
+         you bring a datagram carrier. The UDP carrier below is one example — a WebRTC\n\
+         unreliable DataChannel or QUIC datagrams drop in unchanged.\n\n",
+    );
+    let Some(ex) = ex else {
+        out.push_str(
+            "This package declares no record `->` operations, so there is no datagram payload to encode.\n\n",
+        );
+        return out;
+    };
+    let (Some(req_type), Some(res_type), Some(res_decoder)) =
+        (&ex.req_type, &ex.res_type, &ex.res_decoder)
+    else {
+        out.push_str(
+            "This package's `->` operations have non-record payloads; (de)serialize them manually before framing.\n\n",
+        );
+        return out;
+    };
+    out.push_str("```kotlin\n");
+    out.push_str(&format!("package {}\n\n", config.package));
+    out.push_str(
+        "import community.catalyst.csilgen.transport.Datagram\n\
+         import community.catalyst.csilgen.transport.DatagramCarrier\n\
+         import java.net.DatagramPacket\n\
+         import java.net.DatagramSocket\n\
+         import java.net.InetSocketAddress\n\n",
+    );
+    out.push_str(DATAGRAMS_CARRIER_KT);
+    out.push('\n');
+    out.push_str(&format!(
+        r#"// The operation's datagram ordinal — its @wire-id, or a channel-agreed number.
+const val OP_ORD: ULong = {op_ord}uL
+
+fun main() {{
+    val carrier = UdpDatagramCarrier("localhost", 9000)
+
+    // Fire-and-forget: encode the `->` request and send it. seq 0 marks an unsequenced datagram.
+    val req: {req_type} = {sample}
+    carrier.sendDatagram(Datagram(OP_ORD, 0uL, req.toCbor()).encode())
+
+    // Recv path: a datagram of the RESPONSE type MAY arrive later — or never. There is NO
+    // synchronous response; the caller must tolerate loss and reordering and handle a reply
+    // whenever (if ever) it shows up.
+    val inbound = carrier.recvDatagram()
+    if (inbound != null) {{
+        val dg = Datagram.decode(inbound)
+        val resp: {res_type} = {res_decoder}FromCbor(dg.payload)
+        println("late response: $resp")
+    }}
+}}
+"#,
+        op_ord = ex.op_ord,
+        req_type = req_type,
+        res_type = res_type,
+        res_decoder = res_decoder,
+        sample = ex.sample,
+    ));
+    out.push_str("```\n\n");
+    out
+}
+
+/// The UDP `DatagramCarrier` adapter — spec-independent. `sendDatagram` writes one UDP
+/// packet; `recvDatagram` blocks for the next inbound packet. Datagrams are unreliable and
+/// unordered, so the carrier never waits for or correlates a reply.
+const DATAGRAMS_CARRIER_KT: &str = r#"// One example carrier: UDP via java.net.DatagramSocket. Datagrams are unreliable and
+// unordered, so the carrier never correlates a reply.
+class UdpDatagramCarrier(host: String, port: Int) : DatagramCarrier {
+    private val socket = DatagramSocket()
+    private val address = InetSocketAddress(host, port)
+
+    override fun sendDatagram(bytes: ByteArray) {
+        socket.send(DatagramPacket(bytes, bytes.size, address))
+    }
+
+    override fun recvDatagram(): ByteArray? {
+        val buf = ByteArray(2048)
+        val packet = DatagramPacket(buf, buf.size)
+        socket.receive(packet)
+        return packet.data.copyOf(packet.length)
+    }
+}
+"#;
+
+/// The pieces a unary (`->`) example call needs: the client class + method to call, a
+/// compiling sample request literal, the request/response record type names and the
+/// response decoder stem (so the datagram section can name `req.toCbor()`/
+/// `<res>FromCbor`), and the op's datagram ordinal.
 struct UnaryExample {
     client_class: String,
     method: String,
     has_request: bool,
     sample: String,
+    req_type: Option<String>,
+    res_type: Option<String>,
+    res_decoder: Option<String>,
+    op_ord: u64,
 }
 
 /// The first service (in rule order, matching the emitted client) that has a unary `->`
@@ -599,6 +858,79 @@ fn first_unary_example(input: &WasmGeneratorInput) -> Option<UnaryExample> {
                 } else {
                     kotlin_sample(input, &op.input_type)
                 },
+                // The datagram section needs record type names; a null-input op leaves the
+                // request type absent (and that section then shows its non-record note).
+                req_type: (!null_input)
+                    .then(|| reference_name(&op.input_type))
+                    .flatten(),
+                res_type: reference_name(&success),
+                res_decoder: reference_name(&success).map(|_| camel_case(reference_raw(&success))),
+                // The datagram ordinal is the op's @wire-id when present; otherwise a
+                // channel-agreed placeholder the user fills in.
+                op_ord: op.wire_id.unwrap_or(1),
+            });
+        }
+    }
+    None
+}
+
+/// The pascal-cased type name a `Reference` names, or `None` for any other type
+/// expression (so the datagram section only fires for record references).
+fn reference_name(ty: &CsilTypeExpression) -> Option<String> {
+    match ty {
+        CsilTypeExpression::Reference(n) => Some(pascal_case(n)),
+        _ => None,
+    }
+}
+
+/// The raw (un-cased) name a `Reference` names; only valid when `reference_name` is `Some`.
+fn reference_raw(ty: &CsilTypeExpression) -> &str {
+    match ty {
+        CsilTypeExpression::Reference(n) => n,
+        _ => "",
+    }
+}
+
+/// The pieces the Events session needs: the generated handler interface, channel router,
+/// and outbound encoder names; the wire service; the inbound/outbound record type names;
+/// and a compiling outbound record literal.
+struct ChannelExample {
+    iface: String,
+    service_wire: String,
+    route_fn: String,
+    encode_fn: String,
+    inbound_type: String,
+    outbound_type: String,
+    outbound_sample: String,
+}
+
+/// The first service (in rule order) with a `<->` op whose inbound (input) and outbound
+/// (success output) are both record references, so the generated router + encoder + per-type
+/// codec helpers all exist. `None` when no service has a usable channel op — the Events
+/// section then shows the handshake/heartbeat without dispatch wiring.
+fn first_channel_example(input: &WasmGeneratorInput) -> Option<ChannelExample> {
+    let records = kotlin_record_names(input);
+    for rule in &input.csil_spec.rules {
+        let CsilRuleType::ServiceDef(def) = &rule.rule_type else {
+            continue;
+        };
+        for op in &def.operations {
+            if !matches!(op.direction, CsilServiceDirection::Bidirectional) {
+                continue;
+            }
+            let success = success_type(&op.output_type);
+            if !is_record_ref(&op.input_type, &records) || !is_record_ref(&success, &records) {
+                continue;
+            }
+            let iface = pascal_case(&rule.name);
+            return Some(ChannelExample {
+                iface: iface.clone(),
+                service_wire: wire_service_name(&rule.name),
+                route_fn: format!("route{iface}Channel"),
+                encode_fn: format!("encode{iface}{}", pascal_case(&op.name)),
+                inbound_type: pascal_case(reference_raw(&op.input_type)),
+                outbound_type: pascal_case(reference_raw(&success)),
+                outbound_sample: kotlin_sample(input, &success),
             });
         }
     }
@@ -3689,14 +4021,14 @@ mod tests {
     fn readme_emitted_only_in_package_mode() {
         // No emit_packages: no README (the flat default output).
         let plain = process_generation(spec("kotlin-client", corndogs_rules())).unwrap();
-        assert!(!plain.files.iter().any(|f| f.path == "README.md"));
+        assert!(!plain.files.iter().any(|f| f.path == "genquickstart.md"));
 
         let pkg = process_generation(corndogs_package_input(vec![(
             "emit_packages",
             serde_json::json!(["kotlin"]),
         )]))
         .unwrap();
-        assert!(pkg.files.iter().any(|f| f.path == "README.md"));
+        assert!(pkg.files.iter().any(|f| f.path == "genquickstart.md"));
     }
 
     /// `emit_readme: false` suppresses only the README; the rest of the package (notably the
@@ -3708,34 +4040,75 @@ mod tests {
             serde_json::json!(["kotlin"]),
         )]))
         .unwrap();
-        assert!(on.files.iter().any(|f| f.path == "README.md"));
+        assert!(on.files.iter().any(|f| f.path == "genquickstart.md"));
 
         let off = process_generation(corndogs_package_input(vec![
             ("emit_packages", serde_json::json!(["kotlin"])),
             ("emit_readme", serde_json::json!(false)),
         ]))
         .unwrap();
-        assert!(!off.files.iter().any(|f| f.path == "README.md"));
+        assert!(!off.files.iter().any(|f| f.path == "genquickstart.md"));
         // Everything other than the README is still emitted.
         assert!(off.files.iter().any(|f| f.path == "build.gradle.kts"));
         let on_without_readme: Vec<_> = on
             .files
             .iter()
-            .filter(|f| f.path != "README.md")
+            .filter(|f| f.path != "genquickstart.md")
             .map(|f| &f.path)
             .collect();
         let off_paths: Vec<_> = off.files.iter().map(|f| &f.path).collect();
         assert_eq!(on_without_readme, off_paths);
     }
 
-    /// The client README's Quickstart must be a complete, self-describing CSIL-RPC
-    /// carrier: the seam implementation, the canonical endpoint POST, the tag-24 payload
-    /// wrap, the status + ServiceError handling, client construction over the carrier, and
-    /// an example call with a generated sample literal. (No kotlin toolchain is available
-    /// here, so the carrier is asserted by content, not compiled — runtime verify skipped.)
+    /// Corndogs records plus a record-typed `<->` channel op (`watch-tasks`), so the
+    /// genquickstart exercises all three transport sections (the unary `submit-task` drives
+    /// RPC + Datagrams; the channel op drives Events).
+    fn three_transport_rules() -> Vec<CsilRule> {
+        let mut rules = corndogs_rules();
+        let watch_req = CsilGroupExpression {
+            entries: vec![entry("uuid", builtin("text"), None)],
+        };
+        let status_update = CsilGroupExpression {
+            entries: vec![entry("state", builtin("text"), None)],
+        };
+        // Append the channel op to the existing CorndogsService and add its record types.
+        if let Some(svc_rule) = rules
+            .iter_mut()
+            .find(|r| matches!(r.rule_type, CsilRuleType::ServiceDef(_)))
+            && let CsilRuleType::ServiceDef(def) = &mut svc_rule.rule_type
+        {
+            def.operations.push(op(
+                "watch-tasks",
+                reference("WatchRequest"),
+                reference("StatusUpdate"),
+                CsilServiceDirection::Bidirectional,
+                None,
+            ));
+        }
+        rules.insert(0, rule("WatchRequest", CsilRuleType::GroupDef(watch_req)));
+        rules.insert(
+            1,
+            rule("StatusUpdate", CsilRuleType::GroupDef(status_update)),
+        );
+        rules
+    }
+
+    fn three_transport_input(options: Vec<(&str, serde_json::Value)>) -> WasmGeneratorInput {
+        let mut input = spec("kotlin", three_transport_rules());
+        for (k, v) in options {
+            input.config.options.insert(k.to_string(), v);
+        }
+        input
+    }
+
+    /// The genquickstart is a three-transport, library-based Quickstart: CSIL-RPC over an
+    /// HTTP carrier (lib `RpcRequest`/`RpcResponse`), CSIL-Events over a TLS frame carrier
+    /// (lib `$hello` handshake + heartbeat + the generated router), and CSIL-Datagrams over
+    /// UDP (lib `Datagram`). No kotlinc toolchain is available here, so each section is
+    /// asserted by content, not compiled or run — runtime verify is not possible.
     #[test]
-    fn readme_quickstart_has_carrier_and_example() {
-        let out = process_generation(corndogs_package_input(vec![
+    fn genquickstart_has_three_lib_based_sections() {
+        let out = process_generation(three_transport_input(vec![
             (
                 "kotlin_package",
                 serde_json::Value::String("community.catalyst.demo".to_string()),
@@ -3751,52 +4124,154 @@ mod tests {
             ("emit_packages", serde_json::json!(["kotlin"])),
         ]))
         .unwrap();
-        let c = content(&out, "README.md");
+        let c = content(&out, "genquickstart.md");
 
-        // Title + Gradle consume coordinates (the resolved coordinates).
+        // Title, resolved coordinates, and the transport-library dependency in Install.
         assert!(c.starts_with("# corndogs-client\n"));
         assert!(c.contains("implementation(\"community.catalyst.demo:corndogs-client:1.2.3\")"));
+        assert!(
+            c.contains("implementation(\"community.catalyst.csilgen:csilgen-transport:0.1.0\")")
+        );
+        assert!(c.contains("`csilgen-transport` library owns the envelope"));
 
-        // The carrier is in this package and implements the generated transport seam.
-        assert!(c.contains("package community.catalyst.demo"));
-        assert!(c.contains("class CsilRpcTransport(baseUrl: String) : Transport"));
-        assert!(c.contains(
-            "override fun call(service: String, op: String, request: ByteArray): ByteArray"
-        ));
-        // Hybrid path 1: it reuses the generated CsilCbor model — no third-party dep.
-        assert!(c.contains("no third-party dep"));
-        assert!(c.contains("CborValue.CMap(listOf("));
-
-        // Stdlib blocking HTTP POST to the canonical endpoint.
+        // --- CSIL-RPC (HTTP) ------------------------------------------------------------
+        assert!(c.contains("## CSIL-RPC (HTTP)"));
+        // The carrier implements the generated Transport seam over the lib's envelope.
+        assert!(c.contains("import community.catalyst.csilgen.transport.RpcRequest"));
+        assert!(c.contains("import community.catalyst.csilgen.transport.RpcResponse"));
+        assert!(c.contains("class HttpRpcTransport(baseUrl: String) : Transport"));
+        assert!(c.contains("val envelope = RpcRequest(service, op, request).encode()"));
         assert!(c.contains("import java.net.http.HttpClient"));
         assert!(c.contains("/csil/v1/rpc"));
-        assert!(c.contains(".POST(HttpRequest.BodyPublishers.ofByteArray("));
-
-        // The tag-24 embedded-CBOR payload wrap.
-        assert!(c.contains("CborValue.CTag(24uL, CborValue.CBytes(request))"));
-
-        // Transport status gate + typed ServiceError arm handling.
-        assert!(c.contains("val status = CsilCbor.asLong(CsilCbor.require(env, \"status\"))"));
-        assert!(c.contains("if (status != 0L)"));
-        assert!(c.contains("variant.value == \"ServiceError\""));
-        assert!(c.contains("throw ClientError(code = code, message = \"service error"));
-
-        // Client construction over the carrier + the example call with a sample literal.
-        assert!(c.contains("val client = CorndogsClient(CsilRpcTransport("));
-        // submit-task takes SubmitTaskRequest { task: Task, queue: text }; the sample
-        // fabricates the nested record (optional priority omitted -> defaults to null).
+        assert!(c.contains(".POST(HttpRequest.BodyPublishers.ofByteArray(envelope))"));
+        // Non-zero transport status + typed ServiceError arm handled distinctly.
+        assert!(c.contains("val resp = RpcResponse.decode(httpResp.body())"));
+        assert!(c.contains("resp.asTransportError()?.let"));
+        assert!(c.contains("if (resp.variant == \"ServiceError\")"));
+        // Typed client + the first `->` call with a generated sample literal.
+        assert!(c.contains("val client = CorndogsClient(HttpRpcTransport("));
         assert!(c.contains("client.submitTask(SubmitTaskRequest(task = Task("));
         assert!(c.contains("queue = \"example\""));
-        assert!(c.contains("println(resp)"));
-        // The carrier snippet is space-indented like the rest of the surface.
-        let snippet = c.split("```kotlin").nth(1).unwrap();
-        assert!(!snippet.contains('\t'));
+
+        // --- CSIL-Events (TLS) ----------------------------------------------------------
+        assert!(c.contains("## CSIL-Events (TLS)"));
+        assert!(c.contains("import community.catalyst.csilgen.transport.Hello"));
+        assert!(c.contains("import community.catalyst.csilgen.transport.StreamCarrier"));
+        assert!(c.contains("fun openTlsCarrier(host: String, port: Int): FrameCarrier"));
+        // The $hello handshake + the $ping/$pong heartbeat from the lib.
+        assert!(c.contains("Hello(listOf(1uL), listOf(\"verbose\"), \"corndogs\").encode()"));
+        assert!(c.contains("HelloAck.decode(ackFrame).profile"));
+        assert!(c.contains("if (ev.event == Control.PING_NAME)"));
+        assert!(c.contains("Control.PONG_NAME, Heartbeat(ping.nonce).encode()"));
+        // One outbound event via the generated encoder + dispatch into the generated router.
+        assert!(c.contains("encodeCorndogsServiceWatchTasks(channelCodec, StatusUpdate("));
+        assert!(c.contains(
+            "routeCorndogsServiceChannel(handlers, channelCodec, ev.event!!, ev.payload)"
+        ));
+
+        // --- CSIL-Datagrams (UDP) -------------------------------------------------------
+        assert!(c.contains("## CSIL-Datagrams (UDP)"));
+        assert!(c.contains("import community.catalyst.csilgen.transport.Datagram"));
+        assert!(c.contains("class UdpDatagramCarrier(host: String, port: Int) : DatagramCarrier"));
+        // Encode the `->` request via the generated codec, wrap in the lib's Datagram, send.
+        assert!(c.contains("val req: SubmitTaskRequest = SubmitTaskRequest(task = Task("));
+        assert!(c.contains("carrier.sendDatagram(Datagram(OP_ORD, 0uL, req.toCbor()).encode())"));
+        // The recv path decodes the RESPONSE type, with the explicit "may arrive later" note.
+        assert!(c.contains("val resp: Task = taskFromCbor(dg.payload)"));
+        assert!(c.contains("MAY arrive later — or never"));
+
+        // The whole document is space-indented like the rest of the surface.
+        assert!(!c.contains('\t'));
     }
 
-    /// A null-input op yields a no-argument example call, and a serviceless package falls
-    /// back to the types-only consume section rather than a carrier.
+    /// A package built from the default (`kotlin`/server) target must still be SELF-CONTAINED:
+    /// its genquickstart references the typed client (CSIL-RPC/Datagrams), the channel router
+    /// and handler interface (CSIL-Events), and the codec (all sections), so the emitted file
+    /// set must carry ALL THREE surfaces together — Client.kt (client), Services.kt
+    /// (router/iface), and Codec.kt (codec) — even though a flat server build emits only
+    /// Services.kt. No kotlinc here, so this is assert-only: the file set proves the
+    /// quickstart's symbols all resolve against the single package. Mirrors the OCaml
+    /// generator's package mode.
     #[test]
-    fn readme_handles_null_input_and_serviceless() {
+    fn package_mode_is_self_contained_with_client_router_and_codec() {
+        let out = process_generation(three_transport_input(vec![(
+            "emit_packages",
+            serde_json::json!(["kotlin"]),
+        )]))
+        .unwrap();
+        let paths: Vec<&str> = out.files.iter().map(|f| f.path.as_str()).collect();
+
+        // The package carries the RPC client AND the channel router AND the codec together.
+        assert!(
+            paths.iter().any(|p| p.ends_with("/Client.kt")),
+            "package missing the RPC client surface; paths: {paths:?}"
+        );
+        assert!(
+            paths.iter().any(|p| p.ends_with("/Services.kt")),
+            "package missing the channel-router surface; paths: {paths:?}"
+        );
+        assert!(
+            paths.iter().any(|p| p.ends_with("/Codec.kt")),
+            "package missing the codec; paths: {paths:?}"
+        );
+
+        // Services.kt actually defines the router + handler interface the Events section calls.
+        let services = content(&out, "Services.kt");
+        assert!(services.contains("interface CorndogsService"));
+        assert!(services.contains(
+            "fun routeCorndogsServiceChannel(handlers: CorndogsService, codec: Codec, op: String, data: ByteArray)"
+        ));
+        // Client.kt defines the typed client the RPC/Datagrams sections call.
+        let client = content(&out, "Client.kt");
+        assert!(client.contains("class CorndogsClient"));
+
+        // The Events section dispatches via the generated router + encoder (not codec-direct).
+        let quickstart = content(&out, "genquickstart.md");
+        assert!(quickstart.contains(
+            "routeCorndogsServiceChannel(handlers, channelCodec, ev.event!!, ev.payload)"
+        ));
+        assert!(quickstart.contains("encodeCorndogsServiceWatchTasks(channelCodec, StatusUpdate("));
+
+        // A flat (non-package) server build stays surface-only: just Services.kt, no Client.kt.
+        let flat = process_generation(spec("kotlin", three_transport_rules())).unwrap();
+        let flat_paths: Vec<&str> = flat.files.iter().map(|f| f.path.as_str()).collect();
+        assert!(flat_paths.iter().any(|p| p.ends_with("Services.kt")));
+        assert!(
+            !flat_paths.iter().any(|p| p.ends_with("Client.kt")),
+            "flat server build must stay surface-only; paths: {flat_paths:?}"
+        );
+    }
+
+    /// `genquickstart_transports` selects a subset of sections; an absent value renders all
+    /// three.
+    #[test]
+    fn genquickstart_transports_subset_selects_sections() {
+        let only_events = process_generation(three_transport_input(vec![
+            ("emit_packages", serde_json::json!(["kotlin"])),
+            ("genquickstart_transports", serde_json::json!(["events"])),
+        ]))
+        .unwrap();
+        let c = content(&only_events, "genquickstart.md");
+        assert!(c.contains("## CSIL-Events (TLS)"));
+        assert!(!c.contains("## CSIL-RPC (HTTP)"));
+        assert!(!c.contains("## CSIL-Datagrams (UDP)"));
+
+        // An empty / unknown-only array falls back to all three.
+        let all = process_generation(three_transport_input(vec![
+            ("emit_packages", serde_json::json!(["kotlin"])),
+            ("genquickstart_transports", serde_json::json!([])),
+        ]))
+        .unwrap();
+        let c = content(&all, "genquickstart.md");
+        assert!(c.contains("## CSIL-RPC (HTTP)"));
+        assert!(c.contains("## CSIL-Events (TLS)"));
+        assert!(c.contains("## CSIL-Datagrams (UDP)"));
+    }
+
+    /// A null-input op yields a no-argument RPC call, and a serviceless package degrades each
+    /// section to its note (no `->` op, no channel op) rather than referencing missing symbols.
+    #[test]
+    fn genquickstart_handles_null_input_and_serviceless() {
         let pong = CsilGroupExpression {
             entries: vec![entry("ok", builtin("bool"), None)],
         };
@@ -3822,20 +4297,21 @@ mod tests {
             .options
             .insert("emit_packages".to_string(), serde_json::json!(["kotlin"]));
         let out = process_generation(input).unwrap();
-        let c = content(&out, "README.md");
-        assert!(
-            c.contains("val resp = client.ping()"),
-            "null-input op should call with no args"
-        );
+        let c = content(&out, "genquickstart.md");
+        // RPC: null-input op calls with no args; no record `->` payload so Datagrams notes it.
+        assert!(c.contains("val resp = client.ping()"));
+        assert!(c.contains("non-record payloads"));
+        // No channel op: the Events section shows the handshake without dispatch wiring.
+        assert!(c.contains("there is no generated channel router"));
 
-        // A types-only spec (no services) gets the consume-the-types section, no carrier.
+        // A serviceless spec degrades every section to its note, referencing no client/router.
         let typed = process_generation(package_input(vec![(
             "emit_packages",
             serde_json::json!(["kotlin"]),
         )]))
         .unwrap();
-        let tc = content(&typed, "README.md");
-        assert!(tc.contains("has no service operations"));
+        let tc = content(&typed, "genquickstart.md");
+        assert!(tc.contains("no `->` operations"));
         assert!(!tc.contains(": Transport"));
     }
 }

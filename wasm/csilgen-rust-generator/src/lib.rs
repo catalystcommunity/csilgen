@@ -80,6 +80,35 @@ fn emit_rust_package(input: &WasmGeneratorInput) -> bool {
     tokens.iter().any(|t| t == "rust")
 }
 
+/// Which transport sections a consumer wants in `genquickstart.md`. The
+/// `genquickstart_transports` option is a JSON array subset of
+/// `["rpc","events","datagrams"]`; unknown entries are ignored, and an absent or empty
+/// value (or one that names none of the three) means "all three". Mirrors the
+/// TypeScript reference so the CLI's `--readme-csil-*` flags drive every generator the
+/// same way.
+fn wanted_transports(input: &WasmGeneratorInput) -> (bool, bool, bool) {
+    let listed = match input.config.options.get("genquickstart_transports") {
+        Some(serde_json::Value::Array(items)) => {
+            let names: std::collections::BTreeSet<&str> =
+                items.iter().filter_map(|v| v.as_str()).collect();
+            let any_known = ["rpc", "events", "datagrams"]
+                .iter()
+                .any(|t| names.contains(t));
+            if any_known {
+                Some((
+                    names.contains("rpc"),
+                    names.contains("events"),
+                    names.contains("datagrams"),
+                ))
+            } else {
+                None
+            }
+        }
+        _ => None,
+    };
+    listed.unwrap_or((true, true, true))
+}
+
 /// Crate name for package mode: the `package_name` option verbatim, else a name
 /// derived from the first service's base (e.g. `CorndogsService` -> `corndogs`),
 /// else the neutral `csilgen_client`.
@@ -352,41 +381,48 @@ impl std::fmt::Display for ClientError {
 
 impl std::error::Error for ClientError {}"#;
 
-/// The pieces the README Quickstart's example call needs: the client struct to
-/// construct, the method to call, whether that method takes a request, and a
-/// compiling sample request literal (empty when the op takes none).
+/// The pieces a unary (`->`) example call needs: the client struct to construct, the
+/// method to call, whether that method takes a request, a compiling sample request
+/// literal (empty when the op takes none), the request/response record type names (so
+/// the datagram section can name `encode_<req>`/`decode_<res>`), and the op's datagram
+/// ordinal.
 struct RustExample {
     client_struct: String,
     method: String,
     null_input: bool,
     sample: String,
+    req_snake: Option<String>,
+    res_snake: Option<String>,
+    op_ord: u64,
 }
 
-/// The Quickstart carrier body, identical for every spec, so it is a constant. It
-/// implements the generated sync `Transport`: it wraps the already-encoded request in
-/// a `CsilRpcRequest` envelope (tag-24 payload), POSTs it to `{base_url}/csil/v1/rpc`
-/// with `ureq`, and returns the response payload bytes for the generated client to
-/// decode. A non-zero transport `status` or a typed `ServiceError` arm is surfaced as
-/// a `ClientError`.
-///
-/// Dependency posture follows the csilgen "hybrid" rule. The preferred path — reusing
-/// this package's own codec to build the envelope — is unavailable here: the generated
-/// codec keeps its generic CBOR encode/decode private (only the `CsilCborValue` *type*
-/// is public), so a downstream carrier cannot reach them. So the carrier takes the
-/// next path and **hand-rolls the tiny fixed envelope** with stdlib bytes only — no
-/// CBOR dependency. HTTP is `ureq` (a small blocking client) because Rust's std has no
-/// HTTP client; everything else is `std`.
-const CARRIER_RUST: &str = r#"use std::io::Read;
+/// The pieces the Events session needs to dispatch through the generated channel
+/// router (`route_<service>_channel`) and outbound encoder (`encode_<service>_<op>`):
+/// the service trait name (which also names the router/encoder and the handler impl),
+/// the wire service name, the demonstrated `<->` op's CSIL name (to give that one trait
+/// method a real body), and a compiling literal for the op's success output record (the
+/// encoder's argument).
+struct RustChannelExample {
+    service_trait: String,
+    wire_service: String,
+    op_name: String,
+    outbound_sample: String,
+}
 
-const CSIL_RPC_PATH: &str = "/csil/v1/rpc";
-const CSIL_TAG_EMBEDDED_CBOR: u64 = 24; // RFC 8949 §3.4.5.1: an encoded CBOR data item.
-
-// The carrier owns only the CSIL-RPC envelope + HTTP; it never touches your types.
-pub struct CsilRpcTransport {
+/// The CSIL-RPC HTTP carrier the Quickstart embeds — spec-independent, so a constant.
+/// It builds the request envelope with the library's `RpcRequest`, POSTs it to
+/// `{base_url}/csil/v1/rpc` with `ureq`, and parses the reply with `RpcResponse`.
+/// `into_transport_error` surfaces a non-zero transport status; the typed `ServiceError`
+/// arm (a status-0 variant) is surfaced separately as `ClientError::Service`. It
+/// implements the generated sync `Transport`, so the typed client rides it unchanged.
+const RPC_CARRIER_RUST: &str = r#"// One example carrier: CSIL-RPC over an HTTP POST. The library owns the envelope
+// (RpcRequest/RpcResponse); the carrier owns only the transport. Swap ureq for any
+// HTTP client — it implements the generated Transport seam.
+pub struct HttpRpcCarrier {
     base_url: String,
 }
 
-impl CsilRpcTransport {
+impl HttpRpcCarrier {
     pub fn new(base_url: impl Into<String>) -> Self {
         Self {
             base_url: base_url.into().trim_end_matches('/').to_string(),
@@ -394,196 +430,95 @@ impl CsilRpcTransport {
     }
 }
 
-impl Transport for CsilRpcTransport {
+impl Transport for HttpRpcCarrier {
     fn call(&self, service: &str, op: &str, req: &[u8]) -> Result<Vec<u8>, ClientError> {
-        // CsilRpcRequest = { v, service, op, payload: #6.24(bstr) }, keys laid down in
-        // canonical (length-then-bytewise) order. `payload` is the already-encoded
-        // request wrapped in tag 24; the codec, not the carrier, produced those bytes.
-        let mut body = Vec::new();
-        csil_enc_head(5, 4, &mut body); // map of 4 pairs
-        csil_enc_text("v", &mut body);
-        csil_enc_head(0, 1, &mut body); // value: 1
-        csil_enc_text("op", &mut body);
-        csil_enc_text(op, &mut body);
-        csil_enc_text("payload", &mut body);
-        csil_enc_head(6, CSIL_TAG_EMBEDDED_CBOR, &mut body);
-        csil_enc_bytes(req, &mut body);
-        csil_enc_text("service", &mut body);
-        csil_enc_text(service, &mut body);
-
-        let url = format!("{}{CSIL_RPC_PATH}", self.base_url);
+        let envelope = RpcRequest::new(service, op, req.to_vec())
+            .encode()
+            .map_err(|e| ClientError::Transport(e.to_string()))?;
+        let url = format!("{}/csil/v1/rpc", self.base_url);
         let resp = ureq::post(&url)
             .set("Content-Type", "application/cbor")
             .set("Accept", "application/cbor")
-            .send_bytes(&body)
+            .send_bytes(&envelope)
             .map_err(|e| ClientError::Transport(e.to_string()))?;
-        let mut bytes = Vec::new();
+        let mut body = Vec::new();
         resp.into_reader()
-            .read_to_end(&mut bytes)
+            .read_to_end(&mut body)
             .map_err(|e| ClientError::Transport(e.to_string()))?;
 
-        // CsilRpcResponse = { v, status, ? variant, ? error, payload: #6.24(bstr) }.
-        let env = csil_dec_value(&mut &bytes[..]).map_err(ClientError::Transport)?;
-        let status = env.get("status").and_then(Cbor::as_i64).unwrap_or(0);
-        if status != 0 {
-            let msg = env.get("error").and_then(Cbor::as_text).unwrap_or_default();
-            return Err(ClientError::Transport(format!(
-                "csil-rpc {service}/{op}: transport status {status}: {msg}"
-            )));
-        }
-        let inner = match env.get("payload") {
-            Some(Cbor::Tag(CSIL_TAG_EMBEDDED_CBOR, boxed)) => match boxed.as_ref() {
-                Cbor::Bytes(v) => v.clone(),
-                _ => return Err(ClientError::Transport("tag-24 payload is not a byte string".into())),
-            },
-            _ => return Err(ClientError::Transport("response is missing its tag-24 payload".into())),
-        };
-
-        // A typed `ServiceError` arm (variant == "ServiceError") is an application
-        // error, surfaced as `ClientError::Service`, distinct from a transport failure.
-        if env.get("variant").and_then(Cbor::as_text).as_deref() == Some("ServiceError") {
-            let e = csil_dec_value(&mut &inner[..]).map_err(ClientError::Transport)?;
+        // into_transport_error surfaces any non-zero transport status distinctly from a
+        // typed application error.
+        let decoded = RpcResponse::decode(&body)
+            .map_err(|e| ClientError::Transport(e.to_string()))?
+            .into_transport_error()
+            .map_err(|e| ClientError::Transport(e.to_string()))?;
+        // A typed application error rides as a status-0 "ServiceError" variant — distinct
+        // from a transport failure. Surface it so the typed client decodes success only.
+        if decoded.variant.as_deref() == Some("ServiceError") {
             return Err(ClientError::Service {
-                code: e.get("code").and_then(Cbor::as_i64).unwrap_or(0),
-                message: e.get("message").and_then(Cbor::as_text).unwrap_or_default(),
+                code: 0,
+                message: format!("csil-rpc {service}/{op}: ServiceError"),
             });
         }
-        Ok(inner)
+        Ok(decoded.payload)
     }
 }
+"#;
 
-// --- A tiny self-contained CBOR codec for the fixed envelope (no third-party dep) ---
-
-fn csil_enc_head(major: u8, n: u64, out: &mut Vec<u8>) {
-    let mt = major << 5;
-    if n < 24 {
-        out.push(mt | n as u8);
-    } else if n <= u8::MAX as u64 {
-        out.push(mt | 24);
-        out.push(n as u8);
-    } else if n <= u16::MAX as u64 {
-        out.push(mt | 25);
-        out.extend_from_slice(&(n as u16).to_be_bytes());
-    } else if n <= u32::MAX as u64 {
-        out.push(mt | 26);
-        out.extend_from_slice(&(n as u32).to_be_bytes());
-    } else {
-        out.push(mt | 27);
-        out.extend_from_slice(&n.to_be_bytes());
-    }
+/// The TLS `StreamCarrier` opener — spec-independent. std has no TLS, so the example
+/// opens a plain `TcpStream` (which the compile-check uses) and notes that production
+/// wraps it in a rustls (or native-tls) TLS stream; the library's 4-byte length-prefix
+/// framing is identical over any `Read + Write`.
+const EVENTS_CARRIER_RUST: &str = r#"// One example carrier: a TLS byte stream framed by the library's StreamCarrier (CSIL
+// 4-byte length prefix). std has no TLS, so wrap a TcpStream in a rustls (or native-tls)
+// TlsStream for production — the framing is identical over any Read + Write.
+fn open_tls_carrier(addr: &str) -> std::io::Result<StreamCarrier<TcpStream>> {
+    let stream = TcpStream::connect(addr)?;
+    Ok(StreamCarrier::new(stream))
 }
+"#;
 
-fn csil_enc_text(s: &str, out: &mut Vec<u8>) {
-    csil_enc_head(3, s.len() as u64, out);
-    out.extend_from_slice(s.as_bytes());
-}
-
-fn csil_enc_bytes(b: &[u8], out: &mut Vec<u8>) {
-    csil_enc_head(2, b.len() as u64, out);
-    out.extend_from_slice(b);
-}
-
-// Only the CBOR shapes a CSIL-RPC response uses are kept; any other value decodes to
-// `Other` (its bytes still consumed, so the cursor stays aligned) since the carrier
-// never inspects it.
-enum Cbor {
-    Uint(u64),
-    Int(i64),
-    Text(String),
-    Bytes(Vec<u8>),
-    Map(Vec<(Cbor, Cbor)>),
-    Tag(u64, Box<Cbor>),
-    Other,
-}
-
-impl Cbor {
-    fn as_i64(&self) -> Option<i64> {
-        match self {
-            Cbor::Uint(u) => i64::try_from(*u).ok(),
-            Cbor::Int(i) => Some(*i),
-            _ => None,
-        }
-    }
-    fn as_text(&self) -> Option<String> {
-        match self {
-            Cbor::Text(s) => Some(s.clone()),
-            _ => None,
-        }
-    }
-    fn get(&self, key: &str) -> Option<&Cbor> {
-        match self {
-            Cbor::Map(pairs) => pairs.iter().find_map(|(k, v)| match k {
-                Cbor::Text(s) if s == key => Some(v),
-                _ => None,
-            }),
-            _ => None,
-        }
-    }
-}
-
-fn csil_read_be(b: &mut &[u8], n: usize) -> Result<u64, String> {
-    if b.len() < n {
-        return Err("truncated CBOR integer".into());
-    }
-    let mut v = 0u64;
-    for &byte in &b[..n] {
-        v = (v << 8) | byte as u64;
-    }
-    *b = &b[n..];
-    Ok(v)
-}
-
-fn csil_dec_head(b: &mut &[u8]) -> Result<(u8, u64), String> {
-    let first = *b.first().ok_or("unexpected end of CBOR")?;
-    *b = &b[1..];
-    let info = first & 0x1f;
-    let n = match info {
-        0..=23 => info as u64,
-        24 => csil_read_be(b, 1)?,
-        25 => csil_read_be(b, 2)?,
-        26 => csil_read_be(b, 4)?,
-        27 => csil_read_be(b, 8)?,
-        _ => return Err("unsupported CBOR additional info".into()),
+/// The Events session body when the spec declares no usable channel op: the handshake
+/// and heartbeat still apply, so they are shown, with a note where typed dispatch would
+/// go. Spec-independent, so a constant.
+const EVENTS_NO_CHANNEL_SESSION_RUST: &str = r#"fn session(carrier: &mut impl FrameCarrier) -> Result<(), Box<dyn std::error::Error>> {
+    // $hello / $hello-ack handshake (control plane).
+    let hello = Hello {
+        versions: vec![VERSION],
+        profiles: vec![Profile::Verbose.as_str().to_string()],
+        service: None,
+        auth: None,
     };
-    Ok((first >> 5, n))
-}
+    carrier.send_frame(&hello.encode()?)?;
+    let ack_frame = carrier
+        .recv_frame()?
+        .ok_or_else(|| "connection closed during handshake".to_string())?;
+    let profile =
+        Profile::parse(&HelloAck::decode(&ack_frame)?.profile).ok_or_else(|| "unsupported profile".to_string())?;
 
-fn csil_take(b: &mut &[u8], n: usize) -> Result<Vec<u8>, String> {
-    if b.len() < n {
-        return Err("truncated CBOR string".into());
+    // Recv loop: answer $ping with $pong. This package declares no <->/<- operations,
+    // so there is no typed channel event to decode with the generated codec.
+    while let Some(frame) = carrier.recv_frame()? {
+        let ev = Event::decode(&frame, profile)?;
+        if ev.event.as_deref() == Some(control::PING_NAME) {
+            let ping = Heartbeat::decode(&ev.payload)?;
+            let pong = Heartbeat {
+                nonce: ping.nonce,
+                at: None,
+            };
+            carrier.send_frame(
+                &Event::verbose(None, control::PONG_NAME, pong.encode()?).encode(profile)?,
+            )?;
+        }
     }
-    let v = b[..n].to_vec();
-    *b = &b[n..];
-    Ok(v)
+    Ok(())
 }
 
-fn csil_dec_value(b: &mut &[u8]) -> Result<Cbor, String> {
-    let (major, n) = csil_dec_head(b)?;
-    Ok(match major {
-        0 => Cbor::Uint(n),
-        1 => Cbor::Int(-1 - n as i64),
-        2 => Cbor::Bytes(csil_take(b, n as usize)?),
-        3 => Cbor::Text(String::from_utf8(csil_take(b, n as usize)?).map_err(|_| "invalid UTF-8")?),
-        4 => {
-            for _ in 0..n {
-                csil_dec_value(b)?;
-            }
-            Cbor::Other
-        }
-        5 => {
-            let mut pairs = Vec::new();
-            for _ in 0..n {
-                let k = csil_dec_value(b)?;
-                let v = csil_dec_value(b)?;
-                pairs.push((k, v));
-            }
-            Cbor::Map(pairs)
-        }
-        6 => Cbor::Tag(n, Box::new(csil_dec_value(b)?)),
-        // Simple/float: the header (and its 1/2/4/8 payload bytes) is already consumed.
-        7 => Cbor::Other,
-        _ => return Err("unsupported CBOR major type".into()),
-    })
+fn main() {
+    let mut carrier = open_tls_carrier("localhost:7443").expect("connect");
+    if let Err(err) = session(&mut carrier) {
+        eprintln!("session failed: {err}");
+    }
 }
 "#;
 
@@ -1428,53 +1363,62 @@ impl<'a> RustCodeGenerator<'a> {
             });
         }
 
+        // In self-contained package mode the genquickstart demonstrates both the calling
+        // side (CSIL-RPC/Datagrams over the client) and the handling side (CSIL-Events
+        // over the channel router), so the package must carry both surfaces for its own
+        // quickstart to compile — regardless of which surface the target requested. Flat
+        // (non-package) output stays byte-identical: it emits only the requested surface.
+        // Mirrors the OCaml generator.
+        let package = emit_rust_package(self.input);
+        let want_client = matches!(surface, Surface::Client)
+            || (package && !matches!(surface, Surface::TypesOnly));
+        let want_server = matches!(surface, Surface::Server)
+            || (package && !matches!(surface, Surface::TypesOnly));
+
         if self.input.csil_spec.service_count > 0 {
-            match surface {
-                Surface::Client => {
-                    // `Both` (default) ships the blocking client at the canonical
-                    // `client.rs` plus an async twin (marked symbols) at
-                    // `client_async.rs`; `Async` makes the async client a drop-in at
-                    // `client.rs` with canonical names; `Sync` is the original output.
-                    let sync = ClientShape {
-                        is_async: false,
-                        marker: "",
-                    };
-                    let async_drop_in = ClientShape {
-                        is_async: true,
-                        marker: "",
-                    };
-                    let async_twin = ClientShape {
-                        is_async: true,
-                        marker: "Async",
-                    };
-                    match style {
-                        ClientStyle::Sync => files.push(GeneratedFile {
+            if want_client {
+                // `Both` (default) ships the blocking client at the canonical
+                // `client.rs` plus an async twin (marked symbols) at
+                // `client_async.rs`; `Async` makes the async client a drop-in at
+                // `client.rs` with canonical names; `Sync` is the original output.
+                let sync = ClientShape {
+                    is_async: false,
+                    marker: "",
+                };
+                let async_drop_in = ClientShape {
+                    is_async: true,
+                    marker: "",
+                };
+                let async_twin = ClientShape {
+                    is_async: true,
+                    marker: "Async",
+                };
+                match style {
+                    ClientStyle::Sync => files.push(GeneratedFile {
+                        path: "client.rs".to_string(),
+                        content: self.generate_client(sync)?,
+                    }),
+                    ClientStyle::Async => files.push(GeneratedFile {
+                        path: "client.rs".to_string(),
+                        content: self.generate_client(async_drop_in)?,
+                    }),
+                    ClientStyle::Both => {
+                        files.push(GeneratedFile {
                             path: "client.rs".to_string(),
                             content: self.generate_client(sync)?,
-                        }),
-                        ClientStyle::Async => files.push(GeneratedFile {
-                            path: "client.rs".to_string(),
-                            content: self.generate_client(async_drop_in)?,
-                        }),
-                        ClientStyle::Both => {
-                            files.push(GeneratedFile {
-                                path: "client.rs".to_string(),
-                                content: self.generate_client(sync)?,
-                            });
-                            files.push(GeneratedFile {
-                                path: "client_async.rs".to_string(),
-                                content: self.generate_client(async_twin)?,
-                            });
-                        }
+                        });
+                        files.push(GeneratedFile {
+                            path: "client_async.rs".to_string(),
+                            content: self.generate_client(async_twin)?,
+                        });
                     }
                 }
-                Surface::Server => {
-                    files.push(GeneratedFile {
-                        path: "services.rs".to_string(),
-                        content: self.generate_services()?,
-                    });
-                }
-                Surface::TypesOnly => {}
+            }
+            if want_server {
+                files.push(GeneratedFile {
+                    path: "services.rs".to_string(),
+                    content: self.generate_services()?,
+                });
             }
         }
 
@@ -1482,7 +1426,6 @@ impl<'a> RustCodeGenerator<'a> {
         // root is the crate root (`lib.rs`) so the emitted directory is itself a
         // buildable crate; otherwise it is a plain module (`mod.rs` by default) the
         // consumer drops into their own crate.
-        let package = emit_rust_package(self.input);
         let root_filename = if package {
             "lib.rs".to_string()
         } else {
@@ -1519,8 +1462,11 @@ impl<'a> RustCodeGenerator<'a> {
             // for a carrier to ride on — the canonical blocking `client.rs` exists
             // under `Sync`/`Both` style and the `Client` surface. Otherwise it falls
             // back to a types/codec section, mirroring the TypeScript generator.
-            let client_quickstart = matches!(surface, Surface::Client)
-                && matches!(style, ClientStyle::Sync | ClientStyle::Both);
+            // Package mode emits the client surface for every target (`want_client`), so
+            // the typed RPC example is meaningful regardless of the requested target; it
+            // still needs a *blocking* client for the carrier to ride, hence Sync|Both.
+            let client_quickstart =
+                want_client && matches!(style, ClientStyle::Sync | ClientStyle::Both);
             // The README is opt-out: only an explicit `emit_readme: false` suppresses
             // it. Absent / non-bool / `true` all keep the prior behavior so existing
             // consumers see no change.
@@ -1533,8 +1479,8 @@ impl<'a> RustCodeGenerator<'a> {
                 != Some(false);
             if emit_readme {
                 files.push(GeneratedFile {
-                    path: "README.md".to_string(),
-                    content: self.generate_readme(client_quickstart),
+                    path: "genquickstart.md".to_string(),
+                    content: self.generate_readme(client_quickstart)?,
                 });
             }
         }
@@ -1584,62 +1530,86 @@ impl<'a> RustCodeGenerator<'a> {
         deps
     }
 
-    /// The package README, with a copy-paste **Quickstart**. For a client package the
-    /// Quickstart is a complete CSIL-RPC carrier — the generated codec owns CBOR
-    /// (de)serialization of your types; the carrier only moves the envelope bytes — the
-    /// typed client constructed over it, and one example call a user adapts by changing
-    /// the base URL. A server/types-only package gets a shorter consume-the-types
-    /// section instead.
-    fn generate_readme(&self, client_quickstart: bool) -> String {
+    /// The package README: a transport-by-transport **Quickstart** built on the official
+    /// `csilgen-transport` library. The generated codec owns CBOR (de)serialization of
+    /// your types and the library owns the envelope, framing, and connection lifecycle;
+    /// you supply only a *carrier* that moves bytes, so the same typed surface rides
+    /// HTTP, TLS, a WebSocket, QUIC, or raw UDP unchanged. Each requested section
+    /// (CSIL-RPC over HTTP, CSIL-Events over TLS, CSIL-Datagrams over UDP) is a complete,
+    /// copy-paste program built on the library.
+    fn generate_readme(&mut self, client_quickstart: bool) -> Result<String, String> {
         let name = package_name(self.input);
         // The crate is referenced in Rust paths by its identifier form (hyphens become
         // underscores), so `use` lines and the example resolve regardless of the name.
         let krate = name.replace('-', "_");
         let mut out = format!(
             "# {name}\n\n\
-             Generated by csilgen. A typed, transport-agnostic CSIL-RPC client: the\n\
-             generated codec owns CBOR (de)serialization; you supply a *carrier* that\n\
-             only moves bytes.\n\n\
+             Generated by csilgen. A typed CSIL client: the generated codec owns CBOR\n\
+             (de)serialization and the `csilgen-transport` library owns the envelope,\n\
+             framing, and connection lifecycle. You supply only a *carrier* that moves\n\
+             bytes, so the same typed surface rides HTTP, TLS, a WebSocket, QUIC, or raw\n\
+             UDP unchanged.\n\n\
              ## Add to your project\n\n\
              ```toml\n\
              [dependencies]\n\
              {name} = {{ path = \"./{name}\" }} # TODO: point at the published/vendored crate\n\
-             ureq = \"2\"                       # the Quickstart carrier's blocking HTTP client\n\
+             csilgen-transport = \"0.1\"        # TODO: not yet published — vendor or git for now\n\
+             ureq = \"2\"                       # the CSIL-RPC carrier's blocking HTTP client\n\
              ```\n\n"
         );
 
-        match (client_quickstart, self.first_unary_example()) {
-            (true, Some(example)) => out.push_str(&self.readme_quickstart(&krate, &example)),
-            _ => {
-                out.push_str(&format!(
-                    "## Quickstart\n\n\
-                     This package has no sync RPC client surface — import its generated\n\
-                     types and codec directly:\n\n\
-                     ```rust\n\
-                     use {krate}::*;\n\
-                     ```\n"
-                ));
-            }
+        let (rpc, events, datagrams) = wanted_transports(self.input);
+        // The typed RPC client (and so a meaningful CSIL-RPC example) only exists for a
+        // sync client surface; the per-type codec the Events/Datagrams sections ride is
+        // emitted for every target, so those sections render regardless of surface.
+        let unary = if client_quickstart {
+            self.first_unary_example()
+        } else {
+            None
+        };
+        let channel = self.first_channel_example();
+        if rpc {
+            out.push_str(&self.rust_rpc_section(&krate, unary.as_ref()));
         }
-        out
+        if events {
+            out.push_str(&self.rust_events_section(&krate, channel.as_ref())?);
+        }
+        if datagrams {
+            out.push_str(&self.rust_datagrams_section(&krate, unary.as_ref()));
+        }
+        Ok(out)
     }
 
-    /// The client Quickstart: the dependency-light sync CSIL-RPC carrier, the typed
-    /// client constructed over it, and the first `->` op called with a generated
-    /// sample request literal.
-    fn readme_quickstart(&self, krate: &str, ex: &RustExample) -> String {
-        let mut out = String::from("## Quickstart\n\n");
+    /// CSIL-RPC over HTTP: a carrier implementing the generated sync `Transport` that
+    /// builds the request with the library's `RpcRequest` and parses the reply with
+    /// `RpcResponse` (never hand-rolled), POSTing to `{base_url}/csil/v1/rpc`. The typed
+    /// client decodes the success payload; a non-zero transport status and the
+    /// `ServiceError` arm are surfaced distinctly. Rendered only when the package emits a
+    /// sync client; otherwise a short note points at the `rust-client` target.
+    fn rust_rpc_section(&self, krate: &str, ex: Option<&RustExample>) -> String {
+        let mut out = String::from("## CSIL-RPC (HTTP)\n\n");
         out.push_str(
-            "A complete blocking CSIL-RPC carrier plus the typed client. Change the one\n\
-             base-URL string.\n\n",
+            "Request/response. The library owns the envelope (`RpcRequest`/`RpcResponse`);\n\
+             you bring a carrier that moves bytes. The HTTP carrier below is just one\n\
+             example — swap `ureq` for any client (it implements the generated `Transport`\n\
+             seam).\n\n",
         );
+        let Some(ex) = ex else {
+            out.push_str(
+                "This package emits no sync RPC client (generate the `rust-client` target\n\
+                 for one), so there is no CSIL-RPC call to make here.\n\n",
+            );
+            return out;
+        };
         out.push_str("```rust\n");
-        out.push_str(&format!("use {krate}::*;\n"));
-        out.push_str(CARRIER_RUST);
+        out.push_str(&format!(
+            "use {krate}::*;\nuse csilgen_transport::rpc::{{RpcRequest, RpcResponse}};\nuse std::io::Read;\n\n"
+        ));
+        out.push_str(RPC_CARRIER_RUST);
         out.push('\n');
         out.push_str("fn main() {\n");
         out.push_str(&format!(
-            "    let client = {}::new(CsilRpcTransport::new(\"http://localhost:5080\"));\n",
+            "    let client = {}::new(HttpRpcCarrier::new(\"http://localhost:5080\"));\n",
             ex.client_struct
         ));
         if ex.null_input {
@@ -1654,8 +1624,271 @@ impl<'a> RustCodeGenerator<'a> {
         out.push_str("        Ok(value) => println!(\"{value:?}\"),\n");
         out.push_str("        Err(err) => eprintln!(\"call failed: {err}\"),\n");
         out.push_str("    }\n");
+        out.push_str("}\n```\n\n");
+        out
+    }
+
+    /// CSIL-Events over TLS: a full session example. Opens a TLS byte stream wrapped as
+    /// the library's `StreamCarrier` (CSIL length-prefix framing), performs the
+    /// `$hello`/`$hello-ack` handshake, sends one outbound event via the generated
+    /// encoder, and runs a recv loop that decodes each frame to an `Event`, answers
+    /// `$ping` with `$pong`, and dispatches typed channel events into the generated
+    /// `route_<service>_channel`. When the spec has no usable channel op the typed
+    /// dispatch is replaced with a note (the handshake + heartbeat still apply).
+    fn rust_events_section(
+        &mut self,
+        krate: &str,
+        ch: Option<&RustChannelExample>,
+    ) -> Result<String, String> {
+        let mut out = String::from("## CSIL-Events (TLS)\n\n");
+        out.push_str(
+            "Typed, bidirectional event streams over a long-lived connection. The library\n\
+             owns the `$hello`/`$hello-ack` handshake, the `$ping`/`$pong` heartbeat, and\n\
+             framing; the generated channel router dispatches typed events. The TLS\n\
+             carrier below is just one example — a WebSocket/WebTransport/QUIC carrier\n\
+             drops in unchanged.\n\n",
+        );
+        out.push_str("```rust\n");
+        out.push_str(&format!("use {krate}::*;\n"));
+        out.push_str(
+            "use csilgen_transport::carrier::{FrameCarrier, StreamCarrier};\n\
+             use csilgen_transport::events::{control, Event, Heartbeat, Hello, HelloAck, Profile};\n\
+             use csilgen_transport::VERSION;\n\
+             use std::net::TcpStream;\n\n",
+        );
+        out.push_str(EVENTS_CARRIER_RUST);
+        out.push('\n');
+        match ch {
+            Some(ch) => out.push_str(&self.rust_events_session(ch)?),
+            None => out.push_str(EVENTS_NO_CHANNEL_SESSION_RUST),
+        }
+        out.push_str("```\n\n");
+        Ok(out)
+    }
+
+    /// A quickstart `impl <Trait> for QuickstartHandlers` whose only real body is the
+    /// demonstrated channel method (it prints the decoded event); every other trait
+    /// method is a never-reached `unimplemented!()` stub so the handler satisfies the
+    /// full trait the router requires without fabricating return values. The signatures
+    /// are derived exactly as `generate_service_trait` does, so the impl always matches.
+    fn rust_handler_impl(
+        &mut self,
+        ch: &RustChannelExample,
+        operations: &[CsilServiceOperation],
+    ) -> Result<String, String> {
+        let demo_snake = self.to_snake_case(&ch.op_name);
+        let mut out = format!(
+            "struct QuickstartHandlers;\n\nimpl {} for QuickstartHandlers {{\n    type Context = ();\n",
+            ch.service_trait
+        );
+        for op in operations {
+            let op_snake = self.to_snake_case(&op.name);
+            match op.direction {
+                CsilServiceDirection::Unidirectional => {
+                    let output_type =
+                        self.map_type_to_rust(&success_type(&op.output_type), &None)?;
+                    if is_null_input(&op.input_type) {
+                        out.push_str(&format!(
+                            "    fn {op_snake}(&self, _ctx: &Self::Context) -> Result<{output_type}, ServiceError> {{\n        unimplemented!(\"request/response op; see the CSIL-RPC section\")\n    }}\n"
+                        ));
+                    } else {
+                        let input_type = self.map_type_to_rust(&op.input_type, &None)?;
+                        out.push_str(&format!(
+                            "    fn {op_snake}(&self, _ctx: &Self::Context, _input: {input_type}) -> Result<{output_type}, ServiceError> {{\n        unimplemented!(\"request/response op; see the CSIL-RPC section\")\n    }}\n"
+                        ));
+                    }
+                }
+                CsilServiceDirection::Bidirectional => {
+                    let is_demo = op_snake == demo_snake;
+                    if is_null_input(&op.input_type) {
+                        let body = if is_demo {
+                            format!(
+                                "        println!(\"channel event {op_snake}\");\n        Ok(())\n"
+                            )
+                        } else {
+                            "        unimplemented!()\n".to_string()
+                        };
+                        out.push_str(&format!(
+                            "    fn {op_snake}(&self, _ctx: &Self::Context) -> Result<(), ServiceError> {{\n{body}    }}\n"
+                        ));
+                    } else {
+                        let input_type = self.map_type_to_rust(&op.input_type, &None)?;
+                        if is_demo {
+                            out.push_str(&format!(
+                                "    fn {op_snake}(&self, _ctx: &Self::Context, msg: {input_type}) -> Result<(), ServiceError> {{\n        println!(\"channel event {op_snake}: {{msg:?}}\");\n        Ok(())\n    }}\n"
+                            ));
+                        } else {
+                            out.push_str(&format!(
+                                "    fn {op_snake}(&self, _ctx: &Self::Context, _msg: {input_type}) -> Result<(), ServiceError> {{\n        unimplemented!()\n    }}\n"
+                            ));
+                        }
+                    }
+                }
+                // Reverse is server-pushed only: no inbound trait method.
+                CsilServiceDirection::Reverse => {}
+            }
+        }
         out.push_str("}\n");
-        out.push_str("```\n");
+        Ok(out)
+    }
+
+    /// The channel session body for an Events connection that has a `<->` op: a handler
+    /// implementing the generated service trait, a handshake, one outbound event built by
+    /// the generated encoder, and the recv loop that heartbeats and dispatches inbound
+    /// typed events into the generated channel router.
+    fn rust_events_session(&mut self, ch: &RustChannelExample) -> Result<String, String> {
+        // Clone the operations so the handler impl can call `&mut self` mapping helpers
+        // without holding a borrow on `self.input`.
+        let operations: Vec<CsilServiceOperation> = self
+            .input
+            .csil_spec
+            .rules
+            .iter()
+            .find_map(|r| match &r.rule_type {
+                CsilRuleType::ServiceDef(s) if r.name == ch.service_trait => {
+                    Some(s.operations.clone())
+                }
+                _ => None,
+            })
+            .unwrap_or_default();
+        let handler_impl = self.rust_handler_impl(ch, &operations)?;
+        let service_snake = self.to_snake_case(&ch.service_trait);
+        let op_snake = self.to_snake_case(&ch.op_name);
+        Ok(format!(
+            r#"{handler_impl}
+fn session(carrier: &mut impl FrameCarrier) -> Result<(), Box<dyn std::error::Error>> {{
+    let service = "{wire_service}";
+    let handlers = QuickstartHandlers;
+
+    // $hello / $hello-ack handshake (control plane). The peer's $hello-ack pins the
+    // wire profile for the connection's lifetime.
+    let hello = Hello {{
+        versions: vec![VERSION],
+        profiles: vec![Profile::Verbose.as_str().to_string()],
+        service: Some(service.to_string()),
+        auth: None,
+    }};
+    carrier.send_frame(&hello.encode()?)?;
+    let ack_frame = carrier
+        .recv_frame()?
+        .ok_or_else(|| "connection closed during handshake".to_string())?;
+    let profile =
+        Profile::parse(&HelloAck::decode(&ack_frame)?.profile).ok_or_else(|| "unsupported profile".to_string())?;
+
+    // Send one outbound event: the generated encoder serializes the typed payload, the
+    // library frames it as a verbose Event.
+    let (method, payload) = encode_{service_snake}_{op_snake}(&{outbound_sample});
+    carrier.send_frame(&Event::verbose(Some(service.to_string()), method, payload).encode(profile)?)?;
+
+    // Recv loop: decode each frame to an Event, answer $ping with $pong (the library
+    // heartbeat), and dispatch typed channel events into the generated router.
+    while let Some(frame) = carrier.recv_frame()? {{
+        let ev = Event::decode(&frame, profile)?;
+        match ev.event.as_deref() {{
+            Some(control::PING_NAME) => {{
+                let ping = Heartbeat::decode(&ev.payload)?;
+                let pong = Heartbeat {{
+                    nonce: ping.nonce,
+                    at: None,
+                }};
+                carrier.send_frame(
+                    &Event::verbose(Some(service.to_string()), control::PONG_NAME, pong.encode()?)
+                        .encode(profile)?,
+                )?;
+            }}
+            Some(method) => {{
+                route_{service_snake}_channel(&handlers, &(), method, &ev.payload)?;
+            }}
+            None => {{}}
+        }}
+    }}
+    Ok(())
+}}
+
+fn main() {{
+    let mut carrier = open_tls_carrier("localhost:7443").expect("connect");
+    if let Err(err) = session(&mut carrier) {{
+        eprintln!("session failed: {{err}}");
+    }}
+}}
+"#,
+            handler_impl = handler_impl,
+            wire_service = ch.wire_service,
+            service_snake = service_snake,
+            op_snake = op_snake,
+            outbound_sample = ch.outbound_sample,
+        ))
+    }
+
+    /// CSIL-Datagrams over UDP: encode a `->` request with the generated codec, wrap it
+    /// in the library's `Datagram`, and `send_datagram` it fire-and-forget. The recv
+    /// path `Datagram::decode`s an inbound datagram and decodes its payload with the
+    /// generated codec into the response type — there is NO synchronous response.
+    fn rust_datagrams_section(&self, krate: &str, ex: Option<&RustExample>) -> String {
+        let mut out = String::from("## CSIL-Datagrams (UDP)\n\n");
+        out.push_str(
+            "Unreliable, unordered, message-oriented. The library owns the `Datagram`\n\
+             envelope; you bring a datagram carrier. The UDP carrier below is one example\n\
+             — a WebRTC unreliable channel or QUIC datagrams drop in unchanged.\n\n",
+        );
+        let Some(ex) = ex else {
+            out.push_str(
+                "This package declares no record `->` operations, so there is no datagram\n\
+                 payload to encode.\n\n",
+            );
+            return out;
+        };
+        let (Some(req_snake), Some(res_snake)) = (&ex.req_snake, &ex.res_snake) else {
+            out.push_str(
+                "This package's `->` operations have null or non-record payloads;\n\
+                 (de)serialize them manually before framing.\n\n",
+            );
+            return out;
+        };
+        out.push_str("```rust\n");
+        out.push_str(&format!("use {krate}::*;\n"));
+        out.push_str(
+            "use csilgen_transport::carrier::DatagramCarrier;\n\
+             use csilgen_transport::datagrams::Datagram;\n\
+             use csilgen_transport::udp::UdpDatagramCarrier;\n\
+             use std::net::UdpSocket;\n\n",
+        );
+        out.push_str(&format!(
+            r#"// The operation's datagram ordinal — its @wire-id, or a channel-agreed number.
+const OP_ORD: u64 = {op_ord};
+
+// run_datagrams sends one `->` request as a Datagram fire-and-forget, then tries to
+// decode a late inbound response. There is NO synchronous response: a datagram of the
+// response type MAY arrive later — or never — so the caller must tolerate loss and
+// reordering.
+fn run_datagrams(carrier: &mut impl DatagramCarrier) -> Result<(), Box<dyn std::error::Error>> {{
+    let req = {req_sample};
+    // seq 0 marks an unsequenced datagram.
+    carrier.send_datagram(&Datagram::new(OP_ORD, 0, encode_{req_snake}(&req)).encode()?)?;
+
+    if let Some(inbound) = carrier.recv_datagram()? {{
+        let dg = Datagram::decode(&inbound)?;
+        let resp = decode_{res_snake}(&dg.payload)?;
+        println!("late response: {{resp:?}}");
+    }}
+    Ok(())
+}}
+
+fn main() {{
+    let socket = UdpSocket::bind("0.0.0.0:0").expect("bind");
+    socket.connect("127.0.0.1:9000").expect("connect");
+    let mut carrier = UdpDatagramCarrier::new(socket);
+    if let Err(err) = run_datagrams(&mut carrier) {{
+        eprintln!("datagrams failed: {{err}}");
+    }}
+}}
+"#,
+            op_ord = ex.op_ord,
+            req_sample = ex.sample,
+            req_snake = req_snake,
+            res_snake = res_snake,
+        ));
+        out.push_str("```\n\n");
         out
     }
 
@@ -1691,6 +1924,46 @@ impl<'a> RustCodeGenerator<'a> {
                     } else {
                         self.rust_sample(&op.input_type)
                     },
+                    req_snake: (!null_input)
+                        .then(|| self.to_snake_case(&Self::type_ref_name(&op.input_type))),
+                    res_snake: Some(self.to_snake_case(&Self::type_ref_name(&success))),
+                    // The datagram ordinal is the op's @wire-id when present; otherwise a
+                    // channel-agreed placeholder the user fills in.
+                    op_ord: op.wire_id.unwrap_or(1),
+                });
+            }
+        }
+        None
+    }
+
+    /// The first service (in declaration order) with a `<->` op whose inbound and
+    /// outbound are both records, so the generated per-type codec helpers exist for a
+    /// compiling Events session. `None` when no service has a usable channel op — the
+    /// Events section then shows the handshake/heartbeat without typed dispatch.
+    fn first_channel_example(&self) -> Option<RustChannelExample> {
+        let records = self.record_names();
+        for rule in &self.input.csil_spec.rules {
+            let CsilRuleType::ServiceDef(service) = &rule.rule_type else {
+                continue;
+            };
+            for op in &service.operations {
+                if !matches!(op.direction, CsilServiceDirection::Bidirectional) {
+                    continue;
+                }
+                let success = success_type(&op.output_type);
+                if !Self::is_record_ref(&success, &records)
+                    || !Self::is_record_ref(&op.input_type, &records)
+                {
+                    continue;
+                }
+                // The Events session dispatches through the generated server-side channel
+                // router + encoder: the router decodes the op's input (inbound, handed to
+                // a handler) and the encoder serializes the op's success output (outbound).
+                return Some(RustChannelExample {
+                    service_trait: rule.name.clone(),
+                    wire_service: Self::service_base(&rule.name).to_lowercase(),
+                    op_name: op.name.clone(),
+                    outbound_sample: self.rust_sample(&success),
                 });
             }
         }
@@ -2089,7 +2362,14 @@ impl<'a> RustCodeGenerator<'a> {
         let mut content = String::new();
 
         content.push_str("//! Generated service traits from CSIL specification\n\n");
-        content.push_str("use super::types::*;\n\n");
+        content.push_str("use super::types::*;\n");
+        // The channel router/encoders ride the generated per-type CBOR codec directly
+        // (it owns the wire), so pull it in whenever the spec has channel ops. Gated so
+        // a channel-free spec keeps a clean, unused-import-free module.
+        if self.spec_has_channel_ops() {
+            content.push_str("use super::codec::*;\n");
+        }
+        content.push('\n');
 
         // Only emit the fallback `ServiceError` when the spec doesn't declare its
         // own; otherwise it collides with the type from `types.rs` (both are
@@ -2097,11 +2377,6 @@ impl<'a> RustCodeGenerator<'a> {
         // verbatim via the `use super::types::*` import above.
         if !self.spec_defines_service_error() {
             self.generate_service_error(&mut content);
-            content.push('\n');
-        }
-
-        if self.spec_has_channel_ops() {
-            self.generate_codec_trait(&mut content);
             content.push('\n');
         }
 
@@ -2727,20 +3002,6 @@ impl<'a> RustCodeGenerator<'a> {
             .any(|op| !matches!(op.direction, CsilServiceDirection::Unidirectional))
     }
 
-    /// The codec abstraction the user supplies for the message-routing layer.
-    /// Same shape across all language targets that emit a router/encoder pair:
-    /// the generator never owns serialization or transport, only types and
-    /// dispatch.
-    fn generate_codec_trait(&self, code: &mut String) {
-        code.push_str("/// User-supplied (de)serialization for channel messages. The generator\n");
-        code.push_str("/// is codec-agnostic; the implementer wires this to CBOR, JSON, or\n");
-        code.push_str("/// anything else its protocol expects.\n");
-        code.push_str("pub trait Codec {\n");
-        code.push_str("    fn encode<T: serde::Serialize>(&self, value: &T) -> Result<Vec<u8>, ServiceError>;\n");
-        code.push_str("    fn decode<T: serde::de::DeserializeOwned>(&self, bytes: &[u8]) -> Result<T, ServiceError>;\n");
-        code.push_str("}\n");
-    }
-
     fn generate_service_error(&self, code: &mut String) {
         code.push_str("#[derive(Debug, Clone)]\n");
         code.push_str("pub struct ServiceError {\n");
@@ -2857,9 +3118,36 @@ impl<'a> RustCodeGenerator<'a> {
         }
     }
 
-    /// For services with any `<->` op, emit `route_<service>_channel` that
-    /// decodes inbound bytes (keyed by the wire method name) and dispatches
-    /// to the trait method. Reverse ops never have an inbound route.
+    /// One channel router match arm: decode the op's inbound payload with the generated
+    /// per-type codec and hand it to the trait method. A null inbound payload carries no
+    /// message, so the handler is called without one. Returns `None` for a non-record,
+    /// non-null payload — the per-type codec only covers records, so such an op is left
+    /// unrouted (it falls through to the `unknown channel` arm) rather than emitting an
+    /// uncompilable decode. The label is the match scrutinee (`"Wire"` or an ordinal).
+    fn channel_route_arm(&self, op: &CsilServiceOperation, label: &str) -> Option<String> {
+        let op_snake = self.to_snake_case(&op.name);
+        if is_null_input(&op.input_type) {
+            return Some(format!("        {label} => handlers.{op_snake}(ctx),\n"));
+        }
+        if !Self::is_record_ref(&op.input_type, &self.record_names()) {
+            return None;
+        }
+        let decode_fn = format!(
+            "decode_{}",
+            self.to_snake_case(&Self::type_ref_name(&op.input_type))
+        );
+        Some(format!(
+            "        {label} => {{\n\
+             \x20           let msg = {decode_fn}(bytes)\n\
+             \x20               .map_err(|err| ServiceError {{ code: 400, message: err.to_string() }})?;\n\
+             \x20           handlers.{op_snake}(ctx, msg)\n\
+             \x20       }}\n"
+        ))
+    }
+
+    /// For services with any `<->` op, emit `route_<service>_channel` that decodes
+    /// inbound bytes (keyed by the wire method name) with the generated per-type codec
+    /// and dispatches to the trait method. Reverse ops never have an inbound route.
     fn generate_service_router(
         &mut self,
         service_name: &str,
@@ -2874,32 +3162,25 @@ impl<'a> RustCodeGenerator<'a> {
         let mut content = String::new();
         let fn_name = format!("route_{}_channel", self.to_snake_case(service_name));
         content.push_str(&format!(
-            "/// Decode one inbound channel frame for {service_name} and dispatch\n\
-             /// to the matching trait method. The implementer feeds raw bytes\n\
-             /// from its connection here; we never own the wire.\n\
-             pub fn {fn_name}<H, C>(\n\
+            "/// Decode one inbound channel frame for {service_name} (with the generated\n\
+             /// per-type codec) and dispatch to the matching trait method. The implementer\n\
+             /// feeds raw bytes from its connection here; we never own the wire.\n\
+             pub fn {fn_name}<H>(\n\
              \x20   handlers: &H,\n\
              \x20   ctx: &H::Context,\n\
-             \x20   codec: &C,\n\
              \x20   method: &str,\n\
              \x20   bytes: &[u8],\n\
              ) -> Result<(), ServiceError>\n\
              where\n\
              \x20   H: {service_name},\n\
-             \x20   C: Codec,\n\
              {{\n\
              \x20   match method {{\n"
         ));
         for op in &inbound_ops {
-            let op_snake = self.to_snake_case(&op.name);
-            let input_type = self.map_type_to_rust(&op.input_type, &None)?;
             let wire = Self::pascal_case(&op.name);
-            content.push_str(&format!("        \"{wire}\" => {{\n"));
-            content.push_str(&format!(
-                "            let msg: {input_type} = codec.decode(bytes)?;\n"
-            ));
-            content.push_str(&format!("            handlers.{op_snake}(ctx, msg)\n"));
-            content.push_str("        }\n");
+            if let Some(arm) = self.channel_route_arm(op, &format!("\"{wire}\"")) {
+                content.push_str(&arm);
+            }
         }
         content.push_str("        other => Err(ServiceError {\n");
         content.push_str("            code: 404,\n");
@@ -2938,16 +3219,14 @@ impl<'a> RustCodeGenerator<'a> {
              /// matching trait method. The verbose-profile twin is\n\
              /// `route_{}_channel`; the host calls whichever matches the profile\n\
              /// negotiated on the wire.\n\
-             pub fn {fn_name}<H, C>(\n\
+             pub fn {fn_name}<H>(\n\
              \x20   handlers: &H,\n\
              \x20   ctx: &H::Context,\n\
-             \x20   codec: &C,\n\
              \x20   op: u64,\n\
              \x20   bytes: &[u8],\n\
              ) -> Result<(), ServiceError>\n\
              where\n\
              \x20   H: {service_name},\n\
-             \x20   C: Codec,\n\
              {{\n\
              \x20   match op {{\n",
             self.to_snake_case(service_name)
@@ -2958,14 +3237,9 @@ impl<'a> RustCodeGenerator<'a> {
             let Some(op_id) = op.wire_id else {
                 continue;
             };
-            let op_snake = self.to_snake_case(&op.name);
-            let input_type = self.map_type_to_rust(&op.input_type, &None)?;
-            content.push_str(&format!("        {op_id} => {{\n"));
-            content.push_str(&format!(
-                "            let msg: {input_type} = codec.decode(bytes)?;\n"
-            ));
-            content.push_str(&format!("            handlers.{op_snake}(ctx, msg)\n"));
-            content.push_str("        }\n");
+            if let Some(arm) = self.channel_route_arm(op, &op_id.to_string()) {
+                content.push_str(&arm);
+            }
         }
         content.push_str("        other => Err(ServiceError {\n");
         content.push_str("            code: 404,\n");
@@ -2977,8 +3251,11 @@ impl<'a> RustCodeGenerator<'a> {
     }
 
     /// For each `<->` and `<-` op, emit `encode_<service>_<op>` that returns
-    /// `(method, bytes)` for the implementer to put on the wire. Unidirectional
-    /// ops already have a return value from their trait method, so no encoder.
+    /// `(method, bytes)` — the wire method name and the op's outbound payload encoded
+    /// with the generated per-type codec — for the implementer to put on the wire.
+    /// Unidirectional ops already return a value from their trait method, so no encoder.
+    /// A null outbound payload encodes to empty bytes; a non-record, non-null payload has
+    /// no per-type codec helper and so emits no encoder.
     fn generate_service_encoders(
         &mut self,
         service_name: &str,
@@ -2986,6 +3263,7 @@ impl<'a> RustCodeGenerator<'a> {
     ) -> Result<String, String> {
         let mut content = String::new();
         let svc_snake = self.to_snake_case(service_name);
+        let records = self.record_names();
         for op in &service.operations {
             if !matches!(
                 op.direction,
@@ -2995,13 +3273,30 @@ impl<'a> RustCodeGenerator<'a> {
             }
             let op_snake = self.to_snake_case(&op.name);
             let wire = Self::pascal_case(&op.name);
-            let output_type = self.map_type_to_rust(&op.output_type, &None)?;
             let fn_name = format!("encode_{svc_snake}_{op_snake}");
-            content.push_str(&format!(
+            let doc = format!(
                 "/// Encode a `{wire}` message pushed from {service_name}'s server\n\
-                 /// side; the implementer frames `(method, bytes)` onto its connection.\n\
-                 pub fn {fn_name}<C: Codec>(codec: &C, msg: &{output_type}) -> Result<(String, Vec<u8>), ServiceError> {{\n\
-                 \x20   Ok((\"{wire}\".to_string(), codec.encode(msg)?))\n\
+                 /// side; the implementer frames `(method, bytes)` onto its connection.\n"
+            );
+            if is_null_input(&op.output_type) {
+                content.push_str(&format!(
+                    "{doc}pub fn {fn_name}() -> (String, Vec<u8>) {{\n\
+                     \x20   (\"{wire}\".to_string(), Vec::new())\n\
+                     }}\n"
+                ));
+                continue;
+            }
+            if !Self::is_record_ref(&op.output_type, &records) {
+                continue;
+            }
+            let output_type = self.map_type_to_rust(&op.output_type, &None)?;
+            let encode_fn = format!(
+                "encode_{}",
+                self.to_snake_case(&Self::type_ref_name(&op.output_type))
+            );
+            content.push_str(&format!(
+                "{doc}pub fn {fn_name}(msg: &{output_type}) -> (String, Vec<u8>) {{\n\
+                 \x20   (\"{wire}\".to_string(), {encode_fn}(msg))\n\
                  }}\n"
             ));
         }
@@ -4152,6 +4447,30 @@ mod tests {
     }
 
     #[test]
+    fn package_mode_emits_both_client_and_server_surfaces() {
+        // The genquickstart's RPC/Datagrams sections ride the client surface and its
+        // Events section rides the server-side channel router, so a self-contained
+        // package must carry both — for either requested target. Flat mode stays
+        // single-surface (covered by test_rust_server_alias_and_typesonly).
+        for target in ["rust-client", "rust"] {
+            let mut input = make_unary_service_input(target);
+            input
+                .config
+                .options
+                .insert("emit_packages".to_string(), serde_json::json!(["rust"]));
+            let files = RustCodeGenerator::new(&input).generate().unwrap();
+            assert!(
+                files.iter().any(|f| f.path == "src/client.rs"),
+                "{target}: package mode must emit the client surface"
+            );
+            assert!(
+                files.iter().any(|f| f.path == "src/services.rs"),
+                "{target}: package mode must emit the server/router surface"
+            );
+        }
+    }
+
+    #[test]
     fn test_spec_defined_service_error_not_duplicated() {
         // When the spec declares its own `ServiceError`, the generator must not
         // emit its hardcoded fallback (which would collide via `mod.rs`).
@@ -4311,8 +4630,16 @@ mod tests {
         let mut generator = RustCodeGenerator::new(&input);
         let services = generator.generate_services().unwrap();
 
-        // Codec trait emitted once at the top of the file.
-        assert!(services.contains("pub trait Codec"), "codec trait expected");
+        // The router/encoders ride the generated per-type codec directly (no serde
+        // `Codec` trait), so the module pulls in the codec rather than defining one.
+        assert!(
+            services.contains("use super::codec::*;"),
+            "channel service must import the per-type codec"
+        );
+        assert!(
+            !services.contains("pub trait Codec"),
+            "the serde-generic Codec trait must be gone"
+        );
 
         // Unidirectional kept as request/response.
         assert!(services.contains(
@@ -4324,16 +4651,16 @@ mod tests {
             "fn play(&self, ctx: &Self::Context, msg: User) -> Result<(), ServiceError>"
         ));
 
-        // Router decodes the inbound bytes and dispatches by wire method name.
-        assert!(services.contains("pub fn route_match_channel<H, C>"));
+        // Router decodes the inbound bytes with the per-type codec and dispatches by
+        // wire method name.
+        assert!(services.contains("pub fn route_match_channel<H>"));
         assert!(services.contains("\"Play\" => {"));
+        assert!(services.contains("let msg = decode_user(bytes)"));
         assert!(services.contains("handlers.play(ctx, msg)"));
 
-        // Outbound encoder for the bidirectional op.
-        assert!(services.contains(
-            "pub fn encode_match_play<C: Codec>(codec: &C, msg: &User) -> Result<(String, Vec<u8>), ServiceError>"
-        ));
-        assert!(services.contains("(\"Play\".to_string(), codec.encode(msg)?)"));
+        // Outbound encoder for the bidirectional op, over the per-type codec.
+        assert!(services.contains("pub fn encode_match_play(msg: &User) -> (String, Vec<u8>)"));
+        assert!(services.contains("(\"Play\".to_string(), encode_user(msg))"));
     }
 
     #[test]
@@ -4361,9 +4688,9 @@ mod tests {
         assert!(!router_block.contains("\"Notify\" =>"));
 
         // The encoder for the reverse op (server pushes Output to the client).
-        assert!(services.contains(
-            "pub fn encode_callbacks_notify<C: Codec>(codec: &C, msg: &User) -> Result<(String, Vec<u8>), ServiceError>"
-        ));
+        assert!(
+            services.contains("pub fn encode_callbacks_notify(msg: &User) -> (String, Vec<u8>)")
+        );
     }
 
     #[test]
@@ -6075,12 +6402,12 @@ mod tests {
 
         // Verbose router stays byte-identical alongside the compact twin.
         assert!(
-            services.contains("pub fn route_match_channel<H, C>"),
+            services.contains("pub fn route_match_channel<H>"),
             "verbose router expected, got:\n{services}"
         );
         // Compact twin dispatches on the operation ordinal, not the wire name.
         assert!(
-            services.contains("pub fn route_match_channel_compact<H, C>"),
+            services.contains("pub fn route_match_channel_compact<H>"),
             "compact router expected, got:\n{services}"
         );
         assert!(
@@ -6113,7 +6440,7 @@ mod tests {
         let services = RustCodeGenerator::new(&input).generate_services().unwrap();
         // The verbose router survives; the compact twin must not appear.
         assert!(
-            services.contains("pub fn route_match_channel<H, C>"),
+            services.contains("pub fn route_match_channel<H>"),
             "verbose router expected, got:\n{services}"
         );
         assert!(
@@ -6529,7 +6856,7 @@ mod tests {
         assert!(files.iter().any(|f| f.path == "mod.rs"));
         assert!(files.iter().any(|f| f.path == "types.rs"));
         // The README rides only with the package; the default output has none.
-        assert!(!files.iter().any(|f| f.path == "README.md"));
+        assert!(!files.iter().any(|f| f.path == "genquickstart.md"));
 
         // A token list that does not name rust must not trigger package mode.
         let mut other = corndogs_client_input();
@@ -6565,8 +6892,8 @@ mod tests {
         assert!(files.iter().any(|f| f.path == "src/codec.gen.rs"));
         assert!(files.iter().any(|f| f.path == "src/client.rs"));
         // The README sits at the crate root beside `Cargo.toml`, not under `src/`.
-        assert!(files.iter().any(|f| f.path == "README.md"));
-        assert!(!files.iter().any(|f| f.path == "src/README.md"));
+        assert!(files.iter().any(|f| f.path == "genquickstart.md"));
+        assert!(!files.iter().any(|f| f.path == "src/genquickstart.md"));
         // The flat (non-package) paths and `mod.rs` must be gone.
         assert!(!files.iter().any(|f| f.path == "mod.rs"));
         assert!(!files.iter().any(|f| f.path == "types.rs"));
@@ -6588,7 +6915,7 @@ mod tests {
         let with_readme = RustCodeGenerator::new(&pkg)
             .generate()
             .expect("generation ok");
-        assert!(with_readme.iter().any(|f| f.path == "README.md"));
+        assert!(with_readme.iter().any(|f| f.path == "genquickstart.md"));
 
         let mut off = pkg.clone();
         off.config
@@ -6597,7 +6924,7 @@ mod tests {
         let without_readme = RustCodeGenerator::new(&off)
             .generate()
             .expect("generation ok");
-        assert!(!without_readme.iter().any(|f| f.path == "README.md"));
+        assert!(!without_readme.iter().any(|f| f.path == "genquickstart.md"));
         // The rest of the package is untouched: only the README disappears.
         assert!(without_readme.iter().any(|f| f.path == "Cargo.toml"));
         assert!(without_readme.iter().any(|f| f.path == "src/lib.rs"));
@@ -6683,86 +7010,251 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The package README must carry a copy-paste Quickstart: the carrier (a sync
-    /// `Transport` impl), the CSIL-RPC envelope contract (the `/csil/v1/rpc` POST and
-    /// the tag-24 payload), the `status` / `ServiceError` arms, and the typed example
-    /// call with a sample request literal. Asserted without a toolchain so it guards
-    /// the emitted text everywhere, even where cargo is absent.
+    /// The canonical verification spec for the 3-transport genquickstart: two records
+    /// and a service with both a `->` op (`ping`) and a record-typed `<->` op (`pulse`),
+    /// so the RPC, Events, and Datagrams sections all render against real ops.
+    fn transports_input() -> WasmGeneratorInput {
+        let ping = group_rule("Ping", "msg", "text");
+        let pong = group_rule("Pong", "msg", "text");
+        let mk_op = |name: &str, dir: CsilServiceDirection| CsilServiceOperation {
+            name: name.to_string(),
+            input_type: CsilTypeExpression::Reference("Ping".to_string()),
+            output_type: CsilTypeExpression::Reference("Pong".to_string()),
+            direction: dir,
+            position: CsilPosition {
+                line: 1,
+                column: 1,
+                offset: 0,
+            },
+            doc_comments: Vec::new(),
+            wire_id: None,
+        };
+        let svc = CsilRule {
+            name: "EchoService".to_string(),
+            rule_type: CsilRuleType::ServiceDef(CsilServiceDefinition {
+                operations: vec![
+                    mk_op("ping", CsilServiceDirection::Unidirectional),
+                    mk_op("pulse", CsilServiceDirection::Bidirectional),
+                ],
+                wire_id: None,
+            }),
+            position: CsilPosition {
+                line: 1,
+                column: 1,
+                offset: 0,
+            },
+            doc_comments: Vec::new(),
+        };
+        let mut input = create_test_input();
+        input.config.target = "rust-client".to_string();
+        input
+            .config
+            .options
+            .insert("emit_packages".to_string(), serde_json::json!(["rust"]));
+        input.csil_spec.rules = vec![ping, pong, svc];
+        input.csil_spec.service_count = 1;
+        input
+    }
+
+    fn transports_readme(input: &WasmGeneratorInput) -> String {
+        let files = RustCodeGenerator::new(input).generate().unwrap();
+        files
+            .iter()
+            .find(|f| f.path == "genquickstart.md")
+            .expect("genquickstart.md emitted")
+            .content
+            .clone()
+    }
+
+    /// The slice of `md` from `heading` up to the next `## ` heading (or end).
+    fn md_section<'a>(md: &'a str, heading: &str) -> &'a str {
+        let start = md.find(heading).expect("section heading present");
+        let rest = &md[start..];
+        match rest[heading.len()..].find("\n## ") {
+            Some(off) => &rest[..heading.len() + off],
+            None => rest,
+        }
+    }
+
+    /// The `rust` fenced block under the given `## ` heading.
+    fn section_rust_block(md: &str, heading: &str) -> String {
+        let sec = md_section(md, heading);
+        let start = sec.find("```rust\n").expect("section has a rust block") + "```rust\n".len();
+        let rest = &sec[start..];
+        let end = rest.find("\n```").expect("rust block is closed");
+        rest[..end].to_string()
+    }
+
     #[test]
-    fn package_readme_has_quickstart_carrier_and_example() {
+    fn genquickstart_has_all_three_sections_by_default() {
+        let readme = transports_readme(&transports_input());
+        for heading in [
+            "## CSIL-RPC (HTTP)",
+            "## CSIL-Events (TLS)",
+            "## CSIL-Datagrams (UDP)",
+        ] {
+            assert!(
+                readme.contains(heading),
+                "default genquickstart must contain {heading}:\n{readme}"
+            );
+        }
+        // The deps block pulls in the transport library alongside the package + ureq.
+        assert!(readme.contains("csilgen-transport = \"0.1\""));
+        assert!(readme.contains("ureq = \"2\""));
+    }
+
+    #[test]
+    fn genquickstart_transports_subset_emits_only_listed_sections() {
+        let mut input = transports_input();
+        input.config.options.insert(
+            "genquickstart_transports".to_string(),
+            serde_json::json!(["rpc"]),
+        );
+        let readme = transports_readme(&input);
+        assert!(readme.contains("## CSIL-RPC (HTTP)"));
+        assert!(
+            !readme.contains("## CSIL-Events (TLS)"),
+            "events section must be suppressed:\n{readme}"
+        );
+        assert!(
+            !readme.contains("## CSIL-Datagrams (UDP)"),
+            "datagrams section must be suppressed:\n{readme}"
+        );
+    }
+
+    #[test]
+    fn genquickstart_transports_unknown_or_empty_falls_back_to_all() {
+        for opt in [serde_json::json!([]), serde_json::json!(["bogus"])] {
+            let mut input = transports_input();
+            input
+                .config
+                .options
+                .insert("genquickstart_transports".to_string(), opt.clone());
+            let readme = transports_readme(&input);
+            assert!(
+                readme.contains("## CSIL-RPC (HTTP)")
+                    && readme.contains("## CSIL-Events (TLS)")
+                    && readme.contains("## CSIL-Datagrams (UDP)"),
+                "{opt} must fall back to all three sections:\n{readme}"
+            );
+        }
+
+        let mut input = transports_input();
+        input.config.options.insert(
+            "genquickstart_transports".to_string(),
+            serde_json::json!(["datagrams", "bogus"]),
+        );
+        let readme = transports_readme(&input);
+        assert!(readme.contains("## CSIL-Datagrams (UDP)"));
+        assert!(!readme.contains("## CSIL-RPC (HTTP)"));
+        assert!(!readme.contains("## CSIL-Events (TLS)"));
+    }
+
+    #[test]
+    fn each_section_names_its_library_imports_and_seam() {
+        let readme = transports_readme(&transports_input());
+        let rpc = md_section(&readme, "## CSIL-RPC (HTTP)");
+        let events = md_section(&readme, "## CSIL-Events (TLS)");
+        let datagrams = md_section(&readme, "## CSIL-Datagrams (UDP)");
+
+        // RPC: the library envelope types + the canonical HTTP mount, no hand-rolled CBOR.
+        assert!(rpc.contains("use csilgen_transport::rpc::{RpcRequest, RpcResponse};"));
+        assert!(rpc.contains("RpcRequest::new(service, op, req.to_vec())"));
+        assert!(rpc.contains("RpcResponse::decode(&body)"));
+        assert!(rpc.contains("/csil/v1/rpc"));
+        assert!(rpc.contains("into_transport_error()"));
+        assert!(rpc.contains("== Some(\"ServiceError\")"));
+        assert!(rpc.contains("impl Transport for HttpRpcCarrier"));
+        assert!(rpc.contains("EchoClient::new(HttpRpcCarrier::new("));
+        assert!(rpc.contains("client.ping(Ping { msg: \"example\".to_string() })"));
+        assert!(
+            !readme.contains("hand-roll") && !readme.contains("CSIL_TAG_EMBEDDED_CBOR"),
+            "the lib-based carrier must not hand-roll CBOR:\n{readme}"
+        );
+
+        // Events: the lib's handshake/framing/heartbeat surface + the generated channel
+        // router. Outbound (the op success output, Pong) rides the generated encoder;
+        // inbound dispatch goes through route_<service>_channel into a handler that
+        // implements the generated service trait — not codec-direct.
+        assert!(events.contains("StreamCarrier::new(stream)"));
+        assert!(events.contains("Hello {"));
+        assert!(events.contains("$hello"));
+        assert!(events.contains("HelloAck::decode(&ack_frame)"));
+        assert!(events.contains("control::PING_NAME"));
+        assert!(events.contains("control::PONG_NAME"));
+        assert!(
+            events.contains("encode_echo_service_pulse(&Pong { msg: \"example\".to_string() })"),
+            "outbound must ride the generated encoder:\n{events}"
+        );
+        assert!(
+            events.contains("route_echo_service_channel(&handlers, &(), method, &ev.payload)"),
+            "inbound dispatch must go through the generated channel router:\n{events}"
+        );
+        assert!(
+            events.contains("impl EchoService for QuickstartHandlers"),
+            "the handler must implement the generated service trait:\n{events}"
+        );
+        assert!(
+            !events.contains("decode_pong(&ev.payload)"),
+            "the Events section must not decode payloads directly anymore:\n{events}"
+        );
+
+        // Datagrams: the lib's Datagram + carrier seam, and the no-sync-response warning.
+        assert!(datagrams.contains("use csilgen_transport::datagrams::Datagram;"));
+        assert!(datagrams.contains("Datagram::new(OP_ORD, 0, encode_ping(&req)).encode()"));
+        assert!(datagrams.contains("Datagram::decode(&inbound)"));
+        assert!(datagrams.contains("decode_pong(&dg.payload)"));
+        assert!(datagrams.contains("NO synchronous response"));
+    }
+
+    #[test]
+    fn rpc_section_renders_for_server_target_in_package_mode() {
+        // Package mode emits every surface (client + server) regardless of the requested
+        // target — mirroring OCaml — so even the `rust` server target's genquickstart
+        // carries a working typed RPC client example rather than a pointer to rust-client.
+        let mut input = transports_input();
+        input.config.target = "rust".to_string();
+        let readme = transports_readme(&input);
+        let rpc = md_section(&readme, "## CSIL-RPC (HTTP)");
+        assert!(
+            rpc.contains("EchoClient::new(") && !rpc.contains("no sync RPC client"),
+            "server-target RPC section must render the typed client in package mode:\n{rpc}"
+        );
+        assert!(readme.contains("## CSIL-Events (TLS)"));
+        assert!(readme.contains("## CSIL-Datagrams (UDP)"));
+    }
+
+    #[test]
+    fn events_section_without_channel_ops_emits_a_note() {
+        // The corndogs spec has only a `->` op, so the Events section keeps the handshake
+        // but replaces typed dispatch with a note (no generated-codec channel decode).
         let mut input = corndogs_client_input();
         input
             .config
             .options
             .insert("emit_packages".to_string(), serde_json::json!(["rust"]));
-        let files = RustCodeGenerator::new(&input).generate().unwrap();
-        let readme = files
-            .iter()
-            .find(|f| f.path == "README.md")
-            .expect("README.md emitted");
-        let c = &readme.content;
-
-        // The package title and the carrier's HTTP dependency are spelled out.
-        assert!(c.contains("# corndogs"));
-        assert!(c.contains("ureq = \"2\""));
-
-        // The carrier: a sync `Transport` impl that speaks the CSIL-RPC envelope.
-        assert!(c.contains("impl Transport for CsilRpcTransport"));
-        assert!(c.contains("/csil/v1/rpc"));
-        assert!(c.contains("CSIL_TAG_EMBEDDED_CBOR: u64 = 24"));
-        assert!(c.contains("ureq::post"));
-
-        // Both response arms are handled: a non-zero transport status and the typed
-        // ServiceError variant mapped to `ClientError::Service`.
-        assert!(c.contains("transport status"));
-        assert!(c.contains("== Some(\"ServiceError\")"));
-        assert!(c.contains("ClientError::Service"));
-
-        // The example constructs the typed client over the carrier and calls the first
-        // op with a generated sample literal naming the real request type + fields.
-        assert!(c.contains("CorndogsClient::new(CsilRpcTransport::new("));
-        assert!(c.contains("client.submit_task(SubmitTaskRequest {"));
-        assert!(c.contains("queue: \"example\".to_string()"));
-        // Every field of the nested record is present (optionals as `None`).
-        assert!(c.contains("Task {"));
-        assert!(c.contains("priority: None"));
-    }
-
-    /// A server-surface (or types-only) package gets no carrier Quickstart — there is
-    /// no sync client to ride on — so it falls back to the import-the-types section.
-    #[test]
-    fn package_readme_falls_back_without_a_sync_client() {
-        let mut input = corndogs_client_input();
-        input.config.target = "rust".to_string(); // server surface, no client struct
-        input
-            .config
-            .options
-            .insert("emit_packages".to_string(), serde_json::json!(["rust"]));
-        let files = RustCodeGenerator::new(&input).generate().unwrap();
-        let readme = files
-            .iter()
-            .find(|f| f.path == "README.md")
-            .expect("README.md emitted");
+        let readme = transports_readme(&input);
+        let events = md_section(&readme, "## CSIL-Events (TLS)");
+        assert!(events.contains("$hello"));
         assert!(
-            !readme
-                .content
-                .contains("impl Transport for CsilRpcTransport")
+            events.contains("no <->/<- operations"),
+            "must note the absence of channel ops:\n{events}"
         );
         assert!(
-            readme
-                .content
-                .contains("import its generated\ntypes and codec")
+            !events.contains("decode_"),
+            "no typed channel decode when there are no channel ops:\n{events}"
         );
     }
 
-    /// Generate the client package, drop the README's Quickstart in as an `examples/`
-    /// binary, and compile it with a hermetic offline `cargo build --examples`. A clean
-    /// compile proves the carrier is valid Rust against the *real* generated `Transport`,
-    /// `ClientError`, typed client, and codec — socket-free (the build never runs the
-    /// example, so it opens no socket; the sandbox kills cross-process loopback). `ureq`
-    /// is added as a dev-dependency from the local cargo cache. Skips when no cargo.
+    /// Stage the transports client package, drop the three README sections as `examples/`
+    /// binaries plus an in-process round-trip driver, and drive a hermetic offline cargo.
+    /// `cargo build --examples` compiles all three emitted sections (CSIL-Events is
+    /// interactive/socket-driven, so this is its compile-check) against the real generated
+    /// package + the `csilgen-transport` library; `cargo run --example roundtrip` then
+    /// *runs* the CSIL-RPC (typed client over an in-process library-envelope echo) and
+    /// CSIL-Datagrams (library loopback carrier) round-trips. Socket-free. Skips no cargo.
     #[test]
-    fn readme_quickstart_compiles_against_generated_package() {
+    fn genquickstart_sections_compile_and_round_trip() {
         let probe = std::process::Command::new("cargo")
             .arg("--version")
             .output();
@@ -6771,24 +7263,22 @@ mod tests {
             return;
         }
 
-        let mut input = corndogs_client_input();
-        input
-            .config
-            .options
-            .insert("emit_packages".to_string(), serde_json::json!(["rust"]));
-        let files = RustCodeGenerator::new(&input).generate().unwrap();
-
-        // Extract the single fenced ```rust block from the README — exactly the code a
-        // user would copy — and compile that, not a hand-massaged variant.
-        let readme = &files
+        let files = RustCodeGenerator::new(&transports_input())
+            .generate()
+            .unwrap();
+        let readme = files
             .iter()
-            .find(|f| f.path == "README.md")
+            .find(|f| f.path == "genquickstart.md")
             .unwrap()
-            .content;
-        let after = readme.split("```rust\n").nth(1).expect("a rust code block");
-        let snippet = after.split("\n```").next().expect("a closed code block");
+            .content
+            .clone();
 
-        let dir = std::env::temp_dir().join(format!("csilgen-rust-readme-{}", std::process::id()));
+        let lib = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../transports/rust")
+            .canonicalize()
+            .expect("transports/rust must exist");
+
+        let dir = std::env::temp_dir().join(format!("csilgen-rust-3t-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         for file in &files {
             let path = dir.join(&file.path);
@@ -6796,35 +7286,146 @@ mod tests {
                 std::fs::create_dir_all(parent).unwrap();
             }
             if file.path == "Cargo.toml" {
-                // Examples may use dev-dependencies; the carrier's only one is `ureq`.
+                // The README example carriers ride two dev-deps: the (unpublished)
+                // transport library via a local path, and ureq for the RPC HTTP carrier.
                 let mut cargo = file.content.clone();
-                cargo.push_str("\n[dev-dependencies]\nureq = \"2\"\n");
+                cargo.push_str(&format!(
+                    "\n[dev-dependencies]\ncsilgen-transport = {{ path = \"{}\" }}\nureq = \"2\"\n",
+                    lib.display()
+                ));
                 std::fs::write(&path, cargo).unwrap();
             } else {
                 std::fs::write(&path, &file.content).unwrap();
             }
         }
+
         let examples = dir.join("examples");
         std::fs::create_dir_all(&examples).unwrap();
-        std::fs::write(examples.join("quickstart.rs"), snippet).unwrap();
+        std::fs::write(
+            examples.join("rpc.rs"),
+            section_rust_block(&readme, "## CSIL-RPC (HTTP)"),
+        )
+        .unwrap();
+        std::fs::write(
+            examples.join("events.rs"),
+            section_rust_block(&readme, "## CSIL-Events (TLS)"),
+        )
+        .unwrap();
+        std::fs::write(
+            examples.join("datagrams.rs"),
+            section_rust_block(&readme, "## CSIL-Datagrams (UDP)"),
+        )
+        .unwrap();
+        std::fs::write(examples.join("roundtrip.rs"), RUST_TRANSPORTS_DRIVER).unwrap();
 
+        let target = dir.join("target");
         let build = std::process::Command::new("cargo")
             .arg("build")
             .arg("--examples")
             .arg("--quiet")
             .current_dir(&dir)
-            .env("CARGO_TARGET_DIR", dir.join("target"))
+            .env("CARGO_TARGET_DIR", &target)
             .env("CARGO_NET_OFFLINE", "true")
             .output()
             .unwrap();
-        let stdout = String::from_utf8_lossy(&build.stdout);
-        let stderr = String::from_utf8_lossy(&build.stderr);
         assert!(
             build.status.success(),
-            "cargo build of README quickstart failed:\nstdout:\n{stdout}\nstderr:\n{stderr}"
+            "cargo build of the 3 README sections failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&build.stdout),
+            String::from_utf8_lossy(&build.stderr)
+        );
+
+        let run = std::process::Command::new("cargo")
+            .arg("run")
+            .arg("--example")
+            .arg("roundtrip")
+            .arg("--quiet")
+            .current_dir(&dir)
+            .env("CARGO_TARGET_DIR", &target)
+            .env("CARGO_NET_OFFLINE", "true")
+            .output()
+            .unwrap();
+        assert!(
+            run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+            "RPC + Datagrams round-trip driver failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// The in-process round-trip driver for the transports package. It exercises the same
+    /// generated codec + typed client + library envelope surfaces the emitted RPC and
+    /// Datagrams sections ride, without a socket: CSIL-RPC through an in-process
+    /// `RpcRequest`/`RpcResponse` echo, CSIL-Datagrams through the library's loopback
+    /// datagram carrier. Prints `ok` on success.
+    const RUST_TRANSPORTS_DRIVER: &str = r#"use csilgen_transport::carrier::{DatagramCarrier, LoopbackDatagramCarrier};
+use csilgen_transport::datagrams::Datagram;
+use csilgen_transport::rpc::{RpcRequest, RpcResponse};
+
+use echo::*;
+
+// A "server" on the far side of the dumb byte seam: it composes the request and reply
+// through the library RPC envelope, proving RpcRequest/RpcResponse interop with the
+// generated codec.
+struct RpcEcho;
+
+impl Transport for RpcEcho {
+    fn call(&self, service: &str, op: &str, req: &[u8]) -> Result<Vec<u8>, ClientError> {
+        let envelope = RpcRequest::new(service, op, req.to_vec())
+            .encode()
+            .map_err(|e| ClientError::Transport(e.to_string()))?;
+        let decoded = RpcRequest::decode(&envelope)
+            .map_err(|e| ClientError::Transport(e.to_string()))?;
+        let ping = decode_ping(&decoded.payload).map_err(|e| ClientError::Transport(e.to_string()))?;
+        let pong = Pong { msg: ping.msg };
+        let resp = RpcResponse::ok("Pong", encode_pong(&pong))
+            .encode()
+            .map_err(|e| ClientError::Transport(e.to_string()))?;
+        let parsed = RpcResponse::decode(&resp)
+            .map_err(|e| ClientError::Transport(e.to_string()))?
+            .into_transport_error()
+            .map_err(|e| ClientError::Transport(e.to_string()))?;
+        Ok(parsed.payload)
+    }
+}
+
+fn check(cond: bool, msg: &str) {
+    if !cond {
+        eprintln!("FAIL: {msg}");
+        std::process::exit(1);
+    }
+}
+
+fn main() {
+    // CSIL-RPC: the typed client over the in-process library-envelope echo.
+    let client = EchoClient::new(RpcEcho);
+    let resp = client.ping(Ping { msg: "hello".to_string() }).expect("ping");
+    check(resp.msg == "hello", "rpc round-trip msg");
+
+    // CSIL-Datagrams: send via the library Datagram + generated codec over a loopback,
+    // seed a response datagram, and decode it back into the typed response.
+    let mut carrier = LoopbackDatagramCarrier::new();
+    let req = Ping { msg: "example".to_string() };
+    carrier
+        .send_datagram(&Datagram::new(1, 0, encode_ping(&req)).encode().unwrap())
+        .unwrap();
+    carrier.push_inbound(
+        Datagram::new(1, 0, encode_pong(&Pong { msg: "late".to_string() }))
+            .encode()
+            .unwrap(),
+    );
+    let inbound = carrier.recv_datagram().unwrap().expect("a seeded datagram");
+    let dg = Datagram::decode(&inbound).unwrap();
+    check(decode_pong(&dg.payload).unwrap().msg == "late", "datagram response decode");
+    // The datagram we sent must round-trip through the generated codec too.
+    let sent = carrier.take_outbound().expect("a sent datagram");
+    let sent_dg = Datagram::decode(&sent).unwrap();
+    check(decode_ping(&sent_dg.payload).unwrap().msg == "example", "datagram request round-trip");
+
+    println!("ok");
+}
+"#;
 
     /// Driver `main` for the round-trip crate: it round-trips a corndogs request
     /// through the generated codec directly and through the typed client over a

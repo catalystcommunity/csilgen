@@ -220,65 +220,73 @@ fn build_files(input: &WasmGeneratorInput) -> Result<Vec<GeneratedFile>, i32> {
     }
 
     if input.csil_spec.service_count > 0 {
-        match surface {
-            Surface::Client => {
-                // `Both` (the default) ships the blocking client at `Client.swift` and an
-                // `async` twin at `ClientAsync.swift`; `Async` makes the `async` client a
-                // drop-in at `Client.swift` (canonical names); `Sync` is today's output.
-                let sync = ClientShape {
-                    is_async: false,
-                    marker: "",
-                };
-                let async_drop_in = ClientShape {
-                    is_async: true,
-                    marker: "",
-                };
-                let async_twin = ClientShape {
-                    is_async: true,
-                    marker: "Async",
-                };
-                match style {
-                    ClientStyle::Sync => {
-                        if let Some(client) = generate_client(input, sync) {
-                            files.push(GeneratedFile {
-                                path: "Client.swift".to_string(),
-                                content: client,
-                            });
-                        }
+        // A package's `genquickstart.md` demonstrates the calling side (the CSIL-RPC and
+        // CSIL-Datagrams sections, over the typed client) AND the handling side (the
+        // CSIL-Events section, over the channel router + handler protocol), so a package
+        // must carry BOTH surfaces for its own quickstart to compile — regardless of which
+        // (sub-)target was requested. A flat (non-package) build stays byte-identical: it
+        // emits only the requested surface. Mirrors the OCaml generator.
+        let pkg_mode = emit_packages_includes(&input.config.options, "swift");
+        let want_client = matches!(surface, Surface::Client)
+            || (pkg_mode && !matches!(surface, Surface::TypesOnly));
+        let want_server = matches!(surface, Surface::Server)
+            || (pkg_mode && !matches!(surface, Surface::TypesOnly));
+
+        if want_client {
+            // `Both` (the default) ships the blocking client at `Client.swift` and an
+            // `async` twin at `ClientAsync.swift`; `Async` makes the `async` client a
+            // drop-in at `Client.swift` (canonical names); `Sync` is today's output.
+            let sync = ClientShape {
+                is_async: false,
+                marker: "",
+            };
+            let async_drop_in = ClientShape {
+                is_async: true,
+                marker: "",
+            };
+            let async_twin = ClientShape {
+                is_async: true,
+                marker: "Async",
+            };
+            match style {
+                ClientStyle::Sync => {
+                    if let Some(client) = generate_client(input, sync) {
+                        files.push(GeneratedFile {
+                            path: "Client.swift".to_string(),
+                            content: client,
+                        });
                     }
-                    ClientStyle::Async => {
-                        if let Some(client) = generate_client(input, async_drop_in) {
-                            files.push(GeneratedFile {
-                                path: "Client.swift".to_string(),
-                                content: client,
-                            });
-                        }
+                }
+                ClientStyle::Async => {
+                    if let Some(client) = generate_client(input, async_drop_in) {
+                        files.push(GeneratedFile {
+                            path: "Client.swift".to_string(),
+                            content: client,
+                        });
                     }
-                    ClientStyle::Both => {
-                        if let Some(client) = generate_client(input, sync) {
-                            files.push(GeneratedFile {
-                                path: "Client.swift".to_string(),
-                                content: client,
-                            });
-                        }
-                        if let Some(client) = generate_client(input, async_twin) {
-                            files.push(GeneratedFile {
-                                path: "ClientAsync.swift".to_string(),
-                                content: client,
-                            });
-                        }
+                }
+                ClientStyle::Both => {
+                    if let Some(client) = generate_client(input, sync) {
+                        files.push(GeneratedFile {
+                            path: "Client.swift".to_string(),
+                            content: client,
+                        });
+                    }
+                    if let Some(client) = generate_client(input, async_twin) {
+                        files.push(GeneratedFile {
+                            path: "ClientAsync.swift".to_string(),
+                            content: client,
+                        });
                     }
                 }
             }
-            Surface::Server => {
-                if let Some(services) = generate_services(input) {
-                    files.push(GeneratedFile {
-                        path: "Services.swift".to_string(),
-                        content: services,
-                    });
-                }
-            }
-            Surface::TypesOnly => {}
+        }
+
+        if want_server && let Some(services) = generate_services(input) {
+            files.push(GeneratedFile {
+                path: "Services.swift".to_string(),
+                content: services,
+            });
         }
     }
 
@@ -293,7 +301,7 @@ fn build_files(input: &WasmGeneratorInput) -> Result<Vec<GeneratedFile>, i32> {
         // value keeps the default emission.
         if emit_readme_enabled(&input.config.options) {
             files.push(GeneratedFile {
-                path: "README.md".to_string(),
+                path: "genquickstart.md".to_string(),
                 content: swift_readme(input, &pkg),
             });
         }
@@ -416,59 +424,95 @@ let package = Package(\n\
 }
 
 // ---------------------------------------------------------------------------
-// Package README + CSIL-RPC Quickstart
+// Package README — 3-transport Quickstart (CSIL-RPC / Events / Datagrams)
 // ---------------------------------------------------------------------------
 
-/// The package README, with a copy-paste **Quickstart**. For a client package the
-/// Quickstart is a complete CSIL-RPC carrier (it reuses this package's own generated
-/// `CsilCbor`/`CsilCborValue` for the envelope, so it adds no third-party CBOR
-/// dependency; HTTP is Foundation's blocking `URLSession`), the typed sync client built
-/// over it, and one example call — a user changes only the base-URL string. A spec with
-/// no usable unary operation gets the import-the-types section without a carrier.
+/// Which of the three transport sections to render. The `genquickstart_transports`
+/// option is a JSON array subset of `["rpc","events","datagrams"]`; unknown entries are
+/// ignored, and an absent or all-unknown value means "all three" so the document always
+/// renders something coherent.
+fn wanted_transports(
+    options: &std::collections::HashMap<String, serde_json::Value>,
+) -> (bool, bool, bool) {
+    let Some(items) = options
+        .get("genquickstart_transports")
+        .and_then(|v| v.as_array())
+    else {
+        return (true, true, true);
+    };
+    let names: std::collections::BTreeSet<&str> = items.iter().filter_map(|v| v.as_str()).collect();
+    let any_known = ["rpc", "events", "datagrams"]
+        .iter()
+        .any(|t| names.contains(t));
+    if any_known {
+        (
+            names.contains("rpc"),
+            names.contains("events"),
+            names.contains("datagrams"),
+        )
+    } else {
+        (true, true, true)
+    }
+}
+
+/// The package README: a transport-by-transport Quickstart over the official
+/// `CsilgenTransport` library. The generated codec owns CBOR (de)serialization and the
+/// library owns the envelope/framing/lifecycle; the consumer supplies only a *carrier*
+/// that moves bytes. Each requested section (CSIL-RPC over HTTP, CSIL-Events over TLS,
+/// CSIL-Datagrams over UDP) is a complete, copy-paste example built on the library.
 fn swift_readme(input: &WasmGeneratorInput, pkg: &SwiftPackage) -> String {
     let module = &pkg.target;
     let name = &pkg.name;
     let mut out = format!(
         "# {name}\n\n\
-         Generated by csilgen. A typed, transport-agnostic CSIL-RPC client: the\n\
-         generated codec owns CBOR (de)serialization; you supply a *carrier* that only\n\
-         moves bytes.\n\n\
+         Generated by csilgen. A typed CSIL client: the generated codec owns CBOR\n\
+         (de)serialization and the `CsilgenTransport` library owns the envelope, framing,\n\
+         and connection lifecycle. You supply only a *carrier* that moves bytes, so the\n\
+         same typed surface rides HTTP, TLS, a WebSocket, QUIC, or raw UDP unchanged.\n\n\
          ## Consume\n\n\
-         Add this package to your `Package.swift` dependencies and list the `{name}`\n\
-         library product in your target's `dependencies`:\n\n\
+         Add this package and the transport library to your `Package.swift`. The transport\n\
+         lib is not yet published, so depend on it by local path for now:\n\n\
          ```swift\n\
          // TODO: point at the published git URL + version once tagged.\n\
          .package(path: \"./{name}\"),\n\
-         ```\n\n"
+         .package(path: \"../csilgen/transports/swift\"),\n\
+         ```\n\n\
+         and list both products in your target's `dependencies`: `\"{module}\"` and\n\
+         `.product(name: \"CsilgenTransport\", package: \"swift\")`.\n\n"
     );
-    match first_swift_example(input) {
-        Some(example) => out.push_str(&swift_quickstart(module, &example)),
-        None => out.push_str(&format!(
-            "## Quickstart\n\n\
-             This package has no unary service operations — import the module and use\n\
-             its generated types and codec directly:\n\n\
-             ```swift\n\
-             import {module}\n\
-             // Foo.fromCbor(bytes) decodes; value.toCbor() encodes.\n\
-             ```\n"
-        )),
+
+    let (rpc, events, datagrams) = wanted_transports(&input.config.options);
+    let unary = first_swift_unary_example(input);
+    let channel = first_swift_channel_example(input);
+    if rpc {
+        out.push_str(&swift_rpc_section(module, unary.as_ref()));
+    }
+    if events {
+        out.push_str(&swift_events_section(module, channel.as_ref()));
+    }
+    if datagrams {
+        out.push_str(&swift_datagrams_section(module, unary.as_ref()));
     }
     out
 }
 
-/// The pieces the Quickstart's example call needs: the sync client struct to construct,
-/// the method to call, and a compiling sample request literal (`None` for a request-less
-/// push-style op).
-struct SwiftExample {
+/// The pieces a unary (`->`) example needs: the sync client struct to construct, the
+/// method to call, a compiling sample request literal (`None` for a request-less op),
+/// the request/response record type names (so the datagram section can name them), and
+/// the op's datagram ordinal.
+struct SwiftUnaryExample {
     client_struct: String,
     method: String,
     sample: Option<String>,
+    req_type: Option<String>,
+    res_type: String,
+    op_ord: u64,
 }
 
 /// The first service (declared order) with a unary op whose success type — and, when
 /// present, request type — is a record the generated codec covers, so the example can
 /// call the clean typed sync client form. `None` for a serviceless / non-record-op spec.
-fn first_swift_example(input: &WasmGeneratorInput) -> Option<SwiftExample> {
+fn first_swift_unary_example(input: &WasmGeneratorInput) -> Option<SwiftUnaryExample> {
     let records = swift_record_names(input);
     for rule in &input.csil_spec.rules {
         let CsilRuleType::ServiceDef(service) = &rule.rule_type else {
@@ -478,52 +522,136 @@ fn first_swift_example(input: &WasmGeneratorInput) -> Option<SwiftExample> {
             if !matches!(op.direction, CsilServiceDirection::Unidirectional) {
                 continue;
             }
-            if !is_record_ref(&success_type(&op.output_type), &records) {
+            let success = success_type(&op.output_type);
+            if !is_record_ref(&success, &records) {
                 continue;
             }
             let null_in = is_null_input(&op.input_type);
             if !null_in && !is_record_ref(&op.input_type, &records) {
                 continue;
             }
-            let sample = if null_in {
-                None
+            let (sample, req_type) = if null_in {
+                (None, None)
             } else if let CsilTypeExpression::Reference(name) = &op.input_type {
-                Some(swift_record_literal(
-                    input,
-                    name,
-                    swift_find_record(input, name)?,
-                ))
+                (
+                    Some(swift_record_literal(
+                        input,
+                        name,
+                        swift_find_record(input, name)?,
+                    )),
+                    Some(swift_type_name(name)),
+                )
             } else {
-                None
+                (None, None)
             };
             if !null_in && sample.is_none() {
                 continue;
             }
-            return Some(SwiftExample {
+            let CsilTypeExpression::Reference(res_name) = &success else {
+                continue;
+            };
+            return Some(SwiftUnaryExample {
                 // The blocking client is the unmarked `<Base>Client` (sync shape).
                 client_struct: format!("{}Client", service_base(&rule.name)),
                 method: swift_ident(&op.name),
                 sample,
+                req_type,
+                res_type: swift_type_name(res_name),
+                // The datagram ordinal is the op's @wire-id when present; otherwise a
+                // channel-agreed placeholder the user fills in.
+                op_ord: op.wire_id.unwrap_or(1),
             });
         }
     }
     None
 }
 
-fn swift_quickstart(module: &str, ex: &SwiftExample) -> String {
-    let mut out = String::from("## Quickstart\n\n");
+/// The pieces the Events session needs: the generated handler protocol + channel router +
+/// outbound encoder names, the inbound (op input) and outbound (op success output) record
+/// type names, the handler method name, the outbound sample literal, and the wire service.
+struct SwiftChannelExample {
+    handler_protocol: String,
+    service_wire: String,
+    route_fn: String,
+    encode_fn: String,
+    handler_method: String,
+    inbound_type: String,
+    outbound_type: String,
+    outbound_sample: String,
+}
+
+/// The first service (declared order) with a `<->` op whose input and success output are
+/// both records (so the generated router, encoder, and per-type codec helpers exist).
+/// `None` when no service has a usable channel op — the Events section then shows the
+/// handshake/heartbeat without dispatch wiring.
+fn first_swift_channel_example(input: &WasmGeneratorInput) -> Option<SwiftChannelExample> {
+    let records = swift_record_names(input);
+    for rule in &input.csil_spec.rules {
+        let CsilRuleType::ServiceDef(service) = &rule.rule_type else {
+            continue;
+        };
+        for op in &service.operations {
+            if !matches!(op.direction, CsilServiceDirection::Bidirectional) {
+                continue;
+            }
+            let success = success_type(&op.output_type);
+            if !is_record_ref(&success, &records) || !is_record_ref(&op.input_type, &records) {
+                continue;
+            }
+            // The verbose router decodes the op INPUT and calls the handler; the encoder
+            // produces the op success OUTPUT. Both must be named records for a sample.
+            let (CsilTypeExpression::Reference(in_name), CsilTypeExpression::Reference(out_name)) =
+                (&op.input_type, &success)
+            else {
+                continue;
+            };
+            let type_name = swift_type_name(&rule.name);
+            let method_pascal = swift_type_name(&op.name);
+            return Some(SwiftChannelExample {
+                handler_protocol: type_name.clone(),
+                service_wire: wire_service_string(&rule.name),
+                route_fn: format!("route{type_name}Channel"),
+                encode_fn: format!("encode{type_name}{method_pascal}"),
+                handler_method: swift_ident(&op.name),
+                inbound_type: swift_type_name(in_name),
+                outbound_type: swift_type_name(out_name),
+                outbound_sample: swift_record_literal(
+                    input,
+                    out_name,
+                    swift_find_record(input, out_name)?,
+                ),
+            });
+        }
+    }
+    None
+}
+
+/// CSIL-RPC over HTTP: a carrier implementing the generated `CsilTransport` byte seam that
+/// builds/parses the envelope with the library's `RpcRequest`/`RpcResponse` (never hand-
+/// rolled) and POSTs it to `{baseURL}/csil/v1/rpc`. The typed client decodes the success
+/// payload; a non-zero transport status and the `ServiceError` arm are surfaced distinctly.
+fn swift_rpc_section(module: &str, ex: Option<&SwiftUnaryExample>) -> String {
+    let mut out = String::from("## CSIL-RPC (HTTP)\n\n");
     out.push_str(
-        "A complete CSIL-RPC carrier (no third-party deps — it reuses this package's\n\
-         generated CBOR codec for the envelope) plus the typed client over Foundation's\n\
-         blocking `URLSession`. Change the one base-URL string.\n\n",
+        "Request/response. The library owns the envelope (`RpcRequest`/`RpcResponse`); you\n\
+         bring a carrier that moves bytes. The `URLSession` carrier below is just one\n\
+         example — it implements the generated `CsilTransport` byte seam, so any HTTP\n\
+         client drops in unchanged.\n\n",
     );
+    let Some(ex) = ex else {
+        out.push_str(
+            "This package declares no `->` operations, so there is no RPC call to make.\n\n",
+        );
+        return out;
+    };
     out.push_str("```swift\n");
     out.push_str("import Foundation\n");
-    out.push_str(&format!("import {module}\n\n"));
-    out.push_str(SWIFT_CARRIER);
+    out.push_str(&format!("import {module}\n"));
+    out.push_str("import CsilgenTransport\n\n");
+    out.push_str(SWIFT_RPC_CARRIER);
     out.push('\n');
     out.push_str(&format!(
-        "let client = {}(transport: CsilRpcTransport(baseURL: \"http://localhost:5080\"))\n",
+        "let client = {}(transport: HttpRpcCarrier(baseURL: \"http://localhost:5080\"))\n",
         ex.client_struct
     ));
     match &ex.sample {
@@ -534,7 +662,217 @@ fn swift_quickstart(module: &str, ex: &SwiftExample) -> String {
         None => out.push_str(&format!("let result = try client.{}()\n", ex.method)),
     }
     out.push_str("print(result)\n");
-    out.push_str("```\n");
+    out.push_str("```\n\n");
+    out
+}
+
+/// CSIL-Events over TLS: a full session example. Wraps a TLS `ByteStream`
+/// (Network.framework `NWConnection`) in the library's `StreamCarrier` (length-prefix
+/// framing), performs the `$hello`/`$hello-ack` handshake, sends one outbound event via
+/// the generated `encode<Service><Op>`, and runs a recv loop that decodes each frame to an
+/// `Event`, answers `$ping` with `$pong`, and dispatches typed events to the generated
+/// `route<Service>Channel`. With no channel op the dispatch wiring becomes a note.
+fn swift_events_section(module: &str, ch: Option<&SwiftChannelExample>) -> String {
+    let mut out = String::from("## CSIL-Events (TLS)\n\n");
+    out.push_str(
+        "Typed, bidirectional event streams over a long-lived connection. The library owns\n\
+         the `$hello`/`$hello-ack` handshake, the `$ping`/`$pong` heartbeat, and length-\n\
+         prefix framing (`StreamCarrier` over a `ByteStream`); the generated router\n\
+         dispatches typed events. The TLS carrier below (Network.framework `NWConnection`)\n\
+         is just one example — a WebSocket/QUIC `ByteStream` drops in unchanged.\n\n",
+    );
+    out.push_str("```swift\n");
+    out.push_str("import Foundation\n");
+    out.push_str("import Network\n");
+    out.push_str(&format!("import {module}\n"));
+    out.push_str("import CsilgenTransport\n\n");
+    out.push_str(SWIFT_EVENTS_CARRIER);
+    out.push('\n');
+    match ch {
+        Some(ch) => out.push_str(&swift_events_session(ch)),
+        None => out.push_str(SWIFT_EVENTS_NO_CHANNEL_SESSION),
+    }
+    out.push_str("```\n\n");
+    out
+}
+
+/// The channel session body for an Events connection that has a `<->` op: a `CsilCodec`
+/// backed by the op's generated per-type helpers, the handshake, one outbound event via
+/// the generated encoder, and the recv loop that heartbeats and dispatches into the
+/// generated router.
+fn swift_events_session(ch: &SwiftChannelExample) -> String {
+    format!(
+        r#"
+// A CsilCodec backed by the generated per-type helpers (inbound {inbound}, outbound
+// {outbound}). The generated router uses it to (de)serialize channel payloads.
+struct ChannelCodec: CsilCodec {{
+    func encode<T>(_ value: T) throws -> [UInt8] {{
+        if let v = value as? {outbound} {{ return v.toCbor() }}
+        throw CsilCborError.typeMismatch
+    }}
+    func decode<T>(_ data: [UInt8], as type: T.Type) throws -> T {{
+        if type == {inbound}.self {{ return try {inbound}.fromCbor(data) as! T }}
+        throw CsilCborError.typeMismatch
+    }}
+}}
+
+// The generated handler seam; dispatch lands here. Implement every op of the service.
+struct Handler: {handler} {{
+    func {method}(_ msg: {inbound}) throws {{
+        print("event {method}", msg)
+    }}
+    // ... implement the service's remaining operations.
+}}
+
+func session() throws {{
+    // StreamCarrier wraps any ByteStream with the library's 4-byte length-prefix framing.
+    let carrier = StreamCarrier(stream: TlsByteStream(host: "localhost", port: 7443))
+    let codec = ChannelCodec()
+    let handler = Handler()
+
+    // $hello / $hello-ack handshake (control plane). The peer's $hello-ack pins the wire
+    // profile for the connection's lifetime.
+    try carrier.sendFrame(
+        Hello(versions: [csilVersion], profiles: ["verbose"], service: "{service}").encode())
+    guard let ackFrame = try carrier.recvFrame() else {{
+        throw TransportError.carrier("connection closed during handshake")
+    }}
+    let ack = try HelloAck.decode(ackFrame)
+    guard let profile = Profile.parse(ack.profile) else {{
+        throw TransportError.malformed("peer chose an unknown profile")
+    }}
+
+    // Send one outbound event via the generated encoder, framed as a verbose Event.
+    let out = try {encode}(codec: codec, msg: {sample})
+    try carrier.sendFrame(
+        Event.verbose(service: "{service}", event: out.op, payload: out.data).encode(profile))
+
+    // Recv loop: decode each frame to an Event, answer $ping with $pong, dispatch the rest
+    // to the generated router.
+    while let frame = try carrier.recvFrame() {{
+        let ev = try Event.decode(frame, profile)
+        if ev.event == Control.pingName {{
+            let ping = try Heartbeat.decode(ev.payload)
+            try carrier.sendFrame(
+                Event.verbose(
+                    service: nil, event: Control.pongName,
+                    payload: Heartbeat(nonce: ping.nonce).encode()
+                ).encode(profile))
+            continue
+        }}
+        try {route}(handler, codec: codec, op: ev.event!, data: ev.payload)
+    }}
+}}
+
+try session()
+"#,
+        inbound = ch.inbound_type,
+        outbound = ch.outbound_type,
+        handler = ch.handler_protocol,
+        method = ch.handler_method,
+        service = ch.service_wire,
+        encode = ch.encode_fn,
+        sample = ch.outbound_sample,
+        route = ch.route_fn,
+    )
+}
+
+/// The Events session body when the spec declares no `<->` op: the handshake and heartbeat
+/// still apply, so they are shown, with a note where the dispatch would go.
+const SWIFT_EVENTS_NO_CHANNEL_SESSION: &str = r#"
+func session() throws {
+    // StreamCarrier wraps any ByteStream with the library's 4-byte length-prefix framing.
+    let carrier = StreamCarrier(stream: TlsByteStream(host: "localhost", port: 7443))
+
+    // $hello / $hello-ack handshake (control plane).
+    try carrier.sendFrame(Hello(versions: [csilVersion], profiles: ["verbose"]).encode())
+    guard let ackFrame = try carrier.recvFrame() else {
+        throw TransportError.carrier("connection closed during handshake")
+    }
+    let ack = try HelloAck.decode(ackFrame)
+    guard let profile = Profile.parse(ack.profile) else {
+        throw TransportError.malformed("peer chose an unknown profile")
+    }
+
+    // Recv loop: answer $ping with $pong. This package declares no <->/<- operations, so
+    // there is no generated channel router to dispatch typed events into.
+    while let frame = try carrier.recvFrame() {
+        let ev = try Event.decode(frame, profile)
+        if ev.event == Control.pingName {
+            let ping = try Heartbeat.decode(ev.payload)
+            try carrier.sendFrame(
+                Event.verbose(
+                    service: nil, event: Control.pongName,
+                    payload: Heartbeat(nonce: ping.nonce).encode()
+                ).encode(profile))
+        }
+    }
+}
+
+try session()
+"#;
+
+/// CSIL-Datagrams over UDP: encode a `->` request with the generated codec, wrap it in the
+/// library's `Datagram`, and `sendDatagram` it fire-and-forget. The recv path
+/// `Datagram.decode`s an inbound datagram and decodes its payload with the generated codec
+/// into the RESPONSE type — there is NO synchronous response.
+fn swift_datagrams_section(module: &str, ex: Option<&SwiftUnaryExample>) -> String {
+    let mut out = String::from("## CSIL-Datagrams (UDP)\n\n");
+    out.push_str(
+        "Unreliable, unordered, message-oriented. The library owns the `Datagram`\n\
+         envelope; you bring a datagram carrier. The UDP carrier below (Network.framework\n\
+         `NWConnection`) is one example — QUIC datagrams or a WebRTC channel drop in\n\
+         unchanged.\n\n",
+    );
+    let Some(ex) = ex else {
+        out.push_str(
+            "This package declares no `->` operations, so there is no datagram payload to encode.\n\n",
+        );
+        return out;
+    };
+    let (Some(req_type), Some(sample)) = (&ex.req_type, &ex.sample) else {
+        out.push_str(
+            "This package's `->` operations take no request, so there is no datagram payload to encode.\n\n",
+        );
+        return out;
+    };
+    out.push_str("```swift\n");
+    out.push_str("import Foundation\n");
+    out.push_str("import Network\n");
+    out.push_str(&format!("import {module}\n"));
+    out.push_str("import CsilgenTransport\n\n");
+    out.push_str(SWIFT_DATAGRAMS_CARRIER);
+    out.push('\n');
+    out.push_str(&format!(
+        r#"// The operation's datagram ordinal — its @wire-id, or a channel-agreed number.
+let opOrd: UInt64 = {op_ord}
+
+func main() throws {{
+    let carrier = UdpDatagramCarrier(host: "localhost", port: 9000)
+
+    // Fire-and-forget: encode the `->` request and send it. seq 0 marks an unsequenced
+    // datagram.
+    let req: {req_type} = {sample}
+    try carrier.sendDatagram(Datagram(opOrd: opOrd, seq: 0, payload: req.toCbor()).encode())
+
+    // Recv path: a datagram of the RESPONSE type MAY arrive later — or never. There is NO
+    // synchronous response; the caller must tolerate loss and reordering and handle a reply
+    // whenever (if ever) it shows up.
+    if let inbound = try carrier.recvDatagram() {{
+        let dg = try Datagram.decode(inbound)
+        let resp = try {res_type}.fromCbor(dg.payload)
+        print("late response", resp)
+    }}
+}}
+
+try main()
+"#,
+        op_ord = ex.op_ord,
+        req_type = req_type,
+        sample = sample,
+        res_type = ex.res_type,
+    ));
+    out.push_str("```\n\n");
     out
 }
 
@@ -602,73 +940,149 @@ fn swift_sample(input: &WasmGeneratorInput, ty: &CsilTypeExpression) -> String {
     }
 }
 
-/// The carrier body — identical for every spec, so it is a constant. It wraps the
-/// already-encoded request in a `CsilRpcRequest` envelope (tag-24 payload) using this
-/// package's generated `CsilCbor`, POSTs it to `{baseURL}/csil/v1/rpc` with a blocking
-/// `URLSession`, and unwraps the `CsilRpcResponse` — surfacing a non-zero transport
-/// `status` or a typed `ServiceError` arm as a thrown `CsilClientError`.
-const SWIFT_CARRIER: &str = r#"// The carrier owns only the CSIL-RPC envelope + HTTP; it never touches your types.
-// Hybrid posture, path 1: the envelope reuses this package's generated CsilCbor /
-// CsilCborValue, so it adds no third-party CBOR dependency. HTTP is Foundation's
-// URLSession driven synchronously to satisfy the blocking `CsilTransport` seam.
-struct CsilRpcTransport: CsilTransport {
+/// The CSIL-RPC HTTP carrier — spec-independent, so a constant. It builds the request
+/// envelope with the library's `RpcRequest`, POSTs it to `{baseURL}/csil/v1/rpc` with a
+/// blocking `URLSession`, and lets `RpcResponse.decode` + `asTransportError()` raise on a
+/// non-zero transport status; the typed `ServiceError` arm (a status-0 variant) is
+/// surfaced separately.
+const SWIFT_RPC_CARRIER: &str = r#"// One example carrier: CSIL-RPC over an HTTP POST. The library owns the envelope
+// (RpcRequest/RpcResponse); the carrier owns only the transport. Swap URLSession for any
+// HTTP client — it implements the generated CsilTransport byte seam.
+struct HttpRpcCarrier: CsilTransport {
     let baseURL: String
 
     func call(service: String, op: String, request: [UInt8]) throws -> [UInt8] {
-        // CsilRpcRequest = { v, service, op, payload: #6.24(bstr) }; the payload is the
-        // encoded request wrapped in CBOR tag 24 (embedded CBOR).
-        let envelope = CsilCborValue.map([
-            (.text("v"), .uint(1)),
-            (.text("op"), .text(op)),
-            (.text("service"), .text(service)),
-            (.text("payload"), .tag(24, .bytes(request))),
-        ])
+        // The library builds the envelope (tag-24 payload, canonical CBOR); never hand-roll it.
+        let envelope = RpcRequest(service: service, op: op, payload: request).encode()
         let mount = baseURL.hasSuffix("/") ? baseURL + "csil/v1/rpc" : baseURL + "/csil/v1/rpc"
         var http = URLRequest(url: URL(string: mount)!)
         http.httpMethod = "POST"
         http.setValue("application/cbor", forHTTPHeaderField: "Content-Type")
         http.setValue("application/cbor", forHTTPHeaderField: "Accept")
-        http.httpBody = Data(CsilCbor.encode(envelope))
+        http.httpBody = Data(envelope)
 
         // Block the calling thread on the async URLSession task — the seam is sync.
         let semaphore = DispatchSemaphore(value: 0)
         var outcome: Result<[UInt8], Error> =
-            .failure(CsilClientError(code: -1, message: "csil-rpc: no response"))
+            .failure(TransportError.carrier("csil-rpc: no response"))
         URLSession.shared.dataTask(with: http) { data, response, error in
             defer { semaphore.signal() }
             if let error { outcome = .failure(error); return }
             guard let status = (response as? HTTPURLResponse)?.statusCode, status == 200,
                   let data
             else {
-                outcome = .failure(
-                    CsilClientError(code: -1, message: "csil-rpc: bad HTTP response"))
+                outcome = .failure(TransportError.carrier("csil-rpc: bad HTTP response"))
                 return
             }
             outcome = .success([UInt8](data))
         }.resume()
         semaphore.wait()
-        let responseBytes = try outcome.get()
 
-        let env = try CsilCbor.decode(responseBytes)
-        let status = try CsilCbor.asI64(CsilCbor.require(env, "status"))
-        // status != 0 is a transport failure: no typed payload.
-        if status != 0 {
-            throw CsilClientError(code: status, message: "csil-rpc: transport status \(status)")
+        // The library decodes the response and raises a TransportError for any non-zero
+        // transport status (distinct from a typed application error).
+        let resp = try RpcResponse.decode(try outcome.get())
+        if let err = resp.asTransportError() { throw err }
+        // A typed application error rides as a status-0 `ServiceError` variant — surface it
+        // so the typed client decodes success only.
+        if resp.variant == "ServiceError" {
+            throw TransportError.carrier("csil-rpc \(service)/\(op): ServiceError")
         }
-        let payloadValue = try CsilCbor.require(env, "payload")
-        guard case .tag(24, let innerValue) = payloadValue, case .bytes(let inner) = innerValue
-        else {
-            throw CsilClientError(
-                code: -1, message: "csil-rpc: response payload is not a tag-24 byte string")
+        return resp.payload
+    }
+}
+"#;
+
+/// The CSIL-Events TLS carrier — spec-independent. A `ByteStream` over Network.framework's
+/// `NWConnection` (TLS); `StreamCarrier` adds the library's length-prefix framing. The
+/// event-driven `NWConnection` is bridged to the synchronous `ByteStream` seam with a
+/// semaphore so the host owns a simple blocking I/O loop.
+const SWIFT_EVENTS_CARRIER: &str = r#"// One example carrier: a TLS byte stream (Network.framework) the library frames with its
+// 4-byte length prefix via StreamCarrier. NWConnection is event-driven; the host owns the
+// I/O loop, so each read/write bridges to the synchronous ByteStream seam.
+final class TlsByteStream: ByteStream {
+    private let conn: NWConnection
+    private var buffer: [UInt8] = []
+
+    init(host: String, port: UInt16) {
+        conn = NWConnection(
+            host: NWEndpoint.Host(host),
+            port: NWEndpoint.Port(rawValue: port)!,
+            using: .tls)
+        let ready = DispatchSemaphore(value: 0)
+        conn.stateUpdateHandler = { if $0 == .ready { ready.signal() } }
+        conn.start(queue: .global())
+        ready.wait()
+    }
+
+    func write(_ bytes: [UInt8]) throws {
+        let done = DispatchSemaphore(value: 0)
+        var failure: Error?
+        conn.send(
+            content: Data(bytes),
+            completion: .contentProcessed { failure = $0; done.signal() })
+        done.wait()
+        if let failure { throw TransportError.carrier("tls write: \(failure)") }
+    }
+
+    func readExactly(_ count: Int) throws -> [UInt8] {
+        while buffer.count < count {
+            let done = DispatchSemaphore(value: 0)
+            var chunk: [UInt8] = []
+            conn.receive(minimumIncompleteLength: 1, maximumLength: 65536) { data, _, _, _ in
+                if let data { chunk = [UInt8](data) }
+                done.signal()
+            }
+            done.wait()
+            if chunk.isEmpty { break }  // a clean end of stream
+            buffer.append(contentsOf: chunk)
         }
-        // A typed ServiceError arm is an application error, not a transport one.
-        if case .text(let variant)? = CsilCbor.mapGet(env, "variant"), variant == "ServiceError" {
-            let e = try CsilCbor.decode(inner)
-            let code = try CsilCbor.asI64(CsilCbor.require(e, "code"))
-            let message = try CsilCbor.asText(CsilCbor.require(e, "message"))
-            throw CsilClientError(code: code, message: message)
+        let take = min(count, buffer.count)
+        let out = Array(buffer.prefix(take))
+        buffer.removeFirst(take)
+        return out
+    }
+}
+"#;
+
+/// The CSIL-Datagrams UDP carrier — spec-independent. A `DatagramCarrier` over
+/// Network.framework's `NWConnection` (UDP). `sendDatagram` writes one packet;
+/// `recvDatagram` resolves the next inbound packet (or nil) — it never waits for or
+/// correlates a reply.
+const SWIFT_DATAGRAMS_CARRIER: &str = r#"// One example carrier: UDP via Network.framework. Datagrams are unreliable and unordered,
+// so the carrier never waits for or correlates a reply.
+final class UdpDatagramCarrier: DatagramCarrier {
+    private let conn: NWConnection
+
+    init(host: String, port: UInt16) {
+        conn = NWConnection(
+            host: NWEndpoint.Host(host),
+            port: NWEndpoint.Port(rawValue: port)!,
+            using: .udp)
+        let ready = DispatchSemaphore(value: 0)
+        conn.stateUpdateHandler = { if $0 == .ready { ready.signal() } }
+        conn.start(queue: .global())
+        ready.wait()
+    }
+
+    func sendDatagram(_ datagram: [UInt8]) throws {
+        let done = DispatchSemaphore(value: 0)
+        var failure: Error?
+        conn.send(
+            content: Data(datagram),
+            completion: .contentProcessed { failure = $0; done.signal() })
+        done.wait()
+        if let failure { throw TransportError.carrier("udp send: \(failure)") }
+    }
+
+    func recvDatagram() throws -> [UInt8]? {
+        let done = DispatchSemaphore(value: 0)
+        var packet: [UInt8]? = nil
+        conn.receiveMessage { data, _, _, _ in
+            if let data, !data.isEmpty { packet = [UInt8](data) }
+            done.signal()
         }
-        return inner
+        done.wait()
+        return packet
     }
 }
 "#;

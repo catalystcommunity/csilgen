@@ -62,6 +62,19 @@ enum Commands {
         /// Output directory
         #[arg(short, long)]
         output: PathBuf,
+        /// Limit the generated `genquickstart.md` to the CSIL-RPC transport example.
+        ///
+        /// `--readme-csil-rpc`, `--readme-csil-events`, and `--readme-csil-datagrams`
+        /// select which transport sections the Quickstart shows; passing none emits
+        /// all three.
+        #[arg(long)]
+        readme_csil_rpc: bool,
+        /// Limit the generated `genquickstart.md` to the CSIL-Events transport example.
+        #[arg(long)]
+        readme_csil_events: bool,
+        /// Limit the generated `genquickstart.md` to the CSIL-Datagrams transport example.
+        #[arg(long)]
+        readme_csil_datagrams: bool,
     },
     /// Compare two CSIL files for breaking changes
     Breaking {
@@ -141,6 +154,9 @@ fn run_command(cli: &Cli, reporter: &ErrorReporter) -> Result<(), csilgen_common
             input,
             target,
             output,
+            readme_csil_rpc,
+            readme_csil_events,
+            readme_csil_datagrams,
         } => {
             reporter.report_info(&format!("Generating {target} code from: {input}"))?;
             reporter.report_debug(&format!("Output directory: {}", output.display()))?;
@@ -151,7 +167,21 @@ fn run_command(cli: &Cli, reporter: &ErrorReporter) -> Result<(), csilgen_common
                 None
             };
 
-            match generate_code_with_progress(input, target, output, pb) {
+            // Each `--readme-csil-*` flag opts that transport's Quickstart section in;
+            // with none set we pass `None` so generators emit all three by default.
+            let mut readme_transports: Vec<String> = Vec::new();
+            if *readme_csil_rpc {
+                readme_transports.push("rpc".to_string());
+            }
+            if *readme_csil_events {
+                readme_transports.push("events".to_string());
+            }
+            if *readme_csil_datagrams {
+                readme_transports.push("datagrams".to_string());
+            }
+            let readme_transports = (!readme_transports.is_empty()).then_some(readme_transports);
+
+            match generate_code_with_progress(input, target, output, pb, readme_transports) {
                 Ok(result) => {
                     let summary = format_generation_summary(
                         result.processed_files,

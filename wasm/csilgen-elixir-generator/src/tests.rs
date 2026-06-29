@@ -929,7 +929,7 @@ fn emit_readme_false_suppresses_only_readme() {
         opts(&[("emit_packages", serde_json::json!(["elixir"]))]),
     ))
     .unwrap();
-    assert!(on.files.iter().any(|f| f.path == "README.md"));
+    assert!(on.files.iter().any(|f| f.path == "genquickstart.md"));
 
     // An explicit `emit_readme: false` drops only the README.
     let off = process_generation(group_input(
@@ -941,13 +941,13 @@ fn emit_readme_false_suppresses_only_readme() {
         ]),
     ))
     .unwrap();
-    assert!(!off.files.iter().any(|f| f.path == "README.md"));
+    assert!(!off.files.iter().any(|f| f.path == "genquickstart.md"));
     // The rest of the publishable package is unchanged.
     assert!(off.files.iter().any(|f| f.path == "mix.exs"));
     let on_without_readme: Vec<_> = on
         .files
         .iter()
-        .filter(|f| f.path != "README.md")
+        .filter(|f| f.path != "genquickstart.md")
         .map(|f| &f.path)
         .collect();
     let off_paths: Vec<_> = off.files.iter().map(|f| &f.path).collect();
@@ -1038,38 +1038,288 @@ fn readme_package_input() -> WasmGeneratorInput {
     }
 }
 
-#[test]
-fn package_readme_has_quickstart_carrier_and_example() {
-    let out = process_generation(readme_package_input()).unwrap();
-    // The README rides with the package, at the root.
-    assert!(out.files.iter().any(|f| f.path == "README.md"));
-    let body = file(&out, "README.md");
+/// A package-mode input with a `->` op AND a record-typed `<->` op, so all three
+/// genquickstart sections render their full library-based examples (the unary op feeds
+/// RPC + Datagrams; the channel op feeds Events dispatch).
+fn transports_package_input() -> WasmGeneratorInput {
+    let user = CsilRule {
+        name: "user".to_string(),
+        rule_type: CsilRuleType::GroupDef(CsilGroupExpression {
+            entries: vec![
+                bare_entry("name", CsilTypeExpression::Builtin("text".to_string())),
+                bare_entry("id", CsilTypeExpression::Builtin("int".to_string())),
+            ],
+        }),
+        position: CsilPosition {
+            line: 1,
+            column: 1,
+            offset: 0,
+        },
+        doc_comments: vec![],
+    };
+    let success = CsilTypeExpression::Choice(vec![
+        CsilTypeExpression::Reference("user".to_string()),
+        CsilTypeExpression::Reference("ServiceError".to_string()),
+    ]);
+    let service = CsilRule {
+        name: "user_service".to_string(),
+        rule_type: CsilRuleType::ServiceDef(CsilServiceDefinition {
+            operations: vec![
+                make_op(
+                    "get-user",
+                    "user",
+                    success.clone(),
+                    CsilServiceDirection::Unidirectional,
+                    Some(7),
+                ),
+                make_op(
+                    "watch-user",
+                    "user",
+                    success,
+                    CsilServiceDirection::Bidirectional,
+                    Some(3),
+                ),
+            ],
+            wire_id: Some(1),
+        }),
+        position: CsilPosition {
+            line: 1,
+            column: 1,
+            offset: 0,
+        },
+        doc_comments: vec![],
+    };
+    WasmGeneratorInput {
+        csil_spec: CsilSpecSerialized {
+            rules: vec![user, service],
+            source_content: None,
+            service_count: 1,
+            fields_with_metadata_count: 0,
+        },
+        config: GeneratorConfig {
+            target: "elixir-client".to_string(),
+            output_dir: "/tmp".to_string(),
+            options: opts(&[("emit_packages", serde_json::json!(["elixir"]))]),
+        },
+        generator_metadata: meta(),
+    }
+}
 
-    // Title + a deps install hint naming this package.
+/// Hermetic verification that the `genquickstart.md` transport carriers are not just
+/// well-formed strings but actually compile and run against the real `csilgen_transport`
+/// library and the package's own generated codec. The genquickstart names both the
+/// client surface (RPC) and the server surface (Events router), so this stages both.
+///
+/// What it proves, end to end, under the real BEAM:
+/// - CSIL-RPC: the emitted `CsilRpcHttpCarrier` compiles; a typed request round-trips
+///   through the generated codec + the library's RPC request/response envelope, with an
+///   in-process echo standing in for the HTTP carrier.
+/// - CSIL-Datagrams: the emitted `UdpDatagramCarrier` is run for real over a localhost
+///   UDP echo — `:gen_udp` open/send/recv and `Datagrams` encode/decode included — and the
+///   typed value round-trips through the generated codec.
+/// - CSIL-Events: the interactive TLS session (`TlsFrameCarrier` + handshake + heartbeat +
+///   router dispatch) is compile-checked rather than dialed (no live peer).
+///
+/// The transport library is loaded from its `lib/` sources (no `mix`/`_build` needed), so
+/// the only external requirement is `elixir` on PATH; the test skips cleanly without it.
+#[test]
+fn genquickstart_carriers_run_and_compile() {
+    use std::process::Command;
+    if Command::new("elixir").arg("--version").output().is_err() {
+        eprintln!("skipping: no elixir on PATH");
+        return;
+    }
+
+    // The genquickstart RPC example drives the client surface; its Events example drives
+    // the server router surface. Package mode emits BOTH surfaces into the one package, so
+    // a SINGLE generation of the genquickstart's own target stages everything the three
+    // sections reference — no second generation, mirroring the OCaml reference.
+    let out = process_generation(transports_package_input()).unwrap();
+    assert!(
+        out.files.iter().any(|f| f.path == "lib/client.gen.ex"),
+        "package mode must emit the client surface for the RPC section"
+    );
+    assert!(
+        out.files.iter().any(|f| f.path == "lib/server.gen.ex"),
+        "package mode must emit the server router surface for the Events section"
+    );
+
+    let dir = std::env::temp_dir().join(format!("csilgen-elixir-genqs-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let pkg = dir.join("pkg");
+    for f in &out.files {
+        let p = pkg.join(&f.path);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, &f.content).unwrap();
+    }
+
+    // The transport library lives at the repo root, two levels up from this crate.
+    let lib = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../transports/elixir/lib/csilgen");
+    assert!(
+        lib.join("transport/rpc.ex").exists(),
+        "transport lib sources not found at {}",
+        lib.display()
+    );
+
+    let harness = dir.join("verify.exs");
+    std::fs::write(&harness, GENQUICKSTART_HARNESS_ELIXIR).unwrap();
+
+    let run = Command::new("elixir")
+        .arg(&harness)
+        .arg(&pkg)
+        .arg(&lib)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    assert!(
+        run.status.success()
+            && stdout.contains("EVENTS_COMPILE_OK")
+            && stdout.contains("RPC_RUN_OK")
+            && stdout.contains("DG_RUN_OK"),
+        "genquickstart carrier verification failed:\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The Elixir driver for `genquickstart_carriers_run_and_compile`. Argv is `[pkg, lib]`:
+/// the staged package directory and the transport library's `lib/csilgen` source root.
+/// It loads the library + generated modules, extracts the three transport code blocks
+/// from `genquickstart.md`, runs RPC + Datagrams, and compile-checks Events. Structs are
+/// built with `struct/2` (not `%Mod{}` literals) because the script is one compile unit
+/// and the generated modules only exist after `Code.require_file` runs.
+const GENQUICKSTART_HARNESS_ELIXIR: &str = r#"[pkg, lib] = System.argv()
+
+for f <- ~w(transport/cbor.ex transport/status.ex transport/conventions.ex transport/carrier.ex transport/rpc.ex transport/datagrams.ex transport/events.ex transport.ex) do
+  Code.require_file(Path.join(lib, f))
+end
+
+# Codec before the types whose to_cbor/from_cbor call it; then client + server.
+Code.require_file(Path.join([pkg, "lib", "codec.gen.ex"]))
+Code.require_file(Path.join([pkg, "lib", "types.gen.ex"]))
+Code.require_file(Path.join([pkg, "lib", "client.gen.ex"]))
+Code.require_file(Path.join([pkg, "lib", "server.gen.ex"]))
+
+md = File.read!(Path.join(pkg, "genquickstart.md"))
+
+blocks =
+  Regex.scan(~r/```elixir\n(.*?)```/s, md)
+  |> Enum.map(fn [_, b] -> b end)
+
+rpc = Enum.find(blocks, &String.contains?(&1, "CsilRpcHttpCarrier"))
+events = Enum.find(blocks, &String.contains?(&1, "TlsFrameCarrier"))
+datagrams = Enum.find(blocks, &String.contains?(&1, "UdpDatagramCarrier"))
+
+# --- Events: compile-check the carrier + session (no live peer to dial) ---
+[events_mods, _] = String.split(events, "\nEventsSession.run(", parts: 2)
+Code.compile_string(events_mods)
+IO.puts("EVENTS_COMPILE_OK")
+
+# --- RPC: compile the emitted carrier, then run the typed round-trip through an
+#     in-process echo standing in for the HTTP carrier (lib RPC envelope included) ---
+[rpc_carrier, _] = String.split(rpc, "\ntransport = CsilRpcHttpCarrier.new", parts: 2)
+Code.compile_string(rpc_carrier)
+IO.puts("RPC_CARRIER_COMPILE_OK")
+
+defmodule EchoRpc do
+  @behaviour Csilgen.Generated.Transport
+  alias Csilgen.Transport.RPC
+  defstruct []
+
+  @impl true
+  def call(%__MODULE__{}, service, op, req) when is_binary(req) do
+    # Build and parse the request through the library envelope the emitted carrier uses,
+    # then echo the request payload back as an ok response the typed client decodes.
+    envelope = RPC.encode_request(RPC.new_request(service, op, req))
+    {:ok, dreq} = RPC.decode_request(envelope)
+    body = RPC.encode_response(RPC.new_response_ok("User", dreq.payload))
+    {:ok, resp} = RPC.decode_response(body)
+    :ok = RPC.as_transport_error(resp)
+    resp.payload
+  end
+end
+
+rpc_req = struct(Csilgen.Generated.User, name: "example", id: 7)
+rpc_client = Csilgen.Generated.UserClient.new(struct(EchoRpc, []))
+^rpc_req = Csilgen.Generated.UserClient.get_user(rpc_client, rpc_req)
+IO.puts("RPC_RUN_OK")
+
+# --- Datagrams: run the emitted :gen_udp carrier for real over a localhost UDP echo ---
+[dg_carrier, _] = String.split(datagrams, "\nalias Csilgen.Transport.Datagrams", parts: 2)
+Code.compile_string(dg_carrier)
+IO.puts("DG_CARRIER_COMPILE_OK")
+
+alias Csilgen.Transport.Datagrams
+
+{:ok, srv} = :gen_udp.open(0, [:binary, active: false])
+{:ok, srv_port} = :inet.port(srv)
+
+spawn(fn ->
+  {:ok, {addr, port, data}} = :gen_udp.recv(srv, 0, 5000)
+  :gen_udp.send(srv, addr, port, data)
+end)
+
+{:ok, carrier} = UdpDatagramCarrier.open("localhost", srv_port)
+dg_req = struct(Csilgen.Generated.User, name: "example", id: 9)
+payload = Csilgen.Generated.User.to_cbor(dg_req)
+datagram = Datagrams.encode_datagram(Datagrams.new_datagram(7, 0, payload))
+{:ok, carrier} = UdpDatagramCarrier.send_datagram(carrier, datagram)
+
+case UdpDatagramCarrier.recv_datagram(carrier) do
+  {:ok, bytes, _carrier} ->
+    {:ok, dg} = Datagrams.decode_datagram(bytes)
+    ^dg_req = Csilgen.Generated.User.from_cbor(dg.payload)
+    IO.puts("DG_RUN_OK")
+
+  :empty ->
+    raise "datagram echo did not arrive"
+end
+"#;
+
+#[test]
+fn genquickstart_intro_credits_transport_lib() {
+    let out = process_generation(transports_package_input()).unwrap();
+    let body = file(&out, "genquickstart.md");
+
+    // Title + a deps install hint naming this package and the transport library.
     assert!(body.starts_with("# csilgen_client\n"));
     assert!(body.contains("{:csilgen_client,"));
+    assert!(body.contains("csilgen_transport"));
+    assert!(body.contains("not yet published"));
+    // The intro credits the library for the envelope/framing/lifecycle and the
+    // carrier-only contribution.
+    assert!(body.contains("`csilgen_transport` library owns the"));
+    assert!(body.contains("*carrier*"));
+}
 
+#[test]
+fn genquickstart_rpc_section_uses_lib_envelope_over_http() {
+    let out = process_generation(transports_package_input()).unwrap();
+    let body = file(&out, "genquickstart.md");
+
+    assert!(body.contains("## CSIL-RPC (HTTP)"));
     // The carrier implements the generated transport seam (the behaviour).
-    assert!(body.contains("defmodule CsilRpcTransport do"));
+    assert!(body.contains("defmodule CsilRpcHttpCarrier do"));
     assert!(body.contains("@behaviour Csilgen.Generated.Transport"));
     assert!(body.contains("def call(%__MODULE__{rpc_url: url}, service, op, req)"));
 
-    // It POSTs to the CSIL-RPC endpoint, wraps the payload in CBOR tag 24, and reuses
-    // the generated codec (no third-party dep).
-    assert!(body.contains("/csil/v1/rpc"));
-    assert!(body.contains("POST "));
-    assert!(body.contains("{{:text, \"payload\"}, {:tag, 24, {:bytes, req}}}"));
-    assert!(body.contains("Cbor.encode(envelope)"));
-    assert!(body.contains("Cbor.decode(body)"));
+    // The envelope is the library's RPC request/response — never hand-rolled.
+    assert!(body.contains("alias Csilgen.Transport.RPC"));
+    assert!(body.contains("RPC.encode_request(RPC.new_request(service, op, req))"));
+    assert!(body.contains("RPC.decode_response(body)"));
+    assert!(body.contains("RPC.as_transport_error(resp)"));
 
-    // The status / typed ServiceError arms are handled.
-    assert!(body.contains("transport status"));
-    assert!(body.contains("{:text, \"ServiceError\"} ->"));
-    assert!(body.contains("raise \"service error"));
+    // It POSTs to the CSIL-RPC endpoint over the stdlib HTTP client.
+    assert!(body.contains("/csil/v1/rpc"));
+    assert!(body.contains(":httpc.request(:post,"));
+
+    // The typed ServiceError application arm is handled distinctly.
+    assert!(body.contains("resp.variant == \"ServiceError\""));
 
     // Client construction over the carrier + the first unary call with a generated
     // sample struct literal (required fields only, struct field atoms).
-    assert!(body.contains("transport = CsilRpcTransport.new(\"http://localhost:5080\")"));
+    assert!(body.contains("transport = CsilRpcHttpCarrier.new(\"http://localhost:5080\")"));
     assert!(body.contains("client = Csilgen.Generated.UserClient.new(transport)"));
     assert!(body.contains(
         "resp = Csilgen.Generated.UserClient.get_user(client, %Csilgen.Generated.User{name: \"example\", id: 0})"
@@ -1077,12 +1327,100 @@ fn package_readme_has_quickstart_carrier_and_example() {
 }
 
 #[test]
+fn genquickstart_events_section_handshake_and_router_dispatch() {
+    let out = process_generation(transports_package_input()).unwrap();
+    let body = file(&out, "genquickstart.md");
+
+    assert!(body.contains("## CSIL-Events (TLS)"));
+    // A TLS frame carrier built on the library's length-prefix framing.
+    assert!(body.contains("defmodule TlsFrameCarrier do"));
+    assert!(body.contains("@behaviour Csilgen.Transport.Carrier"));
+    assert!(body.contains("Carrier.frame_length_prefixed(frame)"));
+    assert!(body.contains("Carrier.read_length_prefixed(c.buffer)"));
+    assert!(body.contains(":ssl.connect("));
+
+    // The $hello / $hello-ack handshake via the library control plane.
+    assert!(body.contains("Events.encode_hello(%Hello{versions: [1], profiles: [\"verbose\"]"));
+    assert!(body.contains("Events.parse_profile(profile_name)"));
+    // The $ping / $pong heartbeat answered with the library Heartbeat.
+    assert!(body.contains("event: \"$ping\""));
+    assert!(body.contains("Events.encode_heartbeat(%Heartbeat{nonce: nonce})"));
+
+    // Dispatch into the generated server router + one outbound event via the encoder.
+    assert!(body.contains("Csilgen.Generated.UserServer.encode_watch_user(ExampleCodec,"));
+    assert!(
+        body.contains("Csilgen.Generated.UserServer.route(ExampleHandler, ExampleCodec, ev.event")
+    );
+    assert!(body.contains("@behaviour Csilgen.Generated.UserServer"));
+    assert!(body.contains("def watch_user(msg, _ctx)"));
+    // The Codec seam is backed by the generated per-type helpers.
+    assert!(body.contains("@behaviour Csilgen.Generated.Codec"));
+    assert!(body.contains("def encode(value), do: value.__struct__.to_cbor(value)"));
+    assert!(body.contains("def decode(data, type), do: type.from_cbor(data)"));
+}
+
+#[test]
+fn genquickstart_datagrams_section_send_and_late_response() {
+    let out = process_generation(transports_package_input()).unwrap();
+    let body = file(&out, "genquickstart.md");
+
+    assert!(body.contains("## CSIL-Datagrams (UDP)"));
+    // A UDP datagram carrier over the stdlib :gen_udp.
+    assert!(body.contains("defmodule UdpDatagramCarrier do"));
+    assert!(body.contains(":gen_udp.open("));
+    assert!(body.contains(":gen_udp.send("));
+
+    // Encode the `->` request via the generated codec, wrap in the library's Datagram.
+    assert!(body.contains("alias Csilgen.Transport.Datagrams"));
+    assert!(body.contains("op_ord = 7"));
+    assert!(body.contains("payload = Csilgen.Generated.User.to_cbor(req)"));
+    assert!(body.contains("Datagrams.encode_datagram(Datagrams.new_datagram(op_ord, 0, payload))"));
+
+    // The recv path decodes a late datagram into the RESPONSE type, with the "may
+    // arrive later — or never" caveat.
+    assert!(body.contains("Datagrams.decode_datagram(bytes)"));
+    assert!(body.contains("resp = Csilgen.Generated.User.from_cbor(dg.payload)"));
+    assert!(body.contains("MAY arrive later"));
+    assert!(body.contains("synchronous response"));
+}
+
+#[test]
+fn genquickstart_transports_option_selects_sections() {
+    // A subset names only events: the RPC and Datagrams sections are suppressed.
+    let mut input = transports_package_input();
+    input.config.options.insert(
+        "genquickstart_transports".to_string(),
+        serde_json::json!(["events"]),
+    );
+    let out = process_generation(input).unwrap();
+    let body = file(&out, "genquickstart.md");
+
+    assert!(body.contains("## CSIL-Events (TLS)"));
+    assert!(!body.contains("## CSIL-RPC (HTTP)"));
+    assert!(!body.contains("## CSIL-Datagrams (UDP)"));
+}
+
+#[test]
+fn genquickstart_no_channel_op_shows_handshake_note() {
+    // The single-unary-op spec has no `<->` op: the Events section still shows the
+    // handshake + heartbeat, with a note where the dispatch would go.
+    let out = process_generation(readme_package_input()).unwrap();
+    let body = file(&out, "genquickstart.md");
+
+    assert!(body.contains("## CSIL-Events (TLS)"));
+    assert!(body.contains("Events.encode_hello(%Hello{versions: [1], profiles: [\"verbose\"]})"));
+    assert!(body.contains("no generated channel router"));
+    // No router/handler dispatch is wired without a channel op.
+    assert!(!body.contains("ExampleHandler"));
+}
+
+#[test]
 fn package_readme_absent_without_package_mode() {
     // The flat (non-package) layout never ships a README.
-    let mut input = readme_package_input();
+    let mut input = transports_package_input();
     input.config.options = HashMap::new();
     let out = process_generation(input).unwrap();
-    assert!(!out.files.iter().any(|f| f.path == "README.md"));
+    assert!(!out.files.iter().any(|f| f.path == "genquickstart.md"));
 }
 
 /// Build the corndogs `elixir-client` spec in package mode and prove the emitted Mix

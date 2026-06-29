@@ -164,21 +164,29 @@ fn generate_ocaml(
         .iter()
         .any(|r| matches!(r.rule_type, CsilRuleType::ServiceDef(_)));
 
-    match surface {
-        Surface::TypesOnly => {}
-        Surface::Client if has_services => {
+    // A package's `genquickstart.md` demonstrates both the calling side (the RPC and
+    // Datagrams sections, over `Client`) and the handling side (the Events section,
+    // over `Services`), so a package must carry both surfaces for its own quickstart
+    // to compile — regardless of which surface was requested. A flat (non-package)
+    // build stays byte-identical: it emits only the requested surface.
+    let pkg_mode = package_requested(config);
+    let want_client =
+        matches!(surface, Surface::Client) || (pkg_mode && !matches!(surface, Surface::TypesOnly));
+    let want_server =
+        matches!(surface, Surface::Server) || (pkg_mode && !matches!(surface, Surface::TypesOnly));
+    if has_services {
+        if want_client {
             files.push(GeneratedFile {
                 path: "client.ml".to_string(),
                 content: generate_client(spec),
             });
         }
-        Surface::Server if has_services => {
+        if want_server {
             files.push(GeneratedFile {
                 path: "services.ml".to_string(),
                 content: generate_services(spec),
             });
         }
-        _ => {}
     }
 
     // Package mode is orthogonal to the surface: it relocates whatever the surface
@@ -194,6 +202,7 @@ fn generate_ocaml(
             &pkg,
             &version,
             emit_readme_enabled(config),
+            wanted_transports(config),
         ));
     }
 
@@ -291,7 +300,7 @@ fn emit_readme_enabled(config: &GeneratorConfig) -> bool {
 
 /// Relocate the generated modules into `lib/` and prepend the dune/opam scaffolding
 /// that turns the output directory into a standalone package, plus a copy-paste
-/// `README.md` Quickstart. The generated codec is self-contained, so the emitted
+/// `genquickstart.md` Quickstart. The generated codec is self-contained, so the emitted
 /// library declares no third-party dependencies.
 fn wrap_as_package(
     spec: &CsilSpecSerialized,
@@ -299,6 +308,7 @@ fn wrap_as_package(
     pkg: &str,
     version: &str,
     emit_readme: bool,
+    transports: (bool, bool, bool),
 ) -> Vec<GeneratedFile> {
     let mut out = Vec::with_capacity(files.len() + 4);
     out.push(GeneratedFile {
@@ -313,8 +323,8 @@ fn wrap_as_package(
     // absent, non-bool, or `true` value keeps the default emission.
     if emit_readme {
         out.push(GeneratedFile {
-            path: "README.md".to_string(),
-            content: readme(spec, pkg),
+            path: "genquickstart.md".to_string(),
+            content: readme(spec, pkg, transports),
         });
     }
     out.push(GeneratedFile {
@@ -366,59 +376,89 @@ fn lib_dune_file(pkg: &str) -> String {
 // Package README + CSIL-RPC Quickstart
 // ---------------------------------------------------------------------------
 
-/// The package README, with a copy-paste **Quickstart**. For a client package the
-/// Quickstart is a complete CSIL-RPC carrier (it reuses this package's own generated
-/// `Codec.Cbor` for the envelope, so it adds no third-party CBOR dependency; HTTP is a
-/// minimal blocking POST over the stdlib `unix` library), the typed client built over
-/// it, and one example call — a user changes only the base-URL string. A spec with no
-/// usable unary operation gets the consume-the-types section without a carrier.
-fn readme(spec: &CsilSpecSerialized, pkg: &str) -> String {
+/// Which transport sections the consumer wants in `genquickstart.md`. The
+/// `genquickstart_transports` option is a JSON array subset of
+/// `["rpc","events","datagrams"]`; unknown entries are ignored, and an absent or empty
+/// value means "all three". Sections always render in a fixed order.
+fn wanted_transports(config: &GeneratorConfig) -> (bool, bool, bool) {
+    let listed = match config.options.get("genquickstart_transports") {
+        Some(serde_json::Value::Array(items)) => {
+            let names: Vec<&str> = items.iter().filter_map(|v| v.as_str()).collect();
+            let has = |t: &str| names.contains(&t);
+            // An array that names none of the known transports (all unknown, or empty)
+            // falls back to all three rather than an empty doc.
+            if has("rpc") || has("events") || has("datagrams") {
+                Some((has("rpc"), has("events"), has("datagrams")))
+            } else {
+                None
+            }
+        }
+        _ => None,
+    };
+    listed.unwrap_or((true, true, true))
+}
+
+/// The package genquickstart: a transport-by-transport Quickstart over the official
+/// `csilgen-transport` library. The generated codec owns CBOR (de)serialization and the
+/// library owns the envelope/framing/lifecycle; you supply only a *carrier* that moves
+/// bytes. Each requested section (CSIL-RPC over HTTP, CSIL-Events over TLS,
+/// CSIL-Datagrams over UDP) is a complete, copy-paste example built on the library.
+fn readme(spec: &CsilSpecSerialized, pkg: &str, transports: (bool, bool, bool)) -> String {
     // dune wraps the library under a single Capitalized module of the library name, so
-    // the generated `Types`/`Codec`/`Client` are reached as `<Root>.Types`, etc.
+    // the generated `Types`/`Codec`/`Client`/`Services` are reached as `<Root>.Types`,
+    // etc.; the transport library is `Csilgen_transport`.
     let root = capitalize(pkg);
     let mut out = format!(
         "# {pkg}\n\n\
-         Generated by csilgen. A typed, transport-agnostic CSIL-RPC client: the\n\
-         generated codec owns CBOR (de)serialization; you supply a *carrier* that only\n\
-         moves bytes.\n\n\
+         Generated by csilgen. A typed CSIL client: the generated codec owns CBOR\n\
+         (de)serialization and the official `csilgen-transport` library owns the\n\
+         envelope, framing, and connection lifecycle. You supply only a *carrier* that\n\
+         moves bytes, so the same typed surface rides HTTP, TLS, a WebSocket, QUIC, or\n\
+         raw UDP unchanged.\n\n\
          ## Consume\n\n\
-         This is a dune/opam package. Depend on it (and the stdlib `unix` library the\n\
-         Quickstart carrier uses for HTTP) from your executable's `dune`:\n\n\
+         This is a dune/opam package. Depend on it, the transport library, and the\n\
+         stdlib `unix` library (the example carriers' socket I/O) from your\n\
+         executable's `dune`:\n\n\
          ```\n\
          (executable\n \
          (name main)\n \
-         (libraries {pkg} unix))\n\
+         (libraries {pkg} csilgen-transport unix))\n\
          ```\n\n\
-         <!-- TODO: publish to an opam repository so consumers can `opam install {pkg}`. -->\n\n"
+         <!-- TODO: `csilgen-transport` is not yet published — vendor it or pin a git\n\
+              source until it lands in an opam repository, then `opam install {pkg}`. -->\n\n"
     );
-    match first_ocaml_example(spec) {
-        Some(example) => out.push_str(&ocaml_quickstart(spec, &root, &example)),
-        None => out.push_str(&format!(
-            "## Quickstart\n\n\
-             This package has no unary service operations — open its generated modules\n\
-             and use the types and codec directly:\n\n\
-             ```ocaml\n\
-             open {root}\n\
-             (* Types.* records, Codec.encode_<t>_bytes / Codec.decode_<t>_bytes *)\n\
-             ```\n"
-        )),
+    let (rpc, events, datagrams) = transports;
+    let unary = first_unary_example(spec);
+    let channel = first_channel_example(spec);
+    if rpc {
+        out.push_str(&rpc_section(&root, unary.as_ref()));
+    }
+    if events {
+        out.push_str(&events_section(&root, channel.as_ref()));
+    }
+    if datagrams {
+        out.push_str(&datagrams_section(&root, unary.as_ref()));
     }
     out
 }
 
-/// The pieces the Quickstart's example call needs: the service module (under `Client`),
-/// the call function, and a compiling sample request `(literal, ocaml-type-name)` — or
-/// `None` for a request-less push-style op.
-struct OcamlExample {
+/// The pieces a unary (`->`) example needs: the service module (under `Client`), the
+/// call function, a compiling sample request `(literal, type-name)` (None for a
+/// request-less op), the request/response codec type names (so the datagram section can
+/// name `encode_<t>_bytes`/`decode_<t>_bytes`), and the op's datagram ordinal.
+struct UnaryExample {
     service_module: String,
     fn_name: String,
     sample: Option<(String, String)>,
+    req_codec: Option<String>,
+    res_codec: Option<String>,
+    op_ord: i64,
 }
 
 /// The first service (in declared order) with a unary op whose success type — and, when
 /// present, request type — is a record the generated codec covers, so the example can
 /// call the clean typed client form. `None` for a serviceless / non-record-op spec.
-fn first_ocaml_example(spec: &CsilSpecSerialized) -> Option<OcamlExample> {
+fn first_unary_example(spec: &CsilSpecSerialized) -> Option<UnaryExample> {
     let records = codec_record_names(spec);
     for rule in &spec.rules {
         let CsilRuleType::ServiceDef(service) = &rule.rule_type else {
@@ -428,12 +468,13 @@ fn first_ocaml_example(spec: &CsilSpecSerialized) -> Option<OcamlExample> {
             if !matches!(op.direction, CsilServiceDirection::Unidirectional) {
                 continue;
             }
-            if op_codec_type(&success_type(&op.output_type), &records).is_none() {
+            let res_codec = op_codec_type(&success_type(&op.output_type), &records);
+            if res_codec.is_none() {
                 continue;
             }
             let null_in = op_input_is_null(&op.input_type);
-            let sample = if null_in {
-                None
+            let (sample, req_codec) = if null_in {
+                (None, None)
             } else {
                 // The request must be a record the codec covers, so the typed client
                 // method takes the value directly (no consumer-supplied closures).
@@ -441,30 +482,49 @@ fn first_ocaml_example(spec: &CsilSpecSerialized) -> Option<OcamlExample> {
                     continue;
                 };
                 let group = ocaml_find_record(spec, name)?;
-                Some((ocaml_record_literal(spec, group), ocaml_type_name(name)))
+                (
+                    Some((ocaml_record_literal(spec, group), ocaml_type_name(name))),
+                    op_codec_type(&op.input_type, &records),
+                )
             };
-            return Some(OcamlExample {
+            return Some(UnaryExample {
                 service_module: ocaml_module_name(&rule.name),
                 fn_name: ocaml_ident(&op.name),
                 sample,
+                req_codec,
+                res_codec,
+                // The datagram ordinal is the op's @wire-id when present; otherwise a
+                // channel-agreed placeholder the user fills in.
+                op_ord: op.wire_id.map(|id| id as i64).unwrap_or(1),
             });
         }
     }
     None
 }
 
-fn ocaml_quickstart(spec: &CsilSpecSerialized, root: &str, ex: &OcamlExample) -> String {
-    let _ = spec;
-    let mut out = String::from("## Quickstart\n\n");
+/// CSIL-RPC over HTTP: a carrier implementing the generated `Client` transport seam that
+/// builds/parses the envelope with the library's `Rpc.encode_request`/`Rpc.decode_response`
+/// (never hand-rolled) and POSTs it to `{base}/csil/v1/rpc` over the stdlib `unix`
+/// library. The typed client decodes the success payload; a non-zero transport status
+/// (`Rpc.as_transport_error`) and the `ServiceError` application arm are surfaced
+/// distinctly.
+fn rpc_section(root: &str, ex: Option<&UnaryExample>) -> String {
+    let mut out = String::from("## CSIL-RPC (HTTP)\n\n");
     out.push_str(
-        "A complete CSIL-RPC carrier (it reuses this package's generated CBOR codec for\n\
-         the envelope — no third-party CBOR dependency — and POSTs over the stdlib `unix`\n\
-         library) plus the typed client. Change the one base-URL string.\n\n",
+        "Request/response. The library owns the envelope (`Rpc.encode_request`/\n\
+         `Rpc.decode_response`); you bring a carrier that moves bytes. The `unix`-socket\n\
+         HTTP carrier below is just one example — swap it for any HTTP client (it\n\
+         implements the generated `Client` byte seam).\n\n",
     );
+    let Some(ex) = ex else {
+        out.push_str(
+            "This package declares no `->` operations, so there is no RPC call to make.\n\n",
+        );
+        return out;
+    };
     out.push_str("```ocaml\n");
-    out.push_str(&format!("open {root}\n\n"));
-    out.push_str("module Cbor = Codec.Cbor\n\n");
-    out.push_str(OCAML_CARRIER);
+    out.push_str(&format!("open {root}\nopen Csilgen_transport\n\n"));
+    out.push_str(RPC_CARRIER_OCAML);
     out.push('\n');
     out.push_str("let () =\n");
     out.push_str("  let client = make_rpc_client \"http://localhost:5080\" in\n");
@@ -487,7 +547,7 @@ fn ocaml_quickstart(spec: &CsilSpecSerialized, root: &str, ex: &OcamlExample) ->
     }
     out.push_str("  | Ok _resp -> print_endline \"ok: received typed response\"\n");
     out.push_str("  | Error e -> prerr_endline e\n");
-    out.push_str("```\n");
+    out.push_str("```\n\n");
     out
 }
 
@@ -557,15 +617,15 @@ fn ocaml_sample(spec: &CsilSpecSerialized, ty: &CsilTypeExpression) -> String {
     }
 }
 
-/// The carrier body — identical for every spec, so it is a constant. It wraps the
-/// already-encoded request in a `CsilRpcRequest` envelope (tag-24 payload) via the
-/// package's generated `Cbor`, POSTs it to `{baseUrl}/csil/v1/rpc` over the stdlib
-/// `unix` library, and unwraps the `CsilRpcResponse` — surfacing a non-zero transport
-/// `status` or a typed `ServiceError` arm as an `Error`.
-const OCAML_CARRIER: &str = r#"(* Hybrid posture, path 1: the envelope reuses this package's generated CBOR codec
-   [Cbor] (aliased above), so the carrier adds no third-party CBOR dependency. HTTP is
-   a minimal blocking POST over the stdlib [unix] library (bundled with the OCaml
-   compiler), so the whole carrier is dependency-free. *)
+/// The HTTP carrier body — spec-independent, so a constant. It encodes the request with
+/// the library's `Rpc.encode_request` (never hand-rolled), POSTs it to
+/// `{base}/csil/v1/rpc` over the stdlib `unix` library, and decodes the reply with
+/// `Rpc.decode_response`. `Rpc.as_transport_error` surfaces a non-zero transport status;
+/// the typed `ServiceError` arm (a status-0 `variant`) is surfaced separately so the
+/// generated client decodes success only.
+const RPC_CARRIER_OCAML: &str = r#"(* The library owns the CSIL-RPC envelope ([Rpc]); this carrier owns only the HTTP
+   transport. HTTP is a minimal blocking POST over the stdlib [unix] library (bundled
+   with the OCaml compiler) — one example carrier; swap it for any HTTP client. *)
 
 (* Minimal blocking HTTP/1.1 POST; returns (status_code, body_bytes). *)
 let http_post ~(base_url : string) ~(path : string) ~(body : bytes) :
@@ -619,54 +679,359 @@ let http_post ~(base_url : string) ~(path : string) ~(body : bytes) :
 
 (* The generated client's transport seam. *)
 let csil_rpc_call base_url ~service ~op ~(payload : bytes) : (bytes, string) result =
-  (* CsilRpcRequest = { v, service, op, payload: #6.24(bstr) } in canonical key order;
-     the payload is the encoded request wrapped in CBOR tag 24 (embedded CBOR). *)
-  let envelope =
-    Cbor.Map
-      [
-        (Cbor.Text "v", Cbor.int64 1L);
-        (Cbor.Text "op", Cbor.Text op);
-        (Cbor.Text "service", Cbor.Text service);
-        (Cbor.Text "payload", Cbor.Tag (24, Cbor.Bytes payload));
-      ]
-  in
-  match http_post ~base_url ~path:"/csil/v1/rpc" ~body:(Cbor.encode envelope) with
+  (* Encode the request with the library's RPC envelope (never hand-rolled). *)
+  let req = Rpc.new_request service op payload in
+  match http_post ~base_url ~path:"/csil/v1/rpc" ~body:(Rpc.encode_request req) with
   | Error _ as e -> e
   | Ok (http_status, _) when http_status <> 200 ->
     Error (Printf.sprintf "csil-rpc: http %d" http_status)
   | Ok (_, resp_bytes) -> (
-    match Cbor.decode resp_bytes with
-    | Error e -> Error ("csil-rpc: bad response cbor: " ^ e)
-    | Ok (Cbor.Map kvs) -> (
-      let field k = List.assoc_opt (Cbor.Text k) kvs in
-      let status = match field "status" with Some v -> Cbor.to_i64 v | None -> 0L in
-      (* status <> 0 is a transport failure: no typed payload. *)
-      if status <> 0L then
-        Error (Printf.sprintf "csil-rpc: transport status %Ld" status)
-      else
-        match field "payload" with
-        | Some (Cbor.Tag (24, Cbor.Bytes inner)) -> (
-          (* A typed ServiceError arm is an application error, not a transport one. *)
-          match field "variant" with
-          | Some (Cbor.Text "ServiceError") -> (
-            match Cbor.decode inner with
-            | Ok (Cbor.Map e) ->
-              let get k = List.assoc_opt (Cbor.Text k) e in
-              let code = match get "code" with Some v -> Cbor.to_i64 v | None -> 0L in
-              let message =
-                match get "message" with Some v -> Cbor.to_text v | None -> ""
-              in
-              Error (Printf.sprintf "service error %Ld: %s" code message)
-            | _ -> Error "csil-rpc: bad ServiceError payload")
-          | _ -> Ok inner)
-        | _ -> Error "csil-rpc: response payload is not a tag-24 byte string")
-    | Ok _ -> Error "csil-rpc: response is not a CBOR map")
+    match Rpc.decode_response resp_bytes with
+    | Error _ -> Error "csil-rpc: bad response envelope"
+    | Ok resp -> (
+      (* A non-zero transport status is a transport failure: no typed payload. *)
+      match Rpc.as_transport_error resp with
+      | Some _ -> Error "csil-rpc: non-zero transport status"
+      | None -> (
+        (* A typed ServiceError arm rides as a status-0 [variant] — an application
+           error distinct from a transport failure. Surface it so the client decodes
+           success only. *)
+        match resp.Rpc.variant with
+        | Some "ServiceError" -> Error "csil-rpc: ServiceError"
+        | _ -> Ok resp.Rpc.payload)))
 
 (* Build the typed client over the carrier; change the base URL to your server. *)
 let make_rpc_client base_url =
   Client.make_client ~call:(fun ~service ~op ~payload ->
       csil_rpc_call base_url ~service ~op ~payload)
 "#;
+
+/// CSIL-Events over TLS: a full session example. Opens a TLS byte stream wrapped as the
+/// library's `Carrier.stream_carrier` (CSIL length-prefix framing), performs the
+/// `$hello`/`$hello-ack` handshake, sends one outbound event via the generated codec,
+/// and runs a recv loop that decodes each frame to an `Events.event`, answers `$ping`
+/// with `$pong`, and dispatches typed events to the generated `Services.<S>.route`. When
+/// the spec has no record channel op the dispatch wiring is replaced with a note (the
+/// handshake + heartbeat still apply to any connection).
+fn events_section(root: &str, ch: Option<&ChannelExample>) -> String {
+    let mut out = String::from("## CSIL-Events (TLS)\n\n");
+    out.push_str(
+        "Typed, bidirectional event streams over a long-lived connection. The library\n\
+         owns the `$hello`/`$hello-ack` handshake, the `$ping`/`$pong` heartbeat, and\n\
+         length-prefix framing; the generated router dispatches typed events. The TLS\n\
+         carrier below is just one example — a WebSocket/QUIC carrier drops in unchanged.\n\n",
+    );
+    out.push_str("```ocaml\n");
+    out.push_str(&format!("open {root}\nopen Csilgen_transport\n\n"));
+    out.push_str(EVENTS_CARRIER_OCAML);
+    out.push('\n');
+    match ch {
+        Some(ch) => out.push_str(&events_session(ch)),
+        None => out.push_str(EVENTS_NO_CHANNEL_SESSION_OCAML),
+    }
+    out.push_str("```\n\n");
+    out
+}
+
+/// The TLS frame-carrier adapter — spec-independent, so a constant. It opens a TCP
+/// stream and hands the channels to the library's `Carrier.stream_carrier`, which owns
+/// the length-prefix framing. Wrapping the channels in TLS (via the `tls`/`ssl` opam
+/// lib) is a one-line swap the comment marks; the session logic is unchanged.
+const EVENTS_CARRIER_OCAML: &str = r#"(* One example carrier: a byte stream framed with CSIL's 4-byte length prefix. The
+   library's [stream_carrier] owns framing; this only opens the socket. For real TLS,
+   wrap [ic]/[oc] with the [tls] (or [ssl]) opam library at the marked point — the
+   carrier and the session logic below ride any channel pair unchanged. *)
+let connect_frame_carrier host port : Carrier.frame_carrier =
+  let he = Unix.gethostbyname host in
+  let addr = Unix.ADDR_INET (he.Unix.h_addr_list.(0), port) in
+  let ic, oc = Unix.open_connection addr in
+  (* TLS swap point: [let ic, oc = Tls_unix.wrap ic oc in] (or the [ssl] equivalent). *)
+  Carrier.stream_carrier ic oc
+"#;
+
+/// The channel session body for an Events connection that has a record `<->` op: the
+/// handshake, one outbound event via the generated codec, the generated handler record,
+/// and the recv loop that heartbeats and dispatches into the generated router.
+fn events_session(ch: &ChannelExample) -> String {
+    format!(
+        r#"let () =
+  let carrier = connect_frame_carrier "localhost" 7443 in
+
+  (* $hello / $hello-ack handshake. The peer's $hello-ack pins the wire profile. *)
+  let hello : Events.hello =
+    {{ versions = [ 1L ]; profiles = [ "verbose" ]; hello_service = Some "{wire_service}"; hello_auth = None }}
+  in
+  ignore (carrier.Carrier.send_frame (Events.encode_hello hello));
+  let profile =
+    match carrier.Carrier.recv_frame () with
+    | Ok (Some frame) -> (
+      match Events.decode_hello_ack frame with
+      | Ok (ack : Events.hello_ack) -> (
+        match Events.parse_profile ack.ack_profile with Some p -> p | None -> Events.Verbose)
+      | Error _ -> failwith "csil-events: bad hello-ack")
+    | _ -> failwith "csil-events: no hello-ack"
+  in
+
+  (* Send one outbound event via the generated codec, framed as a typed Event. *)
+  let value : Types.{out_type} = {out_sample} in
+  let outbound = Events.new_verbose_event (Some "{wire_service}") "{wire_op}" (Codec.encode_{out_codec}_bytes value) in
+  (match Events.encode_event outbound profile with
+   | Ok frame -> ignore (carrier.Carrier.send_frame frame)
+   | Error _ -> ());
+
+  (* The generated handler record: the router dispatches inbound events to it. *)
+  let handler : Services.{service_module}.handler = {handler_record} in
+
+  (* Recv loop: decode each frame to an Event, answer $ping with $pong (heartbeat), and
+     dispatch the rest into the generated router. *)
+  let rec loop () =
+    match carrier.Carrier.recv_frame () with
+    | Ok (Some frame) -> (
+      match Events.decode_event frame profile with
+      | Ok (ev : Events.event) ->
+        (match ev.event with
+         | Some name when name = Events.ping_name -> (
+           match Events.decode_heartbeat ev.payload with
+           | Ok hb ->
+             let pong = Events.new_verbose_event None Events.pong_name (Events.encode_heartbeat hb) in
+             (match Events.encode_event pong profile with
+              | Ok b -> ignore (carrier.Carrier.send_frame b)
+              | Error _ -> ())
+           | Error _ -> ())
+         | Some name -> ignore (Services.{service_module}.route handler ~op:name ~payload:ev.payload)
+         | None -> ());
+        loop ()
+      | Error _ -> ())
+    | _ -> ()
+  in
+  loop ()
+"#,
+        wire_service = ch.wire_service,
+        out_type = ch.out_type,
+        out_sample = ch.out_sample,
+        out_codec = ch.out_codec,
+        wire_op = ch.wire_op,
+        service_module = ch.service_module,
+        handler_record = ch.handler_record,
+    )
+}
+
+/// The Events session body when the spec declares no record channel op: the handshake
+/// and heartbeat still apply, so they are shown, with a note where the dispatch would go.
+const EVENTS_NO_CHANNEL_SESSION_OCAML: &str = r#"let () =
+  let carrier = connect_frame_carrier "localhost" 7443 in
+
+  (* $hello / $hello-ack handshake. The peer's $hello-ack pins the wire profile. *)
+  let hello : Events.hello =
+    { versions = [ 1L ]; profiles = [ "verbose" ]; hello_service = None; hello_auth = None }
+  in
+  ignore (carrier.Carrier.send_frame (Events.encode_hello hello));
+  let profile =
+    match carrier.Carrier.recv_frame () with
+    | Ok (Some frame) -> (
+      match Events.decode_hello_ack frame with
+      | Ok (ack : Events.hello_ack) -> (
+        match Events.parse_profile ack.ack_profile with Some p -> p | None -> Events.Verbose)
+      | Error _ -> failwith "csil-events: bad hello-ack")
+    | _ -> failwith "csil-events: no hello-ack"
+  in
+
+  (* Recv loop: answer $ping with $pong. This build exposes no generated channel router
+     (it is emitted by the `ocaml`/`ocaml-server` target for record `<->`/`<-` ops), so
+     there is no typed dispatch to wire here. *)
+  let rec loop () =
+    match carrier.Carrier.recv_frame () with
+    | Ok (Some frame) -> (
+      match Events.decode_event frame profile with
+      | Ok (ev : Events.event) ->
+        (match ev.event with
+         | Some name when name = Events.ping_name -> (
+           match Events.decode_heartbeat ev.payload with
+           | Ok hb ->
+             let pong = Events.new_verbose_event None Events.pong_name (Events.encode_heartbeat hb) in
+             (match Events.encode_event pong profile with
+              | Ok b -> ignore (carrier.Carrier.send_frame b)
+              | Error _ -> ())
+           | Error _ -> ())
+         | _ -> ());
+        loop ()
+      | Error _ -> ())
+    | _ -> ()
+  in
+  loop ()
+"#;
+
+/// CSIL-Datagrams over UDP: encode a `->` request with the generated codec, wrap it in
+/// the library's `Datagram`, and send it fire-and-forget over the library's UDP carrier.
+/// The recv path `Datagrams.decode_datagram`s an inbound datagram and decodes its payload
+/// with the generated codec into the RESPONSE type — there is NO synchronous response.
+fn datagrams_section(root: &str, ex: Option<&UnaryExample>) -> String {
+    let mut out = String::from("## CSIL-Datagrams (UDP)\n\n");
+    out.push_str(
+        "Unreliable, unordered, message-oriented. The library owns the `Datagram`\n\
+         envelope (and a UDP carrier); you bring a datagram carrier. The UDP carrier\n\
+         below is one example — a WebRTC unreliable channel or QUIC datagrams drop in\n\
+         unchanged.\n\n",
+    );
+    let Some(ex) = ex else {
+        out.push_str(
+            "This package declares no `->` operations, so there is no datagram payload to encode.\n\n",
+        );
+        return out;
+    };
+    let (Some((sample, req_type)), Some(req_codec), Some(res_codec)) =
+        (&ex.sample, &ex.req_codec, &ex.res_codec)
+    else {
+        out.push_str(
+            "This package's `->` operations have non-record payloads; (de)serialize them manually before framing.\n\n",
+        );
+        return out;
+    };
+    out.push_str("```ocaml\n");
+    out.push_str(&format!("open {root}\nopen Csilgen_transport\n\n"));
+    out.push_str(DATAGRAMS_CARRIER_OCAML);
+    out.push('\n');
+    out.push_str(&format!(
+        r#"let () =
+  let carrier = connect_datagram_carrier "localhost" 9000 in
+
+  (* The operation's datagram ordinal — its @wire-id, or a channel-agreed number. *)
+  let op_ord = {op_ord}L in
+
+  (* Fire-and-forget: encode the [->] request via the generated codec, wrap it in the
+     library's Datagram, and send it. seq 0 marks an unsequenced datagram. *)
+  let req : Types.{req_type} = {sample} in
+  let dg = Datagrams.new_datagram op_ord 0L (Codec.encode_{req_codec}_bytes req) in
+  ignore (carrier.Carrier.send_datagram (Datagrams.encode_datagram dg));
+
+  (* Recv path: a datagram of the RESPONSE type MAY arrive later — or never. There is NO
+     synchronous response; the caller must tolerate loss and reordering and handle a
+     reply whenever (if ever) it shows up. *)
+  match carrier.Carrier.recv_datagram () with
+  | Ok (Some bytes) -> (
+    match Datagrams.decode_datagram bytes with
+    | Ok (dg : Datagrams.datagram) ->
+      let resp = Codec.decode_{res_codec}_bytes dg.payload in
+      ignore resp;
+      print_endline "late response"
+    | Error _ -> ())
+  | _ -> ()
+```
+
+"#,
+        op_ord = ex.op_ord,
+        req_type = req_type,
+        sample = sample,
+        req_codec = req_codec,
+        res_codec = res_codec,
+    ));
+    out
+}
+
+/// The UDP datagram-carrier adapter — spec-independent, so a constant. It opens a
+/// connected UDP socket and wraps it with the library's `Udp.udp_datagram_carrier`; the
+/// carrier never waits for or correlates a reply.
+const DATAGRAMS_CARRIER_OCAML: &str = r#"(* One example carrier: UDP via the library's [Udp.udp_datagram_carrier] over a
+   connected [unix] socket. Datagrams are unreliable and unordered, so the carrier never
+   waits for or correlates a reply. The library owns the Datagram envelope. *)
+let connect_datagram_carrier host port : Carrier.datagram_carrier =
+  let he = Unix.gethostbyname host in
+  let addr = Unix.ADDR_INET (he.Unix.h_addr_list.(0), port) in
+  let sock = Unix.socket Unix.PF_INET Unix.SOCK_DGRAM 0 in
+  Unix.connect sock addr;
+  Udp.udp_datagram_carrier sock
+"#;
+
+/// The pieces the Events session needs: the generated service module (under `Services`),
+/// the wire service/op strings, the channel op's input/output codec type names, the
+/// outbound sample literal + type, and the full handler-record literal (every non-reverse
+/// op field, with the channel op's field wired to decode + dispatch).
+struct ChannelExample {
+    service_module: String,
+    wire_service: String,
+    wire_op: String,
+    out_codec: String,
+    out_type: String,
+    out_sample: String,
+    handler_record: String,
+}
+
+/// The first service (in declared order) with a `<->` op whose input and success output
+/// are both records (so the generated router + handler + per-type codec helpers exist).
+/// `None` when no service has a usable channel op — the Events section then shows the
+/// handshake/heartbeat without dispatch wiring.
+fn first_channel_example(spec: &CsilSpecSerialized) -> Option<ChannelExample> {
+    let records = codec_record_names(spec);
+    for rule in &spec.rules {
+        let CsilRuleType::ServiceDef(service) = &rule.rule_type else {
+            continue;
+        };
+        for op in &service.operations {
+            if !matches!(op.direction, CsilServiceDirection::Bidirectional) {
+                continue;
+            }
+            let success = success_type(&op.output_type);
+            let (Some(in_codec), Some(out_codec)) = (
+                op_codec_type(&op.input_type, &records),
+                op_codec_type(&success, &records),
+            ) else {
+                continue;
+            };
+            let CsilTypeExpression::Reference(out_name) = &success else {
+                continue;
+            };
+            let out_group = ocaml_find_record(spec, out_name)?;
+            return Some(ChannelExample {
+                service_module: ocaml_module_name(&rule.name),
+                wire_service: wire_service_name(&rule.name),
+                wire_op: wire_op_name(&op.name),
+                out_codec,
+                out_type: ocaml_type_name(out_name),
+                out_sample: ocaml_record_literal(spec, out_group),
+                handler_record: ocaml_handler_record(spec, service, &op.name, &in_codec),
+            });
+        }
+    }
+    None
+}
+
+/// The full `{ field = fn; ... }` handler-record literal the generated `route` takes:
+/// one field per non-reverse op. The chosen channel op's field decodes its payload with
+/// the generated codec and logs; the other inbound ops get inert stubs so the record is
+/// complete (a unary stub returns a transport error, a fire-and-forget channel stub
+/// returns unit).
+fn ocaml_handler_record(
+    spec: &CsilSpecSerialized,
+    service: &CsilServiceDefinition,
+    channel_op: &str,
+    in_codec: &str,
+) -> String {
+    let mut fields: Vec<String> = Vec::new();
+    for op in &service.operations {
+        if matches!(op.direction, CsilServiceDirection::Reverse) {
+            continue;
+        }
+        let field = ocaml_ident(&op.name);
+        if op.name == channel_op {
+            fields.push(format!(
+                "{field} = (fun payload -> let msg = Codec.decode_{in_codec}_bytes payload in ignore msg; print_endline \"event {wire}\")",
+                wire = wire_op_name(&op.name)
+            ));
+        } else {
+            match op.direction {
+                CsilServiceDirection::Unidirectional => fields.push(format!(
+                    "{field} = (fun _payload -> Services.transport_error ~status:0L ~message:\"unhandled in this events demo\")"
+                )),
+                CsilServiceDirection::Bidirectional => {
+                    fields.push(format!("{field} = (fun _payload -> ())"))
+                }
+                CsilServiceDirection::Reverse => {}
+            }
+        }
+    }
+    let _ = spec;
+    format!("{{ {} }}", fields.join("; "))
+}
 
 // ---------------------------------------------------------------------------
 // Identifier mapping

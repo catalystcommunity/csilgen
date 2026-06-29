@@ -740,7 +740,7 @@ fn package_files_absent_without_request() {
     assert!(paths.contains(&"client.ml"));
     assert!(!paths.contains(&"dune-project"));
     assert!(!paths.iter().any(|p| p.ends_with(".opam")));
-    assert!(!paths.contains(&"README.md"));
+    assert!(!paths.contains(&"genquickstart.md"));
     assert!(!paths.iter().any(|p| p.starts_with("lib/")));
 }
 
@@ -790,62 +790,186 @@ fn pingpong_spec() -> CsilSpecSerialized {
     }
 }
 
+/// An `Echo` service with a `->` op (`ping`) AND a record `<->` op (`watch`), both over
+/// the single-field `Ping`/`Pong` records — so all three genquickstart sections render
+/// their full library-based examples.
+fn transports_spec() -> CsilSpecSerialized {
+    CsilSpecSerialized {
+        rules: vec![
+            record_typedef("Ping", vec![bare_entry("msg", builtin("text"))]),
+            record_typedef("Pong", vec![bare_entry("msg", builtin("text"))]),
+            CsilRule {
+                name: "Echo".into(),
+                rule_type: CsilRuleType::ServiceDef(CsilServiceDefinition {
+                    operations: vec![
+                        CsilServiceOperation {
+                            name: "ping".into(),
+                            input_type: CsilTypeExpression::Reference("Ping".into()),
+                            output_type: CsilTypeExpression::Reference("Pong".into()),
+                            direction: CsilServiceDirection::Unidirectional,
+                            position: pos(),
+                            doc_comments: vec![],
+                            wire_id: Some(7),
+                        },
+                        CsilServiceOperation {
+                            name: "watch".into(),
+                            input_type: CsilTypeExpression::Reference("Ping".into()),
+                            output_type: CsilTypeExpression::Reference("Pong".into()),
+                            direction: CsilServiceDirection::Bidirectional,
+                            position: pos(),
+                            doc_comments: vec![],
+                            wire_id: Some(3),
+                        },
+                    ],
+                    wire_id: Some(1),
+                }),
+                position: pos(),
+                doc_comments: vec![],
+            },
+        ],
+        source_content: None,
+        service_count: 1,
+        fields_with_metadata_count: 0,
+    }
+}
+
+/// These assert the structural contract of the emitted genquickstart; the companion
+/// `genquickstart_carriers_compile_against_lib` proves the same carriers actually
+/// compile against the real package + transport library when a toolchain is present.
 #[test]
-fn package_readme_has_quickstart_carrier_and_example() {
-    // No OCaml toolchain is available here, so the README carrier cannot be compiled
-    // or run; this asserts the structural contract instead (runtime verify skipped).
+fn genquickstart_intro_credits_transport_lib() {
+    let spec = transports_spec();
+    let cfg = package_config("ocaml-client", Some(serde_json::json!(["ocaml"])));
+    let files = generate_ocaml(&spec, &cfg).unwrap();
+    let c = &readme_of(&files);
+
+    // The intro credits the library for the envelope/framing/lifecycle and names the
+    // carrier-only contribution; the Consume section adds the transport dep with a
+    // "not yet published" caveat.
+    assert!(c.contains("`csilgen-transport` library owns the"));
+    assert!(c.contains("*carrier*"));
+    assert!(c.contains("(libraries echo csilgen-transport unix)"));
+    assert!(c.contains("not yet published"));
+}
+
+#[test]
+fn genquickstart_rpc_section_uses_lib_envelope_over_http() {
+    let spec = transports_spec();
+    let cfg = package_config("ocaml-client", Some(serde_json::json!(["ocaml"])));
+    let files = generate_ocaml(&spec, &cfg).unwrap();
+    let c = &readme_of(&files);
+
+    assert!(c.contains("## CSIL-RPC (HTTP)"));
+    // The carrier implements the generated transport seam (the `client.call` record).
+    assert!(c.contains("Client.make_client ~call"));
+    // The envelope is the library's RPC request/response — never hand-rolled.
+    assert!(c.contains("Rpc.new_request service op payload"));
+    assert!(c.contains("Rpc.encode_request req"));
+    assert!(c.contains("Rpc.decode_response resp_bytes"));
+    assert!(c.contains("Rpc.as_transport_error resp"));
+    // It POSTs the canonical mount over the stdlib HTTP carrier.
+    assert!(c.contains("/csil/v1/rpc"));
+    assert!(c.contains("POST %s HTTP/1.1"));
+    // The typed ServiceError application arm is surfaced distinctly.
+    assert!(c.contains("\"ServiceError\""));
+    // The typed client is constructed over the carrier with a base URL, and the example
+    // call passes a generated sample request literal.
+    assert!(c.contains("make_rpc_client \"http://localhost:5080\""));
+    assert!(c.contains("Client.Echo.ping client req"));
+    assert!(c.contains("let req : Types.ping = { msg = \"example\" }"));
+}
+
+#[test]
+fn genquickstart_events_section_handshake_and_router_dispatch() {
+    let spec = transports_spec();
+    let cfg = package_config("ocaml-client", Some(serde_json::json!(["ocaml"])));
+    let files = generate_ocaml(&spec, &cfg).unwrap();
+    let c = &readme_of(&files);
+
+    assert!(c.contains("## CSIL-Events (TLS)"));
+    // A frame carrier built on the library's length-prefix framing over a stream.
+    assert!(c.contains("Carrier.stream_carrier ic oc"));
+    assert!(c.contains("TLS swap point"));
+    // The $hello / $hello-ack handshake via the library control plane.
+    assert!(c.contains("Events.encode_hello hello"));
+    assert!(c.contains("Events.decode_hello_ack frame"));
+    assert!(c.contains("Events.parse_profile ack.ack_profile"));
+    // The $ping / $pong heartbeat answered with the library Heartbeat.
+    assert!(c.contains("Events.ping_name"));
+    assert!(c.contains("Events.encode_heartbeat hb"));
+    // Dispatch into the generated server router + one outbound event via the codec.
+    assert!(c.contains("Events.new_verbose_event (Some \"echo\") \"Watch\""));
+    assert!(c.contains("Codec.encode_pong_bytes value"));
+    assert!(c.contains("Services.Echo.route handler ~op:name ~payload:ev.payload"));
+    // The handler record decodes the inbound channel payload with the generated codec.
+    assert!(c.contains("Services.Echo.handler"));
+    assert!(c.contains("Codec.decode_ping_bytes payload"));
+}
+
+#[test]
+fn genquickstart_datagrams_section_send_and_late_response() {
+    let spec = transports_spec();
+    let cfg = package_config("ocaml-client", Some(serde_json::json!(["ocaml"])));
+    let files = generate_ocaml(&spec, &cfg).unwrap();
+    let c = &readme_of(&files);
+
+    assert!(c.contains("## CSIL-Datagrams (UDP)"));
+    // The UDP datagram carrier comes from the library, over a connected unix socket.
+    assert!(c.contains("Udp.udp_datagram_carrier sock"));
+    assert!(c.contains("Unix.SOCK_DGRAM"));
+    // Encode the `->` request via the generated codec, wrap in the library's Datagram.
+    assert!(c.contains("op_ord = 7L"));
+    assert!(c.contains("let req : Types.ping = { msg = \"example\" }"));
+    assert!(c.contains("Datagrams.new_datagram op_ord 0L (Codec.encode_ping_bytes req)"));
+    assert!(c.contains("Datagrams.encode_datagram dg"));
+    // The recv path decodes a late datagram into the RESPONSE type, with the caveat.
+    assert!(c.contains("Datagrams.decode_datagram bytes"));
+    assert!(c.contains("Codec.decode_pong_bytes dg.payload"));
+    assert!(c.contains("MAY arrive later"));
+    assert!(c.contains("synchronous response"));
+}
+
+#[test]
+fn genquickstart_transports_option_selects_sections() {
+    // A subset names only events: the RPC and Datagrams sections are suppressed.
+    let spec = transports_spec();
+    let mut cfg = package_config("ocaml-client", Some(serde_json::json!(["ocaml"])));
+    cfg.options.insert(
+        "genquickstart_transports".to_string(),
+        serde_json::json!(["events"]),
+    );
+    let files = generate_ocaml(&spec, &cfg).unwrap();
+    let c = &readme_of(&files);
+
+    assert!(c.contains("## CSIL-Events (TLS)"));
+    assert!(!c.contains("## CSIL-RPC (HTTP)"));
+    assert!(!c.contains("## CSIL-Datagrams (UDP)"));
+}
+
+#[test]
+fn genquickstart_no_channel_op_shows_handshake_note() {
+    // The pingpong spec has no `<->` op: the Events section still shows the handshake +
+    // heartbeat, with a note where the dispatch would go.
     let spec = pingpong_spec();
     let cfg = package_config("ocaml-client", Some(serde_json::json!(["ocaml"])));
     let files = generate_ocaml(&spec, &cfg).unwrap();
-    let readme = files
-        .iter()
-        .find(|f| f.path == "README.md")
-        .expect("README.md emitted at the package root");
-    let c = &readme.content;
+    let c = &readme_of(&files);
 
-    // The carrier implements the generated transport seam (the `client.call` record).
-    assert!(
-        c.contains("Client.make_client ~call"),
-        "carrier must build the generated client over a `call` seam:\n{c}"
-    );
-    // It POSTs the canonical mount with the stdlib HTTP carrier.
-    assert!(
-        c.contains("/csil/v1/rpc"),
-        "carrier must POST the canonical mount"
-    );
-    assert!(
-        c.contains("POST %s HTTP/1.1"),
-        "carrier must speak HTTP/1.1"
-    );
-    // The request payload is tag-24 wrapped (embedded CBOR).
-    assert!(
-        c.contains("Cbor.Tag (24, Cbor.Bytes payload)"),
-        "request payload must be tag-24 wrapped"
-    );
-    // Both response arms are handled: transport status and the typed ServiceError arm.
-    assert!(
-        c.contains("transport status"),
-        "must surface a non-zero transport status"
-    );
-    assert!(
-        c.contains("\"ServiceError\""),
-        "must handle the typed ServiceError arm"
-    );
-    // The typed client is constructed over the carrier with a base URL.
-    assert!(
-        c.contains("make_rpc_client \"http://localhost:5080\""),
-        "example must construct the client over the carrier:\n{c}"
-    );
-    // The example call passes a generated sample request literal (not the failwith
-    // escape) and names the typed request binding.
-    assert!(
-        c.contains("Client.Echo.ping client req"),
-        "example call must invoke the first op over the carrier:\n{c}"
-    );
-    assert!(
-        c.contains("let req : Types.ping = { msg = \"example\" }"),
-        "example must pass a generated sample literal:\n{c}"
-    );
+    assert!(c.contains("## CSIL-Events (TLS)"));
+    assert!(c.contains("Events.encode_hello hello"));
+    assert!(c.contains("no generated channel router"));
+    // No handler/router dispatch is wired without a channel op.
+    assert!(!c.contains("Services.Echo.route"));
+}
+
+/// The `genquickstart.md` body, or a panic naming the missing file.
+fn readme_of(files: &[GeneratedFile]) -> String {
+    files
+        .iter()
+        .find(|f| f.path == "genquickstart.md")
+        .expect("genquickstart.md emitted at the package root")
+        .content
+        .clone()
 }
 
 #[test]
@@ -853,7 +977,7 @@ fn package_readme_absent_without_request() {
     let spec = pingpong_spec();
     let cfg = package_config("ocaml-client", None);
     let files = generate_ocaml(&spec, &cfg).unwrap();
-    assert!(!files.iter().any(|f| f.path == "README.md"));
+    assert!(!files.iter().any(|f| f.path == "genquickstart.md"));
 }
 
 #[test]
@@ -863,7 +987,7 @@ fn package_readme_opt_out_suppresses_only_readme() {
     // By default the README is emitted alongside the package scaffolding.
     let default_cfg = package_config("ocaml-client", Some(serde_json::json!(["ocaml"])));
     let default_files = generate_ocaml(&spec, &default_cfg).unwrap();
-    assert!(default_files.iter().any(|f| f.path == "README.md"));
+    assert!(default_files.iter().any(|f| f.path == "genquickstart.md"));
 
     // An explicit `emit_readme: false` suppresses only the README; the dune/opam
     // scaffolding and the relocated sources are unchanged.
@@ -872,7 +996,7 @@ fn package_readme_opt_out_suppresses_only_readme() {
         .insert("emit_readme".to_string(), serde_json::json!(false));
     let files = generate_ocaml(&spec, &cfg).unwrap();
     let paths: Vec<&str> = files.iter().map(|f| f.path.as_str()).collect();
-    assert!(!paths.contains(&"README.md"));
+    assert!(!paths.contains(&"genquickstart.md"));
     assert!(paths.contains(&"dune-project"));
     assert!(paths.iter().any(|p| p.ends_with(".opam")));
     assert!(paths.contains(&"lib/types.ml"));
@@ -901,7 +1025,7 @@ fn package_files_emitted_when_ocaml_requested() {
     // to a valid OCaml library name.
     assert!(paths.contains(&"dune-project"));
     assert!(paths.contains(&"corndogs_service.opam"));
-    assert!(paths.contains(&"README.md"));
+    assert!(paths.contains(&"genquickstart.md"));
     assert!(paths.contains(&"lib/dune"));
     // The generated modules are relocated under `lib/`, none left at the root.
     assert!(paths.contains(&"lib/types.ml"));
@@ -984,6 +1108,138 @@ fn package_builds_with_dune() {
     assert!(
         run.status.success(),
         "dune build of generated package failed:\n{}{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// --- genquickstart carrier verification -------------------------------------
+
+/// Whether a tool answers `--version` on PATH (so the test skips cleanly off a CI
+/// box without the OCaml toolchain rather than failing).
+fn tool_on_path(tool: &str) -> bool {
+    std::process::Command::new(tool)
+        .arg("--version")
+        .output()
+        .is_ok()
+}
+
+/// Pull every fenced ```ocaml block out of the genquickstart, in document order.
+/// Each block is a complete, copy-paste carrier example, so each becomes its own
+/// executable for the compile-check.
+fn ocaml_code_blocks(md: &str) -> Vec<String> {
+    let mut blocks = Vec::new();
+    let mut rest = md;
+    while let Some(start) = rest.find("```ocaml\n") {
+        let after = &rest[start + "```ocaml\n".len()..];
+        let Some(end) = after.find("```") else { break };
+        blocks.push(after[..end].to_string());
+        rest = &after[end + 3..];
+    }
+    blocks
+}
+
+/// Compile-check the three transport carriers the genquickstart actually emits
+/// against the REAL generated package and the reference `transports/ocaml` library.
+///
+/// The carriers use Unix sockets/TLS, so a `dune build` (typecheck + compile) is the
+/// right bar — a full network run is not hermetic. The package is generated with both
+/// surfaces (the package mode carries `Client` and `Services`), so all three sections
+/// — CSIL-RPC (over `Client`), CSIL-Events (over `Services`), CSIL-Datagrams (over
+/// `Client`) — resolve against one staged project. Skips cleanly when the OCaml
+/// toolchain or the reference library is absent.
+#[test]
+fn genquickstart_carriers_compile_against_lib() {
+    if !tool_on_path("dune") || !tool_on_path("ocaml") {
+        eprintln!("skipping: no dune/ocaml on PATH");
+        return;
+    }
+    // The reference transport library lives outside this crate, in the repo.
+    let lib_src = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../transports/ocaml/lib")
+        .canonicalize();
+    let Ok(lib_src) = lib_src else {
+        eprintln!("skipping: transports/ocaml/lib not found");
+        return;
+    };
+
+    // A spec with a `->` op (drives RPC + Datagrams) AND a record `<->` op (drives the
+    // Events router dispatch), so every section emits its full library-based example.
+    let spec = transports_spec();
+    let cfg = package_config("ocaml", Some(serde_json::json!(["ocaml"])));
+    let files = generate_ocaml(&spec, &cfg).unwrap();
+
+    let md = readme_of(&files);
+    let blocks = ocaml_code_blocks(&md);
+    assert_eq!(
+        blocks.len(),
+        3,
+        "expected RPC + Events + Datagrams carrier blocks, got {}",
+        blocks.len()
+    );
+
+    let dir = std::env::temp_dir().join(format!(
+        "csilgen-ocaml-genquickstart-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+
+    // Stage the generated package as-is (its own dune-project is the build root); the
+    // genquickstart.md doc itself is not a build input.
+    for f in &files {
+        if f.path == "genquickstart.md" {
+            continue;
+        }
+        let path = dir.join(&f.path);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, &f.content).unwrap();
+    }
+
+    // Vendor the reference transport library next to the package, as the library name
+    // (`csilgen_transport`) the carriers `open Csilgen_transport`. A private
+    // (public_name-less) copy needs no opam file; warnings are silenced so the
+    // compile-check fails only on real type errors.
+    let tdir = dir.join("transport");
+    std::fs::create_dir_all(&tdir).unwrap();
+    for entry in std::fs::read_dir(&lib_src).unwrap() {
+        let entry = entry.unwrap();
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.ends_with(".ml") || name.ends_with(".mli") {
+            std::fs::copy(entry.path(), tdir.join(name.as_ref())).unwrap();
+        }
+    }
+    std::fs::write(
+        tdir.join("dune"),
+        "(library\n (name csilgen_transport)\n (libraries unix)\n (flags (:standard -w -a)))\n",
+    )
+    .unwrap();
+
+    // Each carrier block becomes its own executable over the generated package
+    // (`echo`) and the vendored transport library.
+    for (i, block) in blocks.iter().enumerate() {
+        let cdir = dir.join(format!("carrier_{i}"));
+        std::fs::create_dir_all(&cdir).unwrap();
+        std::fs::write(cdir.join("main.ml"), block).unwrap();
+        std::fs::write(
+            cdir.join("dune"),
+            "(executable\n (name main)\n (libraries echo csilgen_transport unix)\n (flags (:standard -w -a)))\n",
+        )
+        .unwrap();
+    }
+
+    let run = std::process::Command::new("dune")
+        .arg("build")
+        .arg("--profile")
+        .arg("release")
+        .arg("--root")
+        .arg(&dir)
+        .output()
+        .unwrap();
+    assert!(
+        run.status.success(),
+        "dune build of emitted genquickstart carriers failed:\n{}{}",
         String::from_utf8_lossy(&run.stdout),
         String::from_utf8_lossy(&run.stderr)
     );
