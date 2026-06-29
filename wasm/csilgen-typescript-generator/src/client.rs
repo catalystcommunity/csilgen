@@ -2,12 +2,13 @@
 //!
 //! The client owns (de)serialization via the generated codec; the caller-supplied
 //! `ServiceTransport` only moves bytes (`call(service, op, req) -> bytes`). A
-//! unary method encodes its request record, calls the transport, and decodes the
-//! response record. The `ClientShape` selects the seam: a sync client returns the
-//! decoded record directly (the host owns the I/O loop), an async client `await`s a
+//! unary method encodes its request, calls the transport, and decodes the response.
+//! The `ClientShape` selects the seam: a sync client returns the decoded value
+//! directly (the host owns the I/O loop), an async client `await`s a
 //! `Promise`-returning seam and returns a `Promise` (for a `fetch`/WebSocket host).
-//! Ops whose request or response is not a record the codec can (de)serialize are
-//! skipped with a note.
+//! A record request/response uses its byte-level `to<T>Cbor`/`from<T>Cbor`; any other
+//! shape (a scalar id, a bare array, a scalar/array/map alias) is encoded/decoded via
+//! the codec's generic CBOR, so every op gets a method — none is silently dropped.
 //!
 //! Per-direction emission shape:
 //!
@@ -30,7 +31,9 @@ use crate::{
     common::{self, BidiTransport, ClientShape, DecimalMapping},
     types,
 };
-use csilgen_common::{CsilServiceDefinition, CsilServiceOperation, WasmGeneratorInput};
+use csilgen_common::{
+    CsilServiceDefinition, CsilServiceOperation, CsilSpecSerialized, WasmGeneratorInput,
+};
 use std::collections::{BTreeSet, HashSet};
 
 const DEFAULT_TYPES_MODULE: &str = "./types.gen";
@@ -70,7 +73,6 @@ pub fn generate(input: &WasmGeneratorInput, shape: ClientShape) -> Result<String
     let mapping = common::decimal_mapping(input)?;
     let spec = &input.csil_spec;
     let services = common::sorted_services(spec);
-    let records = codec::record_names(spec);
 
     let mut out = common::header(input, "typescript-client");
 
@@ -79,15 +81,9 @@ pub fn generate(input: &WasmGeneratorInput, shape: ClientShape) -> Result<String
     let mut codec_imports: BTreeSet<String> = BTreeSet::new();
     let mut body = String::new();
     for (name, def) in &services {
-        if let Some(class) = service_class(
-            name,
-            def,
-            mode,
-            mapping,
-            shape,
-            &records,
-            &mut codec_imports,
-        ) {
+        if let Some(class) =
+            service_class(spec, name, def, mode, mapping, shape, &mut codec_imports)
+        {
             body.push_str(&class);
             body.push('\n');
         }
@@ -184,17 +180,19 @@ fn service_class_has_methods(def: &CsilServiceDefinition, mode: BidiTransport) -
 }
 
 fn service_class(
+    spec: &CsilSpecSerialized,
     name: &str,
     def: &CsilServiceDefinition,
     mode: BidiTransport,
     mapping: DecimalMapping,
     shape: ClientShape,
-    records: &HashSet<String>,
     codec_imports: &mut BTreeSet<String>,
 ) -> Option<String> {
     if !service_class_has_methods(def, mode) {
         return None;
     }
+    let records = codec::record_names(spec);
+    let records = &records;
     let class = shape.class_name(&common::service_base(name));
     let transport = shape.transport_name();
     let wire_service = common::service_wire(name);
@@ -209,6 +207,7 @@ fn service_class(
             (_, csilgen_common::CsilServiceDirection::Unidirectional) => {
                 out.push('\n');
                 out.push_str(&unary_method(
+                    spec,
                     op,
                     &wire_service,
                     mapping,
@@ -219,9 +218,18 @@ fn service_class(
             }
             (BidiTransport::Rpc, csilgen_common::CsilServiceDirection::Bidirectional) => {
                 out.push('\n');
-                out.push_str(&rpc_send(op, &wire_service, shape, records, codec_imports));
+                out.push_str(&rpc_send(
+                    spec,
+                    op,
+                    &wire_service,
+                    mapping,
+                    shape,
+                    records,
+                    codec_imports,
+                ));
                 out.push('\n');
                 out.push_str(&rpc_check(
+                    spec,
                     op,
                     &wire_service,
                     mapping,
@@ -233,6 +241,7 @@ fn service_class(
             (BidiTransport::Rpc, csilgen_common::CsilServiceDirection::Reverse) => {
                 out.push('\n');
                 out.push_str(&rpc_check(
+                    spec,
                     op,
                     &wire_service,
                     mapping,
@@ -250,17 +259,68 @@ fn service_class(
     Some(out)
 }
 
-/// A note emitted in place of a method whose request/response is not a record the
-/// codec can (de)serialize — mirrors the Go/Swift/Python clients. The carrier moves
-/// bytes, so a non-record payload must be handled by the consumer.
-fn non_record_note(op: &CsilServiceOperation) -> String {
+/// A comment emitted in place of a method whose request or response the codec cannot
+/// (de)serialize from its exported helpers: a `decimal` payload with no record-level
+/// decimal support, or an undecodable multi-variant choice union. The carrier still
+/// moves the bytes, so such a payload is handled by the consumer.
+fn unsupported_op_note(op: &CsilServiceOperation) -> String {
     format!(
         "\n  // operation '{}' has a non-record payload; (de)serialize it manually\n",
         op.name
     )
 }
 
+/// Encode an op request to the wire bytes passed to the transport, plus the method's
+/// request parameter declaration. A record uses its byte-level `to<T>Cbor`; a `null`
+/// input (a push op) carries no body, so the parameter is dropped and an empty payload
+/// sent; any other shape — a scalar id, a bare array, a scalar/array/map alias —
+/// encodes via the codec's generic CBOR so the op is never silently dropped.
+fn encode_request(
+    spec: &CsilSpecSerialized,
+    op: &CsilServiceOperation,
+    mapping: DecimalMapping,
+    records: &HashSet<String>,
+    codec_imports: &mut BTreeSet<String>,
+) -> (String, String) {
+    if common::is_null_type(&op.input_type) {
+        return (String::new(), "new Uint8Array()".to_string());
+    }
+    let param = format!("req: {}", common::ts_type(&op.input_type, mapping));
+    if codec::is_record_ref(&op.input_type, records) {
+        let to_req = format!("to{}Cbor", codec::record_ref_name(&op.input_type));
+        codec_imports.insert(to_req.clone());
+        (param, format!("{to_req}(req)"))
+    } else {
+        let (expr, imports) = codec::op_encode_expr(spec, records, mapping, &op.input_type, "req");
+        codec_imports.extend(imports);
+        (param, expr)
+    }
+}
+
+/// Decode a unary response from the transport bytes named by `bytes_expr`. A record
+/// uses its byte-level `from<T>Cbor`; any other shape decodes via the codec's generic
+/// CBOR.
+fn decode_response(
+    spec: &CsilSpecSerialized,
+    success: &csilgen_common::CsilTypeExpression,
+    bytes_expr: &str,
+    mapping: DecimalMapping,
+    records: &HashSet<String>,
+    codec_imports: &mut BTreeSet<String>,
+) -> String {
+    if codec::is_record_ref(success, records) {
+        let from_res = format!("from{}Cbor", codec::record_ref_name(success));
+        codec_imports.insert(from_res.clone());
+        format!("{from_res}({bytes_expr})")
+    } else {
+        let (expr, imports) = codec::op_decode_expr(spec, records, mapping, success, bytes_expr);
+        codec_imports.extend(imports);
+        expr
+    }
+}
+
 fn unary_method(
+    spec: &CsilSpecSerialized,
     op: &CsilServiceOperation,
     wire_service: &str,
     mapping: DecimalMapping,
@@ -269,73 +329,58 @@ fn unary_method(
     codec_imports: &mut BTreeSet<String>,
 ) -> String {
     let success = common::success_type(&op.output_type);
-    let null_input = common::is_null_type(&op.input_type);
-    // The typed-codec path needs a record success type (the response carries
-    // `from<T>Cbor`) and a record-or-null request (the request carries `to<T>Cbor`).
-    if !codec::is_record_ref(&success, records)
-        || !(null_input || codec::is_record_ref(&op.input_type, records))
+    if !codec::op_boundary_expressible(spec, records, &op.input_type)
+        || !codec::op_boundary_expressible(spec, records, &success)
     {
-        return non_record_note(op);
+        return unsupported_op_note(op);
     }
     let method = common::to_camel(&op.name);
     let wire_method = common::method_wire(op);
-    let res = codec::record_ref_name(&success);
-    let from_res = format!("from{res}Cbor");
-    codec_imports.insert(from_res.clone());
+    let (req_param, req_bytes) = encode_request(spec, op, mapping, records, codec_imports);
+    let decode_resp = decode_response(spec, &success, "csilResp", mapping, records, codec_imports);
 
     let (async_kw, await_kw) = (shape.async_kw(), shape.await_kw());
-    let ret = shape.ret(&res);
+    let ret = shape.ret(&common::ts_type(&success, mapping));
     let throws = vec![
         "@throws {ServiceError} when the API returns an error response".to_string(),
         "@throws transport errors (network, timeout) raised by the transport".to_string(),
     ];
     let mut out = common::jsdoc(&op.doc_comments, &throws, "  ");
-    // A push op (`-> Event`) has a `null` input: there is no request body, so the
-    // request parameter is omitted and an empty payload is sent.
-    if null_input {
-        out.push_str(&format!("  {async_kw}{method}(): {ret} {{\n"));
-        out.push_str(&format!(
-            "    const csilResp = {await_kw}this.t.call(\"{wire_service}\", \"{wire_method}\", new Uint8Array());\n"
-        ));
-    } else {
-        let req = common::ts_type(&op.input_type, mapping);
-        let to_req = format!("to{}Cbor", codec::record_ref_name(&op.input_type));
-        codec_imports.insert(to_req.clone());
-        out.push_str(&format!("  {async_kw}{method}(req: {req}): {ret} {{\n"));
-        out.push_str(&format!(
-            "    const csilResp = {await_kw}this.t.call(\"{wire_service}\", \"{wire_method}\", {to_req}(req));\n"
-        ));
-    }
-    out.push_str(&format!("    return {from_res}(csilResp);\n"));
+    out.push_str(&format!("  {async_kw}{method}({req_param}): {ret} {{\n"));
+    out.push_str(&format!(
+        "    const csilResp = {await_kw}this.t.call(\"{wire_service}\", \"{wire_method}\", {req_bytes});\n"
+    ));
+    out.push_str(&format!("    return {decode_resp};\n"));
     out.push_str("  }\n");
     out
 }
 
-/// rpc-mode outbound: `send<Op>` posts an input record over a synthetic op name.
+/// rpc-mode outbound: `send<Op>` posts an input over a synthetic op name. The input is
+/// encoded like a unary request, so a non-record input is no longer dropped.
 fn rpc_send(
+    spec: &CsilSpecSerialized,
     op: &CsilServiceOperation,
     wire_service: &str,
+    mapping: DecimalMapping,
     shape: ClientShape,
     records: &HashSet<String>,
     codec_imports: &mut BTreeSet<String>,
 ) -> String {
-    if !codec::is_record_ref(&op.input_type, records) {
-        return non_record_note(op);
+    if !codec::op_boundary_expressible(spec, records, &op.input_type) {
+        return unsupported_op_note(op);
     }
     let camel = common::to_camel(&op.name);
     let wire_method = format!("{}Send", common::method_wire(op));
-    let req = common::ts_type(&op.input_type, DecimalMapping::Csil);
-    let to_req = format!("to{}Cbor", codec::record_ref_name(&op.input_type));
-    codec_imports.insert(to_req.clone());
+    let (param, req_bytes) = encode_request(spec, op, mapping, records, codec_imports);
     let (async_kw, await_kw) = (shape.async_kw(), shape.await_kw());
     let ret = shape.ret("void");
     let mut out = String::new();
     out.push_str(&format!(
-        "  {async_kw}send{}(req: {req}): {ret} {{\n",
+        "  {async_kw}send{}({param}): {ret} {{\n",
         pascal_from_camel(&camel)
     ));
     out.push_str(&format!(
-        "    {await_kw}this.t.call(\"{wire_service}\", \"{wire_method}\", {to_req}(req));\n"
+        "    {await_kw}this.t.call(\"{wire_service}\", \"{wire_method}\", {req_bytes});\n"
     ));
     out.push_str("  }\n");
     out
@@ -344,6 +389,7 @@ fn rpc_send(
 /// rpc-mode inbound: `check<Op>` drains the server's pending outbound queue, decoding
 /// the CBOR array of records the poll returns.
 fn rpc_check(
+    spec: &CsilSpecSerialized,
     op: &CsilServiceOperation,
     wire_service: &str,
     mapping: DecimalMapping,
@@ -352,16 +398,20 @@ fn rpc_check(
     codec_imports: &mut BTreeSet<String>,
 ) -> String {
     let success = common::success_type(&op.output_type);
-    if !codec::is_record_ref(&success, records) {
-        return non_record_note(op);
+    if !codec::op_boundary_expressible(spec, records, &success) {
+        return unsupported_op_note(op);
     }
     let camel = common::to_camel(&op.name);
     let wire_method = format!("{}Check", common::method_wire(op));
     let res = common::ts_type(&success, mapping);
-    let from_value = format!("from{}CborValue", codec::record_ref_name(&success));
+    // The poll returns a CBOR array; each element decodes as the success type. A record
+    // element uses its `from<T>CborValue`, any other shape the codec's generic CBOR, so
+    // a non-record poll element is no longer dropped.
+    let (decode_elem, elem_imports) =
+        codec::op_decode_value_expr(spec, records, mapping, &success, "csilE");
     codec_imports.insert("decode".to_string());
     codec_imports.insert("asArray".to_string());
-    codec_imports.insert(from_value.clone());
+    codec_imports.extend(elem_imports);
     let (async_kw, await_kw) = (shape.async_kw(), shape.await_kw());
     let ret = shape.ret(&format!("{res}[]"));
     let mut out = String::new();
@@ -373,7 +423,7 @@ fn rpc_check(
         "    const csilResp = {await_kw}this.t.call(\"{wire_service}\", \"{wire_method}\", new Uint8Array());\n"
     ));
     out.push_str(&format!(
-        "    return asArray(decode(csilResp)).map((csilE) => {from_value}(csilE));\n"
+        "    return asArray(decode(csilResp)).map((csilE) => {decode_elem});\n"
     ));
     out.push_str("  }\n");
     out

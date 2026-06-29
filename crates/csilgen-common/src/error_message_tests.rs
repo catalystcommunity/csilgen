@@ -384,12 +384,14 @@ mod error_message_regression_tests {
         );
         assert!(validation_error.is_fatal());
 
-        // Non-critical errors should not be fatal
+        // A failed generation is fatal: the CLI must exit non-zero on a crashed
+        // generator (e.g. a WASM trap) so callers detect it by status, not by guessing
+        // from whether any files were written.
         let generation_error = CsilgenError::GenerationError("Template error".to_string());
-        assert!(!generation_error.is_fatal());
+        assert!(generation_error.is_fatal());
 
         let wasm_error = CsilgenError::wasm_error_with_context("Memory warning", "test-gen");
-        assert!(!wasm_error.is_fatal());
+        assert!(wasm_error.is_fatal());
 
         // Multiple errors with any fatal should be fatal
         let multi_error = CsilgenError::MultipleErrors(vec![

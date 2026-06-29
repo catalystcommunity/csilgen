@@ -1,7 +1,7 @@
 //! Emits `types.gen.ts`: interfaces, type aliases, unions, and the shared
 //! `ServiceError` shape when the spec declares services.
 
-use crate::common::{self, DecimalMapping};
+use crate::common::{self, DecimalMapping, ts_string_literal};
 use csilgen_common::{
     CsilControlOperator, CsilDependsCompareOp, CsilDependsCondition, CsilFieldMetadata,
     CsilGroupEntry, CsilGroupExpression, CsilGroupKey, CsilLiteralValue, CsilRuleType,
@@ -745,26 +745,6 @@ fn guard(indent: &str, condition: &str, message: &str, access: &str) -> String {
     let field = access.strip_prefix("value.").unwrap_or(access);
     let literal = ts_string_literal(&format!("{field}: {message}"));
     format!("{indent}if ({condition}) errors.push({literal});\n")
-}
-
-/// Render `s` as a double-quoted TypeScript string literal with every special
-/// character escaped, so interpolated values can never produce invalid source.
-fn ts_string_literal(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 2);
-    out.push('"');
-    for c in s.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
-            c => out.push(c),
-        }
-    }
-    out.push('"');
-    out
 }
 
 /// Render a `decimal` comparison bound as a quoted TS string suitable for

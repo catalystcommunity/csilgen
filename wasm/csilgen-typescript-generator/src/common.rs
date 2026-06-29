@@ -1,7 +1,7 @@
 //! Shared helpers for the TypeScript emitters (types / client / server).
 
 use csilgen_common::{
-    CsilGroupExpression, CsilGroupKey, CsilOccurrence, CsilRule, CsilRuleType,
+    CsilGroupExpression, CsilGroupKey, CsilLiteralValue, CsilOccurrence, CsilRule, CsilRuleType,
     CsilServiceDefinition, CsilServiceDirection, CsilServiceOperation, CsilSpecSerialized,
     CsilTypeExpression, WasmGeneratorInput,
 };
@@ -235,11 +235,51 @@ pub fn ts_type(type_expr: &CsilTypeExpression, mapping: DecimalMapping) -> Strin
         CsilTypeExpression::Socket(name) | CsilTypeExpression::Plug(name) => to_pascal(name),
         // A fixed-shape array maps to a TS tuple type.
         CsilTypeExpression::Tuple(group) => tuple_type(group, mapping),
-        // Inline groups and bare literals are uncommon in operation signatures;
-        // fall back to a permissive type so output still compiles.
+        // Inline groups are uncommon in operation signatures; fall back to a
+        // permissive type so output still compiles.
         CsilTypeExpression::Group(_) => "object".to_string(),
-        CsilTypeExpression::Literal(_) => "unknown".to_string(),
+        CsilTypeExpression::Literal(value) => ts_literal_type(value),
     }
+}
+
+/// Render a literal value as its TypeScript literal type. An enum-style choice of
+/// literals (`"active" / "archived"`) is a `Choice` of `Literal`s, so rendering each
+/// member precisely makes the union `"active" | "archived"` rather than the useless
+/// `unknown | unknown` a blanket fallback produced — which both documents the wire
+/// vocabulary and lets the value flow into the codec's `CborValue` without a cast.
+pub fn ts_literal_type(value: &CsilLiteralValue) -> String {
+    match value {
+        CsilLiteralValue::Text(s) => ts_string_literal(s),
+        CsilLiteralValue::Integer(i) => i.to_string(),
+        CsilLiteralValue::Float(f) => f.to_string(),
+        CsilLiteralValue::Bool(b) => b.to_string(),
+        CsilLiteralValue::Null => "null".to_string(),
+        // A byte-string or array literal has no TS literal-type spelling; keep a
+        // permissive type so a spec that uses one still compiles.
+        CsilLiteralValue::Bytes(_) => "Uint8Array".to_string(),
+        CsilLiteralValue::Array(_) => "unknown[]".to_string(),
+    }
+}
+
+/// A TypeScript string-literal expression: the string wrapped in double quotes with
+/// the JSON control characters escaped. Shared by type rendering and the codec so a
+/// wire key or enum value is quoted identically everywhere.
+pub fn ts_string_literal(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }
 
 /// Map a fixed-shape array (`[text, int]` / `[tag: text, value: any]`) to a

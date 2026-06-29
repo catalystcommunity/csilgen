@@ -1293,3 +1293,215 @@ fn extract_all_c_blocks(md: &str) -> Vec<String> {
     }
     out
 }
+
+// ---- non-record op boundaries (scalar aliases, bare arrays) ----------------
+
+/// A service whose ops cross non-record boundaries: `get-house` takes a scalar
+/// transparent alias (`HouseID = text`) and `list-houses` returns a bare `[* House]`.
+/// Before the fix the client called a `csil_encode_HouseID`/`csil_decode_<list>` that
+/// no record codec ever defined, so the package failed to compile.
+fn house_service_rules() -> Vec<CsilRule> {
+    let house = group_rule(
+        "House",
+        vec![
+            bare_entry(
+                "house_id",
+                CsilTypeExpression::Reference("HouseID".to_string()),
+            ),
+            bare_entry("name", builtin("text")),
+        ],
+    );
+    let list_req = group_rule("ListReq", vec![bare_entry("limit", builtin("int"))]);
+    let svc = service_rule(
+        "HouseService",
+        vec![
+            op(
+                "get-house",
+                CsilTypeExpression::Reference("HouseID".to_string()),
+                CsilTypeExpression::Reference("House".to_string()),
+                CsilServiceDirection::Unidirectional,
+                None,
+            ),
+            op(
+                "list-houses",
+                CsilTypeExpression::Reference("ListReq".to_string()),
+                CsilTypeExpression::Array {
+                    element_type: Box::new(CsilTypeExpression::Reference("House".to_string())),
+                    occurrence: Some(CsilOccurrence::ZeroOrMore),
+                },
+                CsilServiceDirection::Unidirectional,
+                None,
+            ),
+        ],
+        None,
+    );
+    vec![alias_rule("HouseID", builtin("text")), house, list_req, svc]
+}
+
+#[test]
+fn nonrecord_op_boundaries_emit_synthetic_codecs() {
+    let out = process_generation(input_with_rules(
+        house_service_rules(),
+        "c-client",
+        HashMap::new(),
+    ))
+    .unwrap();
+    let codec = file_named(&out.files, "codec.gen.h");
+    let client = file_named(&out.files, "client.gen.h");
+
+    // The scalar-alias request boundary gets its own bare-value codec + public wrappers.
+    assert!(
+        codec.contains("static inline int csilc_enc_HouseID(csilc_buf *b, const HouseID *v)"),
+        "missing synthetic scalar-alias encoder:\n{codec}"
+    );
+    assert!(codec.contains("csil_encode_HouseID("));
+    assert!(codec.contains("csil_decode_HouseID("));
+    // The bare-array response boundary reuses the named-list machinery: an items+count
+    // struct plus its array codec, so the wire form stays a plain CBOR array.
+    assert!(
+        codec.contains("} CsilHouseList;"),
+        "missing synthetic list struct for the bare array boundary:\n{codec}"
+    );
+    assert!(
+        codec.contains(
+            "static inline int csilc_enc_CsilHouseList(csilc_buf *b, const CsilHouseList *v)"
+        ),
+        "missing synthetic list encoder:\n{codec}"
+    );
+    assert!(codec.contains("csil_decode_CsilHouseList("));
+
+    // The client declares the boundary C types and calls the synthetic wrappers.
+    assert!(client.contains("const HouseID *req"));
+    assert!(client.contains("if (csil_encode_HouseID(req,"));
+    assert!(client.contains("CsilHouseList *resp"));
+    assert!(client.contains("csil_decode_CsilHouseList(csil_respb,"));
+}
+
+const NONRECORD_DRIVER_C: &str = r#"#include "client.gen.h"
+#include <assert.h>
+#include <stdio.h>
+#include <string.h>
+
+/* Loopback "server": echo the decoded scalar id back inside a House, and answer a
+ * list request with a two-element House array, exercising every boundary codec. */
+static int stub_call(void *self, const char *service, const char *op,
+                     const uint8_t *req, size_t req_len,
+                     uint8_t **resp, size_t *resp_len) {
+    (void)self;
+    assert(strcmp(service, "house") == 0);
+    if (strcmp(op, "GetHouse") == 0) {
+        HouseID id;
+        CsilCodecArena *owner;
+        if (csil_decode_HouseID(req, req_len, &id, &owner)) return 1;
+        House h;
+        memset(&h, 0, sizeof(h));
+        h.house_id = id; /* echo the scalar request value back */
+        h.name = "Maple";
+        int rc = csil_encode_House(&h, resp, resp_len);
+        csil_codec_arena_free(owner);
+        return rc;
+    }
+    if (strcmp(op, "ListHouses") == 0) {
+        ListReq lr;
+        CsilCodecArena *owner;
+        if (csil_decode_ListReq(req, req_len, &lr, &owner)) return 1;
+        House hs[2];
+        memset(hs, 0, sizeof(hs));
+        hs[0].house_id = "h1"; hs[0].name = "A";
+        hs[1].house_id = "h2"; hs[1].name = "B";
+        CsilHouseList list;
+        list.items = hs;
+        list.count = 2;
+        int rc = csil_encode_CsilHouseList(&list, resp, resp_len);
+        csil_codec_arena_free(owner);
+        return rc;
+    }
+    return 1;
+}
+
+int main(void) {
+    CsilgenTransport tr;
+    tr.call = stub_call;
+    tr.self = NULL;
+
+    /* scalar-alias request boundary: a bare CBOR text carries the id over the wire */
+    HouseID qid = "house-42";
+    House resp;
+    CsilCodecArena *ro = NULL;
+    assert(csil_house_get_house(&tr, &qid, &resp, &ro) == 0);
+    assert(strcmp(resp.name, "Maple") == 0);
+    assert(strcmp(resp.house_id, "house-42") == 0);
+    csil_codec_arena_free(ro);
+
+    /* bare-array response boundary: a CBOR array decodes into items + count */
+    ListReq lr;
+    lr.limit = 10;
+    CsilHouseList houses;
+    CsilCodecArena *lo = NULL;
+    assert(csil_house_list_houses(&tr, &lr, &houses, &lo) == 0);
+    assert(houses.count == 2);
+    assert(strcmp(houses.items[0].house_id, "h1") == 0 && strcmp(houses.items[0].name, "A") == 0);
+    assert(strcmp(houses.items[1].house_id, "h2") == 0 && strcmp(houses.items[1].name, "B") == 0);
+    csil_codec_arena_free(lo);
+
+    printf("ok\n");
+    return 0;
+}
+"#;
+
+/// Compile and round-trip a scalar-alias request and a bare-array response through
+/// gcc. Skips cleanly when no C compiler is present so the suite stays portable.
+#[test]
+fn nonrecord_boundary_client_round_trips_through_gcc() {
+    let cc = ["cc", "gcc", "clang"].into_iter().find(|c| {
+        std::process::Command::new(c)
+            .arg("--version")
+            .output()
+            .is_ok()
+    });
+    let Some(cc) = cc else {
+        eprintln!("skipping: no C compiler on PATH");
+        return;
+    };
+
+    let out = process_generation(input_with_rules(
+        house_service_rules(),
+        "c-client",
+        HashMap::new(),
+    ))
+    .unwrap();
+    let dir = std::env::temp_dir().join(format!("csilgen-c-nonrec-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    for file in &out.files {
+        std::fs::write(dir.join(&file.path), &file.content).unwrap();
+    }
+    std::fs::write(dir.join("driver.c"), NONRECORD_DRIVER_C).unwrap();
+
+    let bin = dir.join("driver");
+    let compile = std::process::Command::new(cc)
+        .args(["-std=c11", "-Wall", "-Wextra", "-O1"])
+        .arg("-I")
+        .arg(&dir)
+        .arg(dir.join("driver.c"))
+        .arg("-o")
+        .arg(&bin)
+        .output()
+        .unwrap();
+    assert!(
+        compile.status.success(),
+        "compile failed:\n{}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let warnings = String::from_utf8_lossy(&compile.stderr);
+    assert!(warnings.is_empty(), "compiler warnings:\n{warnings}");
+
+    let run = std::process::Command::new(&bin).output().unwrap();
+    assert!(
+        run.status.success(),
+        "round-trip failed:\n{}{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

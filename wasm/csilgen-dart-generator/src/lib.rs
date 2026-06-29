@@ -648,6 +648,9 @@ pub fn generate_dart_code(
             .get("package_name")
             .and_then(|v| v.as_str())
             .filter(|s| !s.is_empty())
+            // A path-style `package_name` is the cross-ecosystem source of truth; pub
+            // wants only its tail. See `package_name_last_segment`.
+            .map(csilgen_common::package_name_last_segment)
             .unwrap_or(&library_name),
     );
 

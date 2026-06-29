@@ -691,7 +691,14 @@ fn find_record<'a>(input: &'a WasmGeneratorInput, name: &str) -> Option<&'a Csil
 /// back to `csilgen-client` for a service-less spec.
 fn package_name(input: &WasmGeneratorInput) -> String {
     if let Some(name) = option_string(input, "package_name") {
-        return name;
+        // A leading `@` marks an npm scoped name (`@org/pkg`) whose slash is the scope
+        // separator, not a path — keep it whole. Otherwise a path-style `package_name`
+        // (e.g. a Go module path) is the cross-ecosystem source of truth and npm wants
+        // only its tail. See `package_name_last_segment`.
+        if name.starts_with('@') {
+            return name;
+        }
+        return csilgen_common::package_name_last_segment(&name).to_string();
     }
     let services = common::sorted_services(&input.csil_spec);
     if let Some((name, _)) = services.first() {

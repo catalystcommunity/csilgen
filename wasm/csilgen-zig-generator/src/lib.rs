@@ -1924,7 +1924,9 @@ fn package_name(input: &WasmGeneratorInput) -> String {
         .map(str::trim)
         .filter(|s| !s.is_empty())
     {
-        return name.to_string();
+        // A path-style `package_name` is the cross-ecosystem source of truth; Zig
+        // wants only its tail. See `package_name_last_segment`.
+        return csilgen_common::package_name_last_segment(name).to_string();
     }
     for rule in &input.csil_spec.rules {
         if let CsilRuleType::ServiceDef(_) = &rule.rule_type {

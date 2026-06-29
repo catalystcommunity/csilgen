@@ -1810,11 +1810,18 @@ fn go_dec_func(
             )),
         },
         CsilTypeExpression::Reference(name) if records.contains(name) => format!("csilDec{name}"),
-        // A reference to a transparent alias decodes as its underlying type; the
-        // unnamed underlying value the map/array/scalar decoder returns is assignable
-        // to the named alias-typed field.
+        // A reference to a transparent alias (or enum) decodes via its underlying type,
+        // then converts the bare underlying the runtime returns to the named field type.
+        // Go does NOT implicitly assign a `string` to a named `HouseID`, nor a `[]string`
+        // to a named `Tags`, so the wrapper makes the decoder yield the field's exact
+        // type — which also lets `cborDecArray`/`cborDecMap` infer the right element type
+        // (`[]MemberID`, not `[]string`).
         CsilTypeExpression::Reference(name) if aliases.contains_key(name) => {
-            go_dec_func(&aliases[name], records, aliases, config)
+            let inner = go_dec_func(&aliases[name], records, aliases, config);
+            let go_type = map_csil_type_to_go(ty, &None, config.decimal_go_type());
+            format!(
+                "func(csilV cborValue) ({go_type}, error) {{ csilInner, csilErr := ({inner})(csilV); return {go_type}(csilInner), csilErr }}"
+            )
         }
         CsilTypeExpression::Array { element_type, .. } => {
             let elem_ty = map_csil_type_to_go(element_type, &None, config.decimal_go_type());
@@ -1851,7 +1858,14 @@ fn codec_aliases(
         .iter()
         .filter_map(|rule| match &rule.rule_type {
             CsilRuleType::TypeDef(t) => match t {
-                CsilTypeExpression::Group(_) | CsilTypeExpression::Choice(_) => None,
+                CsilTypeExpression::Group(_) => None,
+                // An enum (a choice of scalar literals) has no codec of its own, but it
+                // round-trips as its backing scalar: alias it to that builtin so the
+                // shared encode (`cborText`) and decode-with-conversion paths handle it
+                // exactly like a `Name = text` scalar alias. A true (non-literal) union
+                // stays unaliased and falls back to the null stub.
+                CsilTypeExpression::Choice(choices) => enum_scalar_builtin(choices)
+                    .map(|builtin| (rule.name.clone(), CsilTypeExpression::Builtin(builtin))),
                 other => Some((rule.name.clone(), other.clone())),
             },
             _ => None,
@@ -1953,6 +1967,9 @@ fn emit_record_codec(
     out.push_str(&format!("{i}var csilOut {name}\n"));
     for (member, wire, entry) in &named {
         let wire_lit = go_string_lit(wire);
+        // `go_dec_func` returns a decoder whose result is the field's exact Go type
+        // (it converts a named scalar alias / enum to its named type), so the assignment
+        // is a plain copy — no conversion needed here.
         let dec = go_dec_func(&entry.value_type, records, aliases, config);
         if matches!(entry.occurrence, Some(CsilOccurrence::Optional)) {
             // A missing optional key leaves the field at its zero value (nil); a
@@ -3895,6 +3912,52 @@ fn type_uses_builtin(type_expr: &CsilTypeExpression, builtin: &str) -> bool {
     }
 }
 
+/// The scalar Go type backing a literal-only choice (an enum), or `None` when the
+/// choice mixes non-literal members (a true union, which has no single scalar form).
+/// Every literal kind is checked so a numeric or boolean enum maps to its matching Go
+/// scalar, not just text. An empty choice is not an enum.
+fn literal_choice_scalar_go(choices: &[CsilTypeExpression]) -> Option<&'static str> {
+    let all = |pred: fn(&CsilLiteralValue) -> bool| {
+        !choices.is_empty()
+            && choices.iter().all(|c| match c {
+                CsilTypeExpression::Literal(v) => pred(v),
+                _ => false,
+            })
+    };
+    if all(|v| matches!(v, CsilLiteralValue::Text(_))) {
+        Some("string")
+    } else if all(|v| matches!(v, CsilLiteralValue::Integer(_))) {
+        Some("int64")
+    } else if all(|v| matches!(v, CsilLiteralValue::Float(_))) {
+        Some("float64")
+    } else if all(|v| matches!(v, CsilLiteralValue::Bool(_))) {
+        Some("bool")
+    } else {
+        None
+    }
+}
+
+/// The CSIL builtin an enum's literals back, for aliasing the enum to a scalar in the
+/// codec. `None` when the choice is not a uniform literal enum. The builtin names line
+/// up with what `go_enc_value`/`go_dec_func`/`scalar_alias_go_type` already handle.
+fn enum_scalar_builtin(choices: &[CsilTypeExpression]) -> Option<String> {
+    let kind = |v: &CsilLiteralValue| match v {
+        CsilLiteralValue::Text(_) => Some("text"),
+        CsilLiteralValue::Integer(_) => Some("int"),
+        CsilLiteralValue::Float(_) => Some("float"),
+        CsilLiteralValue::Bool(_) => Some("bool"),
+        _ => None,
+    };
+    let first = match choices.first()? {
+        CsilTypeExpression::Literal(v) => kind(v)?,
+        _ => return None,
+    };
+    choices
+        .iter()
+        .all(|c| matches!(c, CsilTypeExpression::Literal(v) if kind(v) == Some(first)))
+        .then(|| first.to_string())
+}
+
 fn map_csil_type_to_go(
     type_expr: &CsilTypeExpression,
     occurrence: &Option<CsilOccurrence>,
@@ -3938,6 +4001,13 @@ fn map_csil_type_to_go(
             // Unwrap constrained types and map the base type
             // Constraints like .size, .default, .regex are validation rules, not Go types
             return map_csil_type_to_go(base_type, occurrence, decimal_type);
+        }
+        // An enum (`ProjectStatus = "active" / "archived"`) is a closed set of scalar
+        // literals: model it as its scalar Go type (`type ProjectStatus string`), which
+        // round-trips through the codec, rather than `interface{}`, which the codec
+        // cannot (de)serialize and which a constructor cannot assign a typed value to.
+        CsilTypeExpression::Choice(choices) => {
+            literal_choice_scalar_go(choices).unwrap_or("interface{}")
         }
         _ => "interface{}", // Fallback for complex types
     };
@@ -4192,21 +4262,25 @@ fn literal_value_to_go_value(
         }
     };
 
-    // For optional fields, we need to create a pointer to the value
+    // An optional field is a pointer, so its default is a `*T` to a typed temporary.
+    // The temporary must be the field's exact Go type, not the literal's natural type:
+    // a `uint` default literal is an integer but the field is `*uint64`, and an enum
+    // default is text but the field is `*ProjectStatus`. The literal is wrapped in a
+    // conversion to that type (`uint64(50)`, `ProjectStatus("active")`); the non-pointer
+    // path above needs no conversion since an untyped constant assigns to any matching
+    // kind.
     match occurrence {
-        Some(CsilOccurrence::Optional) => match value {
-            CsilLiteralValue::Integer(i) => {
-                format!("func() *int64 {{ v := int64({i}); return &v }}()")
-            }
-            CsilLiteralValue::Float(f) => {
-                format!("func() *float64 {{ v := float64({f}); return &v }}()")
-            }
-            CsilLiteralValue::Text(s) => {
-                format!("func() *string {{ v := \"{s}\"; return &v }}()")
-            }
-            CsilLiteralValue::Bool(b) => format!("func() *bool {{ v := {b}; return &v }}()"),
-            _ => "nil".to_string(),
-        },
+        Some(CsilOccurrence::Optional) => {
+            let go_type = map_csil_type_to_go(value_type, &None, config.decimal_go_type());
+            let lit = match value {
+                CsilLiteralValue::Integer(i) => i.to_string(),
+                CsilLiteralValue::Float(f) => f.to_string(),
+                CsilLiteralValue::Text(s) => go_string_lit(s),
+                CsilLiteralValue::Bool(b) => b.to_string(),
+                _ => return "nil".to_string(),
+            };
+            format!("func() *{go_type} {{ v := {go_type}({lit}); return &v }}()")
+        }
         _ => base_value,
     }
 }
@@ -4386,6 +4460,84 @@ mod tests {
                 "CsilDecimal"
             ),
             "*string"
+        );
+    }
+
+    #[test]
+    fn enum_maps_to_named_scalar_not_interface() {
+        let choices = vec![
+            CsilTypeExpression::Literal(CsilLiteralValue::Text("active".to_string())),
+            CsilTypeExpression::Literal(CsilLiteralValue::Text("archived".to_string())),
+        ];
+        // A text-literal enum is a named string the codec can round-trip, not the
+        // uncompilable `interface{}` it used to collapse to.
+        assert_eq!(
+            map_csil_type_to_go(
+                &CsilTypeExpression::Choice(choices.clone()),
+                &None,
+                "CsilDecimal"
+            ),
+            "string"
+        );
+        assert_eq!(enum_scalar_builtin(&choices), Some("text".to_string()));
+        // A mixed (non-literal) union has no scalar form and stays a union.
+        let union = vec![
+            CsilTypeExpression::Reference("A".to_string()),
+            CsilTypeExpression::Reference("B".to_string()),
+        ];
+        assert_eq!(literal_choice_scalar_go(&union), None);
+    }
+
+    #[test]
+    fn alias_decoder_converts_to_named_type() {
+        use std::collections::{HashMap, HashSet};
+        let config = GoConfig::from_options(&HashMap::new()).unwrap();
+        let records = HashSet::new();
+        let mut aliases = HashMap::new();
+        aliases.insert(
+            "MemberID".to_string(),
+            CsilTypeExpression::Builtin("text".to_string()),
+        );
+        // A named scalar alias decodes the underlying primitive then converts to the
+        // named type, so `cborDecArray` infers `[]MemberID` rather than `[]string`.
+        let dec = go_dec_func(
+            &CsilTypeExpression::Reference("MemberID".to_string()),
+            &records,
+            &aliases,
+            &config,
+        );
+        assert!(
+            dec.contains("MemberID(csilInner)"),
+            "decoder must convert to the named type, got {dec}"
+        );
+    }
+
+    #[test]
+    fn optional_default_pointer_uses_field_type() {
+        use std::collections::HashMap;
+        let config = GoConfig::from_options(&HashMap::new()).unwrap();
+        // A `uint` optional default is a `*uint64`, never the literal's natural `*int64`.
+        let uint_default = literal_value_to_go_value(
+            &CsilLiteralValue::Integer(50),
+            &CsilTypeExpression::Builtin("uint".to_string()),
+            &Some(CsilOccurrence::Optional),
+            &config,
+        );
+        assert!(
+            uint_default.contains("*uint64") && uint_default.contains("uint64(50)"),
+            "got {uint_default}"
+        );
+        // An enum optional default points at the named enum type, not `*string`.
+        let enum_default = literal_value_to_go_value(
+            &CsilLiteralValue::Text("active".to_string()),
+            &CsilTypeExpression::Reference("ProjectStatus".to_string()),
+            &Some(CsilOccurrence::Optional),
+            &config,
+        );
+        assert!(
+            enum_default.contains("*ProjectStatus")
+                && enum_default.contains("ProjectStatus(\"active\")"),
+            "got {enum_default}"
         );
     }
 

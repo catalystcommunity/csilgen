@@ -557,11 +557,13 @@ mod tests {
         );
         assert!(validation_error.is_fatal());
 
+        // A failed generation must be fatal so the CLI exits non-zero: a caller has to
+        // tell a crashed generator (e.g. a WASM trap) from a clean run by status alone.
         let generation_error = CsilgenError::GenerationError("Generator failed".to_string());
-        assert!(!generation_error.is_fatal());
+        assert!(generation_error.is_fatal());
 
         let wasm_error = CsilgenError::WasmError("WASM runtime error".to_string());
-        assert!(!wasm_error.is_fatal());
+        assert!(wasm_error.is_fatal());
     }
 
     #[test]

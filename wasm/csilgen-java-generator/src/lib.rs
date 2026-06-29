@@ -154,8 +154,10 @@ impl JavaConfig {
         // the explicit `package_name` or a kebab of the package's last segment; version
         // defaults to the conventional first release.
         let group_id = package.clone();
+        // A path-style `package_name` is the cross-ecosystem source of truth; the
+        // Maven artifactId wants only its tail. See `package_name_last_segment`.
         let artifact_id = opt("package_name")
-            .map(str::to_string)
+            .map(|name| csilgen_common::package_name_last_segment(name).to_string())
             .unwrap_or_else(|| derive_artifact_id(&package));
         let version = opt("package_version").unwrap_or("0.1.0").to_string();
 

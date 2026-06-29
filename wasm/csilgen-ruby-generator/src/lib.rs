@@ -224,7 +224,9 @@ fn option_str<'a>(config: &'a GeneratorConfig, key: &str) -> Option<&'a str> {
 /// `require "<gem>"` resolves `lib/<gem>.rb`.
 fn package_gem_name(config: &GeneratorConfig) -> String {
     if let Some(name) = option_str(config, "package_name") {
-        let sanitized = sanitize_gem_name(name);
+        // A path-style `package_name` is the cross-ecosystem source of truth; the gem
+        // name wants only its tail. See `package_name_last_segment`.
+        let sanitized = sanitize_gem_name(csilgen_common::package_name_last_segment(name));
         if !sanitized.is_empty() {
             return sanitized;
         }
