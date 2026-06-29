@@ -1215,7 +1215,7 @@ fn serviceless_package_notes_all_three() {
     );
 }
 
-/// `zig` on PATH (the portable suite) or the pinned csilgen-tools build, else `None`
+/// `zig` on PATH (the portable suite) or the pinned catalyst-tools build, else `None`
 /// so the compile-check skips where no Zig toolchain is installed.
 fn zig_bin() -> Option<String> {
     let ok = |bin: &str| {
@@ -1228,8 +1228,14 @@ fn zig_bin() -> Option<String> {
     if ok("zig") {
         return Some("zig".to_string());
     }
-    let home = std::env::var("HOME").ok()?;
-    let pinned = format!("{home}/.local/csilgen-tools/zig-0.14.1/zig");
+    // Fall back to the shared catalyst-tools install ($CATALYST_TOOLS, default
+    // ~/.local/catalyst-tools).
+    let tools = std::env::var("CATALYST_TOOLS").ok().or_else(|| {
+        std::env::var("HOME")
+            .ok()
+            .map(|home| format!("{home}/.local/catalyst-tools"))
+    })?;
+    let pinned = format!("{tools}/zig-0.14.1/zig");
     ok(&pinned).then_some(pinned)
 }
 

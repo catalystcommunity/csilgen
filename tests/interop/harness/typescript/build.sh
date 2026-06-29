@@ -6,7 +6,7 @@
 set -euo pipefail
 
 # shellcheck disable=SC1091
-source "$HOME/.local/csilgen-tools/env.sh" 2>/dev/null || true
+source "${CATALYST_TOOLS:-$HOME/.local/catalyst-tools}/env.sh" 2>/dev/null || true
 # Node is the one explicitly on PATH; prepend it so it wins over any tool shims.
 export PATH="$HOME/.local/opt/node/bin:$PATH"
 
