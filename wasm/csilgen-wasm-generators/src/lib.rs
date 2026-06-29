@@ -1038,10 +1038,6 @@ impl WasmGeneratorRuntime {
         })?;
 
         let mut store = Store::new(&self.engine, ());
-        // Add generous fuel for WASM execution - 100M instructions should be enough for basic operations
-        store
-            .set_fuel(100_000_000)
-            .map_err(|e| CsilgenError::WasmError(format!("Failed to set fuel: {e}")))?;
 
         // Note: Memory limiting would need proper wasmtime configuration
         // For now, we'll rely on time-based and fuel-based limiting
@@ -1096,29 +1092,51 @@ impl WasmGeneratorRuntime {
 
         let input_ptr = self.write_string_to_wasm(&mut store, &memory, &input_json)?;
 
-        // Execute with time limit
-        let start_time = Instant::now();
-        let result_ptr = loop {
-            if start_time.elapsed() > self.limits.max_execution_time {
-                return Err(CsilgenError::WasmError(
-                    "Generator execution exceeded time limit".to_string(),
-                ));
-            }
+        // Size the instruction budget from the serialized input rather than a fixed
+        // ceiling: codegen work scales with the spec, so a constant either starves a
+        // real spec (the longhouse spec needs ~330M instructions; the old 100M cap
+        // trapped mid-run and surfaced as an opaque convert_case backtrace) or
+        // over-permits a tiny one. The heaviest generators observed run ~3.6K
+        // instructions per input byte; the per-byte factor keeps an order of magnitude
+        // of headroom for generators with super-linear (per-field-pair) passes while
+        // still tripping a genuine runaway instead of hanging.
+        const FUEL_BASE: u64 = 1_000_000_000;
+        const FUEL_PER_INPUT_BYTE: u64 = 50_000;
+        let fuel_budget =
+            FUEL_BASE.saturating_add(FUEL_PER_INPUT_BYTE.saturating_mul(input_json.len() as u64));
+        store
+            .set_fuel(fuel_budget)
+            .map_err(|e| CsilgenError::WasmError(format!("Failed to set fuel: {e}")))?;
 
-            match generate_func.call(&mut store, (input_ptr as i32, input_json.len() as i32)) {
-                Ok(result_ptr) => break result_ptr,
-                Err(e) if e.to_string().contains("fuel") => {
-                    // Add more fuel and continue
-                    // In a real implementation, we'd add more fuel here
-                    continue;
-                }
-                Err(e) => {
-                    return Err(CsilgenError::WasmError(format!(
-                        "Generator execution failed: {e}"
-                    )));
-                }
+        // A synchronous wasmtime call cannot be resumed once it traps, so an exhausted
+        // fuel budget is terminal, not a refuel-and-continue point. Detect it via the
+        // error's source chain (the top-level Display is a bare backtrace) and report
+        // it plainly so a caller sees "out of budget", not a generator-internal frame.
+        let start_time = Instant::now();
+        let result_ptr = match generate_func
+            .call(&mut store, (input_ptr as i32, input_json.len() as i32))
+        {
+            Ok(result_ptr) => result_ptr,
+            Err(e) if e.chain().any(|c| c.to_string().contains("fuel")) => {
+                return Err(CsilgenError::WasmError(format!(
+                    "Generator '{generator_name}' exceeded its instruction budget of {fuel_budget} \
+                     for this spec; the generator may have an unbounded loop, or the spec may be \
+                     unusually large"
+                )));
+            }
+            Err(e) => {
+                return Err(CsilgenError::WasmError(format!(
+                    "Generator execution failed: {e}"
+                )));
             }
         };
+
+        if start_time.elapsed() > self.limits.max_execution_time {
+            return Err(CsilgenError::WasmError(format!(
+                "Generator '{generator_name}' exceeded the execution time limit of {:?}",
+                self.limits.max_execution_time
+            )));
+        }
 
         if result_ptr == 0 {
             return Err(CsilgenError::WasmError(

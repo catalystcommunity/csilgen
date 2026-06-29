@@ -330,8 +330,10 @@ impl SwiftPackage {
         if !emit_packages_includes(&input.config.options, "swift") {
             return None;
         }
+        // A path-style `package_name` is the cross-ecosystem source of truth; the Swift
+        // package name wants only its tail. See `package_name_last_segment`.
         let name = option_str(&input.config.options, "package_name")
-            .map(str::to_string)
+            .map(|name| csilgen_common::package_name_last_segment(name).to_string())
             .unwrap_or_else(|| "CsilgenClient".to_string());
         let target = swift_type_name(&name);
         let version = option_str(&input.config.options, "package_version")

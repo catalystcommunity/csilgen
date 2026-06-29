@@ -801,6 +801,99 @@ fn test_struct_codec_canonical_order_and_shapes() {
     assert!(types.contains("Csilgen.Generated.Task.to_cbor_value(v.task)"));
 }
 
+/// An entry carrying a literal default, modeled the way the parser records one: a
+/// `default` custom constraint in the field metadata.
+fn default_entry(name: &str, ty: CsilTypeExpression, value: CsilLiteralValue) -> CsilGroupEntry {
+    CsilGroupEntry {
+        key: Some(CsilGroupKey::Bare(name.to_string())),
+        value_type: ty,
+        occurrence: None,
+        metadata: vec![CsilFieldMetadata::Constraint(
+            CsilValidationConstraint::Custom {
+                name: "default".to_string(),
+                value,
+            },
+        )],
+        doc_comments: vec![],
+    }
+}
+
+#[test]
+fn test_defstruct_keyword_defaults_come_last() {
+    // A defaulted field declared before later bare fields must still emit last in the
+    // defstruct list: Elixir rejects a keyword entry followed by a bare atom. This is
+    // the longhouse `Project` shape that previously produced invalid syntax.
+    let input = group_input(
+        "Project",
+        vec![
+            bare_entry("name", CsilTypeExpression::Builtin("text".to_string())),
+            default_entry(
+                "status",
+                CsilTypeExpression::Builtin("text".to_string()),
+                CsilLiteralValue::Text("active".to_string()),
+            ),
+            bare_entry(
+                "created_by",
+                CsilTypeExpression::Builtin("text".to_string()),
+            ),
+        ],
+        HashMap::new(),
+    );
+    let out = process_generation(input).unwrap();
+    let types = file(&out, "types.gen.ex");
+    // Bare atoms first, the keyword default last — the only ordering Elixir accepts.
+    assert!(types.contains("defstruct [:name, :created_by, status: \"active\"]"));
+}
+
+#[test]
+fn test_empty_record_codec_has_no_unused_bindings() {
+    // A fieldless record reads neither the struct nor the decoded pairs, so both must
+    // bind underscored to compile warning-clean.
+    let input = group_input("EmptyRequest", vec![], HashMap::new());
+    let out = process_generation(input).unwrap();
+    let types = file(&out, "types.gen.ex");
+    assert!(types.contains("def to_cbor_value(%__MODULE__{} = _v) do"));
+    assert!(types.contains("def from_cbor_value({:map, _csil_kvs}) do"));
+    assert!(!types.contains("csil_fields = Map.new"));
+}
+
+#[test]
+fn test_optional_undecodable_field_underscores_bound_value() {
+    // An optional field referencing a non-record type has no real decoder (it falls
+    // back to a `raise`), so the decoded value is never read; the case binding must be
+    // underscored to avoid an unused-variable warning. A decodable optional keeps it.
+    let input = group_input(
+        "Project",
+        vec![
+            optional_entry(
+                "status",
+                CsilTypeExpression::Reference("ProjectStatus".to_string()),
+            ),
+            optional_entry("note", CsilTypeExpression::Builtin("text".to_string())),
+        ],
+        HashMap::new(),
+    );
+    let out = process_generation(input).unwrap();
+    let types = file(&out, "types.gen.ex");
+    assert!(
+        types
+            .contains("nil -> nil; _csil_v -> raise(\"csilgen: no codec for type ProjectStatus\")")
+    );
+    assert!(types.contains("nil -> nil; csil_v -> Csilgen.Generated.Cbor.to_text(csil_v)"));
+}
+
+#[test]
+fn test_codec_runtime_pins_size_arg() {
+    // The decoder reads a length into `arg` then matches a binary of that size; the size
+    // expression must pin (`^arg`) or recent Elixir warns about an outer variable in a
+    // bitstring size.
+    let out = process_generation(corndogs_input("elixir-typesonly")).unwrap();
+    let codec = file(&out, "codec.gen.ex");
+    assert!(codec.contains("<<b::binary-size(^arg), r::binary>> = rest"));
+    assert!(codec.contains("<<s::binary-size(^arg), r::binary>> = rest"));
+    assert!(!codec.contains("binary-size(arg)"));
+}
+
 /// Generate the corndogs `elixir-client` spec, write a driver that loads the
 /// generated modules plus a loopback transport, round-trip via to_cbor/from_cbor
 /// and the typed client, and run it with `elixir`. Skips when elixir is absent.

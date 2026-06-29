@@ -391,6 +391,9 @@ impl PackageCoords {
             .get("package_name")
             .and_then(|v| v.as_str())
             .filter(|s| !s.is_empty())
+            // A path-style `package_name` is the cross-ecosystem source of truth; the
+            // NuGet id wants only its tail. See `package_name_last_segment`.
+            .map(csilgen_common::package_name_last_segment)
             .unwrap_or(&config.namespace)
             .to_string();
         let version = options
@@ -1722,13 +1725,17 @@ fn emit_record_codec(
         "    public static CborValue {type_name}ToCborValue({type_name} value)\n    {{\n"
     ));
     out.push_str("        var csilEntries = new System.Collections.Generic.List<(CborValue, CborValue)>();\n");
-    for (prop, wire, entry) in &canonical {
+    for (index, (prop, wire, entry)) in canonical.iter().enumerate() {
         let wire_lit = csharp_escape(wire);
         if matches!(entry.occurrence, Some(CsilOccurrence::Optional)) {
-            // An absent optional is omitted from the map entirely (wire contract).
-            let enc = csharp_enc_value(&entry.value_type, "csilV", records, aliases);
+            // An absent optional is omitted from the map entirely (wire contract). The
+            // unwrapped non-null binding is named per-field: a C# `is { }` pattern variable
+            // leaks into the enclosing method scope, so a shared name would both collide
+            // (CS0128) and force every optional through the first field's type (CS1503).
+            let bind = format!("csilV{index}");
+            let enc = csharp_enc_value(&entry.value_type, &bind, records, aliases);
             out.push_str(&format!(
-                "        if (value.{prop} is {{ }} csilV)\n        {{\n            csilEntries.Add((new CborValue.Text(\"{wire_lit}\"), {enc}));\n        }}\n"
+                "        if (value.{prop} is {{ }} {bind})\n        {{\n            csilEntries.Add((new CborValue.Text(\"{wire_lit}\"), {enc}));\n        }}\n"
             ));
         } else {
             let enc = csharp_enc_value(
@@ -4009,8 +4016,62 @@ mod tests {
         // The per-record codec pair exists for each record.
         assert!(codec.contains("public static CborValue TaskToCborValue(Task value)"));
         assert!(codec.contains("public static Task TaskFromCborValue(CborValue value)"));
-        // An absent optional is omitted from the map, present-with-null on decode.
-        assert!(codec.contains("if (value.Priority is { } csilV)"));
+        // An absent optional is omitted from the map, present-with-null on decode. The
+        // non-null binding is uniquely suffixed (a `is { }` pattern variable leaks into the
+        // method scope, so a shared name would collide across optionals).
+        assert!(codec.contains("if (value.Priority is { } csilV"));
+    }
+
+    /// Every optional field's `is { }` binding must be uniquely named. A C# `is { }`
+    /// pattern variable leaks into the enclosing method scope, so reusing one name across a
+    /// record's optionals both collides (CS0128) and forces each optional through the first
+    /// field's type (CS1503 — e.g. a `bytes` optional fed a `string` binding). This guards
+    /// the per-field-unique binding that keeps the generated codec compiling.
+    #[test]
+    fn record_codec_binds_each_optional_uniquely() {
+        let opt = |name: &str, ty: CsilTypeExpression| CsilGroupEntry {
+            key: Some(CsilGroupKey::Bare(name.to_string())),
+            value_type: ty,
+            occurrence: Some(CsilOccurrence::Optional),
+            metadata: vec![],
+            doc_comments: Vec::new(),
+        };
+        let text = || CsilTypeExpression::Builtin("text".to_string());
+        // Differing types prove the binding is typed per-field: the `bytes` optional must
+        // bind a `byte[]`, not the `string` an earlier optional would have pinned.
+        let group = CsilGroupExpression {
+            entries: vec![
+                bare_entry("id", text()),
+                opt("note", text()),
+                opt("blob", CsilTypeExpression::Builtin("bytes".to_string())),
+                opt("count", CsilTypeExpression::Builtin("uint".to_string())),
+            ],
+        };
+        let records = std::collections::HashSet::new();
+        let aliases = std::collections::HashMap::new();
+        let codec = emit_record_codec("Thing", &group, &records, &aliases);
+
+        // Each optional binds a distinct name, and the bytes optional routes its own binding
+        // through CborValue.Bytes (a string binding here is the CS1503 we are guarding).
+        let binds: Vec<&str> = codec
+            .lines()
+            .filter_map(|l| l.trim().strip_prefix("if (value."))
+            .filter_map(|l| l.split("is { } ").nth(1))
+            .map(|l| l.trim_end_matches(')'))
+            .collect();
+        assert_eq!(binds.len(), 3, "three optionals must each emit a guard");
+        let unique: std::collections::HashSet<&&str> = binds.iter().collect();
+        assert_eq!(
+            unique.len(),
+            binds.len(),
+            "bindings must be unique: {binds:?}"
+        );
+        // Canonical key order is id(0), blob(1), note(2), count(3); the bytes optional `blob`
+        // lands at index 1 and must route its own binding through CborValue.Bytes.
+        assert!(
+            codec.contains("new CborValue.Bytes(csilV1)"),
+            "the bytes optional must encode its own typed binding"
+        );
     }
 
     #[test]

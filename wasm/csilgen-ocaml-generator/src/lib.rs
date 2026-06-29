@@ -239,7 +239,9 @@ fn package_name(spec: &CsilSpecSerialized, config: &GeneratorConfig) -> String {
         .map(str::trim)
         .filter(|s| !s.is_empty());
     let base = match configured {
-        Some(name) => name.to_string(),
+        // A path-style `package_name` (e.g. a Go module path) is the cross-ecosystem
+        // source of truth; opam wants only its tail. See `package_name_last_segment`.
+        Some(name) => csilgen_common::package_name_last_segment(name).to_string(),
         None => derive_package_name(spec),
     };
     sanitize_lib_name(&base)

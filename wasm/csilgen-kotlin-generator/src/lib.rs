@@ -353,7 +353,9 @@ impl KotlinConfig {
             .get("package_name")
             .and_then(|v| v.as_str())
             .filter(|s| !s.is_empty())
-            .map(str::to_string)
+            // A path-style `package_name` is the cross-ecosystem source of truth; the
+            // artifact name wants only its tail. See `package_name_last_segment`.
+            .map(|name| csilgen_common::package_name_last_segment(name).to_string())
             .unwrap_or_else(|| derive_package_name(&package));
         let package_version = options
             .get("package_version")
@@ -388,8 +390,10 @@ const KOTLIN_GRADLE_PLUGIN_VERSION: &str = "2.0.21";
 
 /// The `build.gradle.kts` for a self-contained package: the Kotlin/JVM + `maven-publish`
 /// plugins, the CSIL coordinates (group/version), a pinned JVM toolchain, and a publish
-/// block — and deliberately no third-party dependencies, since the generated codec runtime
-/// is self-contained.
+/// block. The generated codec runtime carries no third-party libraries, but the
+/// `kotlin("jvm")` plugin always contributes a `kotlin-stdlib` dependency, so a repository
+/// to resolve it is still required — without one Gradle fails with "no repositories are
+/// defined" before it ever compiles a source file.
 fn gradle_build_kts(config: &KotlinConfig) -> String {
     let group = kotlin_escape(&config.package);
     let version = kotlin_escape(&config.package_version);
@@ -403,6 +407,7 @@ fn gradle_build_kts(config: &KotlinConfig) -> String {
     out.push_str("}\n\n");
     out.push_str(&format!("group = \"{group}\"\n"));
     out.push_str(&format!("version = \"{version}\"\n\n"));
+    out.push_str("repositories {\n    mavenCentral()\n}\n\n");
     // A toolchain pins the JVM target so the published artifact is reproducible regardless
     // of the local JDK; 17 is the current LTS baseline.
     out.push_str("kotlin {\n    jvmToolchain(17)\n}\n\n");
@@ -2748,7 +2753,20 @@ fn literal_to_kotlin_typed(value: &CsilLiteralValue, value_type: &CsilTypeExpres
                 return format!("java.time.Instant.parse(\"{}\")", kotlin_escape(&text));
             }
         }
-        OrderedKind::Numeric => {}
+        OrderedKind::Numeric => {
+            // A bare integer literal is `Int` in Kotlin, which does not implicitly widen
+            // to the field's mapped numeric type: `ULong`/`Long` need a `uL`/`L` suffix
+            // and `Double` a decimal point, or the data-class default fails to compile
+            // ("type mismatch: expected ULong, actual Int").
+            if let CsilLiteralValue::Integer(i) = value {
+                match map_csil_type_to_kotlin(value_type, &None).as_str() {
+                    "ULong" => return format!("{i}uL"),
+                    "Long" => return format!("{i}L"),
+                    "Double" => return format!("{i}.0"),
+                    _ => {}
+                }
+            }
+        }
     }
     literal_to_kotlin(value)
 }
@@ -3038,6 +3056,28 @@ mod tests {
             .find(|f| f.path.ends_with(suffix))
             .map(|f| f.content.clone())
             .unwrap_or_else(|| panic!("no file ending in {suffix}"))
+    }
+
+    #[test]
+    fn numeric_default_carries_kotlin_type_suffix() {
+        // A bare integer literal is `Int`; a `ULong`/`Long`/`Double` field default needs
+        // the matching suffix or decimal point, or the data-class default fails to
+        // compile with a type mismatch.
+        let uint = CsilTypeExpression::Builtin("uint".to_string());
+        assert_eq!(
+            literal_to_kotlin_typed(&CsilLiteralValue::Integer(50), &uint),
+            "50uL"
+        );
+        let int = CsilTypeExpression::Builtin("int".to_string());
+        assert_eq!(
+            literal_to_kotlin_typed(&CsilLiteralValue::Integer(7), &int),
+            "7L"
+        );
+        let float = CsilTypeExpression::Builtin("float".to_string());
+        assert_eq!(
+            literal_to_kotlin_typed(&CsilLiteralValue::Integer(3), &float),
+            "3.0"
+        );
     }
 
     #[test]
@@ -3921,6 +3961,9 @@ mod tests {
         assert!(build.contains("jvmToolchain(17)"));
         // No third-party dependency is pulled in; the codec runtime is self-contained.
         assert!(!build.contains("dependencies {"));
+        // A repository is still required: the `kotlin("jvm")` plugin contributes
+        // `kotlin-stdlib`, which Gradle cannot resolve with no repositories defined.
+        assert!(build.contains("mavenCentral()"));
 
         // settings.gradle.kts names the root project after the artifact.
         let settings = content(&out, "settings.gradle.kts");

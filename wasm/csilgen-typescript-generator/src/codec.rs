@@ -8,7 +8,7 @@
 //! Each record gets a deep `to<T>CborValue`/`from<T>CborValue` pair plus the
 //! byte-level `to<T>Cbor`/`from<T>Cbor` the typed client calls.
 
-use crate::common::{self, DecimalMapping};
+use crate::common::{self, DecimalMapping, ts_string_literal};
 use csilgen_common::{
     CsilGroupExpression, CsilGroupKey, CsilLiteralValue, CsilOccurrence, CsilRuleType,
     CsilSpecSerialized, CsilTypeExpression, WasmGeneratorInput,
@@ -171,37 +171,53 @@ fn enc_is_identity(ty: &CsilTypeExpression, ctx: &Ctx) -> bool {
 }
 
 /// A TypeScript expression building the CBOR value tree node for `expr` (a typed
-/// value).
-fn ts_enc_value(ty: &CsilTypeExpression, expr: &str, ctx: &Ctx) -> String {
+/// value). Records every codec-module export the expression names into `imports`, so
+/// a caller emitting the expression outside `codec.gen.ts` (the client, for a
+/// non-record op boundary) imports exactly the helpers it references.
+fn ts_enc_value(
+    ty: &CsilTypeExpression,
+    expr: &str,
+    ctx: &Ctx,
+    imports: &mut BTreeSet<String>,
+) -> String {
     match unwrap_constrained(ty) {
         CsilTypeExpression::Builtin(name) => match name.as_str() {
-            "timestamp" => format!("{{ tag: 0, value: csilTsToText({expr}) }}"),
+            "timestamp" => {
+                imports.insert("csilTsToText".to_string());
+                format!("{{ tag: 0, value: csilTsToText({expr}) }}")
+            }
             "decimal" => match ctx.mapping {
                 DecimalMapping::Csil => format!("{{ tag: 4, value: {expr}.toTag4() }}"),
-                DecimalMapping::Library => format!("{{ tag: 4, value: csilDecToTag4({expr}) }}"),
+                DecimalMapping::Library => {
+                    imports.insert("csilDecToTag4".to_string());
+                    format!("{{ tag: 4, value: csilDecToTag4({expr}) }}")
+                }
             },
             "null" | "nil" => "null".to_string(),
             _ => expr.to_string(),
         },
         CsilTypeExpression::Reference(name) if ctx.records.contains(&common::to_pascal(name)) => {
+            imports.insert(format!("to{}CborValue", common::to_pascal(name)));
             format!("to{}CborValue({expr})", common::to_pascal(name))
         }
         CsilTypeExpression::Reference(name) => match ctx.aliases.get(&common::to_pascal(name)) {
-            Some(underlying) => ts_enc_value(underlying, expr, ctx),
+            Some(underlying) => ts_enc_value(underlying, expr, ctx, imports),
             None => expr.to_string(),
         },
         CsilTypeExpression::Array { element_type, .. } => {
             if enc_is_identity(element_type, ctx) {
                 expr.to_string()
             } else {
-                let inner = ts_enc_value(element_type, "csilE", ctx);
+                imports.insert("CborValue".to_string());
+                let inner = ts_enc_value(element_type, "csilE", ctx, imports);
                 format!("{expr}.map((csilE): CborValue => {inner})")
             }
         }
         CsilTypeExpression::Map { value, .. } => {
             // The in-memory type is `Record<string, V>`; the wire form is a CBOR
             // map, so the object's entries are rebuilt as a `Map` (insertion order).
-            let inner = ts_enc_value(value, "csilV", ctx);
+            imports.insert("CborValue".to_string());
+            let inner = ts_enc_value(value, "csilV", ctx, imports);
             format!(
                 "new Map<CborValue, CborValue>(Object.entries({expr}).map(([csilK, csilV]): [CborValue, CborValue] => [csilK, {inner}]))"
             )
@@ -213,51 +229,263 @@ fn ts_enc_value(ty: &CsilTypeExpression, expr: &str, ctx: &Ctx) -> String {
 
 /// A TypeScript expression reconstructing the typed value from `expr` (a
 /// `CborValue` node). The inverse of `ts_enc_value`; scalars are not the identity
-/// because a decoded node is a `CborValue` union that must be narrowed.
-fn ts_dec_value(ty: &CsilTypeExpression, expr: &str, ctx: &Ctx) -> String {
+/// because a decoded node is a `CborValue` union that must be narrowed. Records every
+/// codec-module export the expression names into `imports` (see `ts_enc_value`).
+fn ts_dec_value(
+    ty: &CsilTypeExpression,
+    expr: &str,
+    ctx: &Ctx,
+    imports: &mut BTreeSet<String>,
+) -> String {
     match unwrap_constrained(ty) {
         CsilTypeExpression::Builtin(name) => match name.as_str() {
             "int" | "uint" | "nint" | "float" | "float16" | "float32" | "float64" | "double" => {
+                imports.insert("asNumber".to_string());
                 format!("asNumber({expr})")
             }
-            "text" | "tstr" => format!("asString({expr})"),
-            "bytes" | "bstr" => format!("asBytes({expr})"),
-            "bool" => format!("asBool({expr})"),
-            "timestamp" => format!("asTimestamp({expr})"),
+            "text" | "tstr" => {
+                imports.insert("asString".to_string());
+                format!("asString({expr})")
+            }
+            "bytes" | "bstr" => {
+                imports.insert("asBytes".to_string());
+                format!("asBytes({expr})")
+            }
+            "bool" => {
+                imports.insert("asBool".to_string());
+                format!("asBool({expr})")
+            }
+            "timestamp" => {
+                imports.insert("asTimestamp".to_string());
+                format!("asTimestamp({expr})")
+            }
             "decimal" => match ctx.mapping {
-                DecimalMapping::Csil => format!("CsilDecimal.fromTag4(asDecimalPayload({expr}))"),
-                DecimalMapping::Library => format!("csilDecFromTag4(asDecimalPayload({expr}))"),
+                DecimalMapping::Csil => {
+                    imports.insert("CsilDecimal".to_string());
+                    imports.insert("asDecimalPayload".to_string());
+                    format!("CsilDecimal.fromTag4(asDecimalPayload({expr}))")
+                }
+                DecimalMapping::Library => {
+                    imports.insert("csilDecFromTag4".to_string());
+                    imports.insert("asDecimalPayload".to_string());
+                    format!("csilDecFromTag4(asDecimalPayload({expr}))")
+                }
             },
             "any" => expr.to_string(),
             "null" | "nil" => "null".to_string(),
-            _ => format!("asString({expr})"),
+            _ => {
+                imports.insert("asString".to_string());
+                format!("asString({expr})")
+            }
         },
         CsilTypeExpression::Reference(name) if ctx.records.contains(&common::to_pascal(name)) => {
+            imports.insert(format!("from{}CborValue", common::to_pascal(name)));
             format!("from{}CborValue({expr})", common::to_pascal(name))
         }
         CsilTypeExpression::Reference(name) => match ctx.aliases.get(&common::to_pascal(name)) {
-            Some(underlying) => ts_dec_value(underlying, expr, ctx),
+            Some(underlying) => ts_dec_value(underlying, expr, ctx, imports),
             None => format!(
                 "({expr} as unknown as {})",
                 common::ts_type(ty, ctx.mapping)
             ),
         },
         CsilTypeExpression::Array { element_type, .. } => {
-            let inner = ts_dec_value(element_type, "csilE", ctx);
+            imports.insert("asArray".to_string());
+            let inner = ts_dec_value(element_type, "csilE", ctx, imports);
             format!("asArray({expr}).map((csilE) => {inner})")
         }
         CsilTypeExpression::Map { value, .. } => {
-            let inner = ts_dec_value(value, "csilV", ctx);
+            imports.insert("asMap".to_string());
+            imports.insert("asString".to_string());
+            let inner = ts_dec_value(value, "csilV", ctx, imports);
             format!(
                 "Object.fromEntries(Array.from(asMap({expr}), ([csilK, csilV]): [string, {}] => [asString(csilK), {inner}]))",
                 common::ts_type(value, ctx.mapping)
             )
         }
-        CsilTypeExpression::Choice(_) => format!("asString({expr})"),
+        // An inline literal choice (`x: "a" / "b"`) now narrows to a precise TS union,
+        // so the decoded scalar must be cast to it; pick the reader from the literal
+        // kind so a numeric enum reads a number rather than a string (a `string as
+        // 1 | 2` cast would not typecheck). A choice of non-literals keeps the prior
+        // permissive string read.
+        CsilTypeExpression::Choice(choices) if all_literal(choices) => {
+            let reader = literal_choice_reader(choices);
+            imports.insert(reader.to_string());
+            format!("({reader}({expr}) as {})", common::ts_type(ty, ctx.mapping))
+        }
+        CsilTypeExpression::Choice(_) => {
+            imports.insert("asString".to_string());
+            format!("asString({expr})")
+        }
         _ => format!(
             "({expr} as unknown as {})",
             common::ts_type(ty, ctx.mapping)
         ),
+    }
+}
+
+/// Whether every member of a choice is a literal value — i.e. the choice is an
+/// enum (`"a" / "b"`, `1 / 2`) rather than a union of structured types.
+fn all_literal(choices: &[CsilTypeExpression]) -> bool {
+    !choices.is_empty()
+        && choices
+            .iter()
+            .all(|c| matches!(c, CsilTypeExpression::Literal(_)))
+}
+
+/// The scalar CBOR reader for a literal enum: `asNumber` when every member is
+/// numeric, `asBool` when every member is a boolean, else `asString`. The cast that
+/// follows narrows the read scalar to the precise union, so the reader must produce
+/// the union's underlying runtime type.
+fn literal_choice_reader(choices: &[CsilTypeExpression]) -> &'static str {
+    let all = |pred: fn(&CsilLiteralValue) -> bool| {
+        choices.iter().all(|c| match c {
+            CsilTypeExpression::Literal(v) => pred(v),
+            _ => false,
+        })
+    };
+    if all(|v| matches!(v, CsilLiteralValue::Integer(_) | CsilLiteralValue::Float(_))) {
+        "asNumber"
+    } else if all(|v| matches!(v, CsilLiteralValue::Bool(_))) {
+        "asBool"
+    } else {
+        "asString"
+    }
+}
+
+/// Byte-level encoder for an arbitrary op-boundary value: `encodeValue(<value tree>)`.
+/// The record path has `to<T>Cbor`, but a scalar/array/map request has no named
+/// helper, so the client builds the call inline from the codec's generic CBOR. Returns
+/// the TS expression encoding `value_expr` (a value of `ty`) to `Uint8Array` plus the
+/// codec exports it names, so the client imports exactly what it references.
+pub fn op_encode_expr(
+    spec: &CsilSpecSerialized,
+    records: &HashSet<String>,
+    mapping: DecimalMapping,
+    ty: &CsilTypeExpression,
+    value_expr: &str,
+) -> (String, BTreeSet<String>) {
+    let aliases = aliases(spec);
+    let ctx = Ctx {
+        records,
+        aliases: &aliases,
+        mapping,
+    };
+    let mut imports = BTreeSet::new();
+    imports.insert("encodeValue".to_string());
+    let tree = ts_enc_value(ty, value_expr, &ctx, &mut imports);
+    (format!("encodeValue({tree})"), imports)
+}
+
+/// Byte-level decoder for an arbitrary op-boundary value: the inverse of
+/// `op_encode_expr`. Returns the TS expression reconstructing a value of `ty` from
+/// the `Uint8Array` named by `bytes_expr`, plus the codec exports it names.
+pub fn op_decode_expr(
+    spec: &CsilSpecSerialized,
+    records: &HashSet<String>,
+    mapping: DecimalMapping,
+    ty: &CsilTypeExpression,
+    bytes_expr: &str,
+) -> (String, BTreeSet<String>) {
+    let aliases = aliases(spec);
+    let ctx = Ctx {
+        records,
+        aliases: &aliases,
+        mapping,
+    };
+    let mut imports = BTreeSet::new();
+    imports.insert("decode".to_string());
+    let dec = ts_dec_value(ty, &format!("decode({bytes_expr})"), &ctx, &mut imports);
+    (dec, imports)
+}
+
+/// Decode an arbitrary value from a `CborValue` node rather than raw bytes — the
+/// element decoder the rpc-mode poll needs, having already split the response array
+/// into nodes. Returns the expression reconstructing a value of `ty` from the node
+/// named by `value_expr`, plus the codec exports it names.
+pub fn op_decode_value_expr(
+    spec: &CsilSpecSerialized,
+    records: &HashSet<String>,
+    mapping: DecimalMapping,
+    ty: &CsilTypeExpression,
+    value_expr: &str,
+) -> (String, BTreeSet<String>) {
+    let aliases = aliases(spec);
+    let ctx = Ctx {
+        records,
+        aliases: &aliases,
+        mapping,
+    };
+    let mut imports = BTreeSet::new();
+    let dec = ts_dec_value(ty, value_expr, &ctx, &mut imports);
+    (dec, imports)
+}
+
+/// Whether any record field uses `decimal`, mirroring the condition under which
+/// `generate` emits the decimal import/bridge. An op boundary that references
+/// `decimal` is only expressible when that support is present, since the decimal
+/// helpers are not part of the always-on runtime.
+fn records_use_decimal(spec: &CsilSpecSerialized) -> bool {
+    spec.rules.iter().any(|rule| {
+        rule_group(&rule.rule_type).is_some_and(|group| {
+            group
+                .entries
+                .iter()
+                .any(|entry| type_uses_decimal(&entry.value_type))
+        })
+    })
+}
+
+/// Whether the client can (de)serialize an op-boundary type with the codec's exported
+/// helpers. Records, scalars, arrays, maps, transparent aliases, and literal enums all
+/// resolve to always-present runtime helpers (or a record's own codec). Two shapes do
+/// not, and keep the skip-with-note path the client falls back to:
+///   - a `decimal` payload when no record uses `decimal`, so the codec emitted neither
+///     the decimal import nor its bridge — the expression would name an undefined
+///     helper;
+///   - a multi-variant choice of non-literals (e.g. a `Res / DomainError` success
+///     union), which carries no wire discriminator to decode against.
+pub fn op_boundary_expressible(
+    spec: &CsilSpecSerialized,
+    records: &HashSet<String>,
+    ty: &CsilTypeExpression,
+) -> bool {
+    let aliases = aliases(spec);
+    let ctx = Ctx {
+        records,
+        aliases: &aliases,
+        mapping: DecimalMapping::Csil,
+    };
+    expressible(ty, &ctx, records_use_decimal(spec))
+}
+
+fn expressible(ty: &CsilTypeExpression, ctx: &Ctx, codec_has_decimal: bool) -> bool {
+    match unwrap_constrained(ty) {
+        CsilTypeExpression::Builtin(name) if name == "decimal" => codec_has_decimal,
+        CsilTypeExpression::Builtin(_) => true,
+        CsilTypeExpression::Reference(name) if ctx.records.contains(&common::to_pascal(name)) => {
+            true
+        }
+        CsilTypeExpression::Reference(name) => match ctx.aliases.get(&common::to_pascal(name)) {
+            Some(underlying) => expressible(underlying, ctx, codec_has_decimal),
+            // An unknown / choice-typedef reference decodes via an opaque cast, which
+            // compiles; only inline shapes need the structural checks below.
+            None => true,
+        },
+        CsilTypeExpression::Array { element_type, .. } => {
+            expressible(element_type, ctx, codec_has_decimal)
+        }
+        CsilTypeExpression::Map { value, .. } => expressible(value, ctx, codec_has_decimal),
+        CsilTypeExpression::Choice(choices) if all_literal(choices) => true,
+        // A single-variant choice resolves to that variant; multiple non-literal
+        // variants have no discriminator on the wire.
+        CsilTypeExpression::Choice(choices) => {
+            choices.len() <= 1
+                && choices
+                    .iter()
+                    .all(|c| expressible(c, ctx, codec_has_decimal))
+        }
+        _ => true,
     }
 }
 
@@ -269,6 +497,9 @@ fn emit_record_codec(name: &str, group: &CsilGroupExpression, ctx: &Ctx) -> Stri
     let type_name = common::to_pascal(name);
     let fields = codec_fields(group);
     let mut out = String::new();
+    // The record codec lives in the same module as every helper it references, so the
+    // import set the value transforms collect is irrelevant here and discarded.
+    let mut ignored_imports = BTreeSet::new();
 
     out.push_str(&format!(
         "export function to{type_name}CborValue(v: {type_name}): CborValue {{\n"
@@ -279,7 +510,7 @@ fn emit_record_codec(name: &str, group: &CsilGroupExpression, ctx: &Ctx) -> Stri
     for field in &encode_fields {
         let wire = ts_string_literal(&field.wire);
         let access = format!("v.{}", field.member);
-        let enc = ts_enc_value(field.value_type, &access, ctx);
+        let enc = ts_enc_value(field.value_type, &access, ctx, &mut ignored_imports);
         if field.optional {
             // The `!== undefined` guard narrows the member to its non-optional type
             // before the encoder transforms it, and omits an absent optional.
@@ -305,14 +536,18 @@ fn emit_record_codec(name: &str, group: &CsilGroupExpression, ctx: &Ctx) -> Stri
         for field in &fields {
             let wire = ts_string_literal(&field.wire);
             if field.optional {
-                let dec = ts_dec_value(field.value_type, "csilV", ctx);
+                let dec = ts_dec_value(field.value_type, "csilV", ctx, &mut ignored_imports);
                 out.push_str(&format!(
                     "    {}: ((csilV: CborValue | undefined) => csilV === undefined ? undefined : {dec})(mapGet(value, {wire})),\n",
                     field.member
                 ));
             } else {
-                let dec =
-                    ts_dec_value(field.value_type, &format!("requireKey(value, {wire})"), ctx);
+                let dec = ts_dec_value(
+                    field.value_type,
+                    &format!("requireKey(value, {wire})"),
+                    ctx,
+                    &mut ignored_imports,
+                );
                 out.push_str(&format!("    {}: {dec},\n", field.member));
             }
         }
@@ -426,26 +661,6 @@ fn string_option(input: &WasmGeneratorInput, key: &str, default: &str) -> String
         .and_then(|v| v.as_str())
         .map(str::to_string)
         .unwrap_or_else(|| default.to_string())
-}
-
-/// A double-quoted TypeScript string literal with the few characters that could
-/// break a wire key escaped (field names are identifiers, but be defensive).
-fn ts_string_literal(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 2);
-    out.push('"');
-    for c in s.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
-            c => out.push(c),
-        }
-    }
-    out.push('"');
-    out
 }
 
 /// `decimal.js` carries no direct tag-4 accessor, so library mode bridges through

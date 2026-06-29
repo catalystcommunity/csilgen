@@ -452,8 +452,15 @@ impl CsilgenError {
             CsilgenError::ParseError(_) => true,
             CsilgenError::ValidationError(_) => true,
             CsilgenError::IoError(_) => true,
+            // A failed generation (including a WASM trap such as an exhausted
+            // instruction budget) is a real failure: the CLI must exit non-zero so a
+            // caller can tell a crashed generator from a clean run by status alone,
+            // rather than gating on "did any files appear".
+            CsilgenError::GenerationError(_) => true,
+            CsilgenError::WasmError(_) => true,
+            CsilgenError::ConfigError(_) => true,
+            CsilgenError::GenericError(_) => true,
             CsilgenError::MultipleErrors(errors) => errors.iter().any(|e| e.is_fatal()),
-            _ => false,
         }
     }
 

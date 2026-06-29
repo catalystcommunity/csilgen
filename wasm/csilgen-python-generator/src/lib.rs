@@ -1404,6 +1404,9 @@ impl PythonGenerator {
             .and_then(|v| v.as_str())
             .map(str::trim)
             .filter(|s| !s.is_empty())
+            // A path-style `package_name` is the cross-ecosystem source of truth; the
+            // PyPI dist name wants only its tail. See `package_name_last_segment`.
+            .map(csilgen_common::package_name_last_segment)
             .unwrap_or("csilgen_client")
             .to_string();
 

@@ -157,6 +157,9 @@ impl ElixirConfig {
             .and_then(|v| v.as_str())
             .map(str::trim)
             .filter(|s| !s.is_empty())
+            // A path-style `package_name` is the cross-ecosystem source of truth; Hex
+            // wants only its tail. See `package_name_last_segment`.
+            .map(csilgen_common::package_name_last_segment)
             .map(snake_case)
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| derive_package_name(&module_root));
@@ -1170,13 +1173,22 @@ fn emit_struct_module(
     }
 
     // defstruct: a field with a default carries it; everything else defaults to nil.
-    let struct_fields: Vec<String> = keyed
+    // Elixir requires keyword entries (`key: default`) to come last in the list, so the
+    // defaulted fields are partitioned after the bare atoms. The split is stable, so
+    // within each group fields keep CSIL declaration order, and the canonical wire layout
+    // (computed independently in `codec_fields`) is unaffected.
+    let bare_fields: Vec<String> = keyed
         .iter()
-        .map(|(e, atom)| match entry_default_value(e) {
-            Some(value) => format!("{atom}: {}", literal_to_elixir(value)),
-            None => format!(":{atom}"),
+        .filter(|(e, _)| entry_default_value(e).is_none())
+        .map(|(_, atom)| format!(":{atom}"))
+        .collect();
+    let defaulted_fields: Vec<String> = keyed
+        .iter()
+        .filter_map(|(e, atom)| {
+            entry_default_value(e).map(|value| format!("{atom}: {}", literal_to_elixir(value)))
         })
         .collect();
+    let struct_fields: Vec<String> = bare_fields.into_iter().chain(defaulted_fields).collect();
     content.push_str(&format!("  defstruct [{}]\n\n", struct_fields.join(", ")));
 
     // @type t with one line per field.
@@ -1468,7 +1480,11 @@ fn emit_struct_codec(
     content.push_str(&format!(
         "  @spec to_cbor_value(t()) :: {root}.Cbor.value()\n"
     ));
-    content.push_str("  def to_cbor_value(%__MODULE__{} = v) do\n");
+    // A fieldless record never reads the struct, so bind it underscored to stay clean.
+    let value_binding = if fields.is_empty() { "_v" } else { "v" };
+    content.push_str(&format!(
+        "  def to_cbor_value(%__MODULE__{{}} = {value_binding}) do\n"
+    ));
     content.push_str("    {:map,\n     Enum.reject(\n       [\n");
     for f in &fields {
         let access = format!("v.{}", f.atom);
@@ -1490,24 +1506,17 @@ fn emit_struct_codec(
 
     content.push_str("\n  @doc \"Reconstructs this struct from a decoded CBOR value tree.\"\n");
     content.push_str("  @spec from_cbor_value(term()) :: t()\n");
-    content.push_str("  def from_cbor_value({:map, csil_kvs}) do\n");
-    content.push_str("    csil_fields = Map.new(csil_kvs)\n");
-    content.push_str("    %__MODULE__{\n");
-    for f in &fields {
-        if f.optional {
-            let dec = dec_value(f.value_type, "csil_v", config, records, aliases);
-            content.push_str(&format!(
-                "      {atom}: (case Map.get(csil_fields, {{:text, \"{wire}\"}}) do nil -> nil; csil_v -> {dec} end),\n",
-                atom = f.atom,
-                wire = f.wire
-            ));
-        } else {
-            let fetch = format!("Map.fetch!(csil_fields, {{:text, \"{}\"}})", f.wire);
-            let dec = dec_value(f.value_type, &fetch, config, records, aliases);
-            content.push_str(&format!("      {atom}: {dec},\n", atom = f.atom));
-        }
+    // A fieldless record never reads the decoded pairs, so bind them underscored.
+    if fields.is_empty() {
+        content.push_str("  def from_cbor_value({:map, _csil_kvs}) do\n");
+        content.push_str("    %__MODULE__{}\n  end\n");
+    } else {
+        content.push_str("  def from_cbor_value({:map, csil_kvs}) do\n");
+        content.push_str("    csil_fields = Map.new(csil_kvs)\n");
+        content.push_str("    %__MODULE__{\n");
+        emit_from_cbor_fields(content, &fields, config, records, aliases);
+        content.push_str("    }\n  end\n");
     }
-    content.push_str("    }\n  end\n");
 
     content.push_str("\n  @doc \"Encodes this struct to canonical CBOR bytes.\"\n");
     content.push_str("  @spec to_cbor(t()) :: binary()\n");
@@ -1520,6 +1529,38 @@ fn emit_struct_codec(
     content.push_str(&format!(
         "  def from_cbor(bytes), do: from_cbor_value({root}.Cbor.decode(bytes))\n"
     ));
+}
+
+/// Emit the `field: <decoder>` body of a record's `from_cbor_value/1`. An optional
+/// field decodes inside a `case` whose present-arm binds the decoded value; when that
+/// field's type has no real decoder (a non-record reference falls back to a `raise`),
+/// the bound value is never read, so the binding is underscored to stay warning-clean.
+fn emit_from_cbor_fields(
+    content: &mut String,
+    fields: &[CodecField<'_>],
+    config: &ElixirConfig,
+    records: &HashSet<String>,
+    aliases: &HashMap<String, CsilTypeExpression>,
+) {
+    for f in fields {
+        if f.optional {
+            let dec = dec_value(f.value_type, "csil_v", config, records, aliases);
+            let bind = if dec.contains("csil_v") {
+                "csil_v"
+            } else {
+                "_csil_v"
+            };
+            content.push_str(&format!(
+                "      {atom}: (case Map.get(csil_fields, {{:text, \"{wire}\"}}) do nil -> nil; {bind} -> {dec} end),\n",
+                atom = f.atom,
+                wire = f.wire
+            ));
+        } else {
+            let fetch = format!("Map.fetch!(csil_fields, {{:text, \"{}\"}})", f.wire);
+            let dec = dec_value(f.value_type, &fetch, config, records, aliases);
+            content.push_str(&format!("      {atom}: {dec},\n", atom = f.atom));
+        }
+    }
 }
 
 /// Build `codec.gen.ex`: the shared self-contained canonical-CBOR value codec the
@@ -2581,11 +2622,11 @@ const CODEC_RUNTIME_ELIXIR: &str = r#"  @moduledoc """
         {{:int, -arg - 1}, rest}
 
       2 ->
-        <<b::binary-size(arg), r::binary>> = rest
+        <<b::binary-size(^arg), r::binary>> = rest
         {{:bytes, b}, r}
 
       3 ->
-        <<s::binary-size(arg), r::binary>> = rest
+        <<s::binary-size(^arg), r::binary>> = rest
         {{:text, s}, r}
 
       4 ->

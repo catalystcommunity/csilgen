@@ -1443,6 +1443,11 @@ fn emit_record_codec(
         ));
     }
     out.push_str("    if (csilc_w_map_head(b, csilc_n)) return -1;\n");
+    // An empty record (`{}`) reads no fields, so `v` would otherwise be an unused
+    // parameter under -Wextra; the cast keeps the codec warning-clean.
+    if fields.is_empty() {
+        out.push_str("    (void)v;\n");
+    }
     for field in &fields {
         emit_enc_field(out, field, scope, warnings);
     }
@@ -1454,8 +1459,14 @@ fn emit_record_codec(
     out.push_str(&format!(
         "static inline int csilc_dec_{name}(const csilc_value *m, CsilCodecArena *a, {name} *out) {{\n"
     ));
-    out.push_str("    const csilc_value *csilc_f;\n");
     out.push_str("    (void)a;\n");
+    // `csilc_f` and `out` are only touched when there are fields to read; an empty
+    // record leaves them unused, so declare/cast them to match the field count.
+    if fields.is_empty() {
+        out.push_str("    (void)out;\n");
+    } else {
+        out.push_str("    const csilc_value *csilc_f;\n");
+    }
     out.push_str("    if (!m || m->kind != CSILC_MAP) return -1;\n");
     for field in &fields {
         emit_dec_field(out, field, scope, warnings);
@@ -1664,14 +1675,11 @@ fn generate_codec(
         .collect();
     // Records, enums, and named map/list aliases all carry a generated codec, so a
     // field referencing any of them flows through the record-reference codec arm.
-    let codec_names: std::collections::HashSet<String> = typed
-        .iter()
-        .filter(|(_, k)| {
-            matches!(k, TypeKind::Struct(_) | TypeKind::Enum(_)) || alias_aggregate(k).is_some()
-        })
-        .map(|(n, _)| n.to_string())
-        .collect();
-    if codec_names.is_empty() {
+    let codec_names = codec_type_names(input);
+    // A service with unidirectional ops still needs this header even when no named
+    // type is codec'd, because the client's per-op boundary wrappers live here; only
+    // a spec with neither codec'd types nor such ops leaves the header unemitted.
+    if codec_names.is_empty() && !spec_has_unidirectional_ops(input) {
         return None;
     }
     // Transparent aliases the codec resolves through so a field typed as one encodes
@@ -1737,33 +1745,65 @@ fn generate_codec(
         {
             continue;
         }
-        public.push_str(&doc_comment(&[
-            &format!("Encode a {name} to CBOR. On success *out is a malloc'd buffer of"),
-            "*out_len bytes the caller frees with free(); returns non-zero on failure.",
-        ]));
-        public.push_str(&format!(
-            "static inline int csil_encode_{name}(const {name} *v, uint8_t **out, size_t *out_len) {{\n\
-             \x20   csilc_buf b;\n\
-             \x20   csilc_buf_init(&b);\n\
-             \x20   if (csilc_enc_{name}(&b, v)) {{ csilc_buf_dispose(&b); return -1; }}\n\
-             \x20   *out = b.data;\n\
-             \x20   *out_len = b.len;\n\
-             \x20   return 0;\n}}\n\n"
-        ));
-        public.push_str(&doc_comment(&[
-            &format!("Decode CBOR into a {name}. On success *owner holds the backing"),
-            "storage (every string/bytes/array inside *out borrows from it); free it",
-            "once with csil_codec_arena_free when done. Returns non-zero on failure.",
-        ]));
-        public.push_str(&format!(
-            "static inline int csil_decode_{name}(const uint8_t *in, size_t len, {name} *out, CsilCodecArena **owner) {{\n\
-             \x20   CsilCodecArena *a;\n\
-             \x20   const csilc_value *root;\n\
-             \x20   if (csilc_decode(in, len, &a, &root)) return -1;\n\
-             \x20   if (csilc_dec_{name}(root, a, out)) {{ csil_codec_arena_free(a); return -1; }}\n\
-             \x20   *owner = a;\n\
-             \x20   return 0;\n}}\n\n"
-        ));
+        emit_public_wrappers(&mut public, name, name);
+    }
+
+    // Synthetic codecs for the op boundaries that are not codec'd named types: a
+    // scalar/transparent-alias request like `get-house: HouseID -> House` and a bare
+    // `[* House]` response. Without these the typed client would call a
+    // `csil_encode_HouseID`/`csil_decode_<list>` that no record or alias ever defined.
+    // Each name is emitted once across the whole spec; a bare array reuses the
+    // named-list machinery (an items+count struct plus its list codec) so the wire
+    // form is a plain CBOR array, identical to what a named list alias produces.
+    let mut synth_structs = String::new();
+    let mut synth_bodies = String::new();
+    let mut synth_public = String::new();
+    let mut synth_seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for rule in &input.csil_spec.rules {
+        let CsilRuleType::ServiceDef(service) = &rule.rule_type else {
+            continue;
+        };
+        for op in &service.operations {
+            if !matches!(op.direction, CsilServiceDirection::Unidirectional) {
+                continue;
+            }
+            let success = success_type(&op.output_type);
+            for ty in [&op.input_type, &success] {
+                let boundary = classify_boundary(ty, &codec_names, config);
+                let Some(synth) = boundary.synth else {
+                    continue;
+                };
+                if !synth_seen.insert(boundary.codec_name.clone()) {
+                    continue;
+                }
+                match synth {
+                    SynthBoundary::Scalar(scalar_ty) => emit_scalar_boundary_codec(
+                        &mut synth_bodies,
+                        &boundary.codec_name,
+                        &boundary.c_type,
+                        &scalar_ty,
+                        &scope,
+                        warnings,
+                    ),
+                    SynthBoundary::Array(element) => {
+                        emit_list_alias_struct(
+                            &mut synth_structs,
+                            &boundary.codec_name,
+                            &element,
+                            config,
+                        );
+                        emit_list_alias_codec(
+                            &mut synth_bodies,
+                            &boundary.codec_name,
+                            &element,
+                            &scope,
+                            warnings,
+                        );
+                    }
+                }
+                emit_public_wrappers(&mut synth_public, &boundary.codec_name, &boundary.c_type);
+            }
+        }
     }
 
     let mut content = String::new();
@@ -1793,9 +1833,203 @@ fn generate_codec(
     content.push_str(&decls);
     content.push('\n');
     content.push_str(&bodies);
+    // A synthetic boundary struct precedes its codec, which precedes its public
+    // wrapper, so each name is defined before use without a forward-declaration pass.
+    content.push_str(&synth_structs);
+    content.push_str(&synth_bodies);
     content.push_str(&public);
+    content.push_str(&synth_public);
     header_close(&mut content, "CSILGEN_CODEC_GEN_H");
     Some(content)
+}
+
+/// Emit the public encode/decode wrappers for a codec type: `csil_encode_<name>`
+/// fills a malloc'd buffer the caller frees with `free()`; `csil_decode_<name>`
+/// fills a value backed by an arena the caller frees once with
+/// `csil_codec_arena_free`. `c_type` is the C token of the value (it equals `name`
+/// for records/enums/aliases, and differs only for a bare-builtin op boundary).
+fn emit_public_wrappers(public: &mut String, name: &str, c_type: &str) {
+    public.push_str(&doc_comment(&[
+        &format!("Encode a {name} to CBOR. On success *out is a malloc'd buffer of"),
+        "*out_len bytes the caller frees with free(); returns non-zero on failure.",
+    ]));
+    public.push_str(&format!(
+        "static inline int csil_encode_{name}(const {c_type} *v, uint8_t **out, size_t *out_len) {{\n\
+         \x20   csilc_buf b;\n\
+         \x20   csilc_buf_init(&b);\n\
+         \x20   if (csilc_enc_{name}(&b, v)) {{ csilc_buf_dispose(&b); return -1; }}\n\
+         \x20   *out = b.data;\n\
+         \x20   *out_len = b.len;\n\
+         \x20   return 0;\n}}\n\n"
+    ));
+    public.push_str(&doc_comment(&[
+        &format!("Decode CBOR into a {name}. On success *owner holds the backing"),
+        "storage (every string/bytes/array inside *out borrows from it); free it",
+        "once with csil_codec_arena_free when done. Returns non-zero on failure.",
+    ]));
+    public.push_str(&format!(
+        "static inline int csil_decode_{name}(const uint8_t *in, size_t len, {c_type} *out, CsilCodecArena **owner) {{\n\
+         \x20   CsilCodecArena *a;\n\
+         \x20   const csilc_value *root;\n\
+         \x20   if (csilc_decode(in, len, &a, &root)) return -1;\n\
+         \x20   if (csilc_dec_{name}(root, a, out)) {{ csil_codec_arena_free(a); return -1; }}\n\
+         \x20   *owner = a;\n\
+         \x20   return 0;\n}}\n\n"
+    ));
+}
+
+/// The named types that carry a generated codec: records, enums, and named map/list
+/// aliases. A reference to any of these resolves to its `csil_encode_*`/`csil_decode_*`.
+fn codec_type_names(input: &WasmGeneratorInput) -> std::collections::HashSet<String> {
+    input
+        .csil_spec
+        .rules
+        .iter()
+        .filter_map(|rule| {
+            let kind = classify_rule(&rule.rule_type)?;
+            let codecd = matches!(kind, TypeKind::Struct(_) | TypeKind::Enum(_))
+                || alias_aggregate(&kind).is_some();
+            codecd.then(|| rule.name.clone())
+        })
+        .collect()
+}
+
+fn spec_has_unidirectional_ops(input: &WasmGeneratorInput) -> bool {
+    input
+        .csil_spec
+        .rules
+        .iter()
+        .any(|rule| match &rule.rule_type {
+            CsilRuleType::ServiceDef(service) => service
+                .operations
+                .iter()
+                .any(|op| matches!(op.direction, CsilServiceDirection::Unidirectional)),
+            _ => false,
+        })
+}
+
+/// A synthetic per-op-boundary codec the client needs but no named type provides:
+/// a scalar/transparent-alias value (one CBOR value, no map wrapper) or a bare
+/// `[* T]` list (a CBOR array, built on the named-list machinery).
+enum SynthBoundary {
+    Scalar(CsilTypeExpression),
+    Array(CsilTypeExpression),
+}
+
+/// How one operation request/response type is (de)serialized by the typed client.
+/// `codec_name` is the `csil_encode_<X>`/`csil_decode_<X>` suffix; `c_type` is the C
+/// token the client declares. `synth` is set when the codec must additionally emit
+/// those functions because no named type already carries them.
+struct OpBoundary {
+    is_null: bool,
+    codec_name: String,
+    c_type: String,
+    synth: Option<SynthBoundary>,
+}
+
+/// Classify an op boundary type. A reference to a codec'd named type reuses its
+/// existing `csil_encode_*`/`csil_decode_*`; a `null`/`nil` input carries no body;
+/// everything else (a scalar/transparent alias, a bare builtin, a bare `[* T]`)
+/// needs a synthetic codec so every operation round-trips, not only record ones.
+fn classify_boundary(
+    ty: &CsilTypeExpression,
+    codec_names: &std::collections::HashSet<String>,
+    config: &CConfig,
+) -> OpBoundary {
+    match unwrap_constrained(ty) {
+        CsilTypeExpression::Builtin(n) if n == "null" || n == "nil" => OpBoundary {
+            is_null: true,
+            codec_name: String::new(),
+            c_type: "void".to_string(),
+            synth: None,
+        },
+        CsilTypeExpression::Reference(n) if codec_names.contains(n) => OpBoundary {
+            is_null: false,
+            codec_name: n.clone(),
+            c_type: n.clone(),
+            synth: None,
+        },
+        // A reference to a transparent scalar alias (`HouseID = text`): its typedef
+        // makes the C token identical to the alias name, and the value emitters
+        // resolve the reference to its underlying codec.
+        reference @ CsilTypeExpression::Reference(n) => OpBoundary {
+            is_null: false,
+            codec_name: n.clone(),
+            c_type: n.clone(),
+            synth: Some(SynthBoundary::Scalar(reference.clone())),
+        },
+        CsilTypeExpression::Array { element_type, .. } => {
+            let name = array_boundary_name(element_type);
+            OpBoundary {
+                is_null: false,
+                codec_name: name.clone(),
+                c_type: name,
+                synth: Some(SynthBoundary::Array((**element_type).clone())),
+            }
+        }
+        builtin @ CsilTypeExpression::Builtin(n) => OpBoundary {
+            is_null: false,
+            codec_name: n.clone(),
+            c_type: base_c_type(builtin, config),
+            synth: Some(SynthBoundary::Scalar(builtin.clone())),
+        },
+        // A bare map or other unrepresentable boundary degrades to a value the codec
+        // warns about and encodes as null, so the output still compiles.
+        other => OpBoundary {
+            is_null: false,
+            codec_name: "CsilUnsupportedBoundary".to_string(),
+            c_type: "void *".to_string(),
+            synth: Some(SynthBoundary::Scalar(other.clone())),
+        },
+    }
+}
+
+/// The synthesized codec/struct name for a bare `[* T]` op boundary. A reference
+/// element keeps its name, a builtin element is capitalized, and anything else
+/// collapses to `Value`; the `Csil…List` shape avoids colliding with user types.
+fn array_boundary_name(element: &CsilTypeExpression) -> String {
+    let token = match unwrap_constrained(element) {
+        CsilTypeExpression::Reference(n) => n.clone(),
+        CsilTypeExpression::Builtin(n) => {
+            let mut chars = n.chars();
+            match chars.next() {
+                Some(first) => first.to_uppercase().chain(chars).collect(),
+                None => "Value".to_string(),
+            }
+        }
+        _ => "Value".to_string(),
+    };
+    format!("Csil{token}List")
+}
+
+/// Emit the encode + decode bodies for a synthetic scalar op boundary: a single
+/// CBOR value with no map wrapper, so the wire form matches what a record field of
+/// the same type would write.
+fn emit_scalar_boundary_codec(
+    out: &mut String,
+    name: &str,
+    c_type: &str,
+    ty: &CsilTypeExpression,
+    scope: &CodecScope,
+    warnings: &mut Vec<GeneratorWarning>,
+) {
+    out.push_str(&format!(
+        "/* csilc_enc_{name} writes a bare {name} value. */\n"
+    ));
+    out.push_str(&format!(
+        "static inline int csilc_enc_{name}(csilc_buf *b, const {c_type} *v) {{\n"
+    ));
+    emit_enc_value(out, "    ", ty, "(*v)", scope, warnings);
+    out.push_str("    return 0;\n}\n\n");
+    out.push_str(&format!(
+        "/* csilc_dec_{name} reads a bare {name} value (arena-borrowed). */\n"
+    ));
+    out.push_str(&format!(
+        "static inline int csilc_dec_{name}(const csilc_value *m, CsilCodecArena *a, {c_type} *out) {{\n"
+    ));
+    out.push_str("    (void)a;\n");
+    emit_dec_value(out, "    ", ty, "m", "(*out)", scope, warnings);
+    out.push_str("    return 0;\n}\n\n");
 }
 
 // ---- client ---------------------------------------------------------------
@@ -1818,11 +2052,15 @@ typedef struct CsilgenTransport {
 ";
 
 fn generate_client(input: &WasmGeneratorInput, config: &CConfig) -> Option<String> {
+    // The client classifies each op boundary against the codec's named types so a
+    // record reuses its `csil_encode_*`/`csil_decode_*` while a scalar/alias/array
+    // boundary calls the synthetic wrapper the codec emits for it.
+    let codec_names = codec_type_names(input);
     let mut body = String::new();
     let mut emitted = false;
     for rule in &input.csil_spec.rules {
         if let CsilRuleType::ServiceDef(service) = &rule.rule_type {
-            emit_client_calls(&mut body, &rule.name, service, config);
+            emit_client_calls(&mut body, &rule.name, service, &codec_names, config);
             emitted = true;
         }
     }
@@ -1853,12 +2091,12 @@ fn emit_client_calls(
     content: &mut String,
     name: &str,
     service: &CsilServiceDefinition,
+    codec_names: &std::collections::HashSet<String>,
     config: &CConfig,
 ) {
     let base = service_base(name);
     let prefix = to_snake(&base);
     let wire_service = base.to_lowercase();
-    let _ = config;
     for op in &service.operations {
         // Only unary request/response ops belong on the RPC client; channel ops
         // ride the router surface the server target emits.
@@ -1871,9 +2109,12 @@ fn emit_client_calls(
         }
         let fn_name = format!("csil_{prefix}_{}", to_snake(&op.name));
         let wire_op = simple_pascal(&op.name);
-        let resp_type = base_c_type(&success_type(&op.output_type), config);
-        let has_input = !op_input_is_null(&op.input_type);
-        let req_type = base_c_type(&op.input_type, config);
+        let success = success_type(&op.output_type);
+        let resp = classify_boundary(&success, codec_names, config);
+        let req = classify_boundary(&op.input_type, codec_names, config);
+        let resp_type = resp.c_type;
+        let has_input = !req.is_null;
+        let req_type = req.c_type;
 
         content.push_str(&doc_comment(&[
             &format!("Invoke {wire_service}/{wire_op} with a typed request and decode the typed"),
@@ -1888,7 +2129,7 @@ fn emit_client_calls(
             content.push_str("    uint8_t *csil_reqb = NULL;\n    size_t csil_reqn = 0;\n");
             content.push_str(&format!(
                 "    if (csil_encode_{}(req, &csil_reqb, &csil_reqn)) return -1;\n",
-                type_codec_name(&op.input_type)
+                req.codec_name
             ));
         } else {
             content.push_str(&format!(
@@ -1905,20 +2146,10 @@ fn emit_client_calls(
         content.push_str("    if (csil_rc != 0) { free(csil_respb); return csil_rc; }\n");
         content.push_str(&format!(
             "    int csil_drc = csil_decode_{}(csil_respb, csil_respn, resp, resp_owner);\n",
-            type_codec_name(&success_type(&op.output_type))
+            resp.codec_name
         ));
         content.push_str("    free(csil_respb);\n");
         content.push_str("    return csil_drc;\n}\n\n");
-    }
-}
-
-/// The codec base name for a type reference (`csil_encode_<Name>` / `csil_decode_<Name>`).
-/// Operation input/output types are references to named records, so this is their name.
-fn type_codec_name(type_expr: &CsilTypeExpression) -> String {
-    match unwrap_constrained(type_expr) {
-        CsilTypeExpression::Reference(name) => name.clone(),
-        CsilTypeExpression::Builtin(name) => name.clone(),
-        _ => "void".to_string(),
     }
 }
 
@@ -2413,7 +2644,9 @@ fn package_name(input: &WasmGeneratorInput) -> String {
         .map(str::trim)
         .filter(|s| !s.is_empty())
     {
-        return name.to_string();
+        // A path-style `package_name` is the cross-ecosystem source of truth; C wants
+        // only its tail. See `package_name_last_segment`.
+        return csilgen_common::package_name_last_segment(name).to_string();
     }
     for rule in &input.csil_spec.rules {
         if let CsilRuleType::ServiceDef(_) = &rule.rule_type {

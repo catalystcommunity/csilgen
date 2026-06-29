@@ -119,7 +119,9 @@ fn package_name(input: &WasmGeneratorInput) -> String {
         .get("package_name")
         .and_then(|v| v.as_str())
     {
-        return name.to_string();
+        // A path-style `package_name` is the cross-ecosystem source of truth; the crate
+        // name wants only its tail. See `package_name_last_segment`.
+        return csilgen_common::package_name_last_segment(name).to_string();
     }
     for rule in &input.csil_spec.rules {
         if matches!(rule.rule_type, CsilRuleType::ServiceDef(_)) {
@@ -2026,7 +2028,7 @@ fn main() {{
                 };
                 fields.push(format!("{field_name}: {value}"));
             } else if let Some(spread) = Self::group_spread_reference(&entry.value_type) {
-                let field_name = self.to_snake_case(&spread);
+                let field_name = Self::escape_rust_ident(&self.to_snake_case(&spread));
                 let value = self.rust_sample(&CsilTypeExpression::Reference(spread));
                 fields.push(format!("{field_name}: {value}"));
             }
@@ -2164,7 +2166,7 @@ fn main() {{
                 // fields, so surface the referenced group as a named field rather
                 // than dropping it silently (which would leave the spread's fields
                 // unrepresentable). The field is named after the referenced type.
-                let field_name = self.to_snake_case(&spread);
+                let field_name = Self::escape_rust_ident(&self.to_snake_case(&spread));
                 content.push_str("    /// Inlined from group spread; flattened on the wire.\n");
                 content.push_str(&format!("    pub {field_name}: {spread},\n"));
             }
@@ -2791,7 +2793,7 @@ fn main() {{
             .iter()
             .filter_map(|e| {
                 let wire = Self::entry_wire_name(e)?;
-                let member = self.to_snake_case(&wire);
+                let member = Self::escape_rust_ident(&self.to_snake_case(&wire));
                 Some((member, wire, e))
             })
             .collect();
@@ -3390,11 +3392,38 @@ fn main() {{
 
     fn extract_field_name(&self, key: &Option<CsilGroupKey>) -> Option<String> {
         match key {
-            Some(CsilGroupKey::Bare(name)) => Some(self.to_snake_case(name)),
+            Some(CsilGroupKey::Bare(name)) => {
+                Some(Self::escape_rust_ident(&self.to_snake_case(name)))
+            }
             Some(CsilGroupKey::Literal(CsilLiteralValue::Text(name))) => {
-                Some(self.to_snake_case(name))
+                Some(Self::escape_rust_ident(&self.to_snake_case(name)))
             }
             _ => None,
+        }
+    }
+
+    /// Make `ident` usable as a Rust binding/field identifier when a CSIL field name
+    /// collides with a keyword (`type`, `match`, `move`, …). Most keywords take the
+    /// raw-identifier form (`r#type`), which keeps the name readable and stable; the
+    /// four that `r#` forbids (`crate`/`self`/`super`/`Self`) fall back to a trailing
+    /// underscore. Only standalone identifiers are escaped — the wire key keeps the
+    /// original spelling, so the rename never reaches the CBOR map.
+    fn escape_rust_ident(ident: &str) -> String {
+        const RAW_FORBIDDEN: [&str; 4] = ["crate", "self", "super", "Self"];
+        const KEYWORDS: [&str; 51] = [
+            "as", "break", "const", "continue", "crate", "else", "enum", "extern", "false", "fn",
+            "for", "if", "impl", "in", "let", "loop", "match", "mod", "move", "mut", "pub", "ref",
+            "return", "self", "static", "struct", "super", "trait", "true", "type", "unsafe",
+            "use", "where", "while", "async", "await", "dyn", "abstract", "become", "box", "do",
+            "final", "macro", "override", "priv", "typeof", "unsized", "virtual", "yield", "try",
+            "Self",
+        ];
+        if !KEYWORDS.contains(&ident) {
+            ident.to_string()
+        } else if RAW_FORBIDDEN.contains(&ident) {
+            format!("{ident}_")
+        } else {
+            format!("r#{ident}")
         }
     }
 
@@ -4087,6 +4116,36 @@ mod tests {
         assert!(types_content.contains("#[derive(Debug, Clone, PartialEq)]"));
         assert!(!types_content.contains("Serialize"));
         assert!(!types_content.contains("#[serde"));
+    }
+
+    #[test]
+    fn keyword_field_names_are_escaped() {
+        // A CSIL field named after a Rust keyword must become a valid identifier; most
+        // take the raw form, the four `r#` forbids take a trailing underscore, and a
+        // non-keyword is untouched.
+        assert_eq!(RustCodeGenerator::escape_rust_ident("type"), "r#type");
+        assert_eq!(RustCodeGenerator::escape_rust_ident("match"), "r#match");
+        assert_eq!(RustCodeGenerator::escape_rust_ident("self"), "self_");
+        assert_eq!(RustCodeGenerator::escape_rust_ident("crate"), "crate_");
+        assert_eq!(RustCodeGenerator::escape_rust_ident("house_id"), "house_id");
+    }
+
+    #[test]
+    fn keyword_field_emits_raw_identifier_in_struct() {
+        use csilgen_common::{CsilGroupEntry, CsilGroupExpression, CsilGroupKey};
+        let input = create_test_input();
+        let mut generator = RustCodeGenerator::new(&input);
+        let group = CsilGroupExpression {
+            entries: vec![CsilGroupEntry {
+                key: Some(CsilGroupKey::Bare("type".to_string())),
+                value_type: CsilTypeExpression::Builtin("text".to_string()),
+                occurrence: None,
+                metadata: vec![],
+                doc_comments: vec![],
+            }],
+        };
+        let out = generator.generate_struct("Node", &group).unwrap();
+        assert!(out.contains("pub r#type: String"), "got {out}");
     }
 
     #[test]
