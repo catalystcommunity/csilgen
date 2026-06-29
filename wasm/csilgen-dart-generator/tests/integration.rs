@@ -1256,7 +1256,7 @@ fn emit_readme_false_suppresses_only_the_readme() {
     )
     .unwrap();
     assert!(
-        with_readme.iter().any(|f| f.path == "README.md"),
+        with_readme.iter().any(|f| f.path == "genquickstart.md"),
         "README emitted by default in package mode"
     );
 
@@ -1273,7 +1273,7 @@ fn emit_readme_false_suppresses_only_the_readme() {
     )
     .unwrap();
     assert!(
-        !without_readme.iter().any(|f| f.path == "README.md"),
+        !without_readme.iter().any(|f| f.path == "genquickstart.md"),
         "emit_readme: false suppresses the README"
     );
     assert!(
@@ -1357,14 +1357,10 @@ fn generated_dart_package_passes_pub_get_and_analyze() {
         std::fs::write(&path, &f.content).unwrap();
     }
 
-    // Drop the README's Quickstart carrier (the real shipped artifact) into lib/ so
-    // `dart analyze` proves it — and its sample example call — compile against the
-    // generated codec + client. The `package:` self-import is rewritten to a relative
-    // one so analysis resolves it even on the no-cache fallback path below.
-    let readme = files.iter().find(|f| f.path == "README.md").unwrap();
-    let carrier = extract_dart_block(&readme.content)
-        .replace("package:csil_sample/csil_sample.dart", "csil_sample.dart");
-    std::fs::write(dir.join("lib/quickstart_carrier.dart"), carrier).unwrap();
+    // The generated lib/ is self-contained (only `dart:` + its own CsilCbor codec — no
+    // `csilgen_transport`), so the package analyzes without any external dependency. The
+    // README's lib-based Quickstart sections are proved separately by
+    // `readme_three_transports_verify`, which supplies the transport-library dep.
 
     let get = std::process::Command::new("dart")
         .args(["pub", "get", "--offline"])
@@ -1406,20 +1402,12 @@ fn generated_dart_package_passes_pub_get_and_analyze() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-// --- README Quickstart carrier ---------------------------------------------
+// --- 3-transport genquickstart (lib-based) ---------------------------------
 
-/// The body of the README's first fenced ```dart block — the shipped Quickstart.
-fn extract_dart_block(readme: &str) -> String {
-    const FENCE: &str = "```dart\n";
-    let start = readme.find(FENCE).expect("README has a dart code block") + FENCE.len();
-    let rest = &readme[start..];
-    let end = rest.find("```").expect("dart code block is closed");
-    rest[..end].to_string()
-}
-
-/// A ping/pong spec whose op echoes its request type as its response type, so the
-/// echo server's tag-24 payload decodes cleanly back into the typed result.
-fn pingpong_rules() -> Vec<CsilRule> {
+/// The verification spec: a `->` op (`ping: Ping -> Ping`, record request and
+/// response so the datagram codec round-trips) and a record-typed `<->` op
+/// (`chat: ChatMsg <-> ChatReply`, both records so the channel router exists).
+fn demo_rules() -> Vec<CsilRule> {
     vec![
         record_rule(
             "Ping",
@@ -1428,19 +1416,32 @@ fn pingpong_rules() -> Vec<CsilRule> {
                 entry("nonce", builtin("int"), false),
             ],
         ),
+        record_rule("ChatMsg", vec![entry("body", builtin("text"), false)]),
+        record_rule("ChatReply", vec![entry("ok", builtin("bool"), false)]),
         CsilRule {
-            name: "EchoService".to_string(),
+            name: "DemoService".to_string(),
             rule_type: CsilRuleType::ServiceDef(CsilServiceDefinition {
-                operations: vec![CsilServiceOperation {
-                    name: "ping".to_string(),
-                    input_type: reference("Ping"),
-                    output_type: reference("Ping"),
-                    direction: CsilServiceDirection::Unidirectional,
-                    position: pos(),
-                    doc_comments: Vec::new(),
-                    wire_id: None,
-                }],
-                wire_id: None,
+                operations: vec![
+                    CsilServiceOperation {
+                        name: "ping".to_string(),
+                        input_type: reference("Ping"),
+                        output_type: reference("Ping"),
+                        direction: CsilServiceDirection::Unidirectional,
+                        position: pos(),
+                        doc_comments: Vec::new(),
+                        wire_id: None,
+                    },
+                    CsilServiceOperation {
+                        name: "chat".to_string(),
+                        input_type: reference("ChatMsg"),
+                        output_type: reference("ChatReply"),
+                        direction: CsilServiceDirection::Bidirectional,
+                        position: pos(),
+                        doc_comments: Vec::new(),
+                        wire_id: Some(2),
+                    },
+                ],
+                wire_id: Some(1),
             }),
             position: pos(),
             doc_comments: Vec::new(),
@@ -1448,154 +1449,386 @@ fn pingpong_rules() -> Vec<CsilRule> {
     ]
 }
 
-#[test]
-fn package_readme_has_quickstart_carrier_and_example() {
-    let files = generate_dart_code(
-        &spec(corndogs_rules(), 1),
-        &config_with(
-            "dart-client",
-            &[
-                ("emit_packages", serde_json::json!(["dart"])),
-                ("package_name", serde_json::json!("csil_sample")),
-            ],
-        ),
+fn demo_pkg_opts(target: &str) -> GeneratorConfig {
+    config_with(
+        target,
+        &[
+            ("emit_packages", serde_json::json!(["dart"])),
+            ("package_name", serde_json::json!("csil_demo")),
+        ],
     )
-    .unwrap();
-    let readme = &files
-        .iter()
-        .find(|f| f.path == "README.md")
-        .expect("README.md emitted in package mode")
-        .content;
+}
 
-    // The carrier implements the generated async transport seam.
+fn readme_of(files: &[GeneratedFile]) -> &str {
+    &files
+        .iter()
+        .find(|f| f.path == "genquickstart.md")
+        .expect("genquickstart.md emitted in package mode")
+        .content
+}
+
+/// The body of the first ```dart block under `heading` (bounded to that section, so a
+/// note-only section returns `None` rather than the next section's block).
+fn extract_dart_block_after(readme: &str, heading: &str) -> Option<String> {
+    let h = readme.find(heading)?;
+    let rest = &readme[h + heading.len()..];
+    let section = &rest[..rest.find("\n## ").unwrap_or(rest.len())];
+    const FENCE: &str = "```dart\n";
+    let start = section.find(FENCE)? + FENCE.len();
+    let after = &section[start..];
+    let end = after.find("```")?;
+    Some(after[..end].to_string())
+}
+
+#[test]
+fn client_package_readme_has_rpc_and_datagram_sections() {
+    let files = generate_dart_code(&spec(demo_rules(), 1), &demo_pkg_opts("dart-client")).unwrap();
+    let readme = readme_of(&files);
+
+    // All three headings render in a fixed order.
     assert!(
-        readme.contains("class CsilRpcTransport implements AsyncCsilTransport {"),
-        "carrier implements the transport seam: {readme}"
+        readme.contains("## CSIL-RPC (HTTP)"),
+        "rpc heading: {readme}"
     );
-    // It POSTs the CSIL-RPC envelope to the canonical path.
+    assert!(
+        readme.contains("## CSIL-Events (TLS)"),
+        "events heading: {readme}"
+    );
+    assert!(
+        readme.contains("## CSIL-Datagrams (UDP)"),
+        "datagrams heading: {readme}"
+    );
+
+    // Install names the transport library, not yet published.
+    assert!(
+        readme.contains("csilgen_transport:") && readme.contains("transports/dart"),
+        "install adds the transport lib: {readme}"
+    );
+
+    // RPC: the carrier implements the generated async seam and builds the envelope with
+    // the LIBRARY's RpcRequest/RpcResponse (never hand-rolled), POSTing to the path.
+    assert!(
+        readme.contains("class HttpRpcCarrier implements AsyncCsilTransport {"),
+        "carrier implements the async seam: {readme}"
+    );
+    assert!(
+        readme.contains("RpcRequest(service, op, Uint8List.fromList(request)).encode()"),
+        "request envelope via the lib: {readme}"
+    );
+    assert!(
+        readme.contains("RpcResponse.decode(bytes).intoTransportError()"),
+        "response decode via the lib: {readme}"
+    );
     assert!(
         readme.contains("/csil/v1/rpc"),
-        "carrier posts to /csil/v1/rpc: {readme}"
+        "posts to the path: {readme}"
     );
-    // The payload is wrapped in CBOR tag 24 (0xd8 0x18) — the embedded-CBOR head.
     assert!(
-        readme.contains("0xd8") && readme.contains("0x18"),
-        "payload wrapped in CBOR tag 24: {readme}"
+        readme.contains("resp.variant == 'ServiceError'"),
+        "typed ServiceError arm handled: {readme}"
     );
-    // Transport-status and typed ServiceError arms are both handled.
     assert!(
-        readme.contains("transport status") && readme.contains("ServiceError"),
-        "status / ServiceError handling: {readme}"
+        readme.contains("import 'package:csilgen_transport/csilgen_transport.dart';"),
+        "imports the transport lib: {readme}"
     );
-    // It reuses the package's own codec for the envelope — no third-party dep.
+    // Example constructs the async client and calls the first `->` op with a sample.
     assert!(
-        readme.contains("CsilCbor.encodeValue") && readme.contains("CsilCbor.decode"),
-        "envelope reuses the generated CsilCbor codec: {readme}"
-    );
-    // The example call constructs the async client and calls the first op with a
-    // generated sample literal.
-    assert!(
-        readme.contains("final client = CorndogsAsyncClient(CsilRpcTransport("),
+        readme.contains("final client = DemoAsyncClient(HttpRpcCarrier("),
         "example constructs the typed client: {readme}"
     );
     assert!(
-        readme.contains("await client.submitTask(SubmitTaskRequest("),
-        "example calls the first unary op with a sample literal: {readme}"
+        readme.contains("await client.ping(Ping(message: 'example', nonce: 0))"),
+        "example calls the first unary op with a sample: {readme}"
+    );
+
+    // Datagrams: encode via the generated codec, wrap in the lib Datagram, and note the
+    // no-synchronous-response semantics.
+    assert!(
+        readme.contains("Datagram(opOrd, 0, request.toCbor()).encode()"),
+        "datagram send via lib + generated codec: {readme}"
     );
     assert!(
-        readme.contains("import 'package:csil_sample/csil_sample.dart';"),
-        "example imports the package barrel: {readme}"
+        readme.contains("Ping.fromCbor(dg.payload)"),
+        "inbound payload decoded into the response type: {readme}"
+    );
+    assert!(
+        readme.contains("MAY arrive later — or never"),
+        "datagram loss/late note: {readme}"
+    );
+
+    // A package carries BOTH surfaces (the server/router too), so even a `dart-client`
+    // package's Events section dispatches into the generated router — not the note case.
+    // The genquickstart is self-contained: RPC client + Events router + codec all resolve
+    // from this one package.
+    assert!(
+        readme.contains("class _Handlers implements DemoServiceHandler {"),
+        "events handler implements the generated interface: {readme}"
+    );
+    assert!(
+        readme.contains("routeDemoServiceChannel(handlers, codec, ev.event!, ev.payload)"),
+        "events dispatches to the generated router: {readme}"
+    );
+    assert!(
+        readme.contains(r"Hello([version], ['verbose'], service: 'demo')"),
+        "events shows the $hello handshake naming the service: {readme}"
     );
 }
 
-/// Hermetically round-trips the shipped README carrier: it injects an in-process
-/// echo `sender` (no socket — the sandbox kills cross-process loopback), so the real
-/// carrier's envelope encode/decode and the typed client are exercised end to end.
-/// Skips when `dart` is not on PATH so the suite stays portable.
 #[test]
-fn readme_quickstart_carrier_round_trips_through_an_injected_echo() {
-    let have = std::process::Command::new("dart")
-        .arg("--version")
-        .output()
-        .is_ok();
-    if !have {
-        eprintln!("skipping: no dart on PATH");
-        return;
-    }
+fn server_package_readme_events_dispatches_to_the_generated_router() {
+    let files = generate_dart_code(&spec(demo_rules(), 1), &demo_pkg_opts("dart")).unwrap();
+    let readme = readme_of(&files);
+
+    // A server surface emits the channel router, so Events dispatches into it.
+    assert!(
+        readme.contains("class _Handlers implements DemoServiceHandler {"),
+        "events handler implements the generated interface: {readme}"
+    );
+    assert!(
+        readme.contains("routeDemoServiceChannel(handlers, codec, ev.event!, ev.payload)"),
+        "events dispatches to the generated router: {readme}"
+    );
+    assert!(
+        readme.contains("Hello([version], ['verbose'], service: 'demo')"),
+        "events handshake names the service: {readme}"
+    );
+    assert!(
+        readme.contains("Control.pingName") && readme.contains("Control.pongName"),
+        "events answers the $ping/$pong heartbeat: {readme}"
+    );
+    assert!(
+        readme.contains("Event.verbose('demo', 'Chat', outbound.toCbor())"),
+        "events sends one outbound event via the generated codec: {readme}"
+    );
+
+    // A package carries BOTH surfaces (the client too), so even a `dart` (server) package's
+    // RPC section shows the live typed client — not the note case.
+    assert!(
+        readme.contains("final client = DemoAsyncClient(HttpRpcCarrier("),
+        "rpc shows the live typed client: {readme}"
+    );
+    assert!(
+        readme.contains("await client.ping(Ping(message: 'example', nonce: 0))"),
+        "rpc calls the first unary op with a sample: {readme}"
+    );
+}
+
+#[test]
+fn genquickstart_transports_selects_a_subset() {
+    // Only "datagrams" requested: the other two sections are suppressed.
     let files = generate_dart_code(
-        &spec(pingpong_rules(), 1),
+        &spec(demo_rules(), 1),
         &config_with(
             "dart-client",
             &[
                 ("emit_packages", serde_json::json!(["dart"])),
-                ("package_name", serde_json::json!("csil_echo")),
+                ("package_name", serde_json::json!("csil_demo")),
+                ("genquickstart_transports", serde_json::json!(["datagrams"])),
             ],
         ),
     )
     .unwrap();
+    let readme = readme_of(&files);
+    assert!(
+        readme.contains("## CSIL-Datagrams (UDP)"),
+        "datagrams kept: {readme}"
+    );
+    assert!(
+        !readme.contains("## CSIL-RPC (HTTP)"),
+        "rpc suppressed: {readme}"
+    );
+    assert!(
+        !readme.contains("## CSIL-Events (TLS)"),
+        "events suppressed: {readme}"
+    );
 
-    let dir = std::env::temp_dir().join(format!("csilgen-dart-readme-{}", std::process::id()));
+    // An array naming no known transport falls back to all three.
+    let all = generate_dart_code(
+        &spec(demo_rules(), 1),
+        &config_with(
+            "dart-client",
+            &[
+                ("emit_packages", serde_json::json!(["dart"])),
+                ("package_name", serde_json::json!("csil_demo")),
+                ("genquickstart_transports", serde_json::json!(["bogus"])),
+            ],
+        ),
+    )
+    .unwrap();
+    let readme = readme_of(&all);
+    assert!(
+        readme.contains("## CSIL-RPC (HTTP)")
+            && readme.contains("## CSIL-Events (TLS)")
+            && readme.contains("## CSIL-Datagrams (UDP)"),
+        "unknown-only subset falls back to all three: {readme}"
+    );
+}
+
+/// Path to the reference Dart transport library, consumed as a path dependency so the
+/// hermetic verification resolves it offline (no network, no published artifact).
+fn transport_lib_path() -> String {
+    format!("{}/../../transports/dart", env!("CARGO_MANIFEST_DIR"))
+}
+
+/// A pubspec for the generated package that adds the transport-library path dep so the
+/// lib-based Quickstart sections compile/run against it.
+fn pubspec_with_transport() -> String {
+    format!(
+        "name: csil_demo\nversion: 0.1.0\npublish_to: none\n\
+         environment:\n  sdk: '>=3.0.0 <4.0.0'\n\
+         dependencies:\n  csilgen_transport:\n    path: {}\n",
+        transport_lib_path()
+    )
+}
+
+fn have_dart() -> bool {
+    std::process::Command::new("dart")
+        .arg("--version")
+        .output()
+        .is_ok()
+}
+
+/// Verify the shipped 3-transport Quickstart against the SINGLE generated package + the
+/// transport library. Package mode now carries BOTH the client and the server/router
+/// surfaces, so all three sections — the RPC client, the live Events router dispatch, and
+/// the Datagrams codec — resolve from one package: this stages that one package and
+/// compile-checks (`dart analyze`) all three sections together, then RUNs RPC and Datagrams
+/// hermetically (an injected in-process echo for RPC, the library's loopback datagram
+/// carrier for UDP — the sandbox kills cross-process sockets). The Events session is
+/// compile-checked only (its handshake/recv-loop wants a live TLS peer). Skips cleanly when
+/// `dart` is absent or the path dep cannot be resolved offline.
+#[test]
+fn readme_three_transports_verify() {
+    if !have_dart() {
+        eprintln!("skipping: no dart on PATH");
+        return;
+    }
+
+    // The single package a user publishes (`--target dart`). In package mode it carries the
+    // client surface AND the server/router surface, so the genquickstart is self-contained.
+    let pkg = generate_dart_code(&spec(demo_rules(), 1), &demo_pkg_opts("dart")).unwrap();
+    let dir = std::env::temp_dir().join(format!("csilgen-dart-3t-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
-    for f in &files {
+    for f in &pkg {
         let path = dir.join(&f.path);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, &f.content).unwrap();
     }
+    // Supply the transport-library dependency the Quickstart sections need.
+    std::fs::write(dir.join("pubspec.yaml"), pubspec_with_transport()).unwrap();
 
-    // The carrier only (the README block up to its example `main`), with the package
-    // self-import rewritten relative so the driver resolves it without pub.
-    let readme = files.iter().find(|f| f.path == "README.md").unwrap();
-    let block = extract_dart_block(&readme.content);
-    let carrier = block[..block.find("Future<void> main").unwrap()]
-        .replace("package:csil_echo/csil_echo.dart", "csil_echo.dart");
-    std::fs::write(dir.join("lib/quickstart_carrier.dart"), carrier).unwrap();
-    std::fs::write(dir.join("driver.dart"), README_ECHO_DRIVER_DART).unwrap();
+    let readme = readme_of(&pkg).to_string();
+    let rpc = extract_dart_block_after(&readme, "## CSIL-RPC (HTTP)").expect("rpc block");
+    let events = extract_dart_block_after(&readme, "## CSIL-Events (TLS)").expect("events block");
+    let datagrams =
+        extract_dart_block_after(&readme, "## CSIL-Datagrams (UDP)").expect("datagrams block");
+    std::fs::write(dir.join("lib/qs_rpc.dart"), &rpc).unwrap();
+    std::fs::write(dir.join("lib/qs_events.dart"), &events).unwrap();
+    std::fs::write(dir.join("lib/qs_datagrams.dart"), &datagrams).unwrap();
+    std::fs::write(dir.join("driver_rpc.dart"), DRIVER_RPC_DART).unwrap();
+    std::fs::write(dir.join("driver_datagrams.dart"), DRIVER_DATAGRAMS_DART).unwrap();
 
-    let run = std::process::Command::new("dart")
-        .arg(dir.join("driver.dart"))
+    let get = std::process::Command::new("dart")
+        .args(["pub", "get", "--offline"])
+        .current_dir(&dir)
+        .output()
+        .unwrap();
+    if !get.status.success() {
+        eprintln!(
+            "skipping: `dart pub get --offline` could not resolve the path dep:\n{}",
+            String::from_utf8_lossy(&get.stderr)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        return;
+    }
+
+    // COMPILE-CHECK all three shipped sections together against the ONE package — the RPC
+    // client, the live Events router dispatch, and the Datagrams codec all at once.
+    let analyze = std::process::Command::new("dart")
+        .arg("analyze")
+        .current_dir(&dir)
         .output()
         .unwrap();
     assert!(
-        run.status.success(),
-        "readme carrier round-trip failed:\n{}{}",
-        String::from_utf8_lossy(&run.stdout),
-        String::from_utf8_lossy(&run.stderr)
+        analyze.status.success(),
+        "single-package analyze failed:\n{}{}",
+        String::from_utf8_lossy(&analyze.stdout),
+        String::from_utf8_lossy(&analyze.stderr)
     );
-    assert_eq!(String::from_utf8_lossy(&run.stdout).trim(), "ok");
+
+    // RUN the RPC carrier over an injected in-process echo.
+    let run_rpc = std::process::Command::new("dart")
+        .arg("run")
+        .arg("driver_rpc.dart")
+        .current_dir(&dir)
+        .output()
+        .unwrap();
+    assert!(
+        run_rpc.status.success(),
+        "rpc run failed:\n{}{}",
+        String::from_utf8_lossy(&run_rpc.stdout),
+        String::from_utf8_lossy(&run_rpc.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&run_rpc.stdout).trim(), "ok");
+
+    // RUN the Datagram send/recv over the library's loopback datagram carrier.
+    let run_dg = std::process::Command::new("dart")
+        .arg("run")
+        .arg("driver_datagrams.dart")
+        .current_dir(&dir)
+        .output()
+        .unwrap();
+    assert!(
+        run_dg.status.success(),
+        "datagram run failed:\n{}{}",
+        String::from_utf8_lossy(&run_dg.stdout),
+        String::from_utf8_lossy(&run_dg.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&run_dg.stdout).trim(), "ok");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Drives the shipped carrier with an injected sender that echoes the tag-24 inner
-/// payload back in a `status: 0` CsilRpcResponse — the same contract the shared echo
-/// mock implements, but in-process so no socket is opened.
-const README_ECHO_DRIVER_DART: &str = r#"import 'dart:typed_data';
+/// Drives the shipped RPC carrier with an injected sender that echoes the request
+/// payload back in a `status: 0` RpcResponse — built with the library's own envelope,
+/// in-process so no socket is opened.
+const DRIVER_RPC_DART: &str = r#"import 'dart:typed_data';
 
-import 'lib/csil_echo.dart';
-import 'lib/quickstart_carrier.dart';
+import 'package:csilgen_transport/csilgen_transport.dart';
+import 'package:csil_demo/csil_demo.dart';
+import 'package:csil_demo/qs_rpc.dart';
 
 Future<Uint8List> echo(Uri uri, Uint8List body) async {
-  // Unwrap the request envelope's tag-24 payload (CsilCbor.decode does this for us).
-  final reqEnv = CsilCbor.decode(body) as Map;
-  final inner = reqEnv['payload'] as Uint8List;
-  // Build CsilRpcResponse = { v: 1, status: 0, payload: #6.24(inner) }.
-  final b = BytesBuilder();
-  b.addByte(0xa3);
-  b.add(CsilCbor.encodeValue('v'));
-  b.add(CsilCbor.encodeValue(1));
-  b.add(CsilCbor.encodeValue('status'));
-  b.add(CsilCbor.encodeValue(0));
-  b.add(CsilCbor.encodeValue('payload'));
-  b.addByte(0xd8);
-  b.addByte(0x18);
-  b.add(CsilCbor.encodeValue(inner));
-  return b.toBytes();
+  final req = RpcRequest.decode(body);
+  return RpcResponse.okReply('Ping', req.payload).encode();
 }
 
 Future<void> main() async {
-  final client = EchoAsyncClient(CsilRpcTransport('http://unused', sender: echo));
+  final client = DemoAsyncClient(HttpRpcCarrier('http://unused', sender: echo));
   final resp = await client.ping(Ping(message: 'hi', nonce: 7));
   if (resp.message != 'hi' || resp.nonce != 7) {
-    throw StateError('round-trip mismatch: ${resp.message}/${resp.nonce}');
+    throw StateError('rpc mismatch: ${resp.message}/${resp.nonce}');
+  }
+  print('ok');
+}
+"#;
+
+/// Drives the shipped Datagram send/recv over the library's loopback datagram carrier:
+/// the sent datagram is looped back as if it arrived later, and its payload decodes
+/// back into the typed response.
+const DRIVER_DATAGRAMS_DART: &str = r#"import 'package:csilgen_transport/csilgen_transport.dart';
+import 'package:csil_demo/csil_demo.dart';
+import 'package:csil_demo/qs_datagrams.dart';
+
+void main() {
+  final carrier = LoopbackDatagramCarrier();
+  sendRequest(carrier, Ping(message: 'hi', nonce: 7));
+  final sent = carrier.takeOutbound();
+  if (sent == null) throw StateError('no datagram sent');
+  // A datagram of the response type "arrives later": loop the sent one back.
+  carrier.pushInbound(sent);
+  final resp = recvResponse(carrier);
+  if (resp == null || resp.message != 'hi' || resp.nonce != 7) {
+    throw StateError('datagram mismatch: $resp');
   }
   print('ok');
 }

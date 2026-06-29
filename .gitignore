@@ -26,3 +26,5 @@ coverage
 tmp
 
 generated
+
+erl_crash.dump

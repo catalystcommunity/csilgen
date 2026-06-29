@@ -211,25 +211,29 @@ fn process_generation(input: WasmGeneratorInput) -> Result<WasmGeneratorOutput, 
         });
     }
 
+    // A package's `genquickstart.md` demonstrates both the calling side (the RPC and
+    // Datagrams sections, over `client.gen.zig`) and the handling side (the Events
+    // section, over the `server.gen.zig` channel router), so a package must carry both
+    // surfaces for its own quickstart to compile against the single emitted package —
+    // regardless of which surface the sub-target requested. A flat (non-package) build
+    // stays byte-identical: it emits only the requested surface.
+    let pkg_mode = emit_packages_includes_zig(&input.config.options);
+    let want_client =
+        matches!(surface, Surface::Client) || (pkg_mode && !matches!(surface, Surface::TypesOnly));
+    let want_server =
+        matches!(surface, Surface::Server) || (pkg_mode && !matches!(surface, Surface::TypesOnly));
     if input.csil_spec.service_count > 0 {
-        match surface {
-            Surface::Client => {
-                if let Some(client) = generate_client(&input) {
-                    files.push(GeneratedFile {
-                        path: make_path("client.gen.zig"),
-                        content: client,
-                    });
-                }
-            }
-            Surface::Server => {
-                if let Some(server) = generate_server(&input, &mut warnings) {
-                    files.push(GeneratedFile {
-                        path: make_path("server.gen.zig"),
-                        content: server,
-                    });
-                }
-            }
-            Surface::TypesOnly => {}
+        if want_client && let Some(client) = generate_client(&input) {
+            files.push(GeneratedFile {
+                path: make_path("client.gen.zig"),
+                content: client,
+            });
+        }
+        if want_server && let Some(server) = generate_server(&input, &mut warnings) {
+            files.push(GeneratedFile {
+                path: make_path("server.gen.zig"),
+                content: server,
+            });
         }
     }
 
@@ -238,7 +242,7 @@ fn process_generation(input: WasmGeneratorInput) -> Result<WasmGeneratorOutput, 
     // OUTPUT directory documents how to drive the generated client end to end.
     // `emit_readme` defaults to true; only an explicit `false` suppresses the
     // README, so a typo or missing value never silently drops the docs.
-    if emit_packages_includes_zig(&input.config.options)
+    if pkg_mode
         && input
             .config
             .options
@@ -247,7 +251,7 @@ fn process_generation(input: WasmGeneratorInput) -> Result<WasmGeneratorOutput, 
             != Some(false)
     {
         files.push(GeneratedFile {
-            path: "README.md".to_string(),
+            path: "genquickstart.md".to_string(),
             content: package_readme(&input),
         });
     }
@@ -1933,7 +1937,37 @@ fn package_name(input: &WasmGeneratorInput) -> String {
     "csilgen-client".to_string()
 }
 
-/// The pieces the Quickstart's example call needs.
+/// Which transport sections to render in `genquickstart.md`. The
+/// `genquickstart_transports` option is a JSON array subset of
+/// `["rpc","events","datagrams"]`; unknown entries are ignored, and an absent or
+/// empty value (or one naming none of the three) means "all three". Sections always
+/// render in a fixed order so the document reads the same regardless of the subset.
+fn wanted_transports(input: &WasmGeneratorInput) -> (bool, bool, bool) {
+    let listed = match input.config.options.get("genquickstart_transports") {
+        Some(serde_json::Value::Array(items)) => {
+            let names: std::collections::BTreeSet<&str> =
+                items.iter().filter_map(|v| v.as_str()).collect();
+            let any_known = ["rpc", "events", "datagrams"]
+                .iter()
+                .any(|t| names.contains(t));
+            if any_known {
+                Some((
+                    names.contains("rpc"),
+                    names.contains("events"),
+                    names.contains("datagrams"),
+                ))
+            } else {
+                None
+            }
+        }
+        _ => None,
+    };
+    listed.unwrap_or((true, true, true))
+}
+
+/// The pieces a unary (`->`) example call needs: the typed client + method, a
+/// compiling request literal, the response type, and — for the datagram section —
+/// the request/response codec names and the op's datagram ordinal.
 struct ZigUnaryExample {
     client_type: String,
     method: String,
@@ -1943,41 +1977,127 @@ struct ZigUnaryExample {
     has_request: bool,
     req_literal: String,
     resp_print_field: Option<String>,
+    /// The input record's codec name (`encode_<X>`), or `None` for a null/non-record
+    /// input — the datagram section needs a record request to encode.
+    req_codec: Option<String>,
+    /// The success output record's codec name (`decode_<X>`).
+    res_codec: String,
+    /// The op's datagram ordinal: its `@wire-id`, or `1` as a channel-agreed default.
+    op_ord: u64,
 }
 
-/// The first service (in declaration order) that has a `->` operation, reduced to an
-/// example call. `None` for a serviceless / types-only package.
+/// The first service (declaration order) with a unidirectional op whose success
+/// output is a record and whose input is null-or-record (matching the typed client's
+/// own gating). `None` for a serviceless / non-record-op package.
 fn first_unary_example(input: &WasmGeneratorInput) -> Option<ZigUnaryExample> {
     for rule in &input.csil_spec.rules {
         let CsilRuleType::ServiceDef(service) = &rule.rule_type else {
             continue;
         };
-        let Some(op) = service
-            .operations
-            .iter()
-            .find(|op| matches!(op.direction, CsilServiceDirection::Unidirectional))
-        else {
-            continue;
-        };
-        let base = service_base(&rule.name);
-        let success = success_type(&op.output_type);
-        let has_request = !op_input_is_null(&op.input_type);
-        return Some(ZigUnaryExample {
-            client_type: format!("{base}Client"),
-            method: zig_ident(&to_snake(&op.name)),
-            wire_service: base.to_lowercase(),
-            wire_op: simple_pascal(&op.name),
-            resp_type: map_zig_type(&success, "types."),
-            has_request,
-            req_literal: if has_request {
-                zig_request_literal(input, &op.input_type)
-            } else {
-                String::new()
-            },
-            resp_print_field: first_text_field(input, &success),
-        });
+        for op in &service.operations {
+            if !matches!(op.direction, CsilServiceDirection::Unidirectional) {
+                continue;
+            }
+            let success = success_type(&op.output_type);
+            let null_input = op_input_is_null(&op.input_type);
+            let res_codec = match record_ref_name(input, &success) {
+                Some(name) => name,
+                None => continue,
+            };
+            if !null_input && record_ref_name(input, &op.input_type).is_none() {
+                continue;
+            }
+            let base = service_base(&rule.name);
+            let has_request = !null_input;
+            return Some(ZigUnaryExample {
+                client_type: format!("{base}Client"),
+                method: zig_ident(&to_snake(&op.name)),
+                wire_service: base.to_lowercase(),
+                wire_op: simple_pascal(&op.name),
+                resp_type: map_zig_type(&success, "types."),
+                has_request,
+                req_literal: if has_request {
+                    zig_request_literal(input, &op.input_type)
+                } else {
+                    String::new()
+                },
+                resp_print_field: first_text_field(input, &success),
+                req_codec: record_ref_name(input, &op.input_type),
+                res_codec,
+                op_ord: op.wire_id.unwrap_or(1),
+            });
+        }
     }
     None
+}
+
+/// The pieces the Events session needs: the generated channel router, handler struct,
+/// and push-encoder names, the inbound/outbound record types and their codec names,
+/// the wire service/op, a sample outbound literal, and the inbound print field.
+struct ZigChannelExample {
+    service_wire: String,
+    handlers_type: String,
+    route_fn: String,
+    encode_fn: String,
+    method: String,
+    wire_op: String,
+    in_type: String,
+    in_codec: String,
+    out_type: String,
+    out_codec: String,
+    out_literal: String,
+    in_print_field: Option<String>,
+}
+
+/// The first service (declaration order) with a `<->` op whose input and success
+/// output are both records (so the generated router + push encoder + per-type codec
+/// helpers exist). `None` when no service has a usable channel op — the Events section
+/// then shows the handshake/heartbeat without dispatch wiring.
+fn first_channel_example(input: &WasmGeneratorInput) -> Option<ZigChannelExample> {
+    for rule in &input.csil_spec.rules {
+        let CsilRuleType::ServiceDef(service) = &rule.rule_type else {
+            continue;
+        };
+        for op in &service.operations {
+            if !matches!(op.direction, CsilServiceDirection::Bidirectional) {
+                continue;
+            }
+            let success = success_type(&op.output_type);
+            let (Some(in_codec), Some(out_codec)) = (
+                record_ref_name(input, &op.input_type),
+                record_ref_name(input, &success),
+            ) else {
+                continue;
+            };
+            let base = service_base(&rule.name);
+            let prefix = to_snake(&base);
+            let method = to_snake(&op.name);
+            return Some(ZigChannelExample {
+                service_wire: base.to_lowercase(),
+                handlers_type: format!("{base}Handlers"),
+                route_fn: format!("route_{prefix}_channel"),
+                encode_fn: format!("encode_{prefix}_{method}"),
+                method: zig_ident(&method),
+                wire_op: simple_pascal(&op.name),
+                in_type: map_zig_type(&op.input_type, "types."),
+                in_codec,
+                out_type: map_zig_type(&success, "types."),
+                out_codec,
+                out_literal: zig_request_literal(input, &success),
+                in_print_field: first_text_field(input, &op.input_type),
+            });
+        }
+    }
+    None
+}
+
+/// The CSIL rule name a type reference names *if it resolves to a record*, else
+/// `None` (a builtin, collection, or unknown reference has no per-type codec).
+fn record_ref_name(input: &WasmGeneratorInput, ty: &CsilTypeExpression) -> Option<String> {
+    let CsilTypeExpression::Reference(name) = unwrap_constrained(ty) else {
+        return None;
+    };
+    find_record(input, name).map(|_| name.clone())
 }
 
 /// A compiling Zig struct literal for the request record's required fields: real
@@ -2027,8 +2147,8 @@ fn zig_sample_value(ty: &CsilTypeExpression) -> String {
     }
 }
 
-/// The first required text field of a record type reference, so the example can print
-/// a typed response value rather than just announcing success.
+/// The first required text field of a record type reference, so an example can print
+/// a typed value rather than just announcing success.
 fn first_text_field(input: &WasmGeneratorInput, ty: &CsilTypeExpression) -> Option<String> {
     let CsilTypeExpression::Reference(name) = unwrap_constrained(ty) else {
         return None;
@@ -2059,68 +2179,83 @@ fn find_record<'a>(input: &'a WasmGeneratorInput, name: &str) -> Option<&'a Csil
         })
 }
 
-/// The package README, with a copy-paste **Quickstart**. For a client package the
-/// Quickstart hand-rolls the tiny CSIL-RPC envelope (the generated codec's generic CBOR
-/// helpers are private to `codec.gen.zig`, so there is no third-party CBOR dependency)
-/// and POSTs it with the Zig stdlib HTTP client, then makes one typed call. A
-/// serviceless package gets a shorter types-only section.
+/// The package README: a transport-by-transport Quickstart over the official
+/// `csilgen_transport` Zig library. The generated codec owns CBOR (de)serialization
+/// and the library owns the envelope/framing/lifecycle; the example supplies only a
+/// *carrier* that moves bytes. Each requested section (CSIL-RPC over HTTP, CSIL-Events
+/// over TLS, CSIL-Datagrams over UDP) is a complete example built on the library.
 fn package_readme(input: &WasmGeneratorInput) -> String {
     let name = package_name(input);
     let mut out = format!(
         "# {name}\n\n\
-         Generated by csilgen. A typed, transport-agnostic CSIL-RPC client in Zig: the\n\
-         generated codec owns CBOR (de)serialization; you supply a *carrier* that only\n\
-         moves bytes.\n\n\
-         ## Consume\n\n\
-         Vendor the generated `.zig` files into your project (or expose them as a module),\n\
-         then `@import` them. A single file that imports `client.gen.zig` pulls in the\n\
-         types and the self-contained CBOR codec. Build with Zig 0.14:\n\n\
+         Generated by csilgen. A typed CSIL client in Zig: the generated codec owns CBOR\n\
+         (de)serialization and the official `csilgen_transport` library owns the envelope,\n\
+         framing, and connection lifecycle. You supply only a *carrier* that moves bytes, so\n\
+         the same typed surface rides HTTP, TLS, a WebSocket, QUIC, or raw UDP unchanged.\n\n\
+         ## Install\n\n\
+         Expose the transport library as the `csilgen_transport` module in your\n\
+         `build.zig.zon` (not yet published — vendor `transports/zig/` or add it as a git\n\
+         dependency for now), then vendor the generated `.zig` files alongside your code.\n\
+         This package ships both surfaces: `client.gen.zig` (the RPC section) and\n\
+         `server.gen.zig` (the Events channel router); both pull in `codec.gen.zig` +\n\
+         `types.gen.zig` — so all three sections below build against this one directory.\n\n\
          ```sh\n\
-         zig build-exe main.zig\n\
-         ```\n\n\
-         > Generate the client surface with `--target zig-client` so `client.gen.zig` is\n\
-         > emitted alongside the codec.\n\n"
+         zig build\n\
+         ```\n\n"
     );
 
-    match first_unary_example(input) {
-        Some(example) => out.push_str(&quickstart(&example)),
-        None => out.push_str(
-            "## Quickstart\n\n\
-             This package has no service operations — `@import(\"types.gen.zig\")` and\n\
-             `@import(\"codec.gen.zig\")` and use the generated `encode_*` / `decode_*`\n\
-             helpers directly.\n",
-        ),
+    let (rpc, events, datagrams) = wanted_transports(input);
+    let unary = first_unary_example(input);
+    let channel = first_channel_example(input);
+    if rpc {
+        out.push_str(&rpc_section(unary.as_ref()));
+    }
+    if events {
+        out.push_str(&events_section(channel.as_ref()));
+    }
+    if datagrams {
+        out.push_str(&datagrams_section(unary.as_ref()));
     }
     out
 }
 
-/// The client Quickstart: a CSIL-RPC carrier that hand-rolls the envelope (no
-/// third-party CBOR dependency) and POSTs over `std.http` (no third-party HTTP
-/// dependency), the transport seam wired to it, and the typed call. A user changes
-/// only the base-URL string.
-fn quickstart(ex: &ZigUnaryExample) -> String {
-    let mut out = String::from("## Quickstart\n\n");
+/// CSIL-RPC over HTTP: a carrier implementing the generated `CsilgenTransport` byte
+/// seam that builds the request with the library's `RpcRequest` and decodes its
+/// `RpcResponse` (never hand-rolled), POSTing to `{base_url}/csil/v1/rpc` over
+/// `std.http`. A non-zero transport status and the typed `ServiceError` arm are
+/// surfaced distinctly; the typed client decodes success only.
+fn rpc_section(ex: Option<&ZigUnaryExample>) -> String {
+    let mut out = String::from("## CSIL-RPC (HTTP)\n\n");
     out.push_str(
-        "A complete CSIL-RPC carrier (no third-party dependency — the envelope is\n\
-         hand-rolled CBOR and the POST uses `std.http`) plus the typed client. Change the\n\
-         one base-URL string.\n\n",
+        "Request/response. The library owns the envelope (`RpcRequest`/`RpcResponse`); you\n\
+         bring a carrier that moves bytes. The HTTP carrier below is just one example — swap\n\
+         `std.http` for any client (it implements the generated `CsilgenTransport` seam).\n\n",
     );
+    let Some(ex) = ex else {
+        out.push_str(
+            "This package declares no record `->` operations, so there is no RPC call to make.\n\n",
+        );
+        return out;
+    };
     out.push_str("```zig\n");
-    out.push_str(CARRIER_ZIG);
+    out.push_str(RPC_CARRIER_ZIG);
     out.push('\n');
-    // The example call: build the carrier, wire the seam, call the first op.
-    out.push_str("pub fn main() !void {\n");
-    out.push_str("    var gpa = std.heap.GeneralPurposeAllocator(.{}){};\n");
-    out.push_str("    defer _ = gpa.deinit();\n");
-    out.push_str("    const alloc = gpa.allocator();\n\n");
-    out.push_str("    var carrier = CsilRpcCarrier{ .base_url = \"http://127.0.0.1:5080\" };\n");
+    out.push_str(
+        "pub fn main() !void {\n\
+         \x20   var gpa = std.heap.GeneralPurposeAllocator(.{}){};\n\
+         \x20   defer _ = gpa.deinit();\n\
+         \x20   const alloc = gpa.allocator();\n\n\
+         \x20   var carrier = HttpRpcCarrier{ .base_url = \"http://127.0.0.1:5080\" };\n",
+    );
     out.push_str(&format!(
         "    const svc = client.{}.init(carrier.transport());\n\n",
         ex.client_type
     ));
-    out.push_str("    // Everything in `resp` is allocated from the arena; free it all at once.\n");
-    out.push_str("    var arena = std.heap.ArenaAllocator.init(alloc);\n");
-    out.push_str("    defer arena.deinit();\n\n");
+    out.push_str(
+        "    // Everything in `resp` is allocated from the arena; free it all at once.\n\
+         \x20   var arena = std.heap.ArenaAllocator.init(alloc);\n\
+         \x20   defer arena.deinit();\n\n",
+    );
     out.push_str(&format!("    var resp: {} = undefined;\n", ex.resp_type));
     if ex.has_request {
         out.push_str(&format!("    const req = {};\n", ex.req_literal));
@@ -2144,230 +2279,471 @@ fn quickstart(ex: &ZigUnaryExample) -> String {
             ex.wire_service, ex.wire_op
         )),
     }
-    out.push_str("}\n");
-    out.push_str("```\n");
+    out.push_str("}\n```\n\n");
     out
 }
 
-/// The carrier body — identical for every spec, so it is a constant. It hand-rolls the
-/// `CsilRpcRequest` envelope (tag-24 payload), POSTs it to `{base_url}/csil/v1/rpc` with
-/// `std.http.Client`, and returns the tag-24 inner bytes for the generated client to
-/// decode. A non-zero transport `status` or a typed `ServiceError` arm becomes an error.
-const CARRIER_ZIG: &str = r#"const std = @import("std");
+/// The HTTP carrier preamble — spec-independent, so a constant. It builds the request
+/// envelope with the library's `RpcRequest`, POSTs it to `{base_url}/csil/v1/rpc` with
+/// `std.http.Client`, decodes the `RpcResponse` with the library, and hands the typed
+/// payload bytes back to the generated client. A non-zero transport status and the
+/// typed `ServiceError` arm become distinct errors.
+const RPC_CARRIER_ZIG: &str = r#"const std = @import("std");
+const csil = @import("csilgen_transport");
 const client = @import("client.gen.zig");
 const types = @import("types.gen.zig");
 
-// Quickstart carrier — CSIL-RPC over HTTP.
-//
-// Dependency posture (path 2 + stdlib HTTP): the generated codec's generic CBOR
-// helpers are private to codec.gen.zig, so the tiny fixed envelope (a 4-entry map
-// plus a tag-24 payload, and reading three known keys back) is hand-rolled here —
-// no third-party CBOR dependency. The POST uses std.http.Client — no third-party
-// HTTP dependency. Drop this in a .zig file next to the generated source.
-const CsilRpcCarrier = struct {
+const rpc = csil.rpc;
+
+// One example carrier: CSIL-RPC over an HTTP POST. The library owns the envelope
+// (RpcRequest/RpcResponse); the carrier owns only the transport. Swap std.http for
+// any HTTP client.
+const HttpRpcCarrier = struct {
     base_url: []const u8, // e.g. "http://127.0.0.1:5080"
 
-    fn transport(self: *CsilRpcCarrier) client.CsilgenTransport {
+    fn transport(self: *HttpRpcCarrier) client.CsilgenTransport {
         return .{ .ptr = self, .call = call };
     }
 
-    // The CsilgenTransport seam: build the envelope, POST it, unwrap the reply.
     fn call(ptr: *anyopaque, alloc: std.mem.Allocator, service: []const u8, op: []const u8, req: []const u8) anyerror![]u8 {
-        const self: *CsilRpcCarrier = @ptrCast(@alignCast(ptr));
+        const self: *HttpRpcCarrier = @ptrCast(@alignCast(ptr));
 
-        // 1. CsilRpcRequest = { v, op, payload: #6.24(bstr), service }.
-        const body = try buildEnvelope(alloc, service, op, req);
+        // Build the request envelope with the library (NOT hand-rolled).
+        const body = try rpc.RpcRequest.init(service, op, req).encode(alloc);
         defer alloc.free(body);
 
-        // 2. POST it to {base_url}/csil/v1/rpc with the stdlib HTTP client.
+        // POST it to {base_url}/csil/v1/rpc with the stdlib HTTP client.
         var http = std.http.Client{ .allocator = alloc };
         defer http.deinit();
         var url_buf: [512]u8 = undefined;
         const url = try std.fmt.bufPrint(&url_buf, "{s}/csil/v1/rpc", .{self.base_url});
-        var resp = std.ArrayList(u8).init(alloc);
-        defer resp.deinit();
+        var resp_body = std.ArrayList(u8).init(alloc);
+        defer resp_body.deinit();
         const result = try http.fetch(.{
             .location = .{ .url = url },
             .method = .POST,
             .payload = body,
             .extra_headers = &.{.{ .name = "content-type", .value = "application/cbor" }},
-            .response_storage = .{ .dynamic = &resp },
+            .response_storage = .{ .dynamic = &resp_body },
         });
         if (result.status != .ok) return error.CsilRpcHttpStatus;
 
-        // 3. Decode the CsilRpcResponse envelope; surface the status / ServiceError
-        //    arms, else hand the tag-24 inner bytes back to the generated client.
-        return unwrap(alloc, resp.items);
+        // Decode the response envelope with the library; surface a non-zero transport
+        // status and the typed ServiceError arm distinctly.
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const resp = try rpc.decode_rpc_response(arena.allocator(), resp_body.items);
+        resp.as_transport_error() catch return error.CsilRpcTransportStatus;
+        if (resp.variant) |variant| {
+            if (std.mem.eql(u8, variant, "ServiceError")) return error.CsilRpcServiceError;
+        }
+        // Hand the typed payload bytes back to the generated client (it frees them).
+        return alloc.dupe(u8, resp.payload);
+    }
+};
+"#;
+
+/// CSIL-Events over TLS: a full session. A TLS byte stream is wrapped as the library's
+/// `FrameCarrier` (CSIL length-prefix framing); the session does the `$hello`/
+/// `$hello-ack` handshake, sends one outbound event via the generated push encoder,
+/// and runs a recv loop that decodes each frame to an `Event`, answers `$ping` with
+/// `$pong`, and dispatches typed events into the generated channel router. With no
+/// channel op the dispatch wiring is replaced by a note (handshake + heartbeat stay).
+fn events_section(ch: Option<&ZigChannelExample>) -> String {
+    let mut out = String::from("## CSIL-Events (TLS)\n\n");
+    out.push_str(
+        "Typed, bidirectional event streams over a long-lived connection. The library owns\n\
+         the `$hello`/`$hello-ack` handshake, the `$ping`/`$pong` heartbeat, and framing; the\n\
+         generated router dispatches typed events. The TLS carrier below is just one example —\n\
+         a WebSocket/WebTransport/QUIC carrier drops in unchanged. (The Zig TLS setup is a\n\
+         little longer than other languages because the cert bundle and handshake are\n\
+         explicit.)\n\n",
+    );
+    out.push_str("```zig\n");
+    match ch {
+        Some(ch) => {
+            out.push_str(EVENTS_PRELUDE_CHANNEL);
+            out.push('\n');
+            out.push_str(EVENTS_TLS_CARRIER_ZIG);
+            out.push('\n');
+            out.push_str(&events_channel_session(ch));
+        }
+        None => {
+            out.push_str(EVENTS_PRELUDE_NOCHANNEL);
+            out.push('\n');
+            out.push_str(EVENTS_TLS_CARRIER_ZIG);
+            out.push('\n');
+            out.push_str(EVENTS_NOCHANNEL_SESSION_ZIG);
+        }
+    }
+    out.push_str("```\n\n");
+    out
+}
+
+/// The channel session body: a `CsilgenCodec` backed by the op's generated per-type
+/// helpers, the typed handler, one outbound event via the generated push encoder, and
+/// the recv loop that heartbeats and dispatches into the generated router.
+fn events_channel_session(ch: &ZigChannelExample) -> String {
+    let print = match &ch.in_print_field {
+        Some(field) => format!(
+            "    std.debug.print(\"event {} {{s}}\\n\", .{{msg.{field}}});\n",
+            ch.method
+        ),
+        None => format!("    std.debug.print(\"event {}\\n\", .{{}});\n", ch.method),
+    };
+    format!(
+        r#"// Back the generated router's CsilgenCodec with the per-type helpers: decode the
+// inbound {in_type}, encode the outbound {out_type}.
+const ChannelCodec = struct {{
+    alloc: std.mem.Allocator,
+
+    fn codec(self: *ChannelCodec) server.CsilgenCodec {{
+        return .{{ .ptr = self, .decode = decode, .encode = encode }};
+    }}
+    fn decode(ptr: *anyopaque, data: []const u8, out: *anyopaque) anyerror!void {{
+        const self: *ChannelCodec = @ptrCast(@alignCast(ptr));
+        const typed: *{in_type} = @ptrCast(@alignCast(out));
+        return codec_gen.decode_{in_codec}(self.alloc, data, typed);
+    }}
+    fn encode(ptr: *anyopaque, value: *const anyopaque) anyerror![]u8 {{
+        const self: *ChannelCodec = @ptrCast(@alignCast(ptr));
+        const typed: *const {out_type} = @ptrCast(@alignCast(value));
+        return codec_gen.encode_{out_codec}(self.alloc, typed);
+    }}
+}};
+
+fn onEvent(ctx: *anyopaque, msg: *const {in_type}) anyerror!void {{
+    _ = ctx;
+{print}}}
+
+pub fn main() !void {{
+    var gpa = std.heap.GeneralPurposeAllocator(.{{}}){{}};
+    defer _ = gpa.deinit();
+    const alloc = gpa.allocator();
+
+    var tls_carrier = try openTlsCarrier(alloc, "localhost", 7443);
+    const carrier = tls_carrier.carrier();
+    defer carrier.close();
+
+    // $hello / $hello-ack handshake (control plane). The peer's $hello-ack pins the
+    // wire profile for the connection's lifetime.
+    const versions = [_]u64{{csil.VERSION}};
+    const profiles = [_][]const u8{{"verbose"}};
+    const hello_frame = try (events.Hello{{ .versions = &versions, .profiles = &profiles, .service = "{service}" }}).encode(alloc);
+    defer alloc.free(hello_frame);
+    try carrier.send(hello_frame);
+
+    const ack_frame = (try carrier.recv(alloc)) orelse return error.ClosedDuringHandshake;
+    defer alloc.free(ack_frame);
+    var ack_arena = std.heap.ArenaAllocator.init(alloc);
+    defer ack_arena.deinit();
+    const ack = try events.decode_hello_ack(ack_arena.allocator(), ack_frame);
+    const profile = events.Profile.parse(ack.profile) orelse return error.UnknownProfile;
+
+    // The router needs a CsilgenCodec for this channel's types; back it with the
+    // generated per-type helpers.
+    var channel_codec = ChannelCodec{{ .alloc = alloc }};
+    const codec = channel_codec.codec();
+    const handlers = server.{handlers_type}{{ .{method} = onEvent }};
+    var ctx: u8 = 0;
+
+    // Send one outbound event via the generated encoder, framed as a verbose Event.
+    const out_msg = {out_literal};
+    const out_bytes = try server.{encode_fn}(codec, &out_msg);
+    defer alloc.free(out_bytes);
+    const out_frame = try (events.Event.verbose("{service}", "{wire_op}", out_bytes)).encode(alloc, profile);
+    defer alloc.free(out_frame);
+    try carrier.send(out_frame);
+
+    // Recv loop: decode each frame to an Event, answer $ping with $pong, dispatch the
+    // rest to the generated router.
+    while (try carrier.recv(alloc)) |frame| {{
+        defer alloc.free(frame);
+        var frame_arena = std.heap.ArenaAllocator.init(alloc);
+        defer frame_arena.deinit();
+        const ev = try events.decode_event(frame_arena.allocator(), frame, profile);
+        const name = ev.event orelse continue;
+        if (std.mem.eql(u8, name, events.PING_NAME)) {{
+            const ping = try events.decode_heartbeat(frame_arena.allocator(), ev.payload);
+            const pong_payload = try (events.Heartbeat{{ .nonce = ping.nonce }}).encode(alloc);
+            defer alloc.free(pong_payload);
+            const pong_frame = try (events.Event.verbose("{service}", events.PONG_NAME, pong_payload)).encode(alloc, profile);
+            defer alloc.free(pong_frame);
+            try carrier.send(pong_frame);
+            continue;
+        }}
+        try server.{route_fn}(&handlers, &ctx, codec, name, ev.payload);
+    }}
+}}
+"#,
+        in_type = ch.in_type,
+        out_type = ch.out_type,
+        in_codec = ch.in_codec,
+        out_codec = ch.out_codec,
+        print = print,
+        service = ch.service_wire,
+        handlers_type = ch.handlers_type,
+        method = ch.method,
+        out_literal = ch.out_literal,
+        encode_fn = ch.encode_fn,
+        wire_op = ch.wire_op,
+        route_fn = ch.route_fn,
+    )
+}
+
+/// The Events imports when the spec has a channel op (the router + push encoder live
+/// in `server.gen.zig`; the per-type helpers in `codec.gen.zig`).
+const EVENTS_PRELUDE_CHANNEL: &str = r#"const std = @import("std");
+const csil = @import("csilgen_transport");
+const server = @import("server.gen.zig");
+const codec_gen = @import("codec.gen.zig");
+const types = @import("types.gen.zig");
+
+const events = csil.events;
+const carrier_seam = csil.carrier;
+"#;
+
+/// The Events imports when the spec has no channel op (no router/codec needed — the
+/// session shows only handshake + heartbeat).
+const EVENTS_PRELUDE_NOCHANNEL: &str = r#"const std = @import("std");
+const csil = @import("csilgen_transport");
+
+const events = csil.events;
+const carrier_seam = csil.carrier;
+"#;
+
+/// The TLS `FrameCarrier` adapter — spec-independent. It length-prefixes each outbound
+/// frame and reads one length-prefixed frame per `recvFrame`, exposing the library's
+/// `FrameCarrier` seam over a `std.crypto.tls.Client` so the session logic is
+/// transport-agnostic. The lib's stream-carrier helpers take a plain `std.net.Stream`,
+/// so the TLS variant re-implements the same 4-byte framing over `tls.Client`.
+const EVENTS_TLS_CARRIER_ZIG: &str = r#"// One example carrier: a TLS byte stream framed with CSIL's 4-byte length prefix.
+const TlsFrameCarrier = struct {
+    stream: std.net.Stream,
+    tls_client: std.crypto.tls.Client,
+    ca: std.crypto.Certificate.Bundle,
+    max_frame: usize = csil.conventions.MAX_FRAME_DEFAULT,
+
+    fn carrier(self: *TlsFrameCarrier) carrier_seam.FrameCarrier {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    const vtable = carrier_seam.FrameCarrier.VTable{ .send_frame = sendFrame, .recv_frame = recvFrame, .close = closeFn };
+
+    fn sendFrame(ptr: *anyopaque, frame: []const u8) carrier_seam.CarrierError!void {
+        const self: *TlsFrameCarrier = @ptrCast(@alignCast(ptr));
+        if (frame.len > self.max_frame) return error.FrameTooLarge;
+        var prefix: [4]u8 = undefined;
+        std.mem.writeInt(u32, &prefix, @intCast(frame.len), .big);
+        self.tls_client.writeAll(self.stream, &prefix) catch return error.Carrier;
+        self.tls_client.writeAll(self.stream, frame) catch return error.Carrier;
+    }
+    fn recvFrame(ptr: *anyopaque, alloc: std.mem.Allocator) carrier_seam.CarrierError!?[]u8 {
+        const self: *TlsFrameCarrier = @ptrCast(@alignCast(ptr));
+        var prefix: [4]u8 = undefined;
+        var got: usize = 0;
+        while (got < prefix.len) {
+            const n = self.tls_client.read(self.stream, prefix[got..]) catch return error.Carrier;
+            if (n == 0) break;
+            got += n;
+        }
+        if (got == 0) return null;
+        if (got < prefix.len) return error.Carrier;
+        const length: usize = @intCast(std.mem.readInt(u32, &prefix, .big));
+        if (length > self.max_frame) return error.FrameTooLarge;
+        const buf = try alloc.alloc(u8, length);
+        errdefer alloc.free(buf);
+        var off: usize = 0;
+        while (off < buf.len) {
+            const n = self.tls_client.read(self.stream, buf[off..]) catch return error.Carrier;
+            if (n == 0) break;
+            off += n;
+        }
+        if (off < buf.len) return error.Carrier;
+        return buf;
+    }
+    fn closeFn(ptr: *anyopaque) void {
+        const self: *TlsFrameCarrier = @ptrCast(@alignCast(ptr));
+        self.stream.close();
     }
 };
 
-fn buildEnvelope(alloc: std.mem.Allocator, service: []const u8, op: []const u8, req: []const u8) ![]u8 {
-    var out = std.ArrayList(u8).init(alloc);
-    errdefer out.deinit();
-    try writeHead(&out, 5, 4); // map(4); keys in length-then-bytewise order
-    try writeText(&out, "v");
-    try writeHead(&out, 0, 1);
-    try writeText(&out, "op");
-    try writeText(&out, op);
-    try writeText(&out, "payload");
-    try writeHead(&out, 6, 24); // tag 24 (embedded CBOR)
-    try writeBytes(&out, req);
-    try writeText(&out, "service");
-    try writeText(&out, service);
-    return out.toOwnedSlice();
+fn openTlsCarrier(alloc: std.mem.Allocator, host: []const u8, port: u16) !TlsFrameCarrier {
+    const stream = try std.net.tcpConnectToHost(alloc, host, port);
+    var ca = std.crypto.Certificate.Bundle{};
+    try ca.rescan(alloc);
+    const tls_client = try std.crypto.tls.Client.init(stream, .{
+        .host = .{ .explicit = host },
+        .ca = .{ .bundle = ca },
+    });
+    return .{ .stream = stream, .tls_client = tls_client, .ca = ca };
 }
+"#;
 
-fn writeHead(out: *std.ArrayList(u8), major: u8, n: u64) !void {
-    const mt: u8 = major << 5;
-    if (n < 24) {
-        try out.append(mt | @as(u8, @intCast(n)));
-    } else if (n < 0x100) {
-        try out.append(mt | 24);
-        try out.append(@intCast(n));
-    } else if (n < 0x10000) {
-        try out.append(mt | 25);
-        var b: [2]u8 = undefined;
-        std.mem.writeInt(u16, &b, @intCast(n), .big);
-        try out.appendSlice(&b);
-    } else if (n < 0x100000000) {
-        try out.append(mt | 26);
-        var b: [4]u8 = undefined;
-        std.mem.writeInt(u32, &b, @intCast(n), .big);
-        try out.appendSlice(&b);
-    } else {
-        try out.append(mt | 27);
-        var b: [8]u8 = undefined;
-        std.mem.writeInt(u64, &b, n, .big);
-        try out.appendSlice(&b);
-    }
-}
+/// The Events session body when the spec declares no channel op: the handshake and
+/// heartbeat still apply, so they are shown, with a note where the dispatch would go.
+const EVENTS_NOCHANNEL_SESSION_ZIG: &str = r#"pub fn main() !void {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const alloc = gpa.allocator();
 
-fn writeText(out: *std.ArrayList(u8), s: []const u8) !void {
-    try writeHead(out, 3, s.len);
-    try out.appendSlice(s);
-}
+    var tls_carrier = try openTlsCarrier(alloc, "localhost", 7443);
+    const carrier = tls_carrier.carrier();
+    defer carrier.close();
 
-fn writeBytes(out: *std.ArrayList(u8), s: []const u8) !void {
-    try writeHead(out, 2, s.len);
-    try out.appendSlice(s);
-}
+    // $hello / $hello-ack handshake (control plane).
+    const versions = [_]u64{csil.VERSION};
+    const profiles = [_][]const u8{"verbose"};
+    const hello_frame = try (events.Hello{ .versions = &versions, .profiles = &profiles }).encode(alloc);
+    defer alloc.free(hello_frame);
+    try carrier.send(hello_frame);
 
-// A minimal read cursor over the response envelope — just enough to find the three
-// known keys; unknown values are skipped generically.
-const Cursor = struct {
-    b: []const u8,
-    i: usize = 0,
+    const ack_frame = (try carrier.recv(alloc)) orelse return error.ClosedDuringHandshake;
+    defer alloc.free(ack_frame);
+    var ack_arena = std.heap.ArenaAllocator.init(alloc);
+    defer ack_arena.deinit();
+    const ack = try events.decode_hello_ack(ack_arena.allocator(), ack_frame);
+    const profile = events.Profile.parse(ack.profile) orelse return error.UnknownProfile;
 
-    const Head = struct { major: u8, arg: u64 };
-
-    fn need(self: *Cursor, n: usize) !void {
-        if (self.i + n > self.b.len) return error.CsilRpcEof;
-    }
-
-    fn head(self: *Cursor) !Head {
-        try self.need(1);
-        const ib = self.b[self.i];
-        self.i += 1;
-        const major: u8 = ib >> 5;
-        const low: u8 = ib & 0x1f;
-        if (low < 24) return .{ .major = major, .arg = low };
-        switch (low) {
-            24 => {
-                try self.need(1);
-                const v = self.b[self.i];
-                self.i += 1;
-                return .{ .major = major, .arg = v };
-            },
-            25 => {
-                try self.need(2);
-                const v = std.mem.readInt(u16, self.b[self.i..][0..2], .big);
-                self.i += 2;
-                return .{ .major = major, .arg = v };
-            },
-            26 => {
-                try self.need(4);
-                const v = std.mem.readInt(u32, self.b[self.i..][0..4], .big);
-                self.i += 4;
-                return .{ .major = major, .arg = v };
-            },
-            27 => {
-                try self.need(8);
-                const v = std.mem.readInt(u64, self.b[self.i..][0..8], .big);
-                self.i += 8;
-                return .{ .major = major, .arg = v };
-            },
-            else => return error.CsilRpcMalformed,
+    // Recv loop: answer $ping with $pong. This package declares no <->/<- operations,
+    // so there is no generated channel router to dispatch typed events into.
+    while (try carrier.recv(alloc)) |frame| {
+        defer alloc.free(frame);
+        var frame_arena = std.heap.ArenaAllocator.init(alloc);
+        defer frame_arena.deinit();
+        const ev = try events.decode_event(frame_arena.allocator(), frame, profile);
+        const name = ev.event orelse continue;
+        if (std.mem.eql(u8, name, events.PING_NAME)) {
+            const ping = try events.decode_heartbeat(frame_arena.allocator(), ev.payload);
+            const pong_payload = try (events.Heartbeat{ .nonce = ping.nonce }).encode(alloc);
+            defer alloc.free(pong_payload);
+            const pong_frame = try (events.Event.verbose(null, events.PONG_NAME, pong_payload)).encode(alloc, profile);
+            defer alloc.free(pong_frame);
+            try carrier.send(pong_frame);
         }
     }
+}
+"#;
 
-    fn str(self: *Cursor, want_major: u8) ![]const u8 {
-        const h = try self.head();
-        if (h.major != want_major) return error.CsilRpcWrongType;
-        const n: usize = @intCast(h.arg);
-        try self.need(n);
-        const s = self.b[self.i .. self.i + n];
-        self.i += n;
-        return s;
+/// CSIL-Datagrams over UDP: encode a `->` request with the generated codec, wrap it in
+/// the library's `Datagram`, and send it fire-and-forget over UDP. The recv path
+/// decodes an inbound `Datagram` and decodes its payload into the RESPONSE type — with
+/// an explicit note that there is NO synchronous response.
+fn datagrams_section(ex: Option<&ZigUnaryExample>) -> String {
+    let mut out = String::from("## CSIL-Datagrams (UDP)\n\n");
+    out.push_str(
+        "Unreliable, unordered, message-oriented. The library owns the `Datagram` envelope;\n\
+         you bring a datagram carrier. The UDP carrier below is one example — a WebRTC\n\
+         unreliable DataChannel or QUIC datagrams drop in unchanged.\n\n",
+    );
+    let needs_record = ex.and_then(|e| e.req_codec.as_ref().map(|c| (e, c)));
+    let Some((ex, req_codec)) = needs_record else {
+        out.push_str(
+            "This package declares no record `->` operations, so there is no datagram payload to encode.\n\n",
+        );
+        return out;
+    };
+    out.push_str("```zig\n");
+    out.push_str(DATAGRAMS_UDP_CARRIER_ZIG);
+    out.push('\n');
+    let print = match &ex.resp_print_field {
+        Some(field) => {
+            format!("        std.debug.print(\"late response {{s}}\\n\", .{{resp.{field}}});\n")
+        }
+        None => "        std.debug.print(\"late response\\n\", .{});\n".to_string(),
+    };
+    out.push_str(&format!(
+        r#"// The operation's datagram ordinal — its @wire-id, or a channel-agreed number.
+const OP_ORD: u64 = {op_ord};
+
+pub fn main() !void {{
+    var gpa = std.heap.GeneralPurposeAllocator(.{{}}){{}};
+    defer _ = gpa.deinit();
+    const alloc = gpa.allocator();
+
+    var udp = try UdpDatagramCarrier.open("127.0.0.1", 9000);
+    const carrier = udp.carrier();
+    defer carrier.close();
+
+    // Fire-and-forget: encode the `->` request and send it. seq 0 marks an
+    // unsequenced datagram.
+    const req = {req_literal};
+    const payload = try codec_gen.encode_{req_codec}(alloc, &req);
+    defer alloc.free(payload);
+    const datagram = try datagrams.Datagram.init(OP_ORD, 0, payload).encode(alloc);
+    defer alloc.free(datagram);
+    try carrier.send(datagram);
+
+    // Recv path: a datagram of the RESPONSE type MAY arrive later — or never. There is
+    // NO synchronous response; the caller must tolerate loss and reordering and handle
+    // a reply whenever (if ever) it shows up.
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    if (try carrier.recv(arena.allocator())) |inbound| {{
+        const dg = try datagrams.decode_datagram(arena.allocator(), inbound);
+        var resp: {resp_type} = undefined;
+        try codec_gen.decode_{res_codec}(arena.allocator(), dg.payload, &resp);
+{print}    }}
+}}
+"#,
+        op_ord = ex.op_ord,
+        req_literal = ex.req_literal,
+        req_codec = req_codec,
+        resp_type = ex.resp_type,
+        res_codec = ex.res_codec,
+        print = print,
+    ));
+    out.push_str("```\n\n");
+    out
+}
+
+/// The UDP `DatagramCarrier` preamble — spec-independent. `send` writes one UDP packet;
+/// `recv` reads the next inbound packet (or null). Datagrams are unreliable and
+/// unordered, so the carrier never waits for or correlates a reply.
+const DATAGRAMS_UDP_CARRIER_ZIG: &str = r#"const std = @import("std");
+const csil = @import("csilgen_transport");
+const codec_gen = @import("codec.gen.zig");
+const types = @import("types.gen.zig");
+
+const datagrams = csil.datagrams;
+const carrier_seam = csil.carrier;
+
+// One example carrier: CSIL-Datagrams over UDP (std.posix). Datagrams are unreliable
+// and unordered, so the carrier never waits for or correlates a reply.
+const UdpDatagramCarrier = struct {
+    sock: std.posix.socket_t,
+    peer: std.net.Address,
+
+    fn open(host: []const u8, port: u16) !UdpDatagramCarrier {
+        const addr = try std.net.Address.parseIp(host, port);
+        const sock = try std.posix.socket(addr.any.family, std.posix.SOCK.DGRAM, std.posix.IPPROTO.UDP);
+        return .{ .sock = sock, .peer = addr };
     }
 
-    fn skip(self: *Cursor) anyerror!void {
-        const h = try self.head();
-        switch (h.major) {
-            0, 1, 7 => {},
-            2, 3 => {
-                const n: usize = @intCast(h.arg);
-                try self.need(n);
-                self.i += n;
-            },
-            4 => {
-                var k: u64 = 0;
-                while (k < h.arg) : (k += 1) try self.skip();
-            },
-            5 => {
-                var k: u64 = 0;
-                while (k < h.arg * 2) : (k += 1) try self.skip();
-            },
-            6 => try self.skip(),
-            else => return error.CsilRpcMalformed,
-        }
+    fn carrier(self: *UdpDatagramCarrier) carrier_seam.DatagramCarrier {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    const vtable = carrier_seam.DatagramCarrier.VTable{ .send_datagram = send, .recv_datagram = recv, .close = closeFn };
+
+    fn send(ptr: *anyopaque, datagram: []const u8) carrier_seam.CarrierError!void {
+        const self: *UdpDatagramCarrier = @ptrCast(@alignCast(ptr));
+        _ = std.posix.sendto(self.sock, datagram, 0, &self.peer.any, self.peer.getOsSockLen()) catch return error.Carrier;
+    }
+    fn recv(ptr: *anyopaque, alloc: std.mem.Allocator) carrier_seam.CarrierError!?[]u8 {
+        const self: *UdpDatagramCarrier = @ptrCast(@alignCast(ptr));
+        var buf: [datagrams.MAX_DATAGRAM_DEFAULT]u8 = undefined;
+        const n = std.posix.recv(self.sock, &buf, 0) catch return error.Carrier;
+        if (n == 0) return null;
+        const out = try alloc.alloc(u8, n);
+        @memcpy(out, buf[0..n]);
+        return out;
+    }
+    fn closeFn(ptr: *anyopaque) void {
+        const self: *UdpDatagramCarrier = @ptrCast(@alignCast(ptr));
+        std.posix.close(self.sock);
     }
 };
-
-fn unwrap(alloc: std.mem.Allocator, body: []const u8) ![]u8 {
-    var c = Cursor{ .b = body };
-    const top = try c.head();
-    if (top.major != 5) return error.CsilRpcMalformed; // CsilRpcResponse is a map
-    var status: i64 = 0;
-    var service_error = false;
-    var payload: ?[]const u8 = null;
-    var k: u64 = 0;
-    while (k < top.arg) : (k += 1) {
-        const key = try c.str(3);
-        if (std.mem.eql(u8, key, "status")) {
-            const h = try c.head();
-            status = switch (h.major) {
-                0 => @intCast(h.arg),
-                1 => -1 - @as(i64, @intCast(h.arg)),
-                else => return error.CsilRpcWrongType,
-            };
-        } else if (std.mem.eql(u8, key, "variant")) {
-            const v = try c.str(3);
-            if (std.mem.eql(u8, v, "ServiceError")) service_error = true;
-        } else if (std.mem.eql(u8, key, "payload")) {
-            const tag = try c.head();
-            if (tag.major != 6 or tag.arg != 24) return error.CsilRpcWrongType;
-            payload = try c.str(2); // the tag-24 inner byte string
-        } else {
-            try c.skip();
-        }
-    }
-    // status != 0 is a transport failure (no typed payload); a ServiceError arm is a
-    // typed application error, distinct from a transport failure.
-    if (status != 0) return error.CsilRpcTransportStatus;
-    if (service_error) return error.CsilRpcServiceError;
-    const inner = payload orelse return error.CsilRpcMissingPayload;
-    return alloc.dupe(u8, inner); // the generated client frees this with alloc.free
-}
 "#;
 
 // ---- spec scans -----------------------------------------------------------

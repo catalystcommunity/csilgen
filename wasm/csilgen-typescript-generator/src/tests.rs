@@ -630,38 +630,177 @@ fn pingpong_spec() -> CsilSpecSerialized {
     ])
 }
 
-#[test]
-fn package_readme_has_quickstart_carrier_and_example() {
-    let mut input = input_with_spec("typescript", pingpong_spec());
+/// A spec with both a `->` op (`ping`) and a `<->` op (`pulse`), records built as
+/// `TypeDef(Group)` so the codec, client, and channel router all render against real
+/// ops — the canonical verification spec for the 3-transport genquickstart.
+fn transports_spec() -> CsilSpecSerialized {
+    let mut spec = spec_of(vec![
+        record_typedef("Ping", vec![field("msg", builtin("text"), false)]),
+        record_typedef("Pong", vec![field("msg", builtin("text"), false)]),
+        CsilRule {
+            name: "Echo".to_string(),
+            rule_type: CsilRuleType::ServiceDef(CsilServiceDefinition {
+                operations: vec![
+                    op("ping", "Ping", "Pong", vec![]),
+                    op_with_direction(
+                        "pulse",
+                        "Ping",
+                        "Pong",
+                        CsilServiceDirection::Bidirectional,
+                        vec![],
+                    ),
+                ],
+                wire_id: None,
+            }),
+            position: pos(),
+            doc_comments: vec![],
+        },
+    ]);
+    spec.service_count = 1;
+    spec
+}
+
+// ---------------------------------------------------------------------------
+// 3-transport genquickstart: structure + per-section unit assertions
+// ---------------------------------------------------------------------------
+
+fn transports_readme(spec: CsilSpecSerialized) -> String {
+    let mut input = input_with_spec("typescript", spec);
     input.config.options.insert(
         "emit_packages".to_string(),
         serde_json::json!(["typescript"]),
     );
     let files = generate_files(&input).expect("generate");
-    let readme = file(&files, "README.md");
+    file(&files, "genquickstart.md").to_string()
+}
 
-    // The carrier (the must-have) is present and implements the async seam.
+#[test]
+fn genquickstart_has_all_three_sections_by_default() {
+    let readme = transports_readme(transports_spec());
+    for heading in [
+        "## CSIL-RPC (HTTP)",
+        "## CSIL-Events (TLS)",
+        "## CSIL-Datagrams (UDP)",
+    ] {
+        assert!(
+            readme.contains(heading),
+            "default genquickstart must contain {heading}:\n{readme}"
+        );
+    }
+    // Install line pulls in the transport library alongside the package.
+    assert!(readme.contains("npm install echo-client csilgen-transport"));
+}
+
+#[test]
+fn genquickstart_transports_subset_emits_only_listed_sections() {
+    let mut input = input_with_spec("typescript", transports_spec());
+    input.config.options.insert(
+        "emit_packages".to_string(),
+        serde_json::json!(["typescript"]),
+    );
+    input.config.options.insert(
+        "genquickstart_transports".to_string(),
+        serde_json::json!(["rpc"]),
+    );
+    let files = generate_files(&input).expect("generate");
+    let readme = file(&files, "genquickstart.md");
+    assert!(readme.contains("## CSIL-RPC (HTTP)"));
     assert!(
-        readme.contains("class CsilRpcTransport implements AsyncServiceTransport"),
-        "README must embed the async CSIL-RPC carrier:\n{readme}"
+        !readme.contains("## CSIL-Events (TLS)"),
+        "events section must be suppressed:\n{readme}"
     );
     assert!(
-        readme.contains("/csil/v1/rpc"),
-        "carrier must POST the canonical mount"
+        !readme.contains("## CSIL-Datagrams (UDP)"),
+        "datagrams section must be suppressed:\n{readme}"
+    );
+}
+
+#[test]
+fn genquickstart_transports_unknown_or_empty_falls_back_to_all() {
+    // An empty array, or one naming only unknown transports, falls back to all three
+    // rather than producing an empty document.
+    for opt in [serde_json::json!([]), serde_json::json!(["bogus"])] {
+        let mut input = input_with_spec("typescript", transports_spec());
+        input.config.options.insert(
+            "emit_packages".to_string(),
+            serde_json::json!(["typescript"]),
+        );
+        input
+            .config
+            .options
+            .insert("genquickstart_transports".to_string(), opt.clone());
+        let files = generate_files(&input).expect("generate");
+        let readme = file(&files, "genquickstart.md");
+        assert!(
+            readme.contains("## CSIL-RPC (HTTP)")
+                && readme.contains("## CSIL-Events (TLS)")
+                && readme.contains("## CSIL-Datagrams (UDP)"),
+            "{opt} must fall back to all three sections:\n{readme}"
+        );
+    }
+
+    // A mix of known + unknown keeps only the known one.
+    let mut input = input_with_spec("typescript", transports_spec());
+    input.config.options.insert(
+        "emit_packages".to_string(),
+        serde_json::json!(["typescript"]),
+    );
+    input.config.options.insert(
+        "genquickstart_transports".to_string(),
+        serde_json::json!(["datagrams", "bogus"]),
+    );
+    let files = generate_files(&input).expect("generate");
+    let readme = file(&files, "genquickstart.md");
+    assert!(readme.contains("## CSIL-Datagrams (UDP)"));
+    assert!(!readme.contains("## CSIL-RPC (HTTP)"));
+    assert!(!readme.contains("## CSIL-Events (TLS)"));
+}
+
+#[test]
+fn each_section_names_its_library_imports_and_seam() {
+    let readme = transports_readme(transports_spec());
+    let rpc = section(&readme, "## CSIL-RPC (HTTP)");
+    let events = section(&readme, "## CSIL-Events (TLS)");
+    let datagrams = section(&readme, "## CSIL-Datagrams (UDP)");
+
+    // RPC: the library envelope types + the canonical HTTP mount, no hand-rolled map.
+    assert!(rpc.contains("import { RpcRequest, RpcResponse } from \"csilgen-transport\";"));
+    assert!(rpc.contains("/csil/v1/rpc"));
+    assert!(rpc.contains("implements AsyncServiceTransport"));
+    assert!(rpc.contains("new AsyncApiClient(new HttpRpcCarrier("));
+    assert!(rpc.contains("client.echo.ping({ msg: \"example\" })"));
+
+    // Events: the lib's handshake/framing surface + the generated channel router.
+    assert!(events.contains("from \"csilgen-transport\";"));
+    assert!(events.contains("$hello"));
+    assert!(events.contains("frameLengthPrefixed"));
+    assert!(events.contains("LengthPrefixedDeframer"));
+    assert!(events.contains("routeEchoChannel(handlers, codec, ev.event!, ev.payload)"));
+    assert!(events.contains("encodeEchoPulse(codec,"));
+
+    // Datagrams: the lib's Datagram + carrier seam, and the no-sync-response warning.
+    assert!(
+        datagrams.contains("import { Datagram, type DatagramCarrier } from \"csilgen-transport\";")
+    );
+    assert!(datagrams.contains("sendDatagram"));
+    assert!(datagrams.contains("NO synchronous response"));
+    assert!(datagrams.contains("new Datagram(OP_ORD, 0, toPingCbor(req)).encode()"));
+}
+
+#[test]
+fn events_section_without_channel_ops_emits_a_note() {
+    // pingpong_spec has only a `->` op, so the Events section keeps the handshake but
+    // replaces the dispatch wiring with a note (no generated router import).
+    let readme = transports_readme(pingpong_spec());
+    let events = section(&readme, "## CSIL-Events (TLS)");
+    assert!(events.contains("$hello"));
+    assert!(
+        events.contains("no <->/<- operations"),
+        "must note the absence of channel ops:\n{events}"
     );
     assert!(
-        readme.contains("{ tag: 24, value: req }"),
-        "request payload must be tag-24 wrapped"
-    );
-    // The example call constructs the async aggregate and calls the first op with a
-    // compiling sample literal (not the `undefined as any` escape).
-    assert!(
-        readme.contains("new AsyncApiClient(new CsilRpcTransport("),
-        "example must construct the typed client over the carrier:\n{readme}"
-    );
-    assert!(
-        readme.contains("client.echo.ping({ msg: \"example\" })"),
-        "example call must pass a generated sample request literal:\n{readme}"
+        !events.contains("routeEchoChannel"),
+        "no channel router import when there are no channel ops:\n{events}"
     );
 }
 
@@ -670,7 +809,7 @@ fn package_readme_has_quickstart_carrier_and_example() {
 /// (barrel, `package.json`, `tsconfig.json`) is unaffected.
 #[test]
 fn package_readme_opt_out_suppresses_only_readme() {
-    let mut input = input_with_spec("typescript", pingpong_spec());
+    let mut input = input_with_spec("typescript", transports_spec());
     input.config.options.insert(
         "emit_packages".to_string(),
         serde_json::json!(["typescript"]),
@@ -679,7 +818,7 @@ fn package_readme_opt_out_suppresses_only_readme() {
     // Default: README present alongside the rest of the package scaffolding.
     let files = generate_files(&input).expect("generate");
     assert!(
-        files.iter().any(|f| f.path == "README.md"),
+        files.iter().any(|f| f.path == "genquickstart.md"),
         "README must be emitted by default in package mode"
     );
 
@@ -690,7 +829,7 @@ fn package_readme_opt_out_suppresses_only_readme() {
         .insert("emit_readme".to_string(), serde_json::json!(false));
     let files = generate_files(&input).expect("generate");
     assert!(
-        !files.iter().any(|f| f.path == "README.md"),
+        !files.iter().any(|f| f.path == "genquickstart.md"),
         "emit_readme: false must suppress the README"
     );
     for path in ["index.ts", "package.json", "tsconfig.json"] {
@@ -701,59 +840,122 @@ fn package_readme_opt_out_suppresses_only_readme() {
     }
 }
 
-/// End-to-end proof the README Quickstart carrier actually works: extract the `ts`
-/// block verbatim and run it under `node` against an in-process CSIL-RPC echo (a
-/// `fetch` stub that decodes the request envelope and echoes the tag-24 inner payload
-/// — exactly the bytes `tools/csil-rpc-echo-mock.py` returns over real HTTP). A green
-/// run proves the carrier builds the envelope, drives `fetch`, and decodes the typed
-/// reply round-trip. The stub avoids cross-process sockets so the test is hermetic;
-/// the standalone mock script verifies the same carrier against real HTTP in a normal
-/// environment. Skips when node/npx are unavailable so the suite stays portable.
-#[test]
-fn readme_quickstart_carrier_round_trips_under_node() {
+// ---------------------------------------------------------------------------
+// Hermetic execution of the genquickstart examples (node, in-process loopback)
+// ---------------------------------------------------------------------------
+
+fn have_node_npx() -> bool {
     let have = |bin: &str| {
         std::process::Command::new(bin)
             .arg("--version")
             .output()
             .is_ok()
     };
-    if !have("node") || !have("npx") {
-        eprintln!("skipping: node/npx not on PATH");
-        return;
-    }
+    have("node") && have("npx")
+}
 
-    let mut input = input_with_spec("typescript", pingpong_spec());
+/// The `ts` block under the given `## ` heading (the section's first fenced block).
+fn section_ts_block(md: &str, heading: &str) -> String {
+    let sec = section(md, heading);
+    let start = sec.find("```ts\n").expect("section has a ts block") + "```ts\n".len();
+    let rest = &sec[start..];
+    let end = rest.find("\n```").expect("ts block is closed");
+    rest[..end].to_string()
+}
+
+/// The slice of `md` from `heading` up to the next `## ` heading (or end).
+fn section<'a>(md: &'a str, heading: &str) -> &'a str {
+    let start = md.find(heading).expect("section heading present");
+    let rest = &md[start..];
+    match rest[heading.len()..].find("\n## ") {
+        Some(off) => &rest[..heading.len() + off],
+        None => rest,
+    }
+}
+
+/// Copy the in-repo `csilgen-transport` library into `dir/lib`, stripping the
+/// `.ts` import extensions so it compiles as CommonJS alongside the generated
+/// package (the lib's own ESM `.ts`-suffixed specifiers are not valid under
+/// CommonJS module resolution without `allowImportingTsExtensions` + `noEmit`).
+fn copy_transport_lib(dir: &std::path::Path) {
+    let src =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../transports/typescript/src");
+    let lib = dir.join("lib");
+    std::fs::create_dir_all(&lib).unwrap();
+    for entry in std::fs::read_dir(&src).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().and_then(|e| e.to_str()) != Some("ts") {
+            continue;
+        }
+        let content = std::fs::read_to_string(&path)
+            .unwrap()
+            .replace(".ts\"", "\"");
+        std::fs::write(lib.join(path.file_name().unwrap()), content).unwrap();
+    }
+}
+
+/// Build the genquickstart package for `transports_spec`, write it + the copied
+/// library + a `node:tls`/`node:dgram` shim into a fresh temp dir, and return the
+/// dir. The example specifiers `csilgen-transport`/`echo-client` are repointed at
+/// the local `./lib/index`/`./index` so everything compiles as one program.
+fn stage_transports_package(label: &str) -> (std::path::PathBuf, String) {
+    let mut input = input_with_spec("typescript", transports_spec());
     input.config.options.insert(
         "emit_packages".to_string(),
         serde_json::json!(["typescript"]),
     );
     let files = generate_files(&input).expect("generate");
+    let readme = file(&files, "genquickstart.md").to_string();
 
-    let dir = std::env::temp_dir().join(format!("csilgen-ts-readme-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("csilgen-ts-{label}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     for f in &files {
         std::fs::write(dir.join(&f.path), &f.content).unwrap();
     }
+    copy_transport_lib(&dir);
+    std::fs::write(dir.join("node-shims.d.ts"), NODE_SHIMS_DTS).unwrap();
+    (dir, readme)
+}
 
-    // The README's `ts` block verbatim, repointed at the local barrel, preceded by an
-    // in-process echo installed as `globalThis.fetch` so the carrier runs unchanged.
-    let readme = file(&files, "README.md");
-    let block = extract_ts_block(readme)
-        .expect("README must contain a ts code block")
-        .replace("from \"echo-client\"", "from \"./index\"");
-    let driver = format!("{ECHO_FETCH_STUB_TS}\n{block}");
-    std::fs::write(dir.join("driver.ts"), driver).unwrap();
-    std::fs::write(dir.join("tsconfig.json"), CODEC_TSCONFIG).unwrap();
+/// Repoint an example block's package specifiers at the locally-staged copies.
+fn local_specifiers(block: &str) -> String {
+    block
+        .replace("from \"csilgen-transport\"", "from \"./lib/index\"")
+        .replace("from \"echo-client\"", "from \"./index\"")
+}
 
-    let build = std::process::Command::new("npx")
-        .args(["-y", "-p", "typescript@5", "tsc", "-p", "tsconfig.json"])
-        .current_dir(&dir)
+fn run_tsc(dir: &std::path::Path, extra_args: &[&str]) -> std::process::Output {
+    let mut args = vec!["-y", "-p", "typescript@5", "tsc", "-p", "tsconfig.json"];
+    args.extend_from_slice(extra_args);
+    std::process::Command::new("npx")
+        .args(&args)
+        .current_dir(dir)
         .output()
-        .unwrap();
+        .unwrap()
+}
+
+/// CSIL-RPC: run the emitted HTTP-carrier example under node with `globalThis.fetch`
+/// stubbed by an in-process CSIL-RPC echo built on the library's `RpcRequest`/
+/// `RpcResponse`. A green run proves the carrier builds the envelope via the lib,
+/// drives `fetch`, and the typed client decodes the reply round-trip. Hermetic (no
+/// sockets). Skips when node/npx are unavailable.
+#[test]
+fn genquickstart_rpc_section_round_trips_under_node() {
+    if !have_node_npx() {
+        eprintln!("skipping: node/npx not on PATH");
+        return;
+    }
+    let (dir, readme) = stage_transports_package("rpc");
+    let block = local_specifiers(&section_ts_block(&readme, "## CSIL-RPC (HTTP)"));
+    let driver = format!("{RPC_ECHO_STUB_TS}\n{block}");
+    std::fs::write(dir.join("driver.ts"), driver).unwrap();
+    std::fs::write(dir.join("tsconfig.json"), TRANSPORTS_TSCONFIG).unwrap();
+
+    let build = run_tsc(&dir, &[]);
     assert!(
         build.status.success(),
-        "tsc failed on the README carrier:\n{}{}",
+        "tsc failed on the RPC example:\n{}{}",
         String::from_utf8_lossy(&build.stdout),
         String::from_utf8_lossy(&build.stderr)
     );
@@ -764,51 +966,167 @@ fn readme_quickstart_carrier_round_trips_under_node() {
         .unwrap();
     assert!(
         run.status.success(),
-        "node run of the README carrier failed:\n{}{}",
+        "node run of the RPC example failed:\n{}{}",
         String::from_utf8_lossy(&run.stdout),
         String::from_utf8_lossy(&run.stderr)
     );
-    // The echo returns the request fields, so the printed Pong carries the sent value.
     assert!(
         String::from_utf8_lossy(&run.stdout).contains("example"),
-        "round-trip did not return the sent field: {}",
+        "RPC round-trip did not return the sent field: {}",
         String::from_utf8_lossy(&run.stdout)
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// An in-process CSIL-RPC echo installed as `globalThis.fetch`: it decodes the request
-/// envelope with the package's own codec and echoes the tag-24 inner payload back in a
-/// `status: 0` response — byte-identical to what the standalone mock returns over HTTP.
-const ECHO_FETCH_STUB_TS: &str = r#"import {
-  encodeValue as _enc,
-  decode as _dec,
-  requireKey as _rk,
-  asBytes as _ab,
-  type CborValue as _CV,
-} from "./index";
+/// CSIL-Datagrams: run the emitted UDP example under node with the real carrier
+/// swapped for the library's in-process `LoopbackDatagramCarrier`, seeded with one
+/// response datagram. Proves the example `Datagram`-encodes the request via the
+/// generated codec, `sendDatagram`s it, and decodes an inbound response datagram back
+/// into the typed response. Hermetic (no sockets). Skips when node/npx unavailable.
+#[test]
+fn genquickstart_datagrams_section_round_trips_under_node() {
+    if !have_node_npx() {
+        eprintln!("skipping: node/npx not on PATH");
+        return;
+    }
+    let (dir, readme) = stage_transports_package("dgram");
+    let block = local_specifiers(&section_ts_block(&readme, "## CSIL-Datagrams (UDP)"))
+        // Swap the real UDP carrier for the seeded loopback (sockets are killed in the
+        // sandbox; the lib loopback exercises the same send/recv codec path in-process).
+        .replace(
+            "openUdpCarrier(\"localhost\", 9000)",
+            "((globalThis as any).__loopback as DatagramCarrier)",
+        );
+    let driver = format!("{DATAGRAM_LOOPBACK_PREAMBLE_TS}\n{block}");
+    std::fs::write(dir.join("driver.ts"), driver).unwrap();
+    std::fs::write(dir.join("tsconfig.json"), TRANSPORTS_TSCONFIG).unwrap();
+
+    let build = run_tsc(&dir, &[]);
+    assert!(
+        build.status.success(),
+        "tsc failed on the datagrams example:\n{}{}",
+        String::from_utf8_lossy(&build.stdout),
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let run = std::process::Command::new("node")
+        .arg(dir.join("out").join("driver.js"))
+        .current_dir(&dir)
+        .output()
+        .unwrap();
+    assert!(
+        run.status.success(),
+        "node run of the datagrams example failed:\n{}{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("late response"),
+        "datagram recv path did not decode the seeded response: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// CSIL-Events: the full TLS session is an interactive, socket-driven loop, so it is
+/// verified compile-only (`tsc --noEmit`) against the generated package + library —
+/// proving the handshake, heartbeat, Codec, and `routeEchoChannel` dispatch wiring all
+/// type-check. The RPC + datagrams examples above are additionally *run*. Skips when
+/// node/npx are unavailable.
+#[test]
+fn genquickstart_events_section_type_checks() {
+    if !have_node_npx() {
+        eprintln!("skipping: node/npx not on PATH");
+        return;
+    }
+    let (dir, readme) = stage_transports_package("events");
+    let block = local_specifiers(&section_ts_block(&readme, "## CSIL-Events (TLS)"));
+    std::fs::write(dir.join("driver.ts"), block).unwrap();
+    std::fs::write(dir.join("tsconfig.json"), TRANSPORTS_TSCONFIG_NOEMIT).unwrap();
+
+    let build = run_tsc(&dir, &["--noEmit"]);
+    assert!(
+        build.status.success(),
+        "events example failed to type-check:\n{}{}",
+        String::from_utf8_lossy(&build.stdout),
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// An in-process CSIL-RPC echo installed as `globalThis.fetch`, built on the library's
+/// `RpcRequest`/`RpcResponse` (aliased so they don't collide with the example's own
+/// imports). It decodes the request envelope and replies with a status-0 `Pong` reply
+/// echoing the request payload.
+const RPC_ECHO_STUB_TS: &str = r#"import { RpcRequest as _RReq, RpcResponse as _RResp } from "./lib/index";
 (globalThis as any).fetch = async (_url: string, init: { body: Uint8Array }): Promise<Response> => {
-  const env = _dec(new Uint8Array(init.body));
-  const payload = _rk(env, "payload") as { value: _CV };
-  const inner = _ab(payload.value);
-  const resp = _enc(
-    new Map<_CV, _CV>([
-      ["v", 1],
-      ["status", 0],
-      ["payload", { tag: 24, value: inner }],
-    ]),
-  );
+  const req = _RReq.decode(new Uint8Array(init.body));
+  const resp = _RResp.ok("Pong", req.payload).encode();
   return new Response(resp as BodyInit, { status: 200 });
 };
 "#;
 
-/// The contents of the first ```` ```ts ```` fenced block in `md`.
-fn extract_ts_block(md: &str) -> Option<String> {
-    let start = md.find("```ts\n")? + "```ts\n".len();
-    let rest = &md[start..];
-    let end = rest.find("\n```")?;
-    Some(rest[..end].to_string())
+/// Seeds a library `LoopbackDatagramCarrier` with one response datagram and exposes
+/// it as `globalThis.__loopback` so the datagrams example (carrier line swapped) sends
+/// to and receives from it in-process. Imports are aliased to avoid colliding with the
+/// example's own `Datagram`/codec imports.
+const DATAGRAM_LOOPBACK_PREAMBLE_TS: &str = r#"import { LoopbackDatagramCarrier as _LDC, Datagram as _DG } from "./lib/index";
+import { toPongCbor as _toPong } from "./index";
+const _lb = new _LDC();
+_lb.pushInbound(new _DG(1, 0, _toPong({ msg: "example" })).encode());
+(globalThis as any).__loopback = _lb;
+"#;
+
+/// Minimal ambient declarations for the node modules the Events/Datagrams carrier
+/// examples import, so they type-check without `@types/node`. The hermetic tests swap
+/// the real sockets for library loopbacks, so these are never executed.
+const NODE_SHIMS_DTS: &str = r#"declare module "node:tls" {
+  export interface TLSSocket {
+    on(event: string, cb: (chunk: Uint8Array) => void): void;
+    write(data: Uint8Array): void;
+  }
+  export function connect(options: { host: string; port: number }): TLSSocket;
 }
+declare module "node:dgram" {
+  export interface Socket {
+    on(event: string, cb: (msg: Uint8Array) => void): void;
+    send(msg: Uint8Array, port: number, host: string): void;
+  }
+  export function createSocket(type: string): Socket;
+}
+"#;
+
+/// tsconfig including both the generated package (`*.ts`) and the staged library
+/// (`lib/*.ts`), emitting CommonJS into `out/` so the driver runs under node.
+const TRANSPORTS_TSCONFIG: &str = r#"{
+  "compilerOptions": {
+    "target": "es2020",
+    "module": "commonjs",
+    "moduleResolution": "node",
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "lib": ["es2020", "dom"],
+    "outDir": "out"
+  },
+  "include": ["*.ts", "lib/*.ts"]
+}
+"#;
+
+/// As `TRANSPORTS_TSCONFIG`, but `noEmit` for a type-check-only verification.
+const TRANSPORTS_TSCONFIG_NOEMIT: &str = r#"{
+  "compilerOptions": {
+    "target": "es2020",
+    "module": "commonjs",
+    "moduleResolution": "node",
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "lib": ["es2020", "dom"],
+    "noEmit": true
+  },
+  "include": ["*.ts", "lib/*.ts"]
+}
+"#;
 
 #[test]
 fn invalid_bidirectional_transport_value_fails_generation() {

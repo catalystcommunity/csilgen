@@ -218,25 +218,29 @@ fn process_generation(input: WasmGeneratorInput) -> Result<WasmGeneratorOutput, 
         });
     }
 
+    // A package's `genquickstart.md` demonstrates both the calling side (the RPC and
+    // Datagrams sections, over `client.gen.h`) and the handling side (the Events
+    // section, over the `server.gen.h` channel router), so a package must carry both
+    // surfaces for its own quickstart to compile against the single emitted package —
+    // regardless of which surface the sub-target requested. A flat (non-package) build
+    // stays byte-identical: it emits only the requested surface.
+    let pkg_mode = emit_packages_includes_c(&input.config.options);
+    let want_client =
+        matches!(surface, Surface::Client) || (pkg_mode && !matches!(surface, Surface::TypesOnly));
+    let want_server =
+        matches!(surface, Surface::Server) || (pkg_mode && !matches!(surface, Surface::TypesOnly));
     if input.csil_spec.service_count > 0 {
-        match surface {
-            Surface::Client => {
-                if let Some(client) = generate_client(&input, &config) {
-                    files.push(GeneratedFile {
-                        path: make_path("client.gen.h"),
-                        content: client,
-                    });
-                }
-            }
-            Surface::Server => {
-                if let Some(server) = generate_server(&input, &config, &mut warnings) {
-                    files.push(GeneratedFile {
-                        path: make_path("server.gen.h"),
-                        content: server,
-                    });
-                }
-            }
-            Surface::TypesOnly => {}
+        if want_client && let Some(client) = generate_client(&input, &config) {
+            files.push(GeneratedFile {
+                path: make_path("client.gen.h"),
+                content: client,
+            });
+        }
+        if want_server && let Some(server) = generate_server(&input, &config, &mut warnings) {
+            files.push(GeneratedFile {
+                path: make_path("server.gen.h"),
+                content: server,
+            });
         }
     }
 
@@ -245,7 +249,7 @@ fn process_generation(input: WasmGeneratorInput) -> Result<WasmGeneratorOutput, 
     // the OUTPUT directory documents how to drive the generated client end to end.
     // `emit_readme` defaults to true; only an explicit `false` suppresses the
     // README, so a typo or missing value never silently drops the docs.
-    if emit_packages_includes_c(&input.config.options)
+    if pkg_mode
         && input
             .config
             .options
@@ -254,7 +258,7 @@ fn process_generation(input: WasmGeneratorInput) -> Result<WasmGeneratorOutput, 
             != Some(false)
     {
         files.push(GeneratedFile {
-            path: "README.md".to_string(),
+            path: "genquickstart.md".to_string(),
             content: package_readme(&input, &config),
         });
     }
@@ -2433,6 +2437,13 @@ struct CUnaryExample {
     has_request: bool,
     req_literal: String,
     resp_print_field: Option<String>,
+    /// The request/response record names for the per-type codec helpers
+    /// (`csil_encode_<X>` / `csil_decode_<X>`) the datagram section calls; `None`
+    /// when the payload is not a record reference the codec covers.
+    req_codec: Option<String>,
+    resp_codec: Option<String>,
+    /// The op's datagram ordinal: its `@wire-id` when present, else a placeholder.
+    op_ord: u64,
 }
 
 fn first_unary_example(input: &WasmGeneratorInput, config: &CConfig) -> Option<CUnaryExample> {
@@ -2464,7 +2475,81 @@ fn first_unary_example(input: &WasmGeneratorInput, config: &CConfig) -> Option<C
                 String::new()
             },
             resp_print_field: first_text_field(input, &success),
+            req_codec: if has_request {
+                record_ref_name(input, &op.input_type)
+            } else {
+                None
+            },
+            resp_codec: record_ref_name(input, &success),
+            op_ord: op.wire_id.unwrap_or(1),
         });
+    }
+    None
+}
+
+/// The record name a type reference names, if it resolves to a record the codec
+/// covers; `None` otherwise. Used to gate the codec-driven datagram payload.
+fn record_ref_name(input: &WasmGeneratorInput, ty: &CsilTypeExpression) -> Option<String> {
+    let CsilTypeExpression::Reference(name) = unwrap_constrained(ty) else {
+        return None;
+    };
+    find_record(input, name).map(|_| name.clone())
+}
+
+/// The pieces the Events session needs: the generated handlers struct + channel router +
+/// outbound encoder names, the inbound (op input) and outbound (op success output) record
+/// type names, the handler method, the outbound wire op + sample literal, and the wire
+/// service.
+struct CChannelExample {
+    handlers_struct: String,
+    service_snake: String,
+    wire_service: String,
+    route_fn: String,
+    encode_fn: String,
+    handler_method: String,
+    inbound_type: String,
+    outbound_type: String,
+    outbound_wire_op: String,
+    outbound_sample: String,
+}
+
+/// The first service (declaration order) with a `<->` op whose input and success output
+/// are both records (so the generated router, encoder, and per-type codec helpers exist).
+/// `None` when no service has a usable channel op — the Events section then shows the
+/// handshake/heartbeat without dispatch wiring.
+fn first_channel_example(input: &WasmGeneratorInput, config: &CConfig) -> Option<CChannelExample> {
+    let _ = config;
+    for rule in &input.csil_spec.rules {
+        let CsilRuleType::ServiceDef(service) = &rule.rule_type else {
+            continue;
+        };
+        for op in &service.operations {
+            if !matches!(op.direction, CsilServiceDirection::Bidirectional) {
+                continue;
+            }
+            let success = success_type(&op.output_type);
+            let (Some(inbound), Some(outbound)) = (
+                record_ref_name(input, &op.input_type),
+                record_ref_name(input, &success),
+            ) else {
+                continue;
+            };
+            let base = service_base(&rule.name);
+            let snake = to_snake(&base);
+            let method = to_snake(&op.name);
+            return Some(CChannelExample {
+                handlers_struct: format!("{base}Handlers"),
+                service_snake: snake.clone(),
+                wire_service: base.to_lowercase(),
+                route_fn: format!("route_{snake}_channel"),
+                encode_fn: format!("encode_{snake}_{method}"),
+                handler_method: method,
+                inbound_type: inbound,
+                outbound_type: outbound,
+                outbound_wire_op: simple_pascal(&op.name),
+                outbound_sample: c_request_literal(input, &success, config),
+            });
+        }
     }
     None
 }
@@ -2549,54 +2634,97 @@ fn find_record<'a>(input: &'a WasmGeneratorInput, name: &str) -> Option<&'a Csil
         })
 }
 
-/// The package README, with a copy-paste **Quickstart**. For a client package the
-/// Quickstart is a complete CSIL-RPC carrier (it reuses this package's own generated
-/// CBOR codec for the envelope, adding no third-party CBOR dependency, and POSTs over
-/// raw POSIX sockets so the whole snippet is libc-only), the transport seam wired to
-/// it, and one example call. A serviceless package gets a shorter types-only section.
+/// Which of the three transport sections to render. The `genquickstart_transports`
+/// option is a JSON array subset of `["rpc","events","datagrams"]`; unknown entries are
+/// ignored, and an absent or all-unknown value means "all three" so the document always
+/// renders something coherent.
+fn wanted_transports(options: &HashMap<String, serde_json::Value>) -> (bool, bool, bool) {
+    let Some(items) = options
+        .get("genquickstart_transports")
+        .and_then(|v| v.as_array())
+    else {
+        return (true, true, true);
+    };
+    let names: std::collections::BTreeSet<&str> = items.iter().filter_map(|v| v.as_str()).collect();
+    let any_known = ["rpc", "events", "datagrams"]
+        .iter()
+        .any(|t| names.contains(t));
+    if any_known {
+        (
+            names.contains("rpc"),
+            names.contains("events"),
+            names.contains("datagrams"),
+        )
+    } else {
+        (true, true, true)
+    }
+}
+
+/// The package README: a transport-by-transport Quickstart over the official `csil`
+/// reference library (`transports/c`). The generated codec owns CBOR (de)serialization
+/// and the library owns the envelope/framing/lifecycle; the consumer supplies only a
+/// *carrier* that moves bytes. Each requested section (CSIL-RPC over HTTP, CSIL-Events
+/// over TLS, CSIL-Datagrams over UDP) is a complete, copy-paste example built on the lib.
 fn package_readme(input: &WasmGeneratorInput, config: &CConfig) -> String {
     let name = package_name(input);
     let mut out = format!(
         "# {name}\n\n\
-         Generated by csilgen. A typed, transport-agnostic CSIL-RPC client in C: the\n\
-         generated codec owns CBOR (de)serialization; you supply a *carrier* that only\n\
-         moves bytes.\n\n\
+         Generated by csilgen. A typed CSIL client in C: the generated codec owns CBOR\n\
+         (de)serialization and the `csil` transport library (`transports/c`) owns the\n\
+         envelope, framing, and connection lifecycle. You supply only a *carrier* that\n\
+         moves bytes, so the same typed surface rides HTTP, TLS, a WebSocket, QUIC, or raw\n\
+         UDP unchanged.\n\n\
          ## Consume\n\n\
          C has no package manager, so vendor the generated headers into your project and\n\
-         put this directory on your include path. The headers are header-only; a single\n\
-         translation unit that `#include`s `client.gen.h` pulls in the types and the\n\
-         self-contained CBOR codec. Build with any C11 compiler:\n\n\
+         put this directory on your include path. The transport library is not yet\n\
+         published; vendor `transports/c` (its `include/` on your include path, its `src/`\n\
+         in your build) for now. A single translation unit that `#include`s `client.gen.h`\n\
+         pulls in the types and the self-contained CBOR codec; `#include <csil/csil.h>`\n\
+         pulls in the transport envelopes. Build with any C11 compiler:\n\n\
          ```sh\n\
-         cc main.c -o demo\n\
+         cc -I. -Ipath/to/transports/c/include main.c path/to/transports/c/src/*.c -o demo\n\
          ```\n\n\
-         > Generate the client surface with `--target c-client` so `client.gen.h` is\n\
-         > emitted alongside the codec.\n\n"
+         > This package ships both surfaces: `client.gen.h` (RPC + Datagrams) and\n\
+         > `server.gen.h` (the Events channel router), plus the shared `codec.gen.h` /\n\
+         > `types.gen.h` — so all three sections below compile against this one directory.\n\n"
     );
 
-    match first_unary_example(input, config) {
-        Some(example) => out.push_str(&quickstart(&example)),
-        None => out.push_str(
-            "## Quickstart\n\n\
-             This package has no service operations — `#include \"types.gen.h\"` and\n\
-             `#include \"codec.gen.h\"` and use the generated `csil_encode_*` /\n\
-             `csil_decode_*` helpers directly.\n",
-        ),
+    let (rpc, events, datagrams) = wanted_transports(&input.config.options);
+    let unary = first_unary_example(input, config);
+    let channel = first_channel_example(input, config);
+    if rpc {
+        out.push_str(&rpc_section(unary.as_ref()));
+    }
+    if events {
+        out.push_str(&events_section(channel.as_ref()));
+    }
+    if datagrams {
+        out.push_str(&datagrams_section(unary.as_ref()));
     }
     out
 }
 
-/// The client Quickstart: a dependency-free blocking CSIL-RPC carrier (reuses the
-/// generated codec for the envelope, raw POSIX sockets for HTTP), the transport seam
-/// wired to it, and the typed call. A user changes only the host/port strings.
-fn quickstart(ex: &CUnaryExample) -> String {
-    let mut out = String::from("## Quickstart\n\n");
+/// CSIL-RPC over HTTP: a carrier implementing the generated `CsilgenTransport` byte seam
+/// that builds the envelope with the library's `csil_rpc_request_*` and decodes the
+/// library's `csil_rpc_response_*` (never hand-rolled), POSTing to `{host}:{port}/csil/v1/rpc`
+/// over raw POSIX sockets. The typed client decodes the success payload; a non-zero
+/// transport status and the `ServiceError` arm are surfaced distinctly.
+fn rpc_section(ex: Option<&CUnaryExample>) -> String {
+    let mut out = String::from("## CSIL-RPC (HTTP)\n\n");
     out.push_str(
-        "A complete CSIL-RPC carrier (no third-party dependency — the envelope reuses\n\
-         this package's generated CBOR codec, and the HTTP POST is hand-rolled over POSIX\n\
-         sockets) plus the typed client. Change the one host/port pair.\n\n",
+        "Request/response. The library owns the envelope (`csil_rpc_request` /\n\
+         `csil_rpc_response`); you bring a carrier that moves bytes. The carrier below\n\
+         implements the generated `CsilgenTransport` byte seam and POSTs over raw POSIX\n\
+         sockets — swap it for libcurl or any HTTP client.\n\n",
     );
+    let Some(ex) = ex else {
+        out.push_str(
+            "This package declares no `->` operations, so there is no RPC call to make.\n\n",
+        );
+        return out;
+    };
     out.push_str("```c\n");
-    out.push_str(CARRIER_C);
+    out.push_str(RPC_CARRIER_C);
     out.push('\n');
     // The example call: build the carrier, wire the seam, call the first op.
     out.push_str("int main(void) {\n");
@@ -2637,27 +2765,260 @@ fn quickstart(ex: &CUnaryExample) -> String {
     }
     out.push_str("    csil_codec_arena_free(owner); // frees everything `resp` borrows\n");
     out.push_str("    return 0;\n}\n");
-    out.push_str("```\n");
+    out.push_str("```\n\n");
     out
 }
 
-/// The carrier body — identical for every spec, so it is a constant. It wraps the
-/// already-encoded request in a `CsilRpcRequest` envelope (tag-24 payload) using the
-/// generated codec's writer, POSTs it to `{host}:{port}/csil/v1/rpc` over a raw
-/// socket, and returns the response payload bytes for the generated client to decode.
-/// A non-zero transport `status` or a typed `ServiceError` arm becomes a non-zero rc.
-const CARRIER_C: &str = r##"// Quickstart carrier — CSIL-RPC over HTTP.
+/// CSIL-Events over TLS: a full session example. A TLS `csil_stream` (OpenSSL) is wrapped
+/// in the library's `csil_stream_carrier` (length-prefix framing); the session does the
+/// `$hello`/`$hello-ack` handshake, sends one outbound event via the generated
+/// `encode_<svc>_<op>`, and runs a recv loop that decodes each frame to a `csil_event`,
+/// answers `$ping` with `$pong`, and dispatches typed events to the generated
+/// `route_<svc>_channel`. With no channel op the dispatch wiring becomes a note.
+fn events_section(ch: Option<&CChannelExample>) -> String {
+    let mut out = String::from("## CSIL-Events (TLS)\n\n");
+    out.push_str(
+        "Typed, bidirectional event streams over a long-lived connection. The library owns\n\
+         the `$hello`/`$hello-ack` handshake, the `$ping`/`$pong` heartbeat, and length-\n\
+         prefix framing (`csil_stream_carrier` over a `csil_stream`); the generated router\n\
+         dispatches typed events. The TLS carrier below uses OpenSSL (link `-lssl\n\
+         -lcrypto`) — swap it for any byte stream (a WebSocket, a QUIC stream).\n\n",
+    );
+    out.push_str("```c\n");
+    out.push_str(EVENTS_CARRIER_C);
+    out.push('\n');
+    match ch {
+        Some(ch) => out.push_str(&events_session(ch)),
+        None => out.push_str(EVENTS_NO_CHANNEL_SESSION_C),
+    }
+    out.push_str("```\n\n");
+    out
+}
+
+/// The channel session body for an Events connection that has a `<->` op: a `CsilgenCodec`
+/// backed by the op's generated per-type helpers, the handshake, one outbound event via
+/// the generated encoder, and the recv loop that heartbeats and dispatches into the
+/// generated router.
+fn events_session(ch: &CChannelExample) -> String {
+    let CChannelExample {
+        handlers_struct,
+        service_snake,
+        wire_service,
+        route_fn,
+        encode_fn,
+        handler_method,
+        inbound_type,
+        outbound_type,
+        outbound_wire_op,
+        outbound_sample,
+    } = ch;
+    let _ = service_snake;
+    format!(
+        r#"// Back the generated router's codec with the per-type CBOR helpers. decode heap-allocs
+// the typed message (its arena backs the strings; the host frees it after dispatch);
+// encode writes a fresh buffer the caller frees.
+static int channel_decode(void *self, const uint8_t *data, size_t len, void *out) {{
+    (void)self;
+    {inbound_type} *msg = ({inbound_type} *)calloc(1, sizeof *msg);
+    CsilCodecArena *owner = NULL;
+    if (!msg || csil_decode_{inbound_type}(data, len, msg, &owner)) {{ free(msg); return -1; }}
+    *(void **)out = msg; /* owner backs msg; free with csil_codec_arena_free post-dispatch */
+    return 0;
+}}
+static int channel_encode(void *self, const void *value, uint8_t **out, size_t *out_len) {{
+    (void)self;
+    return csil_encode_{outbound_type}((const {outbound_type} *)value, out, out_len);
+}}
+
+// The host's handler implementation; dispatch lands here.
+static int on_{handler_method}(void *ctx, const {inbound_type} *msg) {{
+    (void)ctx;
+    (void)msg;
+    printf("event {outbound_wire_op}\n");
+    return 0;
+}}
+
+static int session(SSL *ssl) {{
+    csil_stream stream = {{ .read = tls_read, .write = tls_write, .userdata = ssl }};
+    csil_frame_carrier carrier = csil_stream_carrier(&stream, 0);
+    CsilgenCodec codec = {{ .decode = channel_decode, .encode = channel_encode, .self = NULL }};
+    {handlers_struct} handlers = {{ .{handler_method} = on_{handler_method} }};
+
+    // $hello / $hello-ack handshake (control plane); the ack pins the wire profile for
+    // the connection's lifetime.
+    const uint64_t versions[] = {{ CSIL_VERSION }};
+    const char *profiles[] = {{ "verbose" }};
+    csil_hello hello = {{ .versions = versions, .versions_len = 1,
+                         .profiles = profiles, .profiles_len = 1, .service = "{wire_service}" }};
+    uint8_t *hb = NULL; size_t hbn = 0;
+    if (csil_hello_encode(&hello, &hb, &hbn)
+        || carrier.send_frame(carrier.userdata, hb, hbn)) {{
+        csil_free(hb); csil_stream_carrier_dispose(&carrier); return -1;
+    }}
+    csil_free(hb);
+
+    uint8_t *ackf = NULL; size_t ackn = 0;
+    if (carrier.recv_frame(carrier.userdata, &ackf, &ackn) || !ackf) {{
+        csil_stream_carrier_dispose(&carrier); return -1;
+    }}
+    csil_hello_ack ack;
+    csil_profile profile;
+    if (csil_hello_ack_decode(ackf, ackn, &ack)
+        || !csil_profile_parse(ack.profile, &profile)) {{
+        csil_hello_ack_free(&ack); csil_free(ackf);
+        csil_stream_carrier_dispose(&carrier); return -1;
+    }}
+    csil_hello_ack_free(&ack);
+    csil_free(ackf);
+
+    // Send one outbound event via the generated encoder, framed as a verbose Event.
+    {outbound_type} out_msg = {outbound_sample};
+    uint8_t *outb = NULL; size_t outn = 0;
+    if ({encode_fn}(&codec, &out_msg, &outb, &outn) == 0) {{
+        csil_event ev;
+        csil_event_init_verbose(&ev, "{wire_service}", "{outbound_wire_op}", outb, outn);
+        uint8_t *evb = NULL; size_t evn = 0;
+        if (csil_event_encode(&ev, profile, &evb, &evn) == 0) {{
+            carrier.send_frame(carrier.userdata, evb, evn);
+            csil_free(evb);
+        }}
+        free(outb);
+    }}
+
+    // Recv loop: decode each frame to an Event, answer $ping with $pong, dispatch the
+    // rest to the generated router.
+    for (;;) {{
+        uint8_t *frame = NULL; size_t flen = 0;
+        if (carrier.recv_frame(carrier.userdata, &frame, &flen) || !frame) break;
+        csil_event ev;
+        if (csil_event_decode(frame, flen, profile, &ev)) {{ csil_free(frame); break; }}
+        if (ev.event && strcmp(ev.event, CSIL_PING_NAME) == 0) {{
+            csil_heartbeat ping;
+            if (csil_heartbeat_decode(ev.payload, ev.payload_len, &ping) == 0) {{
+                csil_heartbeat pong = {{ .nonce = ping.nonce }};
+                uint8_t *pb = NULL; size_t pn = 0;
+                if (csil_heartbeat_encode(&pong, &pb, &pn) == 0) {{
+                    csil_event pe;
+                    csil_event_init_verbose(&pe, NULL, CSIL_PONG_NAME, pb, pn);
+                    uint8_t *peb = NULL; size_t pen = 0;
+                    if (csil_event_encode(&pe, profile, &peb, &pen) == 0) {{
+                        carrier.send_frame(carrier.userdata, peb, pen);
+                        csil_free(peb);
+                    }}
+                    csil_free(pb);
+                }}
+                csil_heartbeat_free(&ping);
+            }}
+        }} else if (ev.event) {{
+            {route_fn}(&handlers, NULL, &codec, ev.event, ev.payload, ev.payload_len);
+        }}
+        csil_event_free(&ev);
+        csil_free(frame);
+    }}
+    csil_stream_carrier_dispose(&carrier);
+    return 0;
+}}
+"#,
+    )
+}
+
+/// CSIL-Datagrams over UDP: encode a `->` request with the generated codec, wrap it in the
+/// library's `csil_datagram`, and send it fire-and-forget over a POSIX UDP socket. The
+/// recv path decodes an inbound `csil_datagram` and decodes its payload with the generated
+/// codec into the RESPONSE type — there is NO synchronous response.
+fn datagrams_section(ex: Option<&CUnaryExample>) -> String {
+    let mut out = String::from("## CSIL-Datagrams (UDP)\n\n");
+    out.push_str(
+        "Unreliable, unordered, message-oriented. The library owns the `csil_datagram`\n\
+         envelope; you bring a datagram carrier. The UDP carrier below uses raw POSIX\n\
+         sockets (libc only) — QUIC datagrams or a WebRTC channel drop in unchanged.\n\n",
+    );
+    let Some(ex) = ex else {
+        out.push_str(
+            "This package declares no `->` operations, so there is no datagram payload to encode.\n\n",
+        );
+        return out;
+    };
+    let (Some(req_codec), Some(resp_codec)) = (&ex.req_codec, &ex.resp_codec) else {
+        out.push_str(
+            "This package's `->` operations have non-record payloads, so there is no codec-driven\n\
+             datagram payload to encode; (de)serialize them manually before framing.\n\n",
+        );
+        return out;
+    };
+    out.push_str("```c\n");
+    out.push_str(DATAGRAMS_CARRIER_C);
+    out.push('\n');
+    out.push_str(&format!(
+        "// The operation's datagram ordinal — its @wire-id, or a channel-agreed number.\n#define OP_ORD {}u\n\n",
+        ex.op_ord
+    ));
+    out.push_str("int main(void) {\n");
+    out.push_str("    int fd = udp_connect(\"127.0.0.1\", \"9000\");\n");
+    out.push_str("    if (fd < 0) return 1;\n");
+    out.push_str("    UdpCarrier u = { .fd = fd };\n");
+    out.push_str(
+        "    csil_datagram_carrier carrier = { .send_datagram = udp_send,\n\
+         \x20                                     .recv_datagram = udp_recv, .userdata = &u };\n\n",
+    );
+    out.push_str(
+        "    // Fire-and-forget: encode the `->` request via the generated codec, wrap it in\n\
+         \x20   // the library's Datagram, and send it. seq 0 marks an unsequenced datagram.\n",
+    );
+    let req_decl = declarator(&ex.req_type, 0, "req");
+    out.push_str(&format!("    {req_decl} = {};\n", ex.req_literal));
+    out.push_str("    uint8_t *payload = NULL; size_t payload_len = 0;\n");
+    out.push_str(&format!(
+        "    if (csil_encode_{req_codec}(&req, &payload, &payload_len)) {{ close(fd); return 1; }}\n"
+    ));
+    out.push_str("    csil_datagram dg;\n");
+    out.push_str("    csil_datagram_init(&dg, OP_ORD, 0, payload, payload_len);\n");
+    out.push_str("    uint8_t *frame = NULL; size_t frame_len = 0;\n");
+    out.push_str("    if (csil_datagram_encode(&dg, &frame, &frame_len) == 0) {\n");
+    out.push_str("        carrier.send_datagram(carrier.userdata, frame, frame_len);\n");
+    out.push_str("        csil_free(frame);\n    }\n");
+    out.push_str("    free(payload);\n\n");
+    out.push_str(
+        "    // Recv path: a datagram of the RESPONSE type MAY arrive later — or never. There\n\
+         \x20   // is NO synchronous response; the caller must tolerate loss and reordering and\n\
+         \x20   // handle a reply whenever (if ever) it shows up.\n",
+    );
+    out.push_str("    uint8_t *inb = NULL; size_t inn = 0;\n");
+    out.push_str(
+        "    if (carrier.recv_datagram(carrier.userdata, &inb, &inn) == CSIL_OK && inb) {\n",
+    );
+    out.push_str("        csil_datagram in_dg;\n");
+    out.push_str("        if (csil_datagram_decode(inb, inn, &in_dg) == 0) {\n");
+    let resp_decl = declarator(&ex.resp_type, 0, "resp");
+    out.push_str(&format!("            {resp_decl};\n"));
+    out.push_str("            CsilCodecArena *owner = NULL;\n");
+    out.push_str(&format!(
+        "            if (csil_decode_{resp_codec}(in_dg.payload, in_dg.payload_len, &resp, &owner) == 0) {{\n"
+    ));
+    out.push_str("                printf(\"late response\\n\");\n");
+    out.push_str("                csil_codec_arena_free(owner);\n            }\n");
+    out.push_str("            csil_datagram_free(&in_dg);\n        }\n");
+    out.push_str("        csil_free(inb);\n    }\n");
+    out.push_str("    close(fd);\n    return 0;\n}\n");
+    out.push_str("```\n\n");
+    out
+}
+
+/// The CSIL-RPC HTTP carrier — spec-independent, so a constant. It builds the request
+/// envelope with the library's `csil_rpc_request_*`, POSTs it to `{host}:{port}/csil/v1/rpc`
+/// over a raw POSIX socket (libc only), and decodes the library's `csil_rpc_response_*`;
+/// a non-zero transport status (`csil_rpc_response_is_transport_error`) and the typed
+/// `ServiceError` variant each become a non-zero rc.
+const RPC_CARRIER_C: &str = r##"// One example carrier: CSIL-RPC over an HTTP POST. The library owns the envelope
+// (csil_rpc_request / csil_rpc_response); the carrier owns only the transport. The HTTP
+// POST is hand-rolled over POSIX sockets (libc only) — swap it for libcurl or any client.
+// Drop this in a .c file next to the generated headers and the vendored transport lib.
 //
-// Dependency posture (path 1 + libc): the CBOR envelope reuses THIS package's own
-// generated codec primitives (csilc_buf / csilc_w_* / csilc_decode from
-// codec.gen.h), so there is no third-party CBOR dependency; the HTTP POST is
-// hand-rolled over POSIX sockets, so there is no third-party HTTP dependency either.
-// Drop this in a .c file next to the generated headers.
-//
-// The feature-test macro exposes getaddrinfo/socket under a strict `-std=c11`; it
-// must precede the first system header, so it leads the file.
+// The feature-test macro exposes getaddrinfo/socket under a strict `-std=c11`; it must
+// precede the first system header, so it leads the file.
 #define _POSIX_C_SOURCE 200112L
 #include "client.gen.h"
+#include <csil/csil.h> // the csil reference transport library (transports/c)
 
 #include <netdb.h>
 #include <stdio.h>
@@ -2693,36 +3054,31 @@ static int csil_read_all(int fd, uint8_t **out, size_t *out_len) {
     return 0;
 }
 
-// The CsilgenTransport seam: build the CSIL-RPC envelope, POST it, unwrap the reply.
+// The CsilgenTransport seam: build the CSIL-RPC envelope with the library, POST it, and
+// decode the library's response — never hand-rolling the envelope.
 static int csil_rpc_call(void *self, const char *service, const char *op,
                          const uint8_t *req, size_t req_len,
                          uint8_t **resp, size_t *resp_len) {
     CsilRpcCarrier *c = (CsilRpcCarrier *)self;
 
-    // 1. CsilRpcRequest = { v, op, payload: #6.24(bstr), service } via the package's
-    //    own canonical-CBOR writer (keys in length-then-bytewise order).
-    csilc_buf env;
-    csilc_buf_init(&env);
-    int w = csilc_w_map_head(&env, 4)
-            || csilc_w_text(&env, "v", 1) || csilc_w_uint(&env, 1)
-            || csilc_w_text(&env, "op", 2) || csilc_w_text(&env, op, strlen(op))
-            || csilc_w_text(&env, "payload", 7) || csilc_w_tag(&env, 24)
-            || csilc_w_bytes(&env, req, req_len)
-            || csilc_w_text(&env, "service", 7)
-            || csilc_w_text(&env, service, strlen(service));
-    if (w) { csilc_buf_dispose(&env); return -1; }
+    // 1. Encode the request envelope with the library (tag-24 payload, canonical CBOR).
+    csil_rpc_request rq;
+    csil_rpc_request_init(&rq, service, op, req, req_len);
+    uint8_t *env = NULL;
+    size_t env_len = 0;
+    if (csil_rpc_request_encode(&rq, &env, &env_len)) return -1;
 
     // 2. POST it to {host}:{port}/csil/v1/rpc over a raw socket (libc only).
     struct addrinfo hints, *ai;
     memset(&hints, 0, sizeof(hints));
     hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
-    if (getaddrinfo(c->host, c->port, &hints, &ai)) { csilc_buf_dispose(&env); return -1; }
+    if (getaddrinfo(c->host, c->port, &hints, &ai)) { csil_free(env); return -1; }
     int fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
     if (fd < 0 || connect(fd, ai->ai_addr, ai->ai_addrlen)) {
         if (fd >= 0) close(fd);
         freeaddrinfo(ai);
-        csilc_buf_dispose(&env);
+        csil_free(env);
         return -1;
     }
     freeaddrinfo(ai);
@@ -2732,15 +3088,15 @@ static int csil_rpc_call(void *self, const char *service, const char *op,
                       "POST /csil/v1/rpc HTTP/1.1\r\nHost: %s\r\n"
                       "Content-Type: application/cbor\r\nContent-Length: %zu\r\n"
                       "Connection: close\r\n\r\n",
-                      c->host, env.len);
+                      c->host, env_len);
     if (hn < 0 || hn >= (int)sizeof(header)
         || write(fd, header, (size_t)hn) < 0
-        || (env.len && write(fd, env.data, env.len) < 0)) {
+        || (env_len && write(fd, env, env_len) < 0)) {
         close(fd);
-        csilc_buf_dispose(&env);
+        csil_free(env);
         return -1;
     }
-    csilc_buf_dispose(&env);
+    csil_free(env);
 
     uint8_t *raw = NULL;
     size_t raw_len = 0;
@@ -2759,49 +3115,172 @@ static int csil_rpc_call(void *self, const char *service, const char *op,
     }
     if (!body || raw_len < 12 || memcmp(raw + 9, "200", 3) != 0) { free(raw); return -1; }
 
-    // 4. Decode the CsilRpcResponse envelope with the generated reader.
-    CsilCodecArena *a;
-    const csilc_value *root;
-    if (csilc_decode(body, body_len, &a, &root)) { free(raw); return -1; }
+    // 4. Decode the response envelope with the library.
+    csil_rpc_response rsp;
+    if (csil_rpc_response_decode(body, body_len, &rsp)) { free(raw); return -1; }
 
-    int64_t status = 0;
-    const csilc_value *sv = csilc_map_get(root, "status");
-    if (!sv || !csilc_as_i64(sv, &status) || status != 0) {
-        // status != 0 is a transport failure: there is no typed payload to unwrap.
-        csil_codec_arena_free(a);
+    // A non-zero transport status is a transport failure (no typed payload).
+    if (csil_rpc_response_is_transport_error(&rsp)) {
+        csil_rpc_response_free(&rsp);
         free(raw);
         return -1;
     }
-
-    // status == 0 + variant "ServiceError" is a typed application error, distinct
-    // from a transport failure; surface it as a non-zero return.
-    const csilc_value *var = csilc_map_get(root, "variant");
-    if (var && var->kind == CSILC_TEXT
-        && strcmp((const char *)var->as.bytes.ptr, "ServiceError") == 0) {
+    // A typed application error rides as a status-0 "ServiceError" variant — surface it
+    // so the typed client decodes success only.
+    if (rsp.variant && strcmp(rsp.variant, "ServiceError") == 0) {
         fprintf(stderr, "csil-rpc %s/%s: service error\n", service, op);
-        csil_codec_arena_free(a);
+        csil_rpc_response_free(&rsp);
         free(raw);
         return 1;
     }
 
-    // 5. Unwrap the tag-24 inner bytes and hand a malloc'd copy to the generated
-    //    client, which frees it with free().
-    const csilc_value *pl = csilc_map_get(root, "payload");
-    if (!pl || pl->kind != CSILC_TAG || pl->as.tag.num != 24
-        || pl->as.tag.content->kind != CSILC_BYTES) {
-        csil_codec_arena_free(a);
-        free(raw);
-        return -1;
-    }
-    const csilc_value *inner = pl->as.tag.content;
-    *resp = (uint8_t *)malloc(inner->as.bytes.len ? inner->as.bytes.len : 1);
-    if (!*resp) { csil_codec_arena_free(a); free(raw); return -1; }
-    memcpy(*resp, inner->as.bytes.ptr, inner->as.bytes.len);
-    *resp_len = inner->as.bytes.len;
+    // 5. Hand a malloc'd copy of the success payload to the generated client.
+    *resp = (uint8_t *)malloc(rsp.payload_len ? rsp.payload_len : 1);
+    if (!*resp) { csil_rpc_response_free(&rsp); free(raw); return -1; }
+    memcpy(*resp, rsp.payload, rsp.payload_len);
+    *resp_len = rsp.payload_len;
 
-    csil_codec_arena_free(a);
+    csil_rpc_response_free(&rsp);
     free(raw);
     return 0;
+}
+"##;
+
+/// The CSIL-Events TLS carrier prelude — spec-independent. A `csil_stream` over an OpenSSL
+/// `SSL*`; the per-spec session wraps it in the library's `csil_stream_carrier` (length-
+/// prefix framing). Read/write are synchronous so the host owns a simple blocking I/O loop.
+const EVENTS_CARRIER_C: &str = r##"// One example carrier: a TLS byte stream (OpenSSL — link -lssl -lcrypto) the library
+// frames with its 4-byte length prefix via csil_stream_carrier. Swap OpenSSL for any byte
+// stream (a WebSocket, a QUIC stream) by filling in csil_stream.
+#include "server.gen.h" // the generated handlers + channel router surface (--target c-server)
+#include "codec.gen.h"  // the per-type CBOR (de)serializers
+#include <csil/csil.h>  // the csil reference transport library (transports/c)
+
+#include <openssl/ssl.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+// csil_stream read/write over an OpenSSL SSL*; the host owns the I/O loop and threads.
+static long tls_read(void *self, uint8_t *buf, size_t len) {
+    int n = SSL_read((SSL *)self, buf, (int)len);
+    return n > 0 ? (long)n : (n == 0 ? 0 : -1);
+}
+static int tls_write(void *self, const uint8_t *buf, size_t len) {
+    return SSL_write((SSL *)self, buf, (int)len) == (int)len ? 0 : -1;
+}
+"##;
+
+/// The Events session body when the spec declares no `<->` op: the handshake and heartbeat
+/// still apply, so they are shown, with a note where the dispatch would go.
+const EVENTS_NO_CHANNEL_SESSION_C: &str = r##"static int session(SSL *ssl) {
+    csil_stream stream = { .read = tls_read, .write = tls_write, .userdata = ssl };
+    csil_frame_carrier carrier = csil_stream_carrier(&stream, 0);
+
+    // $hello / $hello-ack handshake (control plane).
+    const uint64_t versions[] = { CSIL_VERSION };
+    const char *profiles[] = { "verbose" };
+    csil_hello hello = { .versions = versions, .versions_len = 1,
+                         .profiles = profiles, .profiles_len = 1 };
+    uint8_t *hb = NULL; size_t hbn = 0;
+    if (csil_hello_encode(&hello, &hb, &hbn)
+        || carrier.send_frame(carrier.userdata, hb, hbn)) {
+        csil_free(hb); csil_stream_carrier_dispose(&carrier); return -1;
+    }
+    csil_free(hb);
+
+    uint8_t *ackf = NULL; size_t ackn = 0;
+    if (carrier.recv_frame(carrier.userdata, &ackf, &ackn) || !ackf) {
+        csil_stream_carrier_dispose(&carrier); return -1;
+    }
+    csil_hello_ack ack;
+    csil_profile profile;
+    if (csil_hello_ack_decode(ackf, ackn, &ack)
+        || !csil_profile_parse(ack.profile, &profile)) {
+        csil_hello_ack_free(&ack); csil_free(ackf);
+        csil_stream_carrier_dispose(&carrier); return -1;
+    }
+    csil_hello_ack_free(&ack);
+    csil_free(ackf);
+
+    // Recv loop: answer $ping with $pong. This package declares no <->/<- operations, so
+    // there is no generated channel router to dispatch typed events into.
+    for (;;) {
+        uint8_t *frame = NULL; size_t flen = 0;
+        if (carrier.recv_frame(carrier.userdata, &frame, &flen) || !frame) break;
+        csil_event ev;
+        if (csil_event_decode(frame, flen, profile, &ev)) { csil_free(frame); break; }
+        if (ev.event && strcmp(ev.event, CSIL_PING_NAME) == 0) {
+            csil_heartbeat ping;
+            if (csil_heartbeat_decode(ev.payload, ev.payload_len, &ping) == 0) {
+                csil_heartbeat pong = { .nonce = ping.nonce };
+                uint8_t *pb = NULL; size_t pn = 0;
+                if (csil_heartbeat_encode(&pong, &pb, &pn) == 0) {
+                    csil_event pe;
+                    csil_event_init_verbose(&pe, NULL, CSIL_PONG_NAME, pb, pn);
+                    uint8_t *peb = NULL; size_t pen = 0;
+                    if (csil_event_encode(&pe, profile, &peb, &pen) == 0) {
+                        carrier.send_frame(carrier.userdata, peb, pen);
+                        csil_free(peb);
+                    }
+                    csil_free(pb);
+                }
+                csil_heartbeat_free(&ping);
+            }
+        }
+        csil_event_free(&ev);
+        csil_free(frame);
+    }
+    csil_stream_carrier_dispose(&carrier);
+    return 0;
+}
+"##;
+
+/// The CSIL-Datagrams UDP carrier prelude — spec-independent. A `csil_datagram_carrier`
+/// over a connected POSIX UDP socket; `udp_send` writes one packet and `udp_recv` reads
+/// the next (it never waits for or correlates a reply).
+const DATAGRAMS_CARRIER_C: &str = r##"// One example carrier: UDP via POSIX sockets (libc only). Datagrams are unreliable and
+// unordered, so the carrier never waits for or correlates a reply.
+#define _POSIX_C_SOURCE 200112L
+#include "client.gen.h"
+#include <csil/csil.h> // the csil reference transport library (transports/c)
+
+#include <netdb.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+typedef struct UdpCarrier { int fd; } UdpCarrier;
+
+static csil_err udp_send(void *self, const uint8_t *data, size_t len) {
+    UdpCarrier *u = (UdpCarrier *)self;
+    return send(u->fd, data, len, 0) == (ssize_t)len ? CSIL_OK : CSIL_ERR_CARRIER;
+}
+static csil_err udp_recv(void *self, uint8_t **out, size_t *out_len) {
+    UdpCarrier *u = (UdpCarrier *)self;
+    uint8_t buf[CSIL_MAX_DATAGRAM_DEFAULT];
+    ssize_t n = recv(u->fd, buf, sizeof buf, 0);
+    if (n < 0) return CSIL_ERR_CARRIER;
+    uint8_t *copy = (uint8_t *)malloc((size_t)n ? (size_t)n : 1);
+    if (!copy) return CSIL_ERR_OOM;
+    memcpy(copy, buf, (size_t)n);
+    *out = copy;
+    *out_len = (size_t)n;
+    return CSIL_OK;
+}
+
+static int udp_connect(const char *host, const char *port) {
+    struct addrinfo hints, *ai;
+    memset(&hints, 0, sizeof hints);
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_DGRAM;
+    if (getaddrinfo(host, port, &hints, &ai)) return -1;
+    int fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+    if (fd >= 0 && connect(fd, ai->ai_addr, ai->ai_addrlen)) { close(fd); fd = -1; }
+    freeaddrinfo(ai);
+    return fd;
 }
 "##;
 

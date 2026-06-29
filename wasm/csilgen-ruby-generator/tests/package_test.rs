@@ -51,7 +51,7 @@ fn gemspec_emitted_only_when_emit_packages_includes_ruby() {
     assert!(!plain.iter().any(|f| f.path.ends_with(".gemspec")));
     assert!(plain.iter().any(|f| f.path == "types.rb"));
     // The README rides with the gem packaging, never the flat layout.
-    assert!(!plain.iter().any(|f| f.path == "README.md"));
+    assert!(!plain.iter().any(|f| f.path == "genquickstart.md"));
 
     // emit_packages present but without "ruby": still unchanged.
     let mut other = HashMap::new();
@@ -84,9 +84,9 @@ fn gemspec_emitted_only_when_emit_packages_includes_ruby() {
     // Package mode also ships a root README with the copy-paste Quickstart carrier.
     let readme = pkg
         .iter()
-        .find(|f| f.path == "README.md")
-        .expect("README.md emitted in package mode");
-    assert!(readme.content.contains("class CsilRpcTransport"));
+        .find(|f| f.path == "genquickstart.md")
+        .expect("genquickstart.md emitted in package mode");
+    assert!(readme.content.contains("class HttpRpcTransport"));
     assert!(readme.content.contains("/csil/v1/rpc"));
     let entry = pkg
         .iter()

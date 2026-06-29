@@ -141,25 +141,33 @@ fn process_generation(input: WasmGeneratorInput) -> Result<WasmGeneratorOutput, 
         _ => return Err(error_codes::GENERATION_ERROR),
     };
 
+    // In self-contained package mode the genquickstart demonstrates both the calling
+    // side (CSIL-RPC/Datagrams over the typed client) and the handling side (CSIL-Events
+    // over the channel router), so the package must carry both surfaces for its own
+    // quickstart to compile — regardless of which surface the target requested. Flat
+    // (non-package) output stays byte-identical: it emits only the requested surface.
+    // Mirrors the OCaml generator.
+    let pkg_mode = emit_packages_includes_go(&input.config.options);
+    let want_client =
+        matches!(surface, Surface::Client) || (pkg_mode && !matches!(surface, Surface::TypesOnly));
+    let want_server =
+        matches!(surface, Surface::Server) || (pkg_mode && !matches!(surface, Surface::TypesOnly));
     if input.csil_spec.service_count > 0 {
-        match surface {
-            Surface::Client => {
-                if let Some(client_content) = generate_client(&input, &config, &mut warnings)? {
-                    files.push(GeneratedFile {
-                        path: make_path("client.gen.go"),
-                        content: client_content,
-                    });
-                }
-            }
-            Surface::Server => {
-                if let Some(services_content) = generate_services(&input, &config, &mut warnings)? {
-                    files.push(GeneratedFile {
-                        path: make_path("services.gen.go"),
-                        content: services_content,
-                    });
-                }
-            }
-            Surface::TypesOnly => {}
+        if want_client
+            && let Some(client_content) = generate_client(&input, &config, &mut warnings)?
+        {
+            files.push(GeneratedFile {
+                path: make_path("client.gen.go"),
+                content: client_content,
+            });
+        }
+        if want_server
+            && let Some(services_content) = generate_services(&input, &config, &mut warnings)?
+        {
+            files.push(GeneratedFile {
+                path: make_path("services.gen.go"),
+                content: services_content,
+            });
         }
     }
 
@@ -210,7 +218,7 @@ fn process_generation(input: WasmGeneratorInput) -> Result<WasmGeneratorOutput, 
         // so a missing or non-bool value (and `true`) keeps the default-on behavior.
         if wants_readme(&input.config.options) {
             files.push(GeneratedFile {
-                path: "README.md".to_string(),
+                path: "genquickstart.md".to_string(),
                 content: package_readme(&input, &module_path, &config),
             });
         }
@@ -259,7 +267,7 @@ fn emit_packages_includes_go(options: &HashMap<String, serde_json::Value>) -> bo
         })
 }
 
-/// Whether to emit the package `README.md`. Default true; only an explicit
+/// Whether to emit the package `genquickstart.md`. Default true; only an explicit
 /// `emit_readme: false` suppresses it, so a missing or non-bool value (and `true`)
 /// leaves the README in place.
 fn wants_readme(options: &HashMap<String, serde_json::Value>) -> bool {
@@ -338,14 +346,47 @@ fn resolve_package_version(options: &HashMap<String, serde_json::Value>) -> Stri
         .to_string()
 }
 
-/// README for the emitted module: the import path a consumer uses (the module path,
-/// plus the output subdir when the package is nested under one), the version, and a
-/// copy-paste **Quickstart**. For a client package the Quickstart is a complete,
-/// dependency-free CSIL-RPC carrier (it hand-rolls the fixed envelope with only the
-/// standard library — see `CARRIER_GO` and the hybrid-posture note there), the typed
-/// client constructed over it, and one example call: the user changes only the
-/// base-URL string. A serviceless / server / types-only package gets the
-/// import-the-package section without a carrier.
+/// The Go import path and package name of the official transport library. It is not
+/// yet published, so a consumer vendors it or adds a `replace` directive; the
+/// genquickstart spells that out in its Install section.
+const GO_TRANSPORT_MODULE: &str = "github.com/catalystcommunity/csilgen/transports/go";
+
+/// Which transport sections a consumer wants in `genquickstart.md`. The
+/// `genquickstart_transports` option is a JSON array subset of
+/// `["rpc","events","datagrams"]`; unknown entries are ignored, and an absent or empty
+/// value (or one that names none of the three) means "all three". Mirrors the
+/// TypeScript reference so the CLI's `--readme-csil-*` flags drive every generator the
+/// same way.
+fn wanted_transports(options: &HashMap<String, serde_json::Value>) -> (bool, bool, bool) {
+    let listed = match options.get("genquickstart_transports") {
+        Some(serde_json::Value::Array(items)) => {
+            let names: std::collections::BTreeSet<&str> =
+                items.iter().filter_map(|v| v.as_str()).collect();
+            let any_known = ["rpc", "events", "datagrams"]
+                .iter()
+                .any(|t| names.contains(t));
+            if any_known {
+                Some((
+                    names.contains("rpc"),
+                    names.contains("events"),
+                    names.contains("datagrams"),
+                ))
+            } else {
+                None
+            }
+        }
+        _ => None,
+    };
+    listed.unwrap_or((true, true, true))
+}
+
+/// README for the emitted module: a transport-by-transport **Quickstart** built on the
+/// official `transports/go` library. The generated codec owns CBOR (de)serialization
+/// of your types and the library owns the envelope, framing, and connection lifecycle;
+/// you supply only a *carrier* that moves bytes, so the same typed surface rides HTTP,
+/// TLS, a WebSocket, QUIC, or raw UDP unchanged. Each requested section (CSIL-RPC over
+/// HTTP, CSIL-Events over TLS, CSIL-Datagrams over UDP) is a complete, copy-paste
+/// program built on the library.
 fn package_readme(input: &WasmGeneratorInput, module_path: &str, config: &GoConfig) -> String {
     let version = resolve_package_version(&input.config.options);
     let import_path = if config.output_subdir.is_empty() {
@@ -357,44 +398,65 @@ fn package_readme(input: &WasmGeneratorInput, module_path: &str, config: &GoConf
         "# {module_path}\n\n\
          Version {version}\n\n\
          Code generated by csilgen; DO NOT EDIT.\n\n\
-         A typed, transport-agnostic CSIL-RPC client: the generated codec owns CBOR\n\
-         (de)serialization; you supply a *carrier* that only moves bytes.\n\n\
-         This directory is a self-contained, dependency-free Go module. Publish it to a\n\
-         git repository, then depend on it from a consumer module:\n\n\
+         A typed CSIL client: the generated codec owns CBOR (de)serialization and the\n\
+         [`transports/go`]({GO_TRANSPORT_MODULE}) library owns the envelope, framing,\n\
+         and connection lifecycle. You supply only a *carrier* that moves bytes, so the\n\
+         same typed surface rides HTTP, TLS, a WebSocket, QUIC, or raw UDP unchanged.\n\n\
+         ## Install\n\n\
          ```sh\n\
          go get {import_path}\n\
-         ```\n\n"
+         go get {GO_TRANSPORT_MODULE}\n\
+         ```\n\n\
+         The CSIL transport library is not yet published; until it is, vendor it or add\n\
+         a `replace` directive in your `go.mod` pointing at a local checkout.\n\n"
     );
 
-    // The client surface (and so a meaningful carrier Quickstart) only exists for the
-    // `go-client` target; the server / types-only surfaces get the plain import.
-    let example = if input.config.target == "go-client" {
-        first_unary_go_example(input, config)
-    } else {
-        None
-    };
-    match example {
-        Some(ex) => out.push_str(&go_quickstart(&import_path, &ex)),
-        None => out.push_str(&format!(
-            "## Quickstart\n\n\
-             Import the generated package and use its types and `Encode`/`Decode` codec\n\
-             directly:\n\n\
-             ```go\n\
-             import api \"{import_path}\"\n\
-             ```\n"
-        )),
+    let (rpc, events, datagrams) = wanted_transports(&input.config.options);
+    // `package_readme` only renders in package mode, where the client surface is always
+    // emitted (every target carries both surfaces, mirroring OCaml), so the typed RPC
+    // example is meaningful regardless of which target was requested.
+    let unary = first_unary_go_example(input, config);
+    let channel = first_channel_go_example(input, config);
+    if rpc {
+        out.push_str(&go_rpc_section(&import_path, unary.as_ref()));
+    }
+    if events {
+        out.push_str(&go_events_section(&import_path, channel.as_ref()));
+    }
+    if datagrams {
+        out.push_str(&go_datagrams_section(&import_path, unary.as_ref()));
     }
     out
 }
 
-/// The pieces the Quickstart's example call needs: the typed client constructor
-/// suffix (`EchoClient` -> `api.NewEchoClient`), the method, and a compiling sample
-/// request literal (empty when the op takes no request).
+/// The pieces a unary (`->`) example call needs: the typed client constructor suffix
+/// (`EchoClient` -> `api.NewEchoClient`), the method, a compiling sample request
+/// literal (empty when the op takes no request), the request/response record type names
+/// (so the datagram section can name `api.Encode<Req>`/`api.Decode<Res>`), and the op's
+/// datagram ordinal.
 struct GoExample {
     ctor: String,
     method: String,
     has_request: bool,
     sample: String,
+    req_type: Option<String>,
+    res_type: Option<String>,
+    op_ord: u64,
+}
+
+/// The pieces the Events session needs to dispatch through the generated channel
+/// router (`Route<Service>Channel`) and outbound encoder (`Encode<Service><Op>`):
+/// the service interface name (which also prefixes the router/encoder), the wire
+/// service name, the channel method name, the inbound record the router decodes and
+/// hands to a handler (the op's input), the outbound record the encoder serializes
+/// (the op's success output), and a compiling sample literal for the outbound record.
+struct GoChannelExample {
+    service_iface: String,
+    wire_service: String,
+    method: String,
+    inbound_type: String,
+    outbound_type: String,
+    outbound_sample: String,
 }
 
 /// The first service (in declaration order) with a unidirectional op the typed client
@@ -428,35 +490,89 @@ fn first_unary_go_example(input: &WasmGeneratorInput, config: &GoConfig) -> Opti
                 } else {
                     go_request_sample(input, &op.input_type, &records, config)
                 },
+                req_type: (!null_input).then(|| type_ref_name(&op.input_type)),
+                res_type: Some(type_ref_name(&success)),
+                // The datagram ordinal is the op's @wire-id when present; otherwise a
+                // channel-agreed placeholder the user fills in.
+                op_ord: op.wire_id.unwrap_or(1),
             });
         }
     }
     None
 }
 
-/// Assemble the Quickstart section: the carrier, the typed client over it, and the
-/// example call. The carrier is the same for every spec, so the per-spec parts are
-/// only the import path, the client constructor, the method, and the sample literal.
-fn go_quickstart(import_path: &str, ex: &GoExample) -> String {
-    let mut out = String::from("## Quickstart\n\n");
+/// The first service (in declaration order) with a `<->` op whose inbound and outbound
+/// are both records, so the generated per-type codec helpers exist for a compiling
+/// Events session. `None` when no service has a usable channel op — the Events section
+/// then shows the handshake/heartbeat without typed dispatch.
+fn first_channel_go_example(
+    input: &WasmGeneratorInput,
+    config: &GoConfig,
+) -> Option<GoChannelExample> {
+    let records = record_names(input);
+    for rule in &input.csil_spec.rules {
+        let CsilRuleType::ServiceDef(service) = &rule.rule_type else {
+            continue;
+        };
+        for op in &service.operations {
+            if !matches!(op.direction, CsilServiceDirection::Bidirectional) {
+                continue;
+            }
+            let success = go_success_type(&op.output_type);
+            if !is_record_ref(&success, &records) || !is_record_ref(&op.input_type, &records) {
+                continue;
+            }
+            // The Events session dispatches through the generated server-side channel
+            // router + encoder: the router decodes the op's input (inbound, handed to a
+            // handler) and the encoder serializes the op's success output (outbound).
+            return Some(GoChannelExample {
+                service_iface: rule.name.clone(),
+                wire_service: go_service_base(&rule.name).to_lowercase(),
+                method: go_method_name(&op.name),
+                inbound_type: type_ref_name(&op.input_type),
+                outbound_type: type_ref_name(&success),
+                outbound_sample: go_request_sample(input, &success, &records, config),
+            });
+        }
+    }
+    None
+}
+
+/// CSIL-RPC over HTTP: a carrier implementing the generated `Transport` seam that
+/// builds the request with the library's `RpcRequest` and parses the reply with
+/// `RpcResponse` (never hand-rolled), POSTing to `{baseURL}/csil/v1/rpc`. The typed
+/// client decodes the success payload; a non-zero transport status and the
+/// `ServiceError` arm are surfaced distinctly. Rendered only when the package emits a
+/// typed client (the `go-client` target); otherwise a short note points there.
+fn go_rpc_section(import_path: &str, ex: Option<&GoExample>) -> String {
+    let mut out = String::from("## CSIL-RPC (HTTP)\n\n");
     out.push_str(
-        "A complete CSIL-RPC carrier plus the typed client. No third-party dependency —\n\
-         the carrier hand-rolls the tiny fixed envelope using only the standard library\n\
-         (the generated codec's generic CBOR helpers are unexported, so a consumer\n\
-         package cannot reuse them). Change the one base-URL string.\n\n",
+        "Request/response. The library owns the envelope (`RpcRequest`/`RpcResponse`);\n\
+         you bring a carrier that moves bytes. The HTTP carrier below is just one\n\
+         example — swap `net/http` for any client (it satisfies the generated `Transport`\n\
+         seam structurally).\n\n",
     );
+    let Some(ex) = ex else {
+        out.push_str(
+            "This package emits no typed RPC client (generate the `go-client` target for\n\
+             one), so there is no CSIL-RPC call to make here.\n\n",
+        );
+        return out;
+    };
     out.push_str("```go\n");
     out.push_str("package main\n\n");
     out.push_str("import (\n");
     out.push_str(
         "\t\"bytes\"\n\t\"context\"\n\t\"fmt\"\n\t\"io\"\n\t\"net/http\"\n\t\"strings\"\n\n",
     );
-    out.push_str(&format!("\tapi \"{import_path}\"\n)\n\n"));
-    out.push_str(CARRIER_GO);
+    out.push_str(&format!(
+        "\ttransport \"{GO_TRANSPORT_MODULE}\"\n\tapi \"{import_path}\"\n)\n\n"
+    ));
+    out.push_str(RPC_CARRIER_GO);
     out.push('\n');
     out.push_str("func main() {\n");
     out.push_str(&format!(
-        "\tclient := api.New{}(&CsilRpcTransport{{BaseURL: \"http://localhost:5080\"}})\n",
+        "\tclient := api.New{}(&HTTPRpcCarrier{{BaseURL: \"http://localhost:5080\"}})\n",
         ex.ctor
     ));
     if ex.has_request {
@@ -472,7 +588,319 @@ fn go_quickstart(import_path: &str, ex: &GoExample) -> String {
     }
     out.push_str("\tif err != nil {\n\t\tpanic(err)\n\t}\n");
     out.push_str("\tfmt.Printf(\"%+v\\n\", resp)\n");
-    out.push_str("}\n```\n");
+    out.push_str("}\n```\n\n");
+    out
+}
+
+/// CSIL-Events over TLS: a full session example. Opens a TLS byte stream wrapped as the
+/// library's `StreamCarrier` (CSIL length-prefix framing), performs the
+/// `$hello`/`$hello-ack` handshake, sends one outbound event whose payload the generated
+/// codec encodes, and runs a recv loop that decodes each frame to an `Event`, answers
+/// `$ping` with `$pong`, and decodes typed channel events with the generated codec. When
+/// the spec has no usable channel op the typed dispatch is replaced with a note (the
+/// handshake + heartbeat still apply to any connection).
+fn go_events_section(import_path: &str, ch: Option<&GoChannelExample>) -> String {
+    let mut out = String::from("## CSIL-Events (TLS)\n\n");
+    out.push_str(
+        "Typed, bidirectional event streams over a long-lived connection. The library\n\
+         owns the `$hello`/`$hello-ack` handshake, the `$ping`/`$pong` heartbeat, and\n\
+         framing; the generated channel router dispatches typed events. The TLS carrier\n\
+         below is just one example — a WebSocket/WebTransport/QUIC carrier drops in\n\
+         unchanged.\n\n",
+    );
+    out.push_str("```go\n");
+    out.push_str("package main\n\n");
+    out.push_str("import (\n");
+    match ch {
+        // The router dispatch needs a context, the codec adapter and handler need fmt.
+        Some(_) => out.push_str("\t\"context\"\n\t\"crypto/tls\"\n\t\"fmt\"\n\n"),
+        None => out.push_str("\t\"crypto/tls\"\n\t\"fmt\"\n\n"),
+    }
+    match ch {
+        Some(_) => out.push_str(&format!(
+            "\ttransport \"{GO_TRANSPORT_MODULE}\"\n\tapi \"{import_path}\"\n)\n\n"
+        )),
+        None => out.push_str(&format!("\ttransport \"{GO_TRANSPORT_MODULE}\"\n)\n\n")),
+    }
+    out.push_str(EVENTS_CARRIER_GO);
+    out.push('\n');
+    match ch {
+        Some(ch) => {
+            out.push_str(&go_channel_codec_and_handler(ch));
+            out.push('\n');
+            out.push_str(&go_events_session(ch));
+        }
+        None => out.push_str(EVENTS_NO_CHANNEL_SESSION_GO),
+    }
+    out.push_str("```\n\n");
+    out
+}
+
+/// The codec adapter and handler the Events session feeds to the generated router.
+/// The adapter bridges the router's byte-oriented `Codec` seam to the generated
+/// per-type codec (decoding the inbound record, encoding the outbound record); the
+/// handler implements the generated service interface — only the channel method is
+/// exercised here, so the request/response methods ride the embedded interface.
+fn go_channel_codec_and_handler(ch: &GoChannelExample) -> String {
+    format!(
+        r#"// channelCodec adapts the generated per-type codec to the router's Codec seam:
+// Decode produces the inbound {inbound} the router hands to a handler; Encode
+// serializes the outbound {outbound} the generated encoder pushes.
+type channelCodec struct{{}}
+
+func (channelCodec) Encode(value any) ([]byte, error) {{
+	switch v := value.(type) {{
+	case api.{outbound}:
+		return api.Encode{outbound}(v), nil
+	default:
+		return nil, fmt.Errorf("unsupported channel type %T", value)
+	}}
+}}
+
+func (channelCodec) Decode(data []byte, out any) error {{
+	switch o := out.(type) {{
+	case *api.{inbound}:
+		decoded, err := api.Decode{inbound}(data)
+		if err != nil {{
+			return err
+		}}
+		*o = decoded
+		return nil
+	default:
+		return fmt.Errorf("unsupported channel type %T", out)
+	}}
+}}
+
+// eventHandlers implements the generated {service} interface. Only the channel method
+// {method} is exercised on the events path; the request/response methods ride the
+// embedded interface and are never called here.
+type eventHandlers struct {{
+	api.{service}
+}}
+
+func (eventHandlers) {method}(ctx context.Context, msg api.{inbound}) error {{
+	fmt.Printf("channel event {method}: %+v\n", msg)
+	return nil
+}}
+"#,
+        inbound = ch.inbound_type,
+        outbound = ch.outbound_type,
+        service = ch.service_iface,
+        method = ch.method,
+    )
+}
+
+/// The channel session body for an Events connection that has a `<->` op: handshake,
+/// one outbound event built by the generated encoder, and the recv loop that heartbeats
+/// and dispatches inbound typed events into the generated channel router.
+fn go_events_session(ch: &GoChannelExample) -> String {
+    format!(
+        r#"func session(carrier transport.FrameCarrier) error {{
+	service := "{wire_service}"
+	ctx := context.Background()
+	codec := channelCodec{{}}
+	handlers := eventHandlers{{}}
+
+	// $hello / $hello-ack handshake (control plane). The peer's $hello-ack pins the
+	// wire profile for the connection's lifetime.
+	helloMsg := transport.Hello{{
+		Versions: []uint64{{transport.VERSION}},
+		Profiles: []string{{transport.ProfileVerbose.String()}},
+		Service:  &service,
+	}}
+	hello, err := helloMsg.Encode()
+	if err != nil {{
+		return err
+	}}
+	if err := carrier.SendFrame(hello); err != nil {{
+		return err
+	}}
+	ackFrame, err := carrier.RecvFrame()
+	if err != nil {{
+		return err
+	}}
+	if ackFrame == nil {{
+		return fmt.Errorf("connection closed during handshake")
+	}}
+	ack, err := transport.DecodeHelloAck(ackFrame)
+	if err != nil {{
+		return err
+	}}
+	profile, ok := transport.ParseProfile(ack.Profile)
+	if !ok {{
+		return fmt.Errorf("unsupported profile %q", ack.Profile)
+	}}
+
+	// Send one outbound event: the generated encoder serializes the typed payload, the
+	// library frames it as a verbose Event.
+	method, payload, err := api.Encode{service}{method}(codec, {outbound_sample})
+	if err != nil {{
+		return err
+	}}
+	out, err := transport.NewVerboseEvent(&service, method, payload).Encode(profile)
+	if err != nil {{
+		return err
+	}}
+	if err := carrier.SendFrame(out); err != nil {{
+		return err
+	}}
+
+	// Recv loop: decode each frame to an Event, answer $ping with $pong (the library
+	// heartbeat), and dispatch typed channel events into the generated router.
+	for {{
+		frame, err := carrier.RecvFrame()
+		if err != nil {{
+			return err
+		}}
+		if frame == nil {{
+			return nil // clean end of stream
+		}}
+		ev, err := transport.DecodeEvent(frame, profile)
+		if err != nil {{
+			return err
+		}}
+		if ev.Event != nil && *ev.Event == transport.PingName {{
+			ping, err := transport.DecodeHeartbeat(ev.Payload)
+			if err != nil {{
+				return err
+			}}
+			pongMsg := transport.Heartbeat{{Nonce: ping.Nonce}}
+			pongPayload, err := pongMsg.Encode()
+			if err != nil {{
+				return err
+			}}
+			pong, err := transport.NewVerboseEvent(&service, transport.PongName, pongPayload).Encode(profile)
+			if err != nil {{
+				return err
+			}}
+			if err := carrier.SendFrame(pong); err != nil {{
+				return err
+			}}
+			continue
+		}}
+		if ev.Event != nil {{
+			if err := api.Route{service}Channel(handlers, ctx, codec, *ev.Event, ev.Payload); err != nil {{
+				return err
+			}}
+		}}
+	}}
+}}
+
+func main() {{
+	carrier, err := openTLSCarrier("localhost:7443")
+	if err != nil {{
+		panic(err)
+	}}
+	if err := session(carrier); err != nil {{
+		panic(err)
+	}}
+}}
+"#,
+        wire_service = ch.wire_service,
+        service = ch.service_iface,
+        method = ch.method,
+        outbound_sample = ch.outbound_sample,
+    )
+}
+
+/// CSIL-Datagrams over UDP: encode a `->` request with the generated codec, wrap it in
+/// the library's `Datagram`, and `SendDatagram` it fire-and-forget. The recv path
+/// `DecodeDatagram`s an inbound datagram and decodes its payload with the generated
+/// codec into the response type — there is NO synchronous response. The body lives in a
+/// `runDatagrams(carrier)` helper so a test can drive it over a loopback carrier.
+fn go_datagrams_section(import_path: &str, ex: Option<&GoExample>) -> String {
+    let mut out = String::from("## CSIL-Datagrams (UDP)\n\n");
+    out.push_str(
+        "Unreliable, unordered, message-oriented. The library owns the `Datagram`\n\
+         envelope; you bring a datagram carrier. The UDP carrier below is one example —\n\
+         a WebRTC unreliable channel or QUIC datagrams drop in unchanged.\n\n",
+    );
+    let Some(ex) = ex else {
+        out.push_str(
+            "This package declares no record `->` operations, so there is no datagram\n\
+             payload to encode.\n\n",
+        );
+        return out;
+    };
+    let (Some(req_type), Some(res_type)) = (&ex.req_type, &ex.res_type) else {
+        out.push_str(
+            "This package's `->` operations have null or non-record payloads;\n\
+             (de)serialize them manually before framing.\n\n",
+        );
+        return out;
+    };
+    out.push_str("```go\n");
+    out.push_str("package main\n\n");
+    out.push_str("import (\n\t\"fmt\"\n\t\"net\"\n\n");
+    out.push_str(&format!(
+        "\ttransport \"{GO_TRANSPORT_MODULE}\"\n\tapi \"{import_path}\"\n)\n\n"
+    ));
+    out.push_str(&format!(
+        r#"// opOrd is the operation's datagram ordinal — its @wire-id, or a channel-agreed number.
+const opOrd = {op_ord}
+
+// openUDPCarrier dials a UDP socket and wraps it as the library's DatagramCarrier.
+func openUDPCarrier(addr string) (transport.DatagramCarrier, error) {{
+	udpAddr, err := net.ResolveUDPAddr("udp", addr)
+	if err != nil {{
+		return nil, err
+	}}
+	conn, err := net.DialUDP("udp", nil, udpAddr)
+	if err != nil {{
+		return nil, err
+	}}
+	return transport.NewUDPDatagramCarrier(conn), nil
+}}
+
+// runDatagrams sends one `->` request as a Datagram fire-and-forget, then tries to
+// decode a late inbound response. There is NO synchronous response: a datagram of the
+// response type MAY arrive later — or never — so the caller must tolerate loss and
+// reordering.
+func runDatagrams(carrier transport.DatagramCarrier) error {{
+	req := {req_sample}
+	// seq 0 marks an unsequenced datagram.
+	datagram, err := transport.NewDatagram(opOrd, 0, api.Encode{req_type}(req)).Encode()
+	if err != nil {{
+		return err
+	}}
+	if err := carrier.SendDatagram(datagram); err != nil {{
+		return err
+	}}
+
+	inbound, err := carrier.RecvDatagram()
+	if err != nil {{
+		return err
+	}}
+	if inbound != nil {{
+		dg, err := transport.DecodeDatagram(inbound)
+		if err != nil {{
+			return err
+		}}
+		resp, err := api.Decode{res_type}(dg.Payload)
+		if err != nil {{
+			return err
+		}}
+		fmt.Printf("late response: %+v\n", resp)
+	}}
+	return nil
+}}
+
+func main() {{
+	carrier, err := openUDPCarrier("localhost:9000")
+	if err != nil {{
+		panic(err)
+	}}
+	if err := runDatagrams(carrier); err != nil {{
+		panic(err)
+	}}
+}}
+"#,
+        op_ord = ex.op_ord,
+        req_sample = ex.sample,
+        req_type = req_type,
+        res_type = res_type,
+    ));
+    out.push_str("```\n\n");
     out
 }
 
@@ -564,32 +992,27 @@ fn find_record<'a>(input: &'a WasmGeneratorInput, name: &str) -> Option<&'a Csil
         })
 }
 
-/// The CSIL-RPC carrier the Quickstart embeds — identical for every spec, so it is a
-/// constant. PATH 2 of the hybrid dependency posture: the generated codec's generic
-/// CBOR helpers (`cborEncode`, `cborValue`, …) are unexported, so a consumer package
-/// cannot reach them; this carrier instead hand-rolls the tiny fixed CSIL-RPC envelope
-/// (a 4-entry request map + a tag-24 payload, and a small reader for the 2–3 response
-/// keys it cares about) using only the standard library — no third-party CBOR
-/// dependency. It satisfies the generated `Transport` interface structurally.
-const CARRIER_GO: &str = r#"// CsilRpcTransport implements the generated Transport interface (same Call
-// signature, satisfied structurally). PATH 2 of the hybrid dependency posture: the
-// generated codec's generic CBOR helpers are unexported, so a consumer package
-// cannot reuse them; this carrier therefore hand-rolls the tiny fixed CSIL-RPC
-// envelope using only the standard library — no third-party CBOR dependency. It
-// owns only the envelope + HTTP, never your application types.
-type CsilRpcTransport struct {
+/// The CSIL-RPC HTTP carrier the Quickstart embeds — spec-independent, so a constant.
+/// It builds the request envelope with the library's `RpcRequest`, POSTs it to
+/// `{baseURL}/csil/v1/rpc`, and parses the reply with `RpcResponse`. `AsTransportError`
+/// surfaces a non-zero transport status; the typed `ServiceError` arm (a status-0
+/// variant) is surfaced separately so the typed client decodes success only. It
+/// satisfies the generated `Transport` interface structurally.
+const RPC_CARRIER_GO: &str = r#"// One example carrier: CSIL-RPC over an HTTP POST. The library owns the envelope
+// (RpcRequest/RpcResponse); the carrier owns only the transport. It satisfies the
+// generated Transport interface structurally — swap net/http for any HTTP client.
+type HTTPRpcCarrier struct {
 	BaseURL string
 	HTTP    *http.Client // optional; defaults to http.DefaultClient
 }
 
-const csilTag24 = 24 // RFC 8949 §3.4.5.1 — embedded encoded CBOR data item
-
-// Call wraps the already-encoded request bytes in a CsilRpcRequest, POSTs it to
-// {BaseURL}/csil/v1/rpc, and returns the response payload bytes for the generated
-// client to decode. A non-zero transport status or a "ServiceError" arm is an error.
-func (t *CsilRpcTransport) Call(ctx context.Context, service, op string, req []byte) ([]byte, error) {
+func (t *HTTPRpcCarrier) Call(ctx context.Context, service, op string, req []byte) ([]byte, error) {
+	envelope, err := transport.NewRpcRequest(service, op, req).Encode()
+	if err != nil {
+		return nil, err
+	}
 	url := strings.TrimRight(t.BaseURL, "/") + "/csil/v1/rpc"
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(csilEncodeEnvelope(service, op, req)))
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(envelope))
 	if err != nil {
 		return nil, err
 	}
@@ -599,189 +1022,124 @@ func (t *CsilRpcTransport) Call(ctx context.Context, service, op string, req []b
 	if client == nil {
 		client = http.DefaultClient
 	}
-	resp, err := client.Do(httpReq)
+	httpResp, err := client.Do(httpReq)
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
-	body, err := io.ReadAll(resp.Body)
+	defer httpResp.Body.Close()
+	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
+		return nil, fmt.Errorf("csil-rpc %s/%s: http %d", service, op, httpResp.StatusCode)
+	}
+	body, err := io.ReadAll(httpResp.Body)
 	if err != nil {
 		return nil, err
 	}
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("csil-rpc %s/%s: http %d", service, op, resp.StatusCode)
+	resp, err := transport.DecodeRpcResponse(body)
+	if err != nil {
+		return nil, err
 	}
-	return csilUnwrapResponse(body)
+	// AsTransportError returns a StatusError for any non-zero transport status.
+	if err := resp.AsTransportError(); err != nil {
+		return nil, err
+	}
+	// A typed application error rides as a status-0 "ServiceError" variant — distinct
+	// from a transport failure. Surface it so the typed client decodes success only.
+	if resp.Variant != nil && *resp.Variant == "ServiceError" {
+		return nil, fmt.Errorf("csil-rpc %s/%s: ServiceError", service, op)
+	}
+	return resp.Payload, nil
 }
+"#;
 
-// csilEncodeEnvelope builds CsilRpcRequest = { v: 1, op, payload: #6.24(bstr),
-// service } directly as canonical CBOR (keys in length-then-bytewise order).
-func csilEncodeEnvelope(service, op string, payload []byte) []byte {
-	var out []byte
-	out = append(out, cborHead(5, 4)...) // map, 4 pairs
-	out = append(out, cborText("v")...)
-	out = append(out, cborHead(0, 1)...) // uint 1
-	out = append(out, cborText("op")...)
-	out = append(out, cborText(op)...)
-	out = append(out, cborText("payload")...)
-	out = append(out, cborHead(6, csilTag24)...) // tag 24, wrapping ...
-	out = append(out, cborBytes(payload)...)     // ... the encoded request bytes
-	out = append(out, cborText("service")...)
-	out = append(out, cborText(service)...)
-	return out
-}
-
-// csilUnwrapResponse reads CsilRpcResponse = { v, status, ? variant, ? error,
-// payload: #6.24(bstr) }: a non-zero status is a transport failure, a "ServiceError"
-// variant is a typed application error, and otherwise the tag-24 inner bytes are
-// handed back to the generated client to decode.
-func csilUnwrapResponse(body []byte) ([]byte, error) {
-	pos := 0
-	v, err := cborRead(body, &pos)
+/// The TLS `StreamCarrier` opener — spec-independent. It dials a TLS byte stream and
+/// wraps it in the library's `StreamCarrier`, whose 4-byte length-prefix framing keeps
+/// the session logic transport-agnostic.
+const EVENTS_CARRIER_GO: &str = r#"// One example carrier: a TLS byte stream framed with CSIL's 4-byte length prefix
+// via the library's StreamCarrier. Swap tls.Dial for a WebSocket/QUIC stream.
+func openTLSCarrier(addr string) (transport.FrameCarrier, error) {
+	conn, err := tls.Dial("tcp", addr, &tls.Config{})
 	if err != nil {
 		return nil, err
 	}
-	m, ok := v.(map[string]interface{})
+	return transport.NewStreamCarrier(conn), nil
+}
+"#;
+
+/// The Events session body when the spec declares no usable channel op: the handshake
+/// and heartbeat still apply, so they are shown, with a note where typed dispatch would
+/// go. Spec-independent, so a constant.
+const EVENTS_NO_CHANNEL_SESSION_GO: &str = r#"func session(carrier transport.FrameCarrier) error {
+	// $hello / $hello-ack handshake (control plane).
+	helloMsg := transport.Hello{
+		Versions: []uint64{transport.VERSION},
+		Profiles: []string{transport.ProfileVerbose.String()},
+	}
+	hello, err := helloMsg.Encode()
+	if err != nil {
+		return err
+	}
+	if err := carrier.SendFrame(hello); err != nil {
+		return err
+	}
+	ackFrame, err := carrier.RecvFrame()
+	if err != nil {
+		return err
+	}
+	if ackFrame == nil {
+		return fmt.Errorf("connection closed during handshake")
+	}
+	ack, err := transport.DecodeHelloAck(ackFrame)
+	if err != nil {
+		return err
+	}
+	profile, ok := transport.ParseProfile(ack.Profile)
 	if !ok {
-		return nil, fmt.Errorf("csil-rpc: response is not a map")
+		return fmt.Errorf("unsupported profile %q", ack.Profile)
 	}
-	if status, _ := asI64(m["status"]); status != 0 {
-		msg, _ := m["error"].(string)
-		return nil, fmt.Errorf("csil-rpc: transport status %d: %s", status, msg)
-	}
-	pl, ok := m["payload"].(cborTagged)
-	if !ok || pl.num != csilTag24 {
-		return nil, fmt.Errorf("csil-rpc: response payload is not a tag-24 byte string")
-	}
-	inner, ok := pl.inner.([]byte)
-	if !ok {
-		return nil, fmt.Errorf("csil-rpc: tag-24 content is not a byte string")
-	}
-	if variant, _ := m["variant"].(string); variant == "ServiceError" {
-		ep := 0
-		ev, _ := cborRead(inner, &ep)
-		em, _ := ev.(map[string]interface{})
-		code, _ := asI64(em["code"])
-		emsg, _ := em["message"].(string)
-		return nil, fmt.Errorf("csil-rpc: service error %d: %s", code, emsg)
-	}
-	return inner, nil
-}
 
-// --- the tiny hand-rolled CBOR the fixed envelope needs (dep-free, stdlib only) ---
-
-type cborTagged struct {
-	num   uint64
-	inner interface{}
-}
-
-func cborHead(major byte, n uint64) []byte {
-	mt := major << 5
-	switch {
-	case n < 24:
-		return []byte{mt | byte(n)}
-	case n < 0x100:
-		return []byte{mt | 24, byte(n)}
-	case n < 0x10000:
-		return []byte{mt | 25, byte(n >> 8), byte(n)}
-	case n < 0x100000000:
-		return []byte{mt | 26, byte(n >> 24), byte(n >> 16), byte(n >> 8), byte(n)}
-	default:
-		return []byte{mt | 27, byte(n >> 56), byte(n >> 48), byte(n >> 40), byte(n >> 32), byte(n >> 24), byte(n >> 16), byte(n >> 8), byte(n)}
+	// Recv loop: answer $ping with $pong. This package declares no <->/<- operations,
+	// so there is no typed channel event to decode with the generated codec.
+	for {
+		frame, err := carrier.RecvFrame()
+		if err != nil {
+			return err
+		}
+		if frame == nil {
+			return nil // clean end of stream
+		}
+		ev, err := transport.DecodeEvent(frame, profile)
+		if err != nil {
+			return err
+		}
+		if ev.Event != nil && *ev.Event == transport.PingName {
+			ping, err := transport.DecodeHeartbeat(ev.Payload)
+			if err != nil {
+				return err
+			}
+			pongMsg := transport.Heartbeat{Nonce: ping.Nonce}
+			pongPayload, err := pongMsg.Encode()
+			if err != nil {
+				return err
+			}
+			pong, err := transport.NewVerboseEvent(nil, transport.PongName, pongPayload).Encode(profile)
+			if err != nil {
+				return err
+			}
+			if err := carrier.SendFrame(pong); err != nil {
+				return err
+			}
+		}
 	}
 }
 
-func cborText(s string) []byte  { return append(cborHead(3, uint64(len(s))), s...) }
-func cborBytes(b []byte) []byte { return append(cborHead(2, uint64(len(b))), b...) }
-
-func asI64(v interface{}) (int64, bool) {
-	switch n := v.(type) {
-	case uint64:
-		return int64(n), true
-	case int64:
-		return n, true
-	}
-	return 0, false
-}
-
-// cborRead parses one CBOR item — enough of RFC 8949 for the response envelope.
-func cborRead(b []byte, pos *int) (interface{}, error) {
-	if *pos >= len(b) {
-		return nil, fmt.Errorf("csil-rpc: truncated cbor")
-	}
-	ib := b[*pos]
-	*pos++
-	major, low := ib>>5, ib&0x1f
-	arg, err := cborArg(b, pos, low)
+func main() {
+	carrier, err := openTLSCarrier("localhost:7443")
 	if err != nil {
-		return nil, err
+		panic(err)
 	}
-	switch major {
-	case 0:
-		return arg, nil
-	case 1:
-		return int64(-1) - int64(arg), nil
-	case 2, 3:
-		end := *pos + int(arg)
-		if end > len(b) {
-			return nil, fmt.Errorf("csil-rpc: truncated string")
-		}
-		seg := b[*pos:end]
-		*pos = end
-		if major == 3 {
-			return string(seg), nil
-		}
-		out := make([]byte, len(seg))
-		copy(out, seg)
-		return out, nil
-	case 4:
-		arr := make([]interface{}, arg)
-		for i := range arr {
-			if arr[i], err = cborRead(b, pos); err != nil {
-				return nil, err
-			}
-		}
-		return arr, nil
-	case 5:
-		m := make(map[string]interface{}, arg)
-		for i := uint64(0); i < arg; i++ {
-			k, kerr := cborRead(b, pos)
-			if kerr != nil {
-				return nil, kerr
-			}
-			val, verr := cborRead(b, pos)
-			if verr != nil {
-				return nil, verr
-			}
-			ks, _ := k.(string)
-			m[ks] = val
-		}
-		return m, nil
-	case 6:
-		inner, ierr := cborRead(b, pos)
-		if ierr != nil {
-			return nil, ierr
-		}
-		return cborTagged{num: arg, inner: inner}, nil
-	default: // major 7 (bool/null/float): not used by the keys we read
-		return nil, nil
+	if err := session(carrier); err != nil {
+		panic(err)
 	}
-}
-
-func cborArg(b []byte, pos *int, low byte) (uint64, error) {
-	if low < 24 {
-		return uint64(low), nil
-	}
-	width := map[byte]int{24: 1, 25: 2, 26: 4, 27: 8}[low]
-	if width == 0 || *pos+width > len(b) {
-		return 0, fmt.Errorf("csil-rpc: bad cbor argument")
-	}
-	var v uint64
-	for i := 0; i < width; i++ {
-		v = v<<8 | uint64(b[*pos+i])
-	}
-	*pos += width
-	return v, nil
 }
 "#;
 
