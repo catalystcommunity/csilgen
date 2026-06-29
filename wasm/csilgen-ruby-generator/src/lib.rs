@@ -919,6 +919,62 @@ fn ruby_method_name(name: &str) -> String {
     name.to_case(Case::Snake)
 }
 
+/// A field-reader reference safe to use as a bare expression inside an instance method.
+/// A CSIL field whose name is a Ruby keyword (e.g. `when`, `class`, `end`) generates a
+/// `Data` reader of that name, but the keyword cannot be written bare — only with an
+/// explicit receiver — so reserved names are qualified as `self.<name>`. The field name
+/// itself is never altered (it is the verbatim CBOR map key), only how it is read.
+fn ruby_reader_ref(field: &str) -> String {
+    const RUBY_KEYWORDS: &[&str] = &[
+        "BEGIN",
+        "END",
+        "alias",
+        "and",
+        "begin",
+        "break",
+        "case",
+        "class",
+        "def",
+        "defined?",
+        "do",
+        "else",
+        "elsif",
+        "end",
+        "ensure",
+        "false",
+        "for",
+        "if",
+        "in",
+        "module",
+        "next",
+        "nil",
+        "not",
+        "or",
+        "redo",
+        "rescue",
+        "retry",
+        "return",
+        "self",
+        "super",
+        "then",
+        "true",
+        "undef",
+        "unless",
+        "until",
+        "when",
+        "while",
+        "yield",
+        "__FILE__",
+        "__LINE__",
+        "__ENCODING__",
+    ];
+    if RUBY_KEYWORDS.contains(&field) {
+        format!("self.{field}")
+    } else {
+        field.to_string()
+    }
+}
+
 /// PascalCase a name with the same simple rule the Go/Python/TS clients use for the
 /// wire. convert_case diverges on acronyms, and the wire string must agree
 /// byte-for-byte across every language, so this is hand-rolled rather than
@@ -1620,6 +1676,61 @@ fn codec_aliases(
         .collect()
 }
 
+/// Is `choices` an all-literal choice (an enum like `"a" / "b"` or `1 / 2 / 3`)? Such a
+/// choice carries its own discriminant — the literal is the value — so it rides the wire
+/// bare. A choice with any non-literal arm is a tagged-sum union (handled separately).
+fn is_enum_choice(choices: &[CsilTypeExpression]) -> bool {
+    choices
+        .iter()
+        .all(|c| matches!(c, CsilTypeExpression::Literal(_)))
+}
+
+/// Named tagged-sum unions: a `TypeDef` whose target is a choice with at least one
+/// non-literal arm (e.g. `IdOrName = uint / text`). The locked wire form is a 2-element
+/// `[variant_index, value]` CBOR array, the index being the 0-based arm position in
+/// declaration order. All-literal choices (enums) are excluded — they stay bare.
+fn codec_unions(
+    spec: &CsilSpecSerialized,
+) -> std::collections::HashMap<String, Vec<CsilTypeExpression>> {
+    spec.rules
+        .iter()
+        .filter_map(|rule| match &rule.rule_type {
+            CsilRuleType::TypeDef(CsilTypeExpression::Choice(choices))
+                if !is_enum_choice(choices) =>
+            {
+                Some((rule.name.clone(), choices.clone()))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// The Ruby `case` matcher that recognizes a value belonging to union arm `ty` at
+/// encode time. Ruby carries no variant wrapper for a union (the value is just a raw
+/// Integer/String/record), so the encoder dispatches on the runtime class, first match
+/// in declaration order winning when two arms share a Ruby class.
+fn ruby_union_guard(
+    ty: &CsilTypeExpression,
+    records: &std::collections::HashSet<String>,
+) -> String {
+    match codec_unwrap(ty) {
+        CsilTypeExpression::Builtin(name) => match name.as_str() {
+            "int" | "uint" => "Integer".to_string(),
+            "float" => "Float".to_string(),
+            "text" | "tstr" | "bytes" | "bstr" => "String".to_string(),
+            "bool" => "TrueClass, FalseClass".to_string(),
+            "timestamp" => "Time".to_string(),
+            "decimal" => "BigDecimal".to_string(),
+            "nil" | "null" => "NilClass".to_string(),
+            _ => "Object".to_string(),
+        },
+        CsilTypeExpression::Reference(name) if records.contains(name) => ruby_class_name(name),
+        CsilTypeExpression::Array { .. } | CsilTypeExpression::Tuple(_) => "Array".to_string(),
+        CsilTypeExpression::Map { .. } => "Hash".to_string(),
+        _ => "Object".to_string(),
+    }
+}
+
 /// A constraint wraps its base for codec purposes; the wire form is the base's.
 fn codec_unwrap(ty: &CsilTypeExpression) -> &CsilTypeExpression {
     match ty {
@@ -1639,6 +1750,7 @@ fn enc_tree(
     expr: &str,
     records: &std::collections::HashSet<String>,
     aliases: &std::collections::HashMap<String, CsilTypeExpression>,
+    unions: &std::collections::HashMap<String, Vec<CsilTypeExpression>>,
 ) -> String {
     match codec_unwrap(ty) {
         CsilTypeExpression::Builtin(name) => match name.as_str() {
@@ -1653,21 +1765,26 @@ fn enc_tree(
         CsilTypeExpression::Reference(name) if records.contains(name) => {
             format!("({expr}).csil_to_tree")
         }
+        // A named tagged-sum union encodes via its generated helper to the locked
+        // `[variant_index, value]` array form.
+        CsilTypeExpression::Reference(name) if unions.contains_key(name) => {
+            format!("CsilCbor.enc_union_{name}({expr})")
+        }
         // A reference to a transparent alias (`StringInt64Map = {* text => int}`,
         // `Tags = [* text]`, `Uuid = text`) has no codec of its own; its Ruby value is
         // just the underlying Hash/Array/scalar, so encode it as the underlying type and
         // let the same `expr` flow through. A map-of-record alias recurses into the
         // record codec via the underlying Map's value type.
         CsilTypeExpression::Reference(name) if aliases.contains_key(name) => {
-            enc_tree(&aliases[name], expr, records, aliases)
+            enc_tree(&aliases[name], expr, records, aliases, unions)
         }
         CsilTypeExpression::Array { element_type, .. } => {
-            let inner = enc_tree(element_type, "csil_e", records, aliases);
+            let inner = enc_tree(element_type, "csil_e", records, aliases, unions);
             format!("({expr}).map {{ |csil_e| {inner} }}")
         }
         CsilTypeExpression::Map { key, value, .. } => {
-            let ek = enc_tree(key, "csil_k", records, aliases);
-            let ev = enc_tree(value, "csil_v", records, aliases);
+            let ek = enc_tree(key, "csil_k", records, aliases, unions);
+            let ev = enc_tree(value, "csil_v", records, aliases, unions);
             format!(
                 "({expr}).each_with_object({{}}) {{ |(csil_k, csil_v), csil_h| csil_h[{ek}] = {ev} }}"
             )
@@ -1684,6 +1801,7 @@ fn dec_tree(
     expr: &str,
     records: &std::collections::HashSet<String>,
     aliases: &std::collections::HashMap<String, CsilTypeExpression>,
+    unions: &std::collections::HashMap<String, Vec<CsilTypeExpression>>,
 ) -> String {
     match codec_unwrap(ty) {
         CsilTypeExpression::Builtin(name) => match name.as_str() {
@@ -1698,25 +1816,77 @@ fn dec_tree(
         CsilTypeExpression::Reference(name) if records.contains(name) => {
             format!("{}.csil_from_tree({expr})", ruby_class_name(name))
         }
+        // A named tagged-sum union decodes via its generated helper, reading the
+        // `[variant_index, value]` array form back to the bare Ruby value.
+        CsilTypeExpression::Reference(name) if unions.contains_key(name) => {
+            format!("CsilCbor.dec_union_{name}({expr})")
+        }
         // A reference to a transparent alias decodes as its underlying type; the decoded
         // Hash/Array/scalar is the alias's Ruby value verbatim. A map-of-record alias
         // recurses into the record codec via the underlying Map's value type.
         CsilTypeExpression::Reference(name) if aliases.contains_key(name) => {
-            dec_tree(&aliases[name], expr, records, aliases)
+            dec_tree(&aliases[name], expr, records, aliases, unions)
         }
         CsilTypeExpression::Array { element_type, .. } => {
-            let inner = dec_tree(element_type, "csil_e", records, aliases);
+            let inner = dec_tree(element_type, "csil_e", records, aliases, unions);
             format!("({expr}).map {{ |csil_e| {inner} }}")
         }
         CsilTypeExpression::Map { key, value, .. } => {
-            let dk = dec_tree(key, "csil_k", records, aliases);
-            let dv = dec_tree(value, "csil_v", records, aliases);
+            let dk = dec_tree(key, "csil_k", records, aliases, unions);
+            let dv = dec_tree(value, "csil_v", records, aliases, unions);
             format!(
                 "({expr}).each_with_object({{}}) {{ |(csil_k, csil_v), csil_h| csil_h[{dk}] = {dv} }}"
             )
         }
         _ => expr.to_string(),
     }
+}
+
+/// Emit the tagged-sum encode/decode helpers for one named union, reopening `CsilCbor`.
+/// `enc_union_<Name>` dispatches on the value's runtime class to its 0-based arm index,
+/// pairing it with the arm's own encoded value; `dec_union_<Name>` reads `[index, value]`
+/// and decodes the value per the arm at that index.
+fn emit_union_codec(
+    name: &str,
+    choices: &[CsilTypeExpression],
+    records: &std::collections::HashSet<String>,
+    aliases: &std::collections::HashMap<String, CsilTypeExpression>,
+    unions: &std::collections::HashMap<String, Vec<CsilTypeExpression>>,
+) -> String {
+    let mut out = String::new();
+    out.push_str(&format!(
+        "# Tagged-sum codec for the {name} union: the locked `[variant_index, value]`\n"
+    ));
+    out.push_str("# CBOR-array wire form, index being the 0-based arm in declaration order.\n");
+    out.push_str("module CsilCbor\n  module_function\n\n");
+
+    out.push_str(&format!("  def enc_union_{name}(value)\n"));
+    out.push_str("    case value\n");
+    for (idx, arm) in choices.iter().enumerate() {
+        let guard = ruby_union_guard(arm, records);
+        let enc = enc_tree(arm, "value", records, aliases, unions);
+        out.push_str(&format!("    when {guard}\n      [{idx}, {enc}]\n"));
+    }
+    out.push_str(&format!(
+        "    else\n      raise ArgumentError, \"csilgen: value does not match any {name} variant\"\n"
+    ));
+    out.push_str("    end\n  end\n\n");
+
+    out.push_str(&format!("  def dec_union_{name}(node)\n"));
+    out.push_str(&format!(
+        "    raise ArgumentError, \"csilgen: {name} is not a 2-element union array\" unless node.is_a?(::Array) && node.length == 2\n"
+    ));
+    out.push_str("    csil_idx, csil_inner = node\n");
+    out.push_str("    case csil_idx\n");
+    for (idx, arm) in choices.iter().enumerate() {
+        let dec = dec_tree(arm, "csil_inner", records, aliases, unions);
+        out.push_str(&format!("    when {idx}\n      {dec}\n"));
+    }
+    out.push_str(&format!(
+        "    else\n      raise ArgumentError, \"csilgen: unknown {name} variant index #{{csil_idx}}\"\n"
+    ));
+    out.push_str("    end\n  end\nend\n\n");
+    out
 }
 
 /// Reopen one generated value class with `to_cbor` / `self.from_cbor` and the
@@ -1728,6 +1898,7 @@ fn emit_record_codec(
     group: &CsilGroupExpression,
     records: &std::collections::HashSet<String>,
     aliases: &std::collections::HashMap<String, CsilTypeExpression>,
+    unions: &std::collections::HashMap<String, Vec<CsilTypeExpression>>,
 ) -> String {
     let class = ruby_class_name(name);
     let in_order: Vec<&CsilGroupEntry> = group.entries.iter().filter(|e| e.key.is_some()).collect();
@@ -1754,10 +1925,11 @@ fn emit_record_codec(
     });
     for entry in &canonical {
         let field = field_name(entry.key.as_ref().unwrap());
-        let node = enc_tree(&entry.value_type, &field, records, aliases);
+        let reader = ruby_reader_ref(&field);
+        let node = enc_tree(&entry.value_type, &reader, records, aliases, unions);
         if matches!(entry.occurrence, Some(CsilOccurrence::Optional)) {
             out.push_str(&format!(
-                "    csil_map[\"{field}\"] = {node} unless {field}.nil?\n"
+                "    csil_map[\"{field}\"] = {node} unless {reader}.nil?\n"
             ));
         } else {
             out.push_str(&format!("    csil_map[\"{field}\"] = {node}\n"));
@@ -1780,7 +1952,7 @@ fn emit_record_codec(
             .map(|entry| {
                 let field = field_name(entry.key.as_ref().unwrap());
                 let access = format!("node[\"{field}\"]");
-                let dec = dec_tree(&entry.value_type, &access, records, aliases);
+                let dec = dec_tree(&entry.value_type, &access, records, aliases, unions);
                 if matches!(entry.occurrence, Some(CsilOccurrence::Optional)) {
                     format!("      {field}: (node.key?(\"{field}\") ? {dec} : nil)")
                 } else {
@@ -1807,6 +1979,7 @@ fn generate_codec_file(spec: &CsilSpecSerialized) -> Option<String> {
         return None;
     }
     let aliases = codec_aliases(spec);
+    let unions = codec_unions(spec);
 
     let mut content = String::new();
     content.push_str(FROZEN_HEADER);
@@ -1827,6 +2000,18 @@ fn generate_codec_file(spec: &CsilSpecSerialized) -> Option<String> {
     }
     content.push('\n');
 
+    // Union helpers precede the record codecs that call them (resolution is at call
+    // time, but emitting the support code first reads top-down).
+    for rule in &spec.rules {
+        if let CsilRuleType::TypeDef(CsilTypeExpression::Choice(choices)) = &rule.rule_type
+            && !is_enum_choice(choices)
+        {
+            content.push_str(&emit_union_codec(
+                &rule.name, choices, &records, &aliases, &unions,
+            ));
+        }
+    }
+
     for rule in &spec.rules {
         let group = match &rule.rule_type {
             CsilRuleType::GroupDef(group) => Some(group),
@@ -1834,7 +2019,9 @@ fn generate_codec_file(spec: &CsilSpecSerialized) -> Option<String> {
             _ => None,
         };
         if let Some(group) = group {
-            content.push_str(&emit_record_codec(&rule.name, group, &records, &aliases));
+            content.push_str(&emit_record_codec(
+                &rule.name, group, &records, &aliases, &unions,
+            ));
         }
     }
 
@@ -2574,6 +2761,14 @@ mod tests {
         CsilTypeExpression::Builtin(name.to_string())
     }
 
+    fn pos() -> CsilPosition {
+        CsilPosition {
+            line: 1,
+            column: 1,
+            offset: 0,
+        }
+    }
+
     fn task_group() -> CsilGroupExpression {
         CsilGroupExpression {
             entries: vec![
@@ -2605,7 +2800,8 @@ mod tests {
         let mut records = std::collections::HashSet::new();
         records.insert("Task".to_string());
         let aliases = std::collections::HashMap::new();
-        let out = emit_record_codec("Task", &task_group(), &records, &aliases);
+        let unions = std::collections::HashMap::new();
+        let out = emit_record_codec("Task", &task_group(), &records, &aliases, &unions);
         assert!(out.contains("class Task"));
         assert!(out.contains("def to_cbor"));
         assert!(out.contains("def self.from_cbor(bytes)"));
@@ -2623,6 +2819,104 @@ mod tests {
         assert!(p_tags < p_uuid && p_uuid < p_state);
         // A missing optional decodes to nil.
         assert!(out.contains("priority: (node.key?(\"priority\") ? node[\"priority\"] : nil)"));
+    }
+
+    #[test]
+    fn reserved_word_field_read_with_explicit_receiver() {
+        // A field named after a Ruby keyword (here `when`, a timestamp) cannot be read
+        // bare inside an instance method, so its encode reference is `self.when`; the
+        // CBOR map key stays the verbatim field name.
+        let group = CsilGroupExpression {
+            entries: vec![bare("when", builtin("timestamp"))],
+        };
+        let records = std::collections::HashSet::new();
+        let aliases = std::collections::HashMap::new();
+        let unions = std::collections::HashMap::new();
+        let out = emit_record_codec("Evt", &group, &records, &aliases, &unions);
+        assert!(
+            out.contains("csil_map[\"when\"] = CsilCbor::Tag.new(0, (self.when).getutc.iso8601)")
+        );
+        // The keyword is legal as a constructor keyword label, so decode stays bare.
+        assert!(out.contains("when: Time.iso8601((node[\"when\"]).value)"));
+    }
+
+    #[test]
+    fn union_emits_tagged_sum_codec() {
+        // `IdOrName = uint / text` is a non-literal choice: a tagged-sum union whose wire
+        // form is the locked `[variant_index, value]` array (0-based declaration order).
+        let spec = CsilSpecSerialized {
+            rules: vec![
+                CsilRule {
+                    name: "IdOrName".to_string(),
+                    rule_type: CsilRuleType::TypeDef(CsilTypeExpression::Choice(vec![
+                        builtin("uint"),
+                        builtin("text"),
+                    ])),
+                    position: pos(),
+                    doc_comments: vec![],
+                },
+                CsilRule {
+                    name: "Holder".to_string(),
+                    rule_type: CsilRuleType::GroupDef(CsilGroupExpression {
+                        entries: vec![bare(
+                            "who",
+                            CsilTypeExpression::Reference("IdOrName".to_string()),
+                        )],
+                    }),
+                    position: pos(),
+                    doc_comments: vec![],
+                },
+            ],
+            source_content: None,
+            service_count: 0,
+            fields_with_metadata_count: 0,
+        };
+        let out = generate_codec_file(&spec).unwrap();
+        // Encode dispatches on the runtime class to the arm index; decode reads it back.
+        assert!(out.contains("def enc_union_IdOrName(value)"));
+        assert!(out.contains("when Integer\n      [0, value]"));
+        assert!(out.contains("when String\n      [1, value]"));
+        assert!(out.contains("def dec_union_IdOrName(node)"));
+        // The field routes through the union helper rather than passing the bare value.
+        assert!(out.contains("csil_map[\"who\"] = CsilCbor.enc_union_IdOrName(who)"));
+        assert!(out.contains("who: CsilCbor.dec_union_IdOrName(node[\"who\"])"));
+    }
+
+    #[test]
+    fn all_literal_choice_is_not_a_union() {
+        // `Color = "red" / "green" / "blue"` is an enum: it carries its own discriminant
+        // and rides bare, so it must NOT get a tagged-sum union helper.
+        let spec = CsilSpecSerialized {
+            rules: vec![
+                CsilRule {
+                    name: "Color".to_string(),
+                    rule_type: CsilRuleType::TypeDef(CsilTypeExpression::Choice(vec![
+                        CsilTypeExpression::Literal(CsilLiteralValue::Text("red".to_string())),
+                        CsilTypeExpression::Literal(CsilLiteralValue::Text("green".to_string())),
+                    ])),
+                    position: pos(),
+                    doc_comments: vec![],
+                },
+                CsilRule {
+                    name: "Holder".to_string(),
+                    rule_type: CsilRuleType::GroupDef(CsilGroupExpression {
+                        entries: vec![bare(
+                            "color",
+                            CsilTypeExpression::Reference("Color".to_string()),
+                        )],
+                    }),
+                    position: pos(),
+                    doc_comments: vec![],
+                },
+            ],
+            source_content: None,
+            service_count: 0,
+            fields_with_metadata_count: 0,
+        };
+        let out = generate_codec_file(&spec).unwrap();
+        assert!(!out.contains("enc_union_Color"));
+        // The enum value is laid down bare (the literal is its own discriminant).
+        assert!(out.contains("csil_map[\"color\"] = (color)"));
     }
 
     #[test]

@@ -1,0 +1,4 @@
+# Build artifacts (produced by build.sh) — only the harness source is checked in.
+node_modules/
+gen/
+dist/

@@ -897,8 +897,8 @@ fn java_sample(input: &WasmGeneratorInput, ty: &CsilTypeExpression) -> String {
             "text" | "tstr" => "\"example\"".to_string(),
             "bool" => "false".to_string(),
             "bytes" | "bstr" => "new byte[0]".to_string(),
-            "int" | "uint" => "0L".to_string(),
-            "float" => "0.0".to_string(),
+            "int" | "uint" | "nint" => "0L".to_string(),
+            "float" | "float64" | "double" => "0.0".to_string(),
             "timestamp" => "java.time.Instant.now()".to_string(),
             "decimal" => "java.math.BigDecimal.ZERO".to_string(),
             _ => "null".to_string(),
@@ -1724,6 +1724,28 @@ fn codec_collapse_choice(choices: &[CsilTypeExpression]) -> Option<&CsilTypeExpr
     }
 }
 
+/// Named `Name = A / B / ...` choice rules (the alias-style `TypeDef(Choice)`), keyed by
+/// PascalCase name. These generate a `record Name(... value)` wrapper, and the codec
+/// gives each one an `enc<Name>`/`dec<Name>` helper: a bare literal for an all-literal
+/// enum, a `[index, value]` tagged sum for a multi-arm union, and a transparent reach
+/// through `.value()` for a literal-narrowed scalar. The sealed-interface `TypeChoice`
+/// rules are a distinct shape and are intentionally excluded here.
+fn codec_choices(
+    input: &WasmGeneratorInput,
+) -> std::collections::HashMap<String, Vec<CsilTypeExpression>> {
+    input
+        .csil_spec
+        .rules
+        .iter()
+        .filter_map(|rule| match &rule.rule_type {
+            CsilRuleType::TypeDef(CsilTypeExpression::Choice(choices)) => {
+                Some((rule.name.to_case(Case::Pascal), choices.clone()))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
 /// A Java expression building a `CborValue` from `expr` (a typed value of the field's
 /// mapped Java type). `depth` keeps nested-lambda parameter names distinct, since Java
 /// forbids a lambda parameter shadowing one already in scope.
@@ -1732,6 +1754,7 @@ fn java_enc_value(
     expr: &str,
     records: &std::collections::HashSet<String>,
     aliases: &std::collections::HashMap<String, CsilTypeExpression>,
+    choices: &std::collections::HashMap<String, Vec<CsilTypeExpression>>,
     depth: usize,
 ) -> String {
     match codec_unwrap_constrained(ty) {
@@ -1744,9 +1767,17 @@ fn java_enc_value(
             "bool" => format!("new CborBool({expr})"),
             "timestamp" => format!("encTimestamp({expr})"),
             "decimal" => format!("encDecimal({expr})"),
+            // `any` already holds the codec's own value tree; it passes through verbatim.
+            "any" => expr.to_string(),
             _ => "new CborNull()".to_string(),
         },
         CsilTypeExpression::Reference(name) if records.contains(&name.to_case(Case::Pascal)) => {
+            format!("enc{}({expr})", name.to_case(Case::Pascal))
+        }
+        // A named choice (enum / union / literal-narrowed scalar) has its own helper.
+        CsilTypeExpression::Reference(name)
+            if choices.contains_key(&name.to_case(Case::Pascal)) =>
+        {
             format!("enc{}({expr})", name.to_case(Case::Pascal))
         }
         // A reference to a transparent alias has no codec of its own; encode its
@@ -1761,27 +1792,56 @@ fn java_enc_value(
                 &format!("({expr}).value()"),
                 records,
                 aliases,
+                choices,
                 depth,
             )
         }
         CsilTypeExpression::Array { element_type, .. } => {
             let p = format!("csilElem{depth}");
-            let inner = java_enc_value(element_type, &p, records, aliases, depth + 1);
+            let inner = java_enc_value(element_type, &p, records, aliases, choices, depth + 1);
             format!("encArray({expr}, {p} -> {inner})")
         }
         CsilTypeExpression::Map { key, value, .. } => {
             let kp = format!("csilK{depth}");
             let vp = format!("csilV{depth}");
-            let kenc = java_enc_value(key, &kp, records, aliases, depth + 1);
-            let venc = java_enc_value(value, &vp, records, aliases, depth + 1);
+            let kenc = java_enc_value(key, &kp, records, aliases, choices, depth + 1);
+            let venc = java_enc_value(value, &vp, records, aliases, choices, depth + 1);
             format!("encMap({expr}, {kp} -> {kenc}, {vp} -> {venc})")
         }
-        CsilTypeExpression::Choice(choices) => match codec_collapse_choice(choices) {
-            Some(only) => java_enc_value(only, expr, records, aliases, depth),
+        // A tuple is a positional CBOR array of fixed length; an absent optional element
+        // is held as `null` in place (encoded as CBOR null) so the length is preserved.
+        CsilTypeExpression::Tuple(group) => {
+            let mut elems: Vec<String> = Vec::new();
+            for (i, entry) in group.entries.iter().enumerate() {
+                let boxed = map_type_boxed(&entry.value_type);
+                let elem_expr = format!("({boxed}) ({expr}).get({i})");
+                let enc = java_enc_value(
+                    &entry.value_type,
+                    &elem_expr,
+                    records,
+                    aliases,
+                    choices,
+                    depth + 1,
+                );
+                if matches!(entry.occurrence, Some(CsilOccurrence::Optional)) {
+                    elems.push(format!(
+                        "(({expr}).get({i}) == null ? new CborNull() : {enc})"
+                    ));
+                } else {
+                    elems.push(enc);
+                }
+            }
+            format!(
+                "new CborArray(java.util.Arrays.asList({}))",
+                elems.join(", ")
+            )
+        }
+        CsilTypeExpression::Choice(choices_inline) => match codec_collapse_choice(choices_inline) {
+            Some(only) => java_enc_value(only, expr, records, aliases, choices, depth),
             None => "new CborNull()".to_string(),
         },
-        // A type the codec cannot model precisely (a non-record reference, a tuple,
-        // `any`) is carried as null rather than emitting uncompilable code.
+        // A type the codec cannot model precisely is carried as null rather than emitting
+        // uncompilable code.
         _ => "new CborNull()".to_string(),
     }
 }
@@ -1794,6 +1854,7 @@ fn java_dec_value(
     expr: &str,
     records: &std::collections::HashSet<String>,
     aliases: &std::collections::HashMap<String, CsilTypeExpression>,
+    choices: &std::collections::HashMap<String, Vec<CsilTypeExpression>>,
     depth: usize,
 ) -> String {
     match codec_unwrap_constrained(ty) {
@@ -1806,9 +1867,16 @@ fn java_dec_value(
             "bool" => format!("asBool({expr})"),
             "timestamp" => format!("asTimestamp({expr})"),
             "decimal" => format!("asDecimal({expr})"),
+            // `any` is the decoded CBOR value tree passed through verbatim.
+            "any" => expr.to_string(),
             _ => "null".to_string(),
         },
         CsilTypeExpression::Reference(name) if records.contains(&name.to_case(Case::Pascal)) => {
+            format!("dec{}({expr})", name.to_case(Case::Pascal))
+        }
+        CsilTypeExpression::Reference(name)
+            if choices.contains_key(&name.to_case(Case::Pascal)) =>
+        {
             format!("dec{}({expr})", name.to_case(Case::Pascal))
         }
         // The underlying decoder yields the unwrapped map/array/scalar value; rewrap it
@@ -1817,23 +1885,46 @@ fn java_dec_value(
             if aliases.contains_key(&name.to_case(Case::Pascal)) =>
         {
             let pascal = name.to_case(Case::Pascal);
-            let inner = java_dec_value(&aliases[&pascal], expr, records, aliases, depth);
+            let inner = java_dec_value(&aliases[&pascal], expr, records, aliases, choices, depth);
             format!("new {pascal}({inner})")
         }
         CsilTypeExpression::Array { element_type, .. } => {
             let p = format!("csilE{depth}");
-            let inner = java_dec_value(element_type, &p, records, aliases, depth + 1);
+            let inner = java_dec_value(element_type, &p, records, aliases, choices, depth + 1);
             format!("decArray({expr}, {p} -> {inner})")
         }
         CsilTypeExpression::Map { key, value, .. } => {
             let kp = format!("csilK{depth}");
             let vp = format!("csilV{depth}");
-            let kdec = java_dec_value(key, &kp, records, aliases, depth + 1);
-            let vdec = java_dec_value(value, &vp, records, aliases, depth + 1);
+            let kdec = java_dec_value(key, &kp, records, aliases, choices, depth + 1);
+            let vdec = java_dec_value(value, &vp, records, aliases, choices, depth + 1);
             format!("decMap({expr}, {kp} -> {kdec}, {vp} -> {vdec})")
         }
-        CsilTypeExpression::Choice(choices) => match codec_collapse_choice(choices) {
-            Some(only) => java_dec_value(only, expr, records, aliases, depth),
+        // A tuple decodes positionally from a fixed-length CBOR array; a CBOR-null element
+        // becomes a `null` in the heterogeneous `List<Object>` it reconstructs. Each
+        // position re-reads the array (idempotent) so the whole tuple stays one expression.
+        CsilTypeExpression::Tuple(group) => {
+            let mut elems: Vec<String> = Vec::new();
+            for (i, entry) in group.entries.iter().enumerate() {
+                let elem = format!("asArray({expr}).get({i})");
+                let dec = java_dec_value(
+                    &entry.value_type,
+                    &elem,
+                    records,
+                    aliases,
+                    choices,
+                    depth + 1,
+                );
+                if matches!(entry.occurrence, Some(CsilOccurrence::Optional)) {
+                    elems.push(format!("({elem} instanceof CborNull ? null : {dec})"));
+                } else {
+                    elems.push(dec);
+                }
+            }
+            format!("java.util.Arrays.<Object>asList({})", elems.join(", "))
+        }
+        CsilTypeExpression::Choice(choices_inline) => match codec_collapse_choice(choices_inline) {
+            Some(only) => java_dec_value(only, expr, records, aliases, choices, depth),
             None => "null".to_string(),
         },
         _ => "null".to_string(),
@@ -1848,6 +1939,7 @@ fn emit_record_codec(
     group: &CsilGroupExpression,
     records: &std::collections::HashSet<String>,
     aliases: &std::collections::HashMap<String, CsilTypeExpression>,
+    choices: &std::collections::HashMap<String, Vec<CsilTypeExpression>>,
 ) -> String {
     let class = name.to_case(Case::Pascal);
     // (member, wire, entry) in declaration order, plus a canonical-key-order copy for
@@ -1877,6 +1969,7 @@ fn emit_record_codec(
             &format!("v.{member}()"),
             records,
             aliases,
+            choices,
             0,
         );
         if matches!(entry.occurrence, Some(CsilOccurrence::Optional)) {
@@ -1903,7 +1996,7 @@ fn emit_record_codec(
             // A missing optional key leaves the field null; a present one decodes into
             // the boxed Java type so absent and present stay distinguishable.
             let bty = map_type_boxed(&entry.value_type);
-            let dec = java_dec_value(&entry.value_type, "csilField", records, aliases, 0);
+            let dec = java_dec_value(&entry.value_type, "csilField", records, aliases, choices, 0);
             out.push_str(&format!("        {bty} {member};\n"));
             out.push_str("        {\n");
             out.push_str(&format!(
@@ -1920,6 +2013,7 @@ fn emit_record_codec(
                 &format!("require(csilRoot, {wire_lit})"),
                 records,
                 aliases,
+                choices,
                 0,
             );
             out.push_str(&format!("        {ty} {member} = {dec};\n"));
@@ -1940,6 +2034,119 @@ fn emit_record_codec(
     out
 }
 
+/// The bare-literal CBOR kind an all-literal choice (an enum) encodes to, taken from its
+/// first literal arm. `None` if the choice has no literal arms (not an enum).
+fn enum_literal_kind(choices: &[CsilTypeExpression]) -> Option<&'static str> {
+    choices.iter().find_map(|c| match c {
+        CsilTypeExpression::Literal(CsilLiteralValue::Text(_)) => Some("text"),
+        CsilTypeExpression::Literal(CsilLiteralValue::Integer(_)) => Some("int"),
+        CsilTypeExpression::Literal(CsilLiteralValue::Float(_)) => Some("float"),
+        CsilTypeExpression::Literal(CsilLiteralValue::Bool(_)) => Some("bool"),
+        _ => None,
+    })
+}
+
+/// Emit the `enc<Name>`/`dec<Name>` helper pair for a named `Name = A / B / ...` choice.
+/// Three shapes, mirroring the locked wire: an all-literal **enum** rides as the bare
+/// literal (its own discriminant); a single-real-arm **literal-narrowed scalar** is a
+/// transparent wrapper over that arm; a multi-arm **union** rides as a `[variant_index,
+/// value]` tagged sum with the index being the arm's 0-based declaration position.
+fn emit_choice_codec(
+    name: &str,
+    choices: &[CsilTypeExpression],
+    records: &std::collections::HashSet<String>,
+    aliases: &std::collections::HashMap<String, CsilTypeExpression>,
+    choices_map: &std::collections::HashMap<String, Vec<CsilTypeExpression>>,
+) -> String {
+    let class = name.to_case(Case::Pascal);
+    let non_literal: Vec<&CsilTypeExpression> = choices
+        .iter()
+        .filter(|c| !matches!(c, CsilTypeExpression::Literal(_)))
+        .collect();
+    let mut out = String::new();
+
+    // Literal-narrowed scalar (e.g. `text / "a" / "b"`): a transparent wrapper over the
+    // one real arm — `map_type` already collapsed it to that scalar.
+    if non_literal.len() == 1 {
+        let arm = non_literal[0];
+        let enc = java_enc_value(arm, "v.value()", records, aliases, choices_map, 0);
+        let dec = java_dec_value(arm, "csilRoot", records, aliases, choices_map, 0);
+        out.push_str(&format!(
+            "    static CborValue enc{class}({class} v) {{\n        return {enc};\n    }}\n\n"
+        ));
+        out.push_str(&format!(
+            "    static {class} dec{class}(CborValue csilRoot) {{\n        return new {class}({dec});\n    }}\n\n"
+        ));
+        return out;
+    }
+
+    // All-literal enum: the bare literal is its own discriminant.
+    if non_literal.is_empty() {
+        let (enc, dec) = match enum_literal_kind(choices).unwrap_or("text") {
+            "int" => (
+                "new CborInt((Long) v.value())".to_string(),
+                format!("new {class}(asI64(csilRoot))"),
+            ),
+            "float" => (
+                "new CborFloat((Double) v.value())".to_string(),
+                format!("new {class}(asF64(csilRoot))"),
+            ),
+            "bool" => (
+                "new CborBool((Boolean) v.value())".to_string(),
+                format!("new {class}(asBool(csilRoot))"),
+            ),
+            _ => (
+                "new CborText((String) v.value())".to_string(),
+                format!("new {class}(asText(csilRoot))"),
+            ),
+        };
+        out.push_str(&format!(
+            "    static CborValue enc{class}({class} v) {{\n        return {enc};\n    }}\n\n"
+        ));
+        out.push_str(&format!(
+            "    static {class} dec{class}(CborValue csilRoot) {{\n        return {dec};\n    }}\n\n"
+        ));
+        return out;
+    }
+
+    // Union: a `[variant_index, value]` tagged sum. Encode dispatches on the value's Java
+    // type to its declaration-order index; decode reads the index and dispatches back.
+    out.push_str(&format!("    static CborValue enc{class}({class} v) {{\n"));
+    out.push_str("        Object csilInner = v.value();\n");
+    for (idx, arm) in choices.iter().enumerate() {
+        if matches!(arm, CsilTypeExpression::Literal(_)) {
+            continue;
+        }
+        let boxed = map_type_boxed(arm);
+        let cast = format!("csilCast{idx}");
+        let enc = java_enc_value(arm, &cast, records, aliases, choices_map, 0);
+        out.push_str(&format!(
+            "        if (csilInner instanceof {boxed} {cast}) {{\n            return new CborArray(java.util.Arrays.asList(new CborUint({idx}L), {enc}));\n        }}\n"
+        ));
+    }
+    out.push_str(&format!(
+        "        throw new CsilCborException(\"csil cbor: {class} value matches no variant\");\n    }}\n\n"
+    ));
+
+    out.push_str(&format!("    static {class} dec{class}(CborValue v) {{\n"));
+    out.push_str("        java.util.List<CborValue> csilArr = asArray(v);\n");
+    out.push_str("        long csilIdx = asU64(csilArr.get(0));\n");
+    out.push_str("        CborValue csilPayload = csilArr.get(1);\n");
+    for (idx, arm) in choices.iter().enumerate() {
+        if matches!(arm, CsilTypeExpression::Literal(_)) {
+            continue;
+        }
+        let dec = java_dec_value(arm, "csilPayload", records, aliases, choices_map, 0);
+        out.push_str(&format!(
+            "        if (csilIdx == {idx}L) {{\n            return new {class}({dec});\n        }}\n"
+        ));
+    }
+    out.push_str(&format!(
+        "        throw new CsilCborException(\"csil cbor: {class} variant index \" + csilIdx);\n    }}\n\n"
+    ));
+    out
+}
+
 /// Build `CsilCbor.java`: the self-contained canonical-CBOR runtime plus an
 /// `encode`/`decode` pair per record. `None` when the spec declares no records.
 fn generate_codec(input: &WasmGeneratorInput, config: &JavaConfig) -> Option<GeneratedFile> {
@@ -1948,6 +2155,7 @@ fn generate_codec(input: &WasmGeneratorInput, config: &JavaConfig) -> Option<Gen
         return None;
     }
     let aliases = codec_aliases(input);
+    let choices = codec_choices(input);
     let mut body = String::new();
     for rule in &input.csil_spec.rules {
         let group = match &rule.rule_type {
@@ -1956,7 +2164,17 @@ fn generate_codec(input: &WasmGeneratorInput, config: &JavaConfig) -> Option<Gen
             _ => None,
         };
         if let Some(group) = group {
-            body.push_str(&emit_record_codec(&rule.name, group, &records, &aliases));
+            body.push_str(&emit_record_codec(
+                &rule.name, group, &records, &aliases, &choices,
+            ));
+        }
+    }
+    // A `enc<Name>`/`dec<Name>` helper for each named choice the records reference.
+    for rule in &input.csil_spec.rules {
+        if let CsilRuleType::TypeDef(CsilTypeExpression::Choice(arms)) = &rule.rule_type {
+            body.push_str(&emit_choice_codec(
+                &rule.name, arms, &records, &aliases, &choices,
+            ));
         }
     }
 
@@ -2360,8 +2578,10 @@ fn generate_router(
 fn map_type(type_expr: &CsilTypeExpression) -> String {
     match type_expr {
         CsilTypeExpression::Builtin(name) => match name.as_str() {
-            "int" | "uint" => "long".to_string(),
-            "float" => "double".to_string(),
+            // `nint` is a CBOR negative integer; it still lives in a signed 64-bit slot.
+            "int" | "uint" | "nint" => "long".to_string(),
+            // `float64` is the explicit-width spelling of `float`; both are IEEE-754 doubles.
+            "float" | "float64" | "double" => "double".to_string(),
             "text" | "tstr" => "String".to_string(),
             "bytes" | "bstr" => "byte[]".to_string(),
             "bool" => "boolean".to_string(),
@@ -2369,7 +2589,11 @@ fn map_type(type_expr: &CsilTypeExpression) -> String {
             "timestamp" => "java.time.Instant".to_string(),
             // CBOR tag 4 exact decimal fraction — BigDecimal is Java's exact decimal.
             "decimal" => "java.math.BigDecimal".to_string(),
-            "any" | "nil" | "null" => "Object".to_string(),
+            // `any` is an arbitrary CBOR value passed through verbatim; the codec's own
+            // value tree is exactly that, so the field holds a CborValue and the codec is
+            // an identity at the seam.
+            "any" => "CsilCbor.CborValue".to_string(),
+            "nil" | "null" => "Object".to_string(),
             other => other.to_case(Case::Pascal),
         },
         CsilTypeExpression::Reference(name) => name.to_case(Case::Pascal),

@@ -337,9 +337,8 @@ fn tuple_type(group: &CsilGroupExpression, mapping: DecimalMapping) -> String {
 fn builtin(name: &str, mapping: DecimalMapping) -> String {
     match name {
         "text" | "string" => "string".to_string(),
-        "int" | "uint" | "integer" | "float" | "float16" | "float32" | "float64" | "number" => {
-            "number".to_string()
-        }
+        "int" | "uint" | "nint" | "integer" | "float" | "float16" | "float32" | "float64"
+        | "double" | "number" => "number".to_string(),
         "bool" | "boolean" => "boolean".to_string(),
         "bytes" => "Uint8Array".to_string(),
         // `timestamp` is CBOR tag 0 on the wire; in TS it is a UTC-based Date.

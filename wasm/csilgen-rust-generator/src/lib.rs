@@ -2324,6 +2324,91 @@ fn main() {{
         }
     }
 
+    /// The choices of a named type-choice rule (`X = a / b / ...`), whether the
+    /// parser modeled it as a `TypeChoice` rule or a `TypeDef` of a `Choice`.
+    fn type_choice(&self, name: &str) -> Option<&Vec<CsilTypeExpression>> {
+        self.input.csil_spec.rules.iter().find_map(|r| {
+            if r.name != name {
+                return None;
+            }
+            match &r.rule_type {
+                CsilRuleType::TypeChoice(choices) => Some(choices),
+                CsilRuleType::TypeDef(CsilTypeExpression::Choice(choices)) => Some(choices),
+                _ => None,
+            }
+        })
+    }
+
+    /// A type-choice whose every variant is a literal of one consistent scalar kind
+    /// is an *enum*: it carries no payload, so each literal is its own wire value and
+    /// discriminant. Returns the literals (in declaration order) when so, else `None`
+    /// — a `None` choice is a *union* (a tagged sum, see `emit_choice_codec`).
+    fn enum_literals(choices: &[CsilTypeExpression]) -> Option<Vec<CsilLiteralValue>> {
+        if choices.is_empty() {
+            return None;
+        }
+        let lits: Vec<CsilLiteralValue> = choices
+            .iter()
+            .filter_map(|c| match c {
+                CsilTypeExpression::Literal(l) => Some(l.clone()),
+                _ => None,
+            })
+            .collect();
+        if lits.len() != choices.len() {
+            return None;
+        }
+        let all_text = lits.iter().all(|l| matches!(l, CsilLiteralValue::Text(_)));
+        let all_int = lits
+            .iter()
+            .all(|l| matches!(l, CsilLiteralValue::Integer(_)));
+        if all_text || all_int {
+            Some(lits)
+        } else {
+            None
+        }
+    }
+
+    /// A Rust unit-variant identifier for an enum literal: the text PascalCased, or
+    /// `V<n>` / `VNeg<n>` for integers; positional `Variant<idx>` as a collision-proof
+    /// fallback. The codec pairs each emitted variant with its literal by index, so the
+    /// name is cosmetic — only its uniqueness within the enum matters.
+    fn enum_variant_ident(lit: &CsilLiteralValue, idx: usize) -> String {
+        let candidate = match lit {
+            CsilLiteralValue::Text(s) => {
+                let p = Self::to_pascal_case(s);
+                if p.is_empty() || p.chars().next().is_some_and(|c| c.is_ascii_digit()) {
+                    String::new()
+                } else {
+                    p
+                }
+            }
+            CsilLiteralValue::Integer(n) if *n < 0 => format!("VNeg{}", n.unsigned_abs()),
+            CsilLiteralValue::Integer(n) => format!("V{n}"),
+            _ => String::new(),
+        };
+        if candidate.is_empty() {
+            format!("Variant{idx}")
+        } else {
+            candidate
+        }
+    }
+
+    /// The unique unit-variant identifiers for an enum, de-duplicating any two literals
+    /// that PascalCase to the same name by falling back to the positional form.
+    fn enum_variant_idents(lits: &[CsilLiteralValue]) -> Vec<String> {
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut out = Vec::with_capacity(lits.len());
+        for (i, lit) in lits.iter().enumerate() {
+            let mut ident = Self::enum_variant_ident(lit, i);
+            if !seen.insert(ident.clone()) {
+                ident = format!("Variant{i}");
+                seen.insert(ident.clone());
+            }
+            out.push(ident);
+        }
+        out
+    }
+
     fn generate_enum(
         &mut self,
         name: &str,
@@ -2331,14 +2416,23 @@ fn main() {{
     ) -> Result<String, String> {
         let mut content = String::new();
 
-        content.push_str(&format!("/// {name} enum variants\n"));
+        content.push_str(&format!("/// {name} variants\n"));
         content.push_str("#[derive(Debug, Clone, PartialEq)]\n");
         content.push_str(&format!("pub enum {name} {{\n"));
 
-        for (i, choice) in choices.iter().enumerate() {
-            let variant_name = format!("Variant{i}");
-            let rust_type = self.map_type_to_rust(choice, &None)?;
-            content.push_str(&format!("    {variant_name}({rust_type}),\n"));
+        // A literal-only choice is an enum (unit variants, bare-literal wire); a
+        // choice with type-bearing variants is a union (a tagged sum, payload per
+        // variant). Both share this declaration; their codecs differ.
+        if let Some(lits) = Self::enum_literals(choices) {
+            for ident in Self::enum_variant_idents(&lits) {
+                content.push_str(&format!("    {ident},\n"));
+            }
+        } else {
+            for (i, choice) in choices.iter().enumerate() {
+                let variant_name = format!("Variant{i}");
+                let rust_type = self.map_type_to_rust(choice, &None)?;
+                content.push_str(&format!("    {variant_name}({rust_type}),\n"));
+            }
         }
 
         content.push('}');
@@ -2691,6 +2785,8 @@ fn main() {{
                 "timestamp" => refed("csil_enc_timestamp"),
                 "decimal" => refed("csil_enc_decimal"),
                 "null" | "nil" => "CsilCborValue::Null".to_string(),
+                // `any` already is a CBOR value tree; carry it through by clone.
+                "any" => format!("{expr}.clone()"),
                 _ => "CsilCborValue::Null".to_string(),
             },
             CsilTypeExpression::Reference(name) if records.contains(name) => {
@@ -2702,6 +2798,10 @@ fn main() {{
             // named-typed `expr` is the underlying type and flows through unchanged.
             CsilTypeExpression::Reference(name) if aliases.contains_key(name) => {
                 self.rust_enc_value(&aliases[name], expr, by_ref, records, aliases)
+            }
+            // A named type-choice (enum or union) has its own value-tree codec.
+            CsilTypeExpression::Reference(name) if self.type_choice(name).is_some() => {
+                refed(&format!("csil_enc_{}", self.to_snake_case(name)))
             }
             CsilTypeExpression::Array { element_type, .. } => {
                 let inner = self.rust_enc_value(element_type, "csil_elem", true, records, aliases);
@@ -2715,9 +2815,38 @@ fn main() {{
                     as_ref()
                 )
             }
-            // A shape the codec cannot model precisely (a non-record reference, a
-            // choice, a tuple, `any`) is carried as null rather than emitting code
-            // that would not compile.
+            // A fixed-shape tuple maps to a Rust tuple; encode positionally into a CBOR
+            // array. An absent optional element is held in place as null so the array
+            // length is fixed (the decoder reads positionally).
+            CsilTypeExpression::Tuple(group) => {
+                let mut parts = Vec::with_capacity(group.entries.len());
+                for (i, entry) in group.entries.iter().enumerate() {
+                    let place = format!("{expr}.{i}");
+                    if matches!(entry.occurrence, Some(CsilOccurrence::Optional)) {
+                        let inner = self.rust_enc_value(
+                            &entry.value_type,
+                            "csil_t",
+                            true,
+                            records,
+                            aliases,
+                        );
+                        parts.push(format!(
+                            "match &{place} {{ Some(csil_t) => {inner}, None => CsilCborValue::Null }}"
+                        ));
+                    } else {
+                        parts.push(self.rust_enc_value(
+                            &entry.value_type,
+                            &place,
+                            false,
+                            records,
+                            aliases,
+                        ));
+                    }
+                }
+                format!("CsilCborValue::Array(vec![{}])", parts.join(", "))
+            }
+            // A shape the codec cannot model precisely (a non-record reference, `any`)
+            // is carried as null rather than emitting code that would not compile.
             _ => "CsilCborValue::Null".to_string(),
         }
     }
@@ -2743,6 +2872,8 @@ fn main() {{
                 "bytes" | "bstr" => "cbor_as_bytes".to_string(),
                 "timestamp" => "csil_as_timestamp".to_string(),
                 "decimal" => "csil_as_decimal".to_string(),
+                // `any` is the CBOR value tree itself; clone it through.
+                "any" => "|csil_v: &CsilCborValue| Ok(csil_v.clone())".to_string(),
                 _ => Self::dec_unsupported(),
             },
             CsilTypeExpression::Reference(name) if records.contains(name) => {
@@ -2754,6 +2885,10 @@ fn main() {{
             CsilTypeExpression::Reference(name) if aliases.contains_key(name) => {
                 self.rust_dec_func(&aliases[name], records, aliases)
             }
+            // A named type-choice (enum or union) decodes via its own value-tree codec.
+            CsilTypeExpression::Reference(name) if self.type_choice(name).is_some() => {
+                format!("csil_dec_{}", self.to_snake_case(name))
+            }
             CsilTypeExpression::Array { element_type, .. } => {
                 let inner = self.rust_dec_func(element_type, records, aliases);
                 format!("|csil_v| cbor_dec_array(csil_v, {inner})")
@@ -2762,6 +2897,32 @@ fn main() {{
                 let kf = self.rust_dec_func(key, records, aliases);
                 let vf = self.rust_dec_func(value, records, aliases);
                 format!("|csil_v| cbor_dec_map(csil_v, {kf}, {vf})")
+            }
+            // Decode a fixed-shape tuple positionally from a CBOR array; an optional
+            // element reads `null` as `None`.
+            CsilTypeExpression::Tuple(group) => {
+                let n = group.entries.len();
+                let mut elems = Vec::with_capacity(n);
+                for (i, entry) in group.entries.iter().enumerate() {
+                    let dec = self.rust_dec_func(&entry.value_type, records, aliases);
+                    if matches!(entry.occurrence, Some(CsilOccurrence::Optional)) {
+                        elems.push(format!(
+                            "{{ if matches!(csil_arr[{i}], CsilCborValue::Null) {{ None }} else {{ let csil_d = {dec}; Some(csil_d(&csil_arr[{i}])?) }} }}"
+                        ));
+                    } else {
+                        elems.push(format!("{{ let csil_d = {dec}; csil_d(&csil_arr[{i}])? }}"));
+                    }
+                }
+                // A 1-tuple needs the trailing comma to stay a tuple.
+                let trailing = if n == 1 { "," } else { "" };
+                format!(
+                    "|csil_v: &CsilCborValue| {{ \
+                       let csil_arr = match csil_v {{ CsilCborValue::Array(csil_a) => csil_a, _ => return Err(CsilCborError(\"csil cbor: tuple expects an array\".to_string())) }}; \
+                       if csil_arr.len() != {n} {{ return Err(CsilCborError(format!(\"csil cbor: tuple expects {n} elements, got {{}}\", csil_arr.len()))); }} \
+                       Ok(({}{trailing})) \
+                     }}",
+                    elems.join(", ")
+                )
             }
             _ => Self::dec_unsupported(),
         }
@@ -2891,6 +3052,108 @@ fn main() {{
         out
     }
 
+    /// Emit the value-tree codec (`csil_enc_<t>`/`csil_dec_<t>`) for a named
+    /// type-choice. An enum (literal-only) encodes as its bare literal — the literal
+    /// is its own discriminant. A union (type-bearing variants) encodes as a tagged
+    /// sum `[variant_index, value]`, the index being the 0-based declaration order, so
+    /// any variant types (records, tuples, nested unions) round-trip unambiguously.
+    fn emit_choice_codec(
+        &self,
+        name: &str,
+        choices: &[CsilTypeExpression],
+        records: &HashSet<String>,
+        aliases: &HashMap<String, CsilTypeExpression>,
+    ) -> String {
+        let snake = self.to_snake_case(name);
+        let mut out = String::new();
+
+        if let Some(lits) = Self::enum_literals(choices) {
+            let idents = Self::enum_variant_idents(&lits);
+            // Encode: each unit variant to its bare literal CBOR value.
+            out.push_str(&format!(
+                "/// Encode a {name} enum as its bare literal value.\n\
+                 fn csil_enc_{snake}(csil_v: &{name}) -> CsilCborValue {{\n    match csil_v {{\n"
+            ));
+            for (ident, lit) in idents.iter().zip(lits.iter()) {
+                let value = match lit {
+                    CsilLiteralValue::Text(s) => format!("cbor_text({s:?})"),
+                    CsilLiteralValue::Integer(n) => format!("cbor_int({n})"),
+                    _ => "CsilCborValue::Null".to_string(),
+                };
+                out.push_str(&format!("        {name}::{ident} => {value},\n"));
+            }
+            out.push_str("    }\n}\n\n");
+
+            // Decode: read the bare scalar and match it back to the variant.
+            let all_text = matches!(lits.first(), Some(CsilLiteralValue::Text(_)));
+            out.push_str(&format!(
+                "/// Decode a bare literal value into a {name} enum.\n\
+                 fn csil_dec_{snake}(csil_v: &CsilCborValue) -> Result<{name}, CsilCborError> {{\n"
+            ));
+            if all_text {
+                out.push_str(
+                    "    let csil_val = cbor_as_text(csil_v)?;\n    match csil_val.as_str() {\n",
+                );
+                for (ident, lit) in idents.iter().zip(lits.iter()) {
+                    if let CsilLiteralValue::Text(s) = lit {
+                        out.push_str(&format!("        {s:?} => Ok({name}::{ident}),\n"));
+                    }
+                }
+            } else {
+                out.push_str("    let csil_val = cbor_as_i64(csil_v)?;\n    match csil_val {\n");
+                for (ident, lit) in idents.iter().zip(lits.iter()) {
+                    if let CsilLiteralValue::Integer(n) = lit {
+                        out.push_str(&format!("        {n} => Ok({name}::{ident}),\n"));
+                    }
+                }
+            }
+            out.push_str(&format!(
+                "        csil_other => Err(CsilCborError(format!(\"csil cbor: unknown {name} value {{csil_other:?}}\"))),\n    }}\n}}\n\n"
+            ));
+            return out;
+        }
+
+        // Union: tagged sum [index, value].
+        out.push_str(&format!(
+            "/// Encode a {name} union as a tagged sum `[variant_index, value]`.\n\
+             fn csil_enc_{snake}(csil_v: &{name}) -> CsilCborValue {{\n    match csil_v {{\n"
+        ));
+        for (i, choice) in choices.iter().enumerate() {
+            let enc = self.rust_enc_value(choice, "csil_x", true, records, aliases);
+            out.push_str(&format!(
+                "        {name}::Variant{i}(csil_x) => CsilCborValue::Array(vec![CsilCborValue::Uint({i}), {enc}]),\n"
+            ));
+        }
+        out.push_str("    }\n}\n\n");
+
+        out.push_str(&format!(
+            "/// Decode a tagged sum `[variant_index, value]` into a {name} union.\n\
+             fn csil_dec_{snake}(csil_v: &CsilCborValue) -> Result<{name}, CsilCborError> {{\n\
+             \x20   let csil_arr = match csil_v {{\n\
+             \x20       CsilCborValue::Array(csil_a) => csil_a,\n\
+             \x20       _ => return Err(CsilCborError(\"csil cbor: union expects a 2-element array\".to_string())),\n\
+             \x20   }};\n\
+             \x20   if csil_arr.len() != 2 {{\n\
+             \x20       return Err(CsilCborError(format!(\"csil cbor: union array has {{}} elements, expected 2\", csil_arr.len())));\n\
+             \x20   }}\n\
+             \x20   let csil_idx = cbor_as_u64(&csil_arr[0])?;\n\
+             \x20   match csil_idx {{\n"
+        ));
+        for (i, choice) in choices.iter().enumerate() {
+            let dec = self.rust_dec_func(choice, records, aliases);
+            out.push_str(&format!(
+                "        {i} => {{\n\
+                 \x20           let csil_decode = {dec};\n\
+                 \x20           Ok({name}::Variant{i}(csil_decode(&csil_arr[1])?))\n\
+                 \x20       }}\n"
+            ));
+        }
+        out.push_str(&format!(
+            "        csil_other => Err(CsilCborError(format!(\"csil cbor: unknown {name} variant {{csil_other}}\"))),\n    }}\n}}\n\n"
+        ));
+        out
+    }
+
     /// Build `codec.gen.rs`: the self-contained canonical-CBOR runtime plus an
     /// `encode_`/`decode_` pair per record. `None` when the spec declares no record
     /// the codec can model.
@@ -2947,6 +3210,17 @@ fn main() {{
             {
                 content.push_str(&self.emit_record_codec(&rule.name, group, &records, &aliases));
             }
+        }
+
+        // Value-tree codecs for named type-choices (enums + unions) so record fields
+        // referencing them encode/decode through `csil_enc_`/`csil_dec_`.
+        for rule in &self.input.csil_spec.rules {
+            let choices = match &rule.rule_type {
+                CsilRuleType::TypeChoice(c) => c,
+                CsilRuleType::TypeDef(CsilTypeExpression::Choice(c)) => c,
+                _ => continue,
+            };
+            content.push_str(&self.emit_choice_codec(&rule.name, choices, &records, &aliases));
         }
 
         Ok(Some(content))
@@ -3520,6 +3794,9 @@ fn main() {{
             "bool" => "bool".to_string(),
             "int" => "i64".to_string(),
             "uint" => "u64".to_string(),
+            // A negative integer (CBOR major type 1); the codec already routes
+            // `nint` through the signed-integer path, so it shares `i64`.
+            "nint" => "i64".to_string(),
             "float" | "float16" | "float32" | "float64" => "f64".to_string(),
             // A UTC-typed instant; the tag-0 RFC3339 wire form is the codec's job.
             "timestamp" => "chrono::DateTime<chrono::Utc>".to_string(),
@@ -3530,7 +3807,9 @@ fn main() {{
                 DecimalMapping::Library => "rust_decimal::Decimal".to_string(),
             },
             "null" => "()".to_string(),
-            "any" => "serde_json::Value".to_string(),
+            // `any` is carried as the codec's own CBOR value tree so it round-trips
+            // losslessly without a serde dependency.
+            "any" => "crate::codec::CsilCborValue".to_string(),
             _ => {
                 self.warnings.push(GeneratorWarning {
                     level: WarningLevel::Warning,
@@ -6095,7 +6374,8 @@ mod tests {
 
         // Keys are positional names only and drop out of the Rust tuple type.
         assert!(types_content.contains("pub type Triple = (String, i64, bool);"));
-        assert!(types_content.contains("pub type Keyed = (String, serde_json::Value);"));
+        // `any` carries through the codec's own CBOR value tree (no serde dependency).
+        assert!(types_content.contains("pub type Keyed = (String, crate::codec::CsilCborValue);"));
     }
 
     #[test]

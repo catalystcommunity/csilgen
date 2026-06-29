@@ -1,0 +1,15 @@
+name: interop_dart_harness
+description: Dart interop harness for the CSIL cross-language interop suite.
+publish_to: none
+
+environment:
+  sdk: ^3.5.0
+
+dependencies:
+  # The hand-written CSIL transport library (RPC/Events/Datagrams envelopes).
+  csilgen_transport:
+    path: ../../../../transports/dart
+  # The generated package for tests/interop/interop.csil (gitignored; produced by
+  # the orchestrator via `csilgen generate --target dart`).
+  interop_api:
+    path: ./gen

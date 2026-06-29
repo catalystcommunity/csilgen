@@ -1,0 +1,5 @@
+# Generated package (produced by the orchestrator) and Dart build artifacts.
+gen/
+.dart_tool/
+.packages
+pubspec.lock

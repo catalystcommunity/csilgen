@@ -1058,6 +1058,10 @@ fn generate_types(
                 has_types = true;
                 emit_data_class(&mut body, &rule.name, group, warnings);
             }
+            CsilRuleType::TypeDef(CsilTypeExpression::Choice(choices)) => {
+                has_types = true;
+                emit_named_choice_type(&mut body, &rule.name, choices);
+            }
             CsilRuleType::TypeDef(type_expr) => {
                 has_types = true;
                 let kt = map_csil_type_to_kotlin(type_expr, &None);
@@ -1709,6 +1713,8 @@ fn kotlin_enc_value(
                 "CborValue.CTag(4uL, CborValue.CArray(listOf(CborValue.CInt((-({expr}).scale()).toLong()), CborValue.CInt(({expr}).unscaledValue().longValueExact()))))"
             ),
             "nil" | "null" => "CborValue.CNull".to_string(),
+            // `any` is already a CborValue (see map_csil_type_to_kotlin); pass it through.
+            "any" => expr.to_string(),
             _ => "CborValue.CNull".to_string(),
         },
         CsilTypeExpression::Reference(name) if records.contains(&pascal_case(name)) => {
@@ -1729,6 +1735,32 @@ fn kotlin_enc_value(
             let k = kotlin_enc_value(key, "csilK", records, aliases);
             let v = kotlin_enc_value(value, "csilV", records, aliases);
             format!("CborValue.CMap(({expr}).map {{ (csilK, csilV) -> {k} to {v} }})")
+        }
+        // A fixed-shape tuple is a positional CBOR array; an absent optional element is a
+        // `null` held in place so the array length is fixed (the locked wire).
+        CsilTypeExpression::Tuple(group) => {
+            let parts: Vec<String> = group
+                .entries
+                .iter()
+                .enumerate()
+                .map(|(i, e)| {
+                    let kt = map_csil_type_to_kotlin(&e.value_type, &None);
+                    if matches!(e.occurrence, Some(CsilOccurrence::Optional)) {
+                        let inner = kotlin_enc_value(&e.value_type, "csilTup", records, aliases);
+                        format!(
+                            "(({expr})[{i}] as {kt}?)?.let {{ csilTup -> {inner} }} ?: CborValue.CNull"
+                        )
+                    } else {
+                        kotlin_enc_value(
+                            &e.value_type,
+                            &format!("(({expr})[{i}] as {kt})"),
+                            records,
+                            aliases,
+                        )
+                    }
+                })
+                .collect();
+            format!("CborValue.CArray(listOf({}))", parts.join(", "))
         }
         CsilTypeExpression::Choice(choices) if choice_is_stringy(choices) => {
             format!("CborValue.CText({expr})")
@@ -1754,6 +1786,8 @@ fn kotlin_dec_value(
             "bool" => format!("CsilCbor.asBoolean({expr})"),
             "timestamp" => format!("java.time.Instant.parse(CsilCbor.asTaggedText({expr}, 0uL))"),
             "decimal" => format!("CsilCbor.asDecimal({expr})"),
+            // `any` keeps the decoded CBOR value verbatim (passes through unchanged).
+            "any" => expr.to_string(),
             _ => format!("CsilCbor.asText({expr})"),
         },
         CsilTypeExpression::Reference(name) if records.contains(&pascal_case(name)) => {
@@ -1773,6 +1807,29 @@ fn kotlin_dec_value(
             let v = kotlin_dec_value(value, "csilV", records, aliases);
             format!("CsilCbor.asMap({expr}).associate {{ (csilK, csilV) -> {k} to {v} }}")
         }
+        // Tuple: a positional CBOR array; optional elements decode through a `null`-in-place
+        // guard. The result is a `List<Any?>` matching the generated field type.
+        CsilTypeExpression::Tuple(group) => {
+            let parts: Vec<String> = group
+                .entries
+                .iter()
+                .enumerate()
+                .map(|(i, e)| {
+                    if matches!(e.occurrence, Some(CsilOccurrence::Optional)) {
+                        let inner = kotlin_dec_value(&e.value_type, "csilTup", records, aliases);
+                        format!(
+                            "(csilArr[{i}]).let {{ csilTup -> if (csilTup is CborValue.CNull) null else {inner} }}"
+                        )
+                    } else {
+                        kotlin_dec_value(&e.value_type, &format!("csilArr[{i}]"), records, aliases)
+                    }
+                })
+                .collect();
+            format!(
+                "CsilCbor.asArray({expr}).let {{ csilArr -> listOf<Any?>({}) }}",
+                parts.join(", ")
+            )
+        }
         CsilTypeExpression::Choice(choices) if choice_is_stringy(choices) => {
             format!("CsilCbor.asText({expr})")
         }
@@ -1790,6 +1847,223 @@ fn choice_is_stringy(choices: &[CsilTypeExpression]) -> bool {
             CsilTypeExpression::Literal(CsilLiteralValue::Text(_)) => true,
             _ => false,
         })
+}
+
+/// How a named `A = X / Y / …` choice is realized in Kotlin: an all-text-literal or
+/// all-int-literal choice is a bare-literal enum (the literal is its own discriminant);
+/// anything else is a tagged-sum union (`[variant_index, value]` on the wire).
+enum ChoiceKind {
+    EnumText,
+    EnumInt,
+    Union,
+}
+
+fn classify_choice(choices: &[CsilTypeExpression]) -> ChoiceKind {
+    if !choices.is_empty()
+        && choices
+            .iter()
+            .all(|c| matches!(c, CsilTypeExpression::Literal(CsilLiteralValue::Text(_))))
+    {
+        return ChoiceKind::EnumText;
+    }
+    if !choices.is_empty()
+        && choices
+            .iter()
+            .all(|c| matches!(c, CsilTypeExpression::Literal(CsilLiteralValue::Integer(_))))
+    {
+        return ChoiceKind::EnumInt;
+    }
+    ChoiceKind::Union
+}
+
+/// The enum-constant name for a text literal: PascalCase of the literal text (mirrors the
+/// reference generators, e.g. `"green"` → `Green`).
+fn enum_text_variant(s: &str) -> String {
+    pascal_case(s)
+}
+
+/// The enum-constant name for an int literal: `V<n>` (a negative `n` becomes `VNeg<abs>`
+/// so the identifier stays legal), matching the reference generators' `V1`/`V2`/`V3`.
+fn enum_int_variant(n: i64) -> String {
+    if n < 0 {
+        format!("VNeg{}", n.unsigned_abs())
+    } else {
+        format!("V{n}")
+    }
+}
+
+/// Emit the Kotlin type for a named `TypeDef` choice rule: an enum for an all-literal
+/// choice, or a sealed-interface union for a mixed choice.
+fn emit_named_choice_type(body: &mut String, name: &str, choices: &[CsilTypeExpression]) {
+    let iface = pascal_case(name);
+    match classify_choice(choices) {
+        ChoiceKind::EnumText => {
+            let variants: Vec<String> = choices
+                .iter()
+                .filter_map(|c| match c {
+                    CsilTypeExpression::Literal(CsilLiteralValue::Text(s)) => {
+                        Some(enum_text_variant(s))
+                    }
+                    _ => None,
+                })
+                .collect();
+            body.push_str(&format!("/** {name} enum (bare-literal wire). */\n"));
+            body.push_str(&format!(
+                "enum class {iface} {{ {} }}\n\n",
+                variants.join(", ")
+            ));
+        }
+        ChoiceKind::EnumInt => {
+            let variants: Vec<String> = choices
+                .iter()
+                .filter_map(|c| match c {
+                    CsilTypeExpression::Literal(CsilLiteralValue::Integer(n)) => {
+                        Some(enum_int_variant(*n))
+                    }
+                    _ => None,
+                })
+                .collect();
+            body.push_str(&format!("/** {name} enum (bare-literal wire). */\n"));
+            body.push_str(&format!(
+                "enum class {iface} {{ {} }}\n\n",
+                variants.join(", ")
+            ));
+        }
+        ChoiceKind::Union => {
+            body.push_str(&format!(
+                "/** {name}: tagged-sum union of {} arms. */\n",
+                choices.len()
+            ));
+            body.push_str(&format!("sealed interface {iface}\n"));
+            for (i, choice) in choices.iter().enumerate() {
+                let kt = map_csil_type_to_kotlin(choice, &None);
+                body.push_str(&format!(
+                    "data class {iface}Variant{i}(val value: {kt}) : {iface}\n"
+                ));
+            }
+            body.push('\n');
+        }
+    }
+}
+
+/// Emit the codec for a named choice rule: a bare-literal enum codec, or a tagged-sum
+/// union codec. Mirrors the reference generators so the wire is byte-identical.
+fn emit_choice_codec(
+    body: &mut String,
+    name: &str,
+    choices: &[CsilTypeExpression],
+    records: &std::collections::HashSet<String>,
+    aliases: &std::collections::HashMap<String, CsilTypeExpression>,
+) {
+    let tn = pascal_case(name);
+    let dec = camel_case(name);
+    match classify_choice(choices) {
+        ChoiceKind::EnumText => {
+            let lits: Vec<(String, String)> = choices
+                .iter()
+                .filter_map(|c| match c {
+                    CsilTypeExpression::Literal(CsilLiteralValue::Text(s)) => {
+                        Some((enum_text_variant(s), s.clone()))
+                    }
+                    _ => None,
+                })
+                .collect();
+            body.push_str(&format!(
+                "/** Encode a {tn} enum as its bare literal value. */\n"
+            ));
+            body.push_str(&format!(
+                "fun {tn}.toCborValue(): CborValue = when (this) {{\n"
+            ));
+            for (variant, lit) in &lits {
+                body.push_str(&format!(
+                    "    {tn}.{variant} -> CborValue.CText(\"{}\")\n",
+                    kotlin_escape(lit)
+                ));
+            }
+            body.push_str("}\n\n");
+            body.push_str(&format!(
+                "/** Decode a bare literal value into a {tn} enum. */\n"
+            ));
+            body.push_str(&format!(
+                "fun {dec}FromCborValue(cbor: CborValue): {tn} = when (CsilCbor.asText(cbor)) {{\n"
+            ));
+            for (variant, lit) in &lits {
+                body.push_str(&format!(
+                    "    \"{}\" -> {tn}.{variant}\n",
+                    kotlin_escape(lit)
+                ));
+            }
+            body.push_str(&format!(
+                "    else -> throw CborError(\"unknown {tn} value\")\n}}\n\n"
+            ));
+        }
+        ChoiceKind::EnumInt => {
+            let lits: Vec<(String, i64)> = choices
+                .iter()
+                .filter_map(|c| match c {
+                    CsilTypeExpression::Literal(CsilLiteralValue::Integer(n)) => {
+                        Some((enum_int_variant(*n), *n))
+                    }
+                    _ => None,
+                })
+                .collect();
+            body.push_str(&format!(
+                "/** Encode a {tn} enum as its bare literal value. */\n"
+            ));
+            body.push_str(&format!(
+                "fun {tn}.toCborValue(): CborValue = when (this) {{\n"
+            ));
+            for (variant, n) in &lits {
+                body.push_str(&format!("    {tn}.{variant} -> CborValue.CInt({n})\n"));
+            }
+            body.push_str("}\n\n");
+            body.push_str(&format!(
+                "/** Decode a bare literal value into a {tn} enum. */\n"
+            ));
+            body.push_str(&format!(
+                "fun {dec}FromCborValue(cbor: CborValue): {tn} = when (CsilCbor.asLong(cbor)) {{\n"
+            ));
+            for (variant, n) in &lits {
+                body.push_str(&format!("    {n}L -> {tn}.{variant}\n"));
+            }
+            body.push_str(&format!(
+                "    else -> throw CborError(\"unknown {tn} value\")\n}}\n\n"
+            ));
+        }
+        ChoiceKind::Union => {
+            body.push_str(&format!(
+                "/** Encode a {tn} union as a tagged sum [variant_index, value]. */\n"
+            ));
+            body.push_str(&format!(
+                "fun {tn}.toCborValue(): CborValue = when (this) {{\n"
+            ));
+            for (i, arm) in choices.iter().enumerate() {
+                let enc = kotlin_enc_value(arm, "this.value", records, aliases);
+                body.push_str(&format!(
+                    "    is {tn}Variant{i} -> CborValue.CArray(listOf(CborValue.CUint({i}uL), {enc}))\n"
+                ));
+            }
+            body.push_str("}\n\n");
+            body.push_str(&format!(
+                "/** Decode a tagged sum [variant_index, value] into a {tn} union. */\n"
+            ));
+            body.push_str(&format!(
+                "fun {dec}FromCborValue(cbor: CborValue): {tn} {{\n"
+            ));
+            body.push_str("    val csilArr = CsilCbor.asArray(cbor)\n");
+            body.push_str(
+                "    if (csilArr.size != 2) throw CborError(\"union expects [index, value]\")\n",
+            );
+            body.push_str("    return when (CsilCbor.asULong(csilArr[0])) {\n");
+            for (i, arm) in choices.iter().enumerate() {
+                let dec = kotlin_dec_value(arm, "csilArr[1]", records, aliases);
+                body.push_str(&format!("        {i}uL -> {tn}Variant{i}({dec})\n"));
+            }
+            body.push_str(&format!(
+                "        else -> throw CborError(\"unknown {tn} variant\")\n    }}\n}}\n\n"
+            ));
+        }
+    }
 }
 
 /// Emit one record's codec: `toCborValue`/`toCbor` (canonical key order) plus the
@@ -1921,17 +2195,27 @@ fn generate_codec(input: &WasmGeneratorInput, config: &KotlinConfig) -> Option<S
         return None;
     }
     let aliases = codec_aliases(input);
+    // Named choices (enums + unions) carry their own `toCborValue`/`<name>FromCborValue`
+    // codec, so a field referencing one resolves exactly like a record does — fold their
+    // names into the same set the enc/dec helpers consult.
+    let mut codec_named = records.clone();
+    for rule in &input.csil_spec.rules {
+        if let CsilRuleType::TypeDef(CsilTypeExpression::Choice(_)) = &rule.rule_type {
+            codec_named.insert(pascal_case(&rule.name));
+        }
+    }
     let mut body = String::new();
     let mut dispatch: Vec<(String, String)> = Vec::new();
     for rule in &input.csil_spec.rules {
-        let group = match &rule.rule_type {
-            CsilRuleType::GroupDef(g) => Some(g),
-            CsilRuleType::TypeDef(CsilTypeExpression::Group(g)) => Some(g),
-            _ => None,
-        };
-        if let Some(group) = group {
-            emit_struct_codec(&mut body, &rule.name, group, &records, &aliases);
-            dispatch.push((pascal_case(&rule.name), camel_case(&rule.name)));
+        match &rule.rule_type {
+            CsilRuleType::GroupDef(g) | CsilRuleType::TypeDef(CsilTypeExpression::Group(g)) => {
+                emit_struct_codec(&mut body, &rule.name, g, &codec_named, &aliases);
+                dispatch.push((pascal_case(&rule.name), camel_case(&rule.name)));
+            }
+            CsilRuleType::TypeDef(CsilTypeExpression::Choice(choices)) => {
+                emit_choice_codec(&mut body, &rule.name, choices, &codec_named, &aliases);
+            }
+            _ => {}
         }
     }
     emit_codec_dispatch(&mut body, &dispatch);
@@ -2459,8 +2743,12 @@ fn emit_ordered_check(
     let kind = ordered_field_kind(value_type);
     let (bound_expr, shown) = match kind {
         OrderedKind::Numeric => {
-            let s = literal_to_kotlin(value);
-            (s.clone(), s)
+            // The bound must carry the field's numeric suffix (`1uL`/`1L`/`1.0`); a bare
+            // `Int` literal does not compare against a `ULong`/`Long`/`Double` field.
+            (
+                literal_to_kotlin_typed(value, value_type),
+                literal_to_kotlin(value),
+            )
         }
         OrderedKind::Decimal => {
             let Some(text) = literal_as_text(value) else {
@@ -2650,9 +2938,9 @@ fn map_csil_type_to_kotlin(
 ) -> String {
     let base = match type_expr {
         CsilTypeExpression::Builtin(name) => match name.as_str() {
-            "int" => "Long".to_string(),
+            "int" | "nint" => "Long".to_string(),
             "uint" => "ULong".to_string(),
-            "float" => "Double".to_string(),
+            "float" | "float64" | "double" => "Double".to_string(),
             "text" | "tstr" => "String".to_string(),
             "bytes" | "bstr" => "ByteArray".to_string(),
             "bool" => "Boolean".to_string(),
@@ -2661,7 +2949,9 @@ fn map_csil_type_to_kotlin(
             // CBOR tag 4 exact decimal; BigDecimal is the JVM-idiomatic exact type.
             "decimal" => "java.math.BigDecimal".to_string(),
             "nil" | "null" => "Unit".to_string(),
-            "any" => "Any".to_string(),
+            // `any` rides as the codec's own CBOR value model so it passes through
+            // byte-identically, the JVM analog of Rust's `CsilCborValue` mapping.
+            "any" => "CborValue".to_string(),
             other => pascal_case(other),
         },
         CsilTypeExpression::Reference(name) => pascal_case(name),
@@ -2846,7 +3136,48 @@ fn kotlin_prop_name(key: &CsilGroupKey, metadata: &[CsilFieldMetadata]) -> Strin
             return kt_name.clone();
         }
     }
-    camel_case(&wire_name_from_key(key))
+    kotlin_safe_ident(&camel_case(&wire_name_from_key(key)))
+}
+
+/// Backtick-escape a name that collides with a Kotlin hard keyword (`when`, `is`, `in`,
+/// …) so it is a legal identifier wherever a property/argument name appears. A
+/// field like `when: timestamp` would otherwise emit `val when: …`, a parse error.
+fn kotlin_safe_ident(name: &str) -> String {
+    const HARD_KEYWORDS: &[&str] = &[
+        "as",
+        "break",
+        "class",
+        "continue",
+        "do",
+        "else",
+        "false",
+        "for",
+        "fun",
+        "if",
+        "in",
+        "interface",
+        "is",
+        "null",
+        "object",
+        "package",
+        "return",
+        "super",
+        "this",
+        "throw",
+        "true",
+        "try",
+        "typealias",
+        "typeof",
+        "val",
+        "var",
+        "when",
+        "while",
+    ];
+    if HARD_KEYWORDS.contains(&name) {
+        format!("`{name}`")
+    } else {
+        name.to_string()
+    }
 }
 
 fn type_override(metadata: &[CsilFieldMetadata]) -> Option<String> {

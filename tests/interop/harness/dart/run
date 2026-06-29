@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# Launch the Dart harness: run <server|client> <rpc|events|datagrams> <port>.
+# Runs main.dart directly under the Dart VM.
+set -euo pipefail
+
+# shellcheck disable=SC1091
+source "$HOME/.local/csilgen-tools/env.sh" 2>/dev/null || true
+
+HERE="$(cd "$(dirname "$0")" && pwd)"
+cd "$HERE"
+exec dart run main.dart "$@"
