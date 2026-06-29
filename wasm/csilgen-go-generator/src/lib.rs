@@ -84,7 +84,11 @@ fn deserialize_input(input_ptr: *const u8, input_len: usize) -> Result<WasmGener
 }
 
 fn process_generation(input: WasmGeneratorInput) -> Result<WasmGeneratorOutput, i32> {
-    let config = GoConfig::from_options(&input.config.options)?;
+    let mut config = GoConfig::from_options(&input.config.options)?;
+    // A named type-choice with a non-literal variant is a union (a tagged sum); record
+    // its name so the codec emits/calls its dedicated `csilEnc`/`csilDec` helper rather
+    // than the null/zero stub. Literal-only choices are enums (handled via aliasing).
+    config.union_names = union_defs(&input).into_iter().map(|(n, _)| n).collect();
     let mut warnings = Vec::new();
     let mut files = Vec::new();
 
@@ -1164,6 +1168,9 @@ struct GoConfig {
     decimal_mapping: DecimalMapping,
     indent_style: String,
     go_imports: Vec<String>,
+    /// Names of union types (non-literal type-choices) in the spec; populated after
+    /// construction since it derives from the spec rules, not the options.
+    union_names: std::collections::HashSet<String>,
 }
 
 impl GoConfig {
@@ -1252,6 +1259,7 @@ impl GoConfig {
             decimal_mapping,
             indent_style: "\t".to_string(), // Go convention is tabs
             go_imports,
+            union_names: std::collections::HashSet::new(),
         })
     }
 }
@@ -1752,6 +1760,7 @@ fn go_enc_value(
             "timestamp" => format!("csilEncTimestamp({expr})"),
             "decimal" => format!("csilEncDecimal({expr})"),
             "nil" | "null" => "cborNull{}".to_string(),
+            "any" => format!("cborEncAny({expr})"),
             _ => "cborNull{}".to_string(),
         },
         CsilTypeExpression::Reference(name) if records.contains(name) => {
@@ -1763,6 +1772,10 @@ fn go_enc_value(
         // the map/array/scalar encoder expects, so the same `expr` flows through.
         CsilTypeExpression::Reference(name) if aliases.contains_key(name) => {
             go_enc_value(&aliases[name], expr, records, aliases, config)
+        }
+        // A union (non-literal type-choice) has its own tagged-sum codec helper.
+        CsilTypeExpression::Reference(name) if config.union_names.contains(name) => {
+            format!("csilEnc{name}({expr})")
         }
         CsilTypeExpression::Array { element_type, .. } => {
             let elem_ty = map_csil_type_to_go(element_type, &None, config.decimal_go_type());
@@ -1778,7 +1791,8 @@ fn go_enc_value(
                 "cborEncMap({expr}, func(csilK {key_ty}) cborValue {{ return {kenc} }}, func(csilV {val_ty}) cborValue {{ return {venc} }})"
             )
         }
-        // A type the codec cannot model precisely (a choice, a tuple, `any`) is
+        CsilTypeExpression::Tuple(group) => go_tuple_enc(group, expr, records, aliases, config),
+        // A type the codec cannot model precisely (`any`, an unmodeled reference) is
         // carried as null rather than emitting uncompilable code.
         _ => "cborNull{}".to_string(),
     }
@@ -1803,6 +1817,7 @@ fn go_dec_func(
             "bool" => "cborAsBool".to_string(),
             "timestamp" => "csilAsTimestamp".to_string(),
             "decimal" => "csilAsDecimal".to_string(),
+            "any" => "cborDecAny".to_string(),
             other => codec_zero_decoder(&map_csil_type_to_go(
                 &CsilTypeExpression::Builtin(other.to_string()),
                 &None,
@@ -1810,6 +1825,10 @@ fn go_dec_func(
             )),
         },
         CsilTypeExpression::Reference(name) if records.contains(name) => format!("csilDec{name}"),
+        // A union (non-literal type-choice) decodes via its tagged-sum codec helper.
+        CsilTypeExpression::Reference(name) if config.union_names.contains(name) => {
+            format!("csilDec{name}")
+        }
         // A reference to a transparent alias (or enum) decodes via its underlying type,
         // then converts the bare underlying the runtime returns to the named field type.
         // Go does NOT implicitly assign a `string` to a named `HouseID`, nor a `[]string`
@@ -1839,6 +1858,7 @@ fn go_dec_func(
                 "func(csilV cborValue) (map[{key_ty}]{val_ty}, error) {{ return cborDecMap(csilV, {kf}, {vf}) }}"
             )
         }
+        CsilTypeExpression::Tuple(group) => go_tuple_dec(group, records, aliases, config),
         // The codec cannot reconstruct this shape; yield its zero value so the
         // generated decoder still compiles against the field's Go type.
         other => codec_zero_decoder(&map_csil_type_to_go(other, &None, config.decimal_go_type())),
@@ -2019,6 +2039,86 @@ fn emit_record_codec(
 
 /// Build `codec.gen.go`: the self-contained canonical-CBOR runtime plus an
 /// `Encode`/`Decode` pair per record. `None` when the spec declares no records.
+/// Named non-literal type-choices (unions) and their variant types, in declaration
+/// order. Literal-only choices are enums (aliased to a scalar elsewhere); a choice
+/// carrying a `null` variant is an optional, not a union — both are excluded.
+fn union_defs(input: &WasmGeneratorInput) -> Vec<(String, Vec<CsilTypeExpression>)> {
+    input
+        .csil_spec
+        .rules
+        .iter()
+        .filter_map(|rule| {
+            let choices = match &rule.rule_type {
+                CsilRuleType::TypeChoice(c) => c,
+                CsilRuleType::TypeDef(CsilTypeExpression::Choice(c)) => c,
+                _ => return None,
+            };
+            if enum_scalar_builtin(choices).is_some() {
+                return None;
+            }
+            let has_null = choices
+                .iter()
+                .any(|c| matches!(c, CsilTypeExpression::Literal(CsilLiteralValue::Null)));
+            if has_null {
+                return None;
+            }
+            Some((rule.name.clone(), choices.clone()))
+        })
+        .collect()
+}
+
+/// Emit the `csilEnc<T>`/`csilDec<T>` pair for a union: a tagged sum
+/// `[variant_index, value]`. Encode type-switches on the Go variant type to find the
+/// index; decode reads the index and dispatches to that variant's decoder.
+fn emit_union_codec(
+    name: &str,
+    variants: &[CsilTypeExpression],
+    records: &std::collections::HashSet<String>,
+    aliases: &std::collections::HashMap<String, CsilTypeExpression>,
+    config: &GoConfig,
+) -> String {
+    let dec = config.decimal_go_type();
+    let mut out = String::new();
+
+    out.push_str(&format!(
+        "// csilEnc{name} encodes a {name} union as a tagged sum [variant_index, value].\n"
+    ));
+    out.push_str(&format!("func csilEnc{name}(csilV {name}) cborValue {{\n"));
+    out.push_str("\tswitch csilX := csilV.(type) {\n");
+    for (i, variant) in variants.iter().enumerate() {
+        let go_type = map_csil_type_to_go(variant, &None, dec);
+        let enc = go_enc_value(variant, "csilX", records, aliases, config);
+        out.push_str(&format!(
+            "\tcase {go_type}:\n\t\treturn cborArray{{cborUint({i}), {enc}}}\n"
+        ));
+    }
+    out.push_str("\tdefault:\n\t\treturn cborNull{}\n\t}\n}\n\n");
+
+    out.push_str(&format!(
+        "// csilDec{name} decodes a tagged sum [variant_index, value] into a {name} union.\n"
+    ));
+    out.push_str(&format!(
+        "func csilDec{name}(csilV cborValue) ({name}, error) {{\n"
+    ));
+    out.push_str(&format!(
+        "\tcsilArr, csilOk := csilV.(cborArray)\n\tif !csilOk || len(csilArr) != 2 {{\n\t\tvar csilZero {name}\n\t\treturn csilZero, fmt.Errorf(\"csil cbor: {name} union expects a 2-element array\")\n\t}}\n"
+    ));
+    out.push_str(&format!(
+        "\tcsilIdx, csilIdxErr := cborAsU64(csilArr[0])\n\tif csilIdxErr != nil {{\n\t\tvar csilZero {name}\n\t\treturn csilZero, csilIdxErr\n\t}}\n"
+    ));
+    out.push_str("\tswitch csilIdx {\n");
+    for (i, variant) in variants.iter().enumerate() {
+        let decf = go_dec_func(variant, records, aliases, config);
+        out.push_str(&format!(
+            "\tcase {i}:\n\t\tcsilVal, csilErr := ({decf})(csilArr[1])\n\t\treturn csilVal, csilErr\n"
+        ));
+    }
+    out.push_str(&format!(
+        "\tdefault:\n\t\tvar csilZero {name}\n\t\treturn csilZero, fmt.Errorf(\"csil cbor: unknown {name} variant %d\", csilIdx)\n\t}}\n}}\n\n"
+    ));
+    out
+}
+
 fn generate_codec(input: &WasmGeneratorInput, config: &GoConfig) -> Option<String> {
     if !spec_has_records(input) {
         return None;
@@ -2058,6 +2158,10 @@ fn generate_codec(input: &WasmGeneratorInput, config: &GoConfig) -> Option<Strin
     content.push_str(")\n\n");
 
     content.push_str(CODEC_RUNTIME_GO);
+    if spec_uses_builtin(input, "any") {
+        content.push('\n');
+        content.push_str(CODEC_ANY_GO);
+    }
     if uses_timestamp {
         content.push('\n');
         content.push_str(CODEC_TIMESTAMP_GO);
@@ -2085,6 +2189,12 @@ fn generate_codec(input: &WasmGeneratorInput, config: &GoConfig) -> Option<Strin
             ));
         }
     }
+    // Tagged-sum codec helpers for unions referenced by record fields.
+    for (name, variants) in union_defs(input) {
+        content.push_str(&emit_union_codec(
+            &name, &variants, &records, &aliases, config,
+        ));
+    }
     Some(content)
 }
 
@@ -2092,6 +2202,58 @@ fn generate_codec(input: &WasmGeneratorInput, config: &GoConfig) -> Option<Strin
 /// decoder, generic composite helpers, and accessors every generated codec builds
 /// on. `bytes` is a Go `[]byte` carried as a CBOR byte string (major type 2) by
 /// construction, never an array of integers.
+/// Dynamic codec for `any`: map a Go native value to/from the CBOR value tree.
+/// Emitted only when the spec uses `any`. Round-trips the scalar shapes the value
+/// tree models; an already-`cborValue` passes through on encode.
+const CODEC_ANY_GO: &str = r#"// cborEncAny encodes an untyped Go value (`any`) into the CBOR value tree.
+func cborEncAny(v interface{}) cborValue {
+	switch x := v.(type) {
+	case nil:
+		return cborNull{}
+	case cborValue:
+		return x
+	case bool:
+		return cborBool(x)
+	case string:
+		return cborText(x)
+	case []byte:
+		return cborBytes(x)
+	case int:
+		return cborInt(int64(x))
+	case int64:
+		return cborInt(x)
+	case uint64:
+		return cborUint(x)
+	case float64:
+		return cborFloat(x)
+	default:
+		return cborNull{}
+	}
+}
+
+// cborDecAny reconstructs an untyped Go value (`any`) from the CBOR value tree.
+func cborDecAny(v cborValue) (interface{}, error) {
+	switch x := v.(type) {
+	case cborNull:
+		return nil, nil
+	case cborBool:
+		return bool(x), nil
+	case cborText:
+		return string(x), nil
+	case cborBytes:
+		return []byte(x), nil
+	case cborInt:
+		return int64(x), nil
+	case cborUint:
+		return uint64(x), nil
+	case cborFloat:
+		return float64(x), nil
+	default:
+		return nil, fmt.Errorf("csil cbor: cannot decode value as any")
+	}
+}
+"#;
+
 const CODEC_RUNTIME_GO: &str = r#"// cborValue is a minimal canonical-CBOR value tree: a closed set of variants the
 // generated codec builds and walks. The marker method keeps the set closed.
 type cborValue interface{ isCbor() }
@@ -3967,6 +4129,9 @@ fn map_csil_type_to_go(
         CsilTypeExpression::Builtin(name) => match name.as_str() {
             "int" => "int64",
             "uint" => "uint64",
+            // Negative integer (CBOR major type 1); the codec routes `nint`
+            // through the signed-integer path, so it shares int64.
+            "nint" => "int64",
             "float" => "float64",
             // `tstr`/`bstr` are the CDDL spellings of `text`/`bytes`; the lexer
             // accepts both, so every generator maps the pair identically.
@@ -4024,6 +4189,85 @@ fn map_csil_type_to_go(
 /// tuple slot in anywhere a type string is expected — top-level alias, struct
 /// field, slice element, or map value — and stay type-safe. Keyed entries take
 /// their key's name; positional ones fall back to `Field0`/`Field1`/….
+/// The Go field name for tuple element `index` — its key's PascalCase, or the
+/// positional `Field<index>` fallback (matching `go_tuple_struct`).
+fn go_tuple_field_name(entry: &CsilGroupEntry, index: usize) -> String {
+    match &entry.key {
+        Some(key) => go_field_name_from_key(key),
+        None => format!("Field{index}"),
+    }
+}
+
+/// Encode a fixed-shape tuple (an anonymous Go struct) positionally into a CBOR
+/// array via an inline func; an absent optional element (a nil pointer) is held in
+/// place as null so the array length is fixed.
+fn go_tuple_enc(
+    group: &CsilGroupExpression,
+    expr: &str,
+    records: &std::collections::HashSet<String>,
+    aliases: &std::collections::HashMap<String, CsilTypeExpression>,
+    config: &GoConfig,
+) -> String {
+    let st = go_tuple_struct(&group.entries, config.decimal_go_type());
+    let mut parts = Vec::with_capacity(group.entries.len());
+    for (i, entry) in group.entries.iter().enumerate() {
+        let field = go_tuple_field_name(entry, i);
+        if matches!(entry.occurrence, Some(CsilOccurrence::Optional)) {
+            let inner = go_enc_value(&entry.value_type, "csilDeref", records, aliases, config);
+            parts.push(format!(
+                "func() cborValue {{ if csilT.{field} == nil {{ return cborNull{{}} }}; csilDeref := *csilT.{field}; return {inner} }}()"
+            ));
+        } else {
+            let inner = go_enc_value(
+                &entry.value_type,
+                &format!("csilT.{field}"),
+                records,
+                aliases,
+                config,
+            );
+            parts.push(inner);
+        }
+    }
+    format!(
+        "func(csilT {st}) cborValue {{ return cborArray{{{}}} }}({expr})",
+        parts.join(", ")
+    )
+}
+
+/// Decode a fixed-shape tuple positionally from a CBOR array into the anonymous Go
+/// struct; an optional element reads `null` as a nil pointer.
+fn go_tuple_dec(
+    group: &CsilGroupExpression,
+    records: &std::collections::HashSet<String>,
+    aliases: &std::collections::HashMap<String, CsilTypeExpression>,
+    config: &GoConfig,
+) -> String {
+    let st = go_tuple_struct(&group.entries, config.decimal_go_type());
+    let n = group.entries.len();
+    let mut body = String::new();
+    body.push_str(&format!("var csilZero {st}; "));
+    body.push_str("csilArr, csilOk := csilV.(cborArray); ");
+    body.push_str(&format!(
+        "if !csilOk || len(csilArr) != {n} {{ return csilZero, fmt.Errorf(\"csil cbor: tuple expects {n} elements\") }}; "
+    ));
+    body.push_str(&format!("var csilOut {st}; "));
+    for (i, entry) in group.entries.iter().enumerate() {
+        let field = go_tuple_field_name(entry, i);
+        let dec = go_dec_func(&entry.value_type, records, aliases, config);
+        if matches!(entry.occurrence, Some(CsilOccurrence::Optional)) {
+            body.push_str(&format!(
+                "if _, csilNull{i} := csilArr[{i}].(cborNull); !csilNull{i} {{ csilV{i}, csilErr{i} := ({dec})(csilArr[{i}]); if csilErr{i} != nil {{ return csilZero, csilErr{i} }}; csilOut.{field} = &csilV{i} }}; "
+            ));
+        } else {
+            body.push_str(&format!(
+                "csilV{i}, csilErr{i} := ({dec})(csilArr[{i}]); if csilErr{i} != nil {{ return csilZero, csilErr{i} }}; csilOut.{field} = csilV{i}; "
+            ));
+        }
+    }
+    body.push_str("return csilOut, nil");
+    format!("func(csilV cborValue) ({st}, error) {{ {body} }}")
+}
+
 fn go_tuple_struct(entries: &[CsilGroupEntry], decimal_type: &str) -> String {
     let fields: Vec<String> = entries
         .iter()

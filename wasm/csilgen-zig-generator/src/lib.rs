@@ -296,6 +296,9 @@ enum TypeKind<'a> {
     Struct(&'a CsilGroupExpression),
     Alias(&'a CsilTypeExpression),
     Enum(Vec<String>),
+    /// An all-int-literal choice (`Priority = 1 / 2 / 3`): a closed `enum(i64)`
+    /// whose wire form is the bare integer (its own discriminant), not a tagged sum.
+    IntEnum(Vec<i64>),
     Union(&'a [CsilTypeExpression]),
     GroupUnion(&'a [CsilGroupExpression]),
 }
@@ -312,17 +315,31 @@ fn classify_rule(rule_type: &CsilRuleType) -> Option<TypeKind<'_>> {
         }
         CsilRuleType::TypeDef(t) => Some(TypeKind::Alias(t)),
         CsilRuleType::TypeChoice(arms) => {
-            let literals: Option<Vec<String>> = arms
+            let text_literals: Option<Vec<String>> = arms
                 .iter()
-                .map(|a| match a {
+                .map(|a| match unwrap_constrained(a) {
                     CsilTypeExpression::Literal(CsilLiteralValue::Text(t)) => Some(t.clone()),
                     _ => None,
                 })
                 .collect();
-            Some(match literals {
-                Some(names) => TypeKind::Enum(names),
-                None => TypeKind::Union(arms),
-            })
+            if let Some(names) = text_literals
+                && !names.is_empty()
+            {
+                return Some(TypeKind::Enum(names));
+            }
+            let int_literals: Option<Vec<i64>> = arms
+                .iter()
+                .map(|a| match unwrap_constrained(a) {
+                    CsilTypeExpression::Literal(CsilLiteralValue::Integer(n)) => Some(*n),
+                    _ => None,
+                })
+                .collect();
+            if let Some(ints) = int_literals
+                && !ints.is_empty()
+            {
+                return Some(TypeKind::IntEnum(ints));
+            }
+            Some(TypeKind::Union(arms))
         }
         CsilRuleType::GroupChoice(arms) => Some(TypeKind::GroupUnion(arms)),
         CsilRuleType::ServiceDef(_) => None,
@@ -339,18 +356,37 @@ fn classify_choice<'a>(
     arms: &'a [CsilTypeExpression],
     whole: &'a CsilTypeExpression,
 ) -> TypeKind<'a> {
-    let literals: Option<Vec<String>> = arms
+    let text_literals: Option<Vec<String>> = arms
         .iter()
-        .map(|a| match a {
+        .map(|a| match unwrap_constrained(a) {
             CsilTypeExpression::Literal(CsilLiteralValue::Text(t)) => Some(t.clone()),
             _ => None,
         })
         .collect();
-    match literals {
-        Some(names) if !names.is_empty() => TypeKind::Enum(names),
-        _ if arms.iter().all(is_text_like) => TypeKind::Alias(whole),
-        _ => TypeKind::Union(arms),
+    if let Some(names) = text_literals
+        && !names.is_empty()
+    {
+        return TypeKind::Enum(names);
     }
+    // An all-int-literal choice is a closed integer enum whose wire form is the bare
+    // integer (matching the Go/Rust references); only a heterogeneous set of real
+    // types becomes a tagged-sum union.
+    let int_literals: Option<Vec<i64>> = arms
+        .iter()
+        .map(|a| match unwrap_constrained(a) {
+            CsilTypeExpression::Literal(CsilLiteralValue::Integer(n)) => Some(*n),
+            _ => None,
+        })
+        .collect();
+    if let Some(ints) = int_literals
+        && !ints.is_empty()
+    {
+        return TypeKind::IntEnum(ints);
+    }
+    if arms.iter().all(is_text_like) {
+        return TypeKind::Alias(whole);
+    }
+    TypeKind::Union(arms)
 }
 
 /// The names this entry embeds *by value* (so its definition is ordered after
@@ -389,6 +425,7 @@ fn generate_types(input: &WasmGeneratorInput, config: &ZigConfig) -> Option<Stri
     for (name, kind) in &typed {
         match kind {
             TypeKind::Enum(variants) => emit_enum(&mut enums, name, variants),
+            TypeKind::IntEnum(values) => emit_int_enum(&mut enums, name, values),
             TypeKind::Alias(t) => {
                 aliases.push_str(&format!("/// {name} is a type alias.\n"));
                 aliases.push_str(&format!("pub const {name} = {};\n\n", map_zig_type(t, "")));
@@ -465,6 +502,11 @@ fn generate_types(input: &WasmGeneratorInput, config: &ZigConfig) -> Option<Stri
     {
         content.push('\n');
     }
+    // An `any`-typed field holds the codec's CBOR value tree; re-export it from the
+    // codec so a type's public surface names the in-memory representation.
+    if spec_uses_builtin(input, "any") {
+        content.push_str("pub const CsilValue = @import(\"codec.gen.zig\").CsilValue;\n\n");
+    }
     // Zig resolves container-level declarations lazily, so types may reference each
     // other regardless of source order — no C-style forward declarations exist or
     // are needed. The definitions below are still emitted in by-value dependency
@@ -535,6 +577,31 @@ fn emit_enum(content: &mut String, name: &str, variants: &[String]) {
     content.push_str("        };\n");
     content.push_str("    }\n");
     content.push_str("};\n\n");
+}
+
+/// An all-int-literal choice maps to a Zig `enum(i64)` with explicit values. The
+/// wire form is the bare integer (its own discriminant), so `wire_value` exposes
+/// the backing integer and the codec encodes/decodes it directly.
+fn emit_int_enum(content: &mut String, name: &str, values: &[i64]) {
+    content.push_str(&format!("/// {name} is an integer enumeration.\n"));
+    content.push_str(&format!("pub const {name} = enum(i64) {{\n"));
+    for v in values {
+        content.push_str(&format!("    {} = {v},\n", int_enum_member(*v)));
+    }
+    content.push_str(&format!(
+        "\n    pub fn wire_value(self: {name}) i64 {{\n        return @intFromEnum(self);\n    }}\n"
+    ));
+    content.push_str("};\n\n");
+}
+
+/// A stable Zig identifier for an int-enum member. Negative values get a `neg`
+/// prefix so the result is always a valid bare identifier.
+fn int_enum_member(v: i64) -> String {
+    if v < 0 {
+        format!("v_neg{}", v.unsigned_abs())
+    } else {
+        format!("v{v}")
+    }
 }
 
 fn emit_struct(content: &mut String, name: &str, group: &CsilGroupExpression, type_prefix: &str) {
@@ -891,7 +958,9 @@ fn emit_enc_value(
                 "{indent}try w_tag(out, 4);\n{indent}try w_array_head(out, 2);\n\
                  {indent}try w_int(out, ({expr}).exponent);\n{indent}try w_int(out, ({expr}).mantissa);\n"
             )),
-            "null" | "nil" | "undefined" | "any" => {
+            // `any` passes its decoded CBOR value through unchanged.
+            "any" => out.push_str(&format!("{indent}try w_value(out, {expr});\n")),
+            "null" | "nil" | "undefined" => {
                 out.push_str(&format!("{indent}try w_null(out);\n"))
             }
             other => {
@@ -901,6 +970,42 @@ fn emit_enc_value(
                 out.push_str(&format!("{indent}try w_null(out);\n"));
             }
         },
+        // A fixed-shape tuple is a positional CBOR array; an absent optional element
+        // is `null` held in place (the array keeps its fixed length).
+        CsilTypeExpression::Tuple(group) => {
+            out.push_str(&format!(
+                "{indent}try w_array_head(out, {});\n",
+                group.entries.len()
+            ));
+            for (i, entry) in group.entries.iter().enumerate() {
+                let elem = format!("({expr})[{i}]");
+                if matches!(entry.occurrence, Some(CsilOccurrence::Optional)) {
+                    out.push_str(&format!("{indent}if ({elem}) |csil_e{i}| {{\n"));
+                    emit_enc_value(
+                        out,
+                        &format!("{indent}    "),
+                        &entry.value_type,
+                        &format!("csil_e{i}"),
+                        codec_names,
+                        aliases,
+                        warnings,
+                    );
+                    out.push_str(&format!(
+                        "{indent}}} else {{\n{indent}    try w_null(out);\n{indent}}}\n"
+                    ));
+                } else {
+                    emit_enc_value(
+                        out,
+                        indent,
+                        &entry.value_type,
+                        &elem,
+                        codec_names,
+                        aliases,
+                        warnings,
+                    );
+                }
+            }
+        }
         CsilTypeExpression::Reference(name) if has_codec(name, codec_names) => {
             out.push_str(&format!("{indent}try enc_{name}(out, &({expr}));\n"))
         }
@@ -974,7 +1079,9 @@ fn emit_dec_value(
                 "{indent}{{\n{indent}    const csil_d = try as_decimal({src});\n\
                  {indent}    {dst} = .{{ .exponent = csil_d.exp, .mantissa = csil_d.mant }};\n{indent}}}\n"
             )),
-            "null" | "nil" | "undefined" | "any" => {
+            // `any` keeps the decoded CBOR value verbatim (it aliases the decode arena).
+            "any" => out.push_str(&format!("{indent}{dst} = {src};\n")),
+            "null" | "nil" | "undefined" => {
                 out.push_str(&format!("{indent}{dst} = null;\n"))
             }
             other => {
@@ -984,6 +1091,45 @@ fn emit_dec_value(
                 out.push_str(&format!("{indent}_ = {src};\n"));
             }
         },
+        // A fixed-shape tuple decodes positionally from a fixed-length CBOR array; an
+        // optional slot reads `null` in place as the absent value.
+        CsilTypeExpression::Tuple(group) => {
+            let len = group.entries.len();
+            out.push_str(&format!(
+                "{indent}if ({src} != .array or {src}.array.len != {len}) return error.WrongType;\n"
+            ));
+            for (i, entry) in group.entries.iter().enumerate() {
+                let elem_src = format!("{src}.array[{i}]");
+                let elem_dst = format!("{dst}[{i}]");
+                if matches!(entry.occurrence, Some(CsilOccurrence::Optional)) {
+                    out.push_str(&format!("{indent}if ({elem_src} == .null) {{\n"));
+                    out.push_str(&format!("{indent}    {elem_dst} = null;\n"));
+                    out.push_str(&format!("{indent}}} else {{\n"));
+                    emit_dec_value(
+                        out,
+                        &format!("{indent}    "),
+                        &entry.value_type,
+                        &elem_src,
+                        &elem_dst,
+                        codec_names,
+                        aliases,
+                        warnings,
+                    );
+                    out.push_str(&format!("{indent}}}\n"));
+                } else {
+                    emit_dec_value(
+                        out,
+                        indent,
+                        &entry.value_type,
+                        &elem_src,
+                        &elem_dst,
+                        codec_names,
+                        aliases,
+                        warnings,
+                    );
+                }
+            }
+        }
         CsilTypeExpression::Reference(name) if has_codec(name, codec_names) => {
             out.push_str(&format!("{indent}try dec_{name}(alloc, {src}, &({dst}));\n"))
         }
@@ -1431,6 +1577,110 @@ fn emit_enum_codec(out: &mut String, name: &str, variants: &[String]) {
     out.push_str("    return error.WrongType;\n}\n\n");
 }
 
+/// Emit the encode + decode for an int-enum type. The wire form is the bare backing
+/// integer (the enum's own discriminant); `intToEnum` rejects an unknown value.
+fn emit_int_enum_codec(out: &mut String, name: &str) {
+    out.push_str(&format!(
+        "fn enc_{name}(out: *std.ArrayList(u8), v: *const types.{name}) CodecError!void {{\n"
+    ));
+    out.push_str("    try w_int(out, @intFromEnum(v.*));\n}\n\n");
+    out.push_str(&format!(
+        "fn dec_{name}(alloc: std.mem.Allocator, src: Value, out: *types.{name}) CodecError!void {{\n"
+    ));
+    out.push_str("    _ = alloc;\n");
+    out.push_str(&format!(
+        "    out.* = std.meta.intToEnum(types.{name}, try as_i64(src)) catch return error.WrongType;\n}}\n\n"
+    ));
+}
+
+/// Emit the encode + decode for a tagged-sum union. The wire form is a 2-element CBOR
+/// array `[variant_index, value]`: the 0-based declaration ordinal then that arm's own
+/// CBOR. Decode reads the index and dispatches to that arm's decoder.
+fn emit_union_codec(
+    out: &mut String,
+    name: &str,
+    arms: &[CsilTypeExpression],
+    codec_names: &std::collections::HashSet<String>,
+    aliases: &HashMap<String, CsilTypeExpression>,
+    warnings: &mut Vec<GeneratorWarning>,
+) {
+    out.push_str(&format!(
+        "fn enc_{name}(out: *std.ArrayList(u8), v: *const types.{name}) CodecError!void {{\n"
+    ));
+    out.push_str("    try w_array_head(out, 2);\n");
+    out.push_str("    switch (v.*) {\n");
+    for (i, arm) in arms.iter().enumerate() {
+        let tag = zig_ident(&to_snake(&arm_name(arm, i)));
+        out.push_str(&format!("        .{tag} => |csil_x| {{\n"));
+        out.push_str(&format!("            try w_uint(out, {i});\n"));
+        emit_enc_value(
+            out,
+            "            ",
+            arm,
+            "csil_x",
+            codec_names,
+            aliases,
+            warnings,
+        );
+        out.push_str("        },\n");
+    }
+    out.push_str("    }\n}\n\n");
+
+    out.push_str(&format!(
+        "fn dec_{name}(alloc: std.mem.Allocator, src: Value, out: *types.{name}) CodecError!void {{\n"
+    ));
+    if !arms
+        .iter()
+        .any(|a| dec_value_uses_alloc(a, codec_names, aliases))
+    {
+        out.push_str("    _ = alloc;\n");
+    }
+    out.push_str("    if (src != .array or src.array.len != 2) return error.WrongType;\n");
+    out.push_str("    const csil_idx = try as_u64(src.array[0]);\n");
+    out.push_str("    switch (csil_idx) {\n");
+    for (i, arm) in arms.iter().enumerate() {
+        let tag = zig_ident(&to_snake(&arm_name(arm, i)));
+        out.push_str(&format!("        {i} => {{\n"));
+        out.push_str(&format!(
+            "            var csil_tmp: {} = undefined;\n",
+            map_zig_type(arm, "types.")
+        ));
+        emit_dec_value(
+            out,
+            "            ",
+            arm,
+            "src.array[1]",
+            "csil_tmp",
+            codec_names,
+            aliases,
+            warnings,
+        );
+        out.push_str(&format!("            out.* = .{{ .{tag} = csil_tmp }};\n"));
+        out.push_str("        },\n");
+    }
+    out.push_str("        else => return error.WrongType,\n");
+    out.push_str("    }\n}\n\n");
+}
+
+/// Whether decoding a value of this type needs the allocator (a referenced codec, an
+/// array, or a map allocates; scalars do not). Used to decide whether a generated
+/// decoder must `_ = alloc` to satisfy Zig's unused-parameter check.
+fn dec_value_uses_alloc(
+    ty: &CsilTypeExpression,
+    codec_names: &std::collections::HashSet<String>,
+    aliases: &HashMap<String, CsilTypeExpression>,
+) -> bool {
+    match resolve_alias(ty, aliases) {
+        CsilTypeExpression::Reference(n) => has_codec(n, codec_names),
+        CsilTypeExpression::Array { .. } | CsilTypeExpression::Map { .. } => true,
+        CsilTypeExpression::Tuple(g) => g
+            .entries
+            .iter()
+            .any(|e| dec_value_uses_alloc(&e.value_type, codec_names, aliases)),
+        _ => false,
+    }
+}
+
 fn generate_codec(
     input: &WasmGeneratorInput,
     config: &ZigConfig,
@@ -1444,7 +1694,12 @@ fn generate_codec(
         .collect();
     let codec_names: std::collections::HashSet<String> = typed
         .iter()
-        .filter(|(_, k)| matches!(k, TypeKind::Struct(_) | TypeKind::Enum(_)))
+        .filter(|(_, k)| {
+            matches!(
+                k,
+                TypeKind::Struct(_) | TypeKind::Enum(_) | TypeKind::IntEnum(_) | TypeKind::Union(_)
+            )
+        })
         .map(|(n, _)| n.to_string())
         .collect();
     if codec_names.is_empty() {
@@ -1460,6 +1715,10 @@ fn generate_codec(
                 emit_record_codec(&mut bodies, name, group, &codec_names, &aliases, warnings)
             }
             TypeKind::Enum(variants) => emit_enum_codec(&mut bodies, name, variants),
+            TypeKind::IntEnum(_) => emit_int_enum_codec(&mut bodies, name),
+            TypeKind::Union(arms) => {
+                emit_union_codec(&mut bodies, name, arms, &codec_names, &aliases, warnings)
+            }
             _ => continue,
         }
         // Public, ergonomic per-type wrappers: encode to a caller-freed slice; decode
@@ -1829,10 +2088,31 @@ fn map_zig_type(type_expr: &CsilTypeExpression, type_prefix: &str) -> String {
             "bool" | "true" | "false" => "bool".to_string(),
             "timestamp" => format!("{type_prefix}CsilTimestamp"),
             "decimal" => format!("{type_prefix}CsilDecimal"),
-            "null" | "nil" | "undefined" | "any" => "?*anyopaque".to_string(),
+            // `any` holds an arbitrary decoded CBOR value (the codec's value tree),
+            // passed through unchanged on the wire.
+            "any" => format!("{type_prefix}CsilValue"),
+            "null" | "nil" | "undefined" => "?*anyopaque".to_string(),
             other => format!("{type_prefix}{other}"),
         },
         CsilTypeExpression::Reference(name) => format!("{type_prefix}{name}"),
+        // A fixed-shape tuple is a Zig tuple struct, one positional field per element;
+        // an optional element is a `?T` slot (held as `null` in place on the wire).
+        CsilTypeExpression::Tuple(group) => {
+            let parts: Vec<String> = group
+                .entries
+                .iter()
+                .map(|e| {
+                    let t = map_zig_type(&e.value_type, type_prefix);
+                    if matches!(e.occurrence, Some(CsilOccurrence::Optional)) && !t.starts_with('?')
+                    {
+                        format!("?{t}")
+                    } else {
+                        t
+                    }
+                })
+                .collect();
+            format!("struct {{ {} }}", parts.join(", "))
+        }
         CsilTypeExpression::Array { element_type, .. } => {
             format!("[]{}", map_zig_type(element_type, type_prefix))
         }
@@ -3058,10 +3338,10 @@ const CSIL_CODEC_RUNTIME_ZIG: &str = r#"// ===== self-contained canonical CBOR c
 
 const CodecError = error{ Malformed, UnexpectedEof, TrailingBytes, WrongType, MissingField } || std.mem.Allocator.Error;
 
-const Pair = struct { key: Value, val: Value };
-const Tag = struct { num: u64, content: *Value };
+pub const Pair = struct { key: Value, val: Value };
+pub const Tag = struct { num: u64, content: *Value };
 
-const Value = union(enum) {
+pub const Value = union(enum) {
     uint: u64,
     int: i64,
     float: f64,
@@ -3073,6 +3353,10 @@ const Value = union(enum) {
     map: []Pair,
     tag: Tag,
 };
+
+/// The in-memory representation of an `any`-typed field: a decoded CBOR value tree
+/// passed through unchanged on the wire.
+pub const CsilValue = Value;
 
 fn write_head(out: *std.ArrayList(u8), major: u8, n: u64) std.mem.Allocator.Error!void {
     const mt: u8 = major << 5;
@@ -3154,6 +3438,35 @@ fn w_f32(out: *std.ArrayList(u8), x: f32) std.mem.Allocator.Error!void {
     var b: [4]u8 = undefined;
     std.mem.writeInt(u32, &b, @bitCast(x), .big);
     try out.appendSlice(&b);
+}
+
+/// Encodes a decoded CBOR value tree verbatim — the passthrough an `any`-typed field
+/// needs. The bytes reproduce what was decoded (including nested arrays/maps/tags).
+fn w_value(out: *std.ArrayList(u8), v: Value) std.mem.Allocator.Error!void {
+    switch (v) {
+        .uint => |x| try w_uint(out, x),
+        .int => |x| try w_int(out, x),
+        .float => |x| try w_f64(out, x),
+        .boolean => |x| try w_bool(out, x),
+        .null => try w_null(out),
+        .bytes => |s| try w_bytes(out, s),
+        .text => |s| try w_text(out, s),
+        .array => |arr| {
+            try w_array_head(out, arr.len);
+            for (arr) |csil_e| try w_value(out, csil_e);
+        },
+        .map => |m| {
+            try w_map_head(out, m.len);
+            for (m) |csil_e| {
+                try w_value(out, csil_e.key);
+                try w_value(out, csil_e.val);
+            }
+        },
+        .tag => |t| {
+            try w_tag(out, t.num);
+            try w_value(out, t.content.*);
+        },
+    }
 }
 
 const Decoded = struct { value: Value, consumed: usize };

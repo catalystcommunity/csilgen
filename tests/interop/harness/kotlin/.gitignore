@@ -1,0 +1,4 @@
+# Generated package + build outputs; only the harness source is checked in.
+gen/
+build/
+.gradle/

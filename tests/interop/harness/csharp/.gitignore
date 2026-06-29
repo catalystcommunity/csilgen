@@ -1,0 +1,4 @@
+# Build artifacts and the generated package — only the harness source is checked in.
+gen/
+bin/
+obj/

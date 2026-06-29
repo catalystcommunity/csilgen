@@ -151,8 +151,14 @@ fn generate_ocaml(
     }
 
     // Per-type CBOR (de)serializers make the generated records usable over the wire
-    // without a hand-written codec; the typed client below calls them.
+    // without a hand-written codec; the typed client below calls them. The codec's
+    // canonical-CBOR value model lives in its own `csil_cbor.ml` so the `any` core
+    // type (a `Csil_cbor.t` field in `types.ml`) shares the codec's value type.
     if let Some(codec) = generate_codec(spec) {
+        files.push(GeneratedFile {
+            path: "csil_cbor.ml".to_string(),
+            content: CSIL_CBOR_OCAML.to_string(),
+        });
         files.push(GeneratedFile {
             path: "codec.ml".to_string(),
             content: codec,
@@ -1204,8 +1210,13 @@ fn wire_op_name(name: &str) -> String {
 fn map_type(type_expr: &CsilTypeExpression) -> String {
     match type_expr {
         CsilTypeExpression::Builtin(name) => match name.as_str() {
-            "int" | "uint" => "int64".to_string(),
-            "float" => "float".to_string(),
+            // CSIL signed/unsigned integers and `nint` all map to `int64`: OCaml's
+            // native `int` is only 63-bit, so a `uint`/large wire value would lose its
+            // high bit. `nint` is a logically-negative integer, still an `int64`.
+            "int" | "uint" | "nint" => "int64".to_string(),
+            // CSIL spells the float core type `float64` (and `float16`/`float32`);
+            // all carry as OCaml's native double-precision `float`.
+            "float" | "float16" | "float32" | "float64" => "float".to_string(),
             // `tstr`/`bstr` are the CDDL spellings of `text`/`bytes`.
             "text" | "tstr" => "string".to_string(),
             "bytes" | "bstr" => "bytes".to_string(),
@@ -1216,7 +1227,9 @@ fn map_type(type_expr: &CsilTypeExpression) -> String {
             "timestamp" => "string".to_string(),
             "decimal" => "string".to_string(),
             "nil" | "null" => "unit".to_string(),
-            "any" => "Csilgen_transport.Cbor.t".to_string(),
+            // `any` is an arbitrary CBOR value, carried through the codec's own
+            // standalone value model so it survives a round-trip unchanged.
+            "any" => "Csil_cbor.t".to_string(),
             other => ocaml_type_name(other),
         },
         CsilTypeExpression::Reference(name) => ocaml_type_name(name),
@@ -1232,10 +1245,19 @@ fn map_type(type_expr: &CsilTypeExpression) -> String {
             if group.entries.is_empty() {
                 "unit".to_string()
             } else {
+                // A tuple's optional element (`?int`) is held as an `option` so an
+                // absent position (encoded as null-in-place) round-trips as `None`.
                 let parts: Vec<String> = group
                     .entries
                     .iter()
-                    .map(|e| map_type(&e.value_type))
+                    .map(|e| {
+                        let base = map_type(&e.value_type);
+                        if matches!(e.occurrence, Some(CsilOccurrence::Optional)) {
+                            format!("{base} option")
+                        } else {
+                            base
+                        }
+                    })
                     .collect();
                 format!("({})", parts.join(" * "))
             }
@@ -1243,8 +1265,8 @@ fn map_type(type_expr: &CsilTypeExpression) -> String {
         CsilTypeExpression::Constrained { base_type, .. } => map_type(base_type),
         // A choice that is not a named rule collapses to the opaque CBOR value; a
         // named choice gets its own variant type via `generate_type_choice`.
-        CsilTypeExpression::Choice(_) => "Csilgen_transport.Cbor.t".to_string(),
-        _ => "Csilgen_transport.Cbor.t".to_string(),
+        CsilTypeExpression::Choice(_) => "Csil_cbor.t".to_string(),
+        _ => "Csil_cbor.t".to_string(),
     }
 }
 
@@ -1456,56 +1478,123 @@ fn render_variant(type_name: &str, arms: &[String]) -> String {
     lines.join("\n")
 }
 
-fn generate_type_choice(name: &str, choices: &[CsilTypeExpression]) -> String {
-    let type_name = ocaml_type_name(name);
+/// The kind of OCaml variant a CSIL type-choice maps to, with the constructor names
+/// already disambiguated so the type declaration and its codec agree exactly.
+enum ChoiceShape {
+    /// All-text-literal enum (idiomatic OCaml nullary constructors), with an
+    /// `Other of string` arm when a leading `text`/`tstr` base keeps it open.
+    StringEnum {
+        arms: Vec<(String, String)>,
+        open_other: Option<String>,
+    },
+    /// All-integer-literal enum: nullary constructors, the bare integer on the wire.
+    IntEnum { arms: Vec<(String, i64)> },
+    /// A tagged-sum union: one constructor per arm carrying its mapped payload (or
+    /// nullary for a `nil`/`null` arm). On the wire it is `[variant_index, value]`.
+    Union {
+        arms: Vec<(String, CsilTypeExpression)>,
+    },
+}
 
-    // A CSIL string enum — every arm a text literal, optionally led by a single
-    // `text`/`tstr` base — is the idiomatic OCaml variant: one nullary
-    // Capitalized constructor per literal. A leading base means any string is
-    // valid on the wire, so an extra `Other of string` arm keeps an unknown value
-    // round-trippable rather than collapsing the whole type to an opaque blob.
-    let literals: Vec<&str> = choices
+/// Classify a type-choice into the OCaml variant shape it maps to, performing all
+/// constructor-name disambiguation once so `generate_type_choice` (the declaration)
+/// and `emit_choice_codec` (the wire) stay in lockstep.
+fn classify_choice(choices: &[CsilTypeExpression]) -> ChoiceShape {
+    let text_literals: Vec<&str> = choices
         .iter()
         .filter_map(|c| match c {
             CsilTypeExpression::Literal(CsilLiteralValue::Text(t)) => Some(t.as_str()),
             _ => None,
         })
         .collect();
+    let int_literals: Vec<i64> = choices
+        .iter()
+        .filter_map(|c| match c {
+            CsilTypeExpression::Literal(CsilLiteralValue::Integer(n)) => Some(*n),
+            _ => None,
+        })
+        .collect();
     let non_literals: Vec<&CsilTypeExpression> = choices
         .iter()
-        .filter(|c| !matches!(c, CsilTypeExpression::Literal(CsilLiteralValue::Text(_))))
+        .filter(|c| {
+            !matches!(
+                c,
+                CsilTypeExpression::Literal(CsilLiteralValue::Text(_))
+                    | CsilTypeExpression::Literal(CsilLiteralValue::Integer(_))
+            )
+        })
         .collect();
     let open_base = matches!(
         non_literals.as_slice(),
         [CsilTypeExpression::Builtin(n)] if n == "text" || n == "tstr"
     );
-    if !literals.is_empty() && (non_literals.is_empty() || open_base) {
+
+    // A pure string enum (optionally led by a `text` base that opens it).
+    if !text_literals.is_empty()
+        && int_literals.is_empty()
+        && (non_literals.is_empty() || open_base)
+    {
         let mut seen: Vec<String> = Vec::new();
-        let mut arms: Vec<String> = Vec::new();
-        for lit in &literals {
-            arms.push(unique_ctor(&mut seen, &ocaml_ctor_name(lit)));
-        }
-        if open_base {
-            arms.push(format!("{} of string", unique_ctor(&mut seen, "Other")));
-        }
-        return render_variant(&type_name, &arms);
+        let arms: Vec<(String, String)> = text_literals
+            .iter()
+            .map(|lit| {
+                (
+                    unique_ctor(&mut seen, &ocaml_ctor_name(lit)),
+                    lit.to_string(),
+                )
+            })
+            .collect();
+        let open_other = open_base.then(|| unique_ctor(&mut seen, "Other"));
+        return ChoiceShape::StringEnum { arms, open_other };
     }
 
-    // Otherwise a union of (named) alternatives: one constructor per arm carrying
-    // its mapped payload, with any name clash disambiguated.
+    // A pure integer enum: the bare integer is its own discriminant on the wire.
+    if !int_literals.is_empty() && text_literals.is_empty() && non_literals.is_empty() {
+        let mut seen: Vec<String> = Vec::new();
+        let arms: Vec<(String, i64)> = int_literals
+            .iter()
+            .map(|n| (unique_ctor(&mut seen, &ocaml_ctor_name(&n.to_string())), *n))
+            .collect();
+        return ChoiceShape::IntEnum { arms };
+    }
+
+    // Otherwise a tagged-sum union over the alternatives in declaration order.
     let mut seen: Vec<String> = Vec::new();
-    let arms: Vec<String> = choices
+    let arms: Vec<(String, CsilTypeExpression)> = choices
         .iter()
         .map(|choice| {
-            let (base, payload) = choice_ctor(choice);
-            let ctor = unique_ctor(&mut seen, &base);
-            match payload {
-                Some(ty) => format!("{ctor} of {ty}"),
-                None => ctor,
-            }
+            let (base, _) = choice_ctor(choice);
+            (unique_ctor(&mut seen, &base), choice.clone())
         })
         .collect();
-    render_variant(&type_name, &arms)
+    ChoiceShape::Union { arms }
+}
+
+fn generate_type_choice(name: &str, choices: &[CsilTypeExpression]) -> String {
+    let type_name = ocaml_type_name(name);
+    match classify_choice(choices) {
+        ChoiceShape::StringEnum { arms, open_other } => {
+            let mut rendered: Vec<String> = arms.into_iter().map(|(ctor, _)| ctor).collect();
+            if let Some(other) = open_other {
+                rendered.push(format!("{other} of string"));
+            }
+            render_variant(&type_name, &rendered)
+        }
+        ChoiceShape::IntEnum { arms } => {
+            let rendered: Vec<String> = arms.into_iter().map(|(ctor, _)| ctor).collect();
+            render_variant(&type_name, &rendered)
+        }
+        ChoiceShape::Union { arms } => {
+            let rendered: Vec<String> = arms
+                .iter()
+                .map(|(ctor, choice)| match choice_ctor(choice).1 {
+                    Some(ty) => format!("{ctor} of {ty}"),
+                    None => ctor.clone(),
+                })
+                .collect();
+            render_variant(&type_name, &rendered)
+        }
+    }
 }
 
 /// A group choice (`A // B`) becomes a variant whose arms each carry an inline
@@ -1515,7 +1604,7 @@ fn generate_type_choice(name: &str, choices: &[CsilTypeExpression]) -> String {
 fn generate_group_choice(name: &str, groups: &[CsilGroupExpression]) -> String {
     let type_name = ocaml_type_name(name);
     let arms: Vec<String> = (1..=groups.len())
-        .map(|n| format!("Variant_{n} of Csilgen_transport.Cbor.t"))
+        .map(|n| format!("Variant_{n} of Csil_cbor.t"))
         .collect();
     render_variant(&type_name, &arms)
 }
@@ -1642,6 +1731,133 @@ fn codec_record_names(spec: &CsilSpecSerialized) -> std::collections::HashSet<St
         .collect()
 }
 
+/// The named type-choice rules that get a generated codec, as `(OCaml type name,
+/// choices)`. A `Reference` to one encodes/decodes through `encode_<t>`/`decode_<t>`
+/// just like a record, rather than the opaque `failwith` stub.
+fn codec_choice_rules(spec: &CsilSpecSerialized) -> Vec<(String, Vec<CsilTypeExpression>)> {
+    spec.rules
+        .iter()
+        .filter_map(|r| match &r.rule_type {
+            CsilRuleType::TypeChoice(choices)
+            | CsilRuleType::TypeDef(CsilTypeExpression::Choice(choices)) => {
+                Some((ocaml_type_name(&r.name), choices.clone()))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// The set of OCaml type names that are choices (for the codec dispatchers to route a
+/// `Reference` to a choice through its generated `encode_<t>`/`decode_<t>`).
+fn codec_choice_names(spec: &CsilSpecSerialized) -> std::collections::HashSet<String> {
+    codec_choice_rules(spec)
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect()
+}
+
+/// Emit `encode_<tn>` / `decode_<tn>` clause bodies for one named type-choice. A
+/// string/integer enum codes as the bare literal (its own discriminant); a union
+/// codes as the locked tagged sum `[variant_index, value]` (0-based ordinal).
+fn emit_choice_codec(
+    name: &str,
+    choices: &[CsilTypeExpression],
+    records: &std::collections::HashSet<String>,
+    choice_set: &std::collections::HashSet<String>,
+    aliases: &std::collections::HashMap<String, CsilTypeExpression>,
+) -> (String, String) {
+    let tn = ocaml_type_name(name);
+    match classify_choice(choices) {
+        ChoiceShape::StringEnum { arms, open_other } => {
+            let mut enc_arms: Vec<String> = arms
+                .iter()
+                .map(|(ctor, lit)| format!("{ctor} -> Cbor.Text \"{lit}\""))
+                .collect();
+            let mut dec_arms: Vec<String> = arms
+                .iter()
+                .map(|(ctor, lit)| format!("\"{lit}\" -> {ctor}"))
+                .collect();
+            if let Some(other) = &open_other {
+                enc_arms.push(format!("{other} csil_s -> Cbor.Text csil_s"));
+                dec_arms.push(format!("csil_s -> {other} csil_s"));
+            } else {
+                dec_arms.push(
+                    "csil_s -> failwith (\"csilgen: unknown enum literal \" ^ csil_s)".to_string(),
+                );
+            }
+            let enc = format!(
+                "encode_{tn} (v : {tn}) : Cbor.t =\n  match v with {}",
+                enc_arms.join(" | ")
+            );
+            let dec = format!(
+                "decode_{tn} (csil_c : Cbor.t) : {tn} =\n  match Cbor.to_text csil_c with {}",
+                dec_arms.join(" | ")
+            );
+            (enc, dec)
+        }
+        ChoiceShape::IntEnum { arms } => {
+            let enc_arms: Vec<String> = arms
+                .iter()
+                .map(|(ctor, n)| format!("{ctor} -> Cbor.int64 {n}L"))
+                .collect();
+            let mut dec_arms: Vec<String> = arms
+                .iter()
+                .map(|(ctor, n)| format!("{n}L -> {ctor}"))
+                .collect();
+            dec_arms.push(
+                "csil_n -> failwith (Printf.sprintf \"csilgen: unknown enum value %Ld\" csil_n)"
+                    .to_string(),
+            );
+            let enc = format!(
+                "encode_{tn} (v : {tn}) : Cbor.t =\n  match v with {}",
+                enc_arms.join(" | ")
+            );
+            let dec = format!(
+                "decode_{tn} (csil_c : Cbor.t) : {tn} =\n  match Cbor.to_i64 csil_c with {}",
+                dec_arms.join(" | ")
+            );
+            (enc, dec)
+        }
+        ChoiceShape::Union { arms } => {
+            let enc_arms: Vec<String> = arms
+                .iter()
+                .enumerate()
+                .map(|(idx, (ctor, choice))| match choice_ctor(choice).1 {
+                    Some(_) => {
+                        let inner = enc_value(choice, "csil_x", records, choice_set, aliases);
+                        format!("{ctor} csil_x -> Cbor.Array [Cbor.int64 {idx}L; {inner}]")
+                    }
+                    None => format!("{ctor} -> Cbor.Array [Cbor.int64 {idx}L; Cbor.Null]"),
+                })
+                .collect();
+            let mut dec_arms: Vec<String> = arms
+                .iter()
+                .enumerate()
+                .map(|(idx, (ctor, choice))| match choice_ctor(choice).1 {
+                    Some(_) => {
+                        let inner = dec_value(choice, "csil_v", records, choice_set, aliases);
+                        format!("{idx}L -> {ctor} {inner}")
+                    }
+                    None => format!("{idx}L -> {ctor}"),
+                })
+                .collect();
+            dec_arms.push(
+                "csil_n -> failwith (Printf.sprintf \"csilgen: unknown union variant %Ld\" csil_n)"
+                    .to_string(),
+            );
+            let enc = format!(
+                "encode_{tn} (v : {tn}) : Cbor.t =\n  match v with {}",
+                enc_arms.join(" | ")
+            );
+            let dec = format!(
+                "decode_{tn} (csil_c : Cbor.t) : {tn} =\n  match csil_c with\n  | Cbor.Array [ csil_idx; csil_v ] -> (match Cbor.to_i64 csil_idx with {})\n  | _ -> failwith \"csilgen: expected union array for {tn}\"",
+                dec_arms.join(" | ")
+            );
+            (enc, dec)
+        }
+    }
+}
+
 /// The transparent type aliases the codec resolves through, keyed by OCaml type
 /// name: a `TypeDef` whose target is a map / array / scalar / reference / tuple
 /// (NOT a record group or a choice, which have their own handling). A field
@@ -1673,43 +1889,72 @@ fn enc_value(
     ty: &CsilTypeExpression,
     expr: &str,
     records: &std::collections::HashSet<String>,
+    choices: &std::collections::HashSet<String>,
     aliases: &std::collections::HashMap<String, CsilTypeExpression>,
 ) -> String {
     match ty {
         CsilTypeExpression::Constrained { base_type, .. } => {
-            enc_value(base_type, expr, records, aliases)
+            enc_value(base_type, expr, records, choices, aliases)
         }
         CsilTypeExpression::Builtin(name) => match name.as_str() {
-            "int" | "uint" => format!("(Cbor.int64 {expr})"),
-            "float" => format!("(Cbor.Float {expr})"),
+            "int" | "uint" | "nint" => format!("(Cbor.int64 {expr})"),
+            "float" | "float16" | "float32" | "float64" => format!("(Cbor.Float {expr})"),
             "text" | "tstr" => format!("(Cbor.Text {expr})"),
             "bytes" | "bstr" => format!("(Cbor.Bytes {expr})"),
             "bool" => format!("(Cbor.Bool {expr})"),
             "timestamp" => format!("(Cbor.Tag (0, Cbor.Text {expr}))"),
+            "decimal" => format!("(Cbor.decimal_to_cbor {expr})"),
+            // `any` is already a `Csil_cbor.t` value, so it passes straight through.
+            "any" => expr.to_string(),
             "nil" | "null" => format!("(ignore {expr}; Cbor.Null)"),
             other => format!("(failwith \"csilgen: no codec for builtin {other}\")"),
         },
         CsilTypeExpression::Reference(name) => {
             let tn = ocaml_type_name(name);
-            if records.contains(&tn) {
+            if records.contains(&tn) || choices.contains(&tn) {
                 format!("(encode_{tn} {expr})")
             } else if let Some(underlying) = aliases.get(&tn) {
                 // A transparent alias has no codec of its own; encode it as its
                 // underlying type. The named OCaml abbreviation is structurally the
                 // underlying type, so the field's value flows through unchanged.
-                enc_value(underlying, expr, records, aliases)
+                enc_value(underlying, expr, records, choices, aliases)
             } else {
                 format!("(failwith \"csilgen: no codec for type {tn}\")")
             }
         }
         CsilTypeExpression::Array { element_type, .. } => {
-            let inner = enc_value(element_type, "csil_e", records, aliases);
+            let inner = enc_value(element_type, "csil_e", records, choices, aliases);
             format!("(Cbor.Array (List.map (fun csil_e -> {inner}) {expr}))")
         }
         CsilTypeExpression::Map { key, value, .. } => {
-            let ek = enc_value(key, "csil_k", records, aliases);
-            let ev = enc_value(value, "csil_v", records, aliases);
+            let ek = enc_value(key, "csil_k", records, choices, aliases);
+            let ev = enc_value(value, "csil_v", records, choices, aliases);
             format!("(Cbor.Map (List.map (fun (csil_k, csil_v) -> ({ek}, {ev})) {expr}))")
+        }
+        // A tuple is a positional CBOR array; an absent optional element is encoded
+        // as null-in-place so the array keeps its fixed length.
+        CsilTypeExpression::Tuple(group) if !group.entries.is_empty() => {
+            let vars: Vec<String> = (0..group.entries.len())
+                .map(|i| format!("csil_t{i}"))
+                .collect();
+            let elems: Vec<String> = group
+                .entries
+                .iter()
+                .zip(&vars)
+                .map(|(e, var)| {
+                    if matches!(e.occurrence, Some(CsilOccurrence::Optional)) {
+                        let inner = enc_value(&e.value_type, "csil_x", records, choices, aliases);
+                        format!("(match {var} with Some csil_x -> {inner} | None -> Cbor.Null)")
+                    } else {
+                        enc_value(&e.value_type, var, records, choices, aliases)
+                    }
+                })
+                .collect();
+            format!(
+                "(let ({}) = {expr} in Cbor.Array [{}])",
+                vars.join(", "),
+                elems.join("; ")
+            )
         }
         _ => "(failwith \"csilgen: no codec for this field shape\")".to_string(),
     }
@@ -1721,47 +1966,76 @@ fn dec_value(
     ty: &CsilTypeExpression,
     expr: &str,
     records: &std::collections::HashSet<String>,
+    choices: &std::collections::HashSet<String>,
     aliases: &std::collections::HashMap<String, CsilTypeExpression>,
 ) -> String {
     match ty {
         CsilTypeExpression::Constrained { base_type, .. } => {
-            dec_value(base_type, expr, records, aliases)
+            dec_value(base_type, expr, records, choices, aliases)
         }
         CsilTypeExpression::Builtin(name) => match name.as_str() {
-            "int" | "uint" => format!("(Cbor.to_i64 {expr})"),
-            "float" => format!("(Cbor.to_float {expr})"),
+            "int" | "uint" | "nint" => format!("(Cbor.to_i64 {expr})"),
+            "float" | "float16" | "float32" | "float64" => format!("(Cbor.to_float {expr})"),
             "text" | "tstr" => format!("(Cbor.to_text {expr})"),
             "bytes" | "bstr" => format!("(Cbor.to_bytes {expr})"),
             "bool" => format!("(Cbor.to_bool {expr})"),
             "timestamp" => format!(
                 "(match {expr} with Cbor.Tag (0, Cbor.Text csil_s) -> csil_s | _ -> failwith \"csilgen: bad timestamp\")"
             ),
+            "decimal" => format!("(Cbor.decimal_of_cbor {expr})"),
+            // `any` is carried as the codec's own value model: hand it back as-is.
+            "any" => expr.to_string(),
             "nil" | "null" => format!("(ignore {expr}; ())"),
             other => format!("(failwith \"csilgen: no codec for builtin {other}\")"),
         },
         CsilTypeExpression::Reference(name) => {
             let tn = ocaml_type_name(name);
-            if records.contains(&tn) {
+            if records.contains(&tn) || choices.contains(&tn) {
                 format!("(decode_{tn} {expr})")
             } else if let Some(underlying) = aliases.get(&tn) {
                 // A transparent alias decodes as its underlying type; the value the
                 // map/array/scalar decoder returns is the named abbreviation's value.
-                dec_value(underlying, expr, records, aliases)
+                dec_value(underlying, expr, records, choices, aliases)
             } else {
                 format!("(failwith \"csilgen: no codec for type {tn}\")")
             }
         }
         CsilTypeExpression::Array { element_type, .. } => {
-            let inner = dec_value(element_type, "csil_e", records, aliases);
+            let inner = dec_value(element_type, "csil_e", records, choices, aliases);
             format!(
                 "(match {expr} with Cbor.Array csil_xs -> List.map (fun csil_e -> {inner}) csil_xs | _ -> failwith \"csilgen: expected array\")"
             )
         }
         CsilTypeExpression::Map { key, value, .. } => {
-            let dk = dec_value(key, "csil_k", records, aliases);
-            let dv = dec_value(value, "csil_v", records, aliases);
+            let dk = dec_value(key, "csil_k", records, choices, aliases);
+            let dv = dec_value(value, "csil_v", records, choices, aliases);
             format!(
                 "(match {expr} with Cbor.Map csil_kvs -> List.map (fun (csil_k, csil_v) -> ({dk}, {dv})) csil_kvs | _ -> failwith \"csilgen: expected map\")"
+            )
+        }
+        // A tuple decodes positionally from a fixed-length CBOR array; an optional
+        // element reads `None` from a null-in-place and `Some` otherwise.
+        CsilTypeExpression::Tuple(group) if !group.entries.is_empty() => {
+            let vars: Vec<String> = (0..group.entries.len())
+                .map(|i| format!("csil_a{i}"))
+                .collect();
+            let elems: Vec<String> = group
+                .entries
+                .iter()
+                .zip(&vars)
+                .map(|(e, var)| {
+                    if matches!(e.occurrence, Some(CsilOccurrence::Optional)) {
+                        let inner = dec_value(&e.value_type, var, records, choices, aliases);
+                        format!("(match {var} with Cbor.Null -> None | _ -> Some {inner})")
+                    } else {
+                        dec_value(&e.value_type, var, records, choices, aliases)
+                    }
+                })
+                .collect();
+            format!(
+                "(match {expr} with Cbor.Array [{}] -> ({}) | _ -> failwith \"csilgen: expected tuple array\")",
+                vars.join("; "),
+                elems.join(", ")
             )
         }
         _ => "(failwith \"csilgen: no codec for this field shape\")".to_string(),
@@ -1774,6 +2048,7 @@ fn emit_record_codec(
     name: &str,
     group: &CsilGroupExpression,
     records: &std::collections::HashSet<String>,
+    choices: &std::collections::HashSet<String>,
     aliases: &std::collections::HashMap<String, CsilTypeExpression>,
 ) -> (String, String) {
     let tn = ocaml_type_name(name);
@@ -1792,13 +2067,19 @@ fn emit_record_codec(
     enc.push_str("  Cbor.Map\n    (List.filter_map\n       (fun x -> x)\n       [\n");
     for f in &fields {
         if f.optional {
-            let inner = enc_value(f.value_type, "csil_x", records, aliases);
+            let inner = enc_value(f.value_type, "csil_x", records, choices, aliases);
             enc.push_str(&format!(
                 "         (match v.{} with Some csil_x -> Some (Cbor.Text \"{}\", {inner}) | None -> None);\n",
                 f.label, f.wire
             ));
         } else {
-            let inner = enc_value(f.value_type, &format!("v.{}", f.label), records, aliases);
+            let inner = enc_value(
+                f.value_type,
+                &format!("v.{}", f.label),
+                records,
+                choices,
+                aliases,
+            );
             enc.push_str(&format!(
                 "         Some (Cbor.Text \"{}\", {inner});\n",
                 f.wire
@@ -1816,7 +2097,7 @@ fn emit_record_codec(
     dec.push_str("      {\n");
     for f in &fields {
         if f.optional {
-            let inner = dec_value(f.value_type, "csil_v", records, aliases);
+            let inner = dec_value(f.value_type, "csil_v", records, choices, aliases);
             dec.push_str(&format!(
                 "        {} = (match csil_field \"{}\" with Some csil_v -> Some {inner} | None -> None);\n",
                 f.label, f.wire
@@ -1826,6 +2107,7 @@ fn emit_record_codec(
                 f.value_type,
                 &format!("(csil_req \"{}\")", f.wire),
                 records,
+                choices,
                 aliases,
             );
             dec.push_str(&format!("        {} = {inner};\n", f.label));
@@ -1847,27 +2129,38 @@ fn generate_codec(spec: &CsilSpecSerialized) -> Option<String> {
     if records.is_empty() {
         return None;
     }
+    let choice_set = codec_choice_names(spec);
     let aliases = codec_aliases(spec);
     let mut enc_clauses: Vec<String> = Vec::new();
     let mut dec_clauses: Vec<String> = Vec::new();
     let mut wrappers = String::new();
+    let mut wrapper = |tn: &str| {
+        wrappers.push_str(&format!(
+            "let encode_{tn}_bytes (v : {tn}) : bytes = Cbor.encode (encode_{tn} v)\n"
+        ));
+        wrappers.push_str(&format!(
+            "let decode_{tn}_bytes (b : bytes) : {tn} =\n  match Cbor.decode b with Ok c -> decode_{tn} c | Error e -> failwith e\n\n"
+        ));
+    };
     for rule in &spec.rules {
-        let group = match &rule.rule_type {
-            CsilRuleType::GroupDef(g) => Some(g),
-            CsilRuleType::TypeDef(CsilTypeExpression::Group(g)) => Some(g),
-            _ => None,
-        };
-        if let Some(group) = group {
-            let (enc, dec) = emit_record_codec(&rule.name, group, &records, &aliases);
-            enc_clauses.push(enc);
-            dec_clauses.push(dec);
-            let tn = ocaml_type_name(&rule.name);
-            wrappers.push_str(&format!(
-                "let encode_{tn}_bytes (v : {tn}) : bytes = Cbor.encode (encode_{tn} v)\n"
-            ));
-            wrappers.push_str(&format!(
-                "let decode_{tn}_bytes (b : bytes) : {tn} =\n  match Cbor.decode b with Ok c -> decode_{tn} c | Error e -> failwith e\n\n"
-            ));
+        match &rule.rule_type {
+            CsilRuleType::GroupDef(group)
+            | CsilRuleType::TypeDef(CsilTypeExpression::Group(group)) => {
+                let (enc, dec) =
+                    emit_record_codec(&rule.name, group, &records, &choice_set, &aliases);
+                enc_clauses.push(enc);
+                dec_clauses.push(dec);
+                wrapper(&ocaml_type_name(&rule.name));
+            }
+            CsilRuleType::TypeChoice(choices)
+            | CsilRuleType::TypeDef(CsilTypeExpression::Choice(choices)) => {
+                let (enc, dec) =
+                    emit_choice_codec(&rule.name, choices, &records, &choice_set, &aliases);
+                enc_clauses.push(enc);
+                dec_clauses.push(dec);
+                wrapper(&ocaml_type_name(&rule.name));
+            }
+            _ => {}
         }
     }
 
@@ -1877,9 +2170,11 @@ fn generate_codec(spec: &CsilSpecSerialized) -> Option<String> {
     // Distinct request/response records may share a label (e.g. `queue`); the uses
     // here are type-directed-disambiguated, so silence warning 30 as `types.ml` does.
     out.push_str("[@@@warning \"-30\"]\n\n");
-    out.push_str("open Types\n");
-    out.push_str(CODEC_RUNTIME_OCAML);
-    out.push('\n');
+    out.push_str("open Types\n\n");
+    // The canonical-CBOR value model + (de)serializer live in their own `Csil_cbor`
+    // module so the `any` core type (a `Csil_cbor.t` field) and the codec share one
+    // value type without a cycle between `types.ml` and `codec.ml`.
+    out.push_str("module Cbor = Csil_cbor\n\n");
     out.push_str("let rec ");
     out.push_str(&enc_clauses.join("\n\nand "));
     out.push_str("\n\n");
@@ -2305,152 +2600,202 @@ fn emit_router_compact(service: &CsilServiceDefinition) -> String {
     out
 }
 
-/// The self-contained canonical-CBOR module the generated codecs build on. Its
-/// `Cbor.t` carries the bool/float/null items a payload may hold (the transport's
-/// envelope codec does not), so the generated output stays standalone.
-const CODEC_RUNTIME_OCAML: &str = r#"
-module Cbor = struct
-  type t =
-    | Uint of int64
-    | Nint of int64 (* the logical (negative) value; encodes as CBOR major type 1 *)
-    | Bool of bool
-    | Float of float
-    | Null
-    | Text of string
-    | Bytes of bytes
-    | Array of t list
-    | Map of (t * t) list
-    | Tag of int * t
+/// The self-contained canonical-CBOR value model + (de)serializer, emitted as its own
+/// `csil_cbor.ml` so the `any` core type (a `Csil_cbor.t` record field in `types.ml`)
+/// and the codec (`codec.ml`) can share one value type without a module cycle. It
+/// carries the bool/float/null items a payload may hold (the transport's envelope
+/// codec does not), and owns the `decimal` core type's CBOR tag-4 wire form, so the
+/// generated package stays standalone with no third-party dependency.
+const CSIL_CBOR_OCAML: &str = r#"(* Code generated by csilgen; DO NOT EDIT. *)
 
-  let int64 (n : int64) : t = if Int64.compare n 0L >= 0 then Uint n else Nint n
+type t =
+  | Uint of int64
+  | Nint of int64 (* the logical (negative) value; encodes as CBOR major type 1 *)
+  | Bool of bool
+  | Float of float
+  | Null
+  | Text of string
+  | Bytes of bytes
+  | Array of t list
+  | Map of (t * t) list
+  | Tag of int * t
 
-  let add_head buf major (u : int64) =
-    let mt = major lsl 5 in
-    let byte shift = Char.chr (Int64.to_int (Int64.logand (Int64.shift_right_logical u shift) 0xffL)) in
-    if Int64.unsigned_compare u 24L < 0 then
-      Buffer.add_char buf (Char.chr (mt lor Int64.to_int u))
-    else if Int64.unsigned_compare u 0x100L < 0 then begin
-      Buffer.add_char buf (Char.chr (mt lor 24));
-      Buffer.add_char buf (byte 0)
-    end
-    else if Int64.unsigned_compare u 0x10000L < 0 then begin
-      Buffer.add_char buf (Char.chr (mt lor 25));
-      Buffer.add_char buf (byte 8);
-      Buffer.add_char buf (byte 0)
-    end
-    else if Int64.unsigned_compare u 0x100000000L < 0 then begin
-      Buffer.add_char buf (Char.chr (mt lor 26));
-      for i = 3 downto 0 do Buffer.add_char buf (byte (i * 8)) done
-    end
-    else begin
-      Buffer.add_char buf (Char.chr (mt lor 27));
-      for i = 7 downto 0 do Buffer.add_char buf (byte (i * 8)) done
-    end
+let int64 (n : int64) : t = if Int64.compare n 0L >= 0 then Uint n else Nint n
 
-  let rec enc buf = function
-    | Uint n -> add_head buf 0 n
-    | Nint n -> add_head buf 1 (Int64.sub (Int64.neg n) 1L)
-    | Bool b -> Buffer.add_char buf (if b then '\xf5' else '\xf4')
-    | Null -> Buffer.add_char buf '\xf6'
-    | Float f ->
-      Buffer.add_char buf '\xfb';
-      let bits = Int64.bits_of_float f in
-      for i = 7 downto 0 do
-        Buffer.add_char buf (Char.chr (Int64.to_int (Int64.logand (Int64.shift_right_logical bits (i * 8)) 0xffL)))
-      done
-    | Text s -> add_head buf 3 (Int64.of_int (String.length s)); Buffer.add_string buf s
-    | Bytes b -> add_head buf 2 (Int64.of_int (Bytes.length b)); Buffer.add_bytes buf b
-    | Array xs -> add_head buf 4 (Int64.of_int (List.length xs)); List.iter (enc buf) xs
-    | Map kvs ->
-      add_head buf 5 (Int64.of_int (List.length kvs));
-      List.iter (fun (k, v) -> enc buf k; enc buf v) kvs
-    | Tag (t, v) -> add_head buf 6 (Int64.of_int t); enc buf v
+let add_head buf major (u : int64) =
+  let mt = major lsl 5 in
+  let byte shift = Char.chr (Int64.to_int (Int64.logand (Int64.shift_right_logical u shift) 0xffL)) in
+  if Int64.unsigned_compare u 24L < 0 then
+    Buffer.add_char buf (Char.chr (mt lor Int64.to_int u))
+  else if Int64.unsigned_compare u 0x100L < 0 then begin
+    Buffer.add_char buf (Char.chr (mt lor 24));
+    Buffer.add_char buf (byte 0)
+  end
+  else if Int64.unsigned_compare u 0x10000L < 0 then begin
+    Buffer.add_char buf (Char.chr (mt lor 25));
+    Buffer.add_char buf (byte 8);
+    Buffer.add_char buf (byte 0)
+  end
+  else if Int64.unsigned_compare u 0x100000000L < 0 then begin
+    Buffer.add_char buf (Char.chr (mt lor 26));
+    for i = 3 downto 0 do Buffer.add_char buf (byte (i * 8)) done
+  end
+  else begin
+    Buffer.add_char buf (Char.chr (mt lor 27));
+    for i = 7 downto 0 do Buffer.add_char buf (byte (i * 8)) done
+  end
 
-  let encode (v : t) : bytes =
-    let buf = Buffer.create 64 in
-    enc buf v;
-    Buffer.to_bytes buf
-
-  let decode (b : bytes) : (t, string) result =
-    let len = Bytes.length b in
-    let byte i = Char.code (Bytes.get b i) in
-    let read_arg pos low =
-      if low < 24 then (Int64.of_int low, pos + 1)
-      else if low = 24 then (Int64.of_int (byte (pos + 1)), pos + 2)
-      else if low = 25 then (Int64.of_int ((byte (pos + 1) lsl 8) lor byte (pos + 2)), pos + 3)
-      else if low = 26 then begin
-        let v = ref 0L in
-        for i = 1 to 4 do v := Int64.logor (Int64.shift_left !v 8) (Int64.of_int (byte (pos + i))) done;
-        (!v, pos + 5)
-      end
-      else if low = 27 then begin
-        let v = ref 0L in
-        for i = 1 to 8 do v := Int64.logor (Int64.shift_left !v 8) (Int64.of_int (byte (pos + i))) done;
-        (!v, pos + 9)
-      end
-      else failwith "csilgen: bad head"
+let rec enc buf = function
+  | Uint n -> add_head buf 0 n
+  | Nint n -> add_head buf 1 (Int64.sub (Int64.neg n) 1L)
+  | Bool b -> Buffer.add_char buf (if b then '\xf5' else '\xf4')
+  | Null -> Buffer.add_char buf '\xf6'
+  | Float f ->
+    Buffer.add_char buf '\xfb';
+    let bits = Int64.bits_of_float f in
+    for i = 7 downto 0 do
+      Buffer.add_char buf (Char.chr (Int64.to_int (Int64.logand (Int64.shift_right_logical bits (i * 8)) 0xffL)))
+    done
+  | Text s -> add_head buf 3 (Int64.of_int (String.length s)); Buffer.add_string buf s
+  | Bytes b -> add_head buf 2 (Int64.of_int (Bytes.length b)); Buffer.add_bytes buf b
+  | Array xs -> add_head buf 4 (Int64.of_int (List.length xs)); List.iter (enc buf) xs
+  | Map kvs ->
+    (* Canonical map ordering (RFC 8949 §4.2.1): entries are sorted by the bytewise
+       lexicographic order of their *encoded* keys, so the same logical map always
+       yields the same bytes regardless of insertion order (records are already in
+       canonical order at generation time, so this is idempotent for them). *)
+    let enc_key k = let b = Buffer.create 16 in enc b k; Buffer.to_bytes b in
+    let sorted =
+      List.stable_sort (fun (k1, _) (k2, _) -> compare (enc_key k1) (enc_key k2)) kvs
     in
-    let rec dec pos =
-      let ib = byte pos in
-      let major = ib lsr 5 and low = ib land 0x1f in
-      if major = 7 then
-        match low with
-        | 20 -> (Bool false, pos + 1)
-        | 21 -> (Bool true, pos + 1)
-        | 22 | 23 -> (Null, pos + 1)
-        | 26 ->
-          let arg, p = read_arg pos low in
-          (Float (Int32.float_of_bits (Int64.to_int32 arg)), p)
-        | 27 ->
-          let arg, p = read_arg pos low in
-          (Float (Int64.float_of_bits arg), p)
-        | _ -> failwith "csilgen: unsupported simple value"
-      else begin
+    add_head buf 5 (Int64.of_int (List.length sorted));
+    List.iter (fun (k, v) -> enc buf k; enc buf v) sorted
+  | Tag (t, v) -> add_head buf 6 (Int64.of_int t); enc buf v
+
+let encode (v : t) : bytes =
+  let buf = Buffer.create 64 in
+  enc buf v;
+  Buffer.to_bytes buf
+
+let decode (b : bytes) : (t, string) result =
+  let len = Bytes.length b in
+  let byte i = Char.code (Bytes.get b i) in
+  let read_arg pos low =
+    if low < 24 then (Int64.of_int low, pos + 1)
+    else if low = 24 then (Int64.of_int (byte (pos + 1)), pos + 2)
+    else if low = 25 then (Int64.of_int ((byte (pos + 1) lsl 8) lor byte (pos + 2)), pos + 3)
+    else if low = 26 then begin
+      let v = ref 0L in
+      for i = 1 to 4 do v := Int64.logor (Int64.shift_left !v 8) (Int64.of_int (byte (pos + i))) done;
+      (!v, pos + 5)
+    end
+    else if low = 27 then begin
+      let v = ref 0L in
+      for i = 1 to 8 do v := Int64.logor (Int64.shift_left !v 8) (Int64.of_int (byte (pos + i))) done;
+      (!v, pos + 9)
+    end
+    else failwith "csilgen: bad head"
+  in
+  let rec dec pos =
+    let ib = byte pos in
+    let major = ib lsr 5 and low = ib land 0x1f in
+    if major = 7 then
+      match low with
+      | 20 -> (Bool false, pos + 1)
+      | 21 -> (Bool true, pos + 1)
+      | 22 | 23 -> (Null, pos + 1)
+      | 26 ->
         let arg, p = read_arg pos low in
-        match major with
-        | 0 -> (Uint arg, p)
-        | 1 -> (Nint (Int64.sub (Int64.neg arg) 1L), p)
-        | 2 -> let n = Int64.to_int arg in (Bytes (Bytes.sub b p n), p + n)
-        | 3 -> let n = Int64.to_int arg in (Text (Bytes.sub_string b p n), p + n)
-        | 4 ->
-          let n = Int64.to_int arg in
-          let rec loop i pos acc =
-            if i = 0 then (List.rev acc, pos)
-            else let v, np = dec pos in loop (i - 1) np (v :: acc)
-          in
-          let items, np = loop n p [] in
-          (Array items, np)
-        | 5 ->
-          let n = Int64.to_int arg in
-          let rec loop i pos acc =
-            if i = 0 then (List.rev acc, pos)
-            else
-              let k, p1 = dec pos in
-              let v, p2 = dec p1 in
-              loop (i - 1) p2 ((k, v) :: acc)
-          in
-          let kvs, np = loop n p [] in
-          (Map kvs, np)
-        | 6 -> let inner, np = dec p in (Tag (Int64.to_int arg, inner), np)
-        | _ -> failwith "csilgen: bad major"
-      end
-    in
-    try
-      let v, np = dec 0 in
-      if np <> len then Error "csilgen: trailing bytes" else Ok v
-    with
-    | Failure m -> Error m
-    | _ -> Error "csilgen: malformed cbor"
+        (Float (Int32.float_of_bits (Int64.to_int32 arg)), p)
+      | 27 ->
+        let arg, p = read_arg pos low in
+        (Float (Int64.float_of_bits arg), p)
+      | _ -> failwith "csilgen: unsupported simple value"
+    else begin
+      let arg, p = read_arg pos low in
+      match major with
+      | 0 -> (Uint arg, p)
+      | 1 -> (Nint (Int64.sub (Int64.neg arg) 1L), p)
+      | 2 -> let n = Int64.to_int arg in (Bytes (Bytes.sub b p n), p + n)
+      | 3 -> let n = Int64.to_int arg in (Text (Bytes.sub_string b p n), p + n)
+      | 4 ->
+        let n = Int64.to_int arg in
+        let rec loop i pos acc =
+          if i = 0 then (List.rev acc, pos)
+          else let v, np = dec pos in loop (i - 1) np (v :: acc)
+        in
+        let items, np = loop n p [] in
+        (Array items, np)
+      | 5 ->
+        let n = Int64.to_int arg in
+        let rec loop i pos acc =
+          if i = 0 then (List.rev acc, pos)
+          else
+            let k, p1 = dec pos in
+            let v, p2 = dec p1 in
+            loop (i - 1) p2 ((k, v) :: acc)
+        in
+        let kvs, np = loop n p [] in
+        (Map kvs, np)
+      | 6 -> let inner, np = dec p in (Tag (Int64.to_int arg, inner), np)
+      | _ -> failwith "csilgen: bad major"
+    end
+  in
+  try
+    let v, np = dec 0 in
+    if np <> len then Error "csilgen: trailing bytes" else Ok v
+  with
+  | Failure m -> Error m
+  | _ -> Error "csilgen: malformed cbor"
 
-  let to_i64 = function Uint n | Nint n -> n | _ -> failwith "csilgen: expected int"
-  let to_text = function Text s -> s | _ -> failwith "csilgen: expected text"
-  let to_bytes = function Bytes b -> b | _ -> failwith "csilgen: expected bytes"
-  let to_bool = function Bool b -> b | _ -> failwith "csilgen: expected bool"
-  let to_float = function
-    | Float f -> f
-    | Uint n | Nint n -> Int64.to_float n
-    | _ -> failwith "csilgen: expected float"
-end
+let to_i64 = function Uint n | Nint n -> n | _ -> failwith "csilgen: expected int"
+let to_text = function Text s -> s | _ -> failwith "csilgen: expected text"
+let to_bytes = function Bytes b -> b | _ -> failwith "csilgen: expected bytes"
+let to_bool = function Bool b -> b | _ -> failwith "csilgen: expected bool"
+let to_float = function
+  | Float f -> f
+  | Uint n | Nint n -> Int64.to_float n
+  | _ -> failwith "csilgen: expected float"
+
+(* The `decimal` core type rides as a CBOR tag-4 decimal fraction `[exponent,
+   mantissa]` (value = mantissa * 10^exponent), byte-identical with the other
+   generators. OCaml has no decimal type, so it is carried as the exact decimal text
+   and parsed/formatted here. *)
+let decimal_to_cbor (s : string) : t =
+  let s = String.trim s in
+  let neg, rest =
+    if String.length s > 0 && s.[0] = '-' then (true, String.sub s 1 (String.length s - 1))
+    else if String.length s > 0 && s.[0] = '+' then (false, String.sub s 1 (String.length s - 1))
+    else (false, s)
+  in
+  let int_part, frac_part =
+    match String.index_opt rest '.' with
+    | Some i -> (String.sub rest 0 i, String.sub rest (i + 1) (String.length rest - i - 1))
+    | None -> (rest, "")
+  in
+  let digits = int_part ^ frac_part in
+  let magnitude = if digits = "" then 0L else Int64.of_string digits in
+  let mantissa = if neg then Int64.neg magnitude else magnitude in
+  let exponent = Int64.of_int (-String.length frac_part) in
+  Tag (4, Array [ int64 exponent; int64 mantissa ])
+
+let decimal_of_cbor (v : t) : string =
+  match v with
+  | Tag (4, Array [ e; m ]) ->
+    let exponent = Int64.to_int (to_i64 e) in
+    let mantissa = to_i64 m in
+    let digits = Int64.to_string (Int64.abs mantissa) in
+    let body =
+      if exponent >= 0 then digits ^ String.make exponent '0'
+      else
+        let scale = -exponent in
+        let dl = String.length digits in
+        if dl > scale then
+          String.sub digits 0 (dl - scale) ^ "." ^ String.sub digits (dl - scale) scale
+        else "0." ^ String.make (scale - dl) '0' ^ digits
+    in
+    if Int64.compare mantissa 0L < 0 then "-" ^ body else body
+  | _ -> failwith "csilgen: expected CBOR tag 4 decimal"
 "#;
 
 #[cfg(test)]

@@ -390,9 +390,13 @@ fn typesonly_surface_emits_only_types() {
     let input = service_input("ocaml-typesonly");
     let files = generate_ocaml(&input.csil_spec, &input.config).unwrap();
     let paths: Vec<&str> = files.iter().map(|f| f.path.as_str()).collect();
-    // The codec rides alongside the types (the records' (de)serializers), so a
-    // typesonly consumer gets usable types without a service surface.
-    assert_eq!(paths, vec!["types.ml", "types.mli", "codec.ml"]);
+    // The codec (and its standalone `csil_cbor.ml` value model) ride alongside the
+    // types (the records' (de)serializers), so a typesonly consumer gets usable types
+    // without a service surface.
+    assert_eq!(
+        paths,
+        vec!["types.ml", "types.mli", "csil_cbor.ml", "codec.ml"]
+    );
 }
 
 #[test]
@@ -586,7 +590,9 @@ fn corndogs_spec() -> CsilSpecSerialized {
 fn codec_emitted_with_typed_client() {
     let spec = corndogs_spec();
     let codec = generate_codec(&spec).expect("codec emitted");
-    assert!(codec.contains("module Cbor = struct"));
+    // The canonical-CBOR value model now lives in its own `csil_cbor.ml`; the codec
+    // aliases it so the `any` core type and the codec share one value type.
+    assert!(codec.contains("module Cbor = Csil_cbor"));
     assert!(codec.contains("let encode_task_bytes (v : task) : bytes"));
     assert!(codec.contains("let decode_submit_task_request_bytes"));
     // bytes -> Cbor.Bytes (major type 2); text -> Cbor.Text.
@@ -631,7 +637,7 @@ fn codec_round_trips_through_dune() {
     std::fs::write(dir.join("dune-project"), "(lang dune 3.0)\n").unwrap();
     std::fs::write(
         dir.join("dune"),
-        "(executable (name test) (modules types codec client test))\n",
+        "(executable (name test) (modules types csil_cbor codec client test))\n",
     )
     .unwrap();
     std::fs::write(dir.join("test.ml"), CODEC_DRIVER_OCAML).unwrap();

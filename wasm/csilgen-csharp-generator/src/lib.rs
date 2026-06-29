@@ -106,15 +106,57 @@ struct CsharpConfig {
     decimal_mapping: DecimalMapping,
 }
 
+/// Derive a valid C# namespace from a `package_name`: its last path segment, with each
+/// dot-delimited part sanitized to a C# identifier (alphanumerics/underscore, never a
+/// leading digit). This keeps the in-code namespace aligned with the package id and the
+/// csproj `RootNamespace`.
+fn csharp_namespace_from_package(package_name: &str) -> String {
+    let tail = csilgen_common::package_name_last_segment(package_name);
+    tail.split('.')
+        .map(|segment| {
+            let mut ident: String = segment
+                .chars()
+                .map(|c| {
+                    if c.is_ascii_alphanumeric() || c == '_' {
+                        c
+                    } else {
+                        '_'
+                    }
+                })
+                .collect();
+            if ident.is_empty() {
+                ident.push('_');
+            }
+            if ident.starts_with(|c: char| c.is_ascii_digit()) {
+                ident.insert(0, '_');
+            }
+            ident
+        })
+        .collect::<Vec<_>>()
+        .join(".")
+}
+
 impl CsharpConfig {
     fn from_options(options: &HashMap<String, serde_json::Value>) -> Result<Self, i32> {
+        // An explicit namespace wins; absent that, a configured `package_name` drives the
+        // namespace so generated code lives under its own package name (aligned with the
+        // csproj RootNamespace) rather than squatting in the transport library's
+        // `Csilgen.Transport` namespace — where its `Cbor`/`CborValue` would collide with
+        // the library's own when a consumer references both.
         let namespace = options
             .get("csharp_namespace")
             .or_else(|| options.get("namespace"))
             .and_then(|v| v.as_str())
             .filter(|s| !s.is_empty())
-            .unwrap_or("Csilgen.Transport")
-            .to_string();
+            .map(str::to_string)
+            .or_else(|| {
+                options
+                    .get("package_name")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .map(csharp_namespace_from_package)
+            })
+            .unwrap_or_else(|| "Csilgen.Transport".to_string());
 
         // A typo in decimal_mapping is a hard error so misconfiguration surfaces at
         // generation time rather than silently degrading to the default.
@@ -1124,6 +1166,10 @@ fn generate_types(input: &WasmGeneratorInput, config: &CsharpConfig) -> Option<S
                 has_types = true;
                 if let CsilTypeExpression::Group(group) = type_expr {
                     emit_record(&mut body, &rule.name, group, config);
+                } else if let CsilTypeExpression::Choice(choices) = type_expr {
+                    // A named type-choice (`Color = "a" / "b"`, `IdOrName = uint / text`) is a
+                    // real enum or tagged union with its own codec, not a transparent alias.
+                    emit_type_choice(&mut body, &rule.name, choices, config);
                 } else {
                     // A scalar/reference/collection alias. `global using` (not a plain
                     // file-scoped `using`) so the named type is visible from the service
@@ -1250,27 +1296,31 @@ fn emit_type_choice(
     );
     body.push_str(&format!("public abstract record {base};\n"));
     for (index, choice) in choices.iter().enumerate() {
-        match choice {
-            CsilTypeExpression::Reference(reference) => {
-                let arm = pascal_ident(reference);
-                let inner = pascal_ident(reference);
-                // The arm wraps the referenced type; the CSIL variant wire name is the
-                // reference verbatim so a decoder can map the tag back to this arm.
-                body.push_str(&format!("// variant '{reference}'\n"));
-                body.push_str(&format!(
-                    "public sealed record {base}{arm}({inner} Value) : {base};\n"
-                ));
-            }
-            other => {
-                let arm = format!("Variant{}", index + 1);
-                let inner = map_csil_type(other, config);
-                body.push_str(&format!(
-                    "public sealed record {base}{arm}({inner} Value) : {base};\n"
-                ));
-            }
+        let arm = union_arm_name(&base, index, choice);
+        let inner = map_csil_type(choice, config);
+        if let CsilTypeExpression::Reference(reference) = choice {
+            // The CSIL variant wire name is the reference verbatim so a decoder can map the
+            // tag back to this arm.
+            body.push_str(&format!("// variant {} '{reference}'\n", index));
+        } else {
+            body.push_str(&format!("// variant {index}\n"));
         }
+        body.push_str(&format!(
+            "public sealed record {arm}({inner} Value) : {base};\n"
+        ));
     }
     body.push('\n');
+}
+
+/// The concrete arm record name for variant `index` of a union named `base`. A reference
+/// arm is named after the referenced type (`IdOrNameTask`); any other shape is positional
+/// (`IdOrNameVariant1`, 1-based for readability). Shared by the type emitter and the codec
+/// so the two never drift on the arm spelling.
+fn union_arm_name(base: &str, index: usize, choice: &CsilTypeExpression) -> String {
+    match choice {
+        CsilTypeExpression::Reference(reference) => format!("{base}{}", pascal_ident(reference)),
+        _ => format!("{base}Variant{}", index + 1),
+    }
 }
 
 /// A group-choice is a tagged union whose arms are anonymous records; each arm
@@ -1576,6 +1626,23 @@ fn codec_aliases(
         .collect()
 }
 
+/// Pascal names of every named type-choice rule (enum or tagged union). A field that
+/// references one routes through that choice's generated `…ToCborValue`/`…FromCborValue`
+/// helper, rather than being stubbed to null the way a plain reference once was.
+fn choice_names(input: &WasmGeneratorInput) -> std::collections::HashSet<String> {
+    input
+        .csil_spec
+        .rules
+        .iter()
+        .filter_map(|rule| match &rule.rule_type {
+            CsilRuleType::TypeDef(CsilTypeExpression::Choice(_)) | CsilRuleType::TypeChoice(_) => {
+                Some(pascal_ident(&rule.name))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
 /// The CBOR encoding of a text key. Comparing these byte slices lexicographically is
 /// exactly RFC 8949 §4.2.1 canonical key ordering, computed here at generation time so
 /// the emitted encoder lays a record's map keys down in canonical order.
@@ -1611,6 +1678,7 @@ fn csharp_enc_value(
     expr: &str,
     records: &std::collections::HashSet<String>,
     aliases: &std::collections::HashMap<String, CsilTypeExpression>,
+    choices: &std::collections::HashSet<String>,
 ) -> String {
     match codec_unwrap_constrained(ty) {
         CsilTypeExpression::Builtin(name) => match name.as_str() {
@@ -1622,10 +1690,16 @@ fn csharp_enc_value(
             "bool" => format!("new CborValue.Bool({expr})"),
             "timestamp" => format!("Cbor.EncTimestamp({expr})"),
             "decimal" => format!("Cbor.EncDecimal({expr})"),
+            // `any` is already a `CborValue`; carry it through verbatim.
+            "any" => expr.to_string(),
             "nil" | "null" => "new CborValue.Null()".to_string(),
             _ => "new CborValue.Null()".to_string(),
         },
         CsilTypeExpression::Reference(name) if records.contains(&pascal_ident(name)) => {
+            format!("{}ToCborValue({expr})", pascal_ident(name))
+        }
+        // A reference to a named enum/union routes through that choice's generated codec.
+        CsilTypeExpression::Reference(name) if choices.contains(&pascal_ident(name)) => {
             format!("{}ToCborValue({expr})", pascal_ident(name))
         }
         // A reference to a transparent alias (`StringInt64Map = {* text => int}`) carries
@@ -1633,23 +1707,68 @@ fn csharp_enc_value(
         // is a `global using` synonym, so `expr` is already the underlying type the
         // resolved encoder expects.
         CsilTypeExpression::Reference(name) if aliases.contains_key(&pascal_ident(name)) => {
-            csharp_enc_value(&aliases[&pascal_ident(name)], expr, records, aliases)
+            csharp_enc_value(
+                &aliases[&pascal_ident(name)],
+                expr,
+                records,
+                aliases,
+                choices,
+            )
         }
         CsilTypeExpression::Array { element_type, .. } => {
-            let inner = csharp_enc_value(element_type, "csilElem", records, aliases);
+            let inner = csharp_enc_value(element_type, "csilElem", records, aliases, choices);
             format!("new CborValue.Array({expr}.Select(csilElem => (CborValue){inner}).ToList())")
         }
         CsilTypeExpression::Map { key, value, .. } => {
-            let kenc = csharp_enc_value(key, "csilKv.Key", records, aliases);
-            let venc = csharp_enc_value(value, "csilKv.Value", records, aliases);
+            let kenc = csharp_enc_value(key, "csilKv.Key", records, aliases, choices);
+            let venc = csharp_enc_value(value, "csilKv.Value", records, aliases, choices);
             format!(
                 "new CborValue.Map({expr}.Select(csilKv => ((CborValue){kenc}, (CborValue){venc})).ToList())"
             )
         }
-        // A shape the codec cannot model precisely (a non-record reference, choice,
-        // tuple, `any`) is carried as null rather than emitting uncompilable code.
+        // A tuple is a fixed-length positional CBOR array.
+        CsilTypeExpression::Tuple(group) => {
+            csharp_tuple_enc(&group.entries, expr, records, aliases, choices)
+        }
+        // A shape the codec cannot model precisely is carried as null rather than emitting
+        // uncompilable code.
         _ => "new CborValue.Null()".to_string(),
     }
+}
+
+/// Encode a tuple as `new CborValue.Array(new CborValue[] { e0, e1, ... })` — one element
+/// per position. An optional element is null-in-place: its CBOR null holds the slot so the
+/// array stays fixed-length and positional.
+fn csharp_tuple_enc(
+    entries: &[CsilGroupEntry],
+    expr: &str,
+    records: &std::collections::HashSet<String>,
+    aliases: &std::collections::HashMap<String, CsilTypeExpression>,
+    choices: &std::collections::HashSet<String>,
+) -> String {
+    let elems: Vec<String> = entries
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| {
+            let field = match &entry.key {
+                Some(key) => pascal_ident(&wire_key(key)),
+                None => format!("Field{index}"),
+            };
+            let access = format!("{expr}.{field}");
+            if matches!(entry.occurrence, Some(CsilOccurrence::Optional)) {
+                let bind = format!("csilTup{index}");
+                let non_null = map_csil_type(&entry.value_type, &codec_config());
+                let enc = csharp_enc_value(&entry.value_type, &bind, records, aliases, choices);
+                format!("{access} is {non_null} {bind} ? (CborValue){enc} : new CborValue.Null()")
+            } else {
+                csharp_enc_value(&entry.value_type, &access, records, aliases, choices)
+            }
+        })
+        .collect();
+    format!(
+        "new CborValue.Array(new CborValue[] {{ {} }})",
+        elems.join(", ")
+    )
 }
 
 /// A C# expression decoding a typed value from `expr` (a `CborValue`).
@@ -1658,6 +1777,7 @@ fn csharp_dec_value(
     expr: &str,
     records: &std::collections::HashSet<String>,
     aliases: &std::collections::HashMap<String, CsilTypeExpression>,
+    choices: &std::collections::HashSet<String>,
 ) -> String {
     match codec_unwrap_constrained(ty) {
         CsilTypeExpression::Builtin(name) => match name.as_str() {
@@ -1669,28 +1789,74 @@ fn csharp_dec_value(
             "bool" => format!("Cbor.AsBool({expr})"),
             "timestamp" => format!("Cbor.AsTimestamp({expr})"),
             "decimal" => format!("Cbor.AsDecimal({expr})"),
+            // `any` is carried through as the decoded `CborValue` itself.
+            "any" => expr.to_string(),
             _ => format!("Cbor.AsText({expr})"),
         },
         CsilTypeExpression::Reference(name) if records.contains(&pascal_ident(name)) => {
+            format!("{}FromCborValue({expr})", pascal_ident(name))
+        }
+        CsilTypeExpression::Reference(name) if choices.contains(&pascal_ident(name)) => {
             format!("{}FromCborValue({expr})", pascal_ident(name))
         }
         // A reference to a transparent alias decodes as its underlying map/array/scalar;
         // the value the resolved decoder returns is assignable to the alias-typed field
         // because the C# alias is a `global using` synonym for that same type.
         CsilTypeExpression::Reference(name) if aliases.contains_key(&pascal_ident(name)) => {
-            csharp_dec_value(&aliases[&pascal_ident(name)], expr, records, aliases)
+            csharp_dec_value(
+                &aliases[&pascal_ident(name)],
+                expr,
+                records,
+                aliases,
+                choices,
+            )
         }
         CsilTypeExpression::Array { element_type, .. } => {
-            let inner = csharp_dec_value(element_type, "csilElem", records, aliases);
+            let inner = csharp_dec_value(element_type, "csilElem", records, aliases, choices);
             format!("Cbor.AsArray({expr}).Select(csilElem => {inner}).ToList()")
         }
         CsilTypeExpression::Map { key, value, .. } => {
-            let kdec = csharp_dec_value(key, "csilKv.Key", records, aliases);
-            let vdec = csharp_dec_value(value, "csilKv.Value", records, aliases);
+            let kdec = csharp_dec_value(key, "csilKv.Key", records, aliases, choices);
+            let vdec = csharp_dec_value(value, "csilKv.Value", records, aliases, choices);
             format!("Cbor.AsMap({expr}).ToDictionary(csilKv => {kdec}, csilKv => {vdec})")
+        }
+        CsilTypeExpression::Tuple(group) => {
+            csharp_tuple_dec(ty, &group.entries, expr, records, aliases, choices)
         }
         _ => format!("Cbor.AsText({expr})"),
     }
+}
+
+/// Decode a fixed-length positional CBOR array back into a C# value tuple. The array is
+/// bound once inside an immediately-invoked lambda so each position is read exactly once;
+/// an optional element reads a CBOR null in its slot back to a null value.
+fn csharp_tuple_dec(
+    tuple_ty: &CsilTypeExpression,
+    entries: &[CsilGroupEntry],
+    expr: &str,
+    records: &std::collections::HashSet<String>,
+    aliases: &std::collections::HashMap<String, CsilTypeExpression>,
+    choices: &std::collections::HashSet<String>,
+) -> String {
+    let tuple_type = map_csil_type(tuple_ty, &codec_config());
+    let parts: Vec<String> = entries
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| {
+            let slot = format!("csilTupArr[{index}]");
+            if matches!(entry.occurrence, Some(CsilOccurrence::Optional)) {
+                let non_null = map_csil_type(&entry.value_type, &codec_config());
+                let dec = csharp_dec_value(&entry.value_type, &slot, records, aliases, choices);
+                format!("{slot} is CborValue.Null ? ({non_null}?)null : {dec}")
+            } else {
+                csharp_dec_value(&entry.value_type, &slot, records, aliases, choices)
+            }
+        })
+        .collect();
+    format!(
+        "((System.Func<{tuple_type}>)(() => {{ var csilTupArr = Cbor.AsArray({expr}); return ({}); }}))()",
+        parts.join(", ")
+    )
 }
 
 /// Emit the per-record `ToCborValue`/`FromCborValue` pair. The encoder lays keys in
@@ -1701,6 +1867,7 @@ fn emit_record_codec(
     group: &CsilGroupExpression,
     records: &std::collections::HashSet<String>,
     aliases: &std::collections::HashMap<String, CsilTypeExpression>,
+    choices: &std::collections::HashSet<String>,
 ) -> String {
     let type_name = pascal_ident(name);
     // (prop, wire, entry) in declaration order, plus a canonical-key-order copy for
@@ -1733,7 +1900,7 @@ fn emit_record_codec(
             // leaks into the enclosing method scope, so a shared name would both collide
             // (CS0128) and force every optional through the first field's type (CS1503).
             let bind = format!("csilV{index}");
-            let enc = csharp_enc_value(&entry.value_type, &bind, records, aliases);
+            let enc = csharp_enc_value(&entry.value_type, &bind, records, aliases, choices);
             out.push_str(&format!(
                 "        if (value.{prop} is {{ }} {bind})\n        {{\n            csilEntries.Add((new CborValue.Text(\"{wire_lit}\"), {enc}));\n        }}\n"
             ));
@@ -1743,6 +1910,7 @@ fn emit_record_codec(
                 &format!("value.{prop}"),
                 records,
                 aliases,
+                choices,
             );
             out.push_str(&format!(
                 "        csilEntries.Add((new CborValue.Text(\"{wire_lit}\"), {enc}));\n"
@@ -1766,6 +1934,7 @@ fn emit_record_codec(
                 &format!("csilRaw{index}"),
                 records,
                 aliases,
+                choices,
             );
             out.push_str(&format!(
                 "        {nullable} csilField{index} = Cbor.MapGet(value, \"{wire_lit}\") is {{ }} csilRaw{index} ? {dec} : null;\n"
@@ -1776,6 +1945,7 @@ fn emit_record_codec(
                 &format!("Cbor.Require(value, \"{wire_lit}\")"),
                 records,
                 aliases,
+                choices,
             );
             out.push_str(&format!("        var csilField{index} = {dec};\n"));
         }
@@ -1785,6 +1955,110 @@ fn emit_record_codec(
         out.push_str(&format!("            {prop} = csilField{index},\n"));
     }
     out.push_str("        };\n    }\n\n");
+    out
+}
+
+/// Emit the codec pair for a named type-choice. An all-literal choice is a closed enum
+/// whose wire form is the bare literal (text or integer); any other choice is a tagged
+/// union encoded as the locked `[variant_index, value]` 2-element array (0-based index in
+/// declaration order, recursive value codec per arm).
+fn emit_choice_codec(
+    name: &str,
+    cases: &[CsilTypeExpression],
+    records: &std::collections::HashSet<String>,
+    aliases: &std::collections::HashMap<String, CsilTypeExpression>,
+    choices: &std::collections::HashSet<String>,
+) -> String {
+    let type_name = pascal_ident(name);
+    if !cases.is_empty() && cases.iter().all(is_literal_choice) {
+        emit_enum_codec(&type_name, cases)
+    } else {
+        emit_union_codec(&type_name, cases, records, aliases, choices)
+    }
+}
+
+/// Bare-literal enum codec: each member maps to its verbatim wire literal (text or the
+/// signed integer it stands for), mirroring `emit_enum`'s member spelling exactly.
+fn emit_enum_codec(type_name: &str, cases: &[CsilTypeExpression]) -> String {
+    let int_based = cases
+        .iter()
+        .all(|c| matches!(c, CsilTypeExpression::Literal(CsilLiteralValue::Integer(_))));
+    let mut to_arms = String::new();
+    let mut from_arms = String::new();
+    for case in cases {
+        match case {
+            CsilTypeExpression::Literal(CsilLiteralValue::Text(text)) => {
+                let member = pascal_ident(text);
+                let lit = csharp_escape(text);
+                to_arms.push_str(&format!(
+                    "        {type_name}.{member} => new CborValue.Text(\"{lit}\"),\n"
+                ));
+                from_arms.push_str(&format!("        \"{lit}\" => {type_name}.{member},\n"));
+            }
+            CsilTypeExpression::Literal(CsilLiteralValue::Integer(value)) => {
+                to_arms.push_str(&format!(
+                    "        {type_name}.Value{value} => new CborValue.Int({value}),\n"
+                ));
+                from_arms.push_str(&format!("        {value} => {type_name}.Value{value},\n"));
+            }
+            _ => {}
+        }
+    }
+    let mut out = String::new();
+    out.push_str(&format!(
+        "    /// <summary>The bare-literal CBOR value for a {type_name}.</summary>\n"
+    ));
+    out.push_str(&format!(
+        "    public static CborValue {type_name}ToCborValue({type_name} value) => value switch\n    {{\n{to_arms}        _ => throw new CborException(\"invalid {type_name}\"),\n    }};\n\n"
+    ));
+    out.push_str(&format!(
+        "    /// <summary>Reconstruct a {type_name} from its bare-literal CBOR value.</summary>\n"
+    ));
+    if int_based {
+        out.push_str(&format!(
+            "    public static {type_name} {type_name}FromCborValue(CborValue value) => Cbor.AsI64(value) switch\n    {{\n{from_arms}        _ => throw new CborException(\"invalid {type_name} value\"),\n    }};\n\n"
+        ));
+    } else {
+        out.push_str(&format!(
+            "    public static {type_name} {type_name}FromCborValue(CborValue value) => Cbor.AsText(value) switch\n    {{\n{from_arms}        _ => throw new CborException(\"invalid {type_name} value\"),\n    }};\n\n"
+        ));
+    }
+    out
+}
+
+/// Tagged-union codec: encode as `[variant_index, value]` (0-based index in declaration
+/// order), decode by reading the index then dispatching to that arm's value codec.
+fn emit_union_codec(
+    type_name: &str,
+    cases: &[CsilTypeExpression],
+    records: &std::collections::HashSet<String>,
+    aliases: &std::collections::HashMap<String, CsilTypeExpression>,
+    choices: &std::collections::HashSet<String>,
+) -> String {
+    let mut to_arms = String::new();
+    let mut from_arms = String::new();
+    for (index, case) in cases.iter().enumerate() {
+        let arm = union_arm_name(type_name, index, case);
+        let enc = csharp_enc_value(case, "csilArm.Value", records, aliases, choices);
+        let dec = csharp_dec_value(case, "csilArr[1]", records, aliases, choices);
+        to_arms.push_str(&format!(
+            "        {arm} csilArm => new CborValue.Array(new CborValue[] {{ new CborValue.Uint({index}), (CborValue){enc} }}),\n"
+        ));
+        from_arms.push_str(&format!("        {index} => new {arm}({dec}),\n"));
+    }
+    let mut out = String::new();
+    out.push_str(&format!(
+        "    /// <summary>The tagged-sum CBOR value for a {type_name}: [variant_index, value].</summary>\n"
+    ));
+    out.push_str(&format!(
+        "    public static CborValue {type_name}ToCborValue({type_name} value) => value switch\n    {{\n{to_arms}        _ => throw new CborException(\"invalid {type_name}\"),\n    }};\n\n"
+    ));
+    out.push_str(&format!(
+        "    /// <summary>Reconstruct a {type_name} from its tagged-sum CBOR value.</summary>\n"
+    ));
+    out.push_str(&format!(
+        "    public static {type_name} {type_name}FromCborValue(CborValue value)\n    {{\n        var csilArr = Cbor.AsArray(value);\n        return Cbor.AsU64(csilArr[0]) switch\n        {{\n{from_arms}            _ => throw new CborException(\"invalid {type_name} variant\"),\n        }};\n    }}\n\n"
+    ));
     out
 }
 
@@ -1807,6 +2081,7 @@ fn generate_codec(input: &WasmGeneratorInput, config: &CsharpConfig) -> Option<S
     }
     let records = record_names(input);
     let aliases = codec_aliases(input);
+    let choices = choice_names(input);
     let uses_timestamp = spec_uses_builtin(input, "timestamp");
     let uses_decimal = spec_uses_builtin(input, "decimal");
 
@@ -1814,20 +2089,36 @@ fn generate_codec(input: &WasmGeneratorInput, config: &CsharpConfig) -> Option<S
     let mut to_arms = String::new();
     let mut from_arms = String::new();
     for rule in &input.csil_spec.rules {
-        let group = match &rule.rule_type {
-            CsilRuleType::GroupDef(g) => Some(g),
-            CsilRuleType::TypeDef(CsilTypeExpression::Group(g)) => Some(g),
-            _ => None,
-        };
-        if let Some(group) = group {
-            let pascal = pascal_ident(&rule.name);
-            methods.push_str(&emit_record_codec(&rule.name, group, &records, &aliases));
-            to_arms.push_str(&format!(
-                "        {pascal} csilTyped => {pascal}ToCborValue(csilTyped),\n"
-            ));
-            from_arms.push_str(&format!(
-                "        if (csilType == typeof({pascal})) return {pascal}FromCborValue(value);\n"
-            ));
+        match &rule.rule_type {
+            CsilRuleType::GroupDef(group)
+            | CsilRuleType::TypeDef(CsilTypeExpression::Group(group)) => {
+                let pascal = pascal_ident(&rule.name);
+                methods.push_str(&emit_record_codec(
+                    &rule.name, group, &records, &aliases, &choices,
+                ));
+                to_arms.push_str(&format!(
+                    "        {pascal} csilTyped => {pascal}ToCborValue(csilTyped),\n"
+                ));
+                from_arms.push_str(&format!(
+                    "        if (csilType == typeof({pascal})) return {pascal}FromCborValue(value);\n"
+                ));
+            }
+            // A named enum/union gets its own codec helper pair, reached from the record
+            // fields that reference it (and from the generic byte surface).
+            CsilRuleType::TypeDef(CsilTypeExpression::Choice(cases))
+            | CsilRuleType::TypeChoice(cases) => {
+                let pascal = pascal_ident(&rule.name);
+                methods.push_str(&emit_choice_codec(
+                    &rule.name, cases, &records, &aliases, &choices,
+                ));
+                to_arms.push_str(&format!(
+                    "        {pascal} csilTyped => {pascal}ToCborValue(csilTyped),\n"
+                ));
+                from_arms.push_str(&format!(
+                    "        if (csilType == typeof({pascal})) return {pascal}FromCborValue(value);\n"
+                ));
+            }
+            _ => {}
         }
     }
 
@@ -2494,7 +2785,9 @@ fn map_csil_type_inner(
         CsilTypeExpression::Builtin(name) => match name.as_str() {
             "int" => "long".to_string(),
             "uint" => "ulong".to_string(),
-            "float" => "double".to_string(),
+            // `nint` is a CBOR negative integer; it still lands in a signed 64-bit C# `long`.
+            "nint" => "long".to_string(),
+            "float" | "float64" | "double" => "double".to_string(),
             // `tstr`/`bstr` are the CDDL spellings of `text`/`bytes`.
             "text" | "tstr" => "string".to_string(),
             "bytes" | "bstr" => "byte[]".to_string(),
@@ -2507,8 +2800,11 @@ fn map_csil_type_inner(
                 DecimalMapping::Csil => format!("{prefix}CsilDecimal"),
                 DecimalMapping::Library => "decimal".to_string(),
             },
-            // CDDL's open `any`/`nil`/`null` are the untyped CBOR item — `object?` in C#.
-            "any" | "nil" | "null" => "object?".to_string(),
+            // CDDL's open `any` is the untyped CBOR item; it is carried verbatim as the
+            // generated codec's own `CborValue` value tree so it round-trips losslessly.
+            "any" => format!("{prefix}CborValue"),
+            // `nil`/`null` are the CBOR null item — `object?` in C#.
+            "nil" | "null" => "object?".to_string(),
             other => format!("{prefix}{}", pascal_ident(other)),
         },
         CsilTypeExpression::Reference(name) => format!("{prefix}{}", pascal_ident(name)),
@@ -2546,7 +2842,13 @@ fn csharp_tuple(entries: &[CsilGroupEntry], config: &CsharpConfig, qualify: bool
         .iter()
         .enumerate()
         .map(|(index, entry)| {
-            let field_type = map_csil_type_inner(&entry.value_type, config, qualify);
+            let mut field_type = map_csil_type_inner(&entry.value_type, config, qualify);
+            // An optional tuple element is held as null-in-place (the wire keeps a fixed-length
+            // positional array with a CBOR null where the value is absent), so its C# type is
+            // nullable.
+            if matches!(entry.occurrence, Some(CsilOccurrence::Optional)) {
+                field_type = csharp_nullable(&field_type);
+            }
             let field_name = match &entry.key {
                 Some(key) => pascal_ident(&wire_key(key)),
                 None => format!("Field{index}"),
@@ -3379,12 +3681,18 @@ mod tests {
     }
 
     #[test]
-    fn any_maps_to_object() {
-        // CDDL `any` is the open CBOR item; C# has no `Any` type, so it must be `object?`.
+    fn any_maps_to_cbor_value() {
+        // CDDL `any` is the open CBOR item; it is carried verbatim as the generated codec's
+        // own `CborValue` value tree so it round-trips losslessly (a `global using` qualifies
+        // the type to the configured namespace).
         let c = config();
         assert_eq!(
             map_csil_type(&CsilTypeExpression::Builtin("any".to_string()), &c),
-            "object?"
+            "CborValue"
+        );
+        assert_eq!(
+            map_csil_type_qualified(&CsilTypeExpression::Builtin("any".to_string()), &c),
+            "Csilgen.Transport.CborValue"
         );
     }
 
@@ -4049,7 +4357,8 @@ mod tests {
         };
         let records = std::collections::HashSet::new();
         let aliases = std::collections::HashMap::new();
-        let codec = emit_record_codec("Thing", &group, &records, &aliases);
+        let choices = std::collections::HashSet::new();
+        let codec = emit_record_codec("Thing", &group, &records, &aliases, &choices);
 
         // Each optional binds a distinct name, and the bytes optional routes its own binding
         // through CborValue.Bytes (a string binding here is the CS1503 we are guarding).
@@ -4072,6 +4381,160 @@ mod tests {
             codec.contains("new CborValue.Bytes(csilV1)"),
             "the bytes optional must encode its own typed binding"
         );
+    }
+
+    /// A spec exercising every construct the interop wire locks: a text enum, an int enum,
+    /// a `uint / text` tagged union, a tuple with an optional element, and an `any` map. The
+    /// generated types must be real (not `global using = object`) and the codec must route
+    /// each through its own helper with the locked wire shape.
+    fn choices_input(target: &str) -> WasmGeneratorInput {
+        let text = || CsilTypeExpression::Builtin("text".to_string());
+        let pos = || CsilPosition {
+            line: 1,
+            column: 1,
+            offset: 0,
+        };
+        let lit_text = |s: &str| CsilTypeExpression::Literal(CsilLiteralValue::Text(s.to_string()));
+        let lit_int = |n: i64| CsilTypeExpression::Literal(CsilLiteralValue::Integer(n));
+        let type_rule = |name: &str, ty: CsilTypeExpression| CsilRule {
+            name: name.to_string(),
+            rule_type: CsilRuleType::TypeDef(ty),
+            position: pos(),
+            doc_comments: Vec::new(),
+        };
+        let positional = |ty: CsilTypeExpression, optional: bool| CsilGroupEntry {
+            key: None,
+            value_type: ty,
+            occurrence: optional.then_some(CsilOccurrence::Optional),
+            metadata: vec![],
+            doc_comments: Vec::new(),
+        };
+        let color = type_rule(
+            "Color",
+            CsilTypeExpression::Choice(vec![lit_text("red"), lit_text("green"), lit_text("blue")]),
+        );
+        let priority = type_rule(
+            "Priority",
+            CsilTypeExpression::Choice(vec![lit_int(1), lit_int(2), lit_int(3)]),
+        );
+        let id_or_name = type_rule(
+            "IdOrName",
+            CsilTypeExpression::Choice(vec![
+                CsilTypeExpression::Builtin("uint".to_string()),
+                text(),
+            ]),
+        );
+        let bag = CsilRule {
+            name: "Bag".to_string(),
+            rule_type: CsilRuleType::GroupDef(CsilGroupExpression {
+                entries: vec![
+                    bare_entry("color", CsilTypeExpression::Reference("Color".to_string())),
+                    bare_entry(
+                        "prio",
+                        CsilTypeExpression::Reference("Priority".to_string()),
+                    ),
+                    bare_entry("who", CsilTypeExpression::Reference("IdOrName".to_string())),
+                    bare_entry(
+                        "pair",
+                        CsilTypeExpression::Tuple(CsilGroupExpression {
+                            entries: vec![
+                                positional(text(), false),
+                                positional(CsilTypeExpression::Builtin("int".to_string()), true),
+                            ],
+                        }),
+                    ),
+                    bare_entry(
+                        "extra",
+                        CsilTypeExpression::Map {
+                            key: Box::new(text()),
+                            value: Box::new(CsilTypeExpression::Builtin("any".to_string())),
+                            occurrence: None,
+                        },
+                    ),
+                ],
+            }),
+            position: pos(),
+            doc_comments: Vec::new(),
+        };
+        WasmGeneratorInput {
+            csil_spec: CsilSpecSerialized {
+                rules: vec![color, priority, id_or_name, bag],
+                source_content: None,
+                service_count: 0,
+                fields_with_metadata_count: 0,
+            },
+            config: GeneratorConfig {
+                target: target.to_string(),
+                output_dir: "/tmp".to_string(),
+                options: HashMap::new(),
+            },
+            generator_metadata: GeneratorMetadata {
+                name: "csharp".to_string(),
+                version: "1.0.0".to_string(),
+                description: String::new(),
+                target: "csharp".to_string(),
+                capabilities: vec![],
+                author: None,
+                homepage: None,
+            },
+        }
+    }
+
+    #[test]
+    fn namespace_derives_from_package_name() {
+        assert_eq!(csharp_namespace_from_package("interop_api"), "interop_api");
+        assert_eq!(csharp_namespace_from_package("Acme.Tasks"), "Acme.Tasks");
+        assert_eq!(
+            csharp_namespace_from_package("github.com/org/repo/clients/corndogs"),
+            "corndogs"
+        );
+        // A leading digit and stray punctuation are sanitized to a valid identifier.
+        assert_eq!(csharp_namespace_from_package("9lives-cat"), "_9lives_cat");
+
+        // A configured package_name (no explicit namespace) becomes the in-code namespace,
+        // keeping generated types out of the transport library's `Csilgen.Transport`.
+        let output = render(input_with_options(
+            "csharp-client",
+            &[
+                ("emit_packages", serde_json::json!(["csharp"])),
+                ("package_name", serde_json::json!("interop_api")),
+            ],
+        ))
+        .expect("generation ok");
+        assert!(file_content(&output, "Codec.gen.cs").contains("namespace interop_api;"));
+        assert!(file_content(&output, "Types.gen.cs").contains("namespace interop_api;"));
+    }
+
+    #[test]
+    fn named_choices_emit_real_types_and_codecs() {
+        let output = render(choices_input("csharp-client")).expect("generation ok");
+        let types = file_content(&output, "Types.gen.cs");
+        let codec = file_content(&output, "Codec.gen.cs");
+
+        // The enums and union are real types, never stubbed to `object`.
+        assert!(types.contains("public enum Color"));
+        assert!(types.contains("public enum Priority"));
+        assert!(types.contains("public abstract record IdOrName"));
+        assert!(types.contains("public sealed record IdOrNameVariant1(ulong Value) : IdOrName"));
+        assert!(!types.contains("global using Color = object"));
+        // The tuple's optional element is nullable; `any` is the codec's own CborValue.
+        assert!(types.contains("(string Field0, long? Field1) Pair"));
+        assert!(types.contains("Dictionary<string, CborValue> Extra"));
+
+        // The text enum encodes its bare wire literal; the int enum its bare integer.
+        assert!(codec.contains("Color.Green => new CborValue.Text(\"green\")"));
+        assert!(codec.contains("Priority.Value2 => new CborValue.Int(2)"));
+        // The union is the locked [variant_index, value] tagged sum (0-based).
+        assert!(codec.contains(
+            "new CborValue.Array(new CborValue[] { new CborValue.Uint(0), (CborValue)new CborValue.Uint(csilArm.Value) })"
+        ));
+        // The record's fields route through the choice codecs and the positional tuple.
+        assert!(codec.contains("ColorToCborValue(value.Color)"));
+        assert!(codec.contains("IdOrNameToCborValue(value.Who)"));
+        assert!(codec.contains("new CborValue.Text(value.Pair.Field0)"));
+        // `any` map values pass through verbatim (no null stub, no AsText).
+        assert!(codec.contains("(CborValue)csilKv.Value"));
+        assert!(!codec.contains("new CborValue.Text(\"who\"), new CborValue.Null()"));
     }
 
     #[test]

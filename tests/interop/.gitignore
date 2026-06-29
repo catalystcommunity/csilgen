@@ -1,0 +1,9 @@
+# Generated interop packages and built harness artifacts (produced by
+# `cargo run -p xtask interop`). The harness source is checked in; its inputs
+# (the per-language generated package) and build outputs are not.
+harness/*/gen/
+harness/rust/target/
+harness/rust/Cargo.lock
+harness/go/csil-interop
+harness/go/go.sum
+harness/**/__pycache__/

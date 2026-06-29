@@ -127,7 +127,9 @@ rather than overloading RPC push.
 ## 2. Carriers
 
 A carrier defines how an envelope is delimited on a given wire. The envelope
-bytes are identical across carriers; only delimiting differs.
+bytes are identical across carriers; only delimiting differs. For a worked,
+per-language server that serves the same dispatch over **both** an HTTP socket and
+a TCP/stream socket at once, see `serving-csil-rpc-http-and-tcp.md`.
 
 ### 2.1 HTTP
 

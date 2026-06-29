@@ -68,9 +68,26 @@ fn aliases(spec: &CsilSpecSerialized) -> HashMap<String, &CsilTypeExpression> {
         .collect()
 }
 
+/// The named multi-variant unions (`Name = A / B`, not all-literal) the codec
+/// covers with a tagged-sum (`[variant_index, value]`) (de)serializer. A literal-only
+/// choice is an enum (bare-literal wire) and is excluded; those carry no discriminator
+/// and resolve through the scalar/enum paths instead.
+fn unions(spec: &CsilSpecSerialized) -> HashMap<String, &[CsilTypeExpression]> {
+    spec.rules
+        .iter()
+        .filter_map(|r| match &r.rule_type {
+            CsilRuleType::TypeDef(CsilTypeExpression::Choice(choices)) if !all_literal(choices) => {
+                Some((common::to_pascal(&r.name), choices.as_slice()))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
 struct Ctx<'a> {
     records: &'a HashSet<String>,
     aliases: &'a HashMap<String, &'a CsilTypeExpression>,
+    unions: &'a HashMap<String, &'a [CsilTypeExpression]>,
     mapping: DecimalMapping,
 }
 
@@ -163,7 +180,11 @@ fn enc_is_identity(ty: &CsilTypeExpression, ctx: &Ctx) -> bool {
             // alias (object -> `Map`) still needs the transform even though it is a
             // non-record reference, so resolve through it rather than assume identity.
             Some(underlying) => enc_is_identity(underlying, ctx),
-            None => !ctx.records.contains(&common::to_pascal(name)),
+            // A union (tagged sum) and a record both need their codec transform.
+            None => {
+                !ctx.records.contains(&common::to_pascal(name))
+                    && !ctx.unions.contains_key(&common::to_pascal(name))
+            }
         },
         CsilTypeExpression::Array { element_type, .. } => enc_is_identity(element_type, ctx),
         _ => false,
@@ -200,6 +221,12 @@ fn ts_enc_value(
             imports.insert(format!("to{}CborValue", common::to_pascal(name)));
             format!("to{}CborValue({expr})", common::to_pascal(name))
         }
+        CsilTypeExpression::Reference(name)
+            if ctx.unions.contains_key(&common::to_pascal(name)) =>
+        {
+            imports.insert(format!("to{}CborValue", common::to_pascal(name)));
+            format!("to{}CborValue({expr})", common::to_pascal(name))
+        }
         CsilTypeExpression::Reference(name) => match ctx.aliases.get(&common::to_pascal(name)) {
             Some(underlying) => ts_enc_value(underlying, expr, ctx, imports),
             None => expr.to_string(),
@@ -221,6 +248,27 @@ fn ts_enc_value(
             format!(
                 "new Map<CborValue, CborValue>(Object.entries({expr}).map(([csilK, csilV]): [CborValue, CborValue] => [csilK, {inner}]))"
             )
+        }
+        CsilTypeExpression::Tuple(group) => {
+            // A tuple is a fixed-length positional CBOR array; an absent optional
+            // element is held in place as `null` so the array length is stable, matching
+            // the Rust/Go/Python reference.
+            imports.insert("CborValue".to_string());
+            let elems: Vec<String> = group
+                .entries
+                .iter()
+                .enumerate()
+                .map(|(i, entry)| {
+                    let elem = format!("{expr}[{i}]");
+                    let inner = ts_enc_value(&entry.value_type, &elem, ctx, imports);
+                    if common::is_optional(&entry.occurrence) {
+                        format!("({elem} === undefined ? null : {inner})")
+                    } else {
+                        inner
+                    }
+                })
+                .collect();
+            format!("([{}] as CborValue[])", elems.join(", "))
         }
         CsilTypeExpression::Choice(_) => expr.to_string(),
         _ => expr.to_string(),
@@ -282,6 +330,12 @@ fn ts_dec_value(
             imports.insert(format!("from{}CborValue", common::to_pascal(name)));
             format!("from{}CborValue({expr})", common::to_pascal(name))
         }
+        CsilTypeExpression::Reference(name)
+            if ctx.unions.contains_key(&common::to_pascal(name)) =>
+        {
+            imports.insert(format!("from{}CborValue", common::to_pascal(name)));
+            format!("from{}CborValue({expr})", common::to_pascal(name))
+        }
         CsilTypeExpression::Reference(name) => match ctx.aliases.get(&common::to_pascal(name)) {
             Some(underlying) => ts_dec_value(underlying, expr, ctx, imports),
             None => format!(
@@ -301,6 +355,31 @@ fn ts_dec_value(
             format!(
                 "Object.fromEntries(Array.from(asMap({expr}), ([csilK, csilV]): [string, {}] => [asString(csilK), {inner}]))",
                 common::ts_type(value, ctx.mapping)
+            )
+        }
+        CsilTypeExpression::Tuple(group) => {
+            // The inverse of the tuple encoder: read a fixed-length array and rebuild the
+            // tuple, mapping a `null` held-in-place back to an absent optional element.
+            imports.insert("asArray".to_string());
+            imports.insert("CborValue".to_string());
+            let elems: Vec<String> = group
+                .entries
+                .iter()
+                .enumerate()
+                .map(|(i, entry)| {
+                    let elem = format!("csilTup[{i}]");
+                    let inner = ts_dec_value(&entry.value_type, &elem, ctx, imports);
+                    if common::is_optional(&entry.occurrence) {
+                        format!("({elem} === null ? undefined : {inner})")
+                    } else {
+                        inner
+                    }
+                })
+                .collect();
+            format!(
+                "((csilTup: CborValue[]) => ([{}] as {}))(asArray({expr}))",
+                elems.join(", "),
+                common::ts_type(ty, ctx.mapping)
             )
         }
         // An inline literal choice (`x: "a" / "b"`) now narrows to a precise TS union,
@@ -353,6 +432,99 @@ fn literal_choice_reader(choices: &[CsilTypeExpression]) -> &'static str {
     }
 }
 
+/// A runtime boolean expression that is true when `expr` (a value of the structural
+/// union) is the `ty` variant. A CSIL union has no in-memory tag, so the tagged-sum
+/// encoder discriminates by the variant's runtime shape, in declaration order. The
+/// final variant is reached only when no earlier predicate matched, so an unsupported
+/// shape falls through to a runtime error rather than a silent miswrite.
+fn ts_variant_predicate(ty: &CsilTypeExpression, expr: &str, ctx: &Ctx) -> String {
+    match unwrap_constrained(ty) {
+        CsilTypeExpression::Builtin(name) => match name.as_str() {
+            "int" | "uint" | "nint" | "float" | "float16" | "float32" | "float64" | "double" => {
+                format!("typeof {expr} === \"number\" || typeof {expr} === \"bigint\"")
+            }
+            "text" | "tstr" => format!("typeof {expr} === \"string\""),
+            "bytes" | "bstr" => format!("{expr} instanceof Uint8Array"),
+            "bool" => format!("typeof {expr} === \"boolean\""),
+            "null" | "nil" => format!("{expr} === null"),
+            _ => "true".to_string(),
+        },
+        CsilTypeExpression::Literal(v) => match v {
+            CsilLiteralValue::Text(s) => format!("{expr} === {}", ts_string_literal(s)),
+            CsilLiteralValue::Integer(i) => format!("{expr} === {i}"),
+            CsilLiteralValue::Float(f) => format!("{expr} === {f}"),
+            CsilLiteralValue::Bool(b) => format!("{expr} === {b}"),
+            CsilLiteralValue::Null => format!("{expr} === null"),
+            _ => "true".to_string(),
+        },
+        CsilTypeExpression::Array { .. } => format!("Array.isArray({expr})"),
+        CsilTypeExpression::Reference(name) => match ctx.aliases.get(&common::to_pascal(name)) {
+            Some(underlying) => ts_variant_predicate(underlying, expr, ctx),
+            // A record reference is an object that is none of the other CborValue shapes.
+            None if ctx.records.contains(&common::to_pascal(name)) => format!(
+                "typeof {expr} === \"object\" && {expr} !== null && !Array.isArray({expr}) && !({expr} instanceof Uint8Array) && !({expr} instanceof Map)"
+            ),
+            // A nested union reaches the wire as a 2-element tagged-sum array.
+            None if ctx.unions.contains_key(&common::to_pascal(name)) => {
+                format!("Array.isArray({expr})")
+            }
+            None => "true".to_string(),
+        },
+        // A map field is an object in memory; an inline group is rare in a union arm.
+        _ => "true".to_string(),
+    }
+}
+
+/// Emit the per-union codec: a tagged-sum (`[variant_index, value]`) encoder and
+/// decoder plus the byte-level `to<T>Cbor`/`from<T>Cbor`. The variant index is the
+/// 0-based declaration order, matching the Rust/Go/Python reference so a union is
+/// byte-identical across languages.
+fn emit_union_codec(name: &str, choices: &[CsilTypeExpression], ctx: &Ctx) -> String {
+    let type_name = common::to_pascal(name);
+    let mut out = String::new();
+    let mut ignored_imports = BTreeSet::new();
+
+    out.push_str(&format!(
+        "export function to{type_name}CborValue(v: {type_name}): CborValue {{\n"
+    ));
+    for (i, variant) in choices.iter().enumerate() {
+        let pred = ts_variant_predicate(variant, "v", ctx);
+        let cast = common::ts_type(variant, ctx.mapping);
+        let enc = ts_enc_value(variant, "csilV", ctx, &mut ignored_imports);
+        out.push_str(&format!(
+            "  if ({pred}) {{ const csilV = v as {cast}; return [{i}, {enc}]; }}\n"
+        ));
+    }
+    out.push_str(&format!(
+        "  throw new Error(\"unencodable {type_name} union value\");\n}}\n\n"
+    ));
+
+    out.push_str(&format!(
+        "export function from{type_name}CborValue(value: CborValue): {type_name} {{\n"
+    ));
+    out.push_str("  const csilArr = asArray(value);\n");
+    out.push_str(&format!(
+        "  if (csilArr.length !== 2) throw new Error(`{type_name} union expects a 2-element array, got ${{csilArr.length}}`);\n"
+    ));
+    out.push_str("  const csilIdx = asNumber(csilArr[0]);\n");
+    out.push_str("  switch (csilIdx) {\n");
+    for (i, variant) in choices.iter().enumerate() {
+        let dec = ts_dec_value(variant, "csilArr[1]", ctx, &mut ignored_imports);
+        out.push_str(&format!("    case {i}: return {dec};\n"));
+    }
+    out.push_str(&format!(
+        "    default: throw new Error(`unknown {type_name} variant ${{csilIdx}}`);\n  }}\n}}\n\n"
+    ));
+
+    out.push_str(&format!(
+        "export function to{type_name}Cbor(v: {type_name}): Uint8Array {{\n  return encodeValue(to{type_name}CborValue(v));\n}}\n\n"
+    ));
+    out.push_str(&format!(
+        "export function from{type_name}Cbor(bytes: Uint8Array): {type_name} {{\n  return from{type_name}CborValue(decode(bytes));\n}}\n\n"
+    ));
+    out
+}
+
 /// Byte-level encoder for an arbitrary op-boundary value: `encodeValue(<value tree>)`.
 /// The record path has `to<T>Cbor`, but a scalar/array/map request has no named
 /// helper, so the client builds the call inline from the codec's generic CBOR. Returns
@@ -366,9 +538,11 @@ pub fn op_encode_expr(
     value_expr: &str,
 ) -> (String, BTreeSet<String>) {
     let aliases = aliases(spec);
+    let unions = unions(spec);
     let ctx = Ctx {
         records,
         aliases: &aliases,
+        unions: &unions,
         mapping,
     };
     let mut imports = BTreeSet::new();
@@ -388,9 +562,11 @@ pub fn op_decode_expr(
     bytes_expr: &str,
 ) -> (String, BTreeSet<String>) {
     let aliases = aliases(spec);
+    let unions = unions(spec);
     let ctx = Ctx {
         records,
         aliases: &aliases,
+        unions: &unions,
         mapping,
     };
     let mut imports = BTreeSet::new();
@@ -411,9 +587,11 @@ pub fn op_decode_value_expr(
     value_expr: &str,
 ) -> (String, BTreeSet<String>) {
     let aliases = aliases(spec);
+    let unions = unions(spec);
     let ctx = Ctx {
         records,
         aliases: &aliases,
+        unions: &unions,
         mapping,
     };
     let mut imports = BTreeSet::new();
@@ -451,9 +629,11 @@ pub fn op_boundary_expressible(
     ty: &CsilTypeExpression,
 ) -> bool {
     let aliases = aliases(spec);
+    let unions = unions(spec);
     let ctx = Ctx {
         records,
         aliases: &aliases,
+        unions: &unions,
         mapping: DecimalMapping::Csil,
     };
     expressible(ty, &ctx, records_use_decimal(spec))
@@ -573,9 +753,11 @@ pub fn generate(input: &WasmGeneratorInput) -> Option<String> {
     }
     let mapping = common::decimal_mapping(input).unwrap_or(DecimalMapping::Csil);
     let aliases = aliases(spec);
+    let unions = unions(spec);
     let ctx = Ctx {
         records: &records,
         aliases: &aliases,
+        unions: &unions,
         mapping,
     };
 
@@ -593,6 +775,17 @@ pub fn generate(input: &WasmGeneratorInput) -> Option<String> {
                 if type_uses_decimal(&entry.value_type) {
                     uses_decimal = true;
                 }
+            }
+        }
+    }
+    // Each union's codec signature names the union type and may reference records or
+    // other declared types in its variants; pull all of them from the types module.
+    for (union_name, choices) in &unions {
+        imports.insert(union_name.clone());
+        for variant in *choices {
+            common::collect_type_refs(variant, &mut imports);
+            if type_uses_decimal(variant) {
+                uses_decimal = true;
             }
         }
     }
@@ -626,6 +819,10 @@ pub fn generate(input: &WasmGeneratorInput) -> Option<String> {
     for rule in &spec.rules {
         if let Some(group) = rule_group(&rule.rule_type) {
             out.push_str(&emit_record_codec(&rule.name, group, &ctx));
+        } else if let CsilRuleType::TypeDef(CsilTypeExpression::Choice(choices)) = &rule.rule_type
+            && !all_literal(choices)
+        {
+            out.push_str(&emit_union_codec(&rule.name, choices, &ctx));
         }
     }
 

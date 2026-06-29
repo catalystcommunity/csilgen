@@ -6,6 +6,8 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
+mod interop;
+
 #[derive(Parser)]
 #[command(name = "xtask")]
 #[command(about = "Development automation tasks for csilgen")]
@@ -32,6 +34,17 @@ enum Commands {
     /// each against the shared conformance vectors. Languages whose toolchain is
     /// absent are skipped with a message rather than failing the run.
     TestTransports,
+    /// Run the cross-language interop matrix: generate the interop package per
+    /// language, build each harness, and exercise every client x server x
+    /// transport pair over Unix sockets. See tests/interop/README.md.
+    Interop {
+        /// Restrict to these languages (default: all registered).
+        #[arg(long, value_delimiter = ',')]
+        langs: Vec<String>,
+        /// Restrict to these transports: rpc, events, datagrams (default: all).
+        #[arg(long, value_delimiter = ',')]
+        transports: Vec<String>,
+    },
 }
 
 /// True if `cmd --version` (or `version`) runs successfully — used to detect an
@@ -363,6 +376,9 @@ fn main() -> Result<()> {
         }
         Commands::TestTransports => {
             test_transports()?;
+        }
+        Commands::Interop { langs, transports } => {
+            interop::run(langs.clone(), transports.clone())?;
         }
     }
 

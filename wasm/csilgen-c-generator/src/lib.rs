@@ -330,28 +330,49 @@ enum TypeKind<'a> {
     Struct(&'a CsilGroupExpression),
     Alias(&'a CsilTypeExpression),
     Enum(Vec<String>),
+    IntEnum(Vec<i64>),
     Union(&'a [CsilTypeExpression]),
     GroupUnion(&'a [CsilGroupExpression]),
+}
+
+/// Classify a type-choice's arms. An all-text-literal choice (`"red"/"green"`) is a
+/// bare-text enum; an all-integer-literal choice (`1/2/3`) is a bare-integer enum;
+/// anything else (type-bearing arms) is a tagged-sum union. The two enum kinds
+/// differ only in their bare wire scalar, matching the rust/go/python wire.
+fn classify_choice(arms: &[CsilTypeExpression]) -> TypeKind<'_> {
+    let text: Option<Vec<String>> = arms
+        .iter()
+        .map(|a| match a {
+            CsilTypeExpression::Literal(CsilLiteralValue::Text(t)) => Some(t.clone()),
+            _ => None,
+        })
+        .collect();
+    if let Some(names) = text {
+        return TypeKind::Enum(names);
+    }
+    let ints: Option<Vec<i64>> = arms
+        .iter()
+        .map(|a| match a {
+            CsilTypeExpression::Literal(CsilLiteralValue::Integer(n)) => Some(*n),
+            _ => None,
+        })
+        .collect();
+    match ints {
+        Some(values) => TypeKind::IntEnum(values),
+        None => TypeKind::Union(arms),
+    }
 }
 
 fn classify_rule(rule_type: &CsilRuleType) -> Option<TypeKind<'_>> {
     match rule_type {
         CsilRuleType::GroupDef(g) => Some(TypeKind::Struct(g)),
         CsilRuleType::TypeDef(CsilTypeExpression::Group(g)) => Some(TypeKind::Struct(g)),
+        // A `X = a / b / c` rule reaches the generator as a `TypeDef` wrapping a
+        // `Choice` (not a `TypeChoice`), so it must be classified here too or the
+        // whole enum/union collapses to a data-less `void *` alias.
+        CsilRuleType::TypeDef(CsilTypeExpression::Choice(arms)) => Some(classify_choice(arms)),
         CsilRuleType::TypeDef(t) => Some(TypeKind::Alias(t)),
-        CsilRuleType::TypeChoice(arms) => {
-            let literals: Option<Vec<String>> = arms
-                .iter()
-                .map(|a| match a {
-                    CsilTypeExpression::Literal(CsilLiteralValue::Text(t)) => Some(t.clone()),
-                    _ => None,
-                })
-                .collect();
-            Some(match literals {
-                Some(names) => TypeKind::Enum(names),
-                None => TypeKind::Union(arms),
-            })
-        }
+        CsilRuleType::TypeChoice(arms) => Some(classify_choice(arms)),
         CsilRuleType::GroupChoice(arms) => Some(TypeKind::GroupUnion(arms)),
         CsilRuleType::ServiceDef(_) => None,
     }
@@ -393,6 +414,7 @@ fn generate_types(input: &WasmGeneratorInput, config: &CConfig) -> Option<String
     for (name, kind) in &typed {
         match kind {
             TypeKind::Enum(variants) => emit_enum(&mut enums, name, variants),
+            TypeKind::IntEnum(values) => emit_int_enum(&mut enums, name, values),
             TypeKind::Alias(t) => match unwrap_constrained(t) {
                 // A named map alias (`StringInt64Map = {* text => int}`) gets a real
                 // struct carrying parallel key/value arrays and a count, so a field of
@@ -502,6 +524,12 @@ fn generate_types(input: &WasmGeneratorInput, config: &CConfig) -> Option<String
     content.push_str(
         "typedef struct CsilBytes {\n    uint8_t *data;\n    size_t len;\n} CsilBytes;\n\n",
     );
+    // An `any` field carries an opaque CBOR value (the codec's own value tree). The
+    // type only needs the incomplete tag here; codec.gen.h defines the full struct.
+    // C11 permits the matching typedef redefinition in both headers.
+    if spec_uses_builtin(input, "any") {
+        content.push_str("typedef struct csilc_value csilc_value;\n\n");
+    }
     // Enums and forward declarations first so by-value members and pointer cycles
     // both resolve; then aliases; then the full definitions in dependency order.
     content.push_str(&enums);
@@ -564,6 +592,31 @@ fn emit_enum(content: &mut String, name: &str, variants: &[String]) {
             "    {}_{},\n",
             to_upper_snake(name),
             to_upper_snake(variant)
+        ));
+    }
+    content.push_str(&format!("}} {name};\n\n"));
+}
+
+/// Suffix for an integer-enum variant's C enumerator name. A negative literal can't
+/// appear in a C identifier, so it is spelled `NEG<magnitude>`.
+fn int_variant_suffix(v: i64) -> String {
+    if v < 0 {
+        format!("NEG{}", v.unsigned_abs())
+    } else {
+        v.to_string()
+    }
+}
+
+/// Emit an integer-literal enum (`Priority = 1 / 2 / 3`). Each enumerator is given
+/// its literal value, so the bare-integer wire codec reads/writes the value directly.
+fn emit_int_enum(content: &mut String, name: &str, values: &[i64]) {
+    content.push_str(&format!("/* {name} is an integer enumeration. */\n"));
+    content.push_str(&format!("typedef enum {name} {{\n"));
+    for value in values {
+        content.push_str(&format!(
+            "    {}_{} = {value},\n",
+            to_upper_snake(name),
+            int_variant_suffix(*value)
         ));
     }
     content.push_str(&format!("}} {name};\n\n"));
@@ -658,6 +711,22 @@ fn emit_field(
                 declarator(&v, 1, &format!("{field}_values"))
             ));
             content.push_str(&format!("    size_t {field}_count;\n"));
+        }
+        // A fixed-shape tuple (`[text, int]`, `[text, ?int, ?bool]`) becomes an
+        // anonymous struct of positional members. An optional element becomes a
+        // pointer so NULL means the absent (null-in-place) slot the wire carries.
+        CsilTypeExpression::Tuple(group) => {
+            content.push_str("    struct {\n");
+            for (member, entry) in tuple_members(group) {
+                let et = base_c_type(&entry.value_type, config);
+                let optional = matches!(entry.occurrence, Some(CsilOccurrence::Optional));
+                let extra_ptr = usize::from(optional && !et.ends_with('*'));
+                content.push_str(&format!(
+                    "        {};\n",
+                    declarator(&et, extra_ptr, &member)
+                ));
+            }
+            content.push_str(&format!("    }} {field};\n"));
         }
         _ => {
             let c_type = base_c_type(base, config);
@@ -1027,9 +1096,13 @@ fn emit_enc_value(
                 "{indent}if (csilc_w_tag(b, 4) || csilc_w_array_head(b, 2) ||\n\
                  {indent}    csilc_w_int(b, ({expr}).exponent) || csilc_w_int(b, ({expr}).mantissa)) return -1;\n"
             )),
-            "null" | "nil" | "undefined" | "any" => {
+            "null" | "nil" | "undefined" => {
                 out.push_str(&format!("{indent}if (csilc_w_null(b)) return -1;\n"))
             }
+            // `any` is an opaque CBOR value tree; re-emit it verbatim.
+            "any" => out.push_str(&format!(
+                "{indent}if (csilc_w_value(b, ({expr}))) return -1;\n"
+            )),
             other => {
                 warnings.push(GeneratorWarning {
                     message: format!("c codec: unsupported builtin `{other}` encoded as null"),
@@ -1107,9 +1180,12 @@ fn emit_dec_value(
             "decimal" => out.push_str(&format!(
                 "{indent}if (!csilc_get_decimal({src}, &({dst}).exponent, &({dst}).mantissa)) return -1;\n"
             )),
-            "null" | "nil" | "undefined" | "any" => {
+            "null" | "nil" | "undefined" => {
                 out.push_str(&format!("{indent}({dst}) = NULL;\n"))
             }
+            // `any` keeps a borrowed pointer into the decode arena's value tree, valid
+            // for the lifetime of the owning decoded value.
+            "any" => out.push_str(&format!("{indent}({dst}) = {src};\n")),
             other => {
                 warnings.push(GeneratorWarning {
                     message: format!("c codec: unsupported builtin `{other}` decoded as zero"),
@@ -1259,6 +1335,34 @@ fn emit_enc_field(
                 emit_enc_map_body(out, "    ", member, klen, (key, value), scope, warnings);
             }
         }
+        // A tuple writes a fixed-length positional CBOR array; an absent optional
+        // element is held in place as null so the array length never changes.
+        CsilTypeExpression::Tuple(group) => {
+            out.push_str(&key_write);
+            out.push_str(&format!(
+                "    if (csilc_w_array_head(b, {})) return -1;\n",
+                group.entries.len()
+            ));
+            for (tmember, entry) in tuple_members(group) {
+                let place = format!("v->{member}.{tmember}");
+                let et = base_c_type(&entry.value_type, &default_config());
+                let is_ptr = et.ends_with('*');
+                if matches!(entry.occurrence, Some(CsilOccurrence::Optional)) {
+                    out.push_str(&format!("    if ({place}) {{\n"));
+                    let val = if is_ptr {
+                        place.clone()
+                    } else {
+                        format!("(*{place})")
+                    };
+                    emit_enc_value(out, "        ", &entry.value_type, &val, scope, warnings);
+                    out.push_str("    } else {\n");
+                    out.push_str("        if (csilc_w_null(b)) return -1;\n");
+                    out.push_str("    }\n");
+                } else {
+                    emit_enc_value(out, "    ", &entry.value_type, &place, scope, warnings);
+                }
+            }
+        }
         _ => {
             // Scalars and references: an optional value-typed field is a pointer to
             // its value, so the present value reads `*v->member`; a pointer-typed
@@ -1361,6 +1465,54 @@ fn emit_dec_field(
                 warnings,
             );
             out.push_str("        }\n    }\n");
+        }
+        // A tuple reads a fixed-length positional array; an optional slot is the
+        // borrowed null marker (pointer left NULL) or a decoded, arena-held value.
+        CsilTypeExpression::Tuple(group) => {
+            let n = group.entries.len();
+            out.push_str(&format!(
+                "    if (!csilc_f || csilc_f->kind != CSILC_ARRAY || csilc_f->as.array.count != {n}) return -1;\n"
+            ));
+            for (i, (tmember, entry)) in tuple_members(group).iter().enumerate() {
+                let dst = format!("out->{member}.{tmember}");
+                let src = format!("&csilc_f->as.array.items[{i}]");
+                let et = base_c_type(&entry.value_type, &default_config());
+                let is_ptr = et.ends_with('*');
+                if matches!(entry.occurrence, Some(CsilOccurrence::Optional)) {
+                    out.push_str(&format!("    if (({src})->kind == CSILC_NULL) {{\n"));
+                    out.push_str(&format!("        {dst} = NULL;\n"));
+                    out.push_str("    } else {\n");
+                    if is_ptr {
+                        emit_dec_value(
+                            out,
+                            "        ",
+                            &entry.value_type,
+                            &src,
+                            &dst,
+                            scope,
+                            warnings,
+                        );
+                    } else {
+                        out.push_str(&format!(
+                            "        {et} *csilc_tp = ({et} *)csilc_arena_alloc(a, sizeof({et}));\n"
+                        ));
+                        out.push_str("        if (!csilc_tp) return -1;\n");
+                        emit_dec_value(
+                            out,
+                            "        ",
+                            &entry.value_type,
+                            &src,
+                            "(*csilc_tp)",
+                            scope,
+                            warnings,
+                        );
+                        out.push_str(&format!("        {dst} = csilc_tp;\n"));
+                    }
+                    out.push_str("    }\n");
+                } else {
+                    emit_dec_value(out, "    ", &entry.value_type, &src, &dst, scope, warnings);
+                }
+            }
         }
         _ => {
             let c_type = base_c_type(base, &default_config());
@@ -1644,6 +1796,107 @@ fn emit_enum_codec(out: &mut String, name: &str, variants: &[String]) {
     out.push_str("            return 0;\n        }\n    }\n    return -1;\n}\n\n");
 }
 
+/// Emit the codec for an integer-literal enum. The wire form is the bare integer
+/// literal, and each C enumerator already equals its literal, so encode writes the
+/// value directly and decode matches it back, rejecting an out-of-set integer.
+fn emit_int_enum_codec(out: &mut String, name: &str, values: &[i64]) {
+    out.push_str(&format!(
+        "/* csilc_enc_{name} writes the {name} variant's bare integer literal. */\n"
+    ));
+    out.push_str(&format!(
+        "static inline int csilc_enc_{name}(csilc_buf *b, const {name} *v) {{\n"
+    ));
+    out.push_str("    return csilc_w_int(b, (int64_t)(*v));\n}\n\n");
+    out.push_str(&format!(
+        "/* csilc_dec_{name} matches the wire integer back to a {name} variant. */\n"
+    ));
+    out.push_str(&format!(
+        "static inline int csilc_dec_{name}(const csilc_value *src, CsilCodecArena *a, {name} *out) {{\n"
+    ));
+    out.push_str("    (void)a;\n    int64_t csilc_v;\n");
+    out.push_str("    if (!csilc_as_i64(src, &csilc_v)) return -1;\n");
+    out.push_str("    switch (csilc_v) {\n");
+    for value in values {
+        out.push_str(&format!("    case {value}:\n"));
+    }
+    out.push_str(&format!(
+        "        *out = ({name})csilc_v;\n        return 0;\n"
+    ));
+    out.push_str("    default: return -1;\n    }\n}\n\n");
+}
+
+/// Emit the codec for a tagged-sum union. The wire form is a 2-element CBOR array
+/// `[variant_index, value]`, the index being the 0-based declaration order, so any
+/// arm types round-trip unambiguously (matching rust/go/python).
+fn emit_union_codec(
+    out: &mut String,
+    name: &str,
+    arms: &[CsilTypeExpression],
+    scope: &CodecScope,
+    warnings: &mut Vec<GeneratorWarning>,
+) {
+    out.push_str(&format!(
+        "/* csilc_enc_{name} writes the union as a tagged sum [variant_index, value]. */\n"
+    ));
+    out.push_str(&format!(
+        "static inline int csilc_enc_{name}(csilc_buf *b, const {name} *v) {{\n"
+    ));
+    out.push_str("    if (csilc_w_array_head(b, 2)) return -1;\n");
+    out.push_str("    switch (v->tag) {\n");
+    for (i, arm) in arms.iter().enumerate() {
+        let tag = format!(
+            "{}_{}",
+            to_upper_snake(name),
+            to_upper_snake(&arm_name(arm, i))
+        );
+        let member = to_snake(&arm_name(arm, i));
+        out.push_str(&format!("    case {tag}:\n"));
+        out.push_str(&format!("        if (csilc_w_uint(b, {i})) return -1;\n"));
+        emit_enc_value(
+            out,
+            "        ",
+            arm,
+            &format!("v->u.{member}"),
+            scope,
+            warnings,
+        );
+        out.push_str("        break;\n");
+    }
+    out.push_str("    default: return -1;\n    }\n    return 0;\n}\n\n");
+
+    out.push_str(&format!(
+        "/* csilc_dec_{name} reads a tagged sum [variant_index, value] into the union. */\n"
+    ));
+    out.push_str(&format!(
+        "static inline int csilc_dec_{name}(const csilc_value *m, CsilCodecArena *a, {name} *out) {{\n"
+    ));
+    out.push_str("    (void)a;\n    uint64_t csilc_idx;\n");
+    out.push_str("    if (!m || m->kind != CSILC_ARRAY || m->as.array.count != 2) return -1;\n");
+    out.push_str("    if (!csilc_as_u64(&m->as.array.items[0], &csilc_idx)) return -1;\n");
+    out.push_str("    switch (csilc_idx) {\n");
+    for (i, arm) in arms.iter().enumerate() {
+        let tag = format!(
+            "{}_{}",
+            to_upper_snake(name),
+            to_upper_snake(&arm_name(arm, i))
+        );
+        let member = to_snake(&arm_name(arm, i));
+        out.push_str(&format!("    case {i}:\n"));
+        out.push_str(&format!("        out->tag = {tag};\n"));
+        emit_dec_value(
+            out,
+            "        ",
+            arm,
+            "&m->as.array.items[1]",
+            &format!("out->u.{member}"),
+            scope,
+            warnings,
+        );
+        out.push_str("        return 0;\n");
+    }
+    out.push_str("    default: return -1;\n    }\n}\n\n");
+}
+
 /// Escape a string for a C string literal.
 fn c_escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
@@ -1712,6 +1965,24 @@ fn generate_codec(
                 ));
                 emit_enum_codec(&mut bodies, name, variants);
             }
+            TypeKind::IntEnum(values) => {
+                decls.push_str(&format!(
+                    "static inline int csilc_enc_{name}(csilc_buf *b, const {name} *v);\n"
+                ));
+                decls.push_str(&format!(
+                    "static inline int csilc_dec_{name}(const csilc_value *src, CsilCodecArena *a, {name} *out);\n"
+                ));
+                emit_int_enum_codec(&mut bodies, name, values);
+            }
+            TypeKind::Union(arms) => {
+                decls.push_str(&format!(
+                    "static inline int csilc_enc_{name}(csilc_buf *b, const {name} *v);\n"
+                ));
+                decls.push_str(&format!(
+                    "static inline int csilc_dec_{name}(const csilc_value *m, CsilCodecArena *a, {name} *out);\n"
+                ));
+                emit_union_codec(&mut bodies, name, arms, &scope, warnings);
+            }
             _ => {
                 if let Some(agg) = alias_aggregate(kind) {
                     decls.push_str(&format!(
@@ -1740,8 +2011,10 @@ fn generate_codec(
     // caller frees once with csil_codec_arena_free.
     let mut public = String::new();
     for (name, kind) in &typed {
-        if !matches!(kind, TypeKind::Struct(_) | TypeKind::Enum(_))
-            && alias_aggregate(kind).is_none()
+        if !matches!(
+            kind,
+            TypeKind::Struct(_) | TypeKind::Enum(_) | TypeKind::IntEnum(_) | TypeKind::Union(_)
+        ) && alias_aggregate(kind).is_none()
         {
             continue;
         }
@@ -1887,8 +2160,10 @@ fn codec_type_names(input: &WasmGeneratorInput) -> std::collections::HashSet<Str
         .iter()
         .filter_map(|rule| {
             let kind = classify_rule(&rule.rule_type)?;
-            let codecd = matches!(kind, TypeKind::Struct(_) | TypeKind::Enum(_))
-                || alias_aggregate(&kind).is_some();
+            let codecd = matches!(
+                kind,
+                TypeKind::Struct(_) | TypeKind::Enum(_) | TypeKind::IntEnum(_) | TypeKind::Union(_)
+            ) || alias_aggregate(&kind).is_some();
             codecd.then(|| rule.name.clone())
         })
         .collect()
@@ -2387,7 +2662,10 @@ fn base_c_type(type_expr: &CsilTypeExpression, config: &CConfig) -> String {
             "bool" | "true" | "false" => "bool".to_string(),
             "timestamp" => "CsilTimestamp".to_string(),
             "decimal" => config.decimal_c_type().to_string(),
-            "null" | "nil" | "undefined" | "any" => "void *".to_string(),
+            "null" | "nil" | "undefined" => "void *".to_string(),
+            // `any` carries an opaque CBOR value through verbatim, held as the codec's
+            // own decoded value-tree node so it re-encodes byte-identically.
+            "any" => "const csilc_value *".to_string(),
             other => other.to_string(),
         },
         CsilTypeExpression::Reference(name) => name.clone(),
@@ -2557,6 +2835,21 @@ fn arm_name(arm: &CsilTypeExpression, index: usize) -> String {
         CsilTypeExpression::Reference(n) | CsilTypeExpression::Builtin(n) => n.clone(),
         _ => format!("Choice{index}"),
     }
+}
+
+/// The positional members of a tuple, paired with their entries. A keyed tuple entry
+/// (`[tag: text, value: any]`) keeps its name; an unnamed positional element becomes
+/// `f<index>`. The same naming is used by the struct, encoder, and decoder.
+fn tuple_members(group: &CsilGroupExpression) -> Vec<(String, &CsilGroupEntry)> {
+    group
+        .entries
+        .iter()
+        .enumerate()
+        .map(|(i, entry)| {
+            let name = entry_field_name(&entry.key).unwrap_or_else(|| format!("f{i}"));
+            (name, entry)
+        })
+        .collect()
 }
 
 // ---- naming (wire names verbatim; C symbols cased) ------------------------
@@ -4052,6 +4345,39 @@ static inline bool csilc_get_decimal(const csilc_value *v, int64_t *exp, int64_t
     if (arr->kind != CSILC_ARRAY || arr->as.array.count != 2) return false;
     return csilc_as_i64(&arr->as.array.items[0], exp) &&
            csilc_as_i64(&arr->as.array.items[1], mant);
+}
+
+/* Re-emit a decoded value tree as CBOR, used by `any` fields that carry an opaque
+ * value through verbatim. A value decoded from canonical input re-encodes to
+ * identical bytes (maps keep their already-canonical input order). */
+static inline int csilc_w_value(csilc_buf *b, const csilc_value *v) {
+    if (!v) return csilc_w_null(b);
+    switch (v->kind) {
+    case CSILC_UINT: return csilc_w_uint(b, v->as.u);
+    case CSILC_NINT: return csilc_w_int(b, v->as.i);
+    case CSILC_TEXT: return csilc_w_text(b, (const char *)v->as.bytes.ptr, v->as.bytes.len);
+    case CSILC_BYTES: return csilc_w_bytes(b, v->as.bytes.ptr, v->as.bytes.len);
+    case CSILC_BOOL: return csilc_w_bool(b, v->as.boolean);
+    case CSILC_NULL: return csilc_w_null(b);
+    case CSILC_FLOAT: return csilc_w_f64(b, v->as.f);
+    case CSILC_ARRAY:
+        if (csilc_w_array_head(b, v->as.array.count)) return -1;
+        for (size_t csilc_i = 0; csilc_i < v->as.array.count; csilc_i++) {
+            if (csilc_w_value(b, &v->as.array.items[csilc_i])) return -1;
+        }
+        return 0;
+    case CSILC_MAP:
+        if (csilc_w_map_head(b, v->as.map.count)) return -1;
+        for (size_t csilc_i = 0; csilc_i < v->as.map.count; csilc_i++) {
+            if (csilc_w_value(b, v->as.map.pairs[csilc_i].key)) return -1;
+            if (csilc_w_value(b, v->as.map.pairs[csilc_i].val)) return -1;
+        }
+        return 0;
+    case CSILC_TAG:
+        if (csilc_w_tag(b, v->as.tag.num)) return -1;
+        return csilc_w_value(b, v->as.tag.content);
+    }
+    return -1;
 }
 "##;
 

@@ -1,0 +1,7 @@
+{
+  "name": "csil-interop-typescript",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "description": "TypeScript interop harness; run via Node native type stripping (node main.ts)."
+}

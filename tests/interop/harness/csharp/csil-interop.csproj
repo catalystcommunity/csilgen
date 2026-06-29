@@ -1,0 +1,25 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <LangVersion>12</LangVersion>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <AssemblyName>csil-interop</AssemblyName>
+    <RootNamespace>CsilInterop</RootNamespace>
+    <Deterministic>true</Deterministic>
+  </PropertyGroup>
+  <ItemGroup>
+    <!-- The generated package is a referenced assembly, not part of this project's own
+         compilation, so its sources under gen/ must be excluded from the default glob (else
+         every generated type is compiled twice — CS0436). -->
+    <Compile Remove="gen/**/*.cs" />
+  </ItemGroup>
+  <ItemGroup>
+    <!-- The generated package (gitignored, produced by the orchestrator / build.sh) and the
+         in-repo transport library. They use distinct namespaces (interop_api vs
+         Csilgen.Transport), so their same-named CBOR value trees do not collide. -->
+    <ProjectReference Include="gen/interop_api.csproj" />
+    <ProjectReference Include="../../../../transports/csharp/src/Csilgen.Transport/Csilgen.Transport.csproj" />
+  </ItemGroup>
+</Project>

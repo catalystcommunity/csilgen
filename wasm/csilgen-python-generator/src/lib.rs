@@ -1336,7 +1336,7 @@ impl PythonGenerator {
         }
 
         if !files.is_empty() {
-            let init_file = self.generate_init_file(&files)?;
+            let init_file = self.generate_init_file(&files, spec)?;
             files.push(init_file);
         }
 
@@ -2989,7 +2989,11 @@ impl PythonGenerator {
         })
     }
 
-    fn generate_init_file(&self, files: &[GeneratedFile]) -> Result<GeneratedFile> {
+    fn generate_init_file(
+        &self,
+        files: &[GeneratedFile],
+        spec: &CsilSpecSerialized,
+    ) -> Result<GeneratedFile> {
         let mut content = String::new();
 
         content.push_str("# Generated package init from CSIL specification\n");
@@ -3017,6 +3021,26 @@ impl PythonGenerator {
                 content.push_str("from .client_async import *\n");
                 exports.push("client_async");
             }
+        }
+
+        // services.py / client.py emit a framework `ServiceError(Exception)`; if the
+        // spec ALSO declares a `ServiceError` record, the wildcard imports above bind
+        // the exception at the package root and shadow the codec-bearing data type.
+        // Re-export the dataclass last so `from <pkg> import ServiceError` resolves to
+        // the record (the exception stays reachable via `.services` for internal use).
+        if exports.contains(&"types")
+            && spec.rules.iter().any(|r| {
+                r.name.to_case(Case::Pascal) == "ServiceError"
+                    && matches!(
+                        r.rule_type,
+                        CsilRuleType::GroupDef(_)
+                            | CsilRuleType::TypeDef(CsilTypeExpression::Group(_))
+                    )
+            })
+        {
+            content.push_str(
+                "\n# A spec-defined `ServiceError` record shadows the framework exception.\nfrom .types import ServiceError\n",
+            );
         }
 
         if !exports.is_empty() {
@@ -3179,6 +3203,7 @@ fn py_enc_value(
     expr: &str,
     records: &HashSet<String>,
     aliases: &HashMap<String, CsilTypeExpression>,
+    unions: &HashSet<String>,
 ) -> String {
     match unwrap_constrained(type_expr) {
         CsilTypeExpression::Builtin(name) => match name.as_str() {
@@ -3189,14 +3214,16 @@ fn py_enc_value(
         },
         CsilTypeExpression::Reference(name) => {
             let suffix = record_suffix(name);
-            if records.contains(&suffix) {
+            // Records and unions both have a generated `_encode_<suffix>_value` helper
+            // (a record map codec, or a union tagged-sum codec).
+            if records.contains(&suffix) || unions.contains(&suffix) {
                 format!("_encode_{suffix}_value({expr})")
             } else if let Some(underlying) = aliases.get(&suffix) {
                 // A transparent alias has no codec of its own; encode its underlying
                 // type. A scalar/structural alias resolves to the identity, but a
                 // map/array-of-record alias recurses into the record helper rather
                 // than passing the dataclass instances through raw (the regression).
-                py_enc_value(underlying, expr, records, aliases)
+                py_enc_value(underlying, expr, records, aliases, unions)
             } else {
                 expr.to_string()
             }
@@ -3205,7 +3232,7 @@ fn py_enc_value(
             if is_identity_type(element_type, records, aliases) {
                 expr.to_string()
             } else {
-                let inner = py_enc_value(element_type, "csil_e", records, aliases);
+                let inner = py_enc_value(element_type, "csil_e", records, aliases, unions);
                 format!("[{inner} for csil_e in {expr}]")
             }
         }
@@ -3214,12 +3241,27 @@ fn py_enc_value(
             {
                 expr.to_string()
             } else {
-                let ek = py_enc_value(key, "csil_k", records, aliases);
-                let ev = py_enc_value(value, "csil_v", records, aliases);
+                let ek = py_enc_value(key, "csil_k", records, aliases, unions);
+                let ev = py_enc_value(value, "csil_v", records, aliases, unions);
                 format!("{{{ek}: {ev} for csil_k, csil_v in {expr}.items()}}")
             }
         }
-        // A tuple/choice/opaque value already is (or is carried as) a value tree.
+        // A fixed-shape tuple encodes positionally into a list; an absent optional
+        // element stays None (encoded as null) so the array length is fixed.
+        CsilTypeExpression::Tuple(group) => {
+            let mut parts = Vec::with_capacity(group.entries.len());
+            for (i, entry) in group.entries.iter().enumerate() {
+                let elem = format!("{expr}[{i}]");
+                let enc = py_enc_value(&entry.value_type, &elem, records, aliases, unions);
+                if matches!(entry.occurrence, Some(CsilOccurrence::Optional)) {
+                    parts.push(format!("(None if {elem} is None else {enc})"));
+                } else {
+                    parts.push(enc);
+                }
+            }
+            format!("[{}]", parts.join(", "))
+        }
+        // An opaque value is carried as its value tree.
         _ => expr.to_string(),
     }
 }
@@ -3231,6 +3273,7 @@ fn py_dec_value(
     expr: &str,
     records: &HashSet<String>,
     aliases: &HashMap<String, CsilTypeExpression>,
+    unions: &HashSet<String>,
 ) -> String {
     match unwrap_constrained(type_expr) {
         CsilTypeExpression::Builtin(name) => match name.as_str() {
@@ -3241,13 +3284,13 @@ fn py_dec_value(
         },
         CsilTypeExpression::Reference(name) => {
             let suffix = record_suffix(name);
-            if records.contains(&suffix) {
+            if records.contains(&suffix) || unions.contains(&suffix) {
                 format!("_decode_{suffix}_value({expr})")
             } else if let Some(underlying) = aliases.get(&suffix) {
                 // The inverse of the encode: resolve a transparent alias to its
                 // underlying type so a map/array-of-record alias reconstructs the
                 // record rather than leaving raw value-tree dicts in place.
-                py_dec_value(underlying, expr, records, aliases)
+                py_dec_value(underlying, expr, records, aliases, unions)
             } else {
                 expr.to_string()
             }
@@ -3256,7 +3299,7 @@ fn py_dec_value(
             if is_identity_type(element_type, records, aliases) {
                 expr.to_string()
             } else {
-                let inner = py_dec_value(element_type, "csil_e", records, aliases);
+                let inner = py_dec_value(element_type, "csil_e", records, aliases, unions);
                 format!("[{inner} for csil_e in {expr}]")
             }
         }
@@ -3265,10 +3308,26 @@ fn py_dec_value(
             {
                 expr.to_string()
             } else {
-                let dk = py_dec_value(key, "csil_k", records, aliases);
-                let dv = py_dec_value(value, "csil_v", records, aliases);
+                let dk = py_dec_value(key, "csil_k", records, aliases, unions);
+                let dv = py_dec_value(value, "csil_v", records, aliases, unions);
                 format!("{{{dk}: {dv} for csil_k, csil_v in {expr}.items()}}")
             }
+        }
+        // Reconstruct a fixed-shape tuple positionally from the decoded array.
+        CsilTypeExpression::Tuple(group) => {
+            let mut parts = Vec::with_capacity(group.entries.len());
+            for (i, entry) in group.entries.iter().enumerate() {
+                let elem = format!("{expr}[{i}]");
+                let dec = py_dec_value(&entry.value_type, &elem, records, aliases, unions);
+                if matches!(entry.occurrence, Some(CsilOccurrence::Optional)) {
+                    parts.push(format!("(None if {elem} is None else {dec})"));
+                } else {
+                    parts.push(dec);
+                }
+            }
+            // A 1-tuple needs the trailing comma to stay a tuple.
+            let trailing = if parts.len() == 1 { "," } else { "" };
+            format!("({}{trailing})", parts.join(", "))
         }
         _ => expr.to_string(),
     }
@@ -3311,6 +3370,7 @@ fn emit_record_codec(
     group: &CsilGroupExpression,
     records: &HashSet<String>,
     aliases: &HashMap<String, CsilTypeExpression>,
+    unions: &HashSet<String>,
 ) -> String {
     let class_name = name.to_case(Case::Pascal);
     let suffix = record_suffix(name);
@@ -3327,7 +3387,7 @@ fn emit_record_codec(
     encode_fields.sort_by(|a, b| a.key_bytes.cmp(&b.key_bytes));
     for field in &encode_fields {
         if field.optional {
-            let enc = py_enc_value(field.value_type, "csil_x", records, aliases);
+            let enc = py_enc_value(field.value_type, "csil_x", records, aliases, unions);
             out.push_str(&format!("    csil_x = v.{}\n", field.attr));
             out.push_str("    if csil_x is not None:\n");
             out.push_str(&format!("        csil_m[\"{}\"] = {enc}\n", field.wire));
@@ -3337,6 +3397,7 @@ fn emit_record_codec(
                 &format!("v.{}", field.attr),
                 records,
                 aliases,
+                unions,
             );
             out.push_str(&format!("    csil_m[\"{}\"] = {enc}\n", field.wire));
         }
@@ -3359,6 +3420,7 @@ fn emit_record_codec(
                     &format!("tree[\"{}\"]", field.wire),
                     records,
                     aliases,
+                    unions,
                 );
                 out.push_str(&format!(
                     "        {}=(None if tree.get(\"{}\") is None else {dec}),\n",
@@ -3370,6 +3432,7 @@ fn emit_record_codec(
                     &format!("tree[\"{}\"]", field.wire),
                     records,
                     aliases,
+                    unions,
                 );
                 out.push_str(&format!("        {}={dec},\n", field.attr));
             }
@@ -3415,6 +3478,101 @@ fn codec_aliases(spec: &CsilSpecSerialized) -> HashMap<String, CsilTypeExpressio
         .collect()
 }
 
+/// Named non-literal type-choices (unions) and their variant types, in declaration
+/// order. Literal-only choices are enums (encoded bare); a choice with a `null`
+/// variant is an optional. Both are excluded.
+fn python_union_defs(spec: &CsilSpecSerialized) -> Vec<(String, Vec<CsilTypeExpression>)> {
+    spec.rules
+        .iter()
+        .filter_map(|rule| {
+            let choices = match &rule.rule_type {
+                CsilRuleType::TypeChoice(c) => c,
+                CsilRuleType::TypeDef(CsilTypeExpression::Choice(c)) => c,
+                _ => return None,
+            };
+            let all_literal = choices
+                .iter()
+                .all(|c| matches!(c, CsilTypeExpression::Literal(_)));
+            let has_null = choices
+                .iter()
+                .any(|c| matches!(c, CsilTypeExpression::Literal(CsilLiteralValue::Null)));
+            if all_literal || has_null {
+                return None;
+            }
+            Some((record_suffix(&rule.name), choices.clone()))
+        })
+        .collect()
+}
+
+/// The Python `isinstance` type a union variant dispatches on when encoding (the
+/// runtime value carries no tag, so the variant index is recovered from its type).
+fn py_isinstance_type(variant: &CsilTypeExpression, records: &HashSet<String>) -> String {
+    match unwrap_constrained(variant) {
+        CsilTypeExpression::Builtin(name) => match name.as_str() {
+            "bool" => "bool".to_string(),
+            "int" | "uint" | "nint" => "int".to_string(),
+            "float" | "float16" | "float32" | "float64" | "double" => "float".to_string(),
+            "text" | "tstr" => "str".to_string(),
+            "bytes" | "bstr" => "(bytes, bytearray)".to_string(),
+            "timestamp" => "datetime".to_string(),
+            "decimal" => "Decimal".to_string(),
+            _ => "object".to_string(),
+        },
+        CsilTypeExpression::Reference(name) if records.contains(&record_suffix(name)) => {
+            name.to_case(Case::Pascal)
+        }
+        CsilTypeExpression::Array { .. } => "list".to_string(),
+        CsilTypeExpression::Map { .. } => "dict".to_string(),
+        _ => "object".to_string(),
+    }
+}
+
+/// Emit the tagged-sum codec helpers for a union: `_encode_<u>_value` dispatches on
+/// the Python runtime type to find the variant index and emits `[index, value]`;
+/// `_decode_<u>_value` reads the index and reconstructs that variant. `bool` is
+/// checked before `int` (Python's `bool` is an `int` subclass).
+fn emit_union_codec(
+    name: &str,
+    variants: &[CsilTypeExpression],
+    records: &HashSet<String>,
+    aliases: &HashMap<String, CsilTypeExpression>,
+    unions: &HashSet<String>,
+) -> String {
+    let suffix = record_suffix(name);
+    let mut out = String::new();
+
+    // Order so a `bool` variant is tested before any `int` variant.
+    let mut order: Vec<usize> = (0..variants.len()).collect();
+    order.sort_by_key(|&i| usize::from(py_isinstance_type(&variants[i], records) != "bool"));
+
+    out.push_str(&format!("def _encode_{suffix}_value(csil_v):\n"));
+    for &i in &order {
+        let ty = py_isinstance_type(&variants[i], records);
+        let enc = py_enc_value(&variants[i], "csil_v", records, aliases, unions);
+        out.push_str(&format!(
+            "    if isinstance(csil_v, {ty}):\n        return [{i}, {enc}]\n"
+        ));
+    }
+    out.push_str(&format!(
+        "    raise ValueError(\"csil cbor: value does not match any {name} variant\")\n\n\n"
+    ));
+
+    out.push_str(&format!("def _decode_{suffix}_value(csil_tree):\n"));
+    out.push_str("    if not isinstance(csil_tree, (list, tuple)) or len(csil_tree) != 2:\n");
+    out.push_str(&format!(
+        "        raise ValueError(\"csil cbor: {name} union expects a 2-element array\")\n"
+    ));
+    out.push_str("    csil_idx = csil_tree[0]\n    csil_val = csil_tree[1]\n");
+    for (i, variant) in variants.iter().enumerate() {
+        let dec = py_dec_value(variant, "csil_val", records, aliases, unions);
+        out.push_str(&format!("    if csil_idx == {i}:\n        return {dec}\n"));
+    }
+    out.push_str(&format!(
+        "    raise ValueError(\"csil cbor: unknown {name} variant\")\n\n\n"
+    ));
+    out
+}
+
 /// Build `codec.py`: the self-contained canonical-CBOR runtime plus per-record
 /// value-tree (de)serializers and the `to_cbor`/`from_cbor` methods bound onto each
 /// dataclass. `None` when the spec declares no record types.
@@ -3434,6 +3592,8 @@ fn generate_codec_file(
     let mut needs_decimal = false;
     let mut needs_re = false;
     let mut needs_tuple = false;
+    let union_defs = python_union_defs(spec);
+    let unions: HashSet<String> = union_defs.iter().map(|(n, _)| n.clone()).collect();
     let mut body = String::new();
     for rule in &spec.rules {
         let group = match &rule.rule_type {
@@ -3451,8 +3611,25 @@ fn generate_codec_file(
                     &mut needs_tuple,
                 );
             }
-            body.push_str(&emit_record_codec(&rule.name, group, records, &aliases));
+            body.push_str(&emit_record_codec(
+                &rule.name, group, records, &aliases, &unions,
+            ));
         }
+    }
+    // Tagged-sum codec helpers for unions referenced by record fields.
+    for (name, variants) in &union_defs {
+        for variant in variants {
+            scan_special_types(
+                variant,
+                &mut needs_datetime,
+                &mut needs_decimal,
+                &mut needs_re,
+                &mut needs_tuple,
+            );
+        }
+        body.push_str(&emit_union_codec(
+            name, variants, records, &aliases, &unions,
+        ));
     }
 
     let mut content = String::new();

@@ -1,0 +1,3 @@
+gen/
+zig-out/
+.zig-cache/

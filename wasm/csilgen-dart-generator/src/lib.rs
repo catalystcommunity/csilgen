@@ -335,8 +335,10 @@ fn map_type(
 ) -> String {
     let base = match type_expr {
         CsilTypeExpression::Builtin(name) => match name.as_str() {
-            "int" | "uint" => "int".to_string(),
-            "float" => "double".to_string(),
+            // `nint` is a signed integer on the wire (negative-only domain), so it
+            // shares Dart's `int`; the CBOR codec already handles negative majors.
+            "int" | "uint" | "nint" => "int".to_string(),
+            "float" | "float16" | "float32" | "float64" => "double".to_string(),
             // `tstr`/`bstr` are the CDDL spellings; map identically to text/bytes.
             "text" | "tstr" => "String".to_string(),
             "bytes" | "bstr" => "Uint8List".to_string(),
@@ -371,6 +373,9 @@ fn map_type(
         // string set — its wire form is just the string, so `String` is both
         // idiomatic and what the (de)serialization cast expects.
         CsilTypeExpression::Choice(choices) if is_string_choice(choices) => "String".to_string(),
+        // A closed set of integer literals (`1 / 2 / 3`) is an int enum — its wire
+        // form is the bare integer, so `int` is both idiomatic and what the codec casts.
+        CsilTypeExpression::Choice(choices) if is_int_choice(choices) => "int".to_string(),
         // Other inline choices/compound forms have no single static Dart type;
         // `Object?` keeps the field usable while a top-level choice rule gets a
         // proper sealed hierarchy.
@@ -388,6 +393,50 @@ fn map_type(
 /// A choice whose members are all `text`/`tstr` and string literals — a closed
 /// string set. Mapped to `String` (see `map_type`) rather than a sealed class,
 /// because the wire form is the literal string itself.
+/// A choice whose members are all integer literals (`1 / 2 / 3`) — a closed int
+/// set (an int enum). Mapped to `int` (see `map_type`) rather than a sealed class,
+/// because the wire carries the bare integer, which is its own discriminant.
+fn is_int_choice(choices: &[CsilTypeExpression]) -> bool {
+    !choices.is_empty()
+        && choices
+            .iter()
+            .all(|c| matches!(c, CsilTypeExpression::Literal(CsilLiteralValue::Integer(_))))
+}
+
+/// The declaration-order arm class name for one union variant: a reference member
+/// keeps its type name (`ResultOk`) so the host pattern-matches by meaning, while a
+/// builtin/literal member is named positionally (`IdOrNameVariant0`). The variant
+/// index (declaration order) is the tagged-sum discriminant on the wire.
+fn union_arm_name(base: &str, index: usize, choice: &CsilTypeExpression) -> String {
+    match choice {
+        CsilTypeExpression::Reference(ref_name) => format!("{base}{}", dart_type_name(ref_name)),
+        _ => format!("{base}Variant{index}"),
+    }
+}
+
+/// The unions (real tagged-sum choices, not string/int enums) keyed by the raw rule
+/// name a `Reference` carries, with their declaration-ordered variant types. The
+/// codec encodes/decodes a union as `[variant_index, value]`.
+fn union_choices(
+    spec: &CsilSpecSerialized,
+) -> std::collections::HashMap<String, Vec<CsilTypeExpression>> {
+    spec.rules
+        .iter()
+        .filter_map(|rule| {
+            let choices = match &rule.rule_type {
+                CsilRuleType::TypeChoice(cs) => cs.clone(),
+                CsilRuleType::TypeDef(CsilTypeExpression::Choice(cs)) => cs.clone(),
+                _ => return None,
+            };
+            if is_string_choice(&choices) || is_int_choice(&choices) {
+                None
+            } else {
+                Some((rule.name.clone(), choices))
+            }
+        })
+        .collect()
+}
+
 fn is_string_choice(choices: &[CsilTypeExpression]) -> bool {
     !choices.is_empty()
         && choices
@@ -1581,17 +1630,19 @@ impl DartGenerator {
 
         let records = record_names(spec);
         let aliases = codec_aliases(spec);
+        let unions = union_choices(spec);
         let mut types_code = String::new();
         for rule in &spec.rules {
             match &rule.rule_type {
                 CsilRuleType::TypeDef(type_expr) => {
                     types_code.push_str(
-                        &self.generate_type_def(&rule.name, type_expr, &records, &aliases),
+                        &self.generate_type_def(&rule.name, type_expr, &records, &aliases, &unions),
                     );
                 }
                 CsilRuleType::GroupDef(group) => {
-                    types_code
-                        .push_str(&self.generate_record(&rule.name, group, &records, &aliases));
+                    types_code.push_str(
+                        &self.generate_record(&rule.name, group, &records, &aliases, &unions),
+                    );
                 }
                 CsilRuleType::TypeChoice(choices) => {
                     types_code.push_str(&self.generate_sealed_choice(&rule.name, choices));
@@ -1614,7 +1665,9 @@ impl DartGenerator {
         // The exact-decimal helper rides alongside the types under the default
         // (csil) mapping when the spec actually uses `decimal`; the library
         // mapping pulls `Decimal` from package:decimal instead.
-        if self.cfg.decimal_mapping == DecimalMapping::Csil && spec_uses_builtin(spec, "decimal") {
+        let csil_decimal =
+            self.cfg.decimal_mapping == DecimalMapping::Csil && spec_uses_builtin(spec, "decimal");
+        if csil_decimal {
             files.push(GeneratedFile {
                 path: "csil_decimal.gen.dart".to_string(),
                 content: CSIL_DECIMAL_DART.to_string(),
@@ -1623,10 +1676,12 @@ impl DartGenerator {
 
         // The self-contained CBOR codec the records' toCbor/fromCbor build on; emitted
         // whenever there are records to (de)serialize, so the output stays standalone.
+        // It learns `CsilDecimal` (CBOR tag 4) only when that helper is emitted, so a
+        // spec without `decimal` keeps a dependency-free codec.
         if !records.is_empty() {
             files.push(GeneratedFile {
                 path: "csil_cbor.gen.dart".to_string(),
-                content: CSIL_CBOR_DART.to_string(),
+                content: csil_cbor_dart(csil_decimal),
             });
         }
 
@@ -1700,6 +1755,7 @@ impl DartGenerator {
                             client_wire_ids,
                             &records,
                             &aliases,
+                            &unions,
                             has_types,
                         ) {
                             files.push(f);
@@ -1717,6 +1773,7 @@ impl DartGenerator {
                             client_wire_ids,
                             &records,
                             &aliases,
+                            &unions,
                             has_types,
                         ) {
                             files.push(f);
@@ -1734,6 +1791,7 @@ impl DartGenerator {
                             client_wire_ids,
                             &records,
                             &aliases,
+                            &unions,
                             has_types,
                         ) {
                             files.push(f);
@@ -1743,7 +1801,7 @@ impl DartGenerator {
                             marker: "Async",
                         };
                         if let Some(f) = self.build_client_file(
-                            spec, twin, async_path, false, &records, &aliases, has_types,
+                            spec, twin, async_path, false, &records, &aliases, &unions, has_types,
                         ) {
                             files.push(f);
                         }
@@ -1821,11 +1879,12 @@ impl DartGenerator {
         type_expr: &CsilTypeExpression,
         records: &std::collections::HashSet<String>,
         aliases: &std::collections::HashMap<String, CsilTypeExpression>,
+        unions: &std::collections::HashMap<String, Vec<CsilTypeExpression>>,
     ) -> String {
         // `Name = { ... }` parses to a TypeDef carrying a Group: emit a real
         // record class so it keeps field-level typing, as the other generators do.
         if let CsilTypeExpression::Group(group) = type_expr {
-            return self.generate_record(name, group, records, aliases);
+            return self.generate_record(name, group, records, aliases, unions);
         }
         if let CsilTypeExpression::Choice(choices) = type_expr {
             return self.generate_sealed_choice(name, choices);
@@ -1841,6 +1900,7 @@ impl DartGenerator {
         group: &CsilGroupExpression,
         records: &std::collections::HashSet<String>,
         aliases: &std::collections::HashMap<String, CsilTypeExpression>,
+        unions: &std::collections::HashMap<String, Vec<CsilTypeExpression>>,
     ) -> String {
         let class_name = dart_type_name(name);
         let decimal = self.cfg.decimal_dart_type();
@@ -1890,7 +1950,7 @@ impl DartGenerator {
         out.push_str(&self.generate_from_map(&class_name, &named));
         out.push_str(&self.generate_validate(&named));
         out.push_str(&self.generate_equality(&class_name, &named));
-        out.push_str(&self.generate_cbor(&class_name, &named, records, aliases));
+        out.push_str(&self.generate_cbor(&class_name, &named, records, aliases, unions));
 
         out.push_str("}\n\n");
         out
@@ -1907,6 +1967,7 @@ impl DartGenerator {
         named: &[(String, String, &CsilGroupEntry)],
         records: &std::collections::HashSet<String>,
         aliases: &std::collections::HashMap<String, CsilTypeExpression>,
+        unions: &std::collections::HashMap<String, Vec<CsilTypeExpression>>,
     ) -> String {
         let decimal = self.cfg.decimal_dart_type();
         let mut out = String::new();
@@ -1929,7 +1990,7 @@ impl DartGenerator {
             } else {
                 member.clone()
             };
-            let value = dart_to_cbor_value(&entry.value_type, &access, records, aliases);
+            let value = dart_to_cbor_value(&entry.value_type, &access, records, aliases, unions);
             if optional {
                 out.push_str(&format!(
                     "    if ({member} != null) map[{wire_lit}] = {value};\n"
@@ -1959,6 +2020,7 @@ impl DartGenerator {
                 records,
                 decimal,
                 aliases,
+                unions,
             );
             if optional {
                 out.push_str(&format!(
@@ -2048,7 +2110,7 @@ impl DartGenerator {
                 }
             }
             for op in control_operators(&entry.value_type) {
-                body.push_str(&self.control_guard(member, op, optional));
+                body.push_str(&self.control_guard(member, op, &entry.value_type, optional));
             }
         }
         if body.is_empty() {
@@ -2171,7 +2233,13 @@ impl DartGenerator {
         }
     }
 
-    fn control_guard(&self, member: &str, op: &CsilControlOperator, optional: bool) -> String {
+    fn control_guard(
+        &self,
+        member: &str,
+        op: &CsilControlOperator,
+        value_type: &CsilTypeExpression,
+        optional: bool,
+    ) -> String {
         let g = |inner: &str| -> String {
             if optional {
                 format!("{member} != null && {inner}")
@@ -2180,6 +2248,9 @@ impl DartGenerator {
             }
         };
         let bang = if optional { "!" } else { "" };
+        // A `decimal`/`timestamp` bound is reconstructed as the matching Dart value so
+        // the comparison is type-correct (`rate < CsilDecimal.parse('0.0')`); numeric
+        // and text bounds stay literal.
         match op {
             CsilControlOperator::Size(size) => self.size_guard(member, size, optional),
             CsilControlOperator::Regex(pattern) => {
@@ -2190,27 +2261,45 @@ impl DartGenerator {
                 )
             }
             CsilControlOperator::GreaterEqual(v) => self.guard(
-                &g(&format!("{member}{bang} < {}", literal_to_dart(v))),
+                &g(&format!(
+                    "{member}{bang} < {}",
+                    self.bound_expr(v, value_type)
+                )),
                 &format!("'{member}' must be >= {}", literal_to_dart(v)),
             ),
             CsilControlOperator::LessEqual(v) => self.guard(
-                &g(&format!("{member}{bang} > {}", literal_to_dart(v))),
+                &g(&format!(
+                    "{member}{bang} > {}",
+                    self.bound_expr(v, value_type)
+                )),
                 &format!("'{member}' must be <= {}", literal_to_dart(v)),
             ),
             CsilControlOperator::GreaterThan(v) => self.guard(
-                &g(&format!("{member}{bang} <= {}", literal_to_dart(v))),
+                &g(&format!(
+                    "{member}{bang} <= {}",
+                    self.bound_expr(v, value_type)
+                )),
                 &format!("'{member}' must be > {}", literal_to_dart(v)),
             ),
             CsilControlOperator::LessThan(v) => self.guard(
-                &g(&format!("{member}{bang} >= {}", literal_to_dart(v))),
+                &g(&format!(
+                    "{member}{bang} >= {}",
+                    self.bound_expr(v, value_type)
+                )),
                 &format!("'{member}' must be < {}", literal_to_dart(v)),
             ),
             CsilControlOperator::Equal(v) => self.guard(
-                &g(&format!("{member}{bang} != {}", literal_to_dart(v))),
+                &g(&format!(
+                    "{member}{bang} != {}",
+                    self.bound_expr(v, value_type)
+                )),
                 &format!("'{member}' must equal {}", literal_to_dart(v)),
             ),
             CsilControlOperator::NotEqual(v) => self.guard(
-                &g(&format!("{member}{bang} == {}", literal_to_dart(v))),
+                &g(&format!(
+                    "{member}{bang} == {}",
+                    self.bound_expr(v, value_type)
+                )),
                 &format!("'{member}' must not equal {}", literal_to_dart(v)),
             ),
             // Default lives on the field; encoding/structural ops are wire-only.
@@ -2380,30 +2469,24 @@ impl DartGenerator {
         if is_string_choice(choices) {
             return format!("typedef {base} = String;\n\n");
         }
+        // A closed int set is likewise a bare-integer alias (an int enum): the wire
+        // carries the integer itself, which is its own discriminant.
+        if is_int_choice(choices) {
+            return format!("typedef {base} = int;\n\n");
+        }
+        // A real union: a `sealed class` base with one `final class` arm per variant
+        // in declaration order, so the host pattern-matches exhaustively and the
+        // arm's position is the tagged-sum discriminant the codec writes.
         let mut out = String::new();
         out.push_str(&format!(
             "sealed class {base} {{\n  const {base}();\n}}\n\n"
         ));
-        let mut emitted_other = false;
-        for choice in choices {
-            match choice {
-                CsilTypeExpression::Reference(ref_name) => {
-                    let arm = dart_type_name(ref_name);
-                    let inner = dart_type_name(ref_name);
-                    out.push_str(&format!(
-                        "final class {base}{arm} extends {base} {{\n  final {inner} value;\n  const {base}{arm}(this.value);\n}}\n\n"
-                    ));
-                }
-                _ => {
-                    if !emitted_other {
-                        emitted_other = true;
-                        let dart_type = map_type(choice, &None, self.cfg.decimal_dart_type());
-                        out.push_str(&format!(
-                            "final class {base}Other extends {base} {{\n  final {dart_type} value;\n  const {base}Other(this.value);\n}}\n\n"
-                        ));
-                    }
-                }
-            }
+        for (index, choice) in choices.iter().enumerate() {
+            let arm = union_arm_name(&base, index, choice);
+            let inner = map_type(choice, &None, self.cfg.decimal_dart_type());
+            out.push_str(&format!(
+                "final class {arm} extends {base} {{\n  final {inner} value;\n  const {arm}(this.value);\n}}\n\n"
+            ));
         }
         out
     }
@@ -2479,13 +2562,15 @@ impl DartGenerator {
         include_wire_ids: bool,
         records: &std::collections::HashSet<String>,
         aliases: &std::collections::HashMap<String, CsilTypeExpression>,
+        unions: &std::collections::HashMap<String, Vec<CsilTypeExpression>>,
         has_types: bool,
     ) -> Option<GeneratedFile> {
         let mut services_code = String::new();
         for rule in &spec.rules {
             if let CsilRuleType::ServiceDef(service) = &rule.rule_type {
-                services_code
-                    .push_str(&self.generate_client(&rule.name, service, records, aliases, shape));
+                services_code.push_str(
+                    &self.generate_client(&rule.name, service, records, aliases, unions, shape),
+                );
                 if include_wire_ids {
                     services_code.push_str(&self.generate_wire_ids(&rule.name, service));
                 }
@@ -2517,6 +2602,7 @@ impl DartGenerator {
         service: &CsilServiceDefinition,
         records: &std::collections::HashSet<String>,
         aliases: &std::collections::HashMap<String, CsilTypeExpression>,
+        unions: &std::collections::HashMap<String, Vec<CsilTypeExpression>>,
         shape: ClientShape,
     ) -> String {
         let base = self.service_base(name);
@@ -2553,6 +2639,7 @@ impl DartGenerator {
                 records,
                 decimal,
                 aliases,
+                unions,
             );
             if is_null_input(&op.input_type) {
                 out.push_str(&format!("  {ret} {method}() {asy}{{\n"));
@@ -2570,7 +2657,7 @@ impl DartGenerator {
                 } else {
                     format!(
                         "CsilCbor.encodeValue({})",
-                        dart_to_cbor_value(&op.input_type, "request", records, aliases)
+                        dart_to_cbor_value(&op.input_type, "request", records, aliases, unions)
                     )
                 };
                 out.push_str(&format!("  {ret} {method}({in_type} request) {asy}{{\n"));
@@ -2793,22 +2880,29 @@ fn contains_record(
     ty: &CsilTypeExpression,
     records: &std::collections::HashSet<String>,
     aliases: &std::collections::HashMap<String, CsilTypeExpression>,
+    unions: &std::collections::HashMap<String, Vec<CsilTypeExpression>>,
 ) -> bool {
     match ty {
         // A reference is either a record directly, or a transparent alias whose
         // underlying shape (e.g. `M = {* text => SomeRecord}`) may itself carry one.
         CsilTypeExpression::Reference(name) if records.contains(&dart_type_name(name)) => true,
+        // A union value is never a shape the CBOR encoder handles by runtime type —
+        // it is lowered to a tagged sum — so a list/map of unions must recurse.
+        CsilTypeExpression::Reference(name) if unions.contains_key(name) => true,
         CsilTypeExpression::Reference(name) => aliases
             .get(name)
-            .is_some_and(|underlying| contains_record(underlying, records, aliases)),
+            .is_some_and(|underlying| contains_record(underlying, records, aliases, unions)),
+        // A tuple is lowered to a positional array, so it always needs the transform.
+        CsilTypeExpression::Tuple(_) => true,
         CsilTypeExpression::Array { element_type, .. } => {
-            contains_record(element_type, records, aliases)
+            contains_record(element_type, records, aliases, unions)
         }
         CsilTypeExpression::Map { key, value, .. } => {
-            contains_record(key, records, aliases) || contains_record(value, records, aliases)
+            contains_record(key, records, aliases, unions)
+                || contains_record(value, records, aliases, unions)
         }
         CsilTypeExpression::Constrained { base_type, .. } => {
-            contains_record(base_type, records, aliases)
+            contains_record(base_type, records, aliases, unions)
         }
         _ => false,
     }
@@ -2823,33 +2917,77 @@ fn dart_to_cbor_value(
     expr: &str,
     records: &std::collections::HashSet<String>,
     aliases: &std::collections::HashMap<String, CsilTypeExpression>,
+    unions: &std::collections::HashMap<String, Vec<CsilTypeExpression>>,
 ) -> String {
     match ty {
         CsilTypeExpression::Constrained { base_type, .. } => {
-            dart_to_cbor_value(base_type, expr, records, aliases)
+            dart_to_cbor_value(base_type, expr, records, aliases, unions)
         }
         CsilTypeExpression::Reference(name) if records.contains(&dart_type_name(name)) => {
             format!("{expr}.toCborValue()")
+        }
+        // A union is a tagged sum on the wire: `[variant_index, value]`, the index in
+        // declaration order, the value that variant's own lowered form (recursive).
+        CsilTypeExpression::Reference(name) if unions.contains_key(name) => {
+            let base = dart_type_name(name);
+            let arms: Vec<String> = unions[name]
+                .iter()
+                .enumerate()
+                .map(|(i, choice)| {
+                    let arm = union_arm_name(&base, i, choice);
+                    let val = dart_to_cbor_value(choice, "csilV.value", records, aliases, unions);
+                    format!("{arm} csilV => <Object?>[{i}, {val}]")
+                })
+                .collect();
+            format!("(switch ({expr}) {{ {} }})", arms.join(", "))
         }
         // A transparent alias is typed as its underlying shape, so the value flowing
         // here IS that shape: recurse into it (a map-of-record alias then maps each
         // value through `toCborValue` instead of passing the bare map straight on,
         // which would drop the nested records).
         CsilTypeExpression::Reference(name) if aliases.contains_key(name) => {
-            dart_to_cbor_value(&aliases[name], expr, records, aliases)
+            dart_to_cbor_value(&aliases[name], expr, records, aliases, unions)
+        }
+        // A tuple is a positional CBOR array; an absent optional element is `null` in
+        // place (the array keeps its fixed length).
+        CsilTypeExpression::Tuple(group) => {
+            let all_keyed = !group.entries.is_empty()
+                && group.entries.iter().all(|e| wire_key_of_entry(e).is_some());
+            let elems: Vec<String> = group
+                .entries
+                .iter()
+                .enumerate()
+                .map(|(i, e)| {
+                    let access = if all_keyed {
+                        format!(
+                            "{expr}.{}",
+                            dart_member_name(&wire_key_of_entry(e).unwrap())
+                        )
+                    } else {
+                        format!("{expr}.${}", i + 1)
+                    };
+                    let conv = dart_to_cbor_value(&e.value_type, &access, records, aliases, unions);
+                    if matches!(e.occurrence, Some(CsilOccurrence::Optional)) && conv != access {
+                        format!("{access} == null ? null : {conv}")
+                    } else {
+                        conv
+                    }
+                })
+                .collect();
+            format!("<Object?>[{}]", elems.join(", "))
         }
         CsilTypeExpression::Array { element_type, .. }
-            if contains_record(element_type, records, aliases) =>
+            if contains_record(element_type, records, aliases, unions) =>
         {
-            let inner = dart_to_cbor_value(element_type, "csilE", records, aliases);
+            let inner = dart_to_cbor_value(element_type, "csilE", records, aliases, unions);
             format!("{expr}.map((csilE) => {inner}).toList()")
         }
         CsilTypeExpression::Map { key, value, .. }
-            if contains_record(key, records, aliases)
-                || contains_record(value, records, aliases) =>
+            if contains_record(key, records, aliases, unions)
+                || contains_record(value, records, aliases, unions) =>
         {
-            let k = dart_to_cbor_value(key, "csilK", records, aliases);
-            let v = dart_to_cbor_value(value, "csilV", records, aliases);
+            let k = dart_to_cbor_value(key, "csilK", records, aliases, unions);
+            let v = dart_to_cbor_value(value, "csilV", records, aliases, unions);
             format!("{expr}.map((csilK, csilV) => MapEntry({k}, {v}))")
         }
         // Scalars, bytes, DateTime, decimal, string-choices, and record-free
@@ -2866,14 +3004,16 @@ fn dart_from_cbor_value(
     records: &std::collections::HashSet<String>,
     decimal: &str,
     aliases: &std::collections::HashMap<String, CsilTypeExpression>,
+    unions: &std::collections::HashMap<String, Vec<CsilTypeExpression>>,
 ) -> String {
     match ty {
         CsilTypeExpression::Constrained { base_type, .. } => {
-            dart_from_cbor_value(base_type, expr, records, decimal, aliases)
+            dart_from_cbor_value(base_type, expr, records, decimal, aliases, unions)
         }
         CsilTypeExpression::Builtin(name) => match name.as_str() {
-            "int" | "uint" => format!("{expr} as int"),
-            "float" => format!("({expr} as num).toDouble()"),
+            // `nint` is signed; the codec decodes the negative major to a Dart int.
+            "int" | "uint" | "nint" => format!("{expr} as int"),
+            "float" | "float16" | "float32" | "float64" => format!("({expr} as num).toDouble()"),
             "text" | "tstr" => format!("{expr} as String"),
             "bytes" | "bstr" => format!("{expr} as Uint8List"),
             "bool" => format!("{expr} as bool"),
@@ -2884,27 +3024,92 @@ fn dart_from_cbor_value(
         CsilTypeExpression::Reference(name) if records.contains(&dart_type_name(name)) => {
             format!("{}.fromCborValue({expr})", dart_type_name(name))
         }
+        // A union decodes from its tagged sum `[variant_index, value]`: read the index,
+        // dispatch to that variant's constructor over its own decoded value.
+        CsilTypeExpression::Reference(name) if unions.contains_key(name) => {
+            let base = dart_type_name(name);
+            let arms: Vec<String> = unions[name]
+                .iter()
+                .enumerate()
+                .map(|(i, choice)| {
+                    let arm = union_arm_name(&base, i, choice);
+                    let val =
+                        dart_from_cbor_value(choice, "csilU[1]", records, decimal, aliases, unions);
+                    format!("{i} => {arm}({val})")
+                })
+                .collect();
+            format!(
+                "(() {{ final csilU = {expr} as List; return switch (csilU[0] as int) {{ {}, _ => throw ArgumentError('unknown {base} variant') }}; }})()",
+                arms.join(", ")
+            )
+        }
         // A transparent alias decodes as its underlying shape (the field is typed as
         // that shape), so a map-of-record alias reconstructs each value through
         // `fromCborValue` and casts to the named-typed map rather than yielding the
         // raw decoded dynamic map, which mistypes the entries and drops the records.
         CsilTypeExpression::Reference(name) if aliases.contains_key(name) => {
-            dart_from_cbor_value(&aliases[name], expr, records, decimal, aliases)
+            dart_from_cbor_value(&aliases[name], expr, records, decimal, aliases, unions)
+        }
+        // A tuple reconstructs the Dart 3 record from the positional array; an absent
+        // optional element stays `null` in place.
+        CsilTypeExpression::Tuple(group) => {
+            let all_keyed = !group.entries.is_empty()
+                && group.entries.iter().all(|e| wire_key_of_entry(e).is_some());
+            let elems: Vec<String> = group
+                .entries
+                .iter()
+                .enumerate()
+                .map(|(i, e)| {
+                    let elem_expr = format!("csilT[{i}]");
+                    let dec = dart_from_cbor_value(
+                        &e.value_type,
+                        &elem_expr,
+                        records,
+                        decimal,
+                        aliases,
+                        unions,
+                    );
+                    let val = if matches!(e.occurrence, Some(CsilOccurrence::Optional)) {
+                        format!("{elem_expr} == null ? null : ({dec})")
+                    } else {
+                        dec
+                    };
+                    if all_keyed {
+                        format!(
+                            "{}: {val}",
+                            dart_member_name(&wire_key_of_entry(e).unwrap())
+                        )
+                    } else {
+                        val
+                    }
+                })
+                .collect();
+            // A single-element positional record needs the trailing-comma form.
+            let record = if !all_keyed && elems.len() == 1 {
+                format!("({},)", elems[0])
+            } else {
+                format!("({})", elems.join(", "))
+            };
+            format!("(() {{ final csilT = {expr} as List; return {record}; }})()")
         }
         CsilTypeExpression::Array { element_type, .. } => {
-            let inner = dart_from_cbor_value(element_type, "csilE", records, decimal, aliases);
+            let inner =
+                dart_from_cbor_value(element_type, "csilE", records, decimal, aliases, unions);
             let et = map_type(element_type, &None, decimal);
             format!("({expr} as List).map((csilE) => {inner}).cast<{et}>().toList()")
         }
         CsilTypeExpression::Map { key, value, .. } => {
             let kt = map_type(key, &None, decimal);
             let vt = map_type(value, &None, decimal);
-            let k = dart_from_cbor_value(key, "csilK", records, decimal, aliases);
-            let v = dart_from_cbor_value(value, "csilV", records, decimal, aliases);
+            let k = dart_from_cbor_value(key, "csilK", records, decimal, aliases, unions);
+            let v = dart_from_cbor_value(value, "csilV", records, decimal, aliases, unions);
             format!("({expr} as Map).map((csilK, csilV) => MapEntry({k}, {v})).cast<{kt}, {vt}>()")
         }
         CsilTypeExpression::Choice(choices) if is_string_choice(choices) => {
             format!("{expr} as String")
+        }
+        CsilTypeExpression::Choice(choices) if is_int_choice(choices) => {
+            format!("{expr} as int")
         }
         _ => expr.to_string(),
     }
@@ -3038,6 +3243,97 @@ final class CsilDecimal implements Comparable<CsilDecimal> {
 
 /// The self-contained canonical CSIL CBOR codec the generated records' toCbor/
 /// fromCbor build on, so the output stays standalone (no third-party CBOR dep).
+/// The self-contained CBOR codec. When `emit_decimal` it also (de)serializes the
+/// generated `CsilDecimal` as CBOR tag 4 `[exponent, mantissa]` (with a CBOR bignum
+/// for a mantissa that overflows a 64-bit machine integer), matching the reference
+/// codecs byte-for-byte; otherwise the codec stays dependency-free.
+fn csil_cbor_dart(emit_decimal: bool) -> String {
+    let mut code = CSIL_CBOR_DART.to_string();
+    if !emit_decimal {
+        return code;
+    }
+    code = code.replace(
+        "import 'dart:convert';\nimport 'dart:typed_data';\n",
+        "import 'dart:convert';\nimport 'dart:typed_data';\n\nimport 'csil_decimal.gen.dart';\n",
+    );
+    code = code.replace(
+        "    } else {\n      throw ArgumentError('CsilCbor: cannot encode ${v.runtimeType}');\n    }",
+        "    } else if (v is CsilDecimal) {\n\
+\x20     b.addByte(0xc4);\n\
+\x20     _head(b, 4, 2);\n\
+\x20     _enc(b, v.exponent);\n\
+\x20     _encBigInt(b, v.mantissa);\n\
+\x20   } else {\n      throw ArgumentError('CsilCbor: cannot encode ${v.runtimeType}');\n    }",
+    );
+    code = code.replace(
+        "        return _CsilDecoded(inner.value, inner.next);\n      default:",
+        "        if (arg == 4 && inner.value is List) {\n\
+\x20         final parts = inner.value as List;\n\
+\x20         return _CsilDecoded(\n\
+\x20             CsilDecimal(parts[0] as int, _bigIntFrom(parts[1])), inner.next);\n\
+\x20       }\n\
+\x20       if (arg == 2 || arg == 3) {\n\
+\x20         final mag = _bytesToBigInt(inner.value as Uint8List);\n\
+\x20         return _CsilDecoded(\n\
+\x20             arg == 3 ? (-mag) - BigInt.one : mag, inner.next);\n\
+\x20       }\n\
+\x20       return _CsilDecoded(inner.value, inner.next);\n      default:",
+    );
+    code = code.replace(
+        "  }\n}\n\nclass _CsilRead {",
+        &format!("  }}\n\n{CSIL_CBOR_DECIMAL_HELPERS}}}\n\nclass _CsilRead {{"),
+    );
+    code
+}
+
+/// The bignum/decimal helpers spliced into the codec class when `decimal` is used.
+const CSIL_CBOR_DECIMAL_HELPERS: &str = r#"  static final BigInt _minI64 = BigInt.parse('-9223372036854775808');
+  static final BigInt _maxI64 = BigInt.parse('9223372036854775807');
+
+  // A mantissa that fits a 64-bit machine integer rides as a plain CBOR integer
+  // (what the reference codecs emit); a larger magnitude uses a CBOR bignum (tag 2
+  // non-negative, tag 3 negative) per RFC 8949 section 3.4.3.
+  static void _encBigInt(BytesBuilder b, BigInt m) {
+    if (m >= _minI64 && m <= _maxI64) {
+      _enc(b, m.toInt());
+      return;
+    }
+    final negative = m.isNegative;
+    final magnitude = negative ? (-m) - BigInt.one : m;
+    b.addByte(negative ? 0xc3 : 0xc2);
+    final bytes = _bigIntToBytes(magnitude);
+    _head(b, 2, bytes.length);
+    b.add(bytes);
+  }
+
+  static Uint8List _bigIntToBytes(BigInt v) {
+    if (v == BigInt.zero) return Uint8List.fromList(<int>[0]);
+    final out = <int>[];
+    var n = v;
+    final mask = BigInt.from(0xff);
+    while (n > BigInt.zero) {
+      out.add((n & mask).toInt());
+      n = n >> 8;
+    }
+    return Uint8List.fromList(out.reversed.toList());
+  }
+
+  static BigInt _bigIntFrom(Object? v) {
+    if (v is BigInt) return v;
+    if (v is int) return BigInt.from(v);
+    if (v is Uint8List) return _bytesToBigInt(v);
+    throw ArgumentError('CsilCbor: bad decimal mantissa ${v.runtimeType}');
+  }
+
+  static BigInt _bytesToBigInt(Uint8List bytes) {
+    var n = BigInt.zero;
+    for (final byte in bytes) {
+      n = (n << 8) | BigInt.from(byte);
+    }
+    return n;
+  }
+"#;
+
 const CSIL_CBOR_DART: &str = r#"// The self-contained canonical CSIL CBOR codec.
 //
 // Code generated by csilgen; DO NOT EDIT.
@@ -3104,7 +3400,11 @@ class CsilCbor {
       b.add(v);
     } else if (v is DateTime) {
       b.addByte(0xc0);
-      final u = utf8.encode(v.toUtc().toIso8601String());
+      // Canonical RFC3339 (tag 0): Dart's toIso8601String always emits a
+      // fractional-seconds part (.000); the wire form omits it when it is zero, so
+      // strip an all-zero fraction to match the other languages byte-for-byte.
+      final iso = v.toUtc().toIso8601String().replaceFirst(RegExp(r'\.0+Z$'), 'Z');
+      final u = utf8.encode(iso);
       _head(b, 3, u.length);
       b.add(u);
     } else if (v is List) {

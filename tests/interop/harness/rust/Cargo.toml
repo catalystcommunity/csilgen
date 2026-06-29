@@ -1,0 +1,18 @@
+# Standalone (own workspace) so it is not swept into the repo workspace build;
+# `gen/` is produced by the interop orchestrator before this crate is built.
+[workspace]
+
+[package]
+name = "csil-interop-rust"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "csil-interop"
+path = "src/main.rs"
+
+[dependencies]
+interop_api = { path = "gen" }
+csilgen-transport = { path = "../../../../transports/rust" }
+chrono = "0.4"

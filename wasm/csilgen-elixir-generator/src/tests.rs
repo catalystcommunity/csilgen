@@ -1403,9 +1403,13 @@ fn genquickstart_rpc_section_uses_lib_envelope_over_http() {
     assert!(body.contains("RPC.decode_response(body)"));
     assert!(body.contains("RPC.as_transport_error(resp)"));
 
-    // It POSTs to the CSIL-RPC endpoint over the stdlib HTTP client.
+    // It POSTs to the CSIL-RPC endpoint over a plain :gen_tcp HTTP client (in
+    // :kernel — runs under mix/releases with no extra_applications), not :inets/:httpc.
     assert!(body.contains("/csil/v1/rpc"));
-    assert!(body.contains(":httpc.request(:post,"));
+    assert!(body.contains(":gen_tcp.connect("));
+    assert!(body.contains("POST #{path} HTTP/1.1"));
+    assert!(!body.contains(":httpc"));
+    assert!(!body.contains(":inets"));
 
     // The typed ServiceError application arm is handled distinctly.
     assert!(body.contains("resp.variant == \"ServiceError\""));
