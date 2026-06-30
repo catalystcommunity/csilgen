@@ -122,6 +122,7 @@ func collectionsOK() interopapi.Collections {
 		Exact3:     []int64{7, 8, 9},
 		Scores:     map[string]int64{"x": 1, "y": 2},
 		Color:      interopapi.Color("green"),
+		Tone:       interopapi.Color("blue"),
 		Prio:       interopapi.Priority(2),
 		Who:        uint64(4242),
 		Pair: struct {

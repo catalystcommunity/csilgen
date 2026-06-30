@@ -982,7 +982,7 @@ fn record_literal(input: &WasmGeneratorInput, name: &str, group: &CsilGroupExpre
     let args: Vec<String> = group
         .entries
         .iter()
-        .filter(|e| e.key.is_some() && field_default(e).is_none())
+        .filter(|e| e.key.is_some() && field_default(e, input).is_none())
         .map(|e| {
             let key = e.key.as_ref().unwrap();
             let prop = kotlin_prop_name(key, &e.metadata);
@@ -1005,6 +1005,54 @@ fn find_record<'a>(input: &'a WasmGeneratorInput, name: &str) -> Option<&'a Csil
             _ => None,
         }
     })
+}
+
+/// The choice arms a reference names, if that name is a `Name = A / B / …` rule —
+/// the lookup that lets an enum-typed field resolve its `.default` to an enum constant.
+fn find_choice<'a>(input: &'a WasmGeneratorInput, name: &str) -> Option<&'a [CsilTypeExpression]> {
+    input.csil_spec.rules.iter().find_map(|r| {
+        if r.name != name {
+            return None;
+        }
+        match &r.rule_type {
+            CsilRuleType::TypeDef(CsilTypeExpression::Choice(choices)) => Some(choices.as_slice()),
+            _ => None,
+        }
+    })
+}
+
+/// The raw (un-cased) name a field's type expression ultimately references, seeing
+/// through a `.default`/constraint wrapper (which a defaulted enum field carries).
+fn referenced_type_name(type_expr: &CsilTypeExpression) -> Option<&str> {
+    match type_expr {
+        CsilTypeExpression::Reference(name) => Some(name),
+        CsilTypeExpression::Constrained { base_type, .. } => referenced_type_name(base_type),
+        _ => None,
+    }
+}
+
+/// An enum-typed field's `.default` rendered as the enum constant (`Status.Active`),
+/// not the raw wire literal — the property's declared type is the enum, so a bare
+/// `"active"` / `1` would not typecheck. `None` when the field is not enum-typed.
+fn enum_default_kotlin(
+    value: &CsilLiteralValue,
+    value_type: &CsilTypeExpression,
+    input: &WasmGeneratorInput,
+) -> Option<String> {
+    let name = referenced_type_name(value_type)?;
+    let choices = find_choice(input, name)?;
+    let iface = pascal_case(name);
+    match classify_choice(choices) {
+        ChoiceKind::EnumText => match value {
+            CsilLiteralValue::Text(s) => Some(format!("{iface}.{}", enum_text_variant(s))),
+            _ => None,
+        },
+        ChoiceKind::EnumInt => match value {
+            CsilLiteralValue::Integer(n) => Some(format!("{iface}.{}", enum_int_variant(*n))),
+            _ => None,
+        },
+        ChoiceKind::Union => None,
+    }
 }
 
 /// The underlying type of a transparent `typealias` a reference names, or `None` when the
@@ -1052,11 +1100,11 @@ fn generate_types(
         match &rule.rule_type {
             CsilRuleType::GroupDef(group) => {
                 has_types = true;
-                emit_data_class(&mut body, &rule.name, group, warnings);
+                emit_data_class(&mut body, &rule.name, group, input, warnings);
             }
             CsilRuleType::TypeDef(CsilTypeExpression::Group(group)) => {
                 has_types = true;
-                emit_data_class(&mut body, &rule.name, group, warnings);
+                emit_data_class(&mut body, &rule.name, group, input, warnings);
             }
             CsilRuleType::TypeDef(CsilTypeExpression::Choice(choices)) => {
                 has_types = true;
@@ -1078,7 +1126,7 @@ fn generate_types(
             }
             CsilRuleType::GroupChoice(choices) => {
                 has_types = true;
-                emit_group_choice(&mut body, &rule.name, choices, warnings);
+                emit_group_choice(&mut body, &rule.name, choices, input, warnings);
             }
             CsilRuleType::ServiceDef(_) => {}
         }
@@ -1101,6 +1149,7 @@ fn emit_data_class(
     body: &mut String,
     name: &str,
     group: &CsilGroupExpression,
+    input: &WasmGeneratorInput,
     _warnings: &mut Vec<GeneratorWarning>,
 ) {
     let class_name = pascal_case(name);
@@ -1132,7 +1181,7 @@ fn emit_data_class(
         if prop != wire {
             body.push_str(&format!("    // wire key: {wire}\n"));
         }
-        let default = field_default(entry);
+        let default = field_default(entry, input);
         let trailing = if idx + 1 < fields.len() { "," } else { "" };
         match default {
             Some(d) => body.push_str(&format!("    val {prop}: {kt_type} = {d}{trailing}\n")),
@@ -1231,6 +1280,7 @@ fn emit_group_choice(
     body: &mut String,
     name: &str,
     choices: &[CsilGroupExpression],
+    input: &WasmGeneratorInput,
     warnings: &mut Vec<GeneratorWarning>,
 ) {
     let iface = pascal_case(name);
@@ -1241,7 +1291,7 @@ fn emit_group_choice(
     body.push_str(&format!("sealed interface {iface}\n\n"));
     for (i, choice) in choices.iter().enumerate() {
         let arm_name = format!("{name}Choice{}", i + 1);
-        emit_data_class_impl(body, &arm_name, choice, &iface, warnings);
+        emit_data_class_impl(body, &arm_name, choice, &iface, input, warnings);
     }
 }
 
@@ -1252,6 +1302,7 @@ fn emit_data_class_impl(
     name: &str,
     group: &CsilGroupExpression,
     iface: &str,
+    input: &WasmGeneratorInput,
     _warnings: &mut Vec<GeneratorWarning>,
 ) {
     let class_name = pascal_case(name);
@@ -1268,7 +1319,7 @@ fn emit_data_class_impl(
         let prop = kotlin_prop_name(key, &entry.metadata);
         let kt_type = type_override(&entry.metadata)
             .unwrap_or_else(|| map_csil_type_to_kotlin(&entry.value_type, &entry.occurrence));
-        let default = field_default(entry);
+        let default = field_default(entry, input);
         let trailing = if idx + 1 < fields.len() { "," } else { "" };
         match default {
             Some(d) => body.push_str(&format!("    val {prop}: {kt_type} = {d}{trailing}\n")),
@@ -2985,8 +3036,11 @@ fn map_csil_type_to_kotlin(
 
 /// The default expression for a `data class` field: an explicit `@default`/`.default`
 /// literal, or `null` for an optional field with no declared default.
-fn field_default(entry: &CsilGroupEntry) -> Option<String> {
+fn field_default(entry: &CsilGroupEntry, input: &WasmGeneratorInput) -> Option<String> {
     if let Some(value) = entry_default_value(entry) {
+        if let Some(rendered) = enum_default_kotlin(value, &entry.value_type, input) {
+            return Some(rendered);
+        }
         return Some(literal_to_kotlin_typed(value, &entry.value_type));
     }
     if matches!(entry.occurrence, Some(CsilOccurrence::Optional)) {
@@ -3409,6 +3463,63 @@ mod tests {
             literal_to_kotlin_typed(&CsilLiteralValue::Integer(3), &float),
             "3.0"
         );
+    }
+
+    #[test]
+    fn enum_field_default_renders_as_enum_constant() {
+        // An enum-typed field's `.default` is the wire literal, but the property's
+        // declared type is the enum — so a bare `"green"` / `2` would not typecheck.
+        // The default must render as the enum constant (`Color.Green` / `Priority.V2`),
+        // for both the optional (`?`) and required forms. Regression for the Kotlin
+        // generator emitting a raw `String` default for enum fields.
+        let color = || CsilTypeExpression::Constrained {
+            base_type: Box::new(reference("Color")),
+            constraints: vec![CsilControlOperator::Default(CsilLiteralValue::Text(
+                "green".to_string(),
+            ))],
+        };
+        let prio = || CsilTypeExpression::Constrained {
+            base_type: Box::new(reference("Priority")),
+            constraints: vec![CsilControlOperator::Default(CsilLiteralValue::Integer(2))],
+        };
+        let record = CsilGroupExpression {
+            entries: vec![
+                entry("opt_tone", color(), Some(CsilOccurrence::Optional)),
+                entry("req_tone", color(), None),
+                entry("opt_rank", prio(), Some(CsilOccurrence::Optional)),
+                entry("req_rank", prio(), None),
+            ],
+        };
+        let out = process_generation(spec(
+            "kotlin",
+            vec![
+                rule(
+                    "Color",
+                    CsilRuleType::TypeDef(CsilTypeExpression::Choice(vec![
+                        CsilTypeExpression::Literal(CsilLiteralValue::Text("red".to_string())),
+                        CsilTypeExpression::Literal(CsilLiteralValue::Text("green".to_string())),
+                        CsilTypeExpression::Literal(CsilLiteralValue::Text("blue".to_string())),
+                    ])),
+                ),
+                rule(
+                    "Priority",
+                    CsilRuleType::TypeDef(CsilTypeExpression::Choice(vec![
+                        CsilTypeExpression::Literal(CsilLiteralValue::Integer(1)),
+                        CsilTypeExpression::Literal(CsilLiteralValue::Integer(2)),
+                        CsilTypeExpression::Literal(CsilLiteralValue::Integer(3)),
+                    ])),
+                ),
+                rule("Palette", CsilRuleType::GroupDef(record)),
+            ],
+        ))
+        .unwrap();
+        let types = content(&out, "Types.kt");
+        assert!(types.contains("val optTone: Color? = Color.Green"));
+        assert!(types.contains("val reqTone: Color = Color.Green"));
+        assert!(types.contains("val optRank: Priority? = Priority.V2"));
+        assert!(types.contains("val reqRank: Priority = Priority.V2"));
+        // The raw-string form is exactly the bug, so it must not appear.
+        assert!(!types.contains("= \"green\""));
     }
 
     #[test]

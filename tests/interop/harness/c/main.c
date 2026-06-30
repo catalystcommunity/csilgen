@@ -80,6 +80,7 @@ static Collections collections_ok(void) {
     c.scores_values = scores_values;
     c.scores_count = 2;
     c.color = COLOR_GREEN;
+    c.tone = COLOR_BLUE;
     c.prio = PRIORITY_2;
     c.who.tag = ID_OR_NAME_UINT;
     c.who.u.uint = 4242;
@@ -200,7 +201,7 @@ static bool collections_eq(const Collections *a, const Collections *b) {
         }
         if (!found) return false;
     }
-    if (a->color != b->color || a->prio != b->prio) return false;
+    if (a->color != b->color || a->tone != b->tone || a->prio != b->prio) return false;
     if (a->who.tag != b->who.tag) return false;
     if (a->who.tag == ID_OR_NAME_UINT && a->who.u.uint != b->who.u.uint) return false;
     if (a->who.tag == ID_OR_NAME_TEXT && !streq(a->who.u.text, b->who.u.text)) return false;
