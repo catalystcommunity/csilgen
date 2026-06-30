@@ -8,7 +8,8 @@
 use convert_case::{Case, Casing};
 use csilgen_common::{
     CsilControlOperator, CsilGroupEntry, CsilGroupExpression, CsilGroupKey, CsilLiteralValue,
-    CsilOccurrence, CsilRuleType, CsilServiceDefinition, CsilServiceDirection, CsilSizeConstraint,
+    CsilOccurrence, CsilRuleType, CsilServiceDefinition, CsilServiceDirection,
+    CsilServiceOperation, CsilSizeConstraint,
     CsilTypeExpression, CsilValidationConstraint, GeneratedFile, GenerationStats,
     GeneratorCapability, GeneratorMetadata, WasmGeneratorInput, WasmGeneratorOutput,
     wasm_interface::*,
@@ -1031,10 +1032,14 @@ fn generate_java(input: &WasmGeneratorInput) -> Result<Vec<GeneratedFile>, i32> 
 
     if want_client && !services.is_empty() {
         let records = record_names(input);
+        let aliases = codec_aliases(input);
+        let choices = codec_choices(input);
         files.push(generate_transport_iface(&config));
         files.push(generate_client_error(&config));
         for (name, def, doc) in &services {
-            files.push(generate_client(&config, name, def, doc, &records));
+            files.push(generate_client(
+                &config, name, def, doc, &records, &aliases, &choices,
+            ));
         }
     }
     if want_server {
@@ -1682,6 +1687,42 @@ fn record_ref_class(ty: &CsilTypeExpression) -> String {
     }
 }
 
+/// Whether `java_enc_value`/`java_dec_value` model an op-boundary type faithfully (so a
+/// per-op codec helper is correct rather than silently lossy). Records, scalars,
+/// transparent aliases, named choices (enums/unions/literal-narrowed scalars), arrays,
+/// maps, and tuples all resolve to real codec expressions. An inline multi-variant
+/// choice has no wire discriminator, and an unmodeled reference has no codec, so those
+/// keep the skip-with-note path the client falls back to.
+fn java_op_boundary_expressible(
+    ty: &CsilTypeExpression,
+    records: &std::collections::HashSet<String>,
+    aliases: &std::collections::HashMap<String, CsilTypeExpression>,
+    choices: &std::collections::HashMap<String, Vec<CsilTypeExpression>>,
+) -> bool {
+    match codec_unwrap_constrained(ty) {
+        CsilTypeExpression::Builtin(_) => true,
+        CsilTypeExpression::Reference(name) => {
+            let pascal = name.to_case(Case::Pascal);
+            records.contains(&pascal) || aliases.contains_key(&pascal) || choices.contains_key(&pascal)
+        }
+        CsilTypeExpression::Array { element_type, .. } => {
+            java_op_boundary_expressible(element_type, records, aliases, choices)
+        }
+        CsilTypeExpression::Map { key, value, .. } => {
+            java_op_boundary_expressible(key, records, aliases, choices)
+                && java_op_boundary_expressible(value, records, aliases, choices)
+        }
+        CsilTypeExpression::Tuple(_) => true,
+        _ => false,
+    }
+}
+
+/// The `<Base><Method>` stem shared by an op's per-op codec helpers and the client
+/// method that calls them, so the two never drift.
+fn op_codec_stem(service_name: &str, op: &CsilServiceOperation) -> String {
+    format!("{}{}", service_base(service_name), wire_method_name(&op.name))
+}
+
 /// The CBOR encoding of a text key. Comparing these byte slices lexicographically is
 /// exactly RFC 8949 §4.2.1 canonical key ordering, computed at generation time so the
 /// emitted encoder lays a record's map keys down in canonical order.
@@ -2149,6 +2190,81 @@ fn emit_choice_codec(
 
 /// Build `CsilCbor.java`: the self-contained canonical-CBOR runtime plus an
 /// `encode`/`decode` pair per record. `None` when the spec declares no records.
+/// Public per-op CBOR helpers so a server (or the client) can compose a
+/// `decode(request)/encode(response)` pair for every op whose boundary is non-record —
+/// scalar-id requests and `[]T`/map/scalar responses included, not just record↔record.
+/// Records keep their `encode<T>`/`decode<T>` wrappers; these add the op-keyed names for
+/// the shapes that have no standalone class to hang a codec on, so client and a
+/// consumer-side server share one wire surface for every op.
+fn emit_op_codecs(
+    input: &WasmGeneratorInput,
+    records: &std::collections::HashSet<String>,
+    aliases: &std::collections::HashMap<String, CsilTypeExpression>,
+    choices: &std::collections::HashMap<String, Vec<CsilTypeExpression>>,
+) -> String {
+    let mut out = String::new();
+    for rule in &input.csil_spec.rules {
+        let CsilRuleType::ServiceDef(service) = &rule.rule_type else {
+            continue;
+        };
+        for op in &service.operations {
+            // Only unary `->` ops get a typed client method, so only they need per-op
+            // byte helpers; channel ops ride the codec-agnostic router surface.
+            if !matches!(op.direction, CsilServiceDirection::Unidirectional) {
+                continue;
+            }
+            let success = success_type(&op.output_type);
+            let null_input = is_null_input(&op.input_type);
+            let req_ok = null_input
+                || java_op_boundary_expressible(&op.input_type, records, aliases, choices);
+            if !req_ok || !java_op_boundary_expressible(&success, records, aliases, choices) {
+                continue;
+            }
+            let stem = op_codec_stem(&rule.name, op);
+            // A record boundary already has its `encode<T>`/`decode<T>` wrapper; only the
+            // non-record shapes need a fresh op-keyed pair.
+            if !null_input && !is_record_ref(&op.input_type, records) {
+                out.push_str(&emit_op_codec_pair(
+                    &format!("{stem}Request"),
+                    &op.input_type,
+                    records,
+                    aliases,
+                    choices,
+                ));
+            }
+            if !is_record_ref(&success, records) {
+                out.push_str(&emit_op_codec_pair(
+                    &format!("{stem}Response"),
+                    &success,
+                    records,
+                    aliases,
+                    choices,
+                ));
+            }
+        }
+    }
+    out
+}
+
+/// One `encode<Name>`/`decode<Name>` pair over the same value builders the record codec
+/// uses for its fields, so an arbitrary op-boundary shape gets the byte seam a record
+/// type has. `decode(data)`/`encode(...)` are the runtime CBOR<->value helpers.
+fn emit_op_codec_pair(
+    helper: &str,
+    ty: &CsilTypeExpression,
+    records: &std::collections::HashSet<String>,
+    aliases: &std::collections::HashMap<String, CsilTypeExpression>,
+    choices: &std::collections::HashMap<String, Vec<CsilTypeExpression>>,
+) -> String {
+    let java_type = map_type_boxed(ty);
+    let enc = java_enc_value(ty, "csilV", records, aliases, choices, 0);
+    let dec = java_dec_value(ty, "decode(csilData)", records, aliases, choices, 0);
+    format!(
+        "    public static byte[] encode{helper}({java_type} csilV) {{\n        return encode({enc});\n    }}\n\n\
+         \x20   public static {java_type} decode{helper}(byte[] csilData) {{\n        return {dec};\n    }}\n\n"
+    )
+}
+
 fn generate_codec(input: &WasmGeneratorInput, config: &JavaConfig) -> Option<GeneratedFile> {
     let records = record_names(input);
     if records.is_empty() {
@@ -2177,6 +2293,9 @@ fn generate_codec(input: &WasmGeneratorInput, config: &JavaConfig) -> Option<Gen
             ));
         }
     }
+    // Per-op byte helpers for non-record op boundaries, so the client and a
+    // consumer-side server share one codec surface for every op, not just record↔record.
+    body.push_str(&emit_op_codecs(input, &records, &aliases, &choices));
 
     let mut code = config.header();
     code.push_str("/**\n");
@@ -2264,6 +2383,8 @@ fn generate_client(
     service: &CsilServiceDefinition,
     doc: &[String],
     records: &std::collections::HashSet<String>,
+    aliases: &std::collections::HashMap<String, CsilTypeExpression>,
+    choices: &std::collections::HashMap<String, Vec<CsilTypeExpression>>,
 ) -> GeneratedFile {
     let base = service_base(name);
     let class = format!("{base}Client");
@@ -2291,39 +2412,50 @@ fn generate_client(
         }
         let success = success_type(&op.output_type);
         let null_input = is_null_input(&op.input_type);
-        // The typed-codec path needs a record success type (and a record or null
-        // request) so the method can call the generated encode/decode. Anything else is
-        // skipped with a note rather than emitting an uncompilable call.
-        if !is_record_ref(&success, records)
-            || !(null_input || is_record_ref(&op.input_type, records))
-        {
+        let req_ok =
+            null_input || java_op_boundary_expressible(&op.input_type, records, aliases, choices);
+        // Only a genuinely inexpressible boundary (an inline multi-variant choice with no
+        // wire discriminator, or an unmodeled reference) is skipped now; scalar/array/map
+        // shapes ride the per-op codec helpers, so every other op gets a method.
+        if !req_ok || !java_op_boundary_expressible(&success, records, aliases, choices) {
             code.push('\n');
             code.push_str(&format!(
-                "    // operation '{}' has a non-record payload; (de)serialize it manually\n",
+                "    // operation '{}' has a payload csilgen can't (de)serialize; handle it manually\n",
                 op.name
             ));
             continue;
         }
         let method = wire_method_name(&op.name);
         let camel = op.name.to_case(Case::Camel);
-        let resp_class = record_ref_class(&success);
+        let stem = op_codec_stem(name, op);
+        let resp_type = map_type_boxed(&success);
+        // A record success reuses its `decode<T>` wrapper; any other shape uses the op's
+        // per-op response decoder.
+        let decode_resp = if is_record_ref(&success, records) {
+            format!("CsilCbor.decode{}", record_ref_class(&success))
+        } else {
+            format!("CsilCbor.decode{stem}Response")
+        };
+        // A null input carries no request body; a record reuses its `encode<T>` wrapper;
+        // any other shape uses the op's per-op request encoder.
         let (params, req_bytes) = if null_input {
             (String::new(), "null".to_string())
         } else {
             let input = map_type(&op.input_type);
-            let req_class = record_ref_class(&op.input_type);
-            (
-                format!("{input} req"),
-                format!("CsilCbor.encode{req_class}(req)"),
-            )
+            let enc = if is_record_ref(&op.input_type, records) {
+                format!("CsilCbor.encode{}(req)", record_ref_class(&op.input_type))
+            } else {
+                format!("CsilCbor.encode{stem}Request(req)")
+            };
+            (format!("{input} req"), enc)
         };
         code.push('\n');
         code.push_str(&javadoc("    ", &clean_doc(&op.doc_comments), &[]));
         code.push_str(&format!(
-            "    public {resp_class} {camel}({params}) throws ClientException {{\n"
+            "    public {resp_type} {camel}({params}) throws ClientException {{\n"
         ));
         code.push_str(&format!(
-            "        return CsilCbor.decode{resp_class}(transport.call(\"{wire_service}\", \"{method}\", {req_bytes}));\n"
+            "        return {decode_resp}(transport.call(\"{wire_service}\", \"{method}\", {req_bytes}));\n"
         ));
         code.push_str("    }\n");
     }
@@ -3559,6 +3691,105 @@ mod tests {
         ));
         // no server interface for the client target.
         assert!(!files.iter().any(|f| f.path.ends_with("Corndogs.java")));
+    }
+
+    #[test]
+    fn non_record_op_boundaries_get_client_methods_and_per_op_codecs() {
+        let arr = |elem: CsilTypeExpression| CsilTypeExpression::Array {
+            element_type: Box::new(elem),
+            occurrence: None,
+        };
+        let svc = CsilServiceDefinition {
+            operations: vec![
+                // record -> record (the only shape the old filter kept)
+                op(
+                    "create-member",
+                    CsilTypeExpression::Reference("Member".to_string()),
+                    CsilTypeExpression::Reference("Member".to_string()),
+                    CsilServiceDirection::Unidirectional,
+                    None,
+                ),
+                // scalar-id (alias) request -> record response
+                op(
+                    "get-member",
+                    CsilTypeExpression::Reference("MemberID".to_string()),
+                    CsilTypeExpression::Reference("Member".to_string()),
+                    CsilServiceDirection::Unidirectional,
+                    None,
+                ),
+                // record request -> bare-array response
+                op(
+                    "list-members",
+                    CsilTypeExpression::Reference("ListMembersRequest".to_string()),
+                    arr(CsilTypeExpression::Reference("Member".to_string())),
+                    CsilServiceDirection::Unidirectional,
+                    None,
+                ),
+                // scalar-id request -> scalar response
+                op(
+                    "delete-task",
+                    CsilTypeExpression::Reference("TaskID".to_string()),
+                    builtin("bool"),
+                    CsilServiceDirection::Unidirectional,
+                    None,
+                ),
+            ],
+            wire_id: None,
+        };
+        let member = CsilGroupExpression {
+            entries: vec![
+                bare("id", CsilTypeExpression::Reference("MemberID".to_string()), None),
+                bare("name", builtin("text"), None),
+            ],
+        };
+        let list_req = CsilGroupExpression {
+            entries: vec![bare("limit", builtin("uint"), Some(CsilOccurrence::Optional))],
+        };
+        let files = generate_java(&input_for(
+            vec![
+                rule("MemberID", CsilRuleType::TypeDef(builtin("text"))),
+                rule("TaskID", CsilRuleType::TypeDef(builtin("text"))),
+                rule("Member", CsilRuleType::GroupDef(member)),
+                rule("ListMembersRequest", CsilRuleType::GroupDef(list_req)),
+                rule("MemberService", CsilRuleType::ServiceDef(svc)),
+            ],
+            "java-client",
+        ))
+        .unwrap();
+
+        let client = file(&files, "MemberClient.java");
+        // Every op gets a method now — scalar-id request, bare-array and scalar responses
+        // included — and none is dropped with a note.
+        assert!(client.content.contains(
+            "public Member getMember(MemberId req) throws ClientException"
+        ));
+        assert!(client.content.contains(
+            "public List<Member> listMembers(ListMembersRequest req) throws ClientException"
+        ));
+        assert!(client.content.contains(
+            "public Boolean deleteTask(TaskId req) throws ClientException"
+        ));
+        assert!(!client.content.contains("handle it manually"));
+        assert!(!client.content.contains("non-record payload"));
+        // A record boundary keeps its `encode<T>`/`decode<T>` wrapper; a non-record
+        // boundary rides the op-keyed per-op helpers.
+        assert!(client.content.contains("CsilCbor.encodeMember(req)"));
+        assert!(client.content.contains("CsilCbor.encodeMemberGetMemberRequest(req)"));
+        assert!(client.content.contains("CsilCbor.decodeMemberListMembersResponse(transport.call("));
+        assert!(client.content.contains("CsilCbor.decodeMemberDeleteTaskResponse(transport.call("));
+
+        let codec = file(&files, "CsilCbor.java");
+        // The non-record op boundaries are exposed as public per-op helpers a server in
+        // another package can compose decode(request)/encode(response) from.
+        assert!(codec.content.contains(
+            "public static MemberId decodeMemberGetMemberRequest(byte[] csilData)"
+        ));
+        assert!(codec.content.contains(
+            "public static byte[] encodeMemberListMembersResponse(List<Member> csilV)"
+        ));
+        assert!(codec.content.contains(
+            "public static byte[] encodeMemberDeleteTaskResponse(Boolean csilV)"
+        ));
     }
 
     #[test]

@@ -588,6 +588,151 @@ fn codec_emitted_with_typed_client() {
 }
 
 #[test]
+fn non_record_op_boundaries_get_client_methods_and_per_op_codecs() {
+    // Mirrors tests/fixtures/services/nonrecord-ops.csil: scalar-id requests, bare-array
+    // and scalar responses, and map responses that the old record-only filter dropped.
+    let array_of = |elem: CsilTypeExpression| CsilTypeExpression::Array {
+        element_type: Box::new(elem),
+        occurrence: None,
+    };
+    let text_map = CsilTypeExpression::Map {
+        key: Box::new(builtin("text")),
+        value: Box::new(builtin("text")),
+        occurrence: None,
+    };
+    let ops = vec![
+        make_op(
+            "create-member",
+            reference("Member"),
+            reference("Member"),
+            CsilServiceDirection::Unidirectional,
+        ),
+        make_op(
+            "get-member",
+            reference("MemberID"),
+            reference("Member"),
+            CsilServiceDirection::Unidirectional,
+        ),
+        make_op(
+            "list-members",
+            reference("ListMembersRequest"),
+            array_of(reference("Member")),
+            CsilServiceDirection::Unidirectional,
+        ),
+        make_op(
+            "delete-task",
+            reference("TaskID"),
+            builtin("bool"),
+            CsilServiceDirection::Unidirectional,
+        ),
+        make_op(
+            "member-names",
+            reference("ListMembersRequest"),
+            text_map,
+            CsilServiceDirection::Unidirectional,
+        ),
+    ];
+    let input = input_from_rules(
+        "swift-client",
+        vec![
+            typedef_rule("MemberID", builtin("text")),
+            typedef_rule("TaskID", builtin("text")),
+            group_rule(
+                "Member",
+                vec![
+                    bare_entry("id", reference("MemberID")),
+                    bare_entry("name", builtin("text")),
+                ],
+            ),
+            group_rule(
+                "ListMembersRequest",
+                vec![opt_entry("limit", builtin("uint"))],
+            ),
+            service_rule("MemberService", ops, None),
+        ],
+        1,
+    );
+    let files = build_files(&input).expect("ok");
+    let client = files
+        .iter()
+        .find(|f| f.path == "Client.swift")
+        .expect("Client.swift emitted");
+
+    // Every op gets a method — scalar-id request, bare-array, scalar, and map responses
+    // included. No op is dropped with a note anymore.
+    assert!(!client.content.contains("handle it manually"));
+    assert!(
+        client
+            .content
+            .contains("public func getMember(_ request: MemberId) throws -> Member")
+    );
+    assert!(
+        client
+            .content
+            .contains("public func listMembers(_ request: ListMembersRequest) throws -> [Member]")
+    );
+    assert!(
+        client
+            .content
+            .contains("public func deleteTask(_ request: TaskId) throws -> Bool")
+    );
+    assert!(client.content.contains(
+        "public func memberNames(_ request: ListMembersRequest) throws -> [String: String]"
+    ));
+    // Record boundary keeps its `toCbor`/`fromCbor`; non-record rides the per-op helpers.
+    assert!(client.content.contains("request: request.toCbor()"));
+    assert!(
+        client
+            .content
+            .contains("encodeMemberGetMemberRequest(request)")
+    );
+    assert!(
+        client
+            .content
+            .contains("decodeMemberListMembersResponse(csilResp)")
+    );
+    assert!(
+        client
+            .content
+            .contains("decodeMemberDeleteTaskResponse(csilResp)")
+    );
+
+    let codec = files
+        .iter()
+        .find(|f| f.path == "Codec.swift")
+        .expect("Codec.swift emitted");
+    // Per-op helpers for non-record shapes are exported, so a server in another module can
+    // compose decode(request)/encode(response) for every op — not just record↔record.
+    assert!(
+        codec.content.contains(
+            "public func decodeMemberGetMemberRequest(_ bytes: [UInt8]) throws -> MemberId"
+        )
+    );
+    assert!(
+        codec
+            .content
+            .contains("public func encodeMemberListMembersResponse(_ value: [Member]) -> [UInt8]")
+    );
+    assert!(
+        codec
+            .content
+            .contains("public func encodeMemberDeleteTaskResponse(_ value: Bool) -> [UInt8]")
+    );
+    // The array response decodes through the Member record codec, not a `.null` stub.
+    assert!(
+        codec
+            .content
+            .contains("try CsilCbor.asArray(csilRoot).map { try Member(cborValue: $0) }")
+    );
+    // The map response round-trips as a real CBOR map.
+    assert!(
+        codec
+            .content
+            .contains("public func encodeMemberMemberNamesResponse")
+    );
+}
+
+#[test]
 fn async_twin_emitted_by_default_with_marked_symbols() {
     // Default client_style is `both`: an `async` twin at ClientAsync.swift whose symbols
     // carry an `Async` marker so it coexists with the blocking client in one module.

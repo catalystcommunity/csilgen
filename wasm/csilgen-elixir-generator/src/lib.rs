@@ -1883,10 +1883,18 @@ fn generate_clients(input: &WasmGeneratorInput, config: &ElixirConfig) -> Option
     content.push_str(&client_prelude(config));
 
     let records = record_csil_names(input);
+    let aliases = codec_aliases(input);
+    let choices = choice_csil_types(input);
+    let cx = Codec {
+        config,
+        records: &records,
+        aliases: &aliases,
+        choices: &choices,
+    };
     let mut emitted = false;
     for rule in &input.csil_spec.rules {
         if let CsilRuleType::ServiceDef(service) = &rule.rule_type {
-            emit_client_module(&mut content, &rule.name, service, config, &records);
+            emit_client_module(&mut content, &rule.name, service, &cx);
             emitted = true;
         }
     }
@@ -1897,6 +1905,40 @@ fn generate_clients(input: &WasmGeneratorInput, config: &ElixirConfig) -> Option
 /// typed client method can call the generated `to_cbor`/`from_cbor` directly.
 fn is_record_ref(ty: &CsilTypeExpression, records: &HashSet<String>) -> bool {
     matches!(ty, CsilTypeExpression::Reference(name) if records.contains(name))
+}
+
+/// Whether `enc_value`/`dec_value` model an op-boundary type faithfully, so a per-op
+/// codec helper is correct rather than silently lossy. Records, scalars, transparent
+/// aliases, named choices (enums and unions), inline enums, arrays, maps, and tuples
+/// all resolve to real codec expressions. An inline multi-variant non-literal choice
+/// carries no wire discriminator the bare in-memory value can recover, and an unmodeled
+/// reference has no codec, so those two keep the skip-with-note path the client falls
+/// back to.
+fn op_boundary_expressible(
+    ty: &CsilTypeExpression,
+    records: &HashSet<String>,
+    aliases: &HashMap<String, CsilTypeExpression>,
+    choices: &HashMap<String, Vec<CsilTypeExpression>>,
+) -> bool {
+    match ty {
+        CsilTypeExpression::Constrained { base_type, .. } => {
+            op_boundary_expressible(base_type, records, aliases, choices)
+        }
+        CsilTypeExpression::Builtin(_) => true,
+        CsilTypeExpression::Reference(name) => {
+            records.contains(name) || aliases.contains_key(name) || choices.contains_key(name)
+        }
+        CsilTypeExpression::Array { element_type, .. } => {
+            op_boundary_expressible(element_type, records, aliases, choices)
+        }
+        CsilTypeExpression::Map { key, value, .. } => {
+            op_boundary_expressible(key, records, aliases, choices)
+                && op_boundary_expressible(value, records, aliases, choices)
+        }
+        CsilTypeExpression::Tuple(_) => true,
+        CsilTypeExpression::Choice(variants) => enum_literal_kind(variants).is_some(),
+        _ => false,
+    }
 }
 
 /// The bare CSIL name of a record reference. Only called after `is_record_ref`
@@ -1912,14 +1954,18 @@ fn emit_client_module(
     content: &mut String,
     name: &str,
     service: &CsilServiceDefinition,
-    config: &ElixirConfig,
-    records: &HashSet<String>,
+    cx: &Codec,
 ) {
+    let config = cx.config;
+    let records = cx.records;
     let base = service_base(name);
     let module = format!("{}.{base}Client", config.module_root);
     let root = &config.module_root;
     // Canonical wire strings (the wire contract): service lowercased, op PascalCased.
     let wire_service = base.to_lowercase();
+    // The shared `<root>.Cbor` module the per-op helpers call is only emitted when the
+    // spec declares records; without it a non-record boundary has no (de)serializer.
+    let has_codec = !records.is_empty();
 
     content.push_str(&format!("defmodule {module} do\n"));
     content.push_str(&format!(
@@ -1933,6 +1979,9 @@ fn emit_client_module(
     content.push_str(&format!("  @spec new({root}.Transport.t()) :: t()\n"));
     content.push_str("  def new(transport), do: %__MODULE__{transport: transport}\n");
 
+    // Per-op private (de)serializers for non-record boundaries, accumulated and emitted
+    // after the public methods so they live in the same module the methods call.
+    let mut helpers = String::new();
     for op in &service.operations {
         // Only unary request/response ops belong on the RPC client; channel ops
         // ride the router/encoder surface emitted by the server target.
@@ -1945,22 +1994,37 @@ fn emit_client_module(
         }
         let success = success_type(&op.output_type);
         let null_input = is_null_input(&op.input_type);
-        // The typed seam needs a record success type (and a record or null request)
-        // so the method can call the generated codec. Anything else is skipped with a
-        // note rather than emitting an uncompilable call.
-        if !is_record_ref(&success, records)
-            || !(null_input || is_record_ref(&op.input_type, records))
-        {
+        let req_ok = null_input
+            || op_boundary_expressible(&op.input_type, records, cx.aliases, cx.choices);
+        let resp_ok = op_boundary_expressible(&success, records, cx.aliases, cx.choices);
+        // A non-record boundary rides the `<root>.Cbor` module via a per-op helper, which
+        // only exists when the spec declares records. Only a genuinely inexpressible
+        // boundary (an inline multi-variant choice with no wire discriminator, or an
+        // unmodeled reference) — or any non-record boundary in a spec with no codec — is
+        // skipped now; every other op gets a method.
+        let needs_codec = (!null_input && !is_record_ref(&op.input_type, records))
+            || !is_record_ref(&success, records);
+        if !req_ok || !resp_ok || (needs_codec && !has_codec) {
             content.push_str(&format!(
-                "\n  # operation {} has a non-record payload; (de)serialize it manually\n",
+                "\n  # operation {} has a payload csilgen can't (de)serialize; handle it manually\n",
                 op.name
             ));
             continue;
         }
         let func = snake_case(&op.name);
         let wire_method = wire_method_name(&op.name);
-        let resp_mod = config.module(&ref_name(&success));
-        let out_ty = format!("{resp_mod}.t()");
+        // A record success reuses its module's `from_cbor`; any other shape gets a per-op
+        // decoder built from the same value builders the record codec uses.
+        let (out_ty, decode_resp) = if is_record_ref(&success, records) {
+            let resp_mod = config.module(&ref_name(&success));
+            (format!("{resp_mod}.t()"), format!("{resp_mod}.from_cbor(resp)"))
+        } else {
+            helpers.push_str(&format!(
+                "\n  defp decode_{func}_response(csil_bytes) do\n    csil_root = {root}.Cbor.decode(csil_bytes)\n    {}\n  end\n",
+                dec_value(&success, "csil_root", cx)
+            ));
+            (map_type(&success, config), format!("decode_{func}_response(resp)"))
+        };
         content.push('\n');
         if null_input {
             content.push_str(&format!("  @spec {func}(t()) :: {out_ty}\n"));
@@ -1971,19 +2035,33 @@ fn emit_client_module(
                 "    resp = {root}.Transport.call(transport, \"{wire_service}\", \"{wire_method}\", <<>>)\n"
             ));
         } else {
-            let req_mod = config.module(&ref_name(&op.input_type));
-            let in_ty = format!("{req_mod}.t()");
+            // A record request reuses its module's `to_cbor`; any other shape gets a
+            // per-op encoder over the shared value builders.
+            let (in_ty, encode_req) = if is_record_ref(&op.input_type, records) {
+                let req_mod = config.module(&ref_name(&op.input_type));
+                (format!("{req_mod}.t()"), format!("{req_mod}.to_cbor(req)"))
+            } else {
+                helpers.push_str(&format!(
+                    "\n  defp encode_{func}_request(req), do: {root}.Cbor.encode({})\n",
+                    enc_value(&op.input_type, "req", cx)
+                ));
+                (
+                    map_type(&op.input_type, config),
+                    format!("encode_{func}_request(req)"),
+                )
+            };
             content.push_str(&format!("  @spec {func}(t(), {in_ty}) :: {out_ty}\n"));
             content.push_str(&format!(
                 "  def {func}(%__MODULE__{{transport: transport}}, req) do\n"
             ));
             content.push_str(&format!(
-                "    resp = {root}.Transport.call(transport, \"{wire_service}\", \"{wire_method}\", {req_mod}.to_cbor(req))\n"
+                "    resp = {root}.Transport.call(transport, \"{wire_service}\", \"{wire_method}\", {encode_req})\n"
             ));
         }
-        content.push_str(&format!("    {resp_mod}.from_cbor(resp)\n"));
+        content.push_str(&format!("    {decode_resp}\n"));
         content.push_str("  end\n");
     }
+    content.push_str(&helpers);
     content.push_str("end\n\n");
 }
 

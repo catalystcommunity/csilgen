@@ -1457,10 +1457,16 @@ fn generate_client(
     let mut body = String::new();
     let mut emitted = false;
     let records = record_names(input);
+    // Aliases and choices let the client tell an expressible non-record boundary (which
+    // rides a per-op codec helper) from an inexpressible one (which it still skips).
+    let aliases = codec_aliases(input);
+    let choices = choice_names(input);
 
     for rule in &input.csil_spec.rules {
         if let CsilRuleType::ServiceDef(service) = &rule.rule_type {
-            emit_client_class(&mut body, &rule.name, service, config, &records, shape);
+            emit_client_class(
+                &mut body, &rule.name, service, config, &records, &aliases, &choices, shape,
+            );
             emitted = true;
         }
     }
@@ -1479,12 +1485,15 @@ fn generate_client(
     Some(content)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn emit_client_class(
     body: &mut String,
     name: &str,
     service: &CsilServiceDefinition,
     config: &CsharpConfig,
     records: &std::collections::HashSet<String>,
+    aliases: &std::collections::HashMap<String, CsilTypeExpression>,
+    choices: &std::collections::HashSet<String>,
     shape: ClientShape,
 ) {
     let base = service_base(name);
@@ -1512,15 +1521,15 @@ fn emit_client_class(
             continue;
         }
         let success = success_type(&operation.output_type);
-        // The typed-codec path needs a record success type (and a record or null
-        // request) so the method can round-trip through the generated codec. Anything
-        // else is skipped with a note rather than emitting an uncompilable call.
-        let resp_ok = is_record_ref(&success, records);
-        let req_ok = op_input_is_null(&operation.input_type)
-            || is_record_ref(&operation.input_type, records);
-        if !resp_ok || !req_ok {
+        let null_input = op_input_is_null(&operation.input_type);
+        let req_ok =
+            null_input || op_boundary_expressible(&operation.input_type, records, aliases, choices);
+        // Only a genuinely inexpressible boundary (an inline multi-variant choice with no
+        // wire discriminator, or an unmodeled reference) is skipped now; scalar/array/map
+        // shapes ride the per-op codec helpers, so every other op gets a method.
+        if !req_ok || !op_boundary_expressible(&success, records, aliases, choices) {
             body.push_str(&format!(
-                "    // operation '{}' has a non-record payload; (de)serialize it manually\n",
+                "    // operation '{}' has a payload csilgen can't (de)serialize; handle it manually\n",
                 operation.name
             ));
             continue;
@@ -1530,6 +1539,7 @@ fn emit_client_class(
         let method = format!("{}{}", pascal_ident(&operation.name), shape.marker);
         let wire_op = wire_op_string(&operation.name);
         let output = map_csil_type(&success, config);
+        let stem = op_codec_stem(name, &operation.name);
         // Only the seam round-trip and the return type turn async; `System.Threading.Tasks`
         // is fully qualified so a record literally named `Task` never shadows the future.
         let (async_kw, await_kw, ret) = if shape.is_async {
@@ -1541,19 +1551,32 @@ fn emit_client_class(
         } else {
             ("", "", output.clone())
         };
-        match op_param(&operation.input_type) {
-            None => {
-                body.push_str(&format!(
-                    "    public {async_kw}{ret} {method}() =>\n        Codec.Decode<{output}>({await_kw}transport.Call(\"{wire_service}\", \"{wire_op}\", System.Array.Empty<byte>()));\n"
-                ));
-            }
+        // A null request carries an empty body; a record reuses `Codec.Encode<T>`; any
+        // other shape uses the op's per-op request encoder.
+        let (params_sig, req_bytes) = match op_param(&operation.input_type) {
+            None => (String::new(), "System.Array.Empty<byte>()".to_string()),
             Some(param) => {
                 let input = map_csil_type(&operation.input_type, config);
-                body.push_str(&format!(
-                    "    public {async_kw}{ret} {method}({input} {param}) =>\n        Codec.Decode<{output}>({await_kw}transport.Call(\"{wire_service}\", \"{wire_op}\", Codec.Encode({param})));\n"
-                ));
+                let enc = if is_record_ref(&operation.input_type, records) {
+                    format!("Codec.Encode({param})")
+                } else {
+                    format!("Codec.Encode{stem}Request({param})")
+                };
+                (format!("{input} {param}"), enc)
             }
-        }
+        };
+        let call =
+            format!("{await_kw}transport.Call(\"{wire_service}\", \"{wire_op}\", {req_bytes})");
+        // A record success reuses the generic `Codec.Decode<T>`; any other shape uses the
+        // op's per-op response decoder.
+        let decode = if is_record_ref(&success, records) {
+            format!("Codec.Decode<{output}>({call})")
+        } else {
+            format!("Codec.Decode{stem}Response({call})")
+        };
+        body.push_str(&format!(
+            "    public {async_kw}{ret} {method}({params_sig}) =>\n        {decode};\n"
+        ));
     }
 
     body.push_str("}\n\n");
@@ -1571,6 +1594,119 @@ fn wire_op_string(name: &str) -> String {
 /// client method can round-trip it through the generated `Codec`.
 fn is_record_ref(ty: &CsilTypeExpression, records: &std::collections::HashSet<String>) -> bool {
     matches!(ty, CsilTypeExpression::Reference(name) if records.contains(&pascal_ident(name)))
+}
+
+/// Whether `csharp_enc_value`/`csharp_dec_value` model an op-boundary type faithfully, so
+/// a per-op codec helper round-trips it rather than silently stubbing it to null. Records,
+/// scalars, transparent aliases, named enums/unions (choices), arrays, maps, and tuples all
+/// resolve to real codec expressions. An inline multi-variant choice has no wire
+/// discriminator and an unmodeled reference has no codec, so those two keep the
+/// skip-with-note path the client falls back to.
+fn op_boundary_expressible(
+    ty: &CsilTypeExpression,
+    records: &std::collections::HashSet<String>,
+    aliases: &std::collections::HashMap<String, CsilTypeExpression>,
+    choices: &std::collections::HashSet<String>,
+) -> bool {
+    match codec_unwrap_constrained(ty) {
+        CsilTypeExpression::Builtin(_) => true,
+        CsilTypeExpression::Reference(name) => {
+            let pascal = pascal_ident(name);
+            records.contains(&pascal) || aliases.contains_key(&pascal) || choices.contains(&pascal)
+        }
+        CsilTypeExpression::Array { element_type, .. } => {
+            op_boundary_expressible(element_type, records, aliases, choices)
+        }
+        CsilTypeExpression::Map { key, value, .. } => {
+            op_boundary_expressible(key, records, aliases, choices)
+                && op_boundary_expressible(value, records, aliases, choices)
+        }
+        CsilTypeExpression::Tuple(_) => true,
+        _ => false,
+    }
+}
+
+/// The `<Base><Method>` stem shared by an op's per-op codec helpers and the client method
+/// that calls them, so the two never drift (`MemberService.get-member` → `MemberGetMember`).
+fn op_codec_stem(service_name: &str, op_name: &str) -> String {
+    format!("{}{}", service_base(service_name), pascal_ident(op_name))
+}
+
+/// Per-op CBOR helpers on the generated `Codec` for every NON-record op boundary, so the
+/// typed client (and a server in another assembly) shares one byte seam for scalar-id
+/// requests, `[]T`/map responses, and the like — not just record↔record. Record boundaries
+/// keep the generic `Codec.Encode<T>`/`Codec.Decode<T>`, so a record-only spec stays
+/// byte-identical and only specs with non-record ops grow these methods.
+fn emit_op_codecs(
+    input: &WasmGeneratorInput,
+    records: &std::collections::HashSet<String>,
+    aliases: &std::collections::HashMap<String, CsilTypeExpression>,
+    choices: &std::collections::HashSet<String>,
+    config: &CsharpConfig,
+) -> String {
+    let mut out = String::new();
+    for rule in &input.csil_spec.rules {
+        let CsilRuleType::ServiceDef(service) = &rule.rule_type else {
+            continue;
+        };
+        for op in &service.operations {
+            if !matches!(op.direction, CsilServiceDirection::Unidirectional) {
+                continue;
+            }
+            let success = success_type(&op.output_type);
+            let null_input = op_input_is_null(&op.input_type);
+            let req_ok =
+                null_input || op_boundary_expressible(&op.input_type, records, aliases, choices);
+            if !req_ok || !op_boundary_expressible(&success, records, aliases, choices) {
+                continue;
+            }
+            let stem = op_codec_stem(&rule.name, &op.name);
+            // A null request carries an empty body and a record reuses `Codec.Encode<T>`,
+            // so only a non-null, non-record request needs its own per-op helper.
+            if !null_input && !is_record_ref(&op.input_type, records) {
+                out.push_str(&emit_op_codec_pair(
+                    &format!("{stem}Request"),
+                    &op.input_type,
+                    records,
+                    aliases,
+                    choices,
+                    config,
+                ));
+            }
+            if !is_record_ref(&success, records) {
+                out.push_str(&emit_op_codec_pair(
+                    &format!("{stem}Response"),
+                    &success,
+                    records,
+                    aliases,
+                    choices,
+                    config,
+                ));
+            }
+        }
+    }
+    out
+}
+
+/// One `Encode<Name>`/`Decode<Name>` pair over the same value builders the record codec
+/// uses, so an arbitrary op-boundary shape gets the byte seam a record type has.
+fn emit_op_codec_pair(
+    helper: &str,
+    ty: &CsilTypeExpression,
+    records: &std::collections::HashSet<String>,
+    aliases: &std::collections::HashMap<String, CsilTypeExpression>,
+    choices: &std::collections::HashSet<String>,
+    config: &CsharpConfig,
+) -> String {
+    let cs_type = map_csil_type(ty, config);
+    let enc = csharp_enc_value(ty, "value", records, aliases, choices);
+    let dec = csharp_dec_value(ty, "Cbor.Decode(data)", records, aliases, choices);
+    format!(
+        "    /// <summary>Encode the {helper} op-boundary payload to canonical CSIL CBOR bytes.</summary>\n    \
+         public static byte[] Encode{helper}({cs_type} value) => Cbor.Encode({enc});\n\n    \
+         /// <summary>Decode canonical CSIL CBOR bytes into the {helper} op-boundary payload.</summary>\n    \
+         public static {cs_type} Decode{helper}(byte[] data) => {dec};\n\n"
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -2076,12 +2212,15 @@ fn codec_config() -> CsharpConfig {
 /// codec pairs, and the generic `Encode<T>`/`Decode<T>` byte surface. `None` when the
 /// spec declares no record types.
 fn generate_codec(input: &WasmGeneratorInput, config: &CsharpConfig) -> Option<String> {
-    if !spec_has_records(input) {
-        return None;
-    }
     let records = record_names(input);
     let aliases = codec_aliases(input);
     let choices = choice_names(input);
+    // Per-op byte helpers for non-record op boundaries; their presence also means a
+    // record-free spec with scalar/array/map ops still needs the codec runtime + class.
+    let op_codecs = emit_op_codecs(input, &records, &aliases, &choices, config);
+    if !spec_has_records(input) && op_codecs.is_empty() {
+        return None;
+    }
     let uses_timestamp = spec_uses_builtin(input, "timestamp");
     let uses_decimal = spec_uses_builtin(input, "decimal");
 
@@ -2167,6 +2306,7 @@ fn generate_codec(input: &WasmGeneratorInput, config: &CsharpConfig) -> Option<S
         "        throw new System.ArgumentException(\"csilgen: no CSIL codec for the requested type\");\n    }\n\n",
     );
     content.push_str(&methods);
+    content.push_str(&op_codecs);
     // Drop the trailing blank line the last method leaves so the class closes cleanly.
     while content.ends_with("\n\n") {
         content.pop();
@@ -4222,6 +4362,160 @@ mod tests {
         assert!(client.contains(
             "public Task SubmitTask(SubmitTaskRequest submitTaskRequest) =>\n        Codec.Decode<Task>(transport.Call(\"corndogs\", \"SubmitTask\", Codec.Encode(submitTaskRequest)));"
         ));
+    }
+
+    /// A spec whose ops exercise the boundary shapes the old record-only filter dropped:
+    /// `MemberID` (scalar alias) requests, a `[*Member]` (bare-array) response, a `bool`
+    /// (scalar) response, and a `{text => text}` (map) response — alongside the one
+    /// record↔record op the filter kept.
+    fn nonrecord_ops_input(target: &str) -> WasmGeneratorInput {
+        let text = || CsilTypeExpression::Builtin("text".to_string());
+        let pos = || CsilPosition {
+            line: 1,
+            column: 1,
+            offset: 0,
+        };
+        let r#ref = |n: &str| CsilTypeExpression::Reference(n.to_string());
+        let alias = |name: &str, ty: CsilTypeExpression| CsilRule {
+            name: name.to_string(),
+            rule_type: CsilRuleType::TypeDef(ty),
+            position: pos(),
+            doc_comments: Vec::new(),
+        };
+        let group_rule = |name: &str, entries: Vec<CsilGroupEntry>| CsilRule {
+            name: name.to_string(),
+            rule_type: CsilRuleType::GroupDef(CsilGroupExpression { entries }),
+            position: pos(),
+            doc_comments: Vec::new(),
+        };
+        let member = group_rule(
+            "Member",
+            vec![
+                bare_entry("id", r#ref("MemberID")),
+                bare_entry("name", text()),
+            ],
+        );
+        let limit = CsilGroupEntry {
+            key: Some(CsilGroupKey::Bare("limit".to_string())),
+            value_type: CsilTypeExpression::Builtin("uint".to_string()),
+            occurrence: Some(CsilOccurrence::Optional),
+            metadata: vec![],
+            doc_comments: Vec::new(),
+        };
+        let list_req = group_rule("ListMembersRequest", vec![limit]);
+        let op = |name: &str, input: CsilTypeExpression, output: CsilTypeExpression| {
+            CsilServiceOperation {
+                name: name.to_string(),
+                input_type: input,
+                output_type: output,
+                direction: CsilServiceDirection::Unidirectional,
+                position: pos(),
+                doc_comments: Vec::new(),
+                wire_id: None,
+            }
+        };
+        let arr = |elem: CsilTypeExpression| CsilTypeExpression::Array {
+            element_type: Box::new(elem),
+            occurrence: None,
+        };
+        let map = |k: CsilTypeExpression, v: CsilTypeExpression| CsilTypeExpression::Map {
+            key: Box::new(k),
+            value: Box::new(v),
+            occurrence: None,
+        };
+        let svc = CsilRule {
+            name: "MemberService".to_string(),
+            rule_type: CsilRuleType::ServiceDef(CsilServiceDefinition {
+                operations: vec![
+                    op("create-member", r#ref("Member"), r#ref("Member")),
+                    op("get-member", r#ref("MemberID"), r#ref("Member")),
+                    op(
+                        "list-members",
+                        r#ref("ListMembersRequest"),
+                        arr(r#ref("Member")),
+                    ),
+                    op(
+                        "delete-task",
+                        r#ref("TaskID"),
+                        CsilTypeExpression::Builtin("bool".to_string()),
+                    ),
+                    op(
+                        "member-names",
+                        r#ref("ListMembersRequest"),
+                        map(text(), text()),
+                    ),
+                ],
+                wire_id: None,
+            }),
+            position: pos(),
+            doc_comments: Vec::new(),
+        };
+        WasmGeneratorInput {
+            csil_spec: CsilSpecSerialized {
+                rules: vec![
+                    alias("MemberID", text()),
+                    alias("TaskID", text()),
+                    member,
+                    list_req,
+                    svc,
+                ],
+                source_content: None,
+                service_count: 1,
+                fields_with_metadata_count: 0,
+            },
+            config: GeneratorConfig {
+                target: target.to_string(),
+                output_dir: "/tmp".to_string(),
+                options: HashMap::new(),
+            },
+            generator_metadata: GeneratorMetadata {
+                name: "csharp".to_string(),
+                version: "1.0.0".to_string(),
+                description: String::new(),
+                target: "csharp".to_string(),
+                capabilities: vec![],
+                author: None,
+                homepage: None,
+            },
+        }
+    }
+
+    #[test]
+    fn non_record_op_boundaries_get_client_methods_and_per_op_codecs() {
+        let output = render(nonrecord_ops_input("csharp-client")).expect("generation ok");
+        let client = file_content(&output, "Client.gen.cs");
+
+        // Every op gets a method now — scalar-id request, bare-array, scalar, and map
+        // responses included; none is dropped with a note.
+        assert!(client.contains("public Member GetMember(MemberID memberID) =>"));
+        assert!(client.contains(
+            "public System.Collections.Generic.List<Member> ListMembers(ListMembersRequest"
+        ));
+        assert!(client.contains("public bool DeleteTask(TaskID taskID) =>"));
+        assert!(client.contains(
+            "public System.Collections.Generic.Dictionary<string, string> MemberNames(ListMembersRequest"
+        ));
+        assert!(!client.contains("handle it manually"));
+        assert!(!client.contains("non-record payload"));
+
+        // The record boundary keeps the generic codec; non-record boundaries ride per-op
+        // helpers, so the client and a consumer share one byte seam for every op.
+        assert!(client.contains(
+            "public Member CreateMember(Member member) =>\n        Codec.Decode<Member>(transport.Call(\"member\", \"CreateMember\", Codec.Encode(member)));"
+        ));
+        assert!(client.contains("Codec.EncodeMemberGetMemberRequest(memberID)"));
+        assert!(client.contains("Codec.DecodeMemberListMembersResponse(transport.Call("));
+        assert!(client.contains("Codec.DecodeMemberDeleteTaskResponse(transport.Call("));
+
+        // The per-op helpers are public static on the generated Codec for cross-assembly use.
+        let codec = file_content(&output, "Codec.gen.cs");
+        assert!(codec
+            .contains("public static MemberID DecodeMemberGetMemberRequest(byte[] data) => Cbor.AsText(Cbor.Decode(data));"));
+        assert!(codec.contains(
+            "public static System.Collections.Generic.List<Member> DecodeMemberListMembersResponse(byte[] data) =>"
+        ));
+        assert!(codec
+            .contains("public static byte[] EncodeMemberDeleteTaskResponse(bool value) => Cbor.Encode(new CborValue.Bool(value));"));
     }
 
     #[test]

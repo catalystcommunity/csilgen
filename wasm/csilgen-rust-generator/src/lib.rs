@@ -2570,6 +2570,7 @@ fn main() {{
         content.push_str("    }\n");
 
         let records = self.record_names();
+        let aliases = self.codec_aliases();
         // Canonical wire strings (the wire contract): service lowercased, op
         // PascalCased — so a Rust client reaches the same endpoint as its peers.
         let wire_service = base.to_lowercase();
@@ -2585,14 +2586,15 @@ fn main() {{
             }
             let success = success_type(&operation.output_type);
             let null_input = is_null_input(&operation.input_type);
-            // The typed-codec path needs a record success type (and a record or null
-            // request) so the method can call the generated `encode_`/`decode_`.
-            // Anything else is skipped with a note rather than an uncompilable call.
-            if !Self::is_record_ref(&success, &records)
-                || !(null_input || Self::is_record_ref(&operation.input_type, &records))
-            {
+            let req_ok =
+                null_input || self.op_boundary_expressible(&operation.input_type, &records, &aliases);
+            // Only a genuinely inexpressible boundary (an inline multi-variant choice
+            // with no wire discriminator, or an unmodeled reference) is skipped now;
+            // scalar/array/map/tuple shapes ride the per-op codec helpers, so every
+            // other op gets a typed method.
+            if !req_ok || !self.op_boundary_expressible(&success, &records, &aliases) {
                 content.push_str(&format!(
-                    "\n    // operation `{}` has a non-record payload; (de)serialize it manually\n",
+                    "\n    // operation `{}` has a payload csilgen can't (de)serialize; handle it manually\n",
                     operation.name
                 ));
                 continue;
@@ -2600,10 +2602,14 @@ fn main() {{
             let method = self.to_snake_case(&operation.name);
             let wire_method = Self::to_pascal_case(&operation.name);
             let output_type = self.map_type_to_rust(&success, &None)?;
-            let resp_dec = format!(
-                "decode_{}",
-                self.to_snake_case(&Self::type_ref_name(&success))
-            );
+            let stem = self.op_codec_stem(name, &operation.name);
+            // A record success reuses its `decode_<t>` wrapper; any other shape uses the
+            // op's per-op response decoder.
+            let resp_dec = if Self::is_record_ref(&success, &records) {
+                format!("decode_{}", self.to_snake_case(&Self::type_ref_name(&success)))
+            } else {
+                format!("decode_{stem}_response")
+            };
             content.push('\n');
             Self::write_op_doc(&mut content, operation, "request/response");
             // A push-style op (`op: -> Event`) takes no request payload: emit a
@@ -2619,10 +2625,16 @@ fn main() {{
                 ));
             } else {
                 let input_type = self.map_type_to_rust(&operation.input_type, &None)?;
-                let req_enc = format!(
-                    "encode_{}",
-                    self.to_snake_case(&Self::type_ref_name(&operation.input_type))
-                );
+                // A record request reuses its `encode_<t>` wrapper; any other shape uses
+                // the op's per-op request encoder.
+                let req_enc = if Self::is_record_ref(&operation.input_type, &records) {
+                    format!(
+                        "encode_{}",
+                        self.to_snake_case(&Self::type_ref_name(&operation.input_type))
+                    )
+                } else {
+                    format!("encode_{stem}_request")
+                };
                 content.push_str(&format!(
                     "    pub {async_kw}fn {method}(&self, req: {input_type}) -> Result<{output_type}, ClientError> {{\n"
                 ));
@@ -2653,6 +2665,48 @@ fn main() {{
     /// typed client method can call the generated `encode_`/`decode_` directly.
     fn is_record_ref(ty: &CsilTypeExpression, records: &HashSet<String>) -> bool {
         matches!(ty, CsilTypeExpression::Reference(name) if records.contains(name))
+    }
+
+    /// Whether `rust_enc_value`/`rust_dec_func` model an op-boundary type faithfully,
+    /// so an op carrying it can get a real client method (a record reuses its own
+    /// `encode_`/`decode_`; anything else rides a per-op codec helper). Records,
+    /// builtins, transparent aliases, named enums/unions, arrays, maps, and tuples all
+    /// resolve to real codec building blocks. An inline multi-variant choice has no
+    /// wire discriminator and an unmodeled reference has no codec, so those two stay on
+    /// the skip-with-note path the client falls back to.
+    fn op_boundary_expressible(
+        &self,
+        ty: &CsilTypeExpression,
+        records: &HashSet<String>,
+        aliases: &HashMap<String, CsilTypeExpression>,
+    ) -> bool {
+        match Self::value_base(ty) {
+            CsilTypeExpression::Builtin(_) => true,
+            CsilTypeExpression::Reference(name) => {
+                records.contains(name)
+                    || aliases.contains_key(name)
+                    || self.type_choice(name).is_some()
+            }
+            CsilTypeExpression::Array { element_type, .. } => {
+                self.op_boundary_expressible(element_type, records, aliases)
+            }
+            CsilTypeExpression::Map { key, value, .. } => {
+                self.op_boundary_expressible(key, records, aliases)
+                    && self.op_boundary_expressible(value, records, aliases)
+            }
+            CsilTypeExpression::Tuple(_) => true,
+            _ => false,
+        }
+    }
+
+    /// The `<service_base>_<method>` stem shared by an op's per-op codec helpers and
+    /// the client method that calls them, so the two never drift.
+    fn op_codec_stem(&self, service_name: &str, op_name: &str) -> String {
+        format!(
+            "{}_{}",
+            self.to_snake_case(&Self::service_base(service_name)),
+            self.to_snake_case(op_name)
+        )
     }
 
     /// The verbatim CSIL wire name for one group entry — the key as written in the
@@ -3052,6 +3106,78 @@ fn main() {{
         out
     }
 
+    /// Exported `encode_<stem>_request`/`decode_<stem>_request` (and `_response`)
+    /// pairs for every op whose boundary is expressible but NOT a record or null — the
+    /// scalar-id requests and `[*T]`/map/scalar responses the record-only filter used
+    /// to drop. They reuse the same `rust_enc_value`/`rust_dec_func` building blocks the
+    /// record codec uses for fields, so the client (and a consumer-side server) own one
+    /// codec surface for every op. Record and null boundaries already have their own
+    /// `encode_`/`decode_` (or no body), so they emit nothing here — an all-record spec
+    /// produces byte-identical codec output.
+    fn emit_op_codecs(
+        &mut self,
+        records: &HashSet<String>,
+        aliases: &HashMap<String, CsilTypeExpression>,
+    ) -> Result<String, String> {
+        // Collect owned (helper, type) pairs first: the rule walk borrows
+        // `self.input` immutably, while `map_type_to_rust` needs `&mut self`, so the two
+        // must not overlap.
+        let mut targets: Vec<(String, CsilTypeExpression)> = Vec::new();
+        for rule in &self.input.csil_spec.rules {
+            let CsilRuleType::ServiceDef(service) = &rule.rule_type else {
+                continue;
+            };
+            for op in &service.operations {
+                if !matches!(op.direction, CsilServiceDirection::Unidirectional) {
+                    continue;
+                }
+                let success = success_type(&op.output_type);
+                let stem = self.op_codec_stem(&rule.name, &op.name);
+                if !is_null_input(&op.input_type)
+                    && !Self::is_record_ref(&op.input_type, records)
+                    && self.op_boundary_expressible(&op.input_type, records, aliases)
+                {
+                    targets.push((format!("{stem}_request"), op.input_type.clone()));
+                }
+                if !Self::is_record_ref(&success, records)
+                    && self.op_boundary_expressible(&success, records, aliases)
+                {
+                    targets.push((format!("{stem}_response"), success));
+                }
+            }
+        }
+
+        let mut out = String::new();
+        for (helper, ty) in &targets {
+            out.push_str(&self.emit_op_codec_pair(helper, ty, records, aliases)?);
+        }
+        Ok(out)
+    }
+
+    /// One `encode_<helper>`/`decode_<helper>` pair over the value builders the record
+    /// codec already uses, giving an arbitrary op-boundary shape the same byte seam a
+    /// record type has.
+    fn emit_op_codec_pair(
+        &mut self,
+        helper: &str,
+        ty: &CsilTypeExpression,
+        records: &HashSet<String>,
+        aliases: &HashMap<String, CsilTypeExpression>,
+    ) -> Result<String, String> {
+        let rust_type = self.map_type_to_rust(ty, &None)?;
+        let enc = self.rust_enc_value(ty, "csil_v", true, records, aliases);
+        let dec = self.rust_dec_func(ty, records, aliases);
+        Ok(format!(
+            "/// Encode the {helper} payload to canonical CSIL CBOR bytes.\n\
+             pub fn encode_{helper}(csil_v: &{rust_type}) -> Vec<u8> {{\n    cbor_encode(&{enc})\n}}\n\n\
+             /// Decode canonical CSIL CBOR bytes into the {helper} payload.\n\
+             pub fn decode_{helper}(csil_data: &[u8]) -> Result<{rust_type}, CsilCborError> {{\n\
+             \x20   let csil_root = cbor_decode(csil_data)?;\n\
+             \x20   let csil_decode = {dec};\n\
+             \x20   csil_decode(&csil_root)\n}}\n\n"
+        ))
+    }
+
     /// Emit the value-tree codec (`csil_enc_<t>`/`csil_dec_<t>`) for a named
     /// type-choice. An enum (literal-only) encodes as its bare literal — the literal
     /// is its own discriminant. A union (type-bearing variants) encodes as a tagged
@@ -3157,7 +3283,7 @@ fn main() {{
     /// Build `codec.gen.rs`: the self-contained canonical-CBOR runtime plus an
     /// `encode_`/`decode_` pair per record. `None` when the spec declares no record
     /// the codec can model.
-    fn generate_codec(&self) -> Result<Option<String>, String> {
+    fn generate_codec(&mut self) -> Result<Option<String>, String> {
         let records = self.record_names();
         if records.is_empty() {
             return Ok(None);
@@ -3222,6 +3348,10 @@ fn main() {{
             };
             content.push_str(&self.emit_choice_codec(&rule.name, choices, &records, &aliases));
         }
+
+        // Per-op byte helpers for non-record (non-null) op boundaries, so the client and
+        // a consumer-side server share one codec surface for every op.
+        content.push_str(&self.emit_op_codecs(&records, &aliases)?);
 
         Ok(Some(content))
     }
@@ -4624,6 +4754,155 @@ mod tests {
         assert!(files.iter().any(|f| f.path == "codec.gen.rs"));
         // The server surface must not leak into the client target.
         assert!(!files.iter().any(|f| f.path == "services.rs"));
+    }
+
+    fn make_nonrecord_ops_input() -> WasmGeneratorInput {
+        let mut input = create_test_input();
+        input.config.target = "rust-client".to_string();
+        let pos = || CsilPosition {
+            line: 1,
+            column: 1,
+            offset: 0,
+        };
+        let r#ref = |n: &str| CsilTypeExpression::Reference(n.to_string());
+        let alias = |name: &str, ty: CsilTypeExpression| CsilRule {
+            name: name.to_string(),
+            rule_type: CsilRuleType::TypeDef(ty),
+            position: pos(),
+            doc_comments: Vec::new(),
+        };
+        let field = |name: &str, ty: CsilTypeExpression, optional: bool| CsilGroupEntry {
+            key: Some(CsilGroupKey::Bare(name.to_string())),
+            value_type: ty,
+            occurrence: optional.then_some(CsilOccurrence::Optional),
+            metadata: vec![],
+            doc_comments: Vec::new(),
+        };
+        let record = |name: &str, entries: Vec<CsilGroupEntry>| CsilRule {
+            name: name.to_string(),
+            rule_type: CsilRuleType::GroupDef(CsilGroupExpression { entries }),
+            position: pos(),
+            doc_comments: Vec::new(),
+        };
+        let op = |name: &str, input: CsilTypeExpression, output: CsilTypeExpression| {
+            CsilServiceOperation {
+                name: name.to_string(),
+                input_type: input,
+                output_type: output,
+                direction: CsilServiceDirection::Unidirectional,
+                position: pos(),
+                doc_comments: Vec::new(),
+                wire_id: None,
+            }
+        };
+        let text = || CsilTypeExpression::Builtin("text".to_string());
+        let rules = &mut input.csil_spec.rules;
+        rules.push(alias("MemberID", text()));
+        rules.push(alias("TaskID", text()));
+        rules.push(record(
+            "Member",
+            vec![field("id", r#ref("MemberID"), false), field("name", text(), false)],
+        ));
+        rules.push(record(
+            "ListMembersRequest",
+            vec![field(
+                "limit",
+                CsilTypeExpression::Builtin("uint".to_string()),
+                true,
+            )],
+        ));
+        rules.push(CsilRule {
+            name: "MemberService".to_string(),
+            rule_type: CsilRuleType::ServiceDef(CsilServiceDefinition {
+                operations: vec![
+                    op("create-member", r#ref("Member"), r#ref("Member")),
+                    op("get-member", r#ref("MemberID"), r#ref("Member")),
+                    op(
+                        "list-members",
+                        r#ref("ListMembersRequest"),
+                        CsilTypeExpression::Array {
+                            element_type: Box::new(r#ref("Member")),
+                            occurrence: Some(CsilOccurrence::ZeroOrMore),
+                        },
+                    ),
+                    op(
+                        "delete-task",
+                        r#ref("TaskID"),
+                        CsilTypeExpression::Builtin("bool".to_string()),
+                    ),
+                    op(
+                        "member-names",
+                        r#ref("ListMembersRequest"),
+                        CsilTypeExpression::Map {
+                            key: Box::new(text()),
+                            value: Box::new(text()),
+                            occurrence: None,
+                        },
+                    ),
+                ],
+                wire_id: None,
+            }),
+            position: pos(),
+            doc_comments: Vec::new(),
+        });
+        input.csil_spec.service_count = 1;
+        input
+    }
+
+    #[test]
+    fn non_record_op_boundaries_get_client_methods_and_per_op_codecs() {
+        let input = make_nonrecord_ops_input();
+        let files = RustCodeGenerator::new(&input).generate().unwrap();
+        let client = files
+            .iter()
+            .find(|f| f.path == "client.rs")
+            .expect("client.rs emitted");
+        let codec = files
+            .iter()
+            .find(|f| f.path == "codec.gen.rs")
+            .expect("codec.gen.rs emitted");
+
+        // Every op gets a method — scalar-id request, bare-array, scalar, and map
+        // responses included, not only the record↔record op the old filter kept.
+        assert!(client.content.contains(
+            "pub fn get_member(&self, req: MemberID) -> Result<Member, ClientError>"
+        ));
+        assert!(client.content.contains(
+            "pub fn list_members(&self, req: ListMembersRequest) -> Result<Vec<Member>, ClientError>"
+        ));
+        assert!(client.content.contains(
+            "pub fn delete_task(&self, req: TaskID) -> Result<bool, ClientError>"
+        ));
+        assert!(client.content.contains(
+            "pub fn member_names(&self, req: ListMembersRequest) -> Result<std::collections::HashMap<String, String>, ClientError>"
+        ));
+        // No op is dropped with a note anymore.
+        assert!(!client.content.contains("handle it manually"));
+
+        // The record boundary keeps its `encode_<t>`/`decode_<t>` wrapper byte-for-byte.
+        assert!(client.content.contains("&encode_member(&req)"));
+        // Non-record boundaries ride the op's per-op helpers.
+        assert!(client.content.contains("&encode_member_get_member_request(&req)"));
+        assert!(client.content.contains("decode_member_list_members_response(&csil_resp)"));
+        assert!(client.content.contains("decode_member_delete_task_response(&csil_resp)"));
+        assert!(client.content.contains("decode_member_member_names_response(&csil_resp)"));
+
+        // The per-op helpers are exported from the codec, so a consumer-side server can
+        // compose decode(request)/encode(response) for every op.
+        assert!(codec.content.contains(
+            "pub fn decode_member_get_member_request(csil_data: &[u8]) -> Result<MemberID, CsilCborError>"
+        ));
+        assert!(codec.content.contains(
+            "pub fn encode_member_list_members_response(csil_v: &Vec<Member>) -> Vec<u8>"
+        ));
+        assert!(codec.content.contains(
+            "pub fn encode_member_delete_task_response(csil_v: &bool) -> Vec<u8>"
+        ));
+        assert!(codec.content.contains(
+            "pub fn encode_member_member_names_response(csil_v: &std::collections::HashMap<String, String>) -> Vec<u8>"
+        ));
+        // The record op needs no per-op helper (its record codec already covers it).
+        assert!(!codec.content.contains("encode_member_create_member_request"));
     }
 
     #[test]
