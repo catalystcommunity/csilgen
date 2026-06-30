@@ -1607,6 +1607,126 @@ fn elixir_package_compiles() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[test]
+fn non_record_op_boundaries_get_client_methods() {
+    let pos = || CsilPosition {
+        line: 1,
+        column: 1,
+        offset: 0,
+    };
+    let alias = |name: &str| CsilRule {
+        name: name.to_string(),
+        rule_type: CsilRuleType::TypeDef(CsilTypeExpression::Builtin("text".to_string())),
+        position: pos(),
+        doc_comments: vec![],
+    };
+    let record = |name: &str, entries: Vec<CsilGroupEntry>| CsilRule {
+        name: name.to_string(),
+        rule_type: CsilRuleType::GroupDef(CsilGroupExpression { entries }),
+        position: pos(),
+        doc_comments: vec![],
+    };
+    let arr = CsilTypeExpression::Array {
+        element_type: Box::new(CsilTypeExpression::Reference("Member".to_string())),
+        occurrence: Some(CsilOccurrence::ZeroOrMore),
+    };
+    let map = CsilTypeExpression::Map {
+        key: Box::new(CsilTypeExpression::Builtin("text".to_string())),
+        value: Box::new(CsilTypeExpression::Builtin("text".to_string())),
+        occurrence: None,
+    };
+    let ops = vec![
+        // record -> record (the only shape the old filter kept)
+        make_op(
+            "create-member",
+            "Member",
+            CsilTypeExpression::Reference("Member".to_string()),
+            CsilServiceDirection::Unidirectional,
+            None,
+        ),
+        // scalar-id request -> record response
+        make_op(
+            "get-member",
+            "MemberID",
+            CsilTypeExpression::Reference("Member".to_string()),
+            CsilServiceDirection::Unidirectional,
+            None,
+        ),
+        // record request -> bare-array response
+        make_op(
+            "list-members",
+            "ListMembersRequest",
+            arr,
+            CsilServiceDirection::Unidirectional,
+            None,
+        ),
+        // scalar-id request -> scalar response
+        make_op(
+            "delete-task",
+            "TaskID",
+            CsilTypeExpression::Builtin("bool".to_string()),
+            CsilServiceDirection::Unidirectional,
+            None,
+        ),
+        // record request -> map response
+        make_op(
+            "member-names",
+            "ListMembersRequest",
+            map,
+            CsilServiceDirection::Unidirectional,
+            None,
+        ),
+    ];
+    let mut input = service_input("MemberService", ops, None, "elixir-client");
+    let rules = &mut input.csil_spec.rules;
+    rules.insert(0, alias("MemberID"));
+    rules.insert(1, alias("TaskID"));
+    rules.insert(
+        2,
+        record(
+            "Member",
+            vec![
+                bare_entry("id", CsilTypeExpression::Reference("MemberID".to_string())),
+                bare_entry("name", CsilTypeExpression::Builtin("text".to_string())),
+            ],
+        ),
+    );
+    rules.insert(
+        3,
+        record(
+            "ListMembersRequest",
+            vec![optional_entry(
+                "limit",
+                CsilTypeExpression::Builtin("uint".to_string()),
+            )],
+        ),
+    );
+
+    let out = process_generation(input).unwrap();
+    let client = file(&out, "client.gen.ex");
+
+    // Every op gets a method now — scalar-id request, bare-array and scalar/map responses included.
+    assert!(client.contains("def create_member(%__MODULE__{transport: transport}, req) do"));
+    assert!(client.contains("def get_member(%__MODULE__{transport: transport}, req) do"));
+    assert!(client.contains("def list_members(%__MODULE__{transport: transport}, req) do"));
+    assert!(client.contains("def delete_task(%__MODULE__{transport: transport}, req) do"));
+    assert!(client.contains("def member_names(%__MODULE__{transport: transport}, req) do"));
+    // No op is dropped with a note anymore.
+    assert!(!client.contains("handle it manually"));
+    assert!(!client.contains("non-record payload"));
+    // Record boundary keeps its module's to_cbor/from_cbor wrappers, byte-for-byte unchanged.
+    assert!(client.contains("Csilgen.Generated.Member.to_cbor(req)"));
+    assert!(client.contains("Csilgen.Generated.Member.from_cbor(resp)"));
+    // Non-record boundaries ride per-op helpers over the shared value codec.
+    assert!(client.contains("defp encode_get_member_request(req), do: Csilgen.Generated.Cbor.encode"));
+    assert!(client.contains("defp decode_list_members_response(csil_bytes) do"));
+    assert!(client.contains("defp decode_delete_task_response(csil_bytes) do"));
+    assert!(client.contains("decode_member_names_response(resp)"));
+    // Non-record response @specs map to their real shapes, not a record `.t()`.
+    assert!(client.contains(":: [Csilgen.Generated.Member.t()]"));
+    assert!(client.contains(":: boolean()"));
+}
+
 // The generated structs are built with `struct/2` rather than `%Mod{}` literals:
 // a script is compiled as one unit, so a `%Mod{}` literal would expand at compile
 // time before `Code.require_file` has loaded the generated modules; `struct/2`

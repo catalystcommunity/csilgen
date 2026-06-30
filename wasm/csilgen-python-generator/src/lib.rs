@@ -1152,7 +1152,10 @@ struct PythonGenerator {
     config: GeneratorConfig,
     use_pydantic: bool,
     generated_types: HashSet<String>,
-    imports: HashSet<String>,
+    // BTreeSet, not HashSet: the import block is emitted by iterating this set directly,
+    // and HashSet iteration order varies between wasm builds of the same source rev, which
+    // breaks reproducible-codegen checks that regen + `git diff --exit-code`.
+    imports: BTreeSet<String>,
 }
 
 impl PythonGenerator {
@@ -1167,7 +1170,7 @@ impl PythonGenerator {
             config: config.clone(),
             use_pydantic,
             generated_types: HashSet::new(),
-            imports: HashSet::new(),
+            imports: BTreeSet::new(),
         }
     }
 
@@ -2455,6 +2458,8 @@ impl PythonGenerator {
         name: &str,
         service: &CsilServiceDefinition,
         records: &HashSet<String>,
+        aliases: &HashMap<String, CsilTypeExpression>,
+        unions: &HashSet<String>,
         shape: ClientShape,
     ) -> Result<String> {
         let service_class = name.to_case(Case::Pascal);
@@ -2486,16 +2491,26 @@ impl PythonGenerator {
                 ));
                 continue;
             }
-            // The typed-codec path needs a record success type (the response carries
-            // `from_cbor`) and a record-or-null request (the request carries
-            // `to_cbor`). Anything else is skipped with a note rather than emitting a
-            // call that can't (de)serialize itself.
+            // A record request/response rides its dataclass `to_cbor`/`from_cbor`; a
+            // null request carries no body. Every other expressible shape (scalar,
+            // alias, array, map, tuple, union) rides the op's per-op codec helpers,
+            // which live in `codec.py`. A boundary that needs those helpers is only
+            // emittable when a codec module exists (i.e. the spec has records); without
+            // one, and for a genuinely inexpressible shape, the op is skipped with a
+            // note rather than a call that can't (de)serialize itself.
             let success = python_success_type(&op.output_type);
+            let null_input = is_null_input(&op.input_type);
             let resp_record = is_record_ref(&success, records);
-            let req_ok = is_null_input(&op.input_type) || is_record_ref(&op.input_type, records);
-            if !resp_record || !req_ok {
+            let req_record_or_null = null_input || is_record_ref(&op.input_type, records);
+            let req_ok =
+                req_record_or_null || py_op_boundary_expressible(&op.input_type, records, aliases, unions);
+            let resp_ok = py_op_boundary_expressible(&success, records, aliases, unions);
+            // A non-record/non-null boundary on either side needs the per-op helpers.
+            let needs_helpers = !req_record_or_null || !resp_record;
+            let has_codec = !records.is_empty();
+            if !req_ok || !resp_ok || (needs_helpers && !has_codec) {
                 out.push_str(&format!(
-                    "\n    # operation {} has a non-record payload; (de)serialize it manually\n",
+                    "\n    # operation {} has a payload csilgen can't (de)serialize; handle it manually\n",
                     op.name
                 ));
                 continue;
@@ -2533,13 +2548,29 @@ impl PythonGenerator {
                 }
                 out.push_str("\"\"\"\n");
             }
-            let payload = if has_input { "req.to_cbor()" } else { "b\"\"" };
-            // Only the transport seam is awaited; `from_cbor` is the synchronous
-            // codec decoding the bytes the seam yields.
+            let stem = op_codec_stem(name, &op.name);
+            // A null input sends empty bytes; a record reuses its `to_cbor`; any other
+            // shape uses the op's per-op request encoder.
+            let payload = if !has_input {
+                "b\"\"".to_string()
+            } else if is_record_ref(&op.input_type, records) {
+                "req.to_cbor()".to_string()
+            } else {
+                format!("encode_{stem}_request(req)")
+            };
+            // Only the transport seam is awaited; the codec decode is synchronous.
             let await_kw = shape.await_kw();
-            out.push_str(&format!(
-                "        return {output_type}.from_cbor({await_kw}self._transport.call(\"{wire_service}\", \"{wire_method}\", {payload}))\n"
-            ));
+            let call = format!(
+                "{await_kw}self._transport.call(\"{wire_service}\", \"{wire_method}\", {payload})"
+            );
+            // A record success reuses its `from_cbor`; any other shape uses the op's
+            // per-op response decoder.
+            let decoded = if resp_record {
+                format!("{output_type}.from_cbor({call})")
+            } else {
+                format!("decode_{stem}_response({call})")
+            };
+            out.push_str(&format!("        return {decoded}\n"));
         }
         out.push('\n');
         Ok(out)
@@ -2557,6 +2588,13 @@ impl PythonGenerator {
         records: &HashSet<String>,
         shape: ClientShape,
     ) -> Result<String> {
+        // The client composes per-op codecs for non-record boundaries from the same
+        // alias/union resolution the record codec uses, so the two agree on the wire.
+        let aliases = codec_aliases(spec);
+        let unions: HashSet<String> = python_union_defs(spec)
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
         let mut body = String::new();
         let mut prelude_emitted = false;
         for rule in &spec.rules {
@@ -2565,7 +2603,9 @@ impl PythonGenerator {
                     body.push_str(&Self::generate_client_prelude(shape));
                     prelude_emitted = true;
                 }
-                body.push_str(&self.generate_client_class(&rule.name, service, records, shape)?);
+                body.push_str(&self.generate_client_class(
+                    &rule.name, service, records, &aliases, &unions, shape,
+                )?);
                 if shape.marker.is_empty()
                     && let Some(wire_ids) = Self::generate_wire_ids(&rule.name, service)
                 {
@@ -3097,6 +3137,115 @@ fn python_record_names(spec: &CsilSpecSerialized) -> HashSet<String> {
 /// value-tree helpers.
 fn is_record_ref(type_expr: &CsilTypeExpression, records: &HashSet<String>) -> bool {
     matches!(type_expr, CsilTypeExpression::Reference(name) if records.contains(&record_suffix(name)))
+}
+
+/// Whether `py_enc_value`/`py_dec_value` model an op-boundary type faithfully, so a
+/// per-op codec helper is correct rather than silently lossy. Records, scalars,
+/// transparent aliases, unions, arrays, maps, and tuples all resolve to real codec
+/// building blocks. An inline multi-variant choice carries no wire discriminator and
+/// an unmodeled reference has no codec, so those two keep the skip-with-note path.
+fn py_op_boundary_expressible(
+    ty: &CsilTypeExpression,
+    records: &HashSet<String>,
+    aliases: &HashMap<String, CsilTypeExpression>,
+    unions: &HashSet<String>,
+) -> bool {
+    match unwrap_constrained(ty) {
+        CsilTypeExpression::Builtin(_) => true,
+        CsilTypeExpression::Reference(name) => {
+            let suffix = record_suffix(name);
+            records.contains(&suffix) || aliases.contains_key(&suffix) || unions.contains(&suffix)
+        }
+        CsilTypeExpression::Array { element_type, .. } => {
+            py_op_boundary_expressible(element_type, records, aliases, unions)
+        }
+        CsilTypeExpression::Map { key, value, .. } => {
+            py_op_boundary_expressible(key, records, aliases, unions)
+                && py_op_boundary_expressible(value, records, aliases, unions)
+        }
+        CsilTypeExpression::Tuple(_) => true,
+        _ => false,
+    }
+}
+
+/// The `<base>_<method>` snake stem shared by an op's per-op codec helpers and the
+/// client method that calls them, so the two never drift.
+fn op_codec_stem(service_name: &str, op_name: &str) -> String {
+    let service_class = service_name.to_case(Case::Pascal);
+    let base = service_class
+        .strip_suffix("Service")
+        .filter(|s| !s.is_empty())
+        .unwrap_or(&service_class);
+    format!("{}_{}", base.to_case(Case::Snake), op_name.to_case(Case::Snake))
+}
+
+/// One `encode_<helper>`/`decode_<helper>` byte-level pair built over the same value
+/// builders the record codec uses for fields, so an arbitrary op-boundary shape gets
+/// the same wire seam a record type has. The names carry no leading underscore so the
+/// client's `from .codec import *` can call them directly.
+fn emit_op_codec_pair(
+    helper: &str,
+    ty: &CsilTypeExpression,
+    records: &HashSet<String>,
+    aliases: &HashMap<String, CsilTypeExpression>,
+    unions: &HashSet<String>,
+) -> String {
+    let enc = py_enc_value(ty, "csil_value", records, aliases, unions);
+    let dec = py_dec_value(ty, "csil_tree", records, aliases, unions);
+    format!(
+        "def encode_{helper}(csil_value) -> bytes:\n    return cbor_encode({enc})\n\n\n\
+         def decode_{helper}(data: bytes):\n    csil_tree = cbor_decode(data)\n    return {dec}\n\n\n"
+    )
+}
+
+/// Per-op byte helpers for the non-record op boundaries the record-only client filter
+/// used to drop: scalar-id requests and bare-array / map / scalar responses. A record
+/// boundary keeps its dataclass `to_cbor`/`from_cbor` and gets no per-op helper, so a
+/// record-only spec's codec is byte-identical to before.
+fn emit_op_codecs(
+    spec: &CsilSpecSerialized,
+    records: &HashSet<String>,
+    aliases: &HashMap<String, CsilTypeExpression>,
+    unions: &HashSet<String>,
+) -> String {
+    let mut out = String::new();
+    for rule in &spec.rules {
+        let CsilRuleType::ServiceDef(service) = &rule.rule_type else {
+            continue;
+        };
+        for op in &service.operations {
+            if !matches!(op.direction, CsilServiceDirection::Unidirectional) {
+                continue;
+            }
+            let success = python_success_type(&op.output_type);
+            let null_input = is_null_input(&op.input_type);
+            let req_ok =
+                null_input || py_op_boundary_expressible(&op.input_type, records, aliases, unions);
+            if !req_ok || !py_op_boundary_expressible(&success, records, aliases, unions) {
+                continue;
+            }
+            let stem = op_codec_stem(&rule.name, &op.name);
+            if !null_input && !is_record_ref(&op.input_type, records) {
+                out.push_str(&emit_op_codec_pair(
+                    &format!("{stem}_request"),
+                    &op.input_type,
+                    records,
+                    aliases,
+                    unions,
+                ));
+            }
+            if !is_record_ref(&success, records) {
+                out.push_str(&emit_op_codec_pair(
+                    &format!("{stem}_response"),
+                    &success,
+                    records,
+                    aliases,
+                    unions,
+                ));
+            }
+        }
+    }
+    out
 }
 
 /// The verbatim CBOR map key for an entry (the raw bare/text-literal name, or the
@@ -3631,6 +3780,39 @@ fn generate_codec_file(
             name, variants, records, &aliases, &unions,
         ));
     }
+    // Per-op byte helpers for non-record op boundaries. Their boundary types may pull
+    // tagged core types (timestamp/decimal) or tuples no record field uses, so scan
+    // each helper's type before composing it.
+    for rule in &spec.rules {
+        let CsilRuleType::ServiceDef(service) = &rule.rule_type else {
+            continue;
+        };
+        for op in &service.operations {
+            if !matches!(op.direction, CsilServiceDirection::Unidirectional) {
+                continue;
+            }
+            let success = python_success_type(&op.output_type);
+            if !is_null_input(&op.input_type) && !is_record_ref(&op.input_type, records) {
+                scan_special_types(
+                    &op.input_type,
+                    &mut needs_datetime,
+                    &mut needs_decimal,
+                    &mut needs_re,
+                    &mut needs_tuple,
+                );
+            }
+            if !is_record_ref(&success, records) {
+                scan_special_types(
+                    &success,
+                    &mut needs_datetime,
+                    &mut needs_decimal,
+                    &mut needs_re,
+                    &mut needs_tuple,
+                );
+            }
+        }
+    }
+    body.push_str(&emit_op_codecs(spec, records, &aliases, &unions));
 
     let mut content = String::new();
     content.push_str("# Generated CBOR codec from CSIL specification\n");
@@ -5658,9 +5840,11 @@ mod tests {
         );
         assert!(!services.contains("req: None"));
 
-        // Client method: heartbeat returns a scalar `bool`, which has no codec, so the
-        // typed-codec client skips it with a note rather than emitting a call that
-        // cannot deserialize itself.
+        // Client method: heartbeat returns a scalar `bool`, and this spec declares no
+        // records, so no codec module is emitted to carry the per-op `decode_*` helper.
+        // With nowhere to (de)serialize the scalar, the op is skipped with a note rather
+        // than emitting a call to a helper that doesn't exist. A scalar boundary IS
+        // emitted when records are present (see `non_record_op_boundaries_*`).
         let mut client_config = create_test_config(false);
         client_config.target = "python-client".to_string();
         let client =
@@ -5672,10 +5856,150 @@ mod tests {
             .content
             .clone();
         assert!(
-            client_src.contains("# operation heartbeat has a non-record payload"),
-            "non-record op must be skipped with a note, got:\n{client_src}"
+            client_src.contains("# operation heartbeat has a payload csilgen can't (de)serialize"),
+            "codecless non-record op must be skipped with a note, got:\n{client_src}"
         );
         assert!(!client_src.contains("def heartbeat(self)"));
+    }
+
+    /// A service whose ops have non-record boundaries — a scalar-id request, a
+    /// bare-array response, a scalar response, and a map response — gets a typed client
+    /// method for *every* op (not just the record↔record one), riding per-op codec
+    /// helpers emitted in `codec.py`. No op is dropped with a manual note. Mirrors the
+    /// `nonrecord-ops.csil` fixture and the Go/TypeScript generators.
+    fn nonrecord_ops_spec() -> CsilSpecSerialized {
+        let text = || CsilTypeExpression::Builtin("text".to_string());
+        let alias = |name: &str, ty: CsilTypeExpression| CsilRule {
+            name: name.to_string(),
+            rule_type: CsilRuleType::TypeDef(ty),
+            position: create_test_position(),
+            doc_comments: Vec::new(),
+        };
+        let member = group_rule_entries(
+            "Member",
+            vec![
+                bare("id", CsilTypeExpression::Reference("MemberID".to_string())),
+                bare("name", text()),
+            ],
+        );
+        let list_req = group_rule_entries(
+            "ListMembersRequest",
+            vec![opt_entry(
+                "limit",
+                CsilTypeExpression::Builtin("uint".to_string()),
+            )],
+        );
+        let op = |name: &str, input: CsilTypeExpression, output: CsilTypeExpression| {
+            CsilServiceOperation {
+                name: name.to_string(),
+                input_type: input,
+                output_type: output,
+                direction: CsilServiceDirection::Unidirectional,
+                position: create_test_position(),
+                doc_comments: Vec::new(),
+                wire_id: None,
+            }
+        };
+        let r#ref = |n: &str| CsilTypeExpression::Reference(n.to_string());
+        let svc = CsilRule {
+            name: "MemberService".to_string(),
+            rule_type: CsilRuleType::ServiceDef(CsilServiceDefinition {
+                operations: vec![
+                    op("create-member", r#ref("Member"), r#ref("Member")),
+                    op("get-member", r#ref("MemberID"), r#ref("Member")),
+                    op(
+                        "list-members",
+                        r#ref("ListMembersRequest"),
+                        CsilTypeExpression::Array {
+                            element_type: Box::new(r#ref("Member")),
+                            occurrence: Some(CsilOccurrence::ZeroOrMore),
+                        },
+                    ),
+                    op(
+                        "delete-task",
+                        r#ref("TaskID"),
+                        CsilTypeExpression::Builtin("bool".to_string()),
+                    ),
+                    op(
+                        "member-names",
+                        r#ref("ListMembersRequest"),
+                        CsilTypeExpression::Map {
+                            key: Box::new(text()),
+                            value: Box::new(text()),
+                            occurrence: None,
+                        },
+                    ),
+                ],
+                wire_id: None,
+            }),
+            position: create_test_position(),
+            doc_comments: Vec::new(),
+        };
+        CsilSpecSerialized {
+            rules: vec![
+                alias("MemberID", text()),
+                alias("TaskID", text()),
+                member,
+                list_req,
+                svc,
+            ],
+            source_content: None,
+            service_count: 1,
+            fields_with_metadata_count: 0,
+        }
+    }
+
+    #[test]
+    fn non_record_op_boundaries_get_client_methods_no_drop_note() {
+        let mut config = create_test_config(false);
+        config.target = "python-client".to_string();
+        let files = generate_python_code_from_serialized(&nonrecord_ops_spec(), &config).unwrap();
+        let client = files
+            .iter()
+            .find(|f| f.path == "client.py")
+            .expect("client.py emitted")
+            .content
+            .clone();
+
+        // Every op gets a method — scalar-id request, bare-array and scalar responses,
+        // and a map response all included, not just record↔record.
+        for sig in [
+            "def create_member(self, req: Member) -> Member:",
+            "def get_member(self, req: MemberId) -> Member:",
+            "def list_members(self, req: ListMembersRequest) -> List[Member]:",
+            "def delete_task(self, req: TaskId) -> bool:",
+            "def member_names(self, req: ListMembersRequest) -> Dict[str, str]:",
+        ] {
+            assert!(client.contains(sig), "missing method `{sig}`, got:\n{client}");
+        }
+        // No op is dropped with a note anymore.
+        assert!(
+            !client.contains("handle it manually"),
+            "an op was dropped with a note, got:\n{client}"
+        );
+        // A record boundary keeps its dataclass `to_cbor`/`from_cbor`; a non-record
+        // boundary rides the op's per-op codec helper.
+        assert!(client.contains("Member.from_cbor("));
+        assert!(client.contains("encode_member_get_member_request(req)"));
+        assert!(client.contains("decode_member_list_members_response("));
+        assert!(client.contains("decode_member_delete_task_response("));
+        assert!(client.contains("decode_member_member_names_response("));
+
+        let codec = files
+            .iter()
+            .find(|f| f.path == "codec.py")
+            .expect("codec.py emitted")
+            .content
+            .clone();
+        // Per-op helpers for non-record shapes are emitted as importable module-level
+        // functions, so the client (and a consumer-side server) share one wire seam.
+        assert!(codec.contains("def encode_member_get_member_request(csil_value) -> bytes:"));
+        assert!(codec.contains("def decode_member_list_members_response(data: bytes):"));
+        assert!(codec.contains("def encode_member_delete_task_response(csil_value) -> bytes:"));
+        // A bare-array of records recurses through the record helper.
+        assert!(codec.contains("_encode_member_value(csil_e)"));
+        // A record↔record op needs no per-op helper (it uses to_cbor/from_cbor).
+        assert!(!codec.contains("member_create_member_request"));
     }
 
     /// A null-input op with a *record* success type does get a typed client method:

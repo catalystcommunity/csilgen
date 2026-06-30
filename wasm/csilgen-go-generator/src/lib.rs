@@ -6,7 +6,8 @@
 use csilgen_common::{
     CsilControlOperator, CsilDependsCompareOp, CsilDependsCondition, CsilFieldMetadata,
     CsilFieldVisibility, CsilGroupEntry, CsilGroupExpression, CsilGroupKey, CsilLiteralValue,
-    CsilOccurrence, CsilRuleType, CsilServiceDefinition, CsilServiceDirection, CsilSizeConstraint,
+    CsilOccurrence, CsilRuleType, CsilServiceDefinition, CsilServiceDirection,
+    CsilServiceOperation, CsilSizeConstraint,
     CsilTypeExpression, CsilValidationConstraint, GeneratedFile, GenerationStats,
     GeneratorCapability, GeneratorMetadata, GeneratorWarning, WarningLevel, WasmGeneratorInput,
     WasmGeneratorOutput, wasm_interface::*,
@@ -2119,6 +2120,119 @@ fn emit_union_codec(
     out
 }
 
+/// Whether `go_enc_value`/`go_dec_func` model an op-boundary type faithfully (so a
+/// per-op codec helper is correct rather than silently lossy). Records, scalars,
+/// transparent aliases, enums (aliased to their backing scalar), unions, arrays,
+/// maps, and tuples all resolve to real codec helpers. An inline multi-variant choice
+/// has no wire discriminator, and an unmodeled reference has no codec, so those two
+/// keep the skip-with-note path the client falls back to.
+fn go_op_boundary_expressible(
+    ty: &CsilTypeExpression,
+    records: &std::collections::HashSet<String>,
+    aliases: &std::collections::HashMap<String, CsilTypeExpression>,
+    config: &GoConfig,
+) -> bool {
+    match codec_unwrap_constrained(ty) {
+        CsilTypeExpression::Builtin(_) => true,
+        CsilTypeExpression::Reference(name) => {
+            records.contains(name)
+                || aliases.contains_key(name)
+                || config.union_names.contains(name)
+        }
+        CsilTypeExpression::Array { element_type, .. } => {
+            go_op_boundary_expressible(element_type, records, aliases, config)
+        }
+        CsilTypeExpression::Map { key, value, .. } => {
+            go_op_boundary_expressible(key, records, aliases, config)
+                && go_op_boundary_expressible(value, records, aliases, config)
+        }
+        CsilTypeExpression::Tuple(_) => true,
+        _ => false,
+    }
+}
+
+/// The `<Base><Method>` stem shared by an op's per-op codec helpers and the client
+/// method that calls them, so the two never drift.
+fn op_codec_stem(service_name: &str, op: &CsilServiceOperation) -> String {
+    format!("{}{}", go_service_base(service_name), go_method_name(&op.name))
+}
+
+/// Exported per-op CBOR helpers so a server in another package can compose a
+/// `decode(request)/encode(response)` pair for every op — scalar-id requests and
+/// `[]T`/map responses included, not just record↔record. The client calls the same
+/// helpers, so a single surface owns the wire for both directions. Records keep their
+/// `Encode<T>`/`Decode<T>` wrappers too; these add the op-keyed names a generic
+/// `rpcRoute[Req,Resp]` adapter dispatches on.
+fn emit_op_codecs(
+    input: &WasmGeneratorInput,
+    records: &std::collections::HashSet<String>,
+    aliases: &std::collections::HashMap<String, CsilTypeExpression>,
+    config: &GoConfig,
+) -> String {
+    let mut out = String::new();
+    for rule in &input.csil_spec.rules {
+        let CsilRuleType::ServiceDef(service) = &rule.rule_type else {
+            continue;
+        };
+        for op in &service.operations {
+            if !matches!(op.direction, CsilServiceDirection::Unidirectional) {
+                continue;
+            }
+            let success = go_success_type(&op.output_type);
+            let null_input = op_input_is_null(&op.input_type);
+            let req_ok =
+                null_input || go_op_boundary_expressible(&op.input_type, records, aliases, config);
+            if !req_ok || !go_op_boundary_expressible(&success, records, aliases, config) {
+                continue;
+            }
+            let stem = op_codec_stem(&rule.name, op);
+            if !null_input {
+                out.push_str(&emit_op_codec_pair(
+                    &format!("{stem}Request"),
+                    &op.input_type,
+                    records,
+                    aliases,
+                    config,
+                ));
+            }
+            out.push_str(&emit_op_codec_pair(
+                &format!("{stem}Response"),
+                &success,
+                records,
+                aliases,
+                config,
+            ));
+        }
+    }
+    out
+}
+
+/// One `Encode<Name>`/`Decode<Name>` pair over the value builders the record codec
+/// already uses, so an arbitrary op-boundary shape gets the same byte seam a record
+/// type has.
+fn emit_op_codec_pair(
+    helper: &str,
+    ty: &CsilTypeExpression,
+    records: &std::collections::HashSet<String>,
+    aliases: &std::collections::HashMap<String, CsilTypeExpression>,
+    config: &GoConfig,
+) -> String {
+    let go_type = map_csil_type_to_go(ty, &None, config.decimal_go_type());
+    let enc = go_enc_value(ty, "csilV", records, aliases, config);
+    let dec = go_dec_func(ty, records, aliases, config);
+    let i = config.indent_style.as_str();
+    format!(
+        "// Encode{helper} encodes the {helper} payload to canonical CSIL CBOR bytes.\n\
+         func Encode{helper}(csilV {go_type}) []byte {{\n{i}return cborEncode({enc})\n}}\n\n\
+         // Decode{helper} decodes canonical CSIL CBOR bytes into the {helper} payload.\n\
+         func Decode{helper}(csilData []byte) ({go_type}, error) {{\n\
+         {i}var csilZero {go_type}\n\
+         {i}csilRoot, csilErr := cborDecode(csilData)\n\
+         {i}if csilErr != nil {{\n{i}{i}return csilZero, csilErr\n{i}}}\n\
+         {i}return ({dec})(csilRoot)\n}}\n\n"
+    )
+}
+
 fn generate_codec(input: &WasmGeneratorInput, config: &GoConfig) -> Option<String> {
     if !spec_has_records(input) {
         return None;
@@ -2195,6 +2309,9 @@ fn generate_codec(input: &WasmGeneratorInput, config: &GoConfig) -> Option<Strin
             &name, &variants, &records, &aliases, config,
         ));
     }
+    // Per-op byte helpers for non-record (and record) op boundaries, so client and a
+    // consumer-side server share one codec surface for every op.
+    content.push_str(&emit_op_codecs(input, &records, &aliases, config));
     Some(content)
 }
 
@@ -2837,10 +2954,11 @@ fn generate_client(
     content.push('\n');
 
     let records = record_names(input);
+    let aliases = codec_aliases(input);
     let mut emitted_any = false;
     for rule in &input.csil_spec.rules {
         if let CsilRuleType::ServiceDef(service) = &rule.rule_type {
-            emit_client_struct(&mut content, &rule.name, service, config, &records);
+            emit_client_struct(&mut content, &rule.name, service, config, &records, &aliases);
             emitted_any = true;
         }
     }
@@ -2864,6 +2982,7 @@ fn emit_client_struct(
     service: &CsilServiceDefinition,
     config: &GoConfig,
     records: &std::collections::HashSet<String>,
+    aliases: &std::collections::HashMap<String, CsilTypeExpression>,
 ) {
     let base = go_service_base(name);
     let client = format!("{base}Client");
@@ -2899,19 +3018,20 @@ fn emit_client_struct(
         }
         let success = go_success_type(&operation.output_type);
         let null_input = op_input_is_null(&operation.input_type);
-        // The typed-codec path needs a record success type (and a record or null
-        // request) so the method can call the generated Encode/Decode. Anything else
-        // is skipped with a note rather than emitting an uncompilable call.
-        if !is_record_ref(&success, records)
-            || !(null_input || is_record_ref(&operation.input_type, records))
-        {
+        let req_ok =
+            null_input || go_op_boundary_expressible(&operation.input_type, records, aliases, config);
+        // Only a genuinely inexpressible boundary (an inline multi-variant choice with no
+        // wire discriminator, or an unmodeled reference) is skipped now; scalar/array/map
+        // shapes ride the per-op codec helpers, so every other op gets a method.
+        if !req_ok || !go_op_boundary_expressible(&success, records, aliases, config) {
             content.push_str(&format!(
-                "// operation {} has a non-record payload; (de)serialize it manually\n\n",
+                "// operation {} has a payload csilgen can't (de)serialize; handle it manually\n\n",
                 operation.name
             ));
             continue;
         }
         let method_name = go_method_name(&operation.name);
+        let stem = op_codec_stem(name, operation);
         let output_type = map_csil_type_to_go(&success, &None, config.decimal_go_type());
         let params = if null_input {
             "ctx context.Context".to_string()
@@ -2927,29 +3047,31 @@ fn emit_client_struct(
             "{}var csilZero {output_type}\n",
             config.indent_style
         ));
-        // A null input carries no request body, so the transport gets a nil payload;
-        // otherwise the request record is encoded to its canonical CBOR bytes first.
-        if null_input {
-            content.push_str(&format!(
-                "{}csilResp, csilErr := c.transport.Call(ctx, \"{wire_service}\", \"{method_name}\", nil)\n",
-                config.indent_style
-            ));
+        // A null input carries no request body (nil payload); a record reuses its
+        // `Encode<T>` wrapper; any other shape uses the op's per-op request encoder.
+        let req_bytes = if null_input {
+            "nil".to_string()
+        } else if is_record_ref(&operation.input_type, records) {
+            format!("Encode{}(req)", type_ref_name(&operation.input_type))
         } else {
-            let req_type = type_ref_name(&operation.input_type);
-            content.push_str(&format!(
-                "{}csilResp, csilErr := c.transport.Call(ctx, \"{wire_service}\", \"{method_name}\", Encode{req_type}(req))\n",
-                config.indent_style
-            ));
-        }
+            format!("Encode{stem}Request(req)")
+        };
+        content.push_str(&format!(
+            "{}csilResp, csilErr := c.transport.Call(ctx, \"{wire_service}\", \"{method_name}\", {req_bytes})\n",
+            config.indent_style
+        ));
         content.push_str(&format!(
             "{i}if csilErr != nil {{\n{i}{i}return csilZero, csilErr\n{i}}}\n",
             i = config.indent_style
         ));
-        let resp_type = type_ref_name(&success);
-        content.push_str(&format!(
-            "{}return Decode{resp_type}(csilResp)\n",
-            config.indent_style
-        ));
+        // A record success reuses its `Decode<T>` wrapper; any other shape uses the op's
+        // per-op response decoder.
+        let decode_resp = if is_record_ref(&success, records) {
+            format!("Decode{}(csilResp)", type_ref_name(&success))
+        } else {
+            format!("Decode{stem}Response(csilResp)")
+        };
+        content.push_str(&format!("{}return {decode_resp}\n", config.indent_style));
         content.push_str("}\n\n");
     }
 }
@@ -6670,4 +6792,114 @@ func main() {
 	fmt.Println("ok")
 }
 "#;
+
+    #[test]
+    fn non_record_op_boundaries_get_client_methods_and_per_op_codecs() {
+        let pos = || CsilPosition {
+            line: 1,
+            column: 1,
+            offset: 0,
+        };
+        let r#ref = |n: &str| CsilTypeExpression::Reference(n.to_string());
+        let alias = |name: &str, ty: CsilTypeExpression| CsilRule {
+            name: name.to_string(),
+            rule_type: CsilRuleType::TypeDef(ty),
+            position: pos(),
+            doc_comments: Vec::new(),
+        };
+        let member = CsilRule {
+            name: "Member".to_string(),
+            rule_type: CsilRuleType::GroupDef(CsilGroupExpression {
+                entries: vec![
+                    bare_entry("id", r#ref("MemberID")),
+                    bare_entry("name", CsilTypeExpression::Builtin("text".to_string())),
+                ],
+            }),
+            position: pos(),
+            doc_comments: Vec::new(),
+        };
+        let op = |name: &str, input: CsilTypeExpression, output: CsilTypeExpression| {
+            CsilServiceOperation {
+                name: name.to_string(),
+                input_type: input,
+                output_type: output,
+                direction: CsilServiceDirection::Unidirectional,
+                position: pos(),
+                doc_comments: Vec::new(),
+                wire_id: None,
+            }
+        };
+        let arr = |elem: CsilTypeExpression| CsilTypeExpression::Array {
+            element_type: Box::new(elem),
+            occurrence: None,
+        };
+        let svc = CsilRule {
+            name: "MemberService".to_string(),
+            rule_type: CsilRuleType::ServiceDef(CsilServiceDefinition {
+                operations: vec![
+                    op("create-member", r#ref("Member"), r#ref("Member")),
+                    op("get-member", r#ref("MemberID"), r#ref("Member")),
+                    op("list-members", r#ref("Member"), arr(r#ref("Member"))),
+                    op("delete-task", r#ref("MemberID"), CsilTypeExpression::Builtin("bool".to_string())),
+                ],
+                wire_id: None,
+            }),
+            position: pos(),
+            doc_comments: Vec::new(),
+        };
+        let input = WasmGeneratorInput {
+            csil_spec: CsilSpecSerialized {
+                rules: vec![
+                    alias("MemberID", CsilTypeExpression::Builtin("text".to_string())),
+                    member,
+                    svc,
+                ],
+                source_content: None,
+                service_count: 1,
+                fields_with_metadata_count: 0,
+            },
+            config: GeneratorConfig {
+                target: "go-client".to_string(),
+                output_dir: "/tmp".to_string(),
+                options: HashMap::new(),
+            },
+            generator_metadata: GeneratorMetadata {
+                name: "go".to_string(),
+                version: "1.0.0".to_string(),
+                description: String::new(),
+                target: "go".to_string(),
+                capabilities: vec![],
+                author: None,
+                homepage: None,
+            },
+        };
+        let config = GoConfig::from_options(&input.config.options).unwrap();
+
+        let client = super::generate_client(&input, &config, &mut Vec::new())
+            .unwrap()
+            .expect("client emitted");
+        // Every op gets a method — scalar-id request, bare-array and scalar responses included.
+        assert!(client.contains(
+            "func (c *MemberClient) GetMember(ctx context.Context, req MemberID) (Member, error)"
+        ));
+        assert!(client.contains(
+            "func (c *MemberClient) ListMembers(ctx context.Context, req Member) ([]Member, error)"
+        ));
+        assert!(client.contains(
+            "func (c *MemberClient) DeleteTask(ctx context.Context, req MemberID) (bool, error)"
+        ));
+        // No op is dropped with a note anymore.
+        assert!(!client.contains("handle it manually"));
+        // Record boundary keeps its `Encode<T>`/`Decode<T>` wrapper; non-record rides per-op helpers.
+        assert!(client.contains("EncodeMember(req)"));
+        assert!(client.contains("EncodeMemberGetMemberRequest(req)"));
+        assert!(client.contains("DecodeMemberListMembersResponse(csilResp)"));
+
+        let codec = super::generate_codec(&input, &config).expect("codec emitted");
+        // Per-op helpers for non-record shapes are exported, so a server in another
+        // package can compose decode(request)/encode(response) for every op.
+        assert!(codec.contains("func DecodeMemberGetMemberRequest(csilData []byte) (MemberID, error)"));
+        assert!(codec.contains("func EncodeMemberListMembersResponse(csilV []Member) []byte"));
+        assert!(codec.contains("func EncodeMemberDeleteTaskResponse(csilV bool) []byte"));
+    }
 }

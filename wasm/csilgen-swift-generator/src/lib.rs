@@ -11,9 +11,9 @@ use convert_case::{Case, Casing};
 use csilgen_common::{
     CsilControlOperator, CsilFieldMetadata, CsilGroupEntry, CsilGroupExpression, CsilGroupKey,
     CsilLiteralValue, CsilOccurrence, CsilRuleType, CsilServiceDefinition, CsilServiceDirection,
-    CsilSizeConstraint, CsilTypeExpression, CsilValidationConstraint, GeneratedFile,
-    GenerationStats, GeneratorCapability, GeneratorMetadata, GeneratorWarning, WasmGeneratorInput,
-    WasmGeneratorOutput, wasm_interface::*,
+    CsilServiceOperation, CsilSizeConstraint, CsilTypeExpression, CsilValidationConstraint,
+    GeneratedFile, GenerationStats, GeneratorCapability, GeneratorMetadata, GeneratorWarning,
+    WasmGeneratorInput, WasmGeneratorOutput, wasm_interface::*,
 };
 
 #[unsafe(no_mangle)]
@@ -2134,6 +2134,117 @@ fn emit_struct_codec(
     out
 }
 
+/// Whether `swift_enc_value`/`swift_dec_value` model an op-boundary type faithfully, so
+/// a per-op codec helper round-trips it rather than silently stubbing to `.null`. Records,
+/// builtins, transparent aliases, arrays, maps, and stringy choices all reach a real
+/// builder. An inline non-stringy choice has no wire discriminator here, a tuple has no
+/// field-builder of its own (unlike the Go generator), and an unmodeled reference (e.g. a
+/// non-stringy enum) has no codec — those keep the client's skip-with-note fallback.
+fn swift_op_boundary_expressible(
+    ty: &CsilTypeExpression,
+    records: &std::collections::HashSet<String>,
+    aliases: &std::collections::HashMap<String, CsilTypeExpression>,
+) -> bool {
+    match unwrap_constrained(ty) {
+        CsilTypeExpression::Builtin(_) => true,
+        CsilTypeExpression::Reference(name) => {
+            records.contains(&swift_type_name(name)) || aliases.contains_key(name)
+        }
+        CsilTypeExpression::Array { element_type, .. } => {
+            swift_op_boundary_expressible(element_type, records, aliases)
+        }
+        CsilTypeExpression::Map { key, value, .. } => {
+            swift_op_boundary_expressible(key, records, aliases)
+                && swift_op_boundary_expressible(value, records, aliases)
+        }
+        CsilTypeExpression::Choice(choices) => choice_is_stringy(choices),
+        _ => false,
+    }
+}
+
+/// The `<Base><Op>` stem shared by an op's per-op codec helpers and the client method
+/// that calls them, so the two never drift (`Member` + `GetMember` → `MemberGetMember`).
+fn op_codec_stem(service_name: &str, op: &CsilServiceOperation) -> String {
+    format!(
+        "{}{}",
+        service_base(service_name),
+        swift_type_name(&op.name)
+    )
+}
+
+/// Per-op CBOR helpers for non-record op boundaries (scalar-id requests, `[T]`/map/scalar
+/// responses), so the client owns one byte seam for every op and a consumer-side server can
+/// compose `decode(request)`/`encode(response)` for shapes records never covered. Records
+/// keep their `toCbor`/`fromCbor` methods; this only adds the op-keyed free functions the
+/// non-record path needs, so a record-only spec's codec stays byte-identical.
+fn emit_op_codecs(
+    input: &WasmGeneratorInput,
+    records: &std::collections::HashSet<String>,
+    aliases: &std::collections::HashMap<String, CsilTypeExpression>,
+) -> String {
+    let mut out = String::new();
+    for rule in &input.csil_spec.rules {
+        let CsilRuleType::ServiceDef(service) = &rule.rule_type else {
+            continue;
+        };
+        for op in &service.operations {
+            if !matches!(op.direction, CsilServiceDirection::Unidirectional) {
+                continue;
+            }
+            let success = success_type(&op.output_type);
+            let null_input = is_null_input(&op.input_type);
+            let req_ok =
+                null_input || swift_op_boundary_expressible(&op.input_type, records, aliases);
+            if !req_ok || !swift_op_boundary_expressible(&success, records, aliases) {
+                continue;
+            }
+            let stem = op_codec_stem(&rule.name, op);
+            // A null input carries no request body, and a record boundary already has
+            // `toCbor`/`fromCbor`; only the non-record halves need a per-op helper.
+            if !null_input && !is_record_ref(&op.input_type, records) {
+                out.push_str(&emit_op_codec_pair(
+                    &format!("{stem}Request"),
+                    &op.input_type,
+                    records,
+                    aliases,
+                ));
+            }
+            if !is_record_ref(&success, records) {
+                out.push_str(&emit_op_codec_pair(
+                    &format!("{stem}Response"),
+                    &success,
+                    records,
+                    aliases,
+                ));
+            }
+        }
+    }
+    out
+}
+
+/// One `encode<Name>`/`decode<Name>` free-function pair over the same value builders the
+/// record codec uses, giving an arbitrary op-boundary shape the byte seam a record has.
+fn emit_op_codec_pair(
+    helper: &str,
+    ty: &CsilTypeExpression,
+    records: &std::collections::HashSet<String>,
+    aliases: &std::collections::HashMap<String, CsilTypeExpression>,
+) -> String {
+    let swift_type = map_type(ty, false);
+    let enc = swift_enc_value(ty, "value", records, aliases);
+    let dec = swift_dec_value(ty, "csilRoot", records, aliases);
+    format!(
+        "/// Encode the {helper} payload to canonical CSIL CBOR bytes.\n\
+         public func encode{helper}(_ value: {swift_type}) -> [UInt8] {{\n\
+         {indent}CsilCbor.encode({enc})\n}}\n\n\
+         /// Decode canonical CSIL CBOR bytes into the {helper} payload.\n\
+         public func decode{helper}(_ bytes: [UInt8]) throws -> {swift_type} {{\n\
+         {indent}let csilRoot = try CsilCbor.decode(bytes)\n\
+         {indent}return {dec}\n}}\n\n",
+        indent = "    "
+    )
+}
+
 /// Build `Codec.swift`: the self-contained CBOR runtime plus a codec extension per
 /// record. `None` when the spec declares no record types.
 fn generate_codec(input: &WasmGeneratorInput) -> Option<String> {
@@ -2153,6 +2264,9 @@ fn generate_codec(input: &WasmGeneratorInput) -> Option<String> {
             body.push_str(&emit_struct_codec(&rule.name, group, &records, &aliases));
         }
     }
+    // Per-op byte helpers for non-record op boundaries, so the client and a consumer-side
+    // server share one codec surface for every op, not just record↔record ones.
+    body.push_str(&emit_op_codecs(input, &records, &aliases));
     let mut content = header("Generated CBOR (de)serializers for the CSIL value types.");
     content.push_str(CODEC_RUNTIME_SWIFT);
     content.push('\n');
@@ -2199,11 +2313,14 @@ fn client_prelude_swift(shape: ClientShape) -> String {
 
 fn generate_client(input: &WasmGeneratorInput, shape: ClientShape) -> Option<String> {
     let records = swift_record_names(input);
+    let aliases = swift_codec_aliases(input);
     let mut body = String::new();
     let mut any = false;
     for rule in &input.csil_spec.rules {
         if let CsilRuleType::ServiceDef(service) = &rule.rule_type {
-            body.push_str(&emit_client_struct(&rule.name, service, &records, shape));
+            body.push_str(&emit_client_struct(
+                &rule.name, service, &records, &aliases, shape,
+            ));
             // Wire-id ordinals are a module-level `enum` shared across both client shapes;
             // only the primary file emits them so the twin never redeclares the enum.
             if shape.marker.is_empty() {
@@ -2226,6 +2343,7 @@ fn emit_client_struct(
     name: &str,
     service: &CsilServiceDefinition,
     records: &std::collections::HashSet<String>,
+    aliases: &std::collections::HashMap<String, CsilTypeExpression>,
     shape: ClientShape,
 ) -> String {
     let base = service_base(name);
@@ -2254,14 +2372,15 @@ fn emit_client_struct(
             continue;
         }
         let success = success_type(&op.output_type);
-        // The typed-codec path needs a record success type (and a record or null
-        // request) so the method can call the generated to/from-CBOR. Anything else
-        // is skipped with a note rather than emitting an uncompilable call.
-        let resp_record = is_record_ref(&success, records);
-        let req_ok = is_null_input(&op.input_type) || is_record_ref(&op.input_type, records);
-        if !resp_record || !req_ok {
+        let null_input = is_null_input(&op.input_type);
+        let req_ok = null_input || swift_op_boundary_expressible(&op.input_type, records, aliases);
+        // Only a genuinely inexpressible boundary (an inline non-stringy choice with no wire
+        // discriminator, a tuple the field builders don't model, or an unmodeled reference)
+        // is skipped now; scalar/array/map shapes ride the per-op codec helpers, so every
+        // other op gets a method.
+        if !req_ok || !swift_op_boundary_expressible(&success, records, aliases) {
             out.push_str(&format!(
-                "    // operation '{}' has a non-record payload; (de)serialize it manually\n",
+                "    // operation '{}' has a payload csilgen can't (de)serialize; handle it manually\n",
                 op.name
             ));
             continue;
@@ -2269,7 +2388,14 @@ fn emit_client_struct(
         let method = swift_ident(&op.name);
         let output = map_type(&success, false);
         let wire_op = wire_op_string(&op.name);
-        if is_null_input(&op.input_type) {
+        let stem = op_codec_stem(name, op);
+        // A record success reuses its `fromCbor`; any other shape uses the op's per-op decoder.
+        let decode_resp = if is_record_ref(&success, records) {
+            format!("{output}.fromCbor(csilResp)")
+        } else {
+            format!("decode{stem}Response(csilResp)")
+        };
+        if null_input {
             out.push_str(&format!(
                 "    public func {method}() {effects} -> {output} {{\n"
             ));
@@ -2280,16 +2406,22 @@ fn emit_client_struct(
             ));
         } else {
             let input = map_type(&op.input_type, false);
+            // A record request reuses its `toCbor`; any other shape uses the op's per-op encoder.
+            let req_bytes = if is_record_ref(&op.input_type, records) {
+                "request.toCbor()".to_string()
+            } else {
+                format!("encode{stem}Request(request)")
+            };
             out.push_str(&format!(
                 "    public func {method}(_ request: {input}) {effects} -> {output} {{\n"
             ));
             out.push_str(&format!(
-                "        let csilResp = try {await_kw}transport.call(service: {}, op: {}, request: request.toCbor())\n",
+                "        let csilResp = try {await_kw}transport.call(service: {}, op: {}, request: {req_bytes})\n",
                 swift_string_lit(&wire_service),
                 swift_string_lit(&wire_op),
             ));
         }
-        out.push_str(&format!("        return try {output}.fromCbor(csilResp)\n"));
+        out.push_str(&format!("        return try {decode_resp}\n"));
         out.push_str("    }\n\n");
     }
     out.push_str("}\n\n");

@@ -1,0 +1,29 @@
+; Service with non-record op boundaries: scalar-id requests, bare-array and
+; scalar responses, and map responses. Mirrors longhouse's GetMember(MemberID),
+; ListMembers -> [*Member], DeleteTask(TaskID) -> bool shapes that the
+; record-only client/codec filter used to drop.
+
+MemberID = text
+TaskID = text
+
+Member = {
+  id: MemberID,
+  name: text,
+}
+
+ListMembersRequest = {
+  limit?: uint,
+}
+
+service MemberService {
+  ; record -> record (the only shape the old filter kept)
+  create-member: Member -> Member,
+  ; scalar-id request -> record response
+  get-member: MemberID -> Member,
+  ; record request -> bare-array response
+  list-members: ListMembersRequest -> [* Member],
+  ; scalar-id request -> scalar response
+  delete-task: TaskID -> bool,
+  ; record request -> map response
+  member-names: ListMembersRequest -> {text => text},
+}

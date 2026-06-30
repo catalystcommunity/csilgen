@@ -9,7 +9,8 @@
 use csilgen_common::{
     CsilControlOperator, CsilFieldMetadata, CsilGroupEntry, CsilGroupExpression, CsilGroupKey,
     CsilLiteralValue, CsilOccurrence, CsilRuleType, CsilServiceDefinition, CsilServiceDirection,
-    CsilSizeConstraint, CsilTypeExpression, CsilValidationConstraint, GeneratedFile,
+    CsilServiceOperation, CsilSizeConstraint, CsilTypeExpression, CsilValidationConstraint,
+    GeneratedFile,
     GenerationStats, GeneratorCapability, GeneratorMetadata, GeneratorWarning, WarningLevel,
     WasmGeneratorInput, WasmGeneratorOutput, wasm_interface::*,
 };
@@ -1381,6 +1382,11 @@ fn generate_client(
     shape: ClientShape,
 ) -> Option<String> {
     let records = kotlin_record_names(input);
+    // The full set of references the codec can (de)serialize (records + named choices) and
+    // the transparent aliases, so an op with a scalar/array/map/tuple/union boundary can
+    // ride the per-op codec helpers instead of being dropped.
+    let named = kotlin_codec_named(input);
+    let aliases = codec_aliases(input);
     let mut body = String::new();
     body.push_str(&client_prelude_kt(shape));
     body.push('\n');
@@ -1388,7 +1394,7 @@ fn generate_client(
     let mut emitted = false;
     for rule in &input.csil_spec.rules {
         if let CsilRuleType::ServiceDef(service) = &rule.rule_type {
-            emit_client_class(&mut body, &rule.name, service, &records, shape);
+            emit_client_class(&mut body, &rule.name, service, &records, &named, &aliases, shape);
             emitted = true;
         }
     }
@@ -1405,6 +1411,8 @@ fn emit_client_class(
     name: &str,
     service: &CsilServiceDefinition,
     records: &std::collections::HashSet<String>,
+    named: &std::collections::HashSet<String>,
+    aliases: &std::collections::HashMap<String, CsilTypeExpression>,
     shape: ClientShape,
 ) {
     let base = service_base(name);
@@ -1431,15 +1439,14 @@ fn emit_client_class(
             continue;
         }
         let success = success_type(&operation.output_type);
-        // The typed-codec path needs a record success type (and a record or null
-        // request) so the method can encode/decode through the generated codec.
-        // Anything else is skipped with a note rather than an uncompilable call.
-        let resp_record = is_record_ref(&success, records);
-        let req_ok = op_input_is_null(&operation.input_type)
-            || is_record_ref(&operation.input_type, records);
-        if !resp_record || !req_ok {
+        let null_input = op_input_is_null(&operation.input_type);
+        let req_ok = null_input || kotlin_op_boundary_expressible(&operation.input_type, named, aliases);
+        // Only a genuinely inexpressible boundary (an inline multi-variant choice with no
+        // wire discriminator, or an unmodeled reference) is skipped now; scalar/array/map/
+        // tuple/union shapes ride the per-op codec helpers, so every other op gets a method.
+        if !req_ok || !kotlin_op_boundary_expressible(&success, named, aliases) {
             body.push_str(&format!(
-                "    // operation '{}' has a non-record payload; (de)serialize it manually\n",
+                "    // operation '{}' has a payload csilgen can't (de)serialize; handle it manually\n",
                 operation.name
             ));
             continue;
@@ -1448,21 +1455,33 @@ fn emit_client_class(
         // The wire op is PascalCased (the wire contract), matching the other targets.
         let wire_op = wire_op_name(&operation.name);
         let output_type = map_csil_type_to_kotlin(&success, &None);
-        if op_input_is_null(&operation.input_type) {
+        let stem = op_codec_stem(name, operation);
+        // A null input carries no request body (empty bytes); a record reuses the generic
+        // `encode`; any other shape uses the op's per-op request encoder.
+        let req_bytes = if null_input {
+            "ByteArray(0)".to_string()
+        } else if is_record_ref(&operation.input_type, records) {
+            "encode(request)".to_string()
+        } else {
+            format!("encode{stem}Request(request)")
+        };
+        let call = format!("transport.call(\"{wire_service}\", \"{wire_op}\", {req_bytes})");
+        // A record success reuses the generic reified `decode`; any other shape uses the
+        // op's per-op response decoder.
+        let decode_resp = if is_record_ref(&success, records) {
+            format!("decode<{output_type}>({call})")
+        } else {
+            format!("decode{stem}Response({call})")
+        };
+        if null_input {
             body.push_str(&format!("    {suspend}fun {method}(): {output_type} {{\n"));
-            // A null-input op sends an empty request body.
-            body.push_str(&format!(
-                "        return decode<{output_type}>(transport.call(\"{wire_service}\", \"{wire_op}\", ByteArray(0)))\n"
-            ));
         } else {
             let input_type = map_csil_type_to_kotlin(&operation.input_type, &None);
             body.push_str(&format!(
                 "    {suspend}fun {method}(request: {input_type}): {output_type} {{\n"
             ));
-            body.push_str(&format!(
-                "        return decode<{output_type}>(transport.call(\"{wire_service}\", \"{wire_op}\", encode(request)))\n"
-            ));
         }
+        body.push_str(&format!("        return {decode_resp}\n"));
         body.push_str("    }\n");
     }
     body.push_str("}\n\n");
@@ -1472,6 +1491,53 @@ fn emit_client_class(
 /// typed client method can encode/decode it through the generated codec.
 fn is_record_ref(ty: &CsilTypeExpression, records: &std::collections::HashSet<String>) -> bool {
     matches!(ty, CsilTypeExpression::Reference(n) if records.contains(&pascal_case(n)))
+}
+
+/// Every reference name the codec carries a `toCborValue`/`<name>FromCborValue` for:
+/// records plus named choices (enums + unions). A field or op boundary referencing one
+/// resolves through the same enc/dec helpers a record does, so client and codec agree on
+/// the wire for it.
+fn kotlin_codec_named(input: &WasmGeneratorInput) -> std::collections::HashSet<String> {
+    let mut set = kotlin_record_names(input);
+    for rule in &input.csil_spec.rules {
+        if let CsilRuleType::TypeDef(CsilTypeExpression::Choice(_)) = &rule.rule_type {
+            set.insert(pascal_case(&rule.name));
+        }
+    }
+    set
+}
+
+/// Whether `kotlin_enc_value`/`kotlin_dec_value` model an op-boundary type faithfully (so a
+/// per-op codec helper is correct rather than silently lossy). Records, scalars, transparent
+/// aliases, named choices (enums/unions), arrays, maps, and tuples all resolve to real codec
+/// helpers. An inline multi-variant choice has no wire discriminator, and an unmodeled
+/// reference has no codec, so those two keep the skip-with-note path the client falls back to.
+fn kotlin_op_boundary_expressible(
+    ty: &CsilTypeExpression,
+    named: &std::collections::HashSet<String>,
+    aliases: &std::collections::HashMap<String, CsilTypeExpression>,
+) -> bool {
+    match unwrap_constrained(ty) {
+        CsilTypeExpression::Builtin(_) => true,
+        CsilTypeExpression::Reference(name) => {
+            named.contains(&pascal_case(name)) || aliases.contains_key(&pascal_case(name))
+        }
+        CsilTypeExpression::Array { element_type, .. } => {
+            kotlin_op_boundary_expressible(element_type, named, aliases)
+        }
+        CsilTypeExpression::Map { key, value, .. } => {
+            kotlin_op_boundary_expressible(key, named, aliases)
+                && kotlin_op_boundary_expressible(value, named, aliases)
+        }
+        CsilTypeExpression::Tuple(_) => true,
+        _ => false,
+    }
+}
+
+/// The `<Base><Method>` stem shared by an op's per-op codec helpers and the client method
+/// that calls them, so the two never drift.
+fn op_codec_stem(service_name: &str, op: &CsilServiceOperation) -> String {
+    format!("{}{}", service_base(service_name), pascal_case(&op.name))
 }
 
 /// Codec + handler-outcome prelude emitted once at the top of `Services.kt` when any
@@ -2238,6 +2304,74 @@ fn emit_codec_dispatch(body: &mut String, records: &[(String, String)]) {
     body.push_str("    else -> throw CborError(\"no CSIL CBOR codec for $type\")\n}\n");
 }
 
+/// Exported per-op CBOR helpers so a server in another module can compose a
+/// `decode(request)/encode(response)` pair for every op — scalar-id requests and
+/// `[]T`/map/scalar responses included, not just record↔record. The client calls the same
+/// helpers, so a single surface owns the wire for both directions. Records keep the generic
+/// `encode`/`decode<T>` path (byte-identical), so only non-record boundaries get a per-op
+/// helper here.
+fn emit_op_codecs(
+    body: &mut String,
+    input: &WasmGeneratorInput,
+    named: &std::collections::HashSet<String>,
+    aliases: &std::collections::HashMap<String, CsilTypeExpression>,
+) {
+    let records = kotlin_record_names(input);
+    for rule in &input.csil_spec.rules {
+        let CsilRuleType::ServiceDef(service) = &rule.rule_type else {
+            continue;
+        };
+        for op in &service.operations {
+            if !matches!(op.direction, CsilServiceDirection::Unidirectional) {
+                continue;
+            }
+            let success = success_type(&op.output_type);
+            let null_input = op_input_is_null(&op.input_type);
+            let req_ok = null_input || kotlin_op_boundary_expressible(&op.input_type, named, aliases);
+            if !req_ok || !kotlin_op_boundary_expressible(&success, named, aliases) {
+                continue;
+            }
+            let stem = op_codec_stem(&rule.name, op);
+            if !null_input && !is_record_ref(&op.input_type, &records) {
+                emit_op_codec_pair(
+                    body,
+                    &format!("{stem}Request"),
+                    &op.input_type,
+                    named,
+                    aliases,
+                );
+            }
+            if !is_record_ref(&success, &records) {
+                emit_op_codec_pair(body, &format!("{stem}Response"), &success, named, aliases);
+            }
+        }
+    }
+}
+
+/// One `encode<Name>`/`decode<Name>` pair over the value builders the record codec already
+/// uses, so an arbitrary op-boundary shape gets the same byte seam a record type has.
+fn emit_op_codec_pair(
+    body: &mut String,
+    helper: &str,
+    ty: &CsilTypeExpression,
+    named: &std::collections::HashSet<String>,
+    aliases: &std::collections::HashMap<String, CsilTypeExpression>,
+) {
+    let kt_type = map_csil_type_to_kotlin(ty, &None);
+    let enc = kotlin_enc_value(ty, "value", named, aliases);
+    let dec = kotlin_dec_value(ty, "csilRoot", named, aliases);
+    body.push_str(&format!(
+        "/** Encode the {helper} payload to canonical CSIL CBOR bytes. */\n\
+         fun encode{helper}(value: {kt_type}): ByteArray = CsilCbor.encode({enc})\n\n"
+    ));
+    body.push_str(&format!(
+        "/** Decode canonical CSIL CBOR bytes into the {helper} payload. */\n\
+         fun decode{helper}(bytes: ByteArray): {kt_type} {{\n\
+         \x20   val csilRoot = CsilCbor.decode(bytes)\n\
+         \x20   return {dec}\n}}\n\n"
+    ));
+}
+
 /// Build `Codec.kt`: the self-contained canonical-CBOR runtime, a codec per record,
 /// and the generic dispatch. `None` when the spec declares no record types.
 fn generate_codec(input: &WasmGeneratorInput, config: &KotlinConfig) -> Option<String> {
@@ -2249,12 +2383,7 @@ fn generate_codec(input: &WasmGeneratorInput, config: &KotlinConfig) -> Option<S
     // Named choices (enums + unions) carry their own `toCborValue`/`<name>FromCborValue`
     // codec, so a field referencing one resolves exactly like a record does — fold their
     // names into the same set the enc/dec helpers consult.
-    let mut codec_named = records.clone();
-    for rule in &input.csil_spec.rules {
-        if let CsilRuleType::TypeDef(CsilTypeExpression::Choice(_)) = &rule.rule_type {
-            codec_named.insert(pascal_case(&rule.name));
-        }
-    }
+    let codec_named = kotlin_codec_named(input);
     let mut body = String::new();
     let mut dispatch: Vec<(String, String)> = Vec::new();
     for rule in &input.csil_spec.rules {
@@ -2270,6 +2399,10 @@ fn generate_codec(input: &WasmGeneratorInput, config: &KotlinConfig) -> Option<S
         }
     }
     emit_codec_dispatch(&mut body, &dispatch);
+    // Per-op byte helpers for non-record op boundaries (scalar-id requests, `[]T`/map/scalar
+    // responses, …), so the client and a consumer-side server share one codec surface for
+    // every op — not just record↔record.
+    emit_op_codecs(&mut body, input, &codec_named, &aliases);
 
     let mut content = file_header(
         config,
@@ -4295,6 +4428,105 @@ mod tests {
                 "decode<RoomDelta>(transport.call(\"world\", \"RoomDelta\", ByteArray(0)))"
             )
         );
+    }
+
+    #[test]
+    fn non_record_op_boundaries_get_client_methods_and_per_op_codecs() {
+        // Mirrors tests/fixtures/services/nonrecord-ops.csil: a scalar-id request, a
+        // bare-array response, a scalar response, and a map response must each yield a
+        // client method (not a drop-note), riding per-op codec helpers.
+        let member = CsilRuleType::GroupDef(CsilGroupExpression {
+            entries: vec![
+                entry("id", reference("MemberID"), None),
+                entry("name", builtin("text"), None),
+            ],
+        });
+        let list_req = CsilRuleType::GroupDef(CsilGroupExpression {
+            entries: vec![entry("limit", builtin("uint"), Some(CsilOccurrence::Optional))],
+        });
+        let member_array = CsilTypeExpression::Array {
+            element_type: Box::new(reference("Member")),
+            occurrence: None,
+        };
+        let text_map = CsilTypeExpression::Map {
+            key: Box::new(builtin("text")),
+            value: Box::new(builtin("text")),
+            occurrence: None,
+        };
+        let service = CsilServiceDefinition {
+            operations: vec![
+                op(
+                    "create-member",
+                    reference("Member"),
+                    reference("Member"),
+                    CsilServiceDirection::Unidirectional,
+                    None,
+                ),
+                op(
+                    "get-member",
+                    reference("MemberID"),
+                    reference("Member"),
+                    CsilServiceDirection::Unidirectional,
+                    None,
+                ),
+                op(
+                    "list-members",
+                    reference("ListMembersRequest"),
+                    member_array,
+                    CsilServiceDirection::Unidirectional,
+                    None,
+                ),
+                op(
+                    "delete-task",
+                    reference("TaskID"),
+                    builtin("bool"),
+                    CsilServiceDirection::Unidirectional,
+                    None,
+                ),
+                op(
+                    "member-names",
+                    reference("ListMembersRequest"),
+                    text_map,
+                    CsilServiceDirection::Unidirectional,
+                    None,
+                ),
+            ],
+            wire_id: None,
+        };
+        let out = process_generation(spec(
+            "kotlin-client",
+            vec![
+                rule("MemberID", CsilRuleType::TypeDef(builtin("text"))),
+                rule("TaskID", CsilRuleType::TypeDef(builtin("text"))),
+                rule("Member", member),
+                rule("ListMembersRequest", list_req),
+                rule("MemberService", CsilRuleType::ServiceDef(service)),
+            ],
+        ))
+        .unwrap();
+        let client = content(&out, "Client.kt");
+
+        // Every op gets a method — scalar-id request, bare-array and scalar responses included.
+        assert!(client.contains("fun getMember(request: MemberID): Member"));
+        assert!(client.contains("fun listMembers(request: ListMembersRequest): List<Member>"));
+        assert!(client.contains("fun deleteTask(request: TaskID): Boolean"));
+        assert!(client.contains("fun memberNames(request: ListMembersRequest): Map<String, String>"));
+        // No op is dropped with a note anymore.
+        assert!(!client.contains("(de)serialize it manually"));
+        // A record boundary keeps the generic `encode`/`decode<T>` path (byte-identical);
+        // non-record boundaries ride the per-op helpers.
+        assert!(client.contains("encode(request)"));
+        assert!(client.contains("encodeMemberGetMemberRequest(request)"));
+        assert!(client.contains("decodeMemberListMembersResponse("));
+        assert!(client.contains("decodeMemberDeleteTaskResponse("));
+
+        let codec = content(&out, "Codec.kt");
+        // Per-op helpers for the non-record shapes are exported so a consumer-side server
+        // can compose decode(request)/encode(response) for every op.
+        assert!(codec.contains("fun decodeMemberGetMemberRequest(bytes: ByteArray): MemberID"));
+        assert!(codec.contains("fun encodeMemberListMembersResponse(value: List<Member>): ByteArray"));
+        assert!(codec.contains("fun encodeMemberDeleteTaskResponse(value: Boolean): ByteArray"));
+        assert!(codec.contains("fun decodeMemberMemberNamesResponse(bytes: ByteArray): Map<String, String>"));
     }
 
     #[test]
