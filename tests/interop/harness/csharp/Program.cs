@@ -50,6 +50,7 @@ internal static class Harness
         Exact3 = new List<long> { 7, 8, 9 },
         Scores = new Dictionary<string, long> { ["x"] = 1, ["y"] = 2 },
         Color = Color.Green,
+        Tone = Color.Blue,
         Prio = Priority.Value2,
         Who = new IdOrNameVariant1(4242),
         Pair = ("p", 5),
@@ -107,7 +108,7 @@ internal static class Harness
         && a.Bounded.SequenceEqual(b.Bounded) && a.Exact3.SequenceEqual(b.Exact3)
         && a.Scores.Count == b.Scores.Count
         && a.Scores.All(kv => b.Scores.TryGetValue(kv.Key, out var v) && v == kv.Value)
-        && a.Color == b.Color && a.Prio == b.Prio && a.Who == b.Who
+        && a.Color == b.Color && a.Tone == b.Tone && a.Prio == b.Prio && a.Who == b.Who
         && a.Pair == b.Pair && a.Triple == b.Triple
         && a.Extra.Count == b.Extra.Count
         && a.Extra.All(kv => b.Extra.TryGetValue(kv.Key, out var v) && CborEq(kv.Value, v));

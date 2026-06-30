@@ -61,6 +61,7 @@ fn collections_ok() -> Collections {
         exact3: vec![7, 8, 9],
         scores,
         color: Color::Green,
+        tone: Color::Blue,
         prio: Priority::V2,
         who: IdOrName::Variant0(4242),
         pair: ("p".to_string(), 5),

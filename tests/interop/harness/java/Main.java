@@ -87,6 +87,7 @@ public final class Main {
             List.of(7L, 8L, 9L),
             scores,
             new Color("green"),
+            new Color("blue"),
             new Priority(2L),
             new IdOrName(4242L),
             Arrays.<Object>asList("p", 5L),

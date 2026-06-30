@@ -62,6 +62,10 @@ Collections = {
   exact3: [3 int],
   scores: {text => int},
   color: Color,
+  ;; enum-typed field carrying a `.default` — exercises enum default rendering
+  ;; (regression: the Kotlin generator emitted a raw String default here, which
+  ;; does not typecheck against the enum-typed property).
+  tone: Color .default "green",
   prio: Priority,
   who: IdOrName,
   pair: [text, int],

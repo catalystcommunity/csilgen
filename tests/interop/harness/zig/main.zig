@@ -70,6 +70,7 @@ fn collectionsOk(a: std.mem.Allocator) !Collections {
         .exact3 = try a.dupe(i64, &[_]i64{ 7, 8, 9 }),
         .scores = scores,
         .color = .green,
+        .tone = .blue,
         .prio = .v2,
         .who = .{ .uint = 4242 },
         .pair = .{ "p", 5 },
@@ -197,6 +198,7 @@ fn collectionsEql(a: Collections, b: Collections) bool {
     if (!sliceEqlI64(a.exact3, b.exact3)) return false;
     if (!scoresEql(a.scores, b.scores)) return false;
     if (a.color != b.color) return false;
+    if (a.tone != b.tone) return false;
     if (a.prio != b.prio) return false;
     // who: tagged union.
     switch (a.who) {

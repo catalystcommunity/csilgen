@@ -52,6 +52,7 @@ defmodule Vectors do
       exact3: [7, 8, 9],
       scores: %{"x" => 1, "y" => 2},
       color: "green",
+      tone: "blue",
       prio: 2,
       who: 4242,
       pair: {"p", 5},

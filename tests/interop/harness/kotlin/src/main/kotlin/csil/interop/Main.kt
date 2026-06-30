@@ -54,6 +54,7 @@ private fun collectionsOk() = Collections(
     exact3 = listOf(7L, 8L, 9L),
     scores = mapOf("x" to 1L, "y" to 2L),
     color = Color.Green,
+    tone = Color.Blue,
     prio = Priority.V2,
     who = IdOrNameVariant0(4242uL),
     pair = listOf("p", 5L),
