@@ -770,7 +770,11 @@ fn cbor_read_arg(b: &[u8], pos: &mut usize, low: u8) -> Result<u64, CsilCborErro
         25 => 2,
         26 => 4,
         27 => 8,
-        _ => return Err(CsilCborError(format!("csil cbor: reserved additional info {low}"))),
+        _ => {
+            return Err(CsilCborError(format!(
+                "csil cbor: reserved additional info {low}"
+            )))
+        }
     };
     if *pos + 1 + width > b.len() {
         return Err(CsilCborError("csil cbor: truncated argument".to_string()));
@@ -785,7 +789,9 @@ fn cbor_read_arg(b: &[u8], pos: &mut usize, low: u8) -> Result<u64, CsilCborErro
 
 fn cbor_dec(b: &[u8], pos: &mut usize) -> Result<CsilCborValue, CsilCborError> {
     if *pos >= b.len() {
-        return Err(CsilCborError("csil cbor: unexpected end of input".to_string()));
+        return Err(CsilCborError(
+            "csil cbor: unexpected end of input".to_string(),
+        ));
     }
     let ib = b[*pos];
     let major = ib >> 5;
@@ -812,7 +818,9 @@ fn cbor_dec(b: &[u8], pos: &mut usize) -> Result<CsilCborValue, CsilCborError> {
                 let bits = cbor_read_arg(b, pos, low)?;
                 Ok(CsilCborValue::Float(f64::from_bits(bits)))
             }
-            _ => Err(CsilCborError(format!("csil cbor: unsupported simple value {low}"))),
+            _ => Err(CsilCborError(format!(
+                "csil cbor: unsupported simple value {low}"
+            ))),
         };
     }
     let arg = cbor_read_arg(b, pos, low)?;
@@ -820,14 +828,18 @@ fn cbor_dec(b: &[u8], pos: &mut usize) -> Result<CsilCborValue, CsilCborError> {
         0 => Ok(CsilCborValue::Uint(arg)),
         1 => {
             if arg > i64::MAX as u64 {
-                return Err(CsilCborError("csil cbor: negative integer out of range".to_string()));
+                return Err(CsilCborError(
+                    "csil cbor: negative integer out of range".to_string(),
+                ));
             }
             Ok(CsilCborValue::Int(-1 - arg as i64))
         }
         2 => {
             let n = arg as usize;
             if *pos + n > b.len() {
-                return Err(CsilCborError("csil cbor: truncated byte string".to_string()));
+                return Err(CsilCborError(
+                    "csil cbor: truncated byte string".to_string(),
+                ));
             }
             let slice = b[*pos..*pos + n].to_vec();
             *pos += n;
@@ -836,7 +848,9 @@ fn cbor_dec(b: &[u8], pos: &mut usize) -> Result<CsilCborValue, CsilCborError> {
         3 => {
             let n = arg as usize;
             if *pos + n > b.len() {
-                return Err(CsilCborError("csil cbor: truncated text string".to_string()));
+                return Err(CsilCborError(
+                    "csil cbor: truncated text string".to_string(),
+                ));
             }
             let s = std::str::from_utf8(&b[*pos..*pos + n])
                 .map_err(|e| CsilCborError(format!("csil cbor: invalid utf-8: {e}")))?
@@ -866,7 +880,9 @@ fn cbor_dec(b: &[u8], pos: &mut usize) -> Result<CsilCborValue, CsilCborError> {
             let inner = cbor_dec(b, pos)?;
             Ok(CsilCborValue::Tag(arg, Box::new(inner)))
         }
-        _ => Err(CsilCborError(format!("csil cbor: unexpected major type {major}"))),
+        _ => Err(CsilCborError(format!(
+            "csil cbor: unexpected major type {major}"
+        ))),
     }
 }
 
@@ -909,10 +925,8 @@ fn cbor_dec_map<K: std::cmp::Eq + std::hash::Hash, V>(
 fn cbor_map_get<'a>(v: &'a CsilCborValue, key: &str) -> Option<&'a CsilCborValue> {
     if let CsilCborValue::Map(entries) = v {
         for (k, val) in entries {
-            if let CsilCborValue::Text(name) = k {
-                if name == key {
-                    return Some(val);
-                }
+            if matches!(k, CsilCborValue::Text(name) if name == key) {
+                return Some(val);
             }
         }
     }
@@ -920,8 +934,7 @@ fn cbor_map_get<'a>(v: &'a CsilCborValue, key: &str) -> Option<&'a CsilCborValue
 }
 
 fn cbor_require<'a>(v: &'a CsilCborValue, key: &str) -> Result<&'a CsilCborValue, CsilCborError> {
-    cbor_map_get(v, key)
-        .ok_or_else(|| CsilCborError(format!("csil cbor: missing field {key:?}")))
+    cbor_map_get(v, key).ok_or_else(|| CsilCborError(format!("csil cbor: missing field {key:?}")))
 }
 
 fn cbor_as_i64(v: &CsilCborValue) -> Result<i64, CsilCborError> {
@@ -937,10 +950,12 @@ fn cbor_as_u64(v: &CsilCborValue) -> Result<u64, CsilCborError> {
     match v {
         CsilCborValue::Uint(x) => Ok(*x),
         CsilCborValue::Int(x) if *x >= 0 => Ok(*x as u64),
-        CsilCborValue::Int(_) => {
-            Err(CsilCborError("csil cbor: negative integer where unsigned expected".to_string()))
-        }
-        _ => Err(CsilCborError("csil cbor: expected unsigned integer".to_string())),
+        CsilCborValue::Int(_) => Err(CsilCborError(
+            "csil cbor: negative integer where unsigned expected".to_string(),
+        )),
+        _ => Err(CsilCborError(
+            "csil cbor: expected unsigned integer".to_string(),
+        )),
     }
 }
 
@@ -1484,6 +1499,12 @@ impl<'a> RustCodeGenerator<'a> {
                     path: "genquickstart.md".to_string(),
                     content: self.generate_readme(client_quickstart)?,
                 });
+            }
+        }
+
+        for file in &mut files {
+            if file.path.ends_with(".rs") {
+                file.content = format!("{}\n", file.content.trim_end());
             }
         }
 
@@ -2133,6 +2154,18 @@ fn main() {{
         }
 
         content.push_str(&format!("#[derive({})]\n", derive_attrs.join(", ")));
+
+        if group.entries.is_empty() {
+            content.push_str(&format!("pub struct {name} {{}}"));
+
+            if let Some(validate_impl) = self.generate_validate_impl(name, group) {
+                content.push_str("\n\n");
+                content.push_str(&validate_impl);
+            }
+
+            return Ok(content);
+        }
+
         content.push_str(&format!("pub struct {name} {{\n"));
 
         for entry in &group.entries {
@@ -2524,14 +2557,14 @@ fn main() {{
         if shape.is_async {
             content.push_str("#![allow(async_fn_in_trait)]\n\n");
         }
-        content.push_str("use super::types::*;\n");
-        // The client owns (de)serialization through the generated per-type codec.
-        content.push_str("use super::codec::*;\n");
         // The marked twin shares the sync client's `ClientError`; import it rather
         // than redefine it so both clients re-export cleanly from the module root.
         if !shape.marker.is_empty() {
             content.push_str("use super::client::ClientError;\n");
         }
+        // The client owns (de)serialization through the generated per-type codec.
+        content.push_str("use super::codec::*;\n");
+        content.push_str("use super::types::*;\n");
         content.push('\n');
 
         content.push_str(&client_prelude(shape));
@@ -2586,8 +2619,8 @@ fn main() {{
             }
             let success = success_type(&operation.output_type);
             let null_input = is_null_input(&operation.input_type);
-            let req_ok =
-                null_input || self.op_boundary_expressible(&operation.input_type, &records, &aliases);
+            let req_ok = null_input
+                || self.op_boundary_expressible(&operation.input_type, &records, &aliases);
             // Only a genuinely inexpressible boundary (an inline multi-variant choice
             // with no wire discriminator, or an unmodeled reference) is skipped now;
             // scalar/array/map/tuple shapes ride the per-op codec helpers, so every
@@ -2606,7 +2639,10 @@ fn main() {{
             // A record success reuses its `decode_<t>` wrapper; any other shape uses the
             // op's per-op response decoder.
             let resp_dec = if Self::is_record_ref(&success, &records) {
-                format!("decode_{}", self.to_snake_case(&Self::type_ref_name(&success)))
+                format!(
+                    "decode_{}",
+                    self.to_snake_case(&Self::type_ref_name(&success))
+                )
             } else {
                 format!("decode_{stem}_response")
             };
@@ -2620,8 +2656,11 @@ fn main() {{
                 content.push_str(&format!(
                     "    pub {async_kw}fn {method}(&self) -> Result<{output_type}, ClientError> {{\n"
                 ));
-                content.push_str(&format!(
-                    "        let csil_resp = self.transport.call(\"{wire_service}\", \"{wire_method}\", &[]){dot_await}?;\n"
+                content.push_str(&Self::rust_client_call(
+                    &wire_service,
+                    &wire_method,
+                    "&[]",
+                    dot_await,
                 ));
             } else {
                 let input_type = self.map_type_to_rust(&operation.input_type, &None)?;
@@ -2638,8 +2677,11 @@ fn main() {{
                 content.push_str(&format!(
                     "    pub {async_kw}fn {method}(&self, req: {input_type}) -> Result<{output_type}, ClientError> {{\n"
                 ));
-                content.push_str(&format!(
-                    "        let csil_resp = self.transport.call(\"{wire_service}\", \"{wire_method}\", &{req_enc}(&req)){dot_await}?;\n"
+                content.push_str(&Self::rust_client_call(
+                    &wire_service,
+                    &wire_method,
+                    &format!("&{req_enc}(&req)"),
+                    dot_await,
                 ));
             }
             content.push_str(&format!(
@@ -2858,16 +2900,31 @@ fn main() {{
                 refed(&format!("csil_enc_{}", self.to_snake_case(name)))
             }
             CsilTypeExpression::Array { element_type, .. } => {
-                let inner = self.rust_enc_value(element_type, "csil_elem", true, records, aliases);
-                format!("cbor_enc_array({}, |csil_elem| {inner})", as_ref())
+                if let Some(func) = self.rust_enc_func(element_type, records, aliases) {
+                    Self::rust_call("cbor_enc_array", &[as_ref(), func])
+                } else {
+                    let inner =
+                        self.rust_enc_value(element_type, "csil_elem", true, records, aliases);
+                    Self::rust_call(
+                        "cbor_enc_array",
+                        &[as_ref(), format!("|csil_elem| {inner}")],
+                    )
+                }
             }
             CsilTypeExpression::Map { key, value, .. } => {
-                let kenc = self.rust_enc_value(key, "csil_mk", true, records, aliases);
-                let venc = self.rust_enc_value(value, "csil_mv", true, records, aliases);
-                format!(
-                    "cbor_enc_map({}, |csil_mk| {kenc}, |csil_mv| {venc})",
-                    as_ref()
-                )
+                let kenc = self
+                    .rust_enc_func(key, records, aliases)
+                    .unwrap_or_else(|| {
+                        let inner = self.rust_enc_value(key, "csil_mk", true, records, aliases);
+                        format!("|csil_mk| {inner}")
+                    });
+                let venc = self
+                    .rust_enc_func(value, records, aliases)
+                    .unwrap_or_else(|| {
+                        let inner = self.rust_enc_value(value, "csil_mv", true, records, aliases);
+                        format!("|csil_mv| {inner}")
+                    });
+                Self::rust_call("cbor_enc_map", &[as_ref(), kenc, venc])
             }
             // A fixed-shape tuple maps to a Rust tuple; encode positionally into a CBOR
             // array. An absent optional element is held in place as null so the array
@@ -2903,6 +2960,83 @@ fn main() {{
             // is carried as null rather than emitting code that would not compile.
             _ => "CsilCborValue::Null".to_string(),
         }
+    }
+
+    /// A bare encoder function path when the typed helper's argument exactly matches
+    /// the generic array/map helper's borrowed element. Returning a path instead of a
+    /// closure keeps generated code clippy-clean without changing the fallback path
+    /// needed for scalar conversions such as `String` to `&str`.
+    fn rust_enc_func(
+        &self,
+        ty: &CsilTypeExpression,
+        records: &HashSet<String>,
+        aliases: &HashMap<String, CsilTypeExpression>,
+    ) -> Option<String> {
+        match Self::value_base(ty) {
+            CsilTypeExpression::Reference(name) if records.contains(name) => {
+                Some(format!("csil_enc_{}", self.to_snake_case(name)))
+            }
+            CsilTypeExpression::Reference(name) if aliases.contains_key(name) => {
+                self.rust_enc_func(&aliases[name], records, aliases)
+            }
+            CsilTypeExpression::Reference(name) if self.type_choice(name).is_some() => {
+                Some(format!("csil_enc_{}", self.to_snake_case(name)))
+            }
+            CsilTypeExpression::Builtin(name) => match name.as_str() {
+                "timestamp" => Some("csil_enc_timestamp".to_string()),
+                "decimal" => Some("csil_enc_decimal".to_string()),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    fn rust_call(name: &str, args: &[String]) -> String {
+        let one_line = format!("{name}({})", args.join(", "));
+        if !one_line.contains('\n') && one_line.len() <= 80 {
+            return one_line;
+        }
+
+        let mut out = format!("{name}(\n");
+        for arg in args {
+            let lines: Vec<&str> = arg.lines().collect();
+            for (idx, line) in lines.iter().enumerate() {
+                out.push_str("    ");
+                out.push_str(line);
+                if idx + 1 == lines.len() {
+                    out.push(',');
+                }
+                out.push('\n');
+            }
+        }
+        out.push(')');
+        out
+    }
+
+    fn blockify_array_closure(value: &str) -> String {
+        if !value.starts_with("cbor_enc_array(") || value.contains('\n') || value.contains('{') {
+            return value.to_string();
+        }
+        let Some(split) = value.find(", |") else {
+            return value.to_string();
+        };
+        let (head, closure) = value.split_at(split + 2);
+        let Some(rest) = closure.strip_prefix('|') else {
+            return value.to_string();
+        };
+        let Some(end) = rest.find('|') else {
+            return value.to_string();
+        };
+        let params = &closure[..end + 2];
+        let body = closure[end + 2..]
+            .trim_start()
+            .strip_suffix(')')
+            .unwrap_or("")
+            .trim();
+        if body.is_empty() {
+            return value.to_string();
+        }
+        format!("{head}{params} {{\n    {body}\n}})")
     }
 
     /// A Rust expression of type `impl Fn(&CsilCborValue) -> Result<T, CsilCborError>`
@@ -2990,6 +3124,137 @@ fn main() {{
             .to_string()
     }
 
+    fn rust_push_entry(wire_lit: &str, value: &str) -> String {
+        let value = if value.len() > 78 {
+            Self::blockify_array_closure(value)
+        } else {
+            value.to_string()
+        };
+        let one_line = format!("    csil_entries.push((cbor_text({wire_lit}), {value}));\n");
+        let tuple_width = format!("cbor_text({wire_lit}), {value}").len();
+        if !value.contains('\n') && tuple_width <= 60 {
+            return one_line;
+        }
+
+        let mut out = format!("    csil_entries.push((\n        cbor_text({wire_lit}),\n");
+        if value.contains('\n') {
+            let lines: Vec<&str> = value.lines().collect();
+            for (idx, line) in lines.iter().enumerate() {
+                out.push_str("        ");
+                out.push_str(line);
+                if idx + 1 == lines.len() {
+                    out.push(',');
+                }
+                out.push('\n');
+            }
+        } else {
+            out.push_str("        ");
+            out.push_str(&value);
+            out.push_str(",\n");
+        }
+        out.push_str("    ));\n");
+        out
+    }
+
+    fn rust_struct_ok(name: &str, members: &[String]) -> String {
+        if members.is_empty() {
+            return format!("    Ok({name} {{}})\n");
+        }
+
+        let one_line = format!("    Ok({name} {{ {} }})\n", members.join(", "));
+        if format!("{{ {} }}", members.join(", ")).len() <= 22 {
+            return one_line;
+        }
+
+        let mut out = format!("    Ok({name} {{\n");
+        for member in members {
+            out.push_str(&format!("        {member},\n"));
+        }
+        out.push_str("    })\n");
+        out
+    }
+
+    fn rust_fn_header(name: &str, arg: &str, ret: &str) -> String {
+        let one_line =
+            format!("fn {name}({arg}: &CsilCborValue) -> Result<{ret}, CsilCborError> {{\n");
+        if one_line.trim_end().len() <= 100 {
+            return one_line;
+        }
+        format!("fn {name}(\n    {arg}: &CsilCborValue,\n) -> Result<{ret}, CsilCborError> {{\n")
+    }
+
+    fn rust_pub_decode_header(name: &str, ret: &str) -> String {
+        let one_line =
+            format!("pub fn {name}(csil_data: &[u8]) -> Result<{ret}, CsilCborError> {{\n");
+        if one_line.trim_end().len() <= 100 {
+            return one_line;
+        }
+        format!("pub fn {name}(\n    csil_data: &[u8],\n) -> Result<{ret}, CsilCborError> {{\n")
+    }
+
+    fn rust_decode_binding(indent: &str, dec: &str) -> String {
+        let one_line = format!("{indent}let csil_decode = {dec};\n");
+        if one_line.trim_end().len() <= 100 {
+            return one_line;
+        }
+        format!("{indent}let csil_decode =\n{indent}    {dec};\n")
+    }
+
+    fn rust_client_call(
+        wire_service: &str,
+        wire_method: &str,
+        request_expr: &str,
+        dot_await: &str,
+    ) -> String {
+        if dot_await.is_empty() {
+            let one_line = format!(
+                "        let csil_resp = self.transport.call(\"{wire_service}\", \"{wire_method}\", {request_expr})?;\n"
+            );
+            if one_line.trim_end().len() <= 100 {
+                return one_line;
+            }
+
+            let chained_call = format!(
+                "                .call(\"{wire_service}\", \"{wire_method}\", {request_expr})?;\n"
+            );
+            if chained_call.trim_end().len() <= 100 {
+                return format!(
+                    "        let csil_resp =\n            self.transport\n{chained_call}"
+                );
+            }
+
+            return format!(
+                "        let csil_resp = self.transport.call(\n\
+                 \x20           \"{wire_service}\",\n\
+                 \x20           \"{wire_method}\",\n\
+                 \x20           {request_expr},\n\
+                 \x20       )?;\n"
+            );
+        }
+
+        let chained_call =
+            format!("            .call(\"{wire_service}\", \"{wire_method}\", {request_expr})\n");
+        if chained_call.trim_end().len() <= 100 {
+            return format!(
+                "        let csil_resp = self\n\
+                 \x20           .transport\n\
+                 {chained_call}\
+                 \x20           .await?;\n"
+            );
+        }
+
+        format!(
+            "        let csil_resp = self\n\
+             \x20           .transport\n\
+             \x20           .call(\n\
+             \x20               \"{wire_service}\",\n\
+             \x20               \"{wire_method}\",\n\
+             \x20               {request_expr},\n\
+             \x20           )\n\
+             \x20           .await?;\n"
+        )
+    }
+
     /// Emit the `csil_enc_<t>`/`csil_dec_<t>` pair plus the public `encode_<t>`/
     /// `decode_<t>` byte wrappers for one record. The encoder lays keys in canonical
     /// RFC 8949 order; the decoder reads by key in declaration order (irrelevant on
@@ -3017,43 +3282,68 @@ fn main() {{
 
         let snake = self.to_snake_case(name);
         let mut out = String::new();
+        let value_param = if named.is_empty() {
+            "_csil_v"
+        } else {
+            "csil_v"
+        };
+        let root_param = if named.is_empty() {
+            "_csil_root"
+        } else {
+            "csil_root"
+        };
 
         out.push_str(&format!(
             "/// Build the canonical CBOR value tree for a {name}.\n"
         ));
         out.push_str(&format!(
-            "fn csil_enc_{snake}(csil_v: &{name}) -> CsilCborValue {{\n"
+            "fn csil_enc_{snake}({value_param}: &{name}) -> CsilCborValue {{\n"
         ));
-        out.push_str(&format!(
-            "    let mut csil_entries: Vec<(CsilCborValue, CsilCborValue)> = Vec::with_capacity({});\n",
-            named.len()
-        ));
-        for (member, wire, entry) in &canonical {
-            let wire_lit = format!("{wire:?}");
-            if matches!(entry.occurrence, Some(CsilOccurrence::Optional)) {
-                // An absent optional is omitted from the map entirely (wire contract).
-                let enc =
-                    self.rust_enc_value(&entry.value_type, "csil_inner", true, records, aliases);
-                out.push_str(&format!(
-                    "    if let Some(csil_inner) = &csil_v.{member} {{\n\
-                     \x20       csil_entries.push((cbor_text({wire_lit}), {enc}));\n\
-                     \x20   }}\n"
-                ));
-            } else {
-                let place = format!("csil_v.{member}");
-                let enc = self.rust_enc_value(&entry.value_type, &place, false, records, aliases);
-                out.push_str(&format!(
-                    "    csil_entries.push((cbor_text({wire_lit}), {enc}));\n"
-                ));
+        if named.is_empty() {
+            out.push_str("    CsilCborValue::Map(Vec::new())\n}\n\n");
+        } else {
+            out.push_str(&format!(
+                "    let mut csil_entries: Vec<(CsilCborValue, CsilCborValue)> = Vec::with_capacity({});\n",
+                named.len()
+            ));
+            for (member, wire, entry) in &canonical {
+                let wire_lit = format!("{wire:?}");
+                if matches!(entry.occurrence, Some(CsilOccurrence::Optional)) {
+                    // An absent optional is omitted from the map entirely (wire contract).
+                    let enc = self.rust_enc_value(
+                        &entry.value_type,
+                        "csil_inner",
+                        true,
+                        records,
+                        aliases,
+                    );
+                    out.push_str(&format!(
+                        "    if let Some(csil_inner) = &csil_v.{member} {{\n"
+                    ));
+                    let push = Self::rust_push_entry(&wire_lit, &enc);
+                    for line in push.lines() {
+                        out.push_str("    ");
+                        out.push_str(line);
+                        out.push('\n');
+                    }
+                    out.push_str("    }\n");
+                } else {
+                    let place = format!("csil_v.{member}");
+                    let enc =
+                        self.rust_enc_value(&entry.value_type, &place, false, records, aliases);
+                    out.push_str(&Self::rust_push_entry(&wire_lit, &enc));
+                }
             }
+            out.push_str("    CsilCborValue::Map(csil_entries)\n}\n\n");
         }
-        out.push_str("    CsilCborValue::Map(csil_entries)\n}\n\n");
 
         out.push_str(&format!(
             "/// Reconstruct a {name} from a decoded CBOR value tree.\n"
         ));
-        out.push_str(&format!(
-            "fn csil_dec_{snake}(csil_root: &CsilCborValue) -> Result<{name}, CsilCborError> {{\n"
+        out.push_str(&Self::rust_fn_header(
+            &format!("csil_dec_{snake}"),
+            root_param,
+            name,
         ));
         for (member, wire, entry) in &named {
             let wire_lit = format!("{wire:?}");
@@ -3064,30 +3354,35 @@ fn main() {{
             let dec = self.rust_dec_func(&entry.value_type, records, aliases);
             if matches!(entry.occurrence, Some(CsilOccurrence::Optional)) {
                 // A missing optional key leaves the field None; a present one decodes.
-                out.push_str(&format!(
-                    "    let {member} = match cbor_map_get(csil_root, {wire_lit}) {{\n\
-                     \x20       Some(csil_field) => {{\n\
-                     \x20           let csil_decode = {dec};\n\
-                     \x20           Some(csil_decode(csil_field)?)\n\
-                     \x20       }}\n\
+                let map_get = format!("cbor_map_get(csil_root, {wire_lit})");
+                if format!("    let {member} = match {map_get} {{").len() <= 100 {
+                    out.push_str(&format!("    let {member} = match {map_get} {{\n"));
+                } else {
+                    out.push_str(&format!("    let {member} = match {map_get}\n    {{\n"));
+                }
+                out.push_str("        Some(csil_field) => {\n");
+                out.push_str(&Self::rust_decode_binding("            ", &dec));
+                out.push_str(
+                    "            Some(csil_decode(csil_field)?)\n\
+                     \x20       }\n\
                      \x20       None => None,\n\
-                     \x20   }};\n"
-                ));
+                     \x20   };\n",
+                );
             } else {
                 out.push_str(&format!(
                     "    let {member} = {{\n\
-                     \x20       let csil_field = cbor_require(csil_root, {wire_lit})?;\n\
-                     \x20       let csil_decode = {dec};\n\
-                     \x20       csil_decode(csil_field)?\n\
-                     \x20   }};\n"
+                     \x20       let csil_field = cbor_require(csil_root, {wire_lit})?;\n"
                 ));
+                out.push_str(&Self::rust_decode_binding("        ", &dec));
+                out.push_str(
+                    "        csil_decode(csil_field)?\n\
+                     \x20   };\n",
+                );
             }
         }
-        out.push_str(&format!("    Ok({name} {{\n"));
-        for (member, _, _) in &named {
-            out.push_str(&format!("        {member},\n"));
-        }
-        out.push_str("    })\n}\n\n");
+        let members: Vec<String> = named.iter().map(|(member, _, _)| member.clone()).collect();
+        out.push_str(&Self::rust_struct_ok(name, &members));
+        out.push_str("}\n\n");
 
         out.push_str(&format!(
             "/// Encode a {name} to canonical CSIL CBOR bytes.\n"
@@ -3098,10 +3393,12 @@ fn main() {{
         out.push_str(&format!(
             "/// Decode canonical CSIL CBOR bytes into a {name}.\n"
         ));
+        out.push_str(&Self::rust_pub_decode_header(
+            &format!("decode_{snake}"),
+            name,
+        ));
         out.push_str(&format!(
-            "pub fn decode_{snake}(csil_data: &[u8]) -> Result<{name}, CsilCborError> {{\n\
-             \x20   let csil_root = cbor_decode(csil_data)?;\n\
-             \x20   csil_dec_{snake}(&csil_root)\n}}\n\n"
+            "    let csil_root = cbor_decode(csil_data)?;\n    csil_dec_{snake}(&csil_root)\n}}\n\n"
         ));
         out
     }
@@ -3167,13 +3464,14 @@ fn main() {{
         let rust_type = self.map_type_to_rust(ty, &None)?;
         let enc = self.rust_enc_value(ty, "csil_v", true, records, aliases);
         let dec = self.rust_dec_func(ty, records, aliases);
+        let decode_binding = Self::rust_decode_binding("    ", &dec);
         Ok(format!(
             "/// Encode the {helper} payload to canonical CSIL CBOR bytes.\n\
              pub fn encode_{helper}(csil_v: &{rust_type}) -> Vec<u8> {{\n    cbor_encode(&{enc})\n}}\n\n\
              /// Decode canonical CSIL CBOR bytes into the {helper} payload.\n\
              pub fn decode_{helper}(csil_data: &[u8]) -> Result<{rust_type}, CsilCborError> {{\n\
              \x20   let csil_root = cbor_decode(csil_data)?;\n\
-             \x20   let csil_decode = {dec};\n\
+             {decode_binding}\
              \x20   csil_decode(&csil_root)\n}}\n\n"
         ))
     }
@@ -3246,9 +3544,15 @@ fn main() {{
         ));
         for (i, choice) in choices.iter().enumerate() {
             let enc = self.rust_enc_value(choice, "csil_x", true, records, aliases);
-            out.push_str(&format!(
-                "        {name}::Variant{i}(csil_x) => CsilCborValue::Array(vec![CsilCborValue::Uint({i}), {enc}]),\n"
-            ));
+            let value = format!("CsilCborValue::Array(vec![CsilCborValue::Uint({i}), {enc}])");
+            let one_line = format!("        {name}::Variant{i}(csil_x) => {value},\n");
+            if !value.contains('\n') && one_line.trim_end().len() <= 100 {
+                out.push_str(&one_line);
+            } else {
+                out.push_str(&format!(
+                    "        {name}::Variant{i}(csil_x) => {{\n            {value}\n        }}\n"
+                ));
+            }
         }
         out.push_str("    }\n}\n\n");
 
@@ -3257,25 +3561,34 @@ fn main() {{
              fn csil_dec_{snake}(csil_v: &CsilCborValue) -> Result<{name}, CsilCborError> {{\n\
              \x20   let csil_arr = match csil_v {{\n\
              \x20       CsilCborValue::Array(csil_a) => csil_a,\n\
-             \x20       _ => return Err(CsilCborError(\"csil cbor: union expects a 2-element array\".to_string())),\n\
+             \x20       _ => {{\n\
+             \x20           return Err(CsilCborError(\n\
+             \x20               \"csil cbor: union expects a 2-element array\".to_string(),\n\
+             \x20           ))\n\
+             \x20       }}\n\
              \x20   }};\n\
              \x20   if csil_arr.len() != 2 {{\n\
-             \x20       return Err(CsilCborError(format!(\"csil cbor: union array has {{}} elements, expected 2\", csil_arr.len())));\n\
+             \x20       return Err(CsilCborError(format!(\n\
+             \x20           \"csil cbor: union array has {{}} elements, expected 2\",\n\
+             \x20           csil_arr.len()\n\
+             \x20       )));\n\
              \x20   }}\n\
              \x20   let csil_idx = cbor_as_u64(&csil_arr[0])?;\n\
              \x20   match csil_idx {{\n"
         ));
         for (i, choice) in choices.iter().enumerate() {
             let dec = self.rust_dec_func(choice, records, aliases);
+            out.push_str(&format!("        {i} => {{\n"));
+            out.push_str(&Self::rust_decode_binding("            ", &dec));
             out.push_str(&format!(
-                "        {i} => {{\n\
-                 \x20           let csil_decode = {dec};\n\
-                 \x20           Ok({name}::Variant{i}(csil_decode(&csil_arr[1])?))\n\
+                "            Ok({name}::Variant{i}(csil_decode(&csil_arr[1])?))\n\
                  \x20       }}\n"
             ));
         }
         out.push_str(&format!(
-            "        csil_other => Err(CsilCborError(format!(\"csil cbor: unknown {name} variant {{csil_other}}\"))),\n    }}\n}}\n\n"
+            "        csil_other => Err(CsilCborError(format!(\n\
+             \x20           \"csil cbor: unknown {name} variant {{csil_other}}\"\n\
+             \x20       ))),\n    }}\n}}\n\n"
         ));
         out
     }
@@ -3449,12 +3762,19 @@ fn main() {{
                     // request parameter rather than a meaningless `input: ()`.
                     if is_null_input(&operation.input_type) {
                         content.push_str(&format!(
-                            "    fn {op_name}(&self, ctx: &Self::Context) -> Result<{output_type}, ServiceError>;\n",
+                            "    fn {op_name}(\n\
+                             \x20       &self,\n\
+                             \x20       ctx: &Self::Context,\n\
+                             \x20   ) -> Result<{output_type}, ServiceError>;\n",
                         ));
                     } else {
                         let input_type = self.map_type_to_rust(&operation.input_type, &None)?;
                         content.push_str(&format!(
-                            "    fn {op_name}(&self, ctx: &Self::Context, input: {input_type}) -> Result<{output_type}, ServiceError>;\n",
+                            "    fn {op_name}(\n\
+                             \x20       &self,\n\
+                             \x20       ctx: &Self::Context,\n\
+                             \x20       input: {input_type},\n\
+                             \x20   ) -> Result<{output_type}, ServiceError>;\n",
                         ));
                     }
                 }
@@ -3468,12 +3788,19 @@ fn main() {{
                     // omit the `msg` parameter rather than emit `msg: ()`.
                     if is_null_input(&operation.input_type) {
                         content.push_str(&format!(
-                            "    fn {op_name}(&self, ctx: &Self::Context) -> Result<(), ServiceError>;\n",
+                            "    fn {op_name}(\n\
+                             \x20       &self,\n\
+                             \x20       ctx: &Self::Context,\n\
+                             \x20   ) -> Result<(), ServiceError>;\n",
                         ));
                     } else {
                         let input_type = self.map_type_to_rust(&operation.input_type, &None)?;
                         content.push_str(&format!(
-                            "    fn {op_name}(&self, ctx: &Self::Context, msg: {input_type}) -> Result<(), ServiceError>;\n",
+                            "    fn {op_name}(\n\
+                             \x20       &self,\n\
+                             \x20       ctx: &Self::Context,\n\
+                             \x20       msg: {input_type},\n\
+                             \x20   ) -> Result<(), ServiceError>;\n",
                         ));
                     }
                 }
@@ -3564,35 +3891,51 @@ fn main() {{
             .iter()
             .filter(|op| matches!(op.direction, CsilServiceDirection::Bidirectional))
             .collect();
+        let arms: Vec<String> = inbound_ops
+            .iter()
+            .filter_map(|op| {
+                let wire = Self::pascal_case(&op.name);
+                self.channel_route_arm(op, &format!("\"{wire}\""))
+            })
+            .collect();
 
         let mut content = String::new();
         let fn_name = format!("route_{}_channel", self.to_snake_case(service_name));
+        let (handlers, ctx, bytes) = if arms.is_empty() {
+            ("_handlers", "_ctx", "_bytes")
+        } else {
+            ("handlers", "ctx", "bytes")
+        };
         content.push_str(&format!(
             "/// Decode one inbound channel frame for {service_name} (with the generated\n\
              /// per-type codec) and dispatch to the matching trait method. The implementer\n\
              /// feeds raw bytes from its connection here; we never own the wire.\n\
              pub fn {fn_name}<H>(\n\
-             \x20   handlers: &H,\n\
-             \x20   ctx: &H::Context,\n\
+             \x20   {handlers}: &H,\n\
+             \x20   {ctx}: &H::Context,\n\
              \x20   method: &str,\n\
-             \x20   bytes: &[u8],\n\
+             \x20   {bytes}: &[u8],\n\
              ) -> Result<(), ServiceError>\n\
              where\n\
              \x20   H: {service_name},\n\
-             {{\n\
-             \x20   match method {{\n"
+             {{\n"
         ));
-        for op in &inbound_ops {
-            let wire = Self::pascal_case(&op.name);
-            if let Some(arm) = self.channel_route_arm(op, &format!("\"{wire}\"")) {
+        if arms.is_empty() {
+            content.push_str("    Err(ServiceError {\n");
+            content.push_str("        code: 404,\n");
+            content.push_str("        message: format!(\"unknown channel {method}\"),\n");
+            content.push_str("    })\n");
+        } else {
+            content.push_str("    match method {\n");
+            for arm in arms {
                 content.push_str(&arm);
             }
+            content.push_str("        other => Err(ServiceError {\n");
+            content.push_str("            code: 404,\n");
+            content.push_str("            message: format!(\"unknown channel {other}\"),\n");
+            content.push_str("        }),\n");
+            content.push_str("    }\n");
         }
-        content.push_str("        other => Err(ServiceError {\n");
-        content.push_str("            code: 404,\n");
-        content.push_str("            message: format!(\"unknown channel {other}\"),\n");
-        content.push_str("        }),\n");
-        content.push_str("    }\n");
         content.push_str("}\n");
         Ok(content)
     }
@@ -3616,9 +3959,21 @@ fn main() {{
             .iter()
             .filter(|op| matches!(op.direction, CsilServiceDirection::Bidirectional))
             .collect();
+        let arms: Vec<String> = inbound_ops
+            .iter()
+            .filter_map(|op| {
+                let op_id = op.wire_id?;
+                self.channel_route_arm(op, &op_id.to_string())
+            })
+            .collect();
 
         let mut content = String::new();
         let fn_name = format!("route_{}_channel_compact", self.to_snake_case(service_name));
+        let (handlers, ctx, bytes) = if arms.is_empty() {
+            ("_handlers", "_ctx", "_bytes")
+        } else {
+            ("handlers", "ctx", "bytes")
+        };
         content.push_str(&format!(
             "/// Decode one inbound channel frame for {service_name} by its\n\
              /// `@wire-id` ordinal (compact transport profile) and dispatch to the\n\
@@ -3626,32 +3981,33 @@ fn main() {{
              /// `route_{}_channel`; the host calls whichever matches the profile\n\
              /// negotiated on the wire.\n\
              pub fn {fn_name}<H>(\n\
-             \x20   handlers: &H,\n\
-             \x20   ctx: &H::Context,\n\
+             \x20   {handlers}: &H,\n\
+             \x20   {ctx}: &H::Context,\n\
              \x20   op: u64,\n\
-             \x20   bytes: &[u8],\n\
+             \x20   {bytes}: &[u8],\n\
              ) -> Result<(), ServiceError>\n\
              where\n\
              \x20   H: {service_name},\n\
-             {{\n\
-             \x20   match op {{\n",
+             {{\n",
             self.to_snake_case(service_name)
         ));
-        for op in &inbound_ops {
-            // The all-or-nothing wire-id rule (enforced by the validator) means a
-            // bidirectional op on a wire-id-bearing service always has an ordinal.
-            let Some(op_id) = op.wire_id else {
-                continue;
-            };
-            if let Some(arm) = self.channel_route_arm(op, &op_id.to_string()) {
+        if arms.is_empty() {
+            content.push_str("    Err(ServiceError {\n");
+            content.push_str("        code: 404,\n");
+            content.push_str("        message: format!(\"unknown channel ordinal {op}\"),\n");
+            content.push_str("    })\n");
+        } else {
+            content.push_str("    match op {\n");
+            for arm in arms {
                 content.push_str(&arm);
             }
+            content.push_str("        other => Err(ServiceError {\n");
+            content.push_str("            code: 404,\n");
+            content
+                .push_str("            message: format!(\"unknown channel ordinal {other}\"),\n");
+            content.push_str("        }),\n");
+            content.push_str("    }\n");
         }
-        content.push_str("        other => Err(ServiceError {\n");
-        content.push_str("            code: 404,\n");
-        content.push_str("            message: format!(\"unknown channel ordinal {other}\"),\n");
-        content.push_str("        }),\n");
-        content.push_str("    }\n");
         content.push_str("}\n");
         Ok(Some(content))
     }
@@ -4632,7 +4988,7 @@ mod tests {
         assert!(services_content.contains("pub trait UserService"));
         assert!(services_content.contains("type Context;"));
         assert!(services_content.contains(
-            "fn create_user(&self, ctx: &Self::Context, input: User) -> Result<User, ServiceError>"
+            "fn create_user(\n        &self,\n        ctx: &Self::Context,\n        input: User,\n    ) -> Result<User, ServiceError>;"
         ));
     }
 
@@ -4713,7 +5069,7 @@ mod tests {
         let mut generator = RustCodeGenerator::new(&input);
         let services = generator.generate_services().unwrap();
         assert!(services.contains(
-            "fn submit_task(&self, ctx: &Self::Context, input: SubmitTaskRequest) -> Result<SubmitTaskResponse, ServiceError>"
+            "fn submit_task(\n        &self,\n        ctx: &Self::Context,\n        input: SubmitTaskRequest,\n    ) -> Result<SubmitTaskResponse, ServiceError>;"
         ));
         assert!(!services.contains("serde_json::Value"));
     }
@@ -4743,7 +5099,7 @@ mod tests {
         ));
         // The client encodes the request, calls over the byte seam, then decodes.
         assert!(client.content.contains(
-            "let csil_resp = self.transport.call(\"corndogs\", \"SubmitTask\", &encode_submit_task_request(&req))?;"
+            "let csil_resp =\n            self.transport\n                .call(\"corndogs\", \"SubmitTask\", &encode_submit_task_request(&req))?;"
         ));
         assert!(
             client
@@ -4801,7 +5157,10 @@ mod tests {
         rules.push(alias("TaskID", text()));
         rules.push(record(
             "Member",
-            vec![field("id", r#ref("MemberID"), false), field("name", text(), false)],
+            vec![
+                field("id", r#ref("MemberID"), false),
+                field("name", text(), false),
+            ],
         ));
         rules.push(record(
             "ListMembersRequest",
@@ -4864,15 +5223,19 @@ mod tests {
 
         // Every op gets a method — scalar-id request, bare-array, scalar, and map
         // responses included, not only the record↔record op the old filter kept.
-        assert!(client.content.contains(
-            "pub fn get_member(&self, req: MemberID) -> Result<Member, ClientError>"
-        ));
+        assert!(
+            client
+                .content
+                .contains("pub fn get_member(&self, req: MemberID) -> Result<Member, ClientError>")
+        );
         assert!(client.content.contains(
             "pub fn list_members(&self, req: ListMembersRequest) -> Result<Vec<Member>, ClientError>"
         ));
-        assert!(client.content.contains(
-            "pub fn delete_task(&self, req: TaskID) -> Result<bool, ClientError>"
-        ));
+        assert!(
+            client
+                .content
+                .contains("pub fn delete_task(&self, req: TaskID) -> Result<bool, ClientError>")
+        );
         assert!(client.content.contains(
             "pub fn member_names(&self, req: ListMembersRequest) -> Result<std::collections::HashMap<String, String>, ClientError>"
         ));
@@ -4882,10 +5245,26 @@ mod tests {
         // The record boundary keeps its `encode_<t>`/`decode_<t>` wrapper byte-for-byte.
         assert!(client.content.contains("&encode_member(&req)"));
         // Non-record boundaries ride the op's per-op helpers.
-        assert!(client.content.contains("&encode_member_get_member_request(&req)"));
-        assert!(client.content.contains("decode_member_list_members_response(&csil_resp)"));
-        assert!(client.content.contains("decode_member_delete_task_response(&csil_resp)"));
-        assert!(client.content.contains("decode_member_member_names_response(&csil_resp)"));
+        assert!(
+            client
+                .content
+                .contains("&encode_member_get_member_request(&req)")
+        );
+        assert!(
+            client
+                .content
+                .contains("decode_member_list_members_response(&csil_resp)")
+        );
+        assert!(
+            client
+                .content
+                .contains("decode_member_delete_task_response(&csil_resp)")
+        );
+        assert!(
+            client
+                .content
+                .contains("decode_member_member_names_response(&csil_resp)")
+        );
 
         // The per-op helpers are exported from the codec, so a consumer-side server can
         // compose decode(request)/encode(response) for every op.
@@ -4895,14 +5274,20 @@ mod tests {
         assert!(codec.content.contains(
             "pub fn encode_member_list_members_response(csil_v: &Vec<Member>) -> Vec<u8>"
         ));
-        assert!(codec.content.contains(
-            "pub fn encode_member_delete_task_response(csil_v: &bool) -> Vec<u8>"
-        ));
+        assert!(
+            codec
+                .content
+                .contains("pub fn encode_member_delete_task_response(csil_v: &bool) -> Vec<u8>")
+        );
         assert!(codec.content.contains(
             "pub fn encode_member_member_names_response(csil_v: &std::collections::HashMap<String, String>) -> Vec<u8>"
         ));
         // The record op needs no per-op helper (its record codec already covers it).
-        assert!(!codec.content.contains("encode_member_create_member_request"));
+        assert!(
+            !codec
+                .content
+                .contains("encode_member_create_member_request")
+        );
     }
 
     #[test]
@@ -4946,7 +5331,7 @@ mod tests {
         ));
         // The seam is awaited before its `?`.
         assert!(twin.content.contains(
-            "let csil_resp = self.transport.call(\"corndogs\", \"SubmitTask\", &encode_submit_task_request(&req)).await?;"
+            ".call(\"corndogs\", \"SubmitTask\", &encode_submit_task_request(&req))\n            .await?;"
         ));
         // The twin must not redefine the shared error type.
         assert!(!twin.content.contains("pub enum ClientError"));
@@ -4990,7 +5375,7 @@ mod tests {
         assert!(client.content.contains(
             "pub async fn submit_task(&self, req: SubmitTaskRequest) -> Result<SubmitTaskResponse, ClientError>"
         ));
-        assert!(client.content.contains(").await?;"));
+        assert!(client.content.contains(".await?;"));
         // No `Async`-marked symbols in the drop-in shape.
         assert!(!client.content.contains("AsyncClient"));
         assert!(!client.content.contains("AsyncTransport"));
@@ -5181,11 +5566,11 @@ mod tests {
         let services_content = generator.generate_services().unwrap();
 
         assert!(services_content.contains(
-            "fn create_entry(&self, ctx: &Self::Context, input: User) -> Result<User, ServiceError>"
+            "fn create_entry(\n        &self,\n        ctx: &Self::Context,\n        input: User,\n    ) -> Result<User, ServiceError>;"
         ));
         assert!(!services_content.contains("fn create-entry("));
         assert!(services_content.contains(
-            "fn list_entries(&self, ctx: &Self::Context, input: User) -> Result<User, ServiceError>"
+            "fn list_entries(\n        &self,\n        ctx: &Self::Context,\n        input: User,\n    ) -> Result<User, ServiceError>;"
         ));
         // Unidirectional ops get a generic (request/response) doc when the CSIL
         // has no `;;;` doc comments on the operation itself.
@@ -5260,12 +5645,12 @@ mod tests {
 
         // Unidirectional kept as request/response.
         assert!(services.contains(
-            "fn list_events(&self, ctx: &Self::Context, input: User) -> Result<User, ServiceError>"
+            "fn list_events(\n        &self,\n        ctx: &Self::Context,\n        input: User,\n    ) -> Result<User, ServiceError>;"
         ));
 
         // Bidirectional is a fire-and-forget inbound handler (no return value).
         assert!(services.contains(
-            "fn play(&self, ctx: &Self::Context, msg: User) -> Result<(), ServiceError>"
+            "fn play(\n        &self,\n        ctx: &Self::Context,\n        msg: User,\n    ) -> Result<(), ServiceError>;"
         ));
 
         // Router decodes the inbound bytes with the per-type codec and dispatches by
@@ -6852,7 +7237,7 @@ mod tests {
             .unwrap();
         assert!(
             services.contains(
-                "fn heartbeat(&self, ctx: &Self::Context) -> Result<Pong, ServiceError>;"
+                "fn heartbeat(\n        &self,\n        ctx: &Self::Context,\n    ) -> Result<Pong, ServiceError>;"
             ),
             "null-input op must omit the `input` parameter, got:\n{services}"
         );
@@ -7303,7 +7688,8 @@ mod tests {
         );
         assert!(codec.content.contains("cbor_int(*csil_inner)"));
         // map<text,int> and list<text> route through the generic helpers.
-        assert!(codec.content.contains("cbor_enc_map(&csil_v.labels,"));
+        assert!(codec.content.contains("cbor_enc_map("));
+        assert!(codec.content.contains("&csil_v.labels"));
         assert!(codec.content.contains("cbor_enc_array(&csil_v.tags,"));
 
         // Keys are laid down in canonical (encoded-key) order: within Task the len-4
@@ -7327,6 +7713,138 @@ mod tests {
                 .content
                 .contains("#[derive(Debug, Clone, PartialEq, Serialize")
         );
+    }
+
+    #[test]
+    fn generated_rust_is_rustfmt_and_clippy_clean() {
+        let cargo_probe = std::process::Command::new("cargo")
+            .arg("--version")
+            .output();
+        let rustfmt_probe = std::process::Command::new("rustfmt")
+            .arg("--version")
+            .output();
+        if cargo_probe.map(|o| !o.status.success()).unwrap_or(true)
+            || rustfmt_probe.map(|o| !o.status.success()).unwrap_or(true)
+        {
+            eprintln!("skipping: cargo or rustfmt not on PATH");
+            return;
+        }
+
+        let mut input = corndogs_client_input();
+        input.config.options.insert(
+            "module_root_filename".to_string(),
+            serde_json::Value::String("lib.rs".to_string()),
+        );
+        input.csil_spec.rules.push(CsilRule {
+            name: "EmptyRequest".to_string(),
+            rule_type: CsilRuleType::GroupDef(CsilGroupExpression { entries: vec![] }),
+            position: CsilPosition {
+                line: 1,
+                column: 1,
+                offset: 0,
+            },
+            doc_comments: Vec::new(),
+        });
+        input.csil_spec.rules.push(CsilRule {
+            name: "CheckValue".to_string(),
+            rule_type: CsilRuleType::TypeDef(CsilTypeExpression::Choice(vec![
+                CsilTypeExpression::Builtin("text".to_string()),
+                CsilTypeExpression::Builtin("int".to_string()),
+                CsilTypeExpression::Builtin("float".to_string()),
+            ])),
+            position: CsilPosition {
+                line: 1,
+                column: 1,
+                offset: 0,
+            },
+            doc_comments: Vec::new(),
+        });
+        input.csil_spec.rules.push(CsilRule {
+            name: "CheckResult".to_string(),
+            rule_type: CsilRuleType::GroupDef(CsilGroupExpression {
+                entries: vec![
+                    CsilGroupEntry {
+                        key: Some(CsilGroupKey::Bare("result".to_string())),
+                        value_type: CsilTypeExpression::Builtin("bool".to_string()),
+                        occurrence: None,
+                        metadata: vec![],
+                        doc_comments: Vec::new(),
+                    },
+                    CsilGroupEntry {
+                        key: Some(CsilGroupKey::Bare("entries".to_string())),
+                        value_type: CsilTypeExpression::Map {
+                            key: Box::new(CsilTypeExpression::Builtin("text".to_string())),
+                            value: Box::new(CsilTypeExpression::Reference(
+                                "CheckValue".to_string(),
+                            )),
+                            occurrence: None,
+                        },
+                        occurrence: None,
+                        metadata: vec![],
+                        doc_comments: Vec::new(),
+                    },
+                ],
+            }),
+            position: CsilPosition {
+                line: 1,
+                column: 1,
+                offset: 0,
+            },
+            doc_comments: Vec::new(),
+        });
+
+        let files = RustCodeGenerator::new(&input).generate().unwrap();
+        let dir = std::env::temp_dir().join(format!("csilgen-rust-tooling-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let src = dir.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        let mut rust_paths = Vec::new();
+        for file in &files {
+            let path = src.join(&file.path);
+            std::fs::write(&path, &file.content).unwrap();
+            if file.path.ends_with(".rs") {
+                rust_paths.push(path);
+            }
+        }
+        std::fs::write(
+            dir.join("Cargo.toml"),
+            "[package]\nname = \"csiltoolingclean\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\n[workspace]\n\n[dependencies]\n",
+        )
+        .unwrap();
+
+        let rustfmt = std::process::Command::new("rustfmt")
+            .arg("--check")
+            .arg("--edition")
+            .arg("2021")
+            .args(&rust_paths)
+            .output()
+            .unwrap();
+        assert!(
+            rustfmt.status.success(),
+            "rustfmt failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&rustfmt.stdout),
+            String::from_utf8_lossy(&rustfmt.stderr)
+        );
+
+        let clippy = std::process::Command::new("cargo")
+            .arg("clippy")
+            .arg("--quiet")
+            .arg("--all-targets")
+            .arg("--")
+            .arg("-D")
+            .arg("warnings")
+            .current_dir(&dir)
+            .env("CARGO_TARGET_DIR", dir.join("target"))
+            .env("CARGO_NET_OFFLINE", "true")
+            .output()
+            .unwrap();
+        assert!(
+            clippy.status.success(),
+            "clippy failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&clippy.stdout),
+            String::from_utf8_lossy(&clippy.stderr)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Compile the generated codec + typed client and round-trip a corndogs request
