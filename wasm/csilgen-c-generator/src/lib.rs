@@ -1122,6 +1122,7 @@ fn emit_enc_value(
         CsilTypeExpression::Reference(name) if scope.aliases.contains_key(name) => {
             emit_enc_value(out, indent, &scope.aliases[name], expr, scope, warnings);
         }
+        CsilTypeExpression::Literal(value) => emit_enc_literal(out, indent, value, warnings),
         CsilTypeExpression::Reference(name) => {
             warnings.push(GeneratorWarning {
                 message: format!("c codec: `{name}` has no generated codec; encoded as null"),
@@ -1202,6 +1203,9 @@ fn emit_dec_value(
         CsilTypeExpression::Reference(name) if scope.aliases.contains_key(name) => {
             emit_dec_value(out, indent, &scope.aliases[name], src, dst, scope, warnings);
         }
+        CsilTypeExpression::Literal(value) => {
+            emit_dec_literal(out, indent, value, src, dst, warnings);
+        }
         CsilTypeExpression::Reference(name) => {
             warnings.push(GeneratorWarning {
                 message: format!("c codec: `{name}` has no generated codec; left zero on decode"),
@@ -1213,6 +1217,108 @@ fn emit_dec_value(
             warnings.push(GeneratorWarning {
                 message: "c codec: unrepresentable nested value left zero on decode".to_string(),
                 level: WarningLevel::Warning, location: None, suggestion: None,
+            });
+            out.push_str(&format!("{indent}(void)({src});\n"));
+        }
+    }
+}
+
+fn emit_enc_literal(
+    out: &mut String,
+    indent: &str,
+    value: &CsilLiteralValue,
+    warnings: &mut Vec<GeneratorWarning>,
+) {
+    match value {
+        CsilLiteralValue::Integer(i) if *i >= 0 => out.push_str(&format!(
+            "{indent}if (csilc_w_uint(b, (uint64_t){i})) return -1;\n"
+        )),
+        CsilLiteralValue::Integer(i) => out.push_str(&format!(
+            "{indent}if (csilc_w_int(b, (int64_t){i})) return -1;\n"
+        )),
+        CsilLiteralValue::Float(f) => out.push_str(&format!(
+            "{indent}if (csilc_w_f64(b, (double){f})) return -1;\n"
+        )),
+        CsilLiteralValue::Text(s) => out.push_str(&format!(
+            "{indent}if (csilc_w_text(b, \"{}\", {})) return -1;\n",
+            c_escape(s),
+            s.len()
+        )),
+        CsilLiteralValue::Bool(b) => {
+            out.push_str(&format!("{indent}if (csilc_w_bool(b, {b})) return -1;\n"))
+        }
+        CsilLiteralValue::Null => {
+            out.push_str(&format!("{indent}if (csilc_w_null(b)) return -1;\n"));
+        }
+        CsilLiteralValue::Bytes(bytes) => {
+            let values = bytes
+                .iter()
+                .map(|b| format!("0x{b:02x}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            out.push_str(&format!(
+                "{indent}{{ static const uint8_t csilc_lit[] = {{ {values} }}; if (csilc_w_bytes(b, csilc_lit, {})) return -1; }}\n",
+                bytes.len()
+            ));
+        }
+        CsilLiteralValue::Array(_) => {
+            warnings.push(GeneratorWarning {
+                message: "c codec: array literal encoded as null".to_string(),
+                level: WarningLevel::Warning,
+                location: None,
+                suggestion: None,
+            });
+            out.push_str(&format!("{indent}if (csilc_w_null(b)) return -1;\n"));
+        }
+    }
+}
+
+fn emit_dec_literal(
+    out: &mut String,
+    indent: &str,
+    value: &CsilLiteralValue,
+    src: &str,
+    dst: &str,
+    warnings: &mut Vec<GeneratorWarning>,
+) {
+    match value {
+        CsilLiteralValue::Integer(i) if *i >= 0 => out.push_str(&format!(
+            "{indent}{{ uint64_t csilc_lit; if (!csilc_as_u64({src}, &csilc_lit) || csilc_lit != (uint64_t){i}) return -1; ({dst}) = (int64_t){i}; }}\n"
+        )),
+        CsilLiteralValue::Integer(i) => out.push_str(&format!(
+            "{indent}{{ int64_t csilc_lit; if (!csilc_as_i64({src}, &csilc_lit) || csilc_lit != (int64_t){i}) return -1; ({dst}) = (int64_t){i}; }}\n"
+        )),
+        CsilLiteralValue::Float(f) => out.push_str(&format!(
+            "{indent}{{ double csilc_lit; if (!csilc_as_f64({src}, &csilc_lit) || csilc_lit != (double){f}) return -1; ({dst}) = (double){f}; }}\n"
+        )),
+        CsilLiteralValue::Text(s) => out.push_str(&format!(
+            "{indent}{{ char *csilc_lit; if (!csilc_get_text({src}, &csilc_lit) || strcmp(csilc_lit, \"{}\") != 0) return -1; ({dst}) = csilc_lit; }}\n",
+            c_escape(s)
+        )),
+        CsilLiteralValue::Bool(b) => out.push_str(&format!(
+            "{indent}{{ bool csilc_lit; if (!csilc_as_bool({src}, &csilc_lit) || csilc_lit != {b}) return -1; ({dst}) = {b}; }}\n"
+        )),
+        CsilLiteralValue::Null => out.push_str(&format!(
+            "{indent}if (!({src}) || ({src})->kind != CSILC_NULL) return -1; ({dst}) = NULL;\n"
+        )),
+        CsilLiteralValue::Bytes(bytes) => {
+            let values = bytes
+                .iter()
+                .map(|b| format!("0x{b:02x}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            out.push_str(&format!(
+                "{indent}{{ static const uint8_t csilc_lit[] = {{ {values} }}; uint8_t *csilc_bytes; size_t csilc_len; if (!csilc_get_bytes({src}, &csilc_bytes, &csilc_len) || csilc_len != {} || memcmp(csilc_bytes, csilc_lit, {}) != 0) return -1; ({dst}).data = csilc_bytes; ({dst}).len = csilc_len; }}\n",
+                bytes.len(),
+                bytes.len()
+            ));
+        }
+        CsilLiteralValue::Array(_) => {
+            warnings.push(GeneratorWarning {
+                message: "c codec: array literal left zero on decode".to_string(),
+                level: WarningLevel::Warning,
+                location: None,
+                suggestion: None,
             });
             out.push_str(&format!("{indent}(void)({src});\n"));
         }
@@ -2667,6 +2773,14 @@ fn base_c_type(type_expr: &CsilTypeExpression, config: &CConfig) -> String {
             // own decoded value-tree node so it re-encodes byte-identically.
             "any" => "const csilc_value *".to_string(),
             other => other.to_string(),
+        },
+        CsilTypeExpression::Literal(value) => match value {
+            CsilLiteralValue::Integer(_) => "int64_t".to_string(),
+            CsilLiteralValue::Float(_) => "double".to_string(),
+            CsilLiteralValue::Text(_) => "char *".to_string(),
+            CsilLiteralValue::Bytes(_) => "CsilBytes".to_string(),
+            CsilLiteralValue::Bool(_) => "bool".to_string(),
+            CsilLiteralValue::Null | CsilLiteralValue::Array(_) => "void *".to_string(),
         },
         CsilTypeExpression::Reference(name) => name.clone(),
         CsilTypeExpression::Array { element_type, .. } => {

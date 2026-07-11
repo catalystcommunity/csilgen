@@ -10,9 +10,8 @@ use csilgen_common::{
     CsilControlOperator, CsilFieldMetadata, CsilGroupEntry, CsilGroupExpression, CsilGroupKey,
     CsilLiteralValue, CsilOccurrence, CsilRuleType, CsilServiceDefinition, CsilServiceDirection,
     CsilServiceOperation, CsilSizeConstraint, CsilTypeExpression, CsilValidationConstraint,
-    GeneratedFile,
-    GenerationStats, GeneratorCapability, GeneratorMetadata, GeneratorWarning, WarningLevel,
-    WasmGeneratorInput, WasmGeneratorOutput, wasm_interface::*,
+    GeneratedFile, GenerationStats, GeneratorCapability, GeneratorMetadata, GeneratorWarning,
+    WarningLevel, WasmGeneratorInput, WasmGeneratorOutput, wasm_interface::*,
 };
 use std::collections::HashMap;
 
@@ -1394,7 +1393,9 @@ fn generate_client(
     let mut emitted = false;
     for rule in &input.csil_spec.rules {
         if let CsilRuleType::ServiceDef(service) = &rule.rule_type {
-            emit_client_class(&mut body, &rule.name, service, &records, &named, &aliases, shape);
+            emit_client_class(
+                &mut body, &rule.name, service, &records, &named, &aliases, shape,
+            );
             emitted = true;
         }
     }
@@ -1440,7 +1441,8 @@ fn emit_client_class(
         }
         let success = success_type(&operation.output_type);
         let null_input = op_input_is_null(&operation.input_type);
-        let req_ok = null_input || kotlin_op_boundary_expressible(&operation.input_type, named, aliases);
+        let req_ok =
+            null_input || kotlin_op_boundary_expressible(&operation.input_type, named, aliases);
         // Only a genuinely inexpressible boundary (an inline multi-variant choice with no
         // wire discriminator, or an unmodeled reference) is skipped now; scalar/array/map/
         // tuple/union shapes ride the per-op codec helpers, so every other op gets a method.
@@ -1882,6 +1884,7 @@ fn kotlin_enc_value(
         CsilTypeExpression::Choice(choices) if choice_is_stringy(choices) => {
             format!("CborValue.CText({expr})")
         }
+        CsilTypeExpression::Literal(lit) => kotlin_literal_cbor_expr(lit),
         _ => "CborValue.CNull".to_string(),
     }
 }
@@ -1949,6 +1952,11 @@ fn kotlin_dec_value(
         }
         CsilTypeExpression::Choice(choices) if choice_is_stringy(choices) => {
             format!("CsilCbor.asText({expr})")
+        }
+        CsilTypeExpression::Literal(lit) => {
+            let expected = kotlin_literal_cbor_expr(lit);
+            let value = kotlin_literal_value_expr(lit);
+            format!("CsilCbor.expectLiteral({expr}, {expected}, {value})")
         }
         _ => format!("CsilCbor.asText({expr})"),
     }
@@ -2327,7 +2335,8 @@ fn emit_op_codecs(
             }
             let success = success_type(&op.output_type);
             let null_input = op_input_is_null(&op.input_type);
-            let req_ok = null_input || kotlin_op_boundary_expressible(&op.input_type, named, aliases);
+            let req_ok =
+                null_input || kotlin_op_boundary_expressible(&op.input_type, named, aliases);
             if !req_ok || !kotlin_op_boundary_expressible(&success, named, aliases) {
                 continue;
             }
@@ -2647,6 +2656,11 @@ object CsilCbor {
 
     fun require(v: CborValue, key: String): CborValue =
         mapGet(v, key) ?: throw CborError("missing field '$key'")
+
+    fun <T> expectLiteral(actual: CborValue, expected: CborValue, value: T): T {
+        if (actual != expected) throw CborError("literal mismatch")
+        return value
+    }
 
     fun asLong(v: CborValue): Long = when (v) {
         is CborValue.CUint -> {
@@ -3152,6 +3166,15 @@ fn map_csil_type_to_kotlin(
         }
         // Kotlin has no anonymous tuple; a fixed-shape array degrades to List<Any?>.
         CsilTypeExpression::Tuple(_) => "List<Any?>".to_string(),
+        CsilTypeExpression::Literal(lit) => match lit {
+            CsilLiteralValue::Integer(_) => "Long".to_string(),
+            CsilLiteralValue::Float(_) => "Double".to_string(),
+            CsilLiteralValue::Text(_) => "String".to_string(),
+            CsilLiteralValue::Bool(_) => "Boolean".to_string(),
+            CsilLiteralValue::Bytes(_) => "ByteArray".to_string(),
+            CsilLiteralValue::Null => "Unit".to_string(),
+            CsilLiteralValue::Array(_) => "Any".to_string(),
+        },
         CsilTypeExpression::Choice(choices) => {
             let reduced = success_type(&CsilTypeExpression::Choice(choices.clone()));
             match reduced {
@@ -3208,11 +3231,53 @@ fn literal_to_kotlin(value: &CsilLiteralValue) -> String {
         CsilLiteralValue::Text(s) => format!("\"{}\"", kotlin_escape(s)),
         CsilLiteralValue::Bool(b) => b.to_string(),
         CsilLiteralValue::Null => "null".to_string(),
-        CsilLiteralValue::Bytes(_) => "ByteArray(0)".to_string(),
+        CsilLiteralValue::Bytes(bytes) => {
+            let values = bytes
+                .iter()
+                .map(|b| format!("{b}.toByte()"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("byteArrayOf({values})")
+        }
         CsilLiteralValue::Array(elements) => {
             let inner: Vec<String> = elements.iter().map(literal_to_kotlin).collect();
             format!("listOf({})", inner.join(", "))
         }
+    }
+}
+
+fn kotlin_literal_cbor_expr(value: &CsilLiteralValue) -> String {
+    match value {
+        CsilLiteralValue::Integer(i) if *i >= 0 => format!("CborValue.CUint({i}uL)"),
+        CsilLiteralValue::Integer(i) => format!("CborValue.CInt({i}L)"),
+        CsilLiteralValue::Float(f) => format!("CborValue.CFloat({f})"),
+        CsilLiteralValue::Text(s) => format!("CborValue.CText(\"{}\")", kotlin_escape(s)),
+        CsilLiteralValue::Bool(b) => format!("CborValue.CBool({b})"),
+        CsilLiteralValue::Null => "CborValue.CNull".to_string(),
+        CsilLiteralValue::Bytes(bytes) => {
+            let values = bytes
+                .iter()
+                .map(|b| format!("{b}.toByte()"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("CborValue.CBytes(byteArrayOf({values}))")
+        }
+        CsilLiteralValue::Array(items) => {
+            let values = items
+                .iter()
+                .map(kotlin_literal_cbor_expr)
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("CborValue.CArray(listOf({values}))")
+        }
+    }
+}
+
+fn kotlin_literal_value_expr(value: &CsilLiteralValue) -> String {
+    match value {
+        CsilLiteralValue::Integer(i) => format!("{i}L"),
+        CsilLiteralValue::Null => "Unit".to_string(),
+        other => literal_to_kotlin(other),
     }
 }
 
@@ -4442,7 +4507,11 @@ mod tests {
             ],
         });
         let list_req = CsilRuleType::GroupDef(CsilGroupExpression {
-            entries: vec![entry("limit", builtin("uint"), Some(CsilOccurrence::Optional))],
+            entries: vec![entry(
+                "limit",
+                builtin("uint"),
+                Some(CsilOccurrence::Optional),
+            )],
         });
         let member_array = CsilTypeExpression::Array {
             element_type: Box::new(reference("Member")),
@@ -4510,7 +4579,9 @@ mod tests {
         assert!(client.contains("fun getMember(request: MemberID): Member"));
         assert!(client.contains("fun listMembers(request: ListMembersRequest): List<Member>"));
         assert!(client.contains("fun deleteTask(request: TaskID): Boolean"));
-        assert!(client.contains("fun memberNames(request: ListMembersRequest): Map<String, String>"));
+        assert!(
+            client.contains("fun memberNames(request: ListMembersRequest): Map<String, String>")
+        );
         // No op is dropped with a note anymore.
         assert!(!client.contains("(de)serialize it manually"));
         // A record boundary keeps the generic `encode`/`decode<T>` path (byte-identical);
@@ -4524,9 +4595,13 @@ mod tests {
         // Per-op helpers for the non-record shapes are exported so a consumer-side server
         // can compose decode(request)/encode(response) for every op.
         assert!(codec.contains("fun decodeMemberGetMemberRequest(bytes: ByteArray): MemberID"));
-        assert!(codec.contains("fun encodeMemberListMembersResponse(value: List<Member>): ByteArray"));
+        assert!(
+            codec.contains("fun encodeMemberListMembersResponse(value: List<Member>): ByteArray")
+        );
         assert!(codec.contains("fun encodeMemberDeleteTaskResponse(value: Boolean): ByteArray"));
-        assert!(codec.contains("fun decodeMemberMemberNamesResponse(bytes: ByteArray): Map<String, String>"));
+        assert!(codec.contains(
+            "fun decodeMemberMemberNamesResponse(bytes: ByteArray): Map<String, String>"
+        ));
     }
 
     #[test]

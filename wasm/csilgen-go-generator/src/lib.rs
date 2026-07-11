@@ -7,10 +7,9 @@ use csilgen_common::{
     CsilControlOperator, CsilDependsCompareOp, CsilDependsCondition, CsilFieldMetadata,
     CsilFieldVisibility, CsilGroupEntry, CsilGroupExpression, CsilGroupKey, CsilLiteralValue,
     CsilOccurrence, CsilRuleType, CsilServiceDefinition, CsilServiceDirection,
-    CsilServiceOperation, CsilSizeConstraint,
-    CsilTypeExpression, CsilValidationConstraint, GeneratedFile, GenerationStats,
-    GeneratorCapability, GeneratorMetadata, GeneratorWarning, WarningLevel, WasmGeneratorInput,
-    WasmGeneratorOutput, wasm_interface::*,
+    CsilServiceOperation, CsilSizeConstraint, CsilTypeExpression, CsilValidationConstraint,
+    GeneratedFile, GenerationStats, GeneratorCapability, GeneratorMetadata, GeneratorWarning,
+    WarningLevel, WasmGeneratorInput, WasmGeneratorOutput, wasm_interface::*,
 };
 use std::collections::HashMap;
 
@@ -1793,6 +1792,7 @@ fn go_enc_value(
             )
         }
         CsilTypeExpression::Tuple(group) => go_tuple_enc(group, expr, records, aliases, config),
+        CsilTypeExpression::Literal(lit) => go_literal_cbor_expr(lit),
         // A type the codec cannot model precisely (`any`, an unmodeled reference) is
         // carried as null rather than emitting uncompilable code.
         _ => "cborNull{}".to_string(),
@@ -1860,6 +1860,14 @@ fn go_dec_func(
             )
         }
         CsilTypeExpression::Tuple(group) => go_tuple_dec(group, records, aliases, config),
+        CsilTypeExpression::Literal(lit) => {
+            let go_type = map_csil_type_to_go(ty, &None, config.decimal_go_type());
+            let expected = go_literal_cbor_expr(lit);
+            let value = literal_value_to_go_string(lit);
+            format!(
+                "func(csilV cborValue) ({go_type}, error) {{ if !cborEqual(csilV, {expected}) {{ var csilZero {go_type}; return csilZero, fmt.Errorf(\"csil cbor: literal mismatch\") }}; return {value}, nil }}"
+            )
+        }
         // The codec cannot reconstruct this shape; yield its zero value so the
         // generated decoder still compiles against the field's Go type.
         other => codec_zero_decoder(&map_csil_type_to_go(other, &None, config.decimal_go_type())),
@@ -2154,7 +2162,11 @@ fn go_op_boundary_expressible(
 /// The `<Base><Method>` stem shared by an op's per-op codec helpers and the client
 /// method that calls them, so the two never drift.
 fn op_codec_stem(service_name: &str, op: &CsilServiceOperation) -> String {
-    format!("{}{}", go_service_base(service_name), go_method_name(&op.name))
+    format!(
+        "{}{}",
+        go_service_base(service_name),
+        go_method_name(&op.name)
+    )
 }
 
 /// Exported per-op CBOR helpers so a server in another package can compose a
@@ -2394,6 +2406,53 @@ type cborMap []cborEntry
 type cborTag struct {
 	num   uint64
 	inner cborValue
+}
+
+func cborEqual(a, b cborValue) bool {
+	switch x := a.(type) {
+	case cborUint:
+		y, ok := b.(cborUint)
+		return ok && x == y
+	case cborInt:
+		y, ok := b.(cborInt)
+		return ok && x == y
+	case cborBool:
+		y, ok := b.(cborBool)
+		return ok && x == y
+	case cborFloat:
+		y, ok := b.(cborFloat)
+		return ok && x == y
+	case cborNull:
+		_, ok := b.(cborNull)
+		return ok
+	case cborText:
+		y, ok := b.(cborText)
+		return ok && x == y
+	case cborBytes:
+		y, ok := b.(cborBytes)
+		if !ok || len(x) != len(y) {
+			return false
+		}
+		for i := range x {
+			if x[i] != y[i] {
+				return false
+			}
+		}
+		return true
+	case cborArray:
+		y, ok := b.(cborArray)
+		if !ok || len(x) != len(y) {
+			return false
+		}
+		for i := range x {
+			if !cborEqual(x[i], y[i]) {
+				return false
+			}
+		}
+		return true
+	default:
+		return false
+	}
 }
 
 func (cborUint) isCbor()  {}
@@ -2958,7 +3017,14 @@ fn generate_client(
     let mut emitted_any = false;
     for rule in &input.csil_spec.rules {
         if let CsilRuleType::ServiceDef(service) = &rule.rule_type {
-            emit_client_struct(&mut content, &rule.name, service, config, &records, &aliases);
+            emit_client_struct(
+                &mut content,
+                &rule.name,
+                service,
+                config,
+                &records,
+                &aliases,
+            );
             emitted_any = true;
         }
     }
@@ -3018,8 +3084,8 @@ fn emit_client_struct(
         }
         let success = go_success_type(&operation.output_type);
         let null_input = op_input_is_null(&operation.input_type);
-        let req_ok =
-            null_input || go_op_boundary_expressible(&operation.input_type, records, aliases, config);
+        let req_ok = null_input
+            || go_op_boundary_expressible(&operation.input_type, records, aliases, config);
         // Only a genuinely inexpressible boundary (an inline multi-variant choice with no
         // wire discriminator, or an unmodeled reference) is skipped now; scalar/array/map
         // shapes ride the per-op codec helpers, so every other op gets a method.
@@ -4284,6 +4350,15 @@ fn map_csil_type_to_go(
         CsilTypeExpression::Tuple(group) => {
             return go_tuple_struct(&group.entries, decimal_type);
         }
+        CsilTypeExpression::Literal(lit) => match lit {
+            CsilLiteralValue::Integer(_) => "int64",
+            CsilLiteralValue::Float(_) => "float64",
+            CsilLiteralValue::Text(_) => "string",
+            CsilLiteralValue::Bool(_) => "bool",
+            CsilLiteralValue::Bytes(_) => "[]byte",
+            CsilLiteralValue::Null => "interface{}",
+            CsilLiteralValue::Array(_) => "interface{}",
+        },
         CsilTypeExpression::Constrained { base_type, .. } => {
             // Unwrap constrained types and map the base type
             // Constraints like .size, .default, .regex are validation rules, not Go types
@@ -4563,13 +4638,47 @@ fn literal_value_to_go_string(value: &CsilLiteralValue) -> String {
     match value {
         CsilLiteralValue::Integer(i) => i.to_string(),
         CsilLiteralValue::Float(f) => f.to_string(),
-        CsilLiteralValue::Text(s) => format!("\"{s}\""),
+        CsilLiteralValue::Text(s) => format!("{s:?}"),
         CsilLiteralValue::Bool(b) => b.to_string(),
         CsilLiteralValue::Null => "nil".to_string(),
-        CsilLiteralValue::Bytes(_) => "[]byte{}".to_string(),
+        CsilLiteralValue::Bytes(bytes) => {
+            let values = bytes
+                .iter()
+                .map(|b| b.to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("[]byte{{{values}}}")
+        }
         CsilLiteralValue::Array(elements) => {
             let formatted: Vec<String> = elements.iter().map(literal_value_to_go_string).collect();
-            format!("[{}]", formatted.join(", "))
+            format!("[]interface{{}}{{{}}}", formatted.join(", "))
+        }
+    }
+}
+
+fn go_literal_cbor_expr(value: &CsilLiteralValue) -> String {
+    match value {
+        CsilLiteralValue::Integer(i) if *i >= 0 => format!("cborUint({i})"),
+        CsilLiteralValue::Integer(i) => format!("cborInt({i})"),
+        CsilLiteralValue::Float(f) => format!("cborFloat({f})"),
+        CsilLiteralValue::Text(s) => format!("cborText({s:?})"),
+        CsilLiteralValue::Bool(b) => format!("cborBool({b})"),
+        CsilLiteralValue::Null => "cborNull{}".to_string(),
+        CsilLiteralValue::Bytes(bytes) => {
+            let values = bytes
+                .iter()
+                .map(|b| b.to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("cborBytes{{{values}}}")
+        }
+        CsilLiteralValue::Array(items) => {
+            let values = items
+                .iter()
+                .map(go_literal_cbor_expr)
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("cborArray{{{values}}}")
         }
     }
 }
@@ -6840,7 +6949,11 @@ func main() {
                     op("create-member", r#ref("Member"), r#ref("Member")),
                     op("get-member", r#ref("MemberID"), r#ref("Member")),
                     op("list-members", r#ref("Member"), arr(r#ref("Member"))),
-                    op("delete-task", r#ref("MemberID"), CsilTypeExpression::Builtin("bool".to_string())),
+                    op(
+                        "delete-task",
+                        r#ref("MemberID"),
+                        CsilTypeExpression::Builtin("bool".to_string()),
+                    ),
                 ],
                 wire_id: None,
             }),
@@ -6898,7 +7011,9 @@ func main() {
         let codec = super::generate_codec(&input, &config).expect("codec emitted");
         // Per-op helpers for non-record shapes are exported, so a server in another
         // package can compose decode(request)/encode(response) for every op.
-        assert!(codec.contains("func DecodeMemberGetMemberRequest(csilData []byte) (MemberID, error)"));
+        assert!(
+            codec.contains("func DecodeMemberGetMemberRequest(csilData []byte) (MemberID, error)")
+        );
         assert!(codec.contains("func EncodeMemberListMembersResponse(csilV []Member) []byte"));
         assert!(codec.contains("func EncodeMemberDeleteTaskResponse(csilV bool) []byte"));
     }

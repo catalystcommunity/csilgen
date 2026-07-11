@@ -369,6 +369,14 @@ fn map_type(
             // map the base and re-apply occurrence at the outer call.
             return map_type(base_type, occurrence, decimal);
         }
+        CsilTypeExpression::Literal(value) => match value {
+            CsilLiteralValue::Integer(_) => "int".to_string(),
+            CsilLiteralValue::Float(_) => "double".to_string(),
+            CsilLiteralValue::Text(_) => "String".to_string(),
+            CsilLiteralValue::Bool(_) => "bool".to_string(),
+            CsilLiteralValue::Bytes(_) => "Uint8List".to_string(),
+            CsilLiteralValue::Null | CsilLiteralValue::Array(_) => "Object?".to_string(),
+        },
         // A choice of text plus string literals (`text / "a" / "b"`) is a closed
         // string set — its wire form is just the string, so `String` is both
         // idiomatic and what the (de)serialization cast expects.
@@ -2948,6 +2956,7 @@ fn dart_to_cbor_value(
         CsilTypeExpression::Reference(name) if aliases.contains_key(name) => {
             dart_to_cbor_value(&aliases[name], expr, records, aliases, unions)
         }
+        CsilTypeExpression::Literal(value) => literal_to_dart(value),
         // A tuple is a positional CBOR array; an absent optional element is `null` in
         // place (the array keeps its fixed length).
         CsilTypeExpression::Tuple(group) => {
@@ -3050,6 +3059,12 @@ fn dart_from_cbor_value(
         CsilTypeExpression::Reference(name) if aliases.contains_key(name) => {
             dart_from_cbor_value(&aliases[name], expr, records, decimal, aliases, unions)
         }
+        CsilTypeExpression::Literal(value) => format!(
+            "CsilCbor.expectLiteral({}, {}, {})",
+            expr,
+            literal_to_dart(value),
+            literal_to_dart(value)
+        ),
         // A tuple reconstructs the Dart 3 record from the positional array; an absent
         // optional element stays `null` in place.
         CsilTypeExpression::Tuple(group) => {
@@ -3430,6 +3445,31 @@ class CsilCbor {
       throw ArgumentError('CsilCbor: trailing bytes');
     }
     return r.value;
+  }
+
+  static T expectLiteral<T>(Object? actual, Object? expected, T value) {
+    if (!_valueEquals(actual, expected)) {
+      throw ArgumentError('CsilCbor: literal mismatch');
+    }
+    return value;
+  }
+
+  static bool _valueEquals(Object? a, Object? b) {
+    if (a is Uint8List && b is Uint8List) {
+      if (a.length != b.length) return false;
+      for (var i = 0; i < a.length; i++) {
+        if (a[i] != b[i]) return false;
+      }
+      return true;
+    }
+    if (a is List && b is List) {
+      if (a.length != b.length) return false;
+      for (var i = 0; i < a.length; i++) {
+        if (!_valueEquals(a[i], b[i])) return false;
+      }
+      return true;
+    }
+    return a == b;
   }
 
   static _CsilRead _readArg(Uint8List b, int pos, int low) {

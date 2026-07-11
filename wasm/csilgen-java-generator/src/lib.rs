@@ -9,10 +9,9 @@ use convert_case::{Case, Casing};
 use csilgen_common::{
     CsilControlOperator, CsilGroupEntry, CsilGroupExpression, CsilGroupKey, CsilLiteralValue,
     CsilOccurrence, CsilRuleType, CsilServiceDefinition, CsilServiceDirection,
-    CsilServiceOperation, CsilSizeConstraint,
-    CsilTypeExpression, CsilValidationConstraint, GeneratedFile, GenerationStats,
-    GeneratorCapability, GeneratorMetadata, WasmGeneratorInput, WasmGeneratorOutput,
-    wasm_interface::*,
+    CsilServiceOperation, CsilSizeConstraint, CsilTypeExpression, CsilValidationConstraint,
+    GeneratedFile, GenerationStats, GeneratorCapability, GeneratorMetadata, WasmGeneratorInput,
+    WasmGeneratorOutput, wasm_interface::*,
 };
 
 // ---------------------------------------------------------------------------
@@ -1703,7 +1702,9 @@ fn java_op_boundary_expressible(
         CsilTypeExpression::Builtin(_) => true,
         CsilTypeExpression::Reference(name) => {
             let pascal = name.to_case(Case::Pascal);
-            records.contains(&pascal) || aliases.contains_key(&pascal) || choices.contains_key(&pascal)
+            records.contains(&pascal)
+                || aliases.contains_key(&pascal)
+                || choices.contains_key(&pascal)
         }
         CsilTypeExpression::Array { element_type, .. } => {
             java_op_boundary_expressible(element_type, records, aliases, choices)
@@ -1720,7 +1721,11 @@ fn java_op_boundary_expressible(
 /// The `<Base><Method>` stem shared by an op's per-op codec helpers and the client
 /// method that calls them, so the two never drift.
 fn op_codec_stem(service_name: &str, op: &CsilServiceOperation) -> String {
-    format!("{}{}", service_base(service_name), wire_method_name(&op.name))
+    format!(
+        "{}{}",
+        service_base(service_name),
+        wire_method_name(&op.name)
+    )
 }
 
 /// The CBOR encoding of a text key. Comparing these byte slices lexicographically is
@@ -1881,6 +1886,7 @@ fn java_enc_value(
             Some(only) => java_enc_value(only, expr, records, aliases, choices, depth),
             None => "new CborNull()".to_string(),
         },
+        CsilTypeExpression::Literal(lit) => java_literal_cbor_expr(lit),
         // A type the codec cannot model precisely is carried as null rather than emitting
         // uncompilable code.
         _ => "new CborNull()".to_string(),
@@ -1968,6 +1974,11 @@ fn java_dec_value(
             Some(only) => java_dec_value(only, expr, records, aliases, choices, depth),
             None => "null".to_string(),
         },
+        CsilTypeExpression::Literal(lit) => {
+            let expected = java_literal_cbor_expr(lit);
+            let value = java_literal_value_expr(lit);
+            format!("expectLiteral({expr}, {expected}, {value})")
+        }
         _ => "null".to_string(),
     }
 }
@@ -2741,6 +2752,15 @@ fn map_type(type_expr: &CsilTypeExpression) -> String {
         }
         // Java has no tuple type; a fixed-shape array becomes a List<Object>.
         CsilTypeExpression::Tuple(_) => "java.util.List<Object>".to_string(),
+        CsilTypeExpression::Literal(lit) => match lit {
+            CsilLiteralValue::Integer(_) => "long".to_string(),
+            CsilLiteralValue::Float(_) => "double".to_string(),
+            CsilLiteralValue::Text(_) => "String".to_string(),
+            CsilLiteralValue::Bool(_) => "boolean".to_string(),
+            CsilLiteralValue::Bytes(_) => "byte[]".to_string(),
+            CsilLiteralValue::Null => "Object".to_string(),
+            CsilLiteralValue::Array(_) => "Object".to_string(),
+        },
         CsilTypeExpression::Constrained { base_type, .. } => map_type(base_type),
         // A `text / "a" / "b"` style choice (a base scalar narrowed by string literals)
         // collapses to that one underlying scalar — the literals constrain values, not the
@@ -2972,6 +2992,59 @@ fn java_string(s: &str) -> String {
     }
     out.push('"');
     out
+}
+
+fn java_literal_cbor_expr(lit: &CsilLiteralValue) -> String {
+    match lit {
+        CsilLiteralValue::Integer(i) if *i >= 0 => format!("new CborUint({i}L)"),
+        CsilLiteralValue::Integer(i) => format!("new CborInt({i}L)"),
+        CsilLiteralValue::Float(f) => format!("new CborFloat({f})"),
+        CsilLiteralValue::Text(s) => format!("new CborText({})", java_string(s)),
+        CsilLiteralValue::Bool(b) => format!("new CborBool({b})"),
+        CsilLiteralValue::Null => "new CborNull()".to_string(),
+        CsilLiteralValue::Bytes(bytes) => {
+            let values = bytes
+                .iter()
+                .map(|b| b.to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("new CborBytes(new byte[] {{ {values} }})")
+        }
+        CsilLiteralValue::Array(items) => {
+            let values = items
+                .iter()
+                .map(java_literal_cbor_expr)
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("new CborArray(java.util.List.of({values}))")
+        }
+    }
+}
+
+fn java_literal_value_expr(lit: &CsilLiteralValue) -> String {
+    match lit {
+        CsilLiteralValue::Integer(i) => format!("{i}L"),
+        CsilLiteralValue::Float(f) => f.to_string(),
+        CsilLiteralValue::Text(s) => java_string(s),
+        CsilLiteralValue::Bool(b) => b.to_string(),
+        CsilLiteralValue::Null => "null".to_string(),
+        CsilLiteralValue::Bytes(bytes) => {
+            let values = bytes
+                .iter()
+                .map(|b| b.to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("new byte[] {{ {values} }}")
+        }
+        CsilLiteralValue::Array(items) => {
+            let values = items
+                .iter()
+                .map(java_literal_value_expr)
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("java.util.Arrays.<Object>asList({values})")
+        }
+    }
 }
 
 /// The self-contained canonical-CBOR (RFC 8949 subset) value model, encoder, decoder,
@@ -3304,6 +3377,27 @@ const CODEC_RUNTIME_JAVA: &str = r#"    /** A minimal canonical-CBOR value tree:
             throw new CsilCborException("csil cbor: missing field " + key);
         }
         return x;
+    }
+
+    public static <T> T expectLiteral(CborValue actual, CborValue expected, T value) {
+        if (!cborEqual(actual, expected)) {
+            throw new CsilCborException("csil cbor: literal mismatch");
+        }
+        return value;
+    }
+
+    private static boolean cborEqual(CborValue actual, CborValue expected) {
+        if (actual instanceof CborBytes a && expected instanceof CborBytes b) {
+            return java.util.Arrays.equals(a.value(), b.value());
+        }
+        if (actual instanceof CborArray a && expected instanceof CborArray b) {
+            if (a.items().size() != b.items().size()) return false;
+            for (int i = 0; i < a.items().size(); i++) {
+                if (!cborEqual(a.items().get(i), b.items().get(i))) return false;
+            }
+            return true;
+        }
+        return actual.equals(expected);
     }
 
     public static <E> CborValue encArray(java.util.List<E> xs, java.util.function.Function<E, CborValue> f) {
@@ -3738,12 +3832,20 @@ mod tests {
         };
         let member = CsilGroupExpression {
             entries: vec![
-                bare("id", CsilTypeExpression::Reference("MemberID".to_string()), None),
+                bare(
+                    "id",
+                    CsilTypeExpression::Reference("MemberID".to_string()),
+                    None,
+                ),
                 bare("name", builtin("text"), None),
             ],
         };
         let list_req = CsilGroupExpression {
-            entries: vec![bare("limit", builtin("uint"), Some(CsilOccurrence::Optional))],
+            entries: vec![bare(
+                "limit",
+                builtin("uint"),
+                Some(CsilOccurrence::Optional),
+            )],
         };
         let files = generate_java(&input_for(
             vec![
@@ -3760,36 +3862,58 @@ mod tests {
         let client = file(&files, "MemberClient.java");
         // Every op gets a method now — scalar-id request, bare-array and scalar responses
         // included — and none is dropped with a note.
-        assert!(client.content.contains(
-            "public Member getMember(MemberId req) throws ClientException"
-        ));
+        assert!(
+            client
+                .content
+                .contains("public Member getMember(MemberId req) throws ClientException")
+        );
         assert!(client.content.contains(
             "public List<Member> listMembers(ListMembersRequest req) throws ClientException"
         ));
-        assert!(client.content.contains(
-            "public Boolean deleteTask(TaskId req) throws ClientException"
-        ));
+        assert!(
+            client
+                .content
+                .contains("public Boolean deleteTask(TaskId req) throws ClientException")
+        );
         assert!(!client.content.contains("handle it manually"));
         assert!(!client.content.contains("non-record payload"));
         // A record boundary keeps its `encode<T>`/`decode<T>` wrapper; a non-record
         // boundary rides the op-keyed per-op helpers.
         assert!(client.content.contains("CsilCbor.encodeMember(req)"));
-        assert!(client.content.contains("CsilCbor.encodeMemberGetMemberRequest(req)"));
-        assert!(client.content.contains("CsilCbor.decodeMemberListMembersResponse(transport.call("));
-        assert!(client.content.contains("CsilCbor.decodeMemberDeleteTaskResponse(transport.call("));
+        assert!(
+            client
+                .content
+                .contains("CsilCbor.encodeMemberGetMemberRequest(req)")
+        );
+        assert!(
+            client
+                .content
+                .contains("CsilCbor.decodeMemberListMembersResponse(transport.call(")
+        );
+        assert!(
+            client
+                .content
+                .contains("CsilCbor.decodeMemberDeleteTaskResponse(transport.call(")
+        );
 
         let codec = file(&files, "CsilCbor.java");
         // The non-record op boundaries are exposed as public per-op helpers a server in
         // another package can compose decode(request)/encode(response) from.
-        assert!(codec.content.contains(
-            "public static MemberId decodeMemberGetMemberRequest(byte[] csilData)"
-        ));
-        assert!(codec.content.contains(
-            "public static byte[] encodeMemberListMembersResponse(List<Member> csilV)"
-        ));
-        assert!(codec.content.contains(
-            "public static byte[] encodeMemberDeleteTaskResponse(Boolean csilV)"
-        ));
+        assert!(
+            codec
+                .content
+                .contains("public static MemberId decodeMemberGetMemberRequest(byte[] csilData)")
+        );
+        assert!(
+            codec.content.contains(
+                "public static byte[] encodeMemberListMembersResponse(List<Member> csilV)"
+            )
+        );
+        assert!(
+            codec
+                .content
+                .contains("public static byte[] encodeMemberDeleteTaskResponse(Boolean csilV)")
+        );
     }
 
     #[test]
