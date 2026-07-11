@@ -1289,6 +1289,15 @@ fn map_type(type_expr: &CsilTypeExpression, optional: bool) -> String {
             format!("[{}: {}]", map_type(key, false), map_type(value, false))
         }
         CsilTypeExpression::Tuple(group) => map_tuple(group),
+        CsilTypeExpression::Literal(lit) => match lit {
+            CsilLiteralValue::Integer(_) => "Int64".to_string(),
+            CsilLiteralValue::Float(_) => "Double".to_string(),
+            CsilLiteralValue::Text(_) => "String".to_string(),
+            CsilLiteralValue::Bool(_) => "Bool".to_string(),
+            CsilLiteralValue::Bytes(_) => "[UInt8]".to_string(),
+            CsilLiteralValue::Null => "AnyCsilValue".to_string(),
+            CsilLiteralValue::Array(_) => "AnyCsilValue".to_string(),
+        },
         CsilTypeExpression::Constrained { base_type, .. } => {
             // Constraints (.size/.regex/.ge…) are validation rules, not Swift types.
             return map_type(base_type, optional);
@@ -1349,6 +1358,48 @@ fn literal_to_swift(value: &CsilLiteralValue) -> String {
             let parts: Vec<String> = elements.iter().map(literal_to_swift).collect();
             format!("[{}]", parts.join(", "))
         }
+    }
+}
+
+fn swift_literal_cbor_expr(value: &CsilLiteralValue) -> String {
+    match value {
+        CsilLiteralValue::Integer(i) if *i >= 0 => format!(".uint(UInt64({i}))"),
+        CsilLiteralValue::Integer(i) => format!(".int(Int64({i}))"),
+        CsilLiteralValue::Float(f) => format!(".double({f})"),
+        CsilLiteralValue::Text(s) => format!(".text({})", swift_string_lit(s)),
+        CsilLiteralValue::Bool(b) => format!(".bool({b})"),
+        CsilLiteralValue::Null => ".null".to_string(),
+        CsilLiteralValue::Bytes(bytes) => {
+            let values = bytes
+                .iter()
+                .map(|b| b.to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(".bytes([{values}])")
+        }
+        CsilLiteralValue::Array(items) => {
+            let values = items
+                .iter()
+                .map(swift_literal_cbor_expr)
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(".array([{values}])")
+        }
+    }
+}
+
+fn swift_literal_value_expr(value: &CsilLiteralValue) -> String {
+    match value {
+        CsilLiteralValue::Null => "AnyCsilValue.null".to_string(),
+        CsilLiteralValue::Bytes(bytes) => {
+            let values = bytes
+                .iter()
+                .map(|b| b.to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("[{values}]")
+        }
+        other => literal_to_swift(other),
     }
 }
 
@@ -1999,6 +2050,7 @@ fn swift_enc_value(
         CsilTypeExpression::Choice(choices) if choice_is_stringy(choices) => {
             format!(".text({expr})")
         }
+        CsilTypeExpression::Literal(lit) => swift_literal_cbor_expr(lit),
         _ => ".null".to_string(),
     }
 }
@@ -2044,6 +2096,11 @@ fn swift_dec_value(
         }
         CsilTypeExpression::Choice(choices) if choice_is_stringy(choices) => {
             format!("try CsilCbor.asText({expr})")
+        }
+        CsilTypeExpression::Literal(lit) => {
+            let expected = swift_literal_cbor_expr(lit);
+            let value = swift_literal_value_expr(lit);
+            format!("try CsilCbor.expectLiteral({expr}, {expected}, {value})")
         }
         _ => format!("try CsilCbor.asText({expr})"),
     }
@@ -2901,6 +2958,28 @@ public enum CsilCbor {
     public static func require(_ v: CsilCborValue, _ key: String) throws -> CsilCborValue {
         guard let x = mapGet(v, key) else { throw CsilCborError.missingField(key) }
         return x
+    }
+
+    public static func expectLiteral<T>(_ actual: CsilCborValue, _ expected: CsilCborValue, _ value: T) throws -> T {
+        guard valueEquals(actual, expected) else { throw CsilCborError.typeMismatch }
+        return value
+    }
+
+    static func valueEquals(_ a: CsilCborValue, _ b: CsilCborValue) -> Bool {
+        switch (a, b) {
+        case (.uint(let x), .uint(let y)): return x == y
+        case (.int(let x), .int(let y)): return x == y
+        case (.bool(let x), .bool(let y)): return x == y
+        case (.float(let x), .float(let y)): return x == y
+        case (.null, .null): return true
+        case (.text(let x), .text(let y)): return x == y
+        case (.bytes(let x), .bytes(let y)): return x == y
+        case (.array(let x), .array(let y)):
+            guard x.count == y.count else { return false }
+            return zip(x, y).allSatisfy { valueEquals($0, $1) }
+        default:
+            return false
+        }
     }
 
     public static func asI64(_ v: CsilCborValue) throws -> Int64 {

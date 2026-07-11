@@ -1021,6 +1021,7 @@ fn emit_enc_value(
             aliases,
             warnings,
         ),
+        CsilTypeExpression::Literal(value) => emit_enc_literal(out, indent, value, warnings),
         CsilTypeExpression::Reference(name) => {
             warnings.push(codec_warning(format!(
                 "zig codec: `{name}` has no generated codec; encoded as null"
@@ -1145,6 +1146,9 @@ fn emit_dec_value(
             aliases,
             warnings,
         ),
+        CsilTypeExpression::Literal(value) => {
+            emit_dec_literal(out, indent, value, src, dst, warnings);
+        }
         CsilTypeExpression::Reference(name) => {
             warnings.push(codec_warning(format!(
                 "zig codec: `{name}` has no generated codec; left default on decode"
@@ -1157,6 +1161,100 @@ fn emit_dec_value(
         _ => {
             warnings.push(codec_warning(
                 "zig codec: unrepresentable nested value left default on decode".to_string(),
+            ));
+            out.push_str(&format!("{indent}_ = {src};\n"));
+        }
+    }
+}
+
+fn emit_enc_literal(
+    out: &mut String,
+    indent: &str,
+    value: &CsilLiteralValue,
+    warnings: &mut Vec<GeneratorWarning>,
+) {
+    match value {
+        CsilLiteralValue::Integer(i) if *i >= 0 => {
+            out.push_str(&format!("{indent}try w_uint(out, @as(u64, {i}));\n"));
+        }
+        CsilLiteralValue::Integer(i) => {
+            out.push_str(&format!("{indent}try w_int(out, @as(i64, {i}));\n"));
+        }
+        CsilLiteralValue::Float(f) => {
+            out.push_str(&format!("{indent}try w_f64(out, @as(f64, {f}));\n"));
+        }
+        CsilLiteralValue::Text(s) => {
+            out.push_str(&format!(
+                "{indent}try w_text(out, \"{}\");\n",
+                zig_escape(s)
+            ));
+        }
+        CsilLiteralValue::Bytes(bytes) => {
+            let values = bytes
+                .iter()
+                .map(|b| format!("0x{b:02x}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            out.push_str(&format!(
+                "{indent}try w_bytes(out, &[_]u8{{ {values} }});\n"
+            ));
+        }
+        CsilLiteralValue::Bool(b) => {
+            out.push_str(&format!("{indent}try w_bool(out, {b});\n"));
+        }
+        CsilLiteralValue::Null => {
+            out.push_str(&format!("{indent}try w_null(out);\n"));
+        }
+        CsilLiteralValue::Array(_) => {
+            warnings.push(codec_warning(
+                "zig codec: array literal encoded as null".to_string(),
+            ));
+            out.push_str(&format!("{indent}try w_null(out);\n"));
+        }
+    }
+}
+
+fn emit_dec_literal(
+    out: &mut String,
+    indent: &str,
+    value: &CsilLiteralValue,
+    src: &str,
+    dst: &str,
+    warnings: &mut Vec<GeneratorWarning>,
+) {
+    match value {
+        CsilLiteralValue::Integer(i) if *i >= 0 => out.push_str(&format!(
+            "{indent}{{ const csil_lit = try as_u64({src}); if (csil_lit != @as(u64, {i})) return error.WrongType; {dst} = @as(i64, {i}); }}\n"
+        )),
+        CsilLiteralValue::Integer(i) => out.push_str(&format!(
+            "{indent}{{ const csil_lit = try as_i64({src}); if (csil_lit != @as(i64, {i})) return error.WrongType; {dst} = @as(i64, {i}); }}\n"
+        )),
+        CsilLiteralValue::Float(f) => out.push_str(&format!(
+            "{indent}{{ const csil_lit = try as_f64({src}); if (csil_lit != @as(f64, {f})) return error.WrongType; {dst} = @as(f64, {f}); }}\n"
+        )),
+        CsilLiteralValue::Text(s) => out.push_str(&format!(
+            "{indent}{{ const csil_lit = try as_text({src}); if (!std.mem.eql(u8, csil_lit, \"{}\")) return error.WrongType; {dst} = csil_lit; }}\n",
+            zig_escape(s)
+        )),
+        CsilLiteralValue::Bytes(bytes) => {
+            let values = bytes
+                .iter()
+                .map(|b| format!("0x{b:02x}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            out.push_str(&format!(
+                "{indent}{{ const csil_lit = try as_bytes({src}); if (!std.mem.eql(u8, csil_lit, &[_]u8{{ {values} }})) return error.WrongType; {dst} = csil_lit; }}\n"
+            ));
+        }
+        CsilLiteralValue::Bool(b) => out.push_str(&format!(
+            "{indent}{{ const csil_lit = try as_bool({src}); if (csil_lit != {b}) return error.WrongType; {dst} = {b}; }}\n"
+        )),
+        CsilLiteralValue::Null => {
+            out.push_str(&format!("{indent}if ({src} != .null) return error.WrongType; {dst} = null;\n"));
+        }
+        CsilLiteralValue::Array(_) => {
+            warnings.push(codec_warning(
+                "zig codec: array literal left default on decode".to_string(),
             ));
             out.push_str(&format!("{indent}_ = {src};\n"));
         }
@@ -2093,6 +2191,14 @@ fn map_zig_type(type_expr: &CsilTypeExpression, type_prefix: &str) -> String {
             "any" => format!("{type_prefix}CsilValue"),
             "null" | "nil" | "undefined" => "?*anyopaque".to_string(),
             other => format!("{type_prefix}{other}"),
+        },
+        CsilTypeExpression::Literal(value) => match value {
+            CsilLiteralValue::Integer(_) => "i64".to_string(),
+            CsilLiteralValue::Float(_) => "f64".to_string(),
+            CsilLiteralValue::Text(_) | CsilLiteralValue::Bytes(_) => "[]const u8".to_string(),
+            CsilLiteralValue::Bool(_) => "bool".to_string(),
+            CsilLiteralValue::Null => "?*anyopaque".to_string(),
+            CsilLiteralValue::Array(_) => format!("{type_prefix}CsilValue"),
         },
         CsilTypeExpression::Reference(name) => format!("{type_prefix}{name}"),
         // A fixed-shape tuple is a Zig tuple struct, one positional field per element;

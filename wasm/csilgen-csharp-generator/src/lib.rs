@@ -1866,6 +1866,7 @@ fn csharp_enc_value(
         CsilTypeExpression::Tuple(group) => {
             csharp_tuple_enc(&group.entries, expr, records, aliases, choices)
         }
+        CsilTypeExpression::Literal(lit) => csharp_literal_cbor_expr(lit),
         // A shape the codec cannot model precisely is carried as null rather than emitting
         // uncompilable code.
         _ => "new CborValue.Null()".to_string(),
@@ -1958,6 +1959,11 @@ fn csharp_dec_value(
         }
         CsilTypeExpression::Tuple(group) => {
             csharp_tuple_dec(ty, &group.entries, expr, records, aliases, choices)
+        }
+        CsilTypeExpression::Literal(lit) => {
+            let expected = csharp_literal_cbor_expr(lit);
+            let value = csharp_literal_value_expr(lit);
+            format!("Cbor.ExpectLiteral({expr}, {expected}, {value})")
         }
         _ => format!("Cbor.AsText({expr})"),
     }
@@ -2961,6 +2967,15 @@ fn map_csil_type_inner(
         ),
         // C# value tuple preserves per-position types where Go would use a struct.
         CsilTypeExpression::Tuple(group) => csharp_tuple(&group.entries, config, qualify),
+        CsilTypeExpression::Literal(lit) => match lit {
+            CsilLiteralValue::Integer(_) => "long".to_string(),
+            CsilLiteralValue::Float(_) => "double".to_string(),
+            CsilLiteralValue::Text(_) => "string".to_string(),
+            CsilLiteralValue::Bool(_) => "bool".to_string(),
+            CsilLiteralValue::Bytes(_) => "byte[]".to_string(),
+            CsilLiteralValue::Null => "object?".to_string(),
+            CsilLiteralValue::Array(_) => "object".to_string(),
+        },
         CsilTypeExpression::Constrained { base_type, .. } => {
             map_csil_type_inner(base_type, config, qualify)
         }
@@ -3267,6 +3282,61 @@ fn csharp_escape(s: &str) -> String {
         }
     }
     out
+}
+
+fn csharp_literal_cbor_expr(lit: &CsilLiteralValue) -> String {
+    match lit {
+        CsilLiteralValue::Integer(i) if *i >= 0 => format!("new CborValue.Uint({i}UL)"),
+        CsilLiteralValue::Integer(i) => format!("new CborValue.Int({i}L)"),
+        CsilLiteralValue::Float(f) => format!("new CborValue.Float({f})"),
+        CsilLiteralValue::Text(s) => format!("new CborValue.Text(\"{}\")", csharp_escape(s)),
+        CsilLiteralValue::Bool(b) => {
+            format!("new CborValue.Bool({})", if *b { "true" } else { "false" })
+        }
+        CsilLiteralValue::Null => "new CborValue.Null()".to_string(),
+        CsilLiteralValue::Bytes(bytes) => {
+            let values = bytes
+                .iter()
+                .map(|b| b.to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("new CborValue.Bytes(new byte[] {{ {values} }})")
+        }
+        CsilLiteralValue::Array(items) => {
+            let values = items
+                .iter()
+                .map(csharp_literal_cbor_expr)
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("new CborValue.Array(new CborValue[] {{ {values} }})")
+        }
+    }
+}
+
+fn csharp_literal_value_expr(lit: &CsilLiteralValue) -> String {
+    match lit {
+        CsilLiteralValue::Integer(i) => format!("{i}L"),
+        CsilLiteralValue::Float(f) => f.to_string(),
+        CsilLiteralValue::Text(s) => format!("\"{}\"", csharp_escape(s)),
+        CsilLiteralValue::Bool(b) => (if *b { "true" } else { "false" }).to_string(),
+        CsilLiteralValue::Null => "null".to_string(),
+        CsilLiteralValue::Bytes(bytes) => {
+            let values = bytes
+                .iter()
+                .map(|b| b.to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("new byte[] {{ {values} }}")
+        }
+        CsilLiteralValue::Array(items) => {
+            let values = items
+                .iter()
+                .map(csharp_literal_value_expr)
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("new object?[] {{ {values} }}")
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3608,6 +3678,26 @@ public static partial class Cbor
 
     public static CborValue Require(CborValue v, string key) =>
         MapGet(v, key) ?? throw new CborException($"missing field '{key}'");
+
+    public static T ExpectLiteral<T>(CborValue actual, CborValue expected, T value)
+    {
+        if (!ValueEquals(actual, expected))
+            throw new CborException("literal mismatch");
+        return value;
+    }
+
+    static bool ValueEquals(CborValue actual, CborValue expected) => (actual, expected) switch
+    {
+        (CborValue.Uint a, CborValue.Uint b) => a.Value == b.Value,
+        (CborValue.Int a, CborValue.Int b) => a.Value == b.Value,
+        (CborValue.Bool a, CborValue.Bool b) => a.Value == b.Value,
+        (CborValue.Float a, CborValue.Float b) => a.Value == b.Value,
+        (CborValue.Null, CborValue.Null) => true,
+        (CborValue.Text a, CborValue.Text b) => a.Value == b.Value,
+        (CborValue.Bytes a, CborValue.Bytes b) => a.Value.AsSpan().SequenceEqual(b.Value),
+        (CborValue.Array a, CborValue.Array b) => a.Items.Count == b.Items.Count && a.Items.Zip(b.Items).All(p => ValueEquals(p.First, p.Second)),
+        _ => false,
+    };
 
     public static long AsI64(CborValue v) => v switch
     {

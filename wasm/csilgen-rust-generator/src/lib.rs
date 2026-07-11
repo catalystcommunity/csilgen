@@ -933,6 +933,16 @@ fn cbor_map_get<'a>(v: &'a CsilCborValue, key: &str) -> Option<&'a CsilCborValue
     None
 }
 
+fn cbor_expect_value(v: &CsilCborValue, expected: &CsilCborValue) -> Result<(), CsilCborError> {
+    if v == expected {
+        Ok(())
+    } else {
+        Err(CsilCborError(format!(
+            "csil cbor: expected literal {expected:?}, got {v:?}"
+        )))
+    }
+}
+
 fn cbor_require<'a>(v: &'a CsilCborValue, key: &str) -> Result<&'a CsilCborValue, CsilCborError> {
     cbor_map_get(v, key).ok_or_else(|| CsilCborError(format!("csil cbor: missing field {key:?}")))
 }
@@ -2491,13 +2501,13 @@ fn main() {{
         let mut content = String::new();
 
         content.push_str("//! Generated service traits from CSIL specification\n\n");
-        content.push_str("use super::types::*;\n");
         // The channel router/encoders ride the generated per-type CBOR codec directly
         // (it owns the wire), so pull it in whenever the spec has channel ops. Gated so
         // a channel-free spec keeps a clean, unused-import-free module.
         if self.spec_has_channel_ops() {
             content.push_str("use super::codec::*;\n");
         }
+        content.push_str("use super::types::*;\n");
         content.push('\n');
 
         // Only emit the fallback `ServiceError` when the spec doesn't declare its
@@ -2956,6 +2966,7 @@ fn main() {{
                 }
                 format!("CsilCborValue::Array(vec![{}])", parts.join(", "))
             }
+            CsilTypeExpression::Literal(literal) => Self::rust_literal_cbor_expr(literal),
             // A shape the codec cannot model precisely (a non-record reference, `any`)
             // is carried as null rather than emitting code that would not compile.
             _ => "CsilCborValue::Null".to_string(),
@@ -3112,6 +3123,13 @@ fn main() {{
                     elems.join(", ")
                 )
             }
+            CsilTypeExpression::Literal(literal) => {
+                let expected = Self::rust_literal_cbor_expr(literal);
+                let value = Self::rust_literal_value_expr(literal);
+                format!(
+                    "|csil_v| {{\n    cbor_expect_value(csil_v, &{expected})?;\n    Ok({value})\n}}"
+                )
+            }
             _ => Self::dec_unsupported(),
         }
     }
@@ -3156,6 +3174,44 @@ fn main() {{
         out
     }
 
+    fn rust_literal_cbor_expr(literal: &CsilLiteralValue) -> String {
+        match literal {
+            CsilLiteralValue::Integer(n) => format!("cbor_int({n})"),
+            CsilLiteralValue::Float(f) => format!("cbor_float({f:?})"),
+            CsilLiteralValue::Text(s) => format!("cbor_text({s:?})"),
+            CsilLiteralValue::Bool(b) => format!("cbor_bool({b})"),
+            CsilLiteralValue::Null => "CsilCborValue::Null".to_string(),
+            CsilLiteralValue::Bytes(bytes) => {
+                let values = bytes
+                    .iter()
+                    .map(|b| b.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("CsilCborValue::Bytes(vec![{values}])")
+            }
+            CsilLiteralValue::Array(_) => "CsilCborValue::Null".to_string(),
+        }
+    }
+
+    fn rust_literal_value_expr(literal: &CsilLiteralValue) -> String {
+        match literal {
+            CsilLiteralValue::Integer(n) => n.to_string(),
+            CsilLiteralValue::Float(f) => format!("{f:?}"),
+            CsilLiteralValue::Text(s) => format!("{s:?}.to_string()"),
+            CsilLiteralValue::Bool(b) => b.to_string(),
+            CsilLiteralValue::Null => "()".to_string(),
+            CsilLiteralValue::Bytes(bytes) => {
+                let values = bytes
+                    .iter()
+                    .map(|b| b.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("vec![{values}]")
+            }
+            CsilLiteralValue::Array(_) => "Vec::<serde_json::Value>::new()".to_string(),
+        }
+    }
+
     fn rust_struct_ok(name: &str, members: &[String]) -> String {
         if members.is_empty() {
             return format!("    Ok({name} {{}})\n");
@@ -3193,11 +3249,48 @@ fn main() {{
     }
 
     fn rust_decode_binding(indent: &str, dec: &str) -> String {
+        if dec.contains('\n') {
+            let mut lines = dec.lines();
+            let first = lines.next().unwrap_or_default();
+            let mut out = format!("{indent}let csil_decode = {first}\n");
+            let remaining: Vec<&str> = lines.collect();
+            for (idx, line) in remaining.iter().enumerate() {
+                out.push_str(indent);
+                out.push_str(line);
+                if idx + 1 == remaining.len() {
+                    out.push(';');
+                }
+                out.push('\n');
+            }
+            return out;
+        }
+
         let one_line = format!("{indent}let csil_decode = {dec};\n");
         if one_line.trim_end().len() <= 100 {
             return one_line;
         }
         format!("{indent}let csil_decode =\n{indent}    {dec};\n")
+    }
+
+    fn rust_trait_method(name: &str, args: &[String], ret: &str) -> String {
+        let params = if args.is_empty() {
+            "&self".to_string()
+        } else {
+            format!("&self, {}", args.join(", "))
+        };
+        let one_line = format!("    fn {name}({params}) -> Result<{ret}, ServiceError>;\n");
+        if one_line.trim_end().len() <= 100 {
+            return one_line;
+        }
+
+        let mut out = format!("    fn {name}(\n        &self,\n");
+        for arg in args {
+            out.push_str("        ");
+            out.push_str(arg);
+            out.push_str(",\n");
+        }
+        out.push_str(&format!("    ) -> Result<{ret}, ServiceError>;\n"));
+        out
     }
 
     fn rust_client_call(
@@ -3282,10 +3375,17 @@ fn main() {{
 
         let snake = self.to_snake_case(name);
         let mut out = String::new();
-        let value_param = if named.is_empty() {
-            "_csil_v"
-        } else {
+        let encoder_reads_value = canonical.iter().any(|(_, _, entry)| {
+            matches!(entry.occurrence, Some(CsilOccurrence::Optional))
+                || !matches!(
+                    Self::value_base(&entry.value_type),
+                    CsilTypeExpression::Literal(_)
+                )
+        });
+        let value_param = if encoder_reads_value {
             "csil_v"
+        } else {
+            "_csil_v"
         };
         let root_param = if named.is_empty() {
             "_csil_root"
@@ -3761,20 +3861,20 @@ fn main() {{
                     // A push-style op (`op: -> Event`) has a `null` input: emit no
                     // request parameter rather than a meaningless `input: ()`.
                     if is_null_input(&operation.input_type) {
-                        content.push_str(&format!(
-                            "    fn {op_name}(\n\
-                             \x20       &self,\n\
-                             \x20       ctx: &Self::Context,\n\
-                             \x20   ) -> Result<{output_type}, ServiceError>;\n",
+                        content.push_str(&Self::rust_trait_method(
+                            &op_name,
+                            &["ctx: &Self::Context".to_string()],
+                            &output_type,
                         ));
                     } else {
                         let input_type = self.map_type_to_rust(&operation.input_type, &None)?;
-                        content.push_str(&format!(
-                            "    fn {op_name}(\n\
-                             \x20       &self,\n\
-                             \x20       ctx: &Self::Context,\n\
-                             \x20       input: {input_type},\n\
-                             \x20   ) -> Result<{output_type}, ServiceError>;\n",
+                        content.push_str(&Self::rust_trait_method(
+                            &op_name,
+                            &[
+                                "ctx: &Self::Context".to_string(),
+                                format!("input: {input_type}"),
+                            ],
+                            &output_type,
                         ));
                     }
                 }
@@ -3787,20 +3887,20 @@ fn main() {{
                     // A null inbound payload means there is no message to receive, so
                     // omit the `msg` parameter rather than emit `msg: ()`.
                     if is_null_input(&operation.input_type) {
-                        content.push_str(&format!(
-                            "    fn {op_name}(\n\
-                             \x20       &self,\n\
-                             \x20       ctx: &Self::Context,\n\
-                             \x20   ) -> Result<(), ServiceError>;\n",
+                        content.push_str(&Self::rust_trait_method(
+                            &op_name,
+                            &["ctx: &Self::Context".to_string()],
+                            "()",
                         ));
                     } else {
                         let input_type = self.map_type_to_rust(&operation.input_type, &None)?;
-                        content.push_str(&format!(
-                            "    fn {op_name}(\n\
-                             \x20       &self,\n\
-                             \x20       ctx: &Self::Context,\n\
-                             \x20       msg: {input_type},\n\
-                             \x20   ) -> Result<(), ServiceError>;\n",
+                        content.push_str(&Self::rust_trait_method(
+                            &op_name,
+                            &[
+                                "ctx: &Self::Context".to_string(),
+                                format!("msg: {input_type}"),
+                            ],
+                            "()",
                         ));
                     }
                 }
@@ -4988,7 +5088,7 @@ mod tests {
         assert!(services_content.contains("pub trait UserService"));
         assert!(services_content.contains("type Context;"));
         assert!(services_content.contains(
-            "fn create_user(\n        &self,\n        ctx: &Self::Context,\n        input: User,\n    ) -> Result<User, ServiceError>;"
+            "fn create_user(&self, ctx: &Self::Context, input: User) -> Result<User, ServiceError>;"
         ));
     }
 
@@ -5566,11 +5666,11 @@ mod tests {
         let services_content = generator.generate_services().unwrap();
 
         assert!(services_content.contains(
-            "fn create_entry(\n        &self,\n        ctx: &Self::Context,\n        input: User,\n    ) -> Result<User, ServiceError>;"
+            "fn create_entry(&self, ctx: &Self::Context, input: User) -> Result<User, ServiceError>;"
         ));
         assert!(!services_content.contains("fn create-entry("));
         assert!(services_content.contains(
-            "fn list_entries(\n        &self,\n        ctx: &Self::Context,\n        input: User,\n    ) -> Result<User, ServiceError>;"
+            "fn list_entries(&self, ctx: &Self::Context, input: User) -> Result<User, ServiceError>;"
         ));
         // Unidirectional ops get a generic (request/response) doc when the CSIL
         // has no `;;;` doc comments on the operation itself.
@@ -5645,12 +5745,12 @@ mod tests {
 
         // Unidirectional kept as request/response.
         assert!(services.contains(
-            "fn list_events(\n        &self,\n        ctx: &Self::Context,\n        input: User,\n    ) -> Result<User, ServiceError>;"
+            "fn list_events(&self, ctx: &Self::Context, input: User) -> Result<User, ServiceError>;"
         ));
 
         // Bidirectional is a fire-and-forget inbound handler (no return value).
         assert!(services.contains(
-            "fn play(\n        &self,\n        ctx: &Self::Context,\n        msg: User,\n    ) -> Result<(), ServiceError>;"
+            "fn play(&self, ctx: &Self::Context, msg: User) -> Result<(), ServiceError>;"
         ));
 
         // Router decodes the inbound bytes with the per-type codec and dispatches by
@@ -7237,7 +7337,7 @@ mod tests {
             .unwrap();
         assert!(
             services.contains(
-                "fn heartbeat(\n        &self,\n        ctx: &Self::Context,\n    ) -> Result<Pong, ServiceError>;"
+                "fn heartbeat(&self, ctx: &Self::Context) -> Result<Pong, ServiceError>;"
             ),
             "null-input op must omit the `input` parameter, got:\n{services}"
         );
@@ -7792,6 +7892,65 @@ mod tests {
             },
             doc_comments: Vec::new(),
         });
+        for (name, literal) in [("Ping", "ping"), ("Stop", "stop")] {
+            input.csil_spec.rules.push(CsilRule {
+                name: name.to_string(),
+                rule_type: CsilRuleType::GroupDef(CsilGroupExpression {
+                    entries: vec![CsilGroupEntry {
+                        key: Some(CsilGroupKey::Bare("kind".to_string())),
+                        value_type: CsilTypeExpression::Literal(CsilLiteralValue::Text(
+                            literal.to_string(),
+                        )),
+                        occurrence: None,
+                        metadata: vec![],
+                        doc_comments: Vec::new(),
+                    }],
+                }),
+                position: CsilPosition {
+                    line: 1,
+                    column: 1,
+                    offset: 0,
+                },
+                doc_comments: Vec::new(),
+            });
+        }
+        input.csil_spec.rules.push(CsilRule {
+            name: "Control".to_string(),
+            rule_type: CsilRuleType::TypeDef(CsilTypeExpression::Choice(vec![
+                CsilTypeExpression::Reference("Ping".to_string()),
+                CsilTypeExpression::Reference("Stop".to_string()),
+            ])),
+            position: CsilPosition {
+                line: 1,
+                column: 1,
+                offset: 0,
+            },
+            doc_comments: Vec::new(),
+        });
+        if let Some(rule) = input
+            .csil_spec
+            .rules
+            .iter_mut()
+            .find(|rule| rule.name == "CorndogsService")
+            && let CsilRuleType::ServiceDef(service) = &mut rule.rule_type
+        {
+            service.operations.push(CsilServiceOperation {
+                name: "control".to_string(),
+                input_type: CsilTypeExpression::Reference("Control".to_string()),
+                output_type: CsilTypeExpression::Choice(vec![
+                    CsilTypeExpression::Reference("Control".to_string()),
+                    CsilTypeExpression::Reference("ServiceError".to_string()),
+                ]),
+                direction: CsilServiceDirection::Bidirectional,
+                position: CsilPosition {
+                    line: 1,
+                    column: 1,
+                    offset: 0,
+                },
+                doc_comments: Vec::new(),
+                wire_id: None,
+            });
+        }
 
         let files = RustCodeGenerator::new(&input).generate().unwrap();
         let dir = std::env::temp_dir().join(format!("csilgen-rust-tooling-{}", std::process::id()));
@@ -7841,6 +8000,95 @@ mod tests {
         assert!(
             clippy.status.success(),
             "clippy failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&clippy.stdout),
+            String::from_utf8_lossy(&clippy.stderr)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let mut server_input = input;
+        server_input.config.target = "rust-server".to_string();
+        for rule in &mut server_input.csil_spec.rules {
+            if rule.name == "ServiceError" {
+                rule.rule_type = CsilRuleType::GroupDef(CsilGroupExpression {
+                    entries: vec![
+                        CsilGroupEntry {
+                            key: Some(CsilGroupKey::Bare("code".to_string())),
+                            value_type: CsilTypeExpression::Builtin("int".to_string()),
+                            occurrence: None,
+                            metadata: vec![],
+                            doc_comments: Vec::new(),
+                        },
+                        CsilGroupEntry {
+                            key: Some(CsilGroupKey::Bare("message".to_string())),
+                            value_type: CsilTypeExpression::Builtin("text".to_string()),
+                            occurrence: None,
+                            metadata: vec![],
+                            doc_comments: Vec::new(),
+                        },
+                    ],
+                });
+            }
+            if rule.name == "CorndogsService"
+                && let CsilRuleType::ServiceDef(service) = &mut rule.rule_type
+                && let Some(control) = service
+                    .operations
+                    .iter_mut()
+                    .find(|op| op.name == "control")
+            {
+                control.output_type = CsilTypeExpression::Reference("ServiceError".to_string());
+            }
+        }
+        let files = RustCodeGenerator::new(&server_input).generate().unwrap();
+        let dir = std::env::temp_dir().join(format!(
+            "csilgen-rust-server-tooling-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let src = dir.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        let mut rust_paths = Vec::new();
+        for file in &files {
+            let path = src.join(&file.path);
+            std::fs::write(&path, &file.content).unwrap();
+            if file.path.ends_with(".rs") {
+                rust_paths.push(path);
+            }
+        }
+        std::fs::write(
+            dir.join("Cargo.toml"),
+            "[package]\nname = \"csilservertoolingclean\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\n[workspace]\n\n[dependencies]\n",
+        )
+        .unwrap();
+
+        let rustfmt = std::process::Command::new("rustfmt")
+            .arg("--check")
+            .arg("--edition")
+            .arg("2021")
+            .args(&rust_paths)
+            .output()
+            .unwrap();
+        assert!(
+            rustfmt.status.success(),
+            "server rustfmt failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&rustfmt.stdout),
+            String::from_utf8_lossy(&rustfmt.stderr)
+        );
+
+        let clippy = std::process::Command::new("cargo")
+            .arg("clippy")
+            .arg("--quiet")
+            .arg("--all-targets")
+            .arg("--")
+            .arg("-D")
+            .arg("warnings")
+            .current_dir(&dir)
+            .env("CARGO_TARGET_DIR", dir.join("target"))
+            .env("CARGO_NET_OFFLINE", "true")
+            .output()
+            .unwrap();
+        assert!(
+            clippy.status.success(),
+            "server clippy failed:\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&clippy.stdout),
             String::from_utf8_lossy(&clippy.stderr)
         );
