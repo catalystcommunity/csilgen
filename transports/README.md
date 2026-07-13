@@ -37,7 +37,8 @@ transports/
 ├── java/        c/        csharp/    # JDK · CMake/C11 · .NET 8
 ├── swift/       kotlin/   zig/       # SwiftPM (UNTESTED, see below) · Gradle/JVM · Zig 0.14
 ├── ocaml/       elixir/   ruby/      # dune/opam · Mix · gem
-└── dart/                            # pub (pure Dart, Flutter-compatible)
+    ├── dart/                            # pub (pure Dart, Flutter-compatible)
+    └── php/                             # Composer package, PHP 7.2+
 ```
 
 Each library ships a `run-tests.sh` (its toolchain's setup+build+test behind one
@@ -84,17 +85,17 @@ run their tools directly; every other language runs via its `transports/<lang>/r
 - Go: `cd transports/go && go test ./...`
 - TypeScript: `cd transports/typescript && npm test`
 - Python: `cd transports/python && python3 -m unittest discover -s tests`
-- C, C#, Dart, Elixir, Java, Kotlin, OCaml, Ruby, Swift, Zig:
+- C, C#, Dart, Elixir, Java, Kotlin, OCaml, PHP, Ruby, Swift, Zig:
   `cd transports/<lang> && ./run-tests.sh`
 
 Required toolchains (per-language, install only what you want to verify): a JDK 17+
 (Java, Kotlin — Gradle wrapper is committed), .NET 8 SDK (C#), `cc`+CMake (C),
-Swift 6, Zig 0.14.x, OCaml 5/dune/opam (OCaml), Elixir 1.18+/OTP 27, Ruby 3.2+,
-Dart SDK 3.5+. Each library's own `README.md` covers consumption and any publishing
+Swift 6, Zig 0.14.x, OCaml 5/dune/opam (OCaml), Elixir 1.18+/OTP 27, PHP 7.2+,
+Ruby 3.2+, Dart SDK 3.5+. Each library's own `README.md` covers consumption and any publishing
 `TODO:`.
 
-`tools/install-transport-toolchains.sh` installs the four download-and-extract
-toolchains (Zig, a JDK for Java+Kotlin, .NET, Dart) into a single per-user dir
+`tools/install-transport-toolchains.sh` installs the download-and-extract/buildable
+toolchains (Zig, a JDK for Java+Kotlin, .NET, Dart, PHP 8.x via static-php-cli, Composer) into a single per-user dir
 (no root, idempotent) and writes an `env.sh` to source before `test-transports`;
 it prints package-manager guidance for the four that need a compiler/system libs
-(Swift, OCaml, Ruby, Elixir).
+(Swift, OCaml, Ruby, Elixir, exact PHP 7.x).

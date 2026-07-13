@@ -7,7 +7,7 @@
 #     pinned version and skips if so, so re-running (or copy-pasting this into
 #     another repo) only installs what is missing.
 #   - No root, no system package manager: everything self-contained lands under one
-#     per-user dir ($CATALYST_TOOLS, default ~/.local/catalyst-tools), shared by all
+#     per-user dir ($CATALYST_TOOLS, default ~/.config/catalyst-tools), shared by all
 #     catalyst projects. Anything that can be installed without system libraries
 #     lives here; tools that need a distro toolchain (Ruby, Elixir/Erlang, Swift)
 #     are left to the system and noted at the end.
@@ -16,7 +16,7 @@
 # Usage:
 #   tools/install-transport-toolchains.sh                  # install/verify everything
 #   CATALYST_TOOLS=/opt/catalyst tools/install-transport-toolchains.sh
-#   source ~/.local/catalyst-tools/env.sh                  # then build/test
+#   source ~/.config/catalyst-tools/env.sh                 # then build/test
 set -euo pipefail
 
 # --- pinned versions (override via env) ------------------------------------
@@ -29,16 +29,18 @@ GO_VER="${GO_VER:-1.26.4}"
 NODE_VER="${NODE_VER:-26.1.0}"
 OCAML_VER="${OCAML_VER:-5.2.1}"     # opam switch compiler (needs cc/make/m4 to build)
 OPAM_SWITCH="${OPAM_SWITCH:-catalyst}"
+PHP_VER="${PHP_VER:-8.4}"            # static-php-cli v3 supports PHP 8.0+; PHP 7.x needs system/phpbrew/source.
+INSTALL_STATIC_PHP="${INSTALL_STATIC_PHP:-1}"
 
-TOOLS="${CATALYST_TOOLS:-$HOME/.local/catalyst-tools}"
+TOOLS="${CATALYST_TOOLS:-$HOME/.config/catalyst-tools}"
 mkdir -p "$TOOLS"
 
 # --- platform detection ----------------------------------------------------
 OS="$(uname -s)"; ARCH="$(uname -m)"
 [ "$OS" = "Linux" ] || { echo "This installer currently supports Linux only (saw $OS)." >&2; exit 1; }
 case "$ARCH" in
-  x86_64)  ZIG_ARCH=x86_64; JDK_ARCH=x64;     DART_ARCH=x64;   DOTNET_ARCH=x64;   GO_ARCH=amd64; NODE_ARCH=x64 ;;
-  aarch64) ZIG_ARCH=aarch64; JDK_ARCH=aarch64; DART_ARCH=arm64; DOTNET_ARCH=arm64; GO_ARCH=arm64; NODE_ARCH=arm64 ;;
+	  x86_64)  ZIG_ARCH=x86_64; JDK_ARCH=x64;     DART_ARCH=x64;   DOTNET_ARCH=x64;   GO_ARCH=amd64; NODE_ARCH=x64; STATIC_PHP_ARCH=x86_64 ;;
+	  aarch64) ZIG_ARCH=aarch64; JDK_ARCH=aarch64; DART_ARCH=arm64; DOTNET_ARCH=arm64; GO_ARCH=arm64; NODE_ARCH=arm64; STATIC_PHP_ARCH=aarch64 ;;
   *) echo "Unsupported arch: $ARCH" >&2; exit 1 ;;
 esac
 
@@ -156,6 +158,70 @@ install_node() {
   "$bin" --version
 }
 
+# --------------------------------------------------------------------------- PHP (self-contained CLI via static-php-cli)
+install_php() {
+  local php="$TOOLS/php-$PHP_VER/bin/php"
+  if [ -x "$php" ] && "$php" -r 'echo PHP_MAJOR_VERSION.".".PHP_MINOR_VERSION;' 2>/dev/null | grep -q "^${PHP_VER%.*}\\."; then
+    echo "PHP $PHP_VER already installed."; return
+  fi
+  if have php && php -r 'exit(PHP_VERSION_ID >= 70200 ? 0 : 1);'; then
+    echo "System PHP is available ($(php -r 'echo PHP_VERSION;'))."; return
+  fi
+  if [ "$INSTALL_STATIC_PHP" != "1" ]; then
+    echo "PHP: skipped — no system PHP >= 7.2 and INSTALL_STATIC_PHP=$INSTALL_STATIC_PHP."; return 0
+  fi
+
+  say "Installing static PHP $PHP_VER CLI via static-php-cli"
+  mkdir -p "$TOOLS/bin"
+  local spc="$TOOLS/bin/spc"
+  if [ ! -x "$spc" ]; then
+    fetch "https://dl.static-php.dev/v3/spc-bin/latest/spc-linux-$STATIC_PHP_ARCH" "$spc" \
+      || fetch "https://dl.static-php.dev/v3/spc-bin/nightly/spc-linux-$STATIC_PHP_ARCH" "$spc"
+    chmod +x "$spc"
+  fi
+  rm -rf "$TOOLS/php-build" "$TOOLS/php-$PHP_VER"
+  mkdir -p "$TOOLS/php-build"
+  (
+    cd "$TOOLS/php-build"
+    if [ -x "$TOOLS/zig-$ZIG_VER/zig" ]; then
+      local zig_dir="$TOOLS/php-build/pkgroot/$ZIG_ARCH-linux/zig"
+      mkdir -p "$zig_dir"
+      rm -f "$zig_dir/zig" "$zig_dir/zig-ar" "$zig_dir/zig-ranlib" "$zig_dir/zig-objcopy"
+      ln -s "$TOOLS/zig-$ZIG_VER/zig" "$zig_dir/zig"
+      printf '#!/usr/bin/env sh\nexec "%s" ar "$@"\n' "$TOOLS/zig-$ZIG_VER/zig" > "$zig_dir/zig-ar"
+      printf '#!/usr/bin/env sh\nexec "%s" ranlib "$@"\n' "$TOOLS/zig-$ZIG_VER/zig" > "$zig_dir/zig-ranlib"
+      printf '#!/usr/bin/env sh\nexec "%s" objcopy "$@"\n' "$TOOLS/zig-$ZIG_VER/zig" > "$zig_dir/zig-objcopy"
+      chmod +x "$zig_dir/zig-ar" "$zig_dir/zig-ranlib" "$zig_dir/zig-objcopy"
+      export PATH="$zig_dir:$PATH" CC="zig cc" CXX="zig c++"
+    fi
+    "$spc" build:php "ctype,filter,iconv,phar" --build-cli --dl-with-php="$PHP_VER" --dl-parallel=10 --dl-retry=5 --dl-ignore-cache=php-src --dl-prefer-binary
+  )
+  mkdir -p "$TOOLS/php-$PHP_VER/bin"
+  cp "$TOOLS/php-build/buildroot/bin/php" "$php"
+  "$php" -v | head -1
+}
+
+# --------------------------------------------------------------------------- Composer
+install_composer() {
+  local composer="$TOOLS/bin/composer"
+  if [ -x "$composer" ]; then
+    "$composer" --version 2>/dev/null | head -1
+    return
+  fi
+  local php_bin="php"
+  if [ -x "$TOOLS/php-$PHP_VER/bin/php" ]; then
+    php_bin="$TOOLS/php-$PHP_VER/bin/php"
+  fi
+  if ! command -v "$php_bin" >/dev/null 2>&1 && [ ! -x "$php_bin" ]; then
+    echo "Composer: skipped — PHP is not available."; return 0
+  fi
+  say "Installing Composer"
+  mkdir -p "$TOOLS/bin"
+  fetch "https://getcomposer.org/download/latest-stable/composer.phar" "$composer"
+  chmod +x "$composer"
+  "$php_bin" "$composer" --version | head -1
+}
+
 # --------------------------------------------------------------------------- OCaml (opam, per-user)
 install_ocaml() {
   if ! { have cc && have make && have m4; }; then
@@ -191,6 +257,8 @@ install_dotnet
 install_dart
 install_go
 install_node
+install_php
+install_composer
 install_ocaml
 
 # --- write a sourceable env file (per-tool opt-out via $CATALYST_TOOLS_SKIP) --
@@ -201,7 +269,7 @@ cat > "$TOOLS/env.sh" <<EOF
 # space-separated, in CATALYST_TOOLS_SKIP before sourcing. The opted-out tool is
 # not prepended, so your own copy already on \$PATH wins. Example:
 #   export CATALYST_TOOLS_SKIP="zig go"
-# Keys: zig java gradle dotnet dart go node opam
+# Keys: zig java gradle dotnet dart go node php composer opam
 export CATALYST_TOOLS="$TOOLS"
 
 # True when \$1 is listed in CATALYST_TOOLS_SKIP (whole word, space-separated).
@@ -212,6 +280,8 @@ _catalyst_skip opam || PATH="$TOOLS/bin:\$PATH"
 _catalyst_skip node || PATH="$TOOLS/node/bin:\$PATH"
 _catalyst_skip go   || PATH="$TOOLS/go/bin:\$PATH"
 _catalyst_skip dart || PATH="$TOOLS/dart-sdk/bin:\$PATH"
+_catalyst_skip php  || PATH="$TOOLS/php-$PHP_VER/bin:\$PATH"
+_catalyst_skip composer || PATH="$TOOLS/bin:\$PATH"
 if ! _catalyst_skip dotnet; then
   export DOTNET_CLI_TELEMETRY_OPTOUT=1 DOTNET_NOLOGO=1 DOTNET_CLI_HOME="$TOOLS/dotnet"
   PATH="$TOOLS/dotnet:\$PATH"
@@ -237,11 +307,12 @@ Activate the toolchains:
     source "$TOOLS/env.sh"
 
 Self-contained tools installed here: Zig, Java (+ Kotlin via Gradle), Gradle, .NET,
-Dart, Go, Node, and OCaml (per-user opam, when cc/make/m4 are present). Rust is the
+Dart, Go, Node, PHP (via static-php-cli), Composer, and OCaml (per-user opam, when cc/make/m4 are present). Rust is the
 host toolchain (use your existing rustup/system cargo).
 
 NOTES — these need distro packages or system libraries, so install them with your
 package manager rather than here:
+  - PHP 7.x runtime: static-php-cli v3 is PHP 8.x; use system packages, phpbrew/asdf, or source builds for exact PHP 7.x execution.
   - Ruby 3.2+      : pacman -Syu ruby   | apt install ruby   | rbenv/ruby-install
   - Elixir/OTP 27+ : pacman -Syu elixir | apt install elixir | asdf / mise
   - Swift 6        : swiftly (https://www.swift.org/install/linux/) or swift.org tarball; pulls some system libs

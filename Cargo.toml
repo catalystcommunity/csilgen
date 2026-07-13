@@ -24,6 +24,7 @@ members = [
     "wasm/csilgen-elixir-generator",
     "wasm/csilgen-ruby-generator",
     "wasm/csilgen-dart-generator",
+    "wasm/csilgen-php-generator",
     "transports/rust",
     "tools/xtask"
 ]
@@ -110,8 +111,10 @@ opt-level = "s"  # Optimize for size
 [profile.release.package."csilgen-dart-generator"]
 opt-level = "s"  # Optimize for size
 
+[profile.release.package."csilgen-php-generator"]
+opt-level = "s"  # Optimize for size
+
 # Development profile
 [profile.dev]
 debug = true
 opt-level = 0
-

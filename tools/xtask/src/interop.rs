@@ -80,6 +80,7 @@ fn registry() -> Vec<Lang> {
         // 6400 is reserved for swift. It is excluded from the matrix for now (no
         // `swiftc` toolchain in this environment); when one is available, add
         // `script_lang("swift", 6400)` here and create tests/interop/harness/swift/.
+        // 6401 is reserved for php once tests/interop/harness/php exists.
     ]
 }
 

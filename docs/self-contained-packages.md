@@ -22,7 +22,7 @@ options {
 }
 ```
 
-Language tokens: `go`, `rust`, `typescript`, `python`, `ruby`, `elixir`, `java`,
+Language tokens: `go`, `rust`, `typescript`, `python`, `php`, `ruby`, `elixir`, `java`,
 `kotlin`, `csharp`, `ocaml`, `swift`, `dart`. (C and Zig — no central registry — are
 a separate follow-up.)
 
@@ -30,7 +30,7 @@ a separate follow-up.)
 
 | Option | Used for | Default |
 | --- | --- | --- |
-| `package_name` | crate / gem / npm / pub / opam / namespace name | derived from the service base, else `csilgen_client` |
+| `package_name` | crate / gem / npm / pub / opam / Composer / namespace name | derived from the service base, else `csilgen_client` |
 | `package_version` | manifest version | `0.1.0` |
 | `go_module` | Go module path (required for a real import path) | `package_name`, else `example.com/<name>` |
 | `java_package`, `kotlin_package` | groupId / Gradle group | existing config |
@@ -43,6 +43,7 @@ a separate follow-up.)
 | rust | `Cargo.toml` (+ `src/lib.rs`) | sources under `src/` | `cargo build` (offline) |
 | typescript | `package.json`, `tsconfig.json` | barrel `index.ts` | `tsc` |
 | python | `pyproject.toml` | package dir + `__init__.py` | import + parse |
+| php | `composer.json` | sources under `src/` with classmap autoload | Rust generator tests; PHP tests when PHP is installed |
 | ruby | `<name>.gemspec` | sources under `lib/` | `gem build` |
 | elixir | `mix.exs` | sources under `lib/` | `mix compile` |
 | java | `pom.xml` | `src/main/java/<pkg>/` | well-formed XML + `javac` |

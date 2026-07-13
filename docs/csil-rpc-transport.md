@@ -244,7 +244,7 @@ behavior:
   return the payload per `variant`; on non-zero `status` raise a transport error
   carrying the code and `error` string.
 
-The reference libraries (`transports/{rust,go,typescript,python}/`) provide
+The reference libraries (`transports/<language>/`) provide
 ready implementations of this seam over all three carriers (HTTP, WebSocket,
 stream) plus the matched **server** side: a dispatcher that frames/deframes
 envelopes and drives the generated router, returning a `CsilRpcResponse` with the

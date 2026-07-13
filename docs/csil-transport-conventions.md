@@ -23,7 +23,7 @@ The normative artifacts of the transport layer are:
 2. **Conformance vectors** — byte-exact fixtures, checked into the repo, that any
    implementation self-checks against. The vectors, not any single library, are
    the source of truth for byte layout.
-3. **Reference libraries** (`transports/{rust,go,typescript,python}/`) —
+3. **Reference libraries** (`transports/<language>/`) —
    hand-maintained, *not* generated, providing matched client and server ends for
    all three transports. A host wires generated shapes onto a reference transport
    and never touches the wire.

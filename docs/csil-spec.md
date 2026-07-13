@@ -693,6 +693,7 @@ Current and planned language targets:
   - `typescript-client` — types plus a typed client (`client.gen.ts`)
   - `typescript-server` — types plus handler interfaces and a `dispatch` helper (`server.gen.ts`)
 - **Python**: Dataclasses with pydantic
+- **PHP**: PHP 7.x classes, Composer package layout, typed clients, and server routers
 - **Go**: Structs with tags
 - **Java**: POJOs with annotations
 - **C#**: Classes with attributes
