@@ -1509,7 +1509,7 @@ Generate a complete e-commerce platform API spec client and server:
 
 ```bash
 # Generate for multiple targets
-for target in typescript python rust go openapi; do
+for target in typescript python php rust go openapi; do
     csilgen generate --input ecommerce.csil --target $target --output ./platform/$target/
 done
 

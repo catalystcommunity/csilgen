@@ -706,6 +706,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "csilgen-php-generator"
+version = "0.1.0"
+dependencies = [
+ "convert_case",
+ "csilgen-common",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "csilgen-python-generator"
 version = "0.1.0"
 dependencies = [

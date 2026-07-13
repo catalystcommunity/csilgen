@@ -1,7 +1,7 @@
 //! Development automation tasks for csilgen
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -57,6 +57,15 @@ fn toolchain_present(cmd: &str, version_arg: &str) -> bool {
         .status()
         .map(|s| s.success())
         .unwrap_or(false)
+}
+
+fn run_transport_test(dir: &Path, runner: &str, args: &[&str]) -> Result<bool> {
+    let mut cmd = std::process::Command::new(runner);
+    cmd.args(args).current_dir(dir);
+
+    cmd.status()
+        .with_context(|| format!("failed to launch {runner} for {}", dir.display()))
+        .map(|status| status.success())
 }
 
 fn test_transports() -> Result<()> {
@@ -195,6 +204,14 @@ fn test_transports() -> Result<()> {
             "./run-tests.sh",
             &[],
         ),
+        (
+            "php",
+            "php",
+            "--version",
+            "transports/php",
+            "./run-tests.sh",
+            &[],
+        ),
     ];
 
     for (lang, tool, ver, dir, runner, args) in langs {
@@ -208,12 +225,7 @@ fn test_transports() -> Result<()> {
             continue;
         }
         println!("\n== {lang} transport tests ==");
-        let ok = std::process::Command::new(runner)
-            .args(*args)
-            .current_dir(&path)
-            .status()
-            .with_context(|| format!("failed to launch {runner} for {lang}"))?
-            .success();
+        let ok = run_transport_test(&path, runner, args)?;
         if ok {
             ran.push(lang);
         } else {
@@ -274,6 +286,8 @@ fn build_wasm() -> Result<()> {
             "csilgen-ruby-generator",
             "--package",
             "csilgen-dart-generator",
+            "--package",
+            "csilgen-php-generator",
             // Not a target — a tiny wasm fixture loaded directly by the
             // wasm-generators integration tests. Building it here keeps those
             // tests runnable without a manual `cargo build --target wasm32` step.

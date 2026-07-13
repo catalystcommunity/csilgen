@@ -1,0 +1,12 @@
+{
+  "name": "csilgen/transport",
+  "description": "CSIL transport reference library for PHP 7.x",
+  "type": "library",
+  "license": "Apache-2.0",
+  "require": {
+    "php": ">=7.2"
+  },
+  "autoload": {
+    "classmap": ["src/"]
+  }
+}
