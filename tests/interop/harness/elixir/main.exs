@@ -40,7 +40,23 @@ defmodule Vectors do
       raw: <<0x01, 0x02, 0xF0, 0xFF>>,
       flag: true,
       when: ts(),
-      amount: G.Decimal.from_string("123.45")
+      amount: G.Decimal.from_string("123.45"),
+      # mixed-union coverage: a value equal to a literal arm must wire as
+      # [1,"pending"]; a value with no literal match must wire as [0,...].
+      status_literal: "pending",
+      status_free: "unlisted",
+      # inline mixed choice (hoisted; literal arm match).
+      note: "info",
+      # inline all-literal choice (not hoisted).
+      size: "medium",
+      # named enum with a trailing `.default`-constrained last arm.
+      level: "high",
+      # named enum assembled via base rule + `/=` extension.
+      season: "autumn",
+      # named all-literal enum with mixed literal kinds (text + int arms); no
+      # wrapper struct/type, bare runtime value.
+      ship_text: "ground",
+      ship_int: 2
     }
   end
 
@@ -228,19 +244,19 @@ end
 defmodule Rpc do
   def dispatch(req) do
     case req.op do
-      "EchoScalars" ->
+      "echo-scalars" ->
         {:ok, r} = Handlers.echo_scalars(G.Scalars.from_cbor(req.payload), %{})
         RPC.new_response_ok("Scalars", G.Scalars.to_cbor(r))
 
-      "EchoCollections" ->
+      "echo-collections" ->
         {:ok, r} = Handlers.echo_collections(G.Collections.from_cbor(req.payload), %{})
         RPC.new_response_ok("Collections", G.Collections.to_cbor(r))
 
-      "EchoNested" ->
+      "echo-nested" ->
         {:ok, r} = Handlers.echo_nested(G.Nested.from_cbor(req.payload), %{})
         RPC.new_response_ok("EchoNestedResult", G.EchoNestedResult.to_cbor(r))
 
-      "ValidateConstrained" ->
+      "validate-constrained" ->
         # The typed error arm rides as a status-0 `ServiceError` variant.
         case Handlers.validate_constrained(G.Constrained.from_cbor(req.payload), %{}) do
           {:ok, r} -> RPC.new_response_ok("Constrained", G.Constrained.to_cbor(r))
@@ -285,7 +301,13 @@ defmodule Rpc do
     cases =
       try do
         r = G.InteropClient.echo_scalars(client, Vectors.scalars_ok())
-        Cases.check(cases, "echo-scalars/success", r == Vectors.scalars_ok(), "mismatch: #{inspect(r)}")
+
+        Cases.check(
+          cases,
+          "echo-scalars/success",
+          r == Vectors.scalars_ok(),
+          "mismatch: #{inspect(r)}"
+        )
       rescue
         e -> Cases.fail(cases, "echo-scalars/success", Exception.message(e))
       end
@@ -293,7 +315,13 @@ defmodule Rpc do
     cases =
       try do
         r = G.InteropClient.echo_collections(client, Vectors.collections_ok())
-        Cases.check(cases, "echo-collections/success", r == Vectors.collections_ok(), "mismatch: #{inspect(r)}")
+
+        Cases.check(
+          cases,
+          "echo-collections/success",
+          r == Vectors.collections_ok(),
+          "mismatch: #{inspect(r)}"
+        )
       rescue
         e -> Cases.fail(cases, "echo-collections/success", Exception.message(e))
       end
@@ -301,7 +329,13 @@ defmodule Rpc do
     cases =
       try do
         r = G.InteropClient.echo_nested(client, Vectors.nested_ok())
-        Cases.check(cases, "echo-nested/success", r.ok && r.echo == Vectors.nested_ok(), "mismatch: #{inspect(r)}")
+
+        Cases.check(
+          cases,
+          "echo-nested/success",
+          r.ok && r.echo == Vectors.nested_ok(),
+          "mismatch: #{inspect(r)}"
+        )
       rescue
         e -> Cases.fail(cases, "echo-nested/success", Exception.message(e))
       end
@@ -309,7 +343,13 @@ defmodule Rpc do
     cases =
       try do
         r = G.InteropClient.validate_constrained(client, Vectors.constrained_ok())
-        Cases.check(cases, "validate-constrained/success", r == Vectors.constrained_ok(), "mismatch: #{inspect(r)}")
+
+        Cases.check(
+          cases,
+          "validate-constrained/success",
+          r == Vectors.constrained_ok(),
+          "mismatch: #{inspect(r)}"
+        )
       rescue
         e -> Cases.fail(cases, "validate-constrained/success", Exception.message(e))
       end
@@ -333,7 +373,7 @@ end
 
 defmodule Evt do
   @ticks 3
-  @service "interop"
+  @service "Interop"
 
   defp send_event(sock, %Events.Event{} = ev) do
     FrameSock.send_frame(sock, Events.encode_event(ev, :verbose))
@@ -393,7 +433,7 @@ defmodule Evt do
       ev.event == Ctl.close() ->
         :ok
 
-      ev.event == "Duplex" ->
+      ev.event == "duplex" ->
         case decode_scalars(ev.payload) do
           {:ok, s} ->
             Handlers.duplex(s, %{})
@@ -430,8 +470,11 @@ defmodule Evt do
 
     ack_ok =
       case FrameSock.recv_frame(sock, 5000) do
-        nil -> false
-        frame -> match?({:ok, %Events.Event{event: "$hello-ack"}}, Events.decode_event(frame, :verbose))
+        nil ->
+          false
+
+        frame ->
+          match?({:ok, %Events.Event{event: "$hello-ack"}}, Events.decode_event(frame, :verbose))
       end
 
     cases = Cases.check(cases, "events/handshake", ack_ok, "no $hello-ack")
@@ -451,7 +494,7 @@ defmodule Evt do
 
         frame ->
           case Events.decode_event(frame, :verbose) do
-            {:ok, %Events.Event{event: "Duplex", payload: p}} ->
+            {:ok, %Events.Event{event: "duplex", payload: p}} ->
               s = G.Scalars.from_cbor(p)
               Cases.check(cases, "duplex/success", s == Vectors.scalars_ok(), "echo mismatch")
 
@@ -472,7 +515,9 @@ defmodule Evt do
           Cases.fail(cases, "unknown-method/failure", "no $error")
 
         frame ->
-          is_err = match?({:ok, %Events.Event{event: "$error"}}, Events.decode_event(frame, :verbose))
+          is_err =
+            match?({:ok, %Events.Event{event: "$error"}}, Events.decode_event(frame, :verbose))
+
           Cases.check(cases, "unknown-method/failure", is_err, "expected $error")
       end
 
@@ -495,7 +540,7 @@ defmodule Evt do
 
       frame ->
         case Events.decode_event(frame, :verbose) do
-          {:ok, %Events.Event{event: "OnTick", payload: p}} ->
+          {:ok, %Events.Event{event: "on-tick", payload: p}} ->
             t = G.Tick.from_cbor(p)
 
             if t.seq == expect do
@@ -505,7 +550,7 @@ defmodule Evt do
             end
 
           {:ok, ev} ->
-            {false, "expected OnTick got #{inspect(ev.event)}"}
+            {false, "expected on-tick got #{inspect(ev.event)}"}
 
           {:error, e} ->
             {false, "decode: #{inspect(e)}"}
@@ -561,8 +606,11 @@ defmodule Dgram do
 
       @op_echo_collections ->
         case safe(fn -> G.Collections.from_cbor(dg.payload) end) do
-          {:ok, c} -> Datagrams.new_datagram(@op_echo_collections, dg.seq, G.Collections.to_cbor(c))
-          :error -> Datagrams.new_datagram(@op_error_sentinel, dg.seq, <<>>)
+          {:ok, c} ->
+            Datagrams.new_datagram(@op_echo_collections, dg.seq, G.Collections.to_cbor(c))
+
+          :error ->
+            Datagrams.new_datagram(@op_error_sentinel, dg.seq, <<>>)
         end
 
       _ ->
@@ -593,7 +641,13 @@ defmodule Dgram do
       case roundtrip.(@op_echo_scalars, 1, G.Scalars.to_cbor(Vectors.scalars_ok())) do
         {:ok, d} when d.op_ord == @op_echo_scalars ->
           s = G.Scalars.from_cbor(d.payload)
-          Cases.check(cases, "echo-scalars/success", s == Vectors.scalars_ok(), "payload mismatch")
+
+          Cases.check(
+            cases,
+            "echo-scalars/success",
+            s == Vectors.scalars_ok(),
+            "payload mismatch"
+          )
 
         {:ok, d} ->
           Cases.fail(cases, "echo-scalars/success", "op_ord #{d.op_ord}")
@@ -606,7 +660,13 @@ defmodule Dgram do
       case roundtrip.(@op_echo_collections, 2, G.Collections.to_cbor(Vectors.collections_ok())) do
         {:ok, d} when d.op_ord == @op_echo_collections ->
           c = G.Collections.from_cbor(d.payload)
-          Cases.check(cases, "echo-collections/success", c == Vectors.collections_ok(), "payload mismatch")
+
+          Cases.check(
+            cases,
+            "echo-collections/success",
+            c == Vectors.collections_ok(),
+            "payload mismatch"
+          )
 
         {:ok, d} ->
           Cases.fail(cases, "echo-collections/success", "op_ord #{d.op_ord}")

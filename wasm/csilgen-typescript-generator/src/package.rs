@@ -2,11 +2,12 @@
 //!
 //! When `emit_packages` includes `"typescript"`, the generator turns the output
 //! directory into a buildable npm package: a barrel `index.ts`, a `package.json`,
-//! and a `tsconfig.json`. The package is CommonJS because the generated `.gen.ts`
-//! modules import each other with extension-less relative specifiers
-//! (`./types.gen`), which only resolve under `node`-style module resolution; an
-//! ESM (`nodenext`) package would require `.js` suffixes the emitters do not
-//! write.
+//! and a `tsconfig.json`. The generated `.gen.ts` modules import each other with
+//! `.ts`-extensioned relative specifiers (`./types.gen.ts`) so consumers can run
+//! the sources directly under Node's ESM type stripping and typecheck under
+//! `nodenext`; the shipped tsconfig therefore enables
+//! `rewriteRelativeImportExtensions` (TS 5.7+) so its own CommonJS `dist/` build
+//! rewrites them to `.js` on emit.
 
 use crate::{codec, common};
 use csilgen_common::{
@@ -116,7 +117,14 @@ fn readme(input: &WasmGeneratorInput) -> String {
          ## Install\n\n\
          ```sh\n\
          npm install {name} csilgen-transport\n\
-         ```\n\n"
+         ```\n\n\
+         The generated modules import each other with `.ts`-extensioned relative\n\
+         specifiers (`./types.gen.ts`), matching this package's `tsconfig.json`\n\
+         (`rewriteRelativeImportExtensions`) and Node's ESM loader. Regenerating\n\
+         outside of package mode — a bare `csilgen generate --target typescript`\n\
+         dropped into an existing project — pass `import_extension: \"js\"` or\n\
+         `\"none\"` to match a project that does not enable that TypeScript 5.7+\n\
+         flag.\n\n"
     );
 
     let (rpc, events, datagrams) = wanted_transports(input);
@@ -733,8 +741,9 @@ fn package_json(input: &WasmGeneratorInput) -> String {
     let value = serde_json::json!({
         "name": name,
         "version": version,
-        // CommonJS: the emitted modules use extension-less relative imports, which
-        // require `node` module resolution rather than ESM.
+        // CommonJS: the built `dist/` keeps the widest consumer reach; the `.ts`
+        // source specifiers are rewritten to `.js` at build time by
+        // `rewriteRelativeImportExtensions` in the shipped tsconfig.
         "type": "commonjs",
         "main": "dist/index.js",
         "types": "dist/index.d.ts",
@@ -750,7 +759,9 @@ fn package_json(input: &WasmGeneratorInput) -> String {
             "build": "tsc"
         },
         "devDependencies": {
-            "typescript": "^5"
+            // 5.7 introduced `rewriteRelativeImportExtensions`, which the shipped
+            // tsconfig relies on to build the `.ts`-extensioned specifiers.
+            "typescript": "^5.7"
         }
     });
     // Pretty-print with a trailing newline so the file reads like a hand-authored one.
@@ -759,6 +770,8 @@ fn package_json(input: &WasmGeneratorInput) -> String {
 
 /// Strict, declaration-emitting config matching the CommonJS modules the
 /// generator writes. `*.ts` picks up the barrel plus every `*.gen.ts`.
+/// `rewriteRelativeImportExtensions` (TS 5.7+) is what lets the `.ts`-extensioned
+/// source specifiers both typecheck and land as `.js` in the emitted `dist/`.
 const TSCONFIG: &str = r#"{
   "compilerOptions": {
     "target": "es2020",
@@ -768,6 +781,7 @@ const TSCONFIG: &str = r#"{
     "esModuleInterop": true,
     "skipLibCheck": true,
     "declaration": true,
+    "rewriteRelativeImportExtensions": true,
     "outDir": "dist",
     "lib": ["es2020", "dom"]
   },
@@ -783,19 +797,26 @@ const TSCONFIG: &str = r#"{
 fn barrel(input: &WasmGeneratorInput, files: &[GeneratedFile]) -> String {
     let mut out = common::header(input, "index");
     let mut seen: BTreeSet<String> = BTreeSet::new();
+    // Already validated by `generate_files`'s eager option check in lib.rs before
+    // any file (including this barrel) is emitted.
+    let ext = common::import_extension(input).unwrap_or(common::ImportExtension::Ts);
     // Fixed order keeps the barrel deterministic and lets `types`/`codec` claim
-    // the shared names before the client/server surfaces do.
-    for path in [
-        "types.gen.ts",
-        "codec.gen.ts",
-        "client.gen.ts",
-        "client.async.gen.ts",
-        "server.gen.ts",
+    // the shared names before the client/server surfaces do. `stem` is the
+    // on-disk filename (always `.ts`, looked up verbatim) minus its extension;
+    // `specifier` is what the re-export line actually carries, which follows
+    // `import_extension` like every other relative specifier this generator emits.
+    for stem in [
+        "types.gen",
+        "codec.gen",
+        "client.gen",
+        "client.async.gen",
+        "server.gen",
     ] {
+        let path = format!("{stem}.ts");
+        let specifier = ext.specifier(stem);
         let Some(file) = files.iter().find(|f| f.path == path) else {
             continue;
         };
-        let stem = path.strip_suffix(".ts").unwrap_or(path);
         let names = exported_names(&file.content);
         if names.iter().any(|n| seen.contains(n)) {
             let mut fresh: Vec<String> = Vec::new();
@@ -806,12 +827,12 @@ fn barrel(input: &WasmGeneratorInput, files: &[GeneratedFile]) -> String {
             }
             if !fresh.is_empty() {
                 out.push_str(&format!(
-                    "export {{ {} }} from \"./{stem}\";\n",
+                    "export {{ {} }} from \"{specifier}\";\n",
                     fresh.join(", ")
                 ));
             }
         } else {
-            out.push_str(&format!("export * from \"./{stem}\";\n"));
+            out.push_str(&format!("export * from \"{specifier}\";\n"));
         }
         for n in names {
             seen.insert(n);

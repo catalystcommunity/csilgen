@@ -4,11 +4,10 @@
 //! CSIL generator that produces Go code with struct definitions and service interfaces.
 
 use csilgen_common::{
-    CsilFieldMetadata, CsilFieldVisibility, CsilGroupKey, CsilRuleType, CsilServiceDirection,
-    GeneratedFile, GenerationStats, GeneratorCapability, GeneratorMetadata, WasmGeneratorInput,
-    WasmGeneratorOutput, WarningLevel, GeneratorWarning, CsilTypeExpression, CsilOccurrence,
-    CsilValidationConstraint, CsilLiteralValue,
-    wasm_interface::*,
+    wasm_interface::*, CsilFieldMetadata, CsilFieldVisibility, CsilGroupKey, CsilLiteralValue,
+    CsilOccurrence, CsilRuleType, CsilServiceDirection, CsilTypeExpression,
+    CsilValidationConstraint, GeneratedFile, GenerationStats, GeneratorCapability,
+    GeneratorMetadata, GeneratorWarning, WarningLevel, WasmGeneratorInput, WasmGeneratorOutput,
 };
 use std::collections::HashMap;
 
@@ -55,10 +54,8 @@ pub extern "C" fn deallocate(ptr: *mut u8, size: usize) {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn generate(input_ptr: *const u8, input_len: usize) -> *mut u8 {
-    let start_time = std::time::Instant::now();
-    
     let result = match deserialize_input(input_ptr, input_len) {
-        Ok(input) => process_generation(input, start_time),
+        Ok(input) => process_generation(input),
         Err(error_code) => return create_error_result(error_code),
     };
 
@@ -78,14 +75,13 @@ fn deserialize_input(input_ptr: *const u8, input_len: usize) -> Result<WasmGener
     }
 
     let input_slice = unsafe { std::slice::from_raw_parts(input_ptr, input_len) };
-    let input_str = std::str::from_utf8(input_slice)
-        .map_err(|_| error_codes::INVALID_INPUT)?;
+    let input_str = std::str::from_utf8(input_slice).map_err(|_| error_codes::INVALID_INPUT)?;
 
     serde_json::from_str::<WasmGeneratorInput>(input_str)
         .map_err(|_| error_codes::SERIALIZATION_ERROR)
 }
 
-fn process_generation(input: WasmGeneratorInput, start_time: std::time::Instant) -> Result<WasmGeneratorOutput, i32> {
+fn process_generation(input: WasmGeneratorInput) -> Result<WasmGeneratorOutput, i32> {
     let config = GoConfig::from_options(&input.config.options);
     let mut warnings = Vec::new();
     let mut files = Vec::new();
@@ -118,7 +114,6 @@ fn process_generation(input: WasmGeneratorInput, start_time: std::time::Instant)
         }
     }
 
-    let generation_time = start_time.elapsed().as_millis() as u64;
     let total_size: usize = files.iter().map(|f| f.content.len()).sum();
 
     let stats = GenerationStats {
@@ -126,7 +121,9 @@ fn process_generation(input: WasmGeneratorInput, start_time: std::time::Instant)
         total_size_bytes: total_size,
         services_count: input.csil_spec.service_count,
         fields_with_metadata_count: input.csil_spec.fields_with_metadata_count,
-        generation_time_ms: generation_time,
+        // wasm32-unknown-unknown has no clock source: `std::time::Instant::now()`
+        // panics at runtime on this target.
+        generation_time_ms: 0,
         peak_memory_bytes: Some(estimate_memory_usage()),
     };
 
@@ -148,14 +145,17 @@ struct GoConfig {
 impl GoConfig {
     fn from_options(options: &HashMap<String, serde_json::Value>) -> Self {
         Self {
-            package_name: options.get("package_name")
+            package_name: options
+                .get("package_name")
                 .and_then(|v| v.as_str())
                 .unwrap_or("api")
                 .to_string(),
-            use_json_tags: options.get("use_json_tags")
+            use_json_tags: options
+                .get("use_json_tags")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(true),
-            generate_validation: options.get("generate_validation")
+            generate_validation: options
+                .get("generate_validation")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(true),
             indent_style: "\t".to_string(), // Go convention is tabs
@@ -164,15 +164,15 @@ impl GoConfig {
 }
 
 fn generate_types(
-    input: &WasmGeneratorInput, 
-    config: &GoConfig, 
-    warnings: &mut Vec<GeneratorWarning>
+    input: &WasmGeneratorInput,
+    config: &GoConfig,
+    warnings: &mut Vec<GeneratorWarning>,
 ) -> Result<Option<String>, i32> {
     let mut content = String::new();
-    
+
     // Package declaration
     content.push_str(&format!("package {}\n\n", config.package_name));
-    
+
     // Imports
     let mut imports = Vec::new();
     if config.use_json_tags {
@@ -182,7 +182,7 @@ fn generate_types(
         imports.push("\"fmt\"");
         imports.push("\"errors\"");
     }
-    
+
     if !imports.is_empty() {
         content.push_str("import (\n");
         for import in imports {
@@ -197,31 +197,38 @@ fn generate_types(
         match &rule.rule_type {
             CsilRuleType::GroupDef(group) => {
                 has_types = true;
-                content.push_str(&format!("// {} represents a structured data type\n", rule.name));
+                content.push_str(&format!(
+                    "// {} represents a structured data type\n",
+                    rule.name
+                ));
                 content.push_str(&format!("type {} struct {{\n", rule.name));
-                
+
                 for entry in &group.entries {
                     if let Some(key) = &entry.key {
                         let field_name = go_field_name_from_key(key);
                         let go_type = map_csil_type_to_go(&entry.value_type, &entry.occurrence);
-                        
+
                         // Add field documentation
                         if let Some(description) = get_field_description(&entry.metadata) {
-                            content.push_str(&format!("{}// {}\n", config.indent_style, description));
+                            content
+                                .push_str(&format!("{}// {}\n", config.indent_style, description));
                         }
-                        
-                        content.push_str(&format!("{}{} {}", config.indent_style, field_name, go_type));
-                        
+
+                        content.push_str(&format!(
+                            "{}{} {}",
+                            config.indent_style, field_name, go_type
+                        ));
+
                         // Add JSON tags if enabled
                         if config.use_json_tags {
                             let json_name = go_json_name_from_key(key);
                             let mut tag_parts = vec![format!("json:\"{}\"", json_name)];
-                            
+
                             // Add omitempty for optional fields
                             if matches!(entry.occurrence, Some(CsilOccurrence::Optional)) {
                                 tag_parts[0] = format!("json:\"{},omitempty\"", json_name);
                             }
-                            
+
                             // Check field visibility
                             let visibility = get_field_visibility(&entry.metadata);
                             match visibility {
@@ -239,14 +246,14 @@ fn generate_types(
                                 }
                                 _ => {}
                             }
-                            
+
                             content.push_str(&format!(" `{}`", tag_parts.join(" ")));
                         }
-                        
+
                         content.push('\n');
                     }
                 }
-                
+
                 content.push_str("}\n\n");
             }
             CsilRuleType::TypeDef(type_expr) => {
@@ -267,15 +274,15 @@ fn generate_types(
 }
 
 fn generate_services(
-    input: &WasmGeneratorInput, 
-    config: &GoConfig, 
-    _warnings: &mut Vec<GeneratorWarning>
+    input: &WasmGeneratorInput,
+    config: &GoConfig,
+    _warnings: &mut Vec<GeneratorWarning>,
 ) -> Result<Option<String>, i32> {
     let mut content = String::new();
-    
+
     // Package declaration
     content.push_str(&format!("package {}\n\n", config.package_name));
-    
+
     // Imports
     content.push_str("import (\n");
     content.push_str(&format!("{}\"context\"\n", config.indent_style));
@@ -286,41 +293,56 @@ fn generate_services(
         if let CsilRuleType::ServiceDef(service) = &rule.rule_type {
             content.push_str(&format!("// {} defines the service interface\n", rule.name));
             content.push_str(&format!("type {} interface {{\n", rule.name));
-            
+
             for operation in &service.operations {
                 let method_name = go_method_name(&operation.name);
                 let input_type = map_csil_type_to_go(&operation.input_type, &None);
                 let output_type = map_csil_type_to_go(&operation.output_type, &None);
-                
+
                 match operation.direction {
                     CsilServiceDirection::Unidirectional => {
-                        content.push_str(&format!("{}{}(ctx context.Context, req {}) ({}, error)\n", 
-                            config.indent_style, method_name, input_type, output_type));
+                        content.push_str(&format!(
+                            "{}{}(ctx context.Context, req {}) ({}, error)\n",
+                            config.indent_style, method_name, input_type, output_type
+                        ));
                     }
                     CsilServiceDirection::Bidirectional => {
-                        content.push_str(&format!("{}{}Stream(ctx context.Context) ({}Stream, error)\n", 
-                            config.indent_style, method_name, method_name));
+                        content.push_str(&format!(
+                            "{}{}Stream(ctx context.Context) ({}Stream, error)\n",
+                            config.indent_style, method_name, method_name
+                        ));
                     }
                     CsilServiceDirection::Reverse => {
-                        content.push_str(&format!("{}On{}(ctx context.Context, handler func({}) error) error\n", 
-                            config.indent_style, method_name, input_type));
+                        content.push_str(&format!(
+                            "{}On{}(ctx context.Context, handler func({}) error) error\n",
+                            config.indent_style, method_name, input_type
+                        ));
                     }
                 }
             }
-            
+
             content.push_str("}\n\n");
-            
+
             // Generate streaming interfaces for bidirectional operations
             for operation in &service.operations {
                 if operation.direction == CsilServiceDirection::Bidirectional {
                     let method_name = go_method_name(&operation.name);
                     let input_type = map_csil_type_to_go(&operation.input_type, &None);
                     let output_type = map_csil_type_to_go(&operation.output_type, &None);
-                    
-                    content.push_str(&format!("// {}Stream handles bidirectional streaming\n", method_name));
+
+                    content.push_str(&format!(
+                        "// {}Stream handles bidirectional streaming\n",
+                        method_name
+                    ));
                     content.push_str(&format!("type {}Stream interface {{\n", method_name));
-                    content.push_str(&format!("{}Send({}) error\n", config.indent_style, input_type));
-                    content.push_str(&format!("{}Recv() ({}, error)\n", config.indent_style, output_type));
+                    content.push_str(&format!(
+                        "{}Send({}) error\n",
+                        config.indent_style, input_type
+                    ));
+                    content.push_str(&format!(
+                        "{}Recv() ({}, error)\n",
+                        config.indent_style, output_type
+                    ));
                     content.push_str(&format!("{}Close() error\n", config.indent_style));
                     content.push_str("}\n\n");
                 }
@@ -332,19 +354,19 @@ fn generate_services(
 }
 
 fn generate_validation(
-    input: &WasmGeneratorInput, 
-    config: &GoConfig, 
-    _warnings: &mut Vec<GeneratorWarning>
+    input: &WasmGeneratorInput,
+    config: &GoConfig,
+    _warnings: &mut Vec<GeneratorWarning>,
 ) -> Result<Option<String>, i32> {
     if !config.generate_validation {
         return Ok(None);
     }
 
     let mut content = String::new();
-    
+
     // Package declaration
     content.push_str(&format!("package {}\n\n", config.package_name));
-    
+
     // Imports
     content.push_str("import (\n");
     content.push_str(&format!("{}\"errors\"\n", config.indent_style));
@@ -355,32 +377,40 @@ fn generate_validation(
     for rule in &input.csil_spec.rules {
         if let CsilRuleType::GroupDef(group) = &rule.rule_type {
             let has_validation = group.entries.iter().any(|entry| {
-                entry.metadata.iter().any(|meta| {
-                    matches!(meta, CsilFieldMetadata::Constraint(_))
-                })
+                entry
+                    .metadata
+                    .iter()
+                    .any(|meta| matches!(meta, CsilFieldMetadata::Constraint(_)))
             });
-            
+
             if has_validation {
-                content.push_str(&format!("// Validate{} validates the {} struct\n", rule.name, rule.name));
+                content.push_str(&format!(
+                    "// Validate{} validates the {} struct\n",
+                    rule.name, rule.name
+                ));
                 content.push_str(&format!("func (v *{}) Validate() error {{\n", rule.name));
-                
+
                 for entry in &group.entries {
                     if let Some(key) = &entry.key {
                         let field_name = go_field_name_from_key(key);
-                        
+
                         for metadata in &entry.metadata {
                             if let CsilFieldMetadata::Constraint(constraint) = metadata {
                                 match constraint {
                                     CsilValidationConstraint::MinLength(min_len) => {
-                                        content.push_str(&format!("{}if len(v.{}) < {} {{\n", 
-                                            config.indent_style, field_name, min_len));
+                                        content.push_str(&format!(
+                                            "{}if len(v.{}) < {} {{\n",
+                                            config.indent_style, field_name, min_len
+                                        ));
                                         content.push_str(&format!("{}{}return fmt.Errorf(\"field '{}' must have at least {} characters\")\n", 
                                             config.indent_style, config.indent_style, field_name, min_len));
                                         content.push_str(&format!("{}}}\n", config.indent_style));
                                     }
                                     CsilValidationConstraint::MaxLength(max_len) => {
-                                        content.push_str(&format!("{}if len(v.{}) > {} {{\n", 
-                                            config.indent_style, field_name, max_len));
+                                        content.push_str(&format!(
+                                            "{}if len(v.{}) > {} {{\n",
+                                            config.indent_style, field_name, max_len
+                                        ));
                                         content.push_str(&format!("{}{}return fmt.Errorf(\"field '{}' must have at most {} characters\")\n", 
                                             config.indent_style, config.indent_style, field_name, max_len));
                                         content.push_str(&format!("{}}}\n", config.indent_style));
@@ -391,34 +421,38 @@ fn generate_validation(
                         }
                     }
                 }
-                
+
                 content.push_str(&format!("{}return nil\n", config.indent_style));
                 content.push_str("}\n\n");
             }
         }
     }
 
-    if content.len() > format!("package {}\n\n", config.package_name).len() + "import (\n\t\"errors\"\n\t\"fmt\"\n)\n\n".len() {
+    if content.len()
+        > format!("package {}\n\n", config.package_name).len()
+            + "import (\n\t\"errors\"\n\t\"fmt\"\n)\n\n".len()
+    {
         Ok(Some(content))
     } else {
         Ok(None)
     }
 }
 
-fn map_csil_type_to_go(type_expr: &CsilTypeExpression, occurrence: &Option<CsilOccurrence>) -> String {
+fn map_csil_type_to_go(
+    type_expr: &CsilTypeExpression,
+    occurrence: &Option<CsilOccurrence>,
+) -> String {
     let base_type = match type_expr {
-        CsilTypeExpression::Builtin(name) => {
-            match name.as_str() {
-                "int" => "int64",
-                "uint" => "uint64",
-                "float" => "float64",
-                "text" => "string",
-                "bytes" => "[]byte",
-                "bool" => "bool",
-                "nil" | "null" => "interface{}",
-                _ => name,
-            }
-        }
+        CsilTypeExpression::Builtin(name) => match name.as_str() {
+            "int" => "int64",
+            "uint" => "uint64",
+            "float" => "float64",
+            "text" => "string",
+            "bytes" => "[]byte",
+            "bool" => "bool",
+            "nil" | "null" => "interface{}",
+            _ => name,
+        },
         CsilTypeExpression::Reference(name) => name,
         CsilTypeExpression::Array { element_type, .. } => {
             let element = map_csil_type_to_go(element_type, &None);
@@ -431,7 +465,7 @@ fn map_csil_type_to_go(type_expr: &CsilTypeExpression, occurrence: &Option<CsilO
         }
         _ => "interface{}", // Fallback for complex types
     };
-    
+
     // Handle occurrence
     match occurrence {
         Some(CsilOccurrence::Optional) => format!("*{}", base_type),
@@ -530,14 +564,13 @@ fn create_error_result(error_code: i32) -> *mut u8 {
         }],
         stats: GenerationStats::default(),
     };
-    
+
     serialize_and_return_ptr(&error_output)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use csilgen_common::*;
 
     #[test]
     fn test_pascal_case() {
@@ -548,14 +581,26 @@ mod tests {
 
     #[test]
     fn test_go_type_mapping() {
-        assert_eq!(map_csil_type_to_go(&CsilTypeExpression::Builtin("text".to_string()), &None), "string");
-        assert_eq!(map_csil_type_to_go(&CsilTypeExpression::Builtin("int".to_string()), &None), "int64");
-        assert_eq!(map_csil_type_to_go(&CsilTypeExpression::Reference("User".to_string()), &None), "User");
+        assert_eq!(
+            map_csil_type_to_go(&CsilTypeExpression::Builtin("text".to_string()), &None),
+            "string"
+        );
+        assert_eq!(
+            map_csil_type_to_go(&CsilTypeExpression::Builtin("int".to_string()), &None),
+            "int64"
+        );
+        assert_eq!(
+            map_csil_type_to_go(&CsilTypeExpression::Reference("User".to_string()), &None),
+            "User"
+        );
     }
 
     #[test]
     fn test_optional_types() {
         let optional = Some(CsilOccurrence::Optional);
-        assert_eq!(map_csil_type_to_go(&CsilTypeExpression::Builtin("text".to_string()), &optional), "*string");
+        assert_eq!(
+            map_csil_type_to_go(&CsilTypeExpression::Builtin("text".to_string()), &optional),
+            "*string"
+        );
     }
 }

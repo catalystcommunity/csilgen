@@ -83,7 +83,7 @@ Every client constructs these exact logical values so any server can echo them
 and the client can assert structural equality. Bytes are hex; timestamps are
 RFC3339 UTC; decimals are exact strings.
 
-- **Scalars (`SCALARS_OK`)**: `i=-42, u=42, n=-7, f=3.5, t="héllo 世界", raw=0x0102f0ff, flag=true, when="2026-06-29T12:34:56Z", amount="123.45"`
+- **Scalars (`SCALARS_OK`)**: `i=-42, u=42, n=-7, f=3.5, t="héllo 世界", raw=0x0102f0ff, flag=true, when="2026-06-29T12:34:56Z", amount="123.45", status_literal="pending" (mixed-union literal arm, wires as [1,"pending"]), status_free="unlisted" (mixed-union general arm, wires as [0,"unlisted"]), note="info" (inline mixed-choice literal arm, hoisted to synthesized `Scalars_note`, wires as [1,"info"]), size="medium" (inline all-literal choice, wires bare, no synthesis), level="high" (named enum `Level` whose last arm is `.default`-constrained; the value used deliberately differs from the declared default "medium"), season="autumn" (named enum `Season` assembled via a base rule + `/=` extension; value comes from the extension arms), ship_text="ground" (named all-literal enum `ShipMode` with MIXED literal kinds — text + int arms — wires bare as text), ship_int=2 (same `ShipMode` type, wires bare as int)`
 - **Collections (`COLLECTIONS_OK`)**: `names=["a","b"], at_least_one=[1,2,3], bounded=[10,20], exact3=[7,8,9], scores={"x":1,"y":2}, extra={"k":"v"} (any-value=text), pair=["p",5], triple=["t",9,true], color="green", prio=2, who=4242 (uint variant)`
 - **Nested (`NESTED_OK`)**: `inner=SCALARS_OK, maybe=CONSTRAINED_OK, many=[SCALARS_OK]`
 - **Constrained valid (`CONSTRAINED_OK`)**: `code="PRD-AB12CD", qty=10, rate="0.25", password="hunter2hunter2", tags=["one","two"]`

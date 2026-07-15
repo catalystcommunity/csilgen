@@ -80,14 +80,22 @@ This documentation is automatically generated from CSIL specifications.
 
 ## Usage
 
+Configuration options come only from the CSIL source file's `options { … }`
+block — the CLI has no `--option` flag:
+
+```csil
+options {
+  title: "My API Documentation",
+  include_metadata: true,
+}
+```
+
 ```bash
 # Build the generator
 cargo build --target wasm32-unknown-unknown --release
 
 # Generate documentation
-csilgen generate --input api.csil --target docs-generator --output ./docs/ \
-  --option title="My API Documentation" \
-  --option include_metadata=true
+csilgen generate --input api.csil --target docs-generator --output ./docs/
 ```
 
 ## Key Implementation Details

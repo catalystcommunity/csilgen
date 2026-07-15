@@ -20,7 +20,7 @@ use crate::{
 };
 use csilgen_common::{CsilServiceDefinition, CsilServiceOperation, WasmGeneratorInput};
 
-const DEFAULT_TYPES_MODULE: &str = "./types.gen";
+const TYPES_STEM: &str = "types.gen";
 
 const PREAMBLE: &str = "\
 // The consumer-defined context carries auth, request id, etc. It is opaque to
@@ -38,6 +38,7 @@ export interface Codec {
 pub fn generate(input: &WasmGeneratorInput) -> Result<String, String> {
     let mode = common::bidi_transport(input)?;
     let mapping = common::decimal_mapping(input)?;
+    let ext = common::import_extension(input)?;
     let spec = &input.csil_spec;
     let services = common::sorted_services(spec);
 
@@ -51,7 +52,8 @@ pub fn generate(input: &WasmGeneratorInput) -> Result<String, String> {
     imports.push("ServiceError".to_string());
     imports.sort();
     imports.dedup();
-    let module = string_option(input, "client_types_module", DEFAULT_TYPES_MODULE);
+    let default_types_module = ext.specifier(TYPES_STEM);
+    let module = string_option(input, "client_types_module", &default_types_module);
     out.push_str(&format!(
         "import type {{ {} }} from \"{module}\";\n\n",
         imports.join(", ")

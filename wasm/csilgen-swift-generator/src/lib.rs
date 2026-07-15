@@ -9,11 +9,12 @@
 
 use convert_case::{Case, Casing};
 use csilgen_common::{
-    CsilControlOperator, CsilFieldMetadata, CsilGroupEntry, CsilGroupExpression, CsilGroupKey,
-    CsilLiteralValue, CsilOccurrence, CsilRuleType, CsilServiceDefinition, CsilServiceDirection,
-    CsilServiceOperation, CsilSizeConstraint, CsilTypeExpression, CsilValidationConstraint,
-    GeneratedFile, GenerationStats, GeneratorCapability, GeneratorMetadata, GeneratorWarning,
-    WasmGeneratorInput, WasmGeneratorOutput, wasm_interface::*,
+    ChoiceClass, CsilControlOperator, CsilFieldMetadata, CsilGroupEntry, CsilGroupExpression,
+    CsilGroupKey, CsilLiteralValue, CsilOccurrence, CsilRuleType, CsilServiceDefinition,
+    CsilServiceDirection, CsilServiceOperation, CsilSizeConstraint, CsilTypeExpression,
+    CsilValidationConstraint, GeneratedFile, GenerationStats, GeneratorCapability,
+    GeneratorMetadata, GeneratorWarning, WasmGeneratorInput, WasmGeneratorOutput,
+    choice_arm_literal, wasm_interface::*,
 };
 
 #[unsafe(no_mangle)]
@@ -200,6 +201,27 @@ fn build_files(input: &WasmGeneratorInput) -> Result<Vec<GeneratedFile>, i32> {
     // Validate `client_style` early so a bad value fails the whole run regardless of the
     // requested surface, mirroring the TypeScript generator's option validation.
     let style = client_style(&input.config.options).map_err(|_| error_codes::GENERATION_ERROR)?;
+
+    // Rewrite inline (anonymous) composite field types to synthesized named rules so
+    // every emitter below sees them as ordinary references and routes them through the
+    // named-rule machinery (types, codec, client, services all read from this one
+    // hoisted view). `hoist_all_literal_choices: true` because this generator's own
+    // pre-shared-classifier hoister (`inline_choice`) hoisted EVERY inline choice, all-
+    // literal or not — Swift has no other route for an inline choice in a field
+    // position, so leaving one inline was never an option here (unlike TypeScript,
+    // which renders a bare-literal enum in place). See
+    // `csilgen_common::hoist_inline_composites`.
+    let hoisted = {
+        let mut cloned = input.clone();
+        cloned.csil_spec = csilgen_common::hoist_inline_composites(
+            &input.csil_spec,
+            csilgen_common::HoistOptions {
+                hoist_all_literal_choices: true,
+            },
+        );
+        cloned
+    };
+    let input = &hoisted;
 
     let mut files = Vec::new();
 
@@ -611,7 +633,7 @@ fn first_swift_channel_example(input: &WasmGeneratorInput) -> Option<SwiftChanne
             let method_pascal = swift_type_name(&op.name);
             return Some(SwiftChannelExample {
                 handler_protocol: type_name.clone(),
-                service_wire: wire_service_string(&rule.name),
+                service_wire: rule.name.clone(),
                 route_fn: format!("route{type_name}Channel"),
                 encode_fn: format!("encode{type_name}{method_pascal}"),
                 handler_method: swift_ident(&op.name),
@@ -1215,28 +1237,6 @@ fn service_base(name: &str) -> String {
         .unwrap_or(pascal)
 }
 
-/// The wire `service` string: the service base, **lowercased**, per
-/// `docs/cbor-wire-contract.md` (`CorndogsService` → `"corndogs"`) — distinct from
-/// the Swift type name, so a Swift client reaches the same endpoint as its peers.
-fn wire_service_string(name: &str) -> String {
-    service_base(name).to_lowercase()
-}
-
-/// The wire `op` string: the operation name PascalCased with the simple rule
-/// (capitalize after `_`/`-`, leave the rest), matching the other generators
-/// (`submit-task` → `"SubmitTask"`).
-fn wire_op_string(name: &str) -> String {
-    let mut out = String::new();
-    for word in name.split(['_', '-']) {
-        let mut chars = word.chars();
-        if let Some(first) = chars.next() {
-            out.extend(first.to_uppercase());
-            out.push_str(chars.as_str());
-        }
-    }
-    out
-}
-
 /// A safely-escaped Swift double-quoted string literal for arbitrary text.
 fn swift_string_lit(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
@@ -1346,6 +1346,17 @@ fn map_tuple(group: &CsilGroupExpression) -> String {
     }
 }
 
+/// The Swift tuple-label for one tuple position: the keyed name where the entry has
+/// one, else the positional `field<index>` `map_tuple` already uses — kept as its own
+/// function so encode/decode (`swift_enc_value`/`swift_dec_value`) address exactly the
+/// member the type declaration (`map_tuple`) named.
+fn tuple_field_label(group: &CsilGroupExpression, index: usize) -> String {
+    match group.entries[index].key.as_ref().and_then(wire_key) {
+        Some(name) => swift_ident(&name),
+        None => format!("field{index}"),
+    }
+}
+
 fn literal_to_swift(value: &CsilLiteralValue) -> String {
     match value {
         CsilLiteralValue::Integer(i) => i.to_string(),
@@ -1412,6 +1423,11 @@ fn generate_types(input: &WasmGeneratorInput) -> Option<String> {
     let mut any = false;
     let mut needs_validation = false;
 
+    // `input.csil_spec` has already been through `csilgen_common::hoist_inline_composites`
+    // (see `build_files`), so every inline choice a field/array-element/map-value/tuple-
+    // element carried now shows up here as an ordinary synthesized `TypeDef(Choice(..))`
+    // rule, appended after the source-declared rules — this same loop emits it exactly
+    // like an author-declared choice rule, with no separate hoisted-types pass needed.
     for rule in &input.csil_spec.rules {
         match &rule.rule_type {
             CsilRuleType::GroupDef(group) => {
@@ -1482,6 +1498,10 @@ fn emit_struct(name: &str, group: &CsilGroupExpression, needs_validation: &mut b
             continue;
         };
         let optional = matches!(entry.occurrence, Some(CsilOccurrence::Optional));
+        // `entry.value_type` is already the post-hoist type: an inline choice this
+        // field carried has been rewritten to a `Reference` to its synthesized named
+        // type by `csilgen_common::hoist_inline_composites` (see `build_files`), so
+        // `map_type` routes it through that type like any other named reference.
         let ty = map_type(&entry.value_type, optional);
         if let Some(desc) = field_description(&entry.metadata) {
             out.push_str(&format!("    /// {desc}\n"));
@@ -1551,30 +1571,133 @@ fn emit_struct(name: &str, group: &CsilGroupExpression, needs_validation: &mut b
 }
 
 /// Whether every arm of a choice is "some text": the open `text`/`tstr` builtin or a
-/// string literal. Such a choice carries no more information than `String` on the wire.
+/// string literal (including one wrapped by a trailing control operator, see
+/// `choice_arm_literal`). Used only for an *inline* anonymous choice (a choice written
+/// directly as a field's type, with no rule name to bind an enum to) as an
+/// is-it-just-a-string fallback signal. A *named* choice/union rule always gets its
+/// own tagged-enum codec via `emit_enum`/`swift_union_choices`, mixed or not — see
+/// `all_text_literals` for the (narrower) test that actually gates that collapse.
 fn choice_is_stringy(choices: &[CsilTypeExpression]) -> bool {
     !choices.is_empty()
         && choices.iter().all(|c| match c {
             CsilTypeExpression::Builtin(n) => n == "text" || n == "tstr",
-            CsilTypeExpression::Literal(CsilLiteralValue::Text(_)) => true,
-            _ => false,
+            _ => matches!(choice_arm_literal(c), Some(CsilLiteralValue::Text(_))),
         })
 }
 
-/// The verbatim wire strings of a closed string-literal choice (every arm a text
-/// literal), or `None` when the choice is anything else.
-fn all_text_literals(choices: &[CsilTypeExpression]) -> Option<Vec<String>> {
-    if choices.is_empty() {
-        return None;
+/// The verbatim wire strings of a closed string-literal vocabulary (every literal a
+/// text literal), or `None` when any literal is a different kind. Operates on the
+/// already-confirmed-all-literal list `classify_choice`/`swift_choice_shape` hands it
+/// (see below), not on raw choice arms — a bare `text`/`tstr` open arm, or any other
+/// non-literal arm, never reaches this function at all: `ChoiceClass::Union` catches
+/// those upstream.
+fn all_text_literals(literals: &[&CsilLiteralValue]) -> Option<Vec<String>> {
+    literals
+        .iter()
+        .map(|lit| match lit {
+            CsilLiteralValue::Text(s) => Some(s.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The literal-kind tag of a non-text scalar literal, for `all_scalar_literals`'s
+/// same-kind check. Text is deliberately absent: a text-literal choice already has its
+/// own dedicated route (`all_text_literals`/`emit_string_enum`), and keeping the two
+/// kind spaces disjoint means a choice can never match both.
+fn scalar_literal_kind(value: &CsilLiteralValue) -> Option<&'static str> {
+    match value {
+        CsilLiteralValue::Integer(_) => Some("int"),
+        CsilLiteralValue::Float(_) => Some("float"),
+        CsilLiteralValue::Bool(_) => Some("bool"),
+        CsilLiteralValue::Bytes(_) => Some("bytes"),
+        _ => None,
     }
-    let mut labels = Vec::with_capacity(choices.len());
-    for choice in choices {
-        match choice {
-            CsilTypeExpression::Literal(CsilLiteralValue::Text(s)) => labels.push(s.clone()),
+}
+
+/// The verbatim literals of a closed uniform-kind scalar vocabulary — every literal an
+/// int/float/bool/bytes literal of the *same* kind — or `None` when the kinds mix or
+/// any literal is text (which `all_text_literals` owns instead). This is the non-text
+/// sibling of `all_text_literals`: same bare-literal wire contract (interop's
+/// `Priority = 1 / 2 / 3` is bare `1`/`2`/`3` on the wire, not a `[index, value]`
+/// tagged sum), just for the literal kinds that can't back a Swift `String`-raw-value
+/// enum.
+fn all_scalar_literals(literals: &[&CsilLiteralValue]) -> Option<Vec<CsilLiteralValue>> {
+    let mut kind = None;
+    for lit in literals {
+        let this_kind = scalar_literal_kind(lit)?;
+        match kind {
+            None => kind = Some(this_kind),
+            Some(k) if k == this_kind => {}
             _ => return None,
         }
     }
-    Some(labels)
+    Some(literals.iter().map(|lit| (*lit).clone()).collect())
+}
+
+/// The verbatim literals of a closed ALL-literal vocabulary whose kinds are NOT
+/// uniform (e.g. `"a" / 1`) — the third bare-literal shape alongside
+/// `all_text_literals` (pure text) and `all_scalar_literals` (one uniform non-text
+/// scalar kind). Per the CSIL wire contract an ALL-literal choice always rides bare
+/// regardless of whether its declared literal kinds happen to match — the wire value
+/// is the literal itself, self-discriminating by its own CBOR major type + value — so
+/// a mixed-kind literal set needs no tag any more than a uniform-kind one does. `None`
+/// when a literal isn't a kind `all_text_literals`/`all_scalar_literals` would
+/// otherwise recognize (bytes included, matching this generator's own existing
+/// scalar-enum scope; a `null`/array literal isn't classifiable here — see
+/// `swift_choice_shape`, which falls such a vocabulary back to `Union` since neither
+/// `mixed_enum_case_name`/`mixed_case_pattern` can discriminate those kinds). Called
+/// only from `classify_enum_literals`, after `all_text_literals`/`all_scalar_literals`
+/// have both already failed, so this never needs to re-check uniformity itself.
+/// Mirrors the PHP/Go generators' analogously broadened `choice_is_enum`/
+/// `choice_all_literal` for the same Finding.
+fn all_mixed_literals(literals: &[&CsilLiteralValue]) -> Option<Vec<CsilLiteralValue>> {
+    for lit in literals {
+        if !matches!(lit, CsilLiteralValue::Text(_)) && scalar_literal_kind(lit).is_none() {
+            return None;
+        }
+    }
+    Some(literals.iter().map(|lit| (*lit).clone()).collect())
+}
+
+/// Swift's classification of a CSIL choice: the shared `csilgen_common::classify_choice`
+/// decides the normative ENUM-vs-UNION split (an ALL-literal vocabulary, any kind or
+/// mix, is an `Enum`; at least one non-literal arm is a `Union`), and this generator's
+/// own three literal-kind sub-shapes (`all_text_literals`/`all_scalar_literals`/
+/// `all_mixed_literals`) further split a confirmed `Enum` into the bare-wire rendering
+/// it gets. `Union` also covers the rare all-literal vocabulary containing a
+/// `null`/array literal (see `all_mixed_literals`'s doc) — Swift has no codec for that
+/// shape as a bare enum, so it falls back to the tagged-sum union exactly as it did
+/// before this classifier existed.
+enum SwiftChoiceShape {
+    StringEnum(Vec<String>),
+    ScalarEnum(Vec<CsilLiteralValue>),
+    MixedEnum(Vec<CsilLiteralValue>),
+    Union,
+}
+
+fn swift_choice_shape(choices: &[CsilTypeExpression]) -> SwiftChoiceShape {
+    match csilgen_common::classify_choice(choices) {
+        ChoiceClass::Enum(literals) => classify_enum_literals(&literals),
+        ChoiceClass::Union(_) => SwiftChoiceShape::Union,
+    }
+}
+
+/// Sub-classify a confirmed-all-literal vocabulary into the bare-wire enum shape Swift
+/// renders it as, trying the narrowest shape first so the three stay mutually
+/// exclusive: pure text, then uniform-kind scalar, then mixed kinds; a vocabulary none
+/// of the three covers (`null`/array literals) falls back to `Union`.
+fn classify_enum_literals(literals: &[&CsilLiteralValue]) -> SwiftChoiceShape {
+    if let Some(labels) = all_text_literals(literals) {
+        return SwiftChoiceShape::StringEnum(labels);
+    }
+    if let Some(lits) = all_scalar_literals(literals) {
+        return SwiftChoiceShape::ScalarEnum(lits);
+    }
+    if let Some(lits) = all_mixed_literals(literals) {
+        return SwiftChoiceShape::MixedEnum(lits);
+    }
+    SwiftChoiceShape::Union
 }
 
 /// A closed set of string literals as a `String`-backed Swift enum: the raw value is the
@@ -1599,19 +1722,190 @@ fn emit_string_enum(type_name: &str, labels: &[String]) -> String {
     out
 }
 
+/// The case name `emit_enum` and `emit_union_codec` both use for a choice arm, so the
+/// type declaration and its codec never drift apart: a `Reference`/`Builtin` arm gets a
+/// named case (its referenced/builtin name), everything else — including a `Literal`
+/// arm — gets a positional `case<index>`.
+fn enum_case_name(choice: &CsilTypeExpression, index: usize) -> String {
+    match choice {
+        CsilTypeExpression::Reference(arm) | CsilTypeExpression::Builtin(arm) => swift_ident(arm),
+        _ => format!("case{index}"),
+    }
+}
+
+/// A Swift case identifier for one scalar-literal enum member (see
+/// `all_scalar_literals`). There's no wire-verbatim label to camelCase the way a text
+/// literal's own value doubles as its case name, so the identifier is derived from the
+/// literal itself: `v1`/`vNeg5` for an int, `vTrue`/`vFalse` for a bool, a
+/// decimal-point-sanitized `v3_14` for a float. A bytes literal has no compact textual
+/// form worth naming after, so it falls back to the positional form every other kind
+/// also uses as its last resort.
+fn scalar_enum_case_name(lit: &CsilLiteralValue, index: usize) -> String {
+    match lit {
+        CsilLiteralValue::Integer(n) if *n < 0 => format!("vNeg{}", n.unsigned_abs()),
+        CsilLiteralValue::Integer(n) => format!("v{n}"),
+        CsilLiteralValue::Bool(b) => format!("v{}", if *b { "True" } else { "False" }),
+        CsilLiteralValue::Float(f) => {
+            let text = f.to_string();
+            let (sign, digits) = match text.strip_prefix('-') {
+                Some(rest) => ("Neg", rest),
+                None => ("", text.as_str()),
+            };
+            format!("v{sign}{}", digits.replace('.', "_"))
+        }
+        _ => format!("v{index}"),
+    }
+}
+
+/// The unique case identifiers for a scalar-literal enum (see `all_scalar_literals`),
+/// de-duplicating any two literals whose derived name collides (e.g. `1` and `-1` both
+/// sanitizing to the same text in a hypothetical future literal kind) by falling back to
+/// the positional form, which is always unique since it's the loop index.
+fn scalar_enum_case_names(lits: &[CsilLiteralValue]) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    lits.iter()
+        .enumerate()
+        .map(|(index, lit)| {
+            let name = scalar_enum_case_name(lit, index);
+            if seen.insert(name.clone()) {
+                name
+            } else {
+                format!("v{index}")
+            }
+        })
+        .collect()
+}
+
+/// A Swift case identifier for one member of a MIXED-kind all-literal enum (see
+/// `all_mixed_literals`). A text literal gets the same wire-verbatim camelCased
+/// label `emit_string_enum` uses for a pure-text enum (there's no reason to lose
+/// that readability just because a sibling arm happens to be a different kind);
+/// every other kind falls back to `scalar_enum_case_name`'s derived-from-the-
+/// literal-itself naming.
+fn mixed_enum_case_name(lit: &CsilLiteralValue, index: usize) -> String {
+    match lit {
+        CsilLiteralValue::Text(s) => swift_ident(s),
+        other => scalar_enum_case_name(other, index),
+    }
+}
+
+/// The unique case identifiers for a mixed-kind literal enum (see
+/// `all_mixed_literals`), de-duplicating a name collision (e.g. a text literal `"1"`
+/// and an integer literal `1` both naming their case `v1`/`v1`... actually `"1"`
+/// camelCases to `_1` via `swift_ident`, but two literals of the same kind could
+/// still collide) the same way `scalar_enum_case_names` does: fall back to the
+/// positional form, which is always unique since it's the loop index.
+fn mixed_enum_case_names(lits: &[CsilLiteralValue]) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    lits.iter()
+        .enumerate()
+        .map(|(index, lit)| {
+            let name = mixed_enum_case_name(lit, index);
+            if seen.insert(name.clone()) {
+                name
+            } else {
+                format!("v{index}")
+            }
+        })
+        .collect()
+}
+
+/// The Swift type Swift's raw-value-enum syntax natively backs a scalar literal kind
+/// with, or `None` when that kind can't be a `case x = <literal>` raw value at all.
+/// Swift's raw-value enum sugar only accepts integer, floating-point, and string literal
+/// raw values (`RawRepresentable` synthesis pattern-matches those literal AST kinds
+/// specifically) — a bool or bytes literal can't be written as `case x = true` /
+/// `case x = [1, 2]` there, so those two kinds fall back to a manual (no raw value)
+/// enum with a hand-written `toCborValue()`/`init(cborValue:)` switch instead of
+/// `emit_scalar_enum`'s native-raw-value path.
+fn scalar_swift_raw_type(lit: &CsilLiteralValue) -> Option<&'static str> {
+    match lit {
+        CsilLiteralValue::Integer(_) => Some("Int64"),
+        CsilLiteralValue::Float(_) => Some("Double"),
+        _ => None,
+    }
+}
+
+/// A closed uniform-kind scalar-literal choice (`all_scalar_literals`) as a Swift enum:
+/// int/float back a native `RawRepresentable` enum (`enum X: Int64 { case v1 = 1 ... }`,
+/// the same shape `emit_string_enum` already uses for `String`), bool/bytes — which
+/// can't be raw-value literals in Swift (see `scalar_swift_raw_type`) — become a manual
+/// enum with no raw value at all; `emit_scalar_enum_codec` supplies the matching
+/// `toCborValue()`/`init(cborValue:)` for either shape.
+fn emit_scalar_enum(type_name: &str, lits: &[CsilLiteralValue]) -> String {
+    let names = scalar_enum_case_names(lits);
+    let mut out = String::new();
+    out.push_str(&format!(
+        "/// {type_name} is a generated CSIL scalar-literal enum (a closed set of wire values).\n"
+    ));
+    match lits.first().and_then(scalar_swift_raw_type) {
+        Some(raw) => {
+            out.push_str(&format!(
+                "public enum {type_name}: {raw}, Equatable, Sendable, CaseIterable {{\n"
+            ));
+            for (case_name, lit) in names.iter().zip(lits) {
+                out.push_str(&format!(
+                    "    case {case_name} = {}\n",
+                    literal_to_swift(lit)
+                ));
+            }
+        }
+        None => {
+            out.push_str(&format!(
+                "public enum {type_name}: Equatable, Sendable, CaseIterable {{\n"
+            ));
+            for case_name in &names {
+                out.push_str(&format!("    case {case_name}\n"));
+            }
+        }
+    }
+    out.push_str("}\n\n");
+    out
+}
+
+/// A closed MIXED-kind all-literal choice (`all_mixed_literals`, e.g. `"a" / 1`) as a
+/// Swift enum: no raw value is possible — Swift's raw-value enum sugar requires ONE
+/// uniform backing type (`RawRepresentable` synthesis), and this choice's arms don't
+/// share one — so it's always the manual (no-raw-value) shape `emit_scalar_enum`
+/// already uses for its own bool/bytes case, just with a case per literal regardless
+/// of kind. `emit_mixed_enum_codec` supplies the matching `toCborValue()`/
+/// `init(cborValue:)`.
+fn emit_mixed_enum(type_name: &str, lits: &[CsilLiteralValue]) -> String {
+    let names = mixed_enum_case_names(lits);
+    let mut out = String::new();
+    out.push_str(&format!(
+        "/// {type_name} is a generated CSIL mixed-literal enum (a closed set of wire values of differing kinds).\n"
+    ));
+    out.push_str(&format!(
+        "public enum {type_name}: Equatable, Sendable, CaseIterable {{\n"
+    ));
+    for case_name in &names {
+        out.push_str(&format!("    case {case_name}\n"));
+    }
+    out.push_str("}\n\n");
+    out
+}
+
 /// A variant/sum type as a Swift `enum` with associated values, one case per declared
-/// choice arm. A pure string-literal set becomes a `String`-backed enum; a choice that
-/// only mixes open `text` with literals collapses to `String`; otherwise reference arms
-/// take the referenced struct and builtin arms take the mapped Swift type.
+/// choice arm. A pure string-literal set becomes a `String`-backed enum
+/// (`emit_string_enum`); a uniform-kind int/float/bool/bytes-literal set becomes a
+/// scalar-backed enum (`emit_scalar_enum`); a MIXED-kind all-literal set (differing
+/// literal kinds, e.g. `"a" / 1`) becomes a manual no-raw-value enum
+/// (`emit_mixed_enum`) — all three keep the literal as the wire's own discriminant,
+/// no `[index, payload]` wrapper. Every other shape — including one that mixes the
+/// open `text` builtin with string literals, e.g. `text / "pending" / "confirmed" /
+/// ...` (at least one non-literal arm) — becomes a tagged enum: reference/builtin
+/// arms take the referenced struct or mapped Swift type under a named case,
+/// everything else (literals, nested shapes) takes a positional case. The enum
+/// case itself is the wire discriminant; see `emit_union_codec` for how that's
+/// encoded/decoded as CBOR.
 fn emit_enum(name: &str, choices: &[CsilTypeExpression]) -> String {
     let type_name = swift_type_name(name);
-    if let Some(labels) = all_text_literals(choices) {
-        return emit_string_enum(&type_name, &labels);
-    }
-    if choice_is_stringy(choices) {
-        return format!(
-            "/// {type_name} is any CSIL text value (an open string choice).\npublic typealias {type_name} = String\n\n"
-        );
+    match swift_choice_shape(choices) {
+        SwiftChoiceShape::StringEnum(labels) => return emit_string_enum(&type_name, &labels),
+        SwiftChoiceShape::ScalarEnum(lits) => return emit_scalar_enum(&type_name, &lits),
+        SwiftChoiceShape::MixedEnum(lits) => return emit_mixed_enum(&type_name, &lits),
+        SwiftChoiceShape::Union => {}
     }
     let mut out = String::new();
     out.push_str(&format!(
@@ -1621,18 +1915,8 @@ fn emit_enum(name: &str, choices: &[CsilTypeExpression]) -> String {
         "public enum {type_name}: Equatable, Sendable {{\n"
     ));
     for (index, choice) in choices.iter().enumerate() {
-        match choice {
-            CsilTypeExpression::Reference(arm) | CsilTypeExpression::Builtin(arm) => {
-                let case = swift_ident(arm);
-                out.push_str(&format!("    case {}({})\n", case, map_type(choice, false)));
-            }
-            other => {
-                out.push_str(&format!(
-                    "    case case{index}({})\n",
-                    map_type(other, false)
-                ));
-            }
-        }
+        let case = enum_case_name(choice, index);
+        out.push_str(&format!("    case {case}({})\n", map_type(choice, false)));
     }
     out.push_str("}\n\n");
     out
@@ -1980,6 +2264,127 @@ fn swift_codec_aliases(
         .collect()
 }
 
+/// Named choice/union rules (`TypeDef(Choice(..))` / `TypeChoice(..)`) that `emit_enum`
+/// renders as a tagged `enum` rather than a `String`-/scalar-backed one — i.e. every
+/// named choice except the pure text-literal set (`all_text_literals`), the uniform
+/// scalar-literal set (`all_scalar_literals`), and the MIXED-kind all-literal set
+/// (`all_mixed_literals`, e.g. `"a" / 1`), which are `emit_enum`'s only remaining
+/// special cases now that the premature `choice_is_stringy` collapse is gone. This
+/// deliberately does NOT also exclude on `choice_is_stringy`: an all-`text`-plus-
+/// literals mix like `OrderStatus` (the motivating case for this whole codec) is
+/// `choice_is_stringy` but is NOT `all_text_literals`, so excluding on it would silently
+/// drop the exact shape this helper exists to cover. Keyed by the raw CSIL rule name
+/// (matching how `swift_codec_aliases` keys transparent aliases), since that's what a
+/// `CsilTypeExpression::Reference(name)` carries.
+fn swift_union_choices(
+    input: &WasmGeneratorInput,
+) -> std::collections::HashMap<String, Vec<CsilTypeExpression>> {
+    input
+        .csil_spec
+        .rules
+        .iter()
+        .filter_map(|rule| {
+            let choices = match &rule.rule_type {
+                CsilRuleType::TypeDef(CsilTypeExpression::Choice(choices)) => choices,
+                CsilRuleType::TypeChoice(choices) => choices,
+                _ => return None,
+            };
+            match swift_choice_shape(choices) {
+                SwiftChoiceShape::Union => Some((rule.name.clone(), choices.clone())),
+                _ => None,
+            }
+        })
+        .collect()
+}
+
+/// Named closed string-literal choice rules (`TypeDef(Choice(..))` / `TypeChoice(..)`
+/// where every arm is a text literal, per `all_text_literals`) — one of the two
+/// complementary sets to `swift_union_choices` (`swift_scalar_enum_choices` is the
+/// other). `emit_enum` renders these as a `String`-backed enum, but that enum still
+/// needs its own `toCborValue()`/`init(cborValue:)` (see `emit_string_enum_codec`):
+/// before this exact map existed, a struct field referencing a rule like `Color = "red"
+/// / "green" / "blue"` fell through `swift_enc_value`/`swift_dec_value`'s catch-all
+/// (`.null` on encode, `asText` on decode — silently dropping the field's data and
+/// producing a decode that doesn't even type-check against the `Color` field type).
+/// Keyed by the raw CSIL rule name, matching `swift_union_choices`/`swift_codec_aliases`.
+fn swift_string_enum_choices(
+    input: &WasmGeneratorInput,
+) -> std::collections::HashMap<String, Vec<String>> {
+    input
+        .csil_spec
+        .rules
+        .iter()
+        .filter_map(|rule| {
+            let choices = match &rule.rule_type {
+                CsilRuleType::TypeDef(CsilTypeExpression::Choice(choices)) => choices,
+                CsilRuleType::TypeChoice(choices) => choices,
+                _ => return None,
+            };
+            match swift_choice_shape(choices) {
+                SwiftChoiceShape::StringEnum(labels) => Some((rule.name.clone(), labels)),
+                _ => None,
+            }
+        })
+        .collect()
+}
+
+/// Named closed uniform-kind scalar-literal choice rules (`TypeDef(Choice(..))` /
+/// `TypeChoice(..)` where every arm is a same-kind int/float/bool/bytes literal, per
+/// `all_scalar_literals`) — the non-text sibling of `swift_string_enum_choices`, same
+/// role: routes a field referencing e.g. `Priority = 1 / 2 / 3` through
+/// `emit_scalar_enum`'s codec (`emit_scalar_enum_codec`) instead of
+/// `swift_enc_value`/`swift_dec_value`'s catch-all. Keyed by the raw CSIL rule name,
+/// matching `swift_union_choices`/`swift_string_enum_choices`/`swift_codec_aliases`.
+fn swift_scalar_enum_choices(
+    input: &WasmGeneratorInput,
+) -> std::collections::HashMap<String, Vec<CsilLiteralValue>> {
+    input
+        .csil_spec
+        .rules
+        .iter()
+        .filter_map(|rule| {
+            let choices = match &rule.rule_type {
+                CsilRuleType::TypeDef(CsilTypeExpression::Choice(choices)) => choices,
+                CsilRuleType::TypeChoice(choices) => choices,
+                _ => return None,
+            };
+            match swift_choice_shape(choices) {
+                SwiftChoiceShape::ScalarEnum(lits) => Some((rule.name.clone(), lits)),
+                _ => None,
+            }
+        })
+        .collect()
+}
+
+/// Named closed MIXED-kind all-literal choice rules (`TypeDef(Choice(..))` /
+/// `TypeChoice(..)` where every arm is a literal but the kinds DON'T all match, per
+/// `all_mixed_literals`, e.g. `"a" / 1`) — the third sibling to
+/// `swift_string_enum_choices`/`swift_scalar_enum_choices`, same role: routes a
+/// field referencing such a rule through `emit_mixed_enum`'s codec
+/// (`emit_mixed_enum_codec`) instead of either narrower enum path or
+/// `swift_enc_value`/`swift_dec_value`'s tagged-union catch-all. Keyed by the raw
+/// CSIL rule name, matching the other three classification maps.
+fn swift_mixed_enum_choices(
+    input: &WasmGeneratorInput,
+) -> std::collections::HashMap<String, Vec<CsilLiteralValue>> {
+    input
+        .csil_spec
+        .rules
+        .iter()
+        .filter_map(|rule| {
+            let choices = match &rule.rule_type {
+                CsilRuleType::TypeDef(CsilTypeExpression::Choice(choices)) => choices,
+                CsilRuleType::TypeChoice(choices) => choices,
+                _ => return None,
+            };
+            match swift_choice_shape(choices) {
+                SwiftChoiceShape::MixedEnum(lits) => Some((rule.name.clone(), lits)),
+                _ => None,
+            }
+        })
+        .collect()
+}
+
 /// The CBOR encoding of a text key; comparing these lexicographically is RFC 8949
 /// §4.2.1 key ordering, computed at generation time for a canonical map.
 fn cbor_text_key_bytes(name: &str) -> Vec<u8> {
@@ -2000,9 +2405,12 @@ fn cbor_text_key_bytes(name: &str) -> Vec<u8> {
     head
 }
 
+/// Strip `.constraint` wrappers (recursively — the parser only ever nests one deep in
+/// practice, but this matches `choice_arm_literal`'s recursion for safety) to reach the
+/// underlying type shape a constraint decorates.
 fn unwrap_constrained(ty: &CsilTypeExpression) -> &CsilTypeExpression {
     match ty {
-        CsilTypeExpression::Constrained { base_type, .. } => base_type,
+        CsilTypeExpression::Constrained { base_type, .. } => unwrap_constrained(base_type),
         other => other,
     }
 }
@@ -2013,6 +2421,7 @@ fn swift_enc_value(
     expr: &str,
     records: &std::collections::HashSet<String>,
     aliases: &std::collections::HashMap<String, CsilTypeExpression>,
+    choice_codecs: &std::collections::HashSet<String>,
 ) -> String {
     match unwrap_constrained(ty) {
         CsilTypeExpression::Builtin(name) => match name.as_str() {
@@ -2031,21 +2440,59 @@ fn swift_enc_value(
         CsilTypeExpression::Reference(name) if records.contains(&swift_type_name(name)) => {
             format!("{expr}.toCborValue()")
         }
+        // A reference to a named choice rule — tagged union (`emit_union_codec`) or
+        // closed string-literal enum (`emit_string_enum_codec`) alike, and likewise for
+        // a choice hoisted out of an inline field position (`csilgen_common::hoist_inline_composites`) —
+        // has its own `toCborValue()`/`init(cborValue:)`, exactly like a record's.
+        CsilTypeExpression::Reference(name) if choice_codecs.contains(name) => {
+            format!("{expr}.toCborValue()")
+        }
         // A reference to a transparent alias (`StringInt64Map = {* text => int}`,
         // `Tags = [* text]`, `Uuid = text`) has no codec of its own; the Swift
         // `typealias` makes the field value already a dictionary/array/scalar, so we
         // encode it as the underlying type rather than stubbing it to `.null`.
         CsilTypeExpression::Reference(name) if aliases.contains_key(name) => {
-            swift_enc_value(&aliases[name], expr, records, aliases)
+            swift_enc_value(&aliases[name], expr, records, aliases, choice_codecs)
         }
         CsilTypeExpression::Array { element_type, .. } => {
-            let inner = swift_enc_value(element_type, "$0", records, aliases);
+            let inner = swift_enc_value(element_type, "$0", records, aliases, choice_codecs);
             format!("CsilCborValue.array({expr}.map {{ {inner} }})")
         }
         CsilTypeExpression::Map { key, value, .. } => {
-            let k = swift_enc_value(key, "$0.key", records, aliases);
-            let v = swift_enc_value(value, "$0.value", records, aliases);
+            let k = swift_enc_value(key, "$0.key", records, aliases, choice_codecs);
+            let v = swift_enc_value(value, "$0.value", records, aliases, choice_codecs);
             format!("CsilCborValue.map({expr}.map {{ ({k}, {v}) }})")
+        }
+        // A tuple is a fixed-shape CBOR array, one element per position; `map_tuple`
+        // collapses a single-element tuple to a bare Swift value (no field access), so
+        // the encoder must match — `expr` is already that one element's own value.
+        CsilTypeExpression::Tuple(group) if group.entries.len() == 1 => {
+            let inner = swift_enc_value(
+                &group.entries[0].value_type,
+                expr,
+                records,
+                aliases,
+                choice_codecs,
+            );
+            format!("CsilCborValue.array([{inner}])")
+        }
+        CsilTypeExpression::Tuple(group) => {
+            let parts: Vec<String> = group
+                .entries
+                .iter()
+                .enumerate()
+                .map(|(index, entry)| {
+                    let accessor = format!("{expr}.{}", tuple_field_label(group, index));
+                    swift_enc_value(
+                        &entry.value_type,
+                        &accessor,
+                        records,
+                        aliases,
+                        choice_codecs,
+                    )
+                })
+                .collect();
+            format!("CsilCborValue.array([{}])", parts.join(", "))
         }
         CsilTypeExpression::Choice(choices) if choice_is_stringy(choices) => {
             format!(".text({expr})")
@@ -2061,6 +2508,7 @@ fn swift_dec_value(
     expr: &str,
     records: &std::collections::HashSet<String>,
     aliases: &std::collections::HashMap<String, CsilTypeExpression>,
+    choice_codecs: &std::collections::HashSet<String>,
 ) -> String {
     match unwrap_constrained(ty) {
         CsilTypeExpression::Builtin(name) => match name.as_str() {
@@ -2077,22 +2525,60 @@ fn swift_dec_value(
         CsilTypeExpression::Reference(name) if records.contains(&swift_type_name(name)) => {
             format!("try {}(cborValue: {expr})", swift_type_name(name))
         }
+        // A reference to a named choice rule (tagged union, string enum, or one
+        // hoisted from an inline field position, per `csilgen_common::hoist_inline_composites`) decodes via its own
+        // `init(cborValue:)` — see `emit_union_codec`/`emit_string_enum_codec`.
+        CsilTypeExpression::Reference(name) if choice_codecs.contains(name) => {
+            format!("try {}(cborValue: {expr})", swift_type_name(name))
+        }
         // A reference to a transparent alias decodes as its underlying type; the
         // dictionary/array/scalar the underlying decoder yields is exactly the
         // `typealias`-named field's type, so it assigns through without a cast.
         CsilTypeExpression::Reference(name) if aliases.contains_key(name) => {
-            swift_dec_value(&aliases[name], expr, records, aliases)
+            swift_dec_value(&aliases[name], expr, records, aliases, choice_codecs)
         }
         CsilTypeExpression::Array { element_type, .. } => {
-            let inner = swift_dec_value(element_type, "$0", records, aliases);
+            let inner = swift_dec_value(element_type, "$0", records, aliases, choice_codecs);
             format!("try CsilCbor.asArray({expr}).map {{ {inner} }}")
         }
         CsilTypeExpression::Map { key, value, .. } => {
             let kt = map_type(key, false);
             let vt = map_type(value, false);
-            let k = swift_dec_value(key, "$1.0", records, aliases);
-            let v = swift_dec_value(value, "$1.1", records, aliases);
+            let k = swift_dec_value(key, "$1.0", records, aliases, choice_codecs);
+            let v = swift_dec_value(value, "$1.1", records, aliases, choice_codecs);
             format!("try CsilCbor.asMap({expr}).reduce(into: [{kt}: {vt}]()) {{ $0[{k}] = {v} }}")
+        }
+        // Mirrors the encoder: a fixed-shape CBOR array, positionally decoded; a
+        // single-element tuple decodes straight to its one element (no field access),
+        // matching `map_tuple`'s Swift-side collapse.
+        CsilTypeExpression::Tuple(group) if group.entries.len() == 1 => {
+            let elem_access = format!("(try CsilCbor.asArray({expr})[0])");
+            swift_dec_value(
+                &group.entries[0].value_type,
+                &elem_access,
+                records,
+                aliases,
+                choice_codecs,
+            )
+        }
+        CsilTypeExpression::Tuple(group) => {
+            let parts: Vec<String> = group
+                .entries
+                .iter()
+                .enumerate()
+                .map(|(index, entry)| {
+                    let elem_access = format!("(try CsilCbor.asArray({expr})[{index}])");
+                    let dec = swift_dec_value(
+                        &entry.value_type,
+                        &elem_access,
+                        records,
+                        aliases,
+                        choice_codecs,
+                    );
+                    format!("{}: {dec}", tuple_field_label(group, index))
+                })
+                .collect();
+            format!("({})", parts.join(", "))
         }
         CsilTypeExpression::Choice(choices) if choice_is_stringy(choices) => {
             format!("try CsilCbor.asText({expr})")
@@ -2112,20 +2598,25 @@ fn emit_struct_codec(
     group: &CsilGroupExpression,
     records: &std::collections::HashSet<String>,
     aliases: &std::collections::HashMap<String, CsilTypeExpression>,
+    choice_codecs: &std::collections::HashSet<String>,
 ) -> String {
     let type_name = swift_type_name(name);
-    // (member, wire, entry) in declaration order, and a canonical-key-order copy for
-    // the encoder so the wire map is deterministic.
-    let named: Vec<(String, String, &CsilGroupEntry)> = group
+    // (member, wire, entry, effective type) in declaration order, and a
+    // canonical-key-order copy for the encoder so the wire map is deterministic.
+    // `e.value_type` is already the post-hoist type (see `build_files`): an inline
+    // choice this field carried has been rewritten to a `Reference` to its
+    // synthesized named choice by `csilgen_common::hoist_inline_composites`.
+    let named: Vec<(String, String, &CsilGroupEntry, CsilTypeExpression)> = group
         .entries
         .iter()
         .filter_map(|e| {
             let member = entry_field_name(e)?;
             let wire = e.key.as_ref().and_then(wire_key)?;
-            Some((member, wire, e))
+            Some((member, wire, e, e.value_type.clone()))
         })
         .collect();
-    let mut canonical: Vec<&(String, String, &CsilGroupEntry)> = named.iter().collect();
+    let mut canonical: Vec<&(String, String, &CsilGroupEntry, CsilTypeExpression)> =
+        named.iter().collect();
     canonical.sort_by_key(|f| cbor_text_key_bytes(&f.1));
 
     let mut out = String::new();
@@ -2133,19 +2624,20 @@ fn emit_struct_codec(
     out.push_str("    /// The CBOR value tree for this record (deep, canonical key order).\n");
     out.push_str("    func toCborValue() -> CsilCborValue {\n");
     out.push_str("        var csilEntries: [(CsilCborValue, CsilCborValue)] = []\n");
-    for (member, wire, entry) in &canonical {
+    for (member, wire, entry, ty) in &canonical {
         let wire_lit = swift_string_lit(wire);
         if matches!(entry.occurrence, Some(CsilOccurrence::Optional)) {
-            let enc = swift_enc_value(&entry.value_type, "csilV", records, aliases);
+            let enc = swift_enc_value(ty, "csilV", records, aliases, choice_codecs);
             out.push_str(&format!(
                 "        if let csilV = self.{member} {{ csilEntries.append(({wire_lit}, {enc})) }}\n"
             ));
         } else {
             let enc = swift_enc_value(
-                &entry.value_type,
+                ty,
                 &format!("self.{member}"),
                 records,
                 aliases,
+                choice_codecs,
             );
             out.push_str(&format!(
                 "        csilEntries.append(({wire_lit}, {enc}))\n"
@@ -2156,27 +2648,28 @@ fn emit_struct_codec(
 
     out.push_str("    /// Reconstruct this record from a decoded CBOR value tree.\n");
     out.push_str("    init(cborValue: CsilCborValue) throws {\n");
-    for (member, wire, entry) in &named {
+    for (member, wire, entry, ty) in &named {
         let wire_lit = swift_string_lit(wire);
         if matches!(entry.occurrence, Some(CsilOccurrence::Optional)) {
-            let opt_ty = map_type(&entry.value_type, true);
-            let dec = swift_dec_value(&entry.value_type, "csilV", records, aliases);
+            let opt_ty = map_type(ty, true);
+            let dec = swift_dec_value(ty, "csilV", records, aliases, choice_codecs);
             out.push_str(&format!(
                 "        let {member}: {opt_ty} = if let csilV = CsilCbor.mapGet(cborValue, {wire_lit}) {{ {dec} }} else {{ nil }}\n"
             ));
         } else {
             let dec = swift_dec_value(
-                &entry.value_type,
+                ty,
                 &format!("(try CsilCbor.require(cborValue, {wire_lit}))"),
                 records,
                 aliases,
+                choice_codecs,
             );
             out.push_str(&format!("        let {member} = {dec}\n"));
         }
     }
     let init_args: Vec<String> = named
         .iter()
-        .map(|(member, _, _)| format!("{member}: {member}"))
+        .map(|(member, _, _, _)| format!("{member}: {member}"))
         .collect();
     out.push_str(&format!("        self.init({})\n", init_args.join(", ")));
     out.push_str("    }\n\n");
@@ -2191,28 +2684,330 @@ fn emit_struct_codec(
     out
 }
 
+/// Emit the `extension <Type>` carrying a named union rule's codec: a `[index, payload]`
+/// tagged sum, 0-based declaration order, matching `emit_enum`'s case naming
+/// (`enum_case_name`) so the type and its codec never drift. The Swift `enum` case
+/// itself is already the discriminant (same design as the Dart/Zig generators' tagged
+/// sum/sealed-class-per-arm types), so encode has no value-equality ambiguity to
+/// resolve the way Go's `interface{}`-backed union does: a literal-typed arm's payload
+/// is its own declared literal (`swift_enc_value` routes `Literal` through
+/// `swift_literal_cbor_expr`, which ignores the wrapped associated value), and decode
+/// validates that same literal via `CsilCbor.expectLiteral` on the way back in.
+fn emit_union_codec(
+    name: &str,
+    choices: &[CsilTypeExpression],
+    records: &std::collections::HashSet<String>,
+    aliases: &std::collections::HashMap<String, CsilTypeExpression>,
+    choice_codecs: &std::collections::HashSet<String>,
+) -> String {
+    let type_name = swift_type_name(name);
+    let mut out = String::new();
+    out.push_str(&format!("public extension {type_name} {{\n"));
+    out.push_str("    /// The CBOR value tree for this variant: a `[index, payload]` tagged sum\n");
+    out.push_str("    /// (0-based declaration order is the wire contract).\n");
+    out.push_str("    func toCborValue() -> CsilCborValue {\n");
+    out.push_str("        switch self {\n");
+    for (index, choice) in choices.iter().enumerate() {
+        let case = enum_case_name(choice, index);
+        let enc = swift_enc_value(choice, "csilV", records, aliases, choice_codecs);
+        out.push_str(&format!(
+            "        case .{case}(let csilV):\n            return .array([.uint({index}), {enc}])\n"
+        ));
+    }
+    out.push_str("        }\n    }\n\n");
+
+    out.push_str("    /// Reconstruct this variant from a decoded CBOR value tree.\n");
+    out.push_str("    init(cborValue: CsilCborValue) throws {\n");
+    out.push_str("        let csilElems = try CsilCbor.asArray(cborValue)\n");
+    out.push_str("        guard csilElems.count == 2 else { throw CsilCborError.malformed }\n");
+    out.push_str("        let csilIndex = try CsilCbor.asU64(csilElems[0])\n");
+    out.push_str("        let csilPayload = csilElems[1]\n");
+    out.push_str("        switch csilIndex {\n");
+    for (index, choice) in choices.iter().enumerate() {
+        let case = enum_case_name(choice, index);
+        let dec = swift_dec_value(choice, "csilPayload", records, aliases, choice_codecs);
+        out.push_str(&format!("        case {index}: self = .{case}({dec})\n"));
+    }
+    out.push_str("        default: throw CsilCborError.typeMismatch\n");
+    out.push_str("        }\n    }\n\n");
+
+    out.push_str("    /// Encode this variant to canonical CSIL CBOR bytes.\n");
+    out.push_str("    func toCbor() -> [UInt8] { CsilCbor.encode(toCborValue()) }\n\n");
+    out.push_str("    /// Decode a CSIL CBOR byte payload into this variant.\n");
+    out.push_str(&format!(
+        "    static func fromCbor(_ bytes: [UInt8]) throws -> {type_name} {{ try {type_name}(cborValue: CsilCbor.decode(bytes)) }}\n"
+    ));
+    out.push_str("}\n\n");
+    out
+}
+
+/// Emit the `extension <Type>` carrying a closed string-literal enum's codec (a named
+/// rule where `all_text_literals` holds, or a choice hoisted from an inline field
+/// position with the same shape — see `csilgen_common::hoist_inline_composites`). The bare CBOR text is
+/// the enum's own wire discriminant (there's no other arm to distinguish it from), so
+/// encode is just the `rawValue`; decode goes through the failable `init(rawValue:)`
+/// so an unrecognized wire string throws instead of being silently accepted — the
+/// "decode-time membership validation" half of the literal-enum wire contract.
+fn emit_string_enum_codec(type_name: &str) -> String {
+    let mut out = String::new();
+    out.push_str(&format!("public extension {type_name} {{\n"));
+    out.push_str("    /// The CBOR value tree for this enum: its wire string verbatim.\n");
+    out.push_str("    func toCborValue() -> CsilCborValue { .text(self.rawValue) }\n\n");
+    out.push_str(
+        "    /// Reconstruct this enum from a decoded CBOR value tree, rejecting a wire\n",
+    );
+    out.push_str("    /// string outside the declared closed set.\n");
+    out.push_str("    init(cborValue: CsilCborValue) throws {\n");
+    out.push_str("        let csilS = try CsilCbor.asText(cborValue)\n");
+    out.push_str(&format!(
+        "        guard let csilV = {type_name}(rawValue: csilS) else {{ throw CsilCborError.typeMismatch }}\n"
+    ));
+    out.push_str("        self = csilV\n");
+    out.push_str("    }\n\n");
+    out.push_str("    /// Encode this enum to canonical CSIL CBOR bytes.\n");
+    out.push_str("    func toCbor() -> [UInt8] { CsilCbor.encode(toCborValue()) }\n\n");
+    out.push_str("    /// Decode a CSIL CBOR byte payload into this enum.\n");
+    out.push_str(&format!(
+        "    static func fromCbor(_ bytes: [UInt8]) throws -> {type_name} {{ try {type_name}(cborValue: CsilCbor.decode(bytes)) }}\n"
+    ));
+    out.push_str("}\n\n");
+    out
+}
+
+/// A Swift array-literal expression for a byte string, used only by
+/// `emit_scalar_enum_codec_manual`'s bytes-literal switch patterns — `literal_to_swift`
+/// stubs `Bytes` to `"[]"` (it's only ever called for a *default value* expression
+/// elsewhere, never a bytes literal), so the actual byte values need their own literal
+/// builder here.
+fn swift_bytes_array_literal(bytes: &[u8]) -> String {
+    let values = bytes
+        .iter()
+        .map(u8::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("[{values}]")
+}
+
+/// The literal pattern text for one arm of `emit_scalar_enum_codec_manual`'s decode
+/// switch: a plain `true`/`false` for a bool (Swift's built-in equality-based
+/// `~=` on `Bool` matches it directly), or a `[UInt8]` array literal for bytes (matched
+/// the same way via the stdlib's `~=` overload for any `Equatable`).
+fn scalar_case_pattern(lit: &CsilLiteralValue) -> String {
+    match lit {
+        CsilLiteralValue::Bytes(bytes) => swift_bytes_array_literal(bytes),
+        _ => literal_to_swift(lit),
+    }
+}
+
+/// Emit the `extension <Type>` carrying a scalar-literal enum's codec (`emit_scalar_enum`'s
+/// int/float raw-value-backed shape). Same bare-literal wire contract as
+/// `emit_string_enum_codec`, just numeric: encode returns the member's own `rawValue` as
+/// its canonical CBOR scalar (an int splits `.uint`/`.int` by sign the same way a
+/// standalone int literal field already does, per `swift_literal_cbor_expr`), decode
+/// reads that raw scalar and maps it back through the failable `init(rawValue:)`,
+/// throwing `CsilCborError.typeMismatch` — the same error the string-enum and
+/// tagged-union codecs already throw for an out-of-set value — on anything outside the
+/// declared closed set.
+fn emit_scalar_enum_codec_raw(type_name: &str, is_int: bool) -> String {
+    let mut out = String::new();
+    out.push_str(&format!("public extension {type_name} {{\n"));
+    out.push_str("    /// The CBOR value tree for this enum: its wire literal verbatim.\n");
+    if is_int {
+        out.push_str("    func toCborValue() -> CsilCborValue {\n");
+        out.push_str("        let csilV = self.rawValue\n");
+        out.push_str("        return csilV >= 0 ? .uint(UInt64(csilV)) : .int(csilV)\n");
+        out.push_str("    }\n\n");
+    } else {
+        out.push_str("    func toCborValue() -> CsilCborValue { .double(self.rawValue) }\n\n");
+    }
+    out.push_str(
+        "    /// Reconstruct this enum from a decoded CBOR value tree, rejecting a scalar\n",
+    );
+    out.push_str("    /// outside the declared closed set.\n");
+    out.push_str("    init(cborValue: CsilCborValue) throws {\n");
+    let as_fn = if is_int { "asI64" } else { "asDouble" };
+    out.push_str(&format!(
+        "        let csilS = try CsilCbor.{as_fn}(cborValue)\n"
+    ));
+    out.push_str(&format!(
+        "        guard let csilV = {type_name}(rawValue: csilS) else {{ throw CsilCborError.typeMismatch }}\n"
+    ));
+    out.push_str("        self = csilV\n");
+    out.push_str("    }\n\n");
+    out.push_str("    /// Encode this enum to canonical CSIL CBOR bytes.\n");
+    out.push_str("    func toCbor() -> [UInt8] { CsilCbor.encode(toCborValue()) }\n\n");
+    out.push_str("    /// Decode a CSIL CBOR byte payload into this enum.\n");
+    out.push_str(&format!(
+        "    static func fromCbor(_ bytes: [UInt8]) throws -> {type_name} {{ try {type_name}(cborValue: CsilCbor.decode(bytes)) }}\n"
+    ));
+    out.push_str("}\n\n");
+    out
+}
+
+/// Emit the `extension <Type>` carrying a scalar-literal enum's codec for the two kinds
+/// that can't be native raw-value enums (`emit_scalar_enum`'s manual/no-raw-value shape
+/// for bool/bytes — see `scalar_swift_raw_type`). Same bare-literal wire contract as
+/// `emit_scalar_enum_codec_raw`, just hand-switched instead of routed through
+/// `RawRepresentable`: encode switches on the case to its own literal, decode reads the
+/// raw scalar and switches it back to a case, throwing `CsilCborError.typeMismatch` on
+/// anything outside the declared closed set.
+fn emit_scalar_enum_codec_manual(type_name: &str, lits: &[CsilLiteralValue]) -> String {
+    let names = scalar_enum_case_names(lits);
+    let is_bool = matches!(lits.first(), Some(CsilLiteralValue::Bool(_)));
+    let as_fn = if is_bool { "asBool" } else { "asBytes" };
+    let mut out = String::new();
+    out.push_str(&format!("public extension {type_name} {{\n"));
+    out.push_str("    /// The CBOR value tree for this enum: its wire literal verbatim.\n");
+    out.push_str("    func toCborValue() -> CsilCborValue {\n");
+    out.push_str("        switch self {\n");
+    for (case_name, lit) in names.iter().zip(lits) {
+        out.push_str(&format!(
+            "        case .{case_name}: return {}\n",
+            swift_literal_cbor_expr(lit)
+        ));
+    }
+    out.push_str("        }\n    }\n\n");
+    out.push_str(
+        "    /// Reconstruct this enum from a decoded CBOR value tree, rejecting a scalar\n",
+    );
+    out.push_str("    /// outside the declared closed set.\n");
+    out.push_str("    init(cborValue: CsilCborValue) throws {\n");
+    out.push_str(&format!(
+        "        let csilS = try CsilCbor.{as_fn}(cborValue)\n"
+    ));
+    out.push_str("        switch csilS {\n");
+    for (case_name, lit) in names.iter().zip(lits) {
+        out.push_str(&format!(
+            "        case {}: self = .{case_name}\n",
+            scalar_case_pattern(lit)
+        ));
+    }
+    out.push_str("        default: throw CsilCborError.typeMismatch\n");
+    out.push_str("        }\n    }\n\n");
+    out.push_str("    /// Encode this enum to canonical CSIL CBOR bytes.\n");
+    out.push_str("    func toCbor() -> [UInt8] { CsilCbor.encode(toCborValue()) }\n\n");
+    out.push_str("    /// Decode a CSIL CBOR byte payload into this enum.\n");
+    out.push_str(&format!(
+        "    static func fromCbor(_ bytes: [UInt8]) throws -> {type_name} {{ try {type_name}(cborValue: CsilCbor.decode(bytes)) }}\n"
+    ));
+    out.push_str("}\n\n");
+    out
+}
+
+/// Emit the `extension <Type>` carrying a closed scalar-literal choice's codec (a named
+/// rule, or a choice hoisted from an inline field position, where every arm is a
+/// same-kind int/float/bool/bytes literal — see `all_scalar_literals`) — the non-text
+/// sibling of `emit_string_enum_codec`, dispatching to the native raw-value shape for
+/// int/float or the manual shape for bool/bytes per `scalar_swift_raw_type`.
+fn emit_scalar_enum_codec(type_name: &str, lits: &[CsilLiteralValue]) -> String {
+    match lits.first() {
+        Some(CsilLiteralValue::Integer(_)) => emit_scalar_enum_codec_raw(type_name, true),
+        Some(CsilLiteralValue::Float(_)) => emit_scalar_enum_codec_raw(type_name, false),
+        _ => emit_scalar_enum_codec_manual(type_name, lits),
+    }
+}
+
+/// The `CsilCborValue` pattern matching ONE arm of a MIXED-kind literal enum's
+/// decoded wire value directly — unlike `emit_scalar_enum_codec_manual`'s
+/// `scalar_case_pattern` (which switches on an already-kind-unwrapped scalar via a
+/// single shared `CsilCbor.as*` accessor), a mixed-kind enum has no single accessor
+/// that covers every arm, so decode switches on the `CsilCborValue` tree node's own
+/// case instead (see `emit_mixed_enum_codec`). Deliberately NOT `swift_literal_cbor_
+/// expr` (which wraps an int in an explicit `UInt64(...)`/`Int64(...)` conversion
+/// call for use as an EXPRESSION) — a Swift `case` pattern needs a bare literal
+/// (`case .uint(1):`), not a call expression, so the associated-value payload here
+/// is always a plain literal token.
+fn mixed_case_pattern(lit: &CsilLiteralValue) -> String {
+    match lit {
+        CsilLiteralValue::Integer(i) if *i >= 0 => format!(".uint({i})"),
+        CsilLiteralValue::Integer(i) => format!(".int({i})"),
+        CsilLiteralValue::Float(f) => format!(".double({f})"),
+        CsilLiteralValue::Text(s) => format!(".text({})", swift_string_lit(s)),
+        CsilLiteralValue::Bool(b) => format!(".bool({b})"),
+        CsilLiteralValue::Bytes(bytes) => format!(".bytes({})", swift_bytes_array_literal(bytes)),
+        // `all_mixed_literals` only ever collects text/int/float/bool/bytes arms
+        // (the same kinds `all_text_literals`/`all_scalar_literals` recognize), so
+        // a null/array literal never reaches here; kept for match exhaustiveness.
+        _ => ".null".to_string(),
+    }
+}
+
+/// Emit the `extension <Type>` carrying a MIXED-kind literal enum's codec (see
+/// `all_mixed_literals`/`emit_mixed_enum`) — the third bare-literal wire shape
+/// alongside `emit_string_enum_codec`/`emit_scalar_enum_codec`: encode switches on
+/// the Swift case to its own literal's `CsilCborValue` (`swift_literal_cbor_expr`,
+/// same as every other literal-carrying codec path in this generator); decode
+/// switches on the DECODED `CsilCborValue` tree node's own case directly (no single
+/// `CsilCbor.as*` accessor spans every arm's kind the way it does for a uniform-kind
+/// scalar enum), throwing `CsilCborError.typeMismatch` — the same error every other
+/// enum/union codec in this generator throws — on anything outside the declared
+/// closed set.
+fn emit_mixed_enum_codec(type_name: &str, lits: &[CsilLiteralValue]) -> String {
+    let names = mixed_enum_case_names(lits);
+    let mut out = String::new();
+    out.push_str(&format!("public extension {type_name} {{\n"));
+    out.push_str("    /// The CBOR value tree for this enum: its wire literal verbatim.\n");
+    out.push_str("    func toCborValue() -> CsilCborValue {\n");
+    out.push_str("        switch self {\n");
+    for (case_name, lit) in names.iter().zip(lits) {
+        out.push_str(&format!(
+            "        case .{case_name}: return {}\n",
+            swift_literal_cbor_expr(lit)
+        ));
+    }
+    out.push_str("        }\n    }\n\n");
+    out.push_str(
+        "    /// Reconstruct this enum from a decoded CBOR value tree, rejecting a value\n",
+    );
+    out.push_str("    /// outside the declared closed set. Mixed literal kinds mean no single\n");
+    out.push_str("    /// `CsilCbor.as*` accessor covers every arm, so this switches on the\n");
+    out.push_str("    /// value tree's own case directly instead.\n");
+    out.push_str("    init(cborValue: CsilCborValue) throws {\n");
+    out.push_str("        switch cborValue {\n");
+    for (case_name, lit) in names.iter().zip(lits) {
+        out.push_str(&format!(
+            "        case {}: self = .{case_name}\n",
+            mixed_case_pattern(lit)
+        ));
+    }
+    out.push_str("        default: throw CsilCborError.typeMismatch\n");
+    out.push_str("        }\n    }\n\n");
+    out.push_str("    /// Encode this enum to canonical CSIL CBOR bytes.\n");
+    out.push_str("    func toCbor() -> [UInt8] { CsilCbor.encode(toCborValue()) }\n\n");
+    out.push_str("    /// Decode a CSIL CBOR byte payload into this enum.\n");
+    out.push_str(&format!(
+        "    static func fromCbor(_ bytes: [UInt8]) throws -> {type_name} {{ try {type_name}(cborValue: CsilCbor.decode(bytes)) }}\n"
+    ));
+    out.push_str("}\n\n");
+    out
+}
+
 /// Whether `swift_enc_value`/`swift_dec_value` model an op-boundary type faithfully, so
 /// a per-op codec helper round-trips it rather than silently stubbing to `.null`. Records,
-/// builtins, transparent aliases, arrays, maps, and stringy choices all reach a real
-/// builder. An inline non-stringy choice has no wire discriminator here, a tuple has no
-/// field-builder of its own (unlike the Go generator), and an unmodeled reference (e.g. a
-/// non-stringy enum) has no codec — those keep the client's skip-with-note fallback.
+/// named choice rules (tagged unions and string enums alike), builtins, transparent
+/// aliases, arrays, maps, and stringy choices all reach a real builder. An inline
+/// non-stringy choice has no wire discriminator here, a tuple has no field-builder of
+/// its own (unlike the Go generator), and an unmodeled reference has no codec — those
+/// keep the client's skip-with-note fallback.
 fn swift_op_boundary_expressible(
     ty: &CsilTypeExpression,
     records: &std::collections::HashSet<String>,
     aliases: &std::collections::HashMap<String, CsilTypeExpression>,
+    choice_codecs: &std::collections::HashSet<String>,
 ) -> bool {
     match unwrap_constrained(ty) {
         CsilTypeExpression::Builtin(_) => true,
         CsilTypeExpression::Reference(name) => {
-            records.contains(&swift_type_name(name)) || aliases.contains_key(name)
+            records.contains(&swift_type_name(name))
+                || aliases.contains_key(name)
+                || choice_codecs.contains(name)
         }
         CsilTypeExpression::Array { element_type, .. } => {
-            swift_op_boundary_expressible(element_type, records, aliases)
+            swift_op_boundary_expressible(element_type, records, aliases, choice_codecs)
         }
         CsilTypeExpression::Map { key, value, .. } => {
-            swift_op_boundary_expressible(key, records, aliases)
-                && swift_op_boundary_expressible(value, records, aliases)
+            swift_op_boundary_expressible(key, records, aliases, choice_codecs)
+                && swift_op_boundary_expressible(value, records, aliases, choice_codecs)
         }
         CsilTypeExpression::Choice(choices) => choice_is_stringy(choices),
         _ => false,
@@ -2238,6 +3033,7 @@ fn emit_op_codecs(
     input: &WasmGeneratorInput,
     records: &std::collections::HashSet<String>,
     aliases: &std::collections::HashMap<String, CsilTypeExpression>,
+    choice_codecs: &std::collections::HashSet<String>,
 ) -> String {
     let mut out = String::new();
     for rule in &input.csil_spec.rules {
@@ -2250,9 +3046,10 @@ fn emit_op_codecs(
             }
             let success = success_type(&op.output_type);
             let null_input = is_null_input(&op.input_type);
-            let req_ok =
-                null_input || swift_op_boundary_expressible(&op.input_type, records, aliases);
-            if !req_ok || !swift_op_boundary_expressible(&success, records, aliases) {
+            let req_ok = null_input
+                || swift_op_boundary_expressible(&op.input_type, records, aliases, choice_codecs);
+            if !req_ok || !swift_op_boundary_expressible(&success, records, aliases, choice_codecs)
+            {
                 continue;
             }
             let stem = op_codec_stem(&rule.name, op);
@@ -2264,6 +3061,7 @@ fn emit_op_codecs(
                     &op.input_type,
                     records,
                     aliases,
+                    choice_codecs,
                 ));
             }
             if !is_record_ref(&success, records) {
@@ -2272,6 +3070,7 @@ fn emit_op_codecs(
                     &success,
                     records,
                     aliases,
+                    choice_codecs,
                 ));
             }
         }
@@ -2286,10 +3085,11 @@ fn emit_op_codec_pair(
     ty: &CsilTypeExpression,
     records: &std::collections::HashSet<String>,
     aliases: &std::collections::HashMap<String, CsilTypeExpression>,
+    choice_codecs: &std::collections::HashSet<String>,
 ) -> String {
     let swift_type = map_type(ty, false);
-    let enc = swift_enc_value(ty, "value", records, aliases);
-    let dec = swift_dec_value(ty, "csilRoot", records, aliases);
+    let enc = swift_enc_value(ty, "value", records, aliases, choice_codecs);
+    let dec = swift_dec_value(ty, "csilRoot", records, aliases, choice_codecs);
     format!(
         "/// Encode the {helper} payload to canonical CSIL CBOR bytes.\n\
          public func encode{helper}(_ value: {swift_type}) -> [UInt8] {{\n\
@@ -2303,13 +3103,37 @@ fn emit_op_codec_pair(
 }
 
 /// Build `Codec.swift`: the self-contained CBOR runtime plus a codec extension per
-/// record. `None` when the spec declares no record types.
+/// record and per named union. `None` when the spec declares neither.
 fn generate_codec(input: &WasmGeneratorInput) -> Option<String> {
     let records = swift_record_names(input);
-    if records.is_empty() {
+    let unions = swift_union_choices(input);
+    let string_enums = swift_string_enum_choices(input);
+    let scalar_enums = swift_scalar_enum_choices(input);
+    let mixed_enums = swift_mixed_enum_choices(input);
+    if records.is_empty()
+        && unions.is_empty()
+        && string_enums.is_empty()
+        && scalar_enums.is_empty()
+        && mixed_enums.is_empty()
+    {
         return None;
     }
     let aliases = swift_codec_aliases(input);
+    // Every named choice rule with its own `toCborValue()`/`init(cborValue:)` — tagged
+    // union, closed string enum, closed scalar-literal enum, and closed mixed-literal
+    // enum alike — so `swift_enc_value`/`swift_dec_value` route a `Reference` to one
+    // through that codec instead of the generic fallback. `input.csil_spec` has already
+    // been through `csilgen_common::hoist_inline_composites` (see `build_files`), so a
+    // choice hoisted out of an inline field position is just another rule these four
+    // maps pick up the same way they pick up an author-declared choice rule — no
+    // separate hoisted-types set to chain in.
+    let choice_codecs: std::collections::HashSet<String> = unions
+        .keys()
+        .chain(string_enums.keys())
+        .chain(scalar_enums.keys())
+        .chain(mixed_enums.keys())
+        .cloned()
+        .collect();
     let mut body = String::new();
     for rule in &input.csil_spec.rules {
         let group = match &rule.rule_type {
@@ -2318,12 +3142,35 @@ fn generate_codec(input: &WasmGeneratorInput) -> Option<String> {
             _ => None,
         };
         if let Some(group) = group {
-            body.push_str(&emit_struct_codec(&rule.name, group, &records, &aliases));
+            body.push_str(&emit_struct_codec(
+                &rule.name,
+                group,
+                &records,
+                &aliases,
+                &choice_codecs,
+            ));
+        }
+        // Declaration-order lookup into the (unordered) maps, so the emitted codec
+        // order matches the spec rather than HashMap iteration order.
+        if let Some(choices) = unions.get(&rule.name) {
+            body.push_str(&emit_union_codec(
+                &rule.name,
+                choices,
+                &records,
+                &aliases,
+                &choice_codecs,
+            ));
+        } else if string_enums.contains_key(&rule.name) {
+            body.push_str(&emit_string_enum_codec(&swift_type_name(&rule.name)));
+        } else if let Some(lits) = scalar_enums.get(&rule.name) {
+            body.push_str(&emit_scalar_enum_codec(&swift_type_name(&rule.name), lits));
+        } else if let Some(lits) = mixed_enums.get(&rule.name) {
+            body.push_str(&emit_mixed_enum_codec(&swift_type_name(&rule.name), lits));
         }
     }
-    // Per-op byte helpers for non-record op boundaries, so the client and a consumer-side
-    // server share one codec surface for every op, not just record↔record ones.
-    body.push_str(&emit_op_codecs(input, &records, &aliases));
+    // Per-op byte helpers for non-record/non-union op boundaries, so the client and a
+    // consumer-side server share one codec surface for every op, not just record↔record.
+    body.push_str(&emit_op_codecs(input, &records, &aliases, &choice_codecs));
     let mut content = header("Generated CBOR (de)serializers for the CSIL value types.");
     content.push_str(CODEC_RUNTIME_SWIFT);
     content.push('\n');
@@ -2371,12 +3218,28 @@ fn client_prelude_swift(shape: ClientShape) -> String {
 fn generate_client(input: &WasmGeneratorInput, shape: ClientShape) -> Option<String> {
     let records = swift_record_names(input);
     let aliases = swift_codec_aliases(input);
+    let unions = swift_union_choices(input);
+    let string_enums = swift_string_enum_choices(input);
+    let scalar_enums = swift_scalar_enum_choices(input);
+    let mixed_enums = swift_mixed_enum_choices(input);
+    let choice_codecs: std::collections::HashSet<String> = unions
+        .keys()
+        .chain(string_enums.keys())
+        .chain(scalar_enums.keys())
+        .chain(mixed_enums.keys())
+        .cloned()
+        .collect();
     let mut body = String::new();
     let mut any = false;
     for rule in &input.csil_spec.rules {
         if let CsilRuleType::ServiceDef(service) = &rule.rule_type {
             body.push_str(&emit_client_struct(
-                &rule.name, service, &records, &aliases, shape,
+                &rule.name,
+                service,
+                &records,
+                &aliases,
+                &choice_codecs,
+                shape,
             ));
             // Wire-id ordinals are a module-level `enum` shared across both client shapes;
             // only the primary file emits them so the twin never redeclares the enum.
@@ -2401,6 +3264,7 @@ fn emit_client_struct(
     service: &CsilServiceDefinition,
     records: &std::collections::HashSet<String>,
     aliases: &std::collections::HashMap<String, CsilTypeExpression>,
+    choice_codecs: &std::collections::HashSet<String>,
     shape: ClientShape,
 ) -> String {
     let base = service_base(name);
@@ -2408,8 +3272,9 @@ fn emit_client_struct(
     let transport = shape.transport_name();
     let effects = shape.effects();
     let await_kw = shape.await_kw();
-    // Canonical wire strings (the wire contract): service lowercased, op PascalCased.
-    let wire_service = wire_service_string(name);
+    // Canonical wire strings: the verbatim CSIL service and op names
+    // (csil-rpc-transport.md §1.1).
+    let wire_service = name;
     let mut out = String::new();
     out.push_str(&format!(
         "/// {client} is a typed client for the {name} service. The client owns\n/// (de)serialization; the carrier only moves bytes.\n"
@@ -2430,12 +3295,13 @@ fn emit_client_struct(
         }
         let success = success_type(&op.output_type);
         let null_input = is_null_input(&op.input_type);
-        let req_ok = null_input || swift_op_boundary_expressible(&op.input_type, records, aliases);
+        let req_ok = null_input
+            || swift_op_boundary_expressible(&op.input_type, records, aliases, choice_codecs);
         // Only a genuinely inexpressible boundary (an inline non-stringy choice with no wire
         // discriminator, a tuple the field builders don't model, or an unmodeled reference)
-        // is skipped now; scalar/array/map shapes ride the per-op codec helpers, so every
-        // other op gets a method.
-        if !req_ok || !swift_op_boundary_expressible(&success, records, aliases) {
+        // is skipped now; scalar/array/map/union shapes ride the per-op codec helpers, so
+        // every other op gets a method.
+        if !req_ok || !swift_op_boundary_expressible(&success, records, aliases, choice_codecs) {
             out.push_str(&format!(
                 "    // operation '{}' has a payload csilgen can't (de)serialize; handle it manually\n",
                 op.name
@@ -2444,7 +3310,7 @@ fn emit_client_struct(
         }
         let method = swift_ident(&op.name);
         let output = map_type(&success, false);
-        let wire_op = wire_op_string(&op.name);
+        let wire_op = &op.name;
         let stem = op_codec_stem(name, op);
         // A record success reuses its `fromCbor`; any other shape uses the op's per-op decoder.
         let decode_resp = if is_record_ref(&success, records) {
@@ -2458,8 +3324,8 @@ fn emit_client_struct(
             ));
             out.push_str(&format!(
                 "        let csilResp = try {await_kw}transport.call(service: {}, op: {}, request: [])\n",
-                swift_string_lit(&wire_service),
-                swift_string_lit(&wire_op),
+                swift_string_lit(wire_service),
+                swift_string_lit(wire_op),
             ));
         } else {
             let input = map_type(&op.input_type, false);
@@ -2474,8 +3340,8 @@ fn emit_client_struct(
             ));
             out.push_str(&format!(
                 "        let csilResp = try {await_kw}transport.call(service: {}, op: {}, request: {req_bytes})\n",
-                swift_string_lit(&wire_service),
-                swift_string_lit(&wire_op),
+                swift_string_lit(wire_service),
+                swift_string_lit(wire_op),
             ));
         }
         out.push_str(&format!("        return try {decode_resp}\n"));
@@ -2609,10 +3475,7 @@ fn emit_channel_router(name: &str, service: &CsilServiceDefinition) -> String {
         }
         let method = swift_ident(&op.name);
         let input = map_type(&op.input_type, false);
-        out.push_str(&format!(
-            "    case {}:\n",
-            swift_string_lit(&wire_op_string(&op.name))
-        ));
+        out.push_str(&format!("    case {}:\n", swift_string_lit(&op.name)));
         out.push_str(&format!(
             "        let msg = try codec.decode(data, as: {input}.self)\n"
         ));
@@ -2686,7 +3549,7 @@ fn emit_channel_encoders(name: &str, service: &CsilServiceDefinition) -> String 
         ));
         out.push_str(&format!(
             "    (op: {}, data: try codec.encode(msg))\n",
-            swift_string_lit(&wire_op_string(&op.name))
+            swift_string_lit(&op.name)
         ));
         out.push_str("}\n\n");
     }

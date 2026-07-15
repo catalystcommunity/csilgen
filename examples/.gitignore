@@ -40,3 +40,8 @@ config.local.*
 # Test outputs
 test-output/
 snapshots/
+
+# custom-generator is a real, checked-in generator crate (see its README), not
+# generated output — the broad *.rs rule above is meant for sample output this
+# directory's examples emit, not for a generator's own source.
+!custom-generator/src/**

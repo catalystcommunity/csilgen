@@ -207,6 +207,9 @@ pub struct CsilRule {
     pub rule_type: CsilRuleType,
     /// Source position for error reporting
     pub position: CsilPosition,
+    /// Documentation comments (`;;;`) preceding this rule
+    #[serde(default)]
+    pub doc_comments: Vec<String>,
 }
 
 pub enum CsilRuleType {
@@ -230,6 +233,9 @@ Services are defined with operations:
 ```rust
 pub struct CsilServiceDefinition {
     pub operations: Vec<CsilServiceOperation>,
+    /// The `@wire-id(N)` service ordinal, if assigned (transport compact profiles)
+    #[serde(default)]
+    pub wire_id: Option<u64>,
 }
 
 pub struct CsilServiceOperation {
@@ -238,6 +244,12 @@ pub struct CsilServiceOperation {
     pub output_type: CsilTypeExpression,
     pub direction: CsilServiceDirection,
     pub position: CsilPosition,
+    /// Documentation comments (`;;;`) preceding this operation
+    #[serde(default)]
+    pub doc_comments: Vec<String>,
+    /// The `@wire-id(N)` operation ordinal, if assigned (transport compact profiles)
+    #[serde(default)]
+    pub wire_id: Option<u64>,
 }
 
 pub enum CsilServiceDirection {
@@ -261,6 +273,9 @@ pub struct CsilGroupEntry {
     pub occurrence: Option<CsilOccurrence>,
     /// Rich metadata annotations
     pub metadata: Vec<CsilFieldMetadata>,
+    /// Documentation comments (`;;;`) preceding this field
+    #[serde(default)]
+    pub doc_comments: Vec<String>,
 }
 
 pub enum CsilFieldMetadata {
@@ -346,13 +361,37 @@ All data exchanged across the WASM boundary uses this format:
 
 ### Memory Allocation Flow
 
-1. **Host allocates input memory**: Calls `allocate(input_size)`
-2. **Host writes input data**: Writes JSON to allocated memory  
-3. **Host calls generate()**: Passes pointer and length
-4. **Generator allocates output memory**: Uses internal `allocate()`
-5. **Generator returns output pointer**: Points to length-prefixed JSON
-6. **Host reads output data**: Reads length, then JSON data
-7. **Host deallocates memories**: Calls `deallocate()` for both buffers
+The host does **not** call your module's `allocate` or `deallocate` for either
+side of the exchange — verified against `WasmGeneratorRuntime::execute_generator`
+in `wasm/csilgen-wasm-generators/src/lib.rs`. What actually happens:
+
+1. **Host writes input data directly**: the host writes the raw, unprefixed
+   JSON bytes of `WasmGeneratorInput` straight into your module's exported
+   `memory` at a host-chosen offset (current implementation: a monotonically
+   increasing offset starting at byte 1024), *without* calling your `allocate`.
+   The length travels separately as the `input_len` argument to `generate` — no
+   length prefix on the input side.
+2. **Host calls `generate(input_ptr, input_len)`**: your `generate` reads the
+   input directly from that memory (`slice::from_raw_parts(input_ptr,
+   input_len)`); it never needs to call its own `allocate` for the input.
+3. **Generator allocates output memory**: your `generate` calls its own
+   `allocate()` to get a buffer for the *output* — this is the only place
+   `allocate` is actually invoked, and only your own code invokes it.
+4. **Generator returns output pointer**: points to length-prefixed JSON (4-byte
+   LE `u32` count + that many bytes of `WasmGeneratorOutput` JSON) inside the
+   buffer from step 3. A null return signals failure.
+5. **Host reads output data**: reads the length prefix, then the JSON, out of
+   your module's memory.
+6. **Host never calls `deallocate`**: each `generate` call runs in a fresh
+   `wasmtime::Store`, and the whole store (including everything your module
+   allocated) is reclaimed when that store drops at the end of the call.
+   Implement `deallocate` correctly anyway — it's exported ABI surface that
+   other embedders of your module may call, not a detail this particular host
+   happens to skip.
+
+See [`docs/generator-plugin-contract.md`](../../docs/generator-plugin-contract.md)
+§2 ("The WASM ABI") for the normative version of this, including execution
+limits (fuel-based, not wall-clock) and error signaling.
 
 ### Memory Safety
 
@@ -360,7 +399,8 @@ All data exchanged across the WASM boundary uses this format:
 - Validate input lengths against `MAX_INPUT_SIZE` (64MB)
 - Ensure output size doesn't exceed `MAX_OUTPUT_SIZE` (256MB)
 - Use `std::mem::forget()` in `allocate()` to prevent premature deallocation
-- Properly reconstruct `Vec` in `deallocate()` to free memory
+- Properly reconstruct `Vec` in `deallocate()` to free memory, even though the
+  current host never calls it
 
 ## Error Codes
 
@@ -658,9 +698,24 @@ fn map_type_expression(expr: &CsilTypeExpression) -> String {
         CsilTypeExpression::Plug(name) => {
             format!("$${}", name) // Plug reference
         }
+        CsilTypeExpression::Tuple(group) => {
+            // Fixed-shape/keyed array (`[a, b, c]` or `[tag: text, value: any]`)
+            format!("/* tuple with {} elements */", group.entries.len())
+        }
+        CsilTypeExpression::Constrained { base_type, constraints } => {
+            // RFC 8610 control operators plus CSIL's `@`-annotation-derived ones
+            // (size, regex, default, comparisons, bits, `.and`, `.within`, …)
+            let base = map_type_expression(base_type);
+            format!("{} /* {} constraint(s) */", base, constraints.len())
+        }
     }
 }
 ```
+
+`CsilTypeExpression` is not a closed, stable set — treat any match over it as needing
+a wildcard arm (or all-variants-handled discipline kept in sync with
+`crates/csilgen-common/src/types.rs`) so a future added variant is a compile error you
+see immediately, not a silent gap in generated output.
 
 ## Configuration Processing
 

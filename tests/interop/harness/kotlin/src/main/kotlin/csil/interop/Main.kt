@@ -28,7 +28,7 @@ import java.net.InetSocketAddress
 import java.net.ServerSocket
 import java.net.Socket
 
-private const val SERVICE = "interop"
+private const val SERVICE = "Interop"
 private const val TICKS = 3L
 
 // ---------------------------------------------------------------------------
@@ -45,6 +45,22 @@ private fun scalarsOk() = Scalars(
     flag = true,
     `when` = java.time.Instant.parse("2026-06-29T12:34:56Z"),
     amount = java.math.BigDecimal("123.45"),
+    // mixed-union coverage: a value equal to a literal arm must wire as
+    // [1,"pending"]; a value with no literal match must wire as [0,...].
+    statusLiteral = MixedStatusVariant1("pending"),
+    statusFree = MixedStatusVariant0("unlisted"),
+    // inline mixed choice (hoisted; literal arm match).
+    note = ScalarsNoteVariant1("info"),
+    // inline all-literal choice (hoisted to an enum).
+    size = ScalarsSize.Medium,
+    // named enum with a trailing `.default`-constrained last arm.
+    level = Level.High,
+    // named enum assembled via base rule + `/=` extension.
+    season = Season.Autumn,
+    // named all-literal enum with mixed literal kinds (text + int arms);
+    // renders as a real Kotlin enum class.
+    shipText = ShipMode.Ground,
+    shipInt = ShipMode.V2,
 )
 
 private fun collectionsOk() = Collections(
@@ -147,12 +163,12 @@ private class RpcTransport(private val client: RpcClient) : Transport {
 }
 
 private fun rpcDispatch(req: RpcRequest): HandlerOutcome = when (req.op) {
-    "EchoScalars" -> reqReply(req.payload, { scalarsFromCbor(it) }) { Reply("Scalars", it.toCbor()) }
-    "EchoCollections" -> reqReply(req.payload, { collectionsFromCbor(it) }) { Reply("Collections", it.toCbor()) }
-    "EchoNested" -> reqReply(req.payload, { nestedFromCbor(it) }) {
+    "echo-scalars" -> reqReply(req.payload, { scalarsFromCbor(it) }) { Reply("Scalars", it.toCbor()) }
+    "echo-collections" -> reqReply(req.payload, { collectionsFromCbor(it) }) { Reply("Collections", it.toCbor()) }
+    "echo-nested" -> reqReply(req.payload, { nestedFromCbor(it) }) {
         Reply("EchoNestedResult", EchoNestedResult(ok = true, echo = it).toCbor())
     }
-    "ValidateConstrained" -> reqReply(req.payload, { constrainedFromCbor(it) }) { input ->
+    "validate-constrained" -> reqReply(req.payload, { constrainedFromCbor(it) }) { input ->
         try {
             input.validate()
             Reply("Constrained", input.toCbor())
@@ -260,7 +276,7 @@ private fun eventsServer(server: ServerSocket) {
 
             // Push N ticks (on-tick / server push).
             for (seq in 0 until TICKS) {
-                sendEvent(carrier, Event.verbose(SERVICE, "OnTick", Tick(seq.toULong()).toCbor()))
+                sendEvent(carrier, Event.verbose(SERVICE, "on-tick", Tick(seq.toULong()).toCbor()))
             }
 
             // React loop.
@@ -270,9 +286,9 @@ private fun eventsServer(server: ServerSocket) {
                 when (ev.event) {
                     Control.PING_NAME -> sendEvent(carrier, Event.verbose(null, Control.PONG_NAME, ev.payload))
                     Control.CLOSE_NAME -> break
-                    "Duplex" -> {
+                    "duplex" -> {
                         val s = scalarsFromCbor(ev.payload)
-                        sendEvent(carrier, Event.verbose(SERVICE, "Duplex", s.toCbor()))
+                        sendEvent(carrier, Event.verbose(SERVICE, "duplex", s.toCbor()))
                     }
                     else -> sendEvent(carrier, Event.verbose(null, Control.ERROR_NAME, ByteArray(0)))
                 }
@@ -301,20 +317,20 @@ private fun eventsClient(ch: Socket): Cases {
         val frame = carrier.recvFrame()
         if (frame == null) { tickOk = false; detail = "stream closed during ticks"; break }
         val ev = Event.decode(frame, Profile.VERBOSE)
-        if (ev.event != "OnTick") { tickOk = false; detail = "expected OnTick got ${ev.event}"; break }
+        if (ev.event != "on-tick") { tickOk = false; detail = "expected on-tick got ${ev.event}"; break }
         val t = tickFromCbor(ev.payload)
         if (t.seq != expect.toULong()) { tickOk = false; detail = "tick seq ${t.seq} != $expect"; break }
     }
     cases.check("on-tick/success", tickOk, detail)
 
     // duplex: send Scalars, expect echo.
-    sendEvent(carrier, Event.verbose(SERVICE, "Duplex", scalarsOk().toCbor()))
+    sendEvent(carrier, Event.verbose(SERVICE, "duplex", scalarsOk().toCbor()))
     val duplexFrame = carrier.recvFrame()
     if (duplexFrame == null) {
         cases.fail("duplex/success", "no echo")
     } else {
         val ev = Event.decode(duplexFrame, Profile.VERBOSE)
-        if (ev.event != "Duplex") {
+        if (ev.event != "duplex") {
             cases.fail("duplex/success", "got ${ev.event}")
         } else {
             val s = scalarsFromCbor(ev.payload)

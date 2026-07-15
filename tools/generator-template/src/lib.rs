@@ -22,9 +22,9 @@
 pub mod helpers;
 
 use csilgen_common::{
-    wasm_interface::*, CsilFieldMetadata, CsilFieldVisibility, CsilRuleType, GeneratedFile,
-    GenerationStats, GeneratorCapability, GeneratorMetadata, GeneratorWarning, SourceLocation,
-    WarningLevel, WasmGeneratorInput, WasmGeneratorOutput,
+    CsilFieldMetadata, CsilFieldVisibility, CsilRuleType, GeneratedFile, GenerationStats,
+    GeneratorCapability, GeneratorMetadata, GeneratorWarning, SourceLocation, WarningLevel,
+    WasmGeneratorInput, WasmGeneratorOutput, wasm_interface::*,
 };
 use std::collections::HashMap;
 
@@ -92,10 +92,8 @@ pub extern "C" fn deallocate(ptr: *mut u8, size: usize) {
 /// It receives serialized `WasmGeneratorInput` and returns serialized `WasmGeneratorOutput`.
 #[unsafe(no_mangle)]
 pub extern "C" fn generate(input_ptr: *const u8, input_len: usize) -> *mut u8 {
-    let start_time = std::time::Instant::now();
-
     let result = match deserialize_input(input_ptr, input_len) {
-        Ok(input) => process_generation_request(input, start_time),
+        Ok(input) => process_generation_request(input),
         Err(error_code) => {
             return create_error_result(error_code);
         }
@@ -125,10 +123,7 @@ fn deserialize_input(input_ptr: *const u8, input_len: usize) -> Result<WasmGener
 }
 
 /// Process the generation request
-fn process_generation_request(
-    input: WasmGeneratorInput,
-    start_time: std::time::Instant,
-) -> Result<WasmGeneratorOutput, i32> {
+fn process_generation_request(input: WasmGeneratorInput) -> Result<WasmGeneratorOutput, i32> {
     // Process configuration options
     let config = process_config(&input.config.options);
 
@@ -139,7 +134,6 @@ fn process_generation_request(
     let files = generate_code(&input, &config)?;
 
     // Calculate statistics
-    let generation_time = start_time.elapsed().as_millis() as u64;
     let total_size: usize = files.iter().map(|f| f.content.len()).sum();
 
     let stats = GenerationStats {
@@ -147,7 +141,11 @@ fn process_generation_request(
         total_size_bytes: total_size,
         services_count: input.csil_spec.service_count,
         fields_with_metadata_count: input.csil_spec.fields_with_metadata_count,
-        generation_time_ms: generation_time,
+        // wasm32-unknown-unknown has no clock source: `std::time::Instant::now()`
+        // panics at runtime on this target (every in-repo generator avoids it —
+        // see wasm/csilgen-noop-generator, wasm/csilgen-rust-generator — and
+        // reports a fixed placeholder instead).
+        generation_time_ms: 0,
         peak_memory_bytes: Some(estimate_peak_memory_usage()),
     };
 
@@ -244,22 +242,22 @@ fn validate_and_warn(input: &WasmGeneratorInput) -> Vec<GeneratorWarning> {
             CsilRuleType::GroupDef(group) => {
                 // Check for fields without proper metadata
                 for entry in &group.entries {
-                    if entry.metadata.is_empty() {
-                        if let Some(key) = &entry.key {
-                            warnings.push(GeneratorWarning {
-                                level: WarningLevel::Info,
-                                message: "Field has no metadata annotations".to_string(),
-                                location: Some(SourceLocation {
-                                    line: rule.position.line,
-                                    column: rule.position.column,
-                                    offset: rule.position.offset,
-                                    context: Some(format!("{}.{:?}", rule.name, key)),
-                                }),
-                                suggestion: Some(
-                                    "Consider adding visibility or validation metadata".to_string(),
-                                ),
-                            });
-                        }
+                    if entry.metadata.is_empty()
+                        && let Some(key) = &entry.key
+                    {
+                        warnings.push(GeneratorWarning {
+                            level: WarningLevel::Info,
+                            message: "Field has no metadata annotations".to_string(),
+                            location: Some(SourceLocation {
+                                line: rule.position.line,
+                                column: rule.position.column,
+                                offset: rule.position.offset,
+                                context: Some(format!("{}.{:?}", rule.name, key)),
+                            }),
+                            suggestion: Some(
+                                "Consider adding visibility or validation metadata".to_string(),
+                            ),
+                        });
                     }
                 }
             }
@@ -481,6 +479,7 @@ mod tests {
                         metadata: vec![CsilFieldMetadata::Visibility(
                             CsilFieldVisibility::Bidirectional,
                         )],
+                        doc_comments: Vec::new(),
                     }],
                 }),
                 position: CsilPosition {
@@ -488,6 +487,7 @@ mod tests {
                     column: 1,
                     offset: 0,
                 },
+                doc_comments: Vec::new(),
             }],
             source_content: Some("Test CSIL".to_string()),
             service_count: 0,
@@ -521,9 +521,11 @@ mod tests {
         let warnings = validate_and_warn(&input);
 
         // Should warn about no services
-        assert!(warnings
-            .iter()
-            .any(|w| w.message.contains("No services found")));
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.message.contains("No services found"))
+        );
     }
 
     #[test]

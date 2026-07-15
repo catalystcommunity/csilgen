@@ -66,6 +66,23 @@ fn input_with_rules(
     }
 }
 
+/// Route `input` through the same `csilgen_common::hoist_inline_composites` pass
+/// `process_generation` applies up front, for a test exercising `generate_types`/
+/// `generate_codec` directly rather than through the top-level entry point — those
+/// two no longer hoist internally (there is exactly one hoist call site now), so a
+/// test asserting on hoisted output must apply it itself, exactly like a real
+/// caller going through `process_generation` would see.
+fn hoisted(input: WasmGeneratorInput) -> WasmGeneratorInput {
+    let mut input = input;
+    input.csil_spec = hoist_inline_composites(
+        &input.csil_spec,
+        HoistOptions {
+            hoist_all_literal_choices: true,
+        },
+    );
+    input
+}
+
 fn group_rule(name: &str, entries: Vec<CsilGroupEntry>) -> CsilRule {
     CsilRule {
         name: name.to_string(),
@@ -266,10 +283,10 @@ fn client_emits_prefixed_calls_with_verbatim_wire_names() {
     let input = input_with_rules(vec![svc], "c-client", HashMap::new());
     let config = CConfig::from_options(&input.config.options).unwrap();
     let client = generate_client(&input, &config).expect("client emitted");
-    // kebab -> snake for the C symbol; service base lowercased and op PascalCased
-    // for the wire strings.
+    // kebab -> snake for the C symbol; the wire strings carry the verbatim CSIL
+    // service and operation names.
     assert!(client.contains("csil_attestation_deposit_claim("));
-    assert!(client.contains("\"attestation\", \"DepositClaim\""));
+    assert!(client.contains("\"AttestationService\", \"deposit-claim\""));
     assert!(client.contains("CsilgenTransport"));
 }
 
@@ -308,7 +325,7 @@ fn server_emits_handlers_wire_ids_and_compact_router() {
     // Verbose + compact router twins.
     assert!(server.contains("route_chat_channel("));
     assert!(server.contains("route_chat_channel_compact("));
-    assert!(server.contains("\"Say\""));
+    assert!(server.contains("strcmp(method, \"say\")"));
     assert!(server.contains("case 0u:"));
 }
 
@@ -362,6 +379,161 @@ fn validation_omitted_without_checks() {
         HashMap::new(),
     );
     assert!(generate_validation(&input).is_none());
+}
+
+/// `CheckValue = text / int / float` — arms named after C keywords must escape
+/// to declarable members, identically in the union typedef and both codec
+/// directions; a non-keyword arm keeps its plain name.
+#[test]
+fn keyword_choice_arms_are_escaped() {
+    let rule = CsilRule {
+        name: "CheckValue".to_string(),
+        rule_type: CsilRuleType::TypeChoice(vec![
+            builtin("text"),
+            builtin("int"),
+            builtin("float"),
+        ]),
+        position: pos(),
+        doc_comments: vec![],
+    };
+    let input = input_with_rules(vec![rule], "c", HashMap::new());
+    let out = process_generation(input).unwrap();
+    let types = &out
+        .files
+        .iter()
+        .find(|f| f.path == "types.gen.h")
+        .expect("types.gen.h emitted")
+        .content;
+    assert!(types.contains("char *text;"));
+    assert!(types.contains("int64_t int_;"));
+    assert!(types.contains("double float_;"));
+    assert!(!types.contains(" int;") && !types.contains(" float;"));
+    let codec = &out
+        .files
+        .iter()
+        .find(|f| f.path == "codec.gen.h")
+        .expect("codec.gen.h emitted")
+        .content;
+    assert!(codec.contains("v->u.int_"));
+    assert!(codec.contains("v->u.float_"));
+    assert!(codec.contains("out->u.int_"));
+    assert!(codec.contains("out->u.float_"));
+    assert!(!codec.contains("u.int)") && !codec.contains("u.float)"));
+    // The tag enumerators are uppercase, out of keyword space, and unescaped.
+    assert!(types.contains("CHECK_VALUE_INT,"));
+}
+
+/// A CSIL field named after a C keyword escapes its struct member (and every
+/// codec access) while the wire key stays verbatim.
+#[test]
+fn keyword_field_names_escape_member_but_not_wire_key() {
+    let input = input_with_rules(
+        vec![group_rule(
+            "Weird",
+            vec![
+                bare_entry("int", builtin("int")),
+                bare_entry("default", builtin("text")),
+            ],
+        )],
+        "c",
+        HashMap::new(),
+    );
+    let out = process_generation(input).unwrap();
+    let types = &out
+        .files
+        .iter()
+        .find(|f| f.path == "types.gen.h")
+        .unwrap()
+        .content;
+    assert!(types.contains("int64_t int_;"));
+    assert!(types.contains("char *default_;"));
+    let codec = &out
+        .files
+        .iter()
+        .find(|f| f.path == "codec.gen.h")
+        .unwrap()
+        .content;
+    assert!(codec.contains("csilc_w_text(b, \"int\", 3)"));
+    assert!(codec.contains("csilc_map_get(m, \"int\")"));
+    assert!(codec.contains("v->int_"));
+    assert!(codec.contains("out->int_"));
+    assert!(codec.contains("csilc_map_get(m, \"default\")"));
+    assert!(codec.contains("out->default_"));
+}
+
+fn size_constrained(base: &str, size: CsilSizeConstraint) -> CsilTypeExpression {
+    CsilTypeExpression::Constrained {
+        base_type: Box::new(builtin(base)),
+        constraints: vec![CsilControlOperator::Size(size)],
+    }
+}
+
+/// `bytes .size 32` must check the CsilBytes `len` member, never strlen (a type
+/// error on the ptr+len struct, and wrong for binary data regardless); `text
+/// .size` keeps its strlen check; a `.size` on an integer (an encoded-width
+/// bound) emits no runtime predicate at all.
+#[test]
+fn bytes_size_checks_length_member_not_strlen() {
+    let mut nonce = bare_entry(
+        "nonce",
+        size_constrained("bytes", CsilSizeConstraint::Exact(12)),
+    );
+    nonce.occurrence = Some(CsilOccurrence::Optional);
+    let input = input_with_rules(
+        vec![group_rule(
+            "Identity",
+            vec![
+                bare_entry(
+                    "signing_public_key",
+                    size_constrained("bytes", CsilSizeConstraint::Exact(32)),
+                ),
+                bare_entry(
+                    "fingerprint",
+                    size_constrained("text", CsilSizeConstraint::Exact(64)),
+                ),
+                nonce,
+                bare_entry(
+                    "width",
+                    size_constrained("uint", CsilSizeConstraint::Max(4)),
+                ),
+            ],
+        )],
+        "c",
+        HashMap::new(),
+    );
+    let validation = generate_validation(&input).expect("validation emitted");
+    assert!(validation.contains(
+        "if (v->signing_public_key.data != NULL && v->signing_public_key.len != 32u) return false;"
+    ));
+    assert!(!validation.contains("strlen(v->signing_public_key"));
+    // An optional bytes field sits behind the absent-as-NULL extra pointer.
+    assert!(validation.contains("if (v->nonce != NULL && v->nonce->len != 12u) return false;"));
+    assert!(validation.contains("if (v->fingerprint != NULL && strlen(v->fingerprint) != 64u)"));
+    assert!(!validation.contains("v->width"));
+}
+
+/// minlength/maxlength metadata on a bytes field takes the same `len` path as
+/// `.size`, including through a transparent alias (`Key = bytes`).
+#[test]
+fn bytes_length_metadata_and_alias_resolve_to_len() {
+    let mut key_entry = bare_entry("key", CsilTypeExpression::Reference("Key".to_string()));
+    key_entry.metadata = vec![CsilFieldMetadata::Constraint(
+        CsilValidationConstraint::MinLength(16),
+    )];
+    let alias = CsilRule {
+        name: "Key".to_string(),
+        rule_type: CsilRuleType::TypeDef(builtin("bytes")),
+        position: pos(),
+        doc_comments: vec![],
+    };
+    let input = input_with_rules(
+        vec![alias, group_rule("Envelope", vec![key_entry])],
+        "c",
+        HashMap::new(),
+    );
+    let validation = generate_validation(&input).expect("validation emitted");
+    assert!(validation.contains("if (v->key.data != NULL && v->key.len < 16u) return false;"));
+    assert!(!validation.contains("strlen"));
 }
 
 #[test]
@@ -671,8 +843,8 @@ static int stub_call(void *self, const char *service, const char *op,
                      const uint8_t *req, size_t req_len,
                      uint8_t **resp, size_t *resp_len) {
     (void)self;
-    assert(strcmp(service, "corndogs") == 0);
-    assert(strcmp(op, "SubmitTask") == 0);
+    assert(strcmp(service, "CorndogsService") == 0);
+    assert(strcmp(op, "submit-task") == 0);
     SubmitTaskRequest in;
     CsilCodecArena *owner;
     if (csil_decode_SubmitTaskRequest(req, req_len, &in, &owner)) return 1;
@@ -796,6 +968,154 @@ int main(void) {
     assert(strcmp(mback.tag_list.items[2], "blue") == 0);
     free(mb);
     csil_codec_arena_free(mowner);
+
+    printf("ok\n");
+    return 0;
+}
+"#;
+
+/// Compile and run output containing keyword-named union arms and `bytes .size`
+/// constraints — the two defect classes that used to emit uncompilable C — proving
+/// the escape scheme and the CsilBytes length check under a real compiler,
+/// warning-clean at -Wall -Wextra. Skips when no C compiler is on PATH.
+#[test]
+fn keyword_arms_and_bytes_size_compile_through_gcc() {
+    let cc = ["cc", "gcc", "clang"].into_iter().find(|c| {
+        std::process::Command::new(c)
+            .arg("--version")
+            .output()
+            .is_ok()
+    });
+    let Some(cc) = cc else {
+        eprintln!("skipping: no C compiler on PATH");
+        return;
+    };
+
+    let check_value = CsilRule {
+        name: "CheckValue".to_string(),
+        rule_type: CsilRuleType::TypeChoice(vec![
+            builtin("text"),
+            builtin("int"),
+            builtin("float"),
+        ]),
+        position: pos(),
+        doc_comments: vec![],
+    };
+    let mut nonce = bare_entry(
+        "nonce",
+        size_constrained("bytes", CsilSizeConstraint::Exact(12)),
+    );
+    nonce.occurrence = Some(CsilOccurrence::Optional);
+    let identity = group_rule(
+        "Identity",
+        vec![
+            bare_entry(
+                "signing_public_key",
+                size_constrained("bytes", CsilSizeConstraint::Exact(32)),
+            ),
+            bare_entry(
+                "fingerprint",
+                size_constrained("text", CsilSizeConstraint::Exact(5)),
+            ),
+            nonce,
+        ],
+    );
+    let input = input_with_rules(vec![check_value, identity], "c", HashMap::new());
+    let out = process_generation(input).unwrap();
+
+    let dir = std::env::temp_dir().join(format!("csilgen-c-kwbytes-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    for file in &out.files {
+        std::fs::write(dir.join(&file.path), &file.content).unwrap();
+    }
+    std::fs::write(dir.join("driver.c"), KEYWORD_BYTES_DRIVER_C).unwrap();
+
+    let bin = dir.join("driver");
+    let compile = std::process::Command::new(cc)
+        .args(["-std=c11", "-Wall", "-Wextra", "-O1"])
+        .arg("-I")
+        .arg(&dir)
+        .arg(dir.join("driver.c"))
+        .arg("-o")
+        .arg(&bin)
+        .output()
+        .unwrap();
+    assert!(
+        compile.status.success(),
+        "compile failed:\n{}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let warnings = String::from_utf8_lossy(&compile.stderr);
+    assert!(warnings.is_empty(), "compiler warnings:\n{warnings}");
+
+    let run = std::process::Command::new(&bin).output().unwrap();
+    assert!(
+        run.status.success(),
+        "round-trip failed:\n{}{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+const KEYWORD_BYTES_DRIVER_C: &str = r#"#include "codec.gen.h"
+#include "validation.gen.h"
+#include <assert.h>
+#include <stdio.h>
+#include <string.h>
+
+int main(void) {
+    /* keyword-named union arms round-trip through their escaped members */
+    CheckValue cv;
+    memset(&cv, 0, sizeof(cv));
+    cv.tag = CHECK_VALUE_INT;
+    cv.u.int_ = -42;
+    uint8_t *b = NULL;
+    size_t n = 0;
+    assert(csil_encode_CheckValue(&cv, &b, &n) == 0);
+    CheckValue back;
+    CsilCodecArena *owner = NULL;
+    assert(csil_decode_CheckValue(b, n, &back, &owner) == 0);
+    assert(back.tag == CHECK_VALUE_INT && back.u.int_ == -42);
+    free(b);
+    csil_codec_arena_free(owner);
+
+    cv.tag = CHECK_VALUE_FLOAT;
+    cv.u.float_ = 2.5;
+    b = NULL;
+    n = 0;
+    assert(csil_encode_CheckValue(&cv, &b, &n) == 0);
+    owner = NULL;
+    assert(csil_decode_CheckValue(b, n, &back, &owner) == 0);
+    assert(back.tag == CHECK_VALUE_FLOAT && back.u.float_ == 2.5);
+    free(b);
+    csil_codec_arena_free(owner);
+
+    /* bytes .size validates the CsilBytes len member, not a string length */
+    uint8_t key[32] = {0};
+    uint8_t nonce_buf[12] = {0};
+    Identity id;
+    memset(&id, 0, sizeof(id));
+    id.signing_public_key.data = key;
+    id.signing_public_key.len = 32;
+    id.fingerprint = "abcde";
+    assert(Identity_validate(&id));
+    id.signing_public_key.len = 31;
+    assert(!Identity_validate(&id));
+    id.signing_public_key.len = 32;
+
+    /* an absent optional bytes field passes; a present one is length-checked */
+    CsilBytes nb = { nonce_buf, 12 };
+    id.nonce = &nb;
+    assert(Identity_validate(&id));
+    nb.len = 11;
+    assert(!Identity_validate(&id));
+    nb.len = 12;
+
+    /* text .size still measures with strlen */
+    id.fingerprint = "abc";
+    assert(!Identity_validate(&id));
 
     printf("ok\n");
     return 0;
@@ -1388,8 +1708,8 @@ static int stub_call(void *self, const char *service, const char *op,
                      const uint8_t *req, size_t req_len,
                      uint8_t **resp, size_t *resp_len) {
     (void)self;
-    assert(strcmp(service, "house") == 0);
-    if (strcmp(op, "GetHouse") == 0) {
+    assert(strcmp(service, "HouseService") == 0);
+    if (strcmp(op, "get-house") == 0) {
         HouseID id;
         CsilCodecArena *owner;
         if (csil_decode_HouseID(req, req_len, &id, &owner)) return 1;
@@ -1401,7 +1721,7 @@ static int stub_call(void *self, const char *service, const char *op,
         csil_codec_arena_free(owner);
         return rc;
     }
-    if (strcmp(op, "ListHouses") == 0) {
+    if (strcmp(op, "list-houses") == 0) {
         ListReq lr;
         CsilCodecArena *owner;
         if (csil_decode_ListReq(req, req_len, &lr, &owner)) return 1;
@@ -1505,3 +1825,629 @@ fn nonrecord_boundary_client_round_trips_through_gcc() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ---- inline (anonymous) choice hoisting ------------------------------------
+
+fn lit_text(s: &str) -> CsilTypeExpression {
+    CsilTypeExpression::Literal(CsilLiteralValue::Text(s.to_string()))
+}
+
+/// The `Status = "active" / "inactive" .default "active"` shape: CSIL's grammar
+/// attaches a trailing control operator to the immediately preceding arm, so the
+/// second arm parses as `Constrained { base_type: Literal("inactive"), .. }`, not a
+/// bare `Literal`. Every arm here is still a literal underneath, so this must stay
+/// the bare-wire string enum shape.
+#[test]
+fn default_suffixed_literal_arm_still_classifies_as_bare_enum() {
+    let rule = CsilRule {
+        name: "Status".to_string(),
+        rule_type: CsilRuleType::TypeChoice(vec![
+            lit_text("active"),
+            CsilTypeExpression::Constrained {
+                base_type: Box::new(lit_text("inactive")),
+                constraints: vec![CsilControlOperator::Default(CsilLiteralValue::Text(
+                    "active".to_string(),
+                ))],
+            },
+        ]),
+        position: pos(),
+        doc_comments: vec![],
+    };
+    let input = input_with_rules(vec![rule], "c", HashMap::new());
+    let config = CConfig::from_options(&input.config.options).unwrap();
+    let types = generate_types(&input, &config).unwrap();
+    assert!(types.contains("typedef enum Status {"));
+    assert!(types.contains("STATUS_ACTIVE,"));
+    assert!(types.contains("STATUS_INACTIVE,"));
+    // Not the tagged-union shape a misclassification would produce.
+    assert!(!types.contains("StatusTag"));
+}
+
+/// A record field whose type is an inline (anonymous) choice with no named rule
+/// behind it — `APIError.error_type` in examples/real-world-api/e-commerce-api.csil
+/// — must behave exactly like a field that instead referenced a named choice rule:
+/// hoisted to a synthesized `APIError_error_type` tagged union with its own codec,
+/// not the `void *error_type;` / dropped-field collapse this used to emit.
+#[test]
+fn inline_choice_field_hoists_like_a_named_choice_reference() {
+    let mut error_type = bare_entry(
+        "error_type",
+        CsilTypeExpression::Choice(vec![
+            builtin("text"),
+            lit_text("not_found"),
+            lit_text("permission_denied"),
+        ]),
+    );
+    error_type.occurrence = Some(CsilOccurrence::Optional);
+    let rule = group_rule(
+        "APIError",
+        vec![bare_entry("code", builtin("int")), error_type],
+    );
+    let input = hoisted(input_with_rules(vec![rule], "c", HashMap::new()));
+    let config = CConfig::from_options(&input.config.options).unwrap();
+    let types = generate_types(&input, &config).unwrap();
+
+    assert!(types.contains("typedef struct APIError_error_type {"));
+    assert!(types.contains("APIError_error_type *error_type;"));
+    assert!(!types.contains("void *error_type"));
+
+    let mut warnings = Vec::new();
+    let codec = generate_codec(&input, &config, &mut warnings).unwrap();
+    assert!(codec.contains("csilc_enc_APIError_error_type("));
+    assert!(codec.contains("csilc_dec_APIError_error_type("));
+    assert!(codec.contains("csilc_enc_APIError_error_type(b, &((*v->error_type)))) return -1;"));
+    // No dropped-field fallback: the field must never degrade to the generic
+    // "no generated codec" null stub.
+    assert!(
+        warnings.is_empty(),
+        "unexpected codec warnings: {warnings:?}"
+    );
+}
+
+/// The torture-spec-shaped record: an inline choice directly as a field, as an
+/// array element, as a map value, and as a tuple element — the contract is broader
+/// than a plain record field (see `hoist_inline_composites`'s doc comment).
+fn torture_inline_choice_rule() -> CsilRule {
+    let mixed_inline = CsilTypeExpression::Choice(vec![
+        builtin("text"),
+        lit_text("not_found"),
+        lit_text("permission_denied"),
+        lit_text("invalid_input"),
+    ]);
+    let pure_literal_inline = CsilTypeExpression::Choice(vec![
+        lit_text("active"),
+        lit_text("inactive"),
+        lit_text("pending"),
+    ]);
+    let constrained_arm_inline = CsilTypeExpression::Choice(vec![
+        builtin("text"),
+        lit_text("low"),
+        CsilTypeExpression::Constrained {
+            base_type: Box::new(lit_text("high")),
+            constraints: vec![CsilControlOperator::Default(CsilLiteralValue::Text(
+                "normal".to_string(),
+            ))],
+        },
+    ]);
+    let tag_list = CsilTypeExpression::Array {
+        element_type: Box::new(CsilTypeExpression::Choice(vec![
+            builtin("text"),
+            lit_text("red"),
+            lit_text("green"),
+            lit_text("blue"),
+        ])),
+        occurrence: Some(CsilOccurrence::ZeroOrMore),
+    };
+    let label_map = CsilTypeExpression::Map {
+        key: Box::new(builtin("text")),
+        value: Box::new(CsilTypeExpression::Choice(vec![
+            builtin("text"),
+            lit_text("urgent"),
+            lit_text("normal"),
+        ])),
+        occurrence: Some(CsilOccurrence::ZeroOrMore),
+    };
+    let coord = CsilTypeExpression::Tuple(CsilGroupExpression {
+        entries: vec![
+            CsilGroupEntry {
+                key: None,
+                value_type: CsilTypeExpression::Choice(vec![
+                    builtin("text"),
+                    lit_text("lat"),
+                    lit_text("lon"),
+                ]),
+                occurrence: None,
+                metadata: vec![],
+                doc_comments: vec![],
+            },
+            CsilGroupEntry {
+                key: None,
+                value_type: builtin("int"),
+                occurrence: None,
+                metadata: vec![],
+                doc_comments: vec![],
+            },
+        ],
+    });
+    group_rule(
+        "TortureInlineChoice",
+        vec![
+            bare_entry("mixed_inline", mixed_inline),
+            bare_entry("pure_literal_inline", pure_literal_inline),
+            bare_entry("constrained_arm_inline", constrained_arm_inline),
+            bare_entry("tag_list", tag_list),
+            bare_entry("label_map", label_map),
+            bare_entry("coord", coord),
+        ],
+    )
+}
+
+/// Every hoisted position (direct field, array element, map value, tuple element)
+/// declares as a synthesized union/enum, and its codec routes through the
+/// synthesized `csilc_enc_*`/`csilc_dec_*` — not a `void *`/`void **` collapse or a
+/// dropped-field codec warning.
+#[test]
+fn inline_choice_hoists_in_array_map_and_tuple_positions() {
+    let input = hoisted(input_with_rules(
+        vec![torture_inline_choice_rule()],
+        "c",
+        HashMap::new(),
+    ));
+    let config = CConfig::from_options(&input.config.options).unwrap();
+    let types = generate_types(&input, &config).unwrap();
+
+    // array element: a hoisted `_item` union, not `void **`.
+    assert!(types.contains("typedef struct TortureInlineChoice_tag_list_item {"));
+    assert!(types.contains("TortureInlineChoice_tag_list_item *tag_list;"));
+    // map value: a hoisted `_value` union, not `void **`.
+    assert!(types.contains("typedef struct TortureInlineChoice_label_map_value {"));
+    assert!(types.contains("TortureInlineChoice_label_map_value *label_map_values;"));
+    // tuple element: a hoisted `_0` union (the shared hoist names an unkeyed tuple
+    // slot by its positional index, not the `f<N>` label `emit_field`'s own
+    // anonymous-struct member uses) embedded by value in the anonymous struct.
+    assert!(types.contains("typedef struct TortureInlineChoice_coord_0 {"));
+    assert!(types.contains("TortureInlineChoice_coord_0 f0;"));
+    // pure-literal direct field: a bare enum, not a tagged union.
+    assert!(types.contains("typedef enum TortureInlineChoice_pure_literal_inline {"));
+    assert!(!types.contains("void *"));
+    assert!(!types.contains("void **"));
+
+    let mut warnings = Vec::new();
+    let codec = generate_codec(&input, &config, &mut warnings).unwrap();
+    assert!(codec.contains("csilc_enc_TortureInlineChoice_tag_list_item("));
+    assert!(codec.contains("csilc_enc_TortureInlineChoice_label_map_value("));
+    assert!(codec.contains("csilc_enc_TortureInlineChoice_coord_0("));
+    assert!(
+        warnings.is_empty(),
+        "unexpected codec warnings: {warnings:?}"
+    );
+}
+
+/// Compile the torture-shaped record and prove, under gcc: (1) the direct-field
+/// cases encode byte-identical to the ocaml reference generator's ground truth
+/// (literal-first tagged-sum precedence, bare-literal enum wire, `.default`-suffixed
+/// arm still a literal), and (2) the array/map/tuple nested positions — a broader
+/// contract than the ocaml reference covers — round-trip encode/decode/re-encode
+/// byte-identically, with the expected bytes for each direct-field case
+/// hand-derived from the same low-level `csilc_w_*` primitives the generated codec
+/// itself calls. Skips cleanly when no C compiler is on PATH.
+#[test]
+fn inline_choice_matches_ocaml_ground_truth_and_round_trips_through_gcc() {
+    let cc = ["cc", "gcc", "clang"].into_iter().find(|c| {
+        std::process::Command::new(c)
+            .arg("--version")
+            .output()
+            .is_ok()
+    });
+    let Some(cc) = cc else {
+        eprintln!("skipping: no C compiler on PATH");
+        return;
+    };
+
+    let input = input_with_rules(vec![torture_inline_choice_rule()], "c", HashMap::new());
+    let out = process_generation(input).unwrap();
+
+    let dir = std::env::temp_dir().join(format!("csilgen-c-inline-choice-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    for file in &out.files {
+        std::fs::write(dir.join(&file.path), &file.content).unwrap();
+    }
+    std::fs::write(dir.join("driver.c"), INLINE_CHOICE_DRIVER_C).unwrap();
+
+    let bin = dir.join("driver");
+    let compile = std::process::Command::new(cc)
+        .args(["-std=c11", "-Wall", "-Wextra", "-O1"])
+        .arg("-I")
+        .arg(&dir)
+        .arg(dir.join("driver.c"))
+        .arg("-o")
+        .arg(&bin)
+        .output()
+        .unwrap();
+    assert!(
+        compile.status.success(),
+        "compile failed:\n{}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let warnings = String::from_utf8_lossy(&compile.stderr);
+    assert!(warnings.is_empty(), "compiler warnings:\n{warnings}");
+
+    let run = std::process::Command::new(&bin).output().unwrap();
+    assert!(
+        run.status.success(),
+        "round-trip failed:\n{}{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Regression for `csilgen_common::hoist`'s case-insensitive collision
+/// disambiguation (mirrors its own
+/// `case_insensitive_collision_between_existing_and_synthesized_rule_is_disambiguated`
+/// test), proven end to end through the C generator's actual output: an existing
+/// rule `UserData` and a field `User.data` typed as an inline MIXED-kind literal
+/// choice (`"x" / 1` — exercising `TypeKind::MixedEnum` from Task 1 in the same
+/// breath) would naively synthesize `User_data`, which pascal-collides with
+/// `UserData` (both canonicalize to `"userdata"`). The hoister must disambiguate
+/// the synthesized name (`User_data_2`) rather than emit two C declarations for
+/// the same case-normalized identifier, which would fail to compile.
+#[test]
+fn mixed_choice_field_disambiguates_against_case_insensitive_collision() {
+    let user_data = group_rule("UserData", vec![bare_entry("value", builtin("text"))]);
+    let mut data_field = bare_entry(
+        "data",
+        CsilTypeExpression::Choice(vec![
+            lit_text("x"),
+            CsilTypeExpression::Literal(CsilLiteralValue::Integer(1)),
+        ]),
+    );
+    data_field.occurrence = None;
+    let user = group_rule("User", vec![bare_entry("id", builtin("text")), data_field]);
+    let input = input_with_rules(vec![user_data, user], "c-typesonly", HashMap::new());
+    let out = process_generation(input).unwrap();
+    let types = &out
+        .files
+        .iter()
+        .find(|f| f.path == "types.gen.h")
+        .expect("types.gen.h emitted")
+        .content;
+    let codec = &out
+        .files
+        .iter()
+        .find(|f| f.path == "codec.gen.h")
+        .expect("codec.gen.h emitted")
+        .content;
+
+    // The original `UserData` rule survives unchanged.
+    assert!(types.contains("typedef struct UserData {"));
+    // The naive, colliding synthesized name must never appear as its own
+    // declaration (only as a substring of the disambiguated `User_data_2`).
+    assert!(
+        !types.contains("typedef struct User_data {")
+            && !types.contains("typedef enum User_dataTag {"),
+        "synthesized name collided with UserData but was not disambiguated:\n{types}"
+    );
+    // The disambiguated mixed-literal enum is declared distinctly, with its own
+    // tagged struct + union payload (see `emit_mixed_enum`) and codec.
+    assert!(types.contains("typedef struct User_data_2 {"));
+    assert!(types.contains("User_data_2Tag tag;"));
+    assert!(types.contains("User_data_2 data;"));
+    assert!(codec.contains("csilc_enc_User_data_2("));
+    assert!(codec.contains("csilc_dec_User_data_2("));
+    // The bare-literal wire form (no `[index, value]` union wrapper): encode
+    // writes the tag's own literal value directly.
+    assert!(codec.contains("csilc_w_text(b, \"x\", 1)"));
+}
+
+/// The disambiguated `User_data_2` mixed-literal enum from the collision test
+/// above compiles distinctly from `UserData` and round-trips both of its
+/// declared literal arms (plus rejects an out-of-vocabulary value), proven under
+/// gcc. Skips cleanly when no C compiler is on PATH.
+#[test]
+fn mixed_choice_disambiguated_type_compiles_and_round_trips_through_gcc() {
+    let cc = ["cc", "gcc", "clang"].into_iter().find(|c| {
+        std::process::Command::new(c)
+            .arg("--version")
+            .output()
+            .is_ok()
+    });
+    let Some(cc) = cc else {
+        eprintln!("skipping: no C compiler on PATH");
+        return;
+    };
+
+    let user_data = group_rule("UserData", vec![bare_entry("value", builtin("text"))]);
+    let mut data_field = bare_entry(
+        "data",
+        CsilTypeExpression::Choice(vec![
+            lit_text("x"),
+            CsilTypeExpression::Literal(CsilLiteralValue::Integer(1)),
+        ]),
+    );
+    data_field.occurrence = None;
+    let user = group_rule("User", vec![bare_entry("id", builtin("text")), data_field]);
+    let input = input_with_rules(vec![user_data, user], "c-typesonly", HashMap::new());
+    let out = process_generation(input).unwrap();
+
+    let dir =
+        std::env::temp_dir().join(format!("csilgen-c-mixed-collision-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    for file in &out.files {
+        std::fs::write(dir.join(&file.path), &file.content).unwrap();
+    }
+    std::fs::write(dir.join("driver.c"), MIXED_COLLISION_DRIVER_C).unwrap();
+
+    let bin = dir.join("driver");
+    let compile = std::process::Command::new(cc)
+        .args(["-std=c11", "-Wall", "-Wextra", "-O1"])
+        .arg("-I")
+        .arg(&dir)
+        .arg(dir.join("driver.c"))
+        .arg("-o")
+        .arg(&bin)
+        .output()
+        .unwrap();
+    assert!(
+        compile.status.success(),
+        "compile failed:\n{}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let warnings = String::from_utf8_lossy(&compile.stderr);
+    assert!(warnings.is_empty(), "compiler warnings:\n{warnings}");
+
+    let run = std::process::Command::new(&bin).output().unwrap();
+    assert!(
+        run.status.success(),
+        "round-trip failed:\n{}{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+const MIXED_COLLISION_DRIVER_C: &str = r#"#include "codec.gen.h"
+#include <assert.h>
+#include <stdio.h>
+#include <string.h>
+
+int main(void) {
+    /* UserData and User_data_2 are genuinely distinct declarations: this compiles
+     * only if the disambiguation actually happened (a real name collision would
+     * be a duplicate `typedef struct UserData` the compiler rejects outright). */
+    UserData ud;
+    ud.value = "distinct";
+    (void)ud;
+
+    User u;
+    u.id = "u1";
+    u.data.tag = USER_DATA_2_X;
+    u.data.u.x = "x";
+
+    uint8_t *b1 = NULL;
+    size_t n1 = 0;
+    assert(csil_encode_User_data_2(&u.data, &b1, &n1) == 0);
+    /* Bare wire value: the 1-byte CBOR text-length-1 head + "x", no [index,
+     * value] array wrapper. */
+    assert(n1 == 2 && b1[0] == 0x61 && b1[1] == 'x');
+
+    User_data_2 back;
+    CsilCodecArena *owner = NULL;
+    assert(csil_decode_User_data_2(b1, n1, &back, &owner) == 0);
+    assert(back.tag == USER_DATA_2_X);
+    assert(strcmp(back.u.x, "x") == 0);
+    csil_codec_arena_free(owner);
+    free(b1);
+
+    /* The integer arm round-trips too. */
+    User_data_2 iv;
+    iv.tag = USER_DATA_2_1;
+    iv.u.v1 = 1;
+    uint8_t *b2 = NULL;
+    size_t n2 = 0;
+    assert(csil_encode_User_data_2(&iv, &b2, &n2) == 0);
+    User_data_2 iback;
+    CsilCodecArena *iowner = NULL;
+    assert(csil_decode_User_data_2(b2, n2, &iback, &iowner) == 0);
+    assert(iback.tag == USER_DATA_2_1);
+    assert(iback.u.v1 == 1);
+    csil_codec_arena_free(iowner);
+    free(b2);
+
+    /* An out-of-vocabulary value (text "y") is rejected on decode. */
+    csilc_buf bogus;
+    csilc_buf_init(&bogus);
+    assert(csilc_w_text(&bogus, "y", 1) == 0);
+    User_data_2 rejected;
+    CsilCodecArena *rowner = NULL;
+    CsilCodecArena *arena;
+    const csilc_value *root;
+    assert(csilc_decode(bogus.data, bogus.len, &arena, &root) == 0);
+    assert(csilc_dec_User_data_2(root, arena, &rejected) != 0);
+    csil_codec_arena_free(arena);
+    csilc_buf_dispose(&bogus);
+    (void)rowner;
+
+    printf("ok\n");
+    return 0;
+}
+"#;
+
+const INLINE_CHOICE_DRIVER_C: &str = r#"#include "codec.gen.h"
+#include <assert.h>
+#include <stdio.h>
+#include <string.h>
+
+/* Hand-derive the expected bytes for mixed_inline(not_found) from the same
+ * low-level csilc_w_* primitives the generated codec itself calls, independent of
+ * csilc_enc_TortureInlineChoice_mixed_inline: a 2-element array, the literal arm's
+ * own declaration index (1: 0=open text, 1="not_found"), and its canonical text —
+ * matching the ocaml reference generator's ground truth
+ * `8201696e6f745f666f756e64`.
+ */
+static void expect_mixed_inline_not_found(void) {
+    csilc_buf want;
+    csilc_buf_init(&want);
+    assert(csilc_w_array_head(&want, 2) == 0);
+    assert(csilc_w_uint(&want, 1) == 0);
+    assert(csilc_w_text(&want, "not_found", strlen("not_found")) == 0);
+
+    TortureInlineChoice_mixed_inline v;
+    v.tag = TORTURE_INLINE_CHOICE_MIXED_INLINE_CHOICE1;
+    v.u.choice1 = "not_found";
+    uint8_t *got = NULL;
+    size_t gotn = 0;
+    assert(csil_encode_TortureInlineChoice_mixed_inline(&v, &got, &gotn) == 0);
+    assert(gotn == want.len && memcmp(got, want.data, want.len) == 0);
+    free(got);
+    csilc_buf_dispose(&want);
+}
+
+/* mixed_inline(Other banana): the free/open text arm keeps its own declaration
+ * index (0) even though a literal arm also carries text payloads. */
+static void expect_mixed_inline_open_arm(void) {
+    csilc_buf want;
+    csilc_buf_init(&want);
+    assert(csilc_w_array_head(&want, 2) == 0);
+    assert(csilc_w_uint(&want, 0) == 0);
+    assert(csilc_w_text(&want, "banana", strlen("banana")) == 0);
+
+    TortureInlineChoice_mixed_inline v;
+    v.tag = TORTURE_INLINE_CHOICE_MIXED_INLINE_TEXT;
+    v.u.text = "banana";
+    uint8_t *got = NULL;
+    size_t gotn = 0;
+    assert(csil_encode_TortureInlineChoice_mixed_inline(&v, &got, &gotn) == 0);
+    assert(gotn == want.len && memcmp(got, want.data, want.len) == 0);
+    free(got);
+    csilc_buf_dispose(&want);
+}
+
+/* pure_literal_inline: a bare CBOR text literal, no array wrapper at all — the
+ * all-literal-arm enum shape's wire form. */
+static void expect_pure_literal_inline_bare_wire(void) {
+    csilc_buf want;
+    csilc_buf_init(&want);
+    assert(csilc_w_text(&want, "inactive", strlen("inactive")) == 0);
+
+    TortureInlineChoice_pure_literal_inline v = TORTURE_INLINE_CHOICE_PURE_LITERAL_INLINE_INACTIVE;
+    uint8_t *got = NULL;
+    size_t gotn = 0;
+    assert(csil_encode_TortureInlineChoice_pure_literal_inline(&v, &got, &gotn) == 0);
+    assert(gotn == want.len && memcmp(got, want.data, want.len) == 0);
+    free(got);
+    csilc_buf_dispose(&want);
+}
+
+/* constrained_arm_inline: the `.default`-suffixed last arm ("high") still codes as
+ * a literal at its own declared index (2), proving the classification-bug fix
+ * (choice_arm_literal seeing through the Constrained wrapper) all the way to the
+ * codec's literal-equality path, not just the enum/union classification. */
+static void expect_constrained_arm_inline_default_suffixed_literal(void) {
+    csilc_buf want;
+    csilc_buf_init(&want);
+    assert(csilc_w_array_head(&want, 2) == 0);
+    assert(csilc_w_uint(&want, 2) == 0);
+    assert(csilc_w_text(&want, "high", strlen("high")) == 0);
+
+    TortureInlineChoice_constrained_arm_inline v;
+    v.tag = TORTURE_INLINE_CHOICE_CONSTRAINED_ARM_INLINE_CHOICE2;
+    v.u.choice2 = "high";
+    uint8_t *got = NULL;
+    size_t gotn = 0;
+    assert(csil_encode_TortureInlineChoice_constrained_arm_inline(&v, &got, &gotn) == 0);
+    assert(gotn == want.len && memcmp(got, want.data, want.len) == 0);
+    free(got);
+    csilc_buf_dispose(&want);
+}
+
+int main(void) {
+    expect_mixed_inline_not_found();
+    expect_mixed_inline_open_arm();
+    expect_pure_literal_inline_bare_wire();
+    expect_constrained_arm_inline_default_suffixed_literal();
+
+    /* Full-record round trip through every hoisted position at once: direct field,
+     * array element, map value, and tuple element, each carrying both a literal-arm
+     * and an open-arm value so both encode/decode branches run. */
+    TortureInlineChoice v;
+    memset(&v, 0, sizeof(v));
+
+    v.mixed_inline.tag = TORTURE_INLINE_CHOICE_MIXED_INLINE_CHOICE1;
+    v.mixed_inline.u.choice1 = "not_found";
+    v.pure_literal_inline = TORTURE_INLINE_CHOICE_PURE_LITERAL_INLINE_INACTIVE;
+    v.constrained_arm_inline.tag = TORTURE_INLINE_CHOICE_CONSTRAINED_ARM_INLINE_TEXT;
+    v.constrained_arm_inline.u.text = "orange";
+
+    TortureInlineChoice_tag_list_item items[2];
+    items[0].tag = TORTURE_INLINE_CHOICE_TAG_LIST_ITEM_CHOICE1;
+    items[0].u.choice1 = "red";
+    items[1].tag = TORTURE_INLINE_CHOICE_TAG_LIST_ITEM_TEXT;
+    items[1].u.text = "unknown_color";
+    v.tag_list = items;
+    v.tag_list_count = 2;
+
+    char *keys[2] = {"a", "b"};
+    TortureInlineChoice_label_map_value vals[2];
+    vals[0].tag = TORTURE_INLINE_CHOICE_LABEL_MAP_VALUE_CHOICE1;
+    vals[0].u.choice1 = "urgent";
+    vals[1].tag = TORTURE_INLINE_CHOICE_LABEL_MAP_VALUE_TEXT;
+    vals[1].u.text = "mystery";
+    v.label_map_keys = keys;
+    v.label_map_values = vals;
+    v.label_map_count = 2;
+
+    v.coord.f0.tag = TORTURE_INLINE_CHOICE_COORD_0_CHOICE1;
+    v.coord.f0.u.choice1 = "lat";
+    v.coord.f1 = 42;
+
+    uint8_t *b1 = NULL;
+    size_t n1 = 0;
+    assert(csil_encode_TortureInlineChoice(&v, &b1, &n1) == 0);
+
+    TortureInlineChoice back;
+    CsilCodecArena *owner = NULL;
+    assert(csil_decode_TortureInlineChoice(b1, n1, &back, &owner) == 0);
+
+    assert(back.mixed_inline.tag == TORTURE_INLINE_CHOICE_MIXED_INLINE_CHOICE1);
+    assert(strcmp(back.mixed_inline.u.choice1, "not_found") == 0);
+    assert(back.pure_literal_inline == TORTURE_INLINE_CHOICE_PURE_LITERAL_INLINE_INACTIVE);
+    assert(back.constrained_arm_inline.tag == TORTURE_INLINE_CHOICE_CONSTRAINED_ARM_INLINE_TEXT);
+    assert(strcmp(back.constrained_arm_inline.u.text, "orange") == 0);
+
+    assert(back.tag_list_count == 2);
+    assert(back.tag_list[0].tag == TORTURE_INLINE_CHOICE_TAG_LIST_ITEM_CHOICE1);
+    assert(strcmp(back.tag_list[0].u.choice1, "red") == 0);
+    assert(back.tag_list[1].tag == TORTURE_INLINE_CHOICE_TAG_LIST_ITEM_TEXT);
+    assert(strcmp(back.tag_list[1].u.text, "unknown_color") == 0);
+
+    assert(back.label_map_count == 2);
+    assert(strcmp(back.label_map_keys[0], "a") == 0);
+    assert(back.label_map_values[0].tag == TORTURE_INLINE_CHOICE_LABEL_MAP_VALUE_CHOICE1);
+    assert(strcmp(back.label_map_values[0].u.choice1, "urgent") == 0);
+    assert(strcmp(back.label_map_keys[1], "b") == 0);
+    assert(back.label_map_values[1].tag == TORTURE_INLINE_CHOICE_LABEL_MAP_VALUE_TEXT);
+    assert(strcmp(back.label_map_values[1].u.text, "mystery") == 0);
+
+    assert(back.coord.f0.tag == TORTURE_INLINE_CHOICE_COORD_0_CHOICE1);
+    assert(strcmp(back.coord.f0.u.choice1, "lat") == 0);
+    assert(back.coord.f1 == 42);
+
+    /* re-encode the decoded value: byte-identical to the first encode proves the
+     * decode->struct->encode path carries no data loss anywhere in the tree,
+     * including the three nested hoisted positions. */
+    uint8_t *b2 = NULL;
+    size_t n2 = 0;
+    assert(csil_encode_TortureInlineChoice(&back, &b2, &n2) == 0);
+    assert(n1 == n2 && memcmp(b1, b2, n1) == 0);
+
+    free(b1);
+    free(b2);
+    csil_codec_arena_free(owner);
+
+    printf("ok\n");
+    return 0;
+}
+"#;

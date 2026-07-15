@@ -10,7 +10,7 @@ use csilgen_common::{
     CsilServiceOperation, CsilSizeConstraint, CsilSpecSerialized, CsilTypeExpression,
     CsilValidationConstraint, CsilgenError, GeneratedFile, GeneratedFiles, GenerationStats,
     GeneratorCapability, GeneratorConfig, GeneratorMetadata, GeneratorWarning, Result,
-    WasmGeneratorInput, WasmGeneratorOutput, wasm_interface::*,
+    WasmGeneratorInput, WasmGeneratorOutput, all_literal, choice_arm_literal, wasm_interface::*,
 };
 use std::collections::{BTreeSet, HashMap, HashSet};
 
@@ -118,7 +118,9 @@ fn csil_literal_to_python_str(value: &CsilLiteralValue) -> String {
     match value {
         CsilLiteralValue::Text(text) => format!("\"{text}\""),
         CsilLiteralValue::Integer(num) => num.to_string(),
-        CsilLiteralValue::Bool(b) => b.to_string(),
+        // Python's bool keywords are capitalized (`True`/`False`); Rust's `bool`
+        // `Display` is lowercase and would emit an undefined bare name.
+        CsilLiteralValue::Bool(b) => if *b { "True" } else { "False" }.to_string(),
         CsilLiteralValue::Float(f) => f.to_string(),
         CsilLiteralValue::Null => "None".to_string(),
         CsilLiteralValue::Bytes(bytes) => {
@@ -390,24 +392,6 @@ fn python_success_type(type_expr: &CsilTypeExpression) -> CsilTypeExpression {
     } else {
         type_expr.clone()
     }
-}
-
-/// PascalCase an operation name for the wire, using the same simple rule the
-/// TypeScript/Go/Rust clients use so all four agree on the method string.
-fn wire_method_name(name: &str) -> String {
-    let mut out = String::new();
-    let mut cap = true;
-    for ch in name.chars() {
-        if ch == '_' || ch == '-' {
-            cap = true;
-        } else if cap {
-            out.extend(ch.to_uppercase());
-            cap = false;
-        } else {
-            out.push(ch);
-        }
-    }
-    out
 }
 
 /// The async/sync surface a client module is emitted as. `client_style` selects it
@@ -1031,11 +1015,6 @@ fn first_channel_example(
             continue;
         };
         let service_class = rule.name.to_case(Case::Pascal);
-        let base = service_class
-            .strip_suffix("Service")
-            .filter(|s| !s.is_empty())
-            .unwrap_or(&service_class)
-            .to_string();
         for op in &service.operations {
             if !matches!(op.direction, CsilServiceDirection::Bidirectional) {
                 continue;
@@ -1055,7 +1034,9 @@ fn first_channel_example(
             let mut used = BTreeSet::new();
             let outbound_sample = python_sample(spec, &op.output_type, &mut used);
             return Some(ChannelExample {
-                service_wire: base.to_lowercase(),
+                // The $hello / Event service string is the CSIL service rule name
+                // verbatim, matching what the generated client and routers use.
+                service_wire: rule.name.clone(),
                 route_fn: format!("route_{snake}_channel"),
                 handler_class: format!("{service_class}Handlers"),
                 encode_fn: format!("encode_{snake}_{}", op.name.to_case(Case::Snake)),
@@ -2415,9 +2396,10 @@ impl PythonGenerator {
         out.push_str(&format!("class {transport}(Protocol):\n"));
         out.push_str(
             "    \"\"\"Caller-supplied byte carrier. It performs the call named by\n\
-             \x20   (service, method) with the already-encoded request bytes and returns the\n\
-             \x20   response bytes, or raises ServiceError. The generated client owns\n\
-             \x20   (de)serialization; the carrier only moves bytes.\n\
+             \x20   (service, method) — the verbatim CSIL service and operation names, ready\n\
+             \x20   to go on the wire unmodified — with the already-encoded request bytes and\n\
+             \x20   returns the response bytes, or raises ServiceError. The generated client\n\
+             \x20   owns (de)serialization; the carrier only moves bytes.\n\
              \x20   \"\"\"\n",
         );
         // An `async def` seam annotated `-> bytes` is a coroutine the client
@@ -2469,7 +2451,10 @@ impl PythonGenerator {
             .unwrap_or(&service_class);
         let client_class = shape.client_class_name(base);
         let transport = shape.transport_name();
-        let wire_service = base.to_lowercase();
+        // The wire service is the CSIL service rule name verbatim (no lowercasing,
+        // no Service-suffix stripping) so a transport can put it on the CSIL-RPC
+        // envelope unmodified (docs/cbor-wire-contract.md "RPC call naming").
+        let wire_service = name;
 
         let mut out = String::new();
         out.push_str(&format!("class {client_class}:\n"));
@@ -2502,8 +2487,8 @@ impl PythonGenerator {
             let null_input = is_null_input(&op.input_type);
             let resp_record = is_record_ref(&success, records);
             let req_record_or_null = null_input || is_record_ref(&op.input_type, records);
-            let req_ok =
-                req_record_or_null || py_op_boundary_expressible(&op.input_type, records, aliases, unions);
+            let req_ok = req_record_or_null
+                || py_op_boundary_expressible(&op.input_type, records, aliases, unions);
             let resp_ok = py_op_boundary_expressible(&success, records, aliases, unions);
             // A non-record/non-null boundary on either side needs the per-op helpers.
             let needs_helpers = !req_record_or_null || !resp_record;
@@ -2516,10 +2501,10 @@ impl PythonGenerator {
                 continue;
             }
             let method_name = op.name.to_case(Case::Snake);
-            // The wire method must agree byte-for-byte with the other language
-            // clients, which all PascalCase the op name with the same simple
-            // rule — convert_case would diverge on acronyms, so avoid it here.
-            let wire_method = wire_method_name(&op.name);
+            // The wire op is the CSIL operation name verbatim (kebab-case as
+            // written) so every language client reaches the same endpoint and the
+            // transport never has to reverse a lossy case transform.
+            let wire_method = &op.name;
             // A `null`-input op carries no request body, so the method takes no `req`
             // parameter and sends empty bytes as the payload.
             let has_input = !is_null_input(&op.input_type);
@@ -2754,7 +2739,9 @@ impl PythonGenerator {
                 out.push_str("    raise ServiceError(404, f\"unknown channel {method}\")\n\n");
             } else {
                 for op in &bidi_ops {
-                    let wire = Self::wire_method(&op.name);
+                    // The verbose-profile wire key is the CSIL operation name
+                    // verbatim (docs/cbor-wire-contract.md "RPC call naming").
+                    let wire = &op.name;
                     let method_name = op.name.to_case(Case::Snake);
                     out.push_str(&format!("    if method == \"{wire}\":\n"));
                     // A `null`-input channel op carries no body to decode, so the
@@ -2820,7 +2807,9 @@ impl PythonGenerator {
                 }
                 let method_name = op.name.to_case(Case::Snake);
                 let output_type = self.map_type_expression(&op.output_type)?;
-                let wire = Self::wire_method(&op.name);
+                // The event name pushed on the verbose wire is the CSIL operation
+                // name verbatim, matching what the routers key on.
+                let wire = &op.name;
                 let fn_name = format!("encode_{}_{}", name.to_case(Case::Snake), method_name);
                 out.push_str(&format!(
                     "def {fn_name}(codec: Codec, msg: {output_type}) -> Tuple[str, bytes]:\n"
@@ -2835,24 +2824,6 @@ impl PythonGenerator {
         }
 
         Ok(out)
-    }
-
-    /// PascalCase wire method name — same convention as TS/Rust/Go so a CBOR
-    /// or JSON frame keyed by method is routable across all generated targets.
-    fn wire_method(s: &str) -> String {
-        let mut out = String::new();
-        let mut cap = true;
-        for ch in s.chars() {
-            if ch == '-' || ch == '_' {
-                cap = true;
-            } else if cap {
-                out.push(ch.to_ascii_uppercase());
-                cap = false;
-            } else {
-                out.push(ch);
-            }
-        }
-        out
     }
 
     fn map_type_expression(&self, type_expr: &CsilTypeExpression) -> Result<String> {
@@ -3176,7 +3147,11 @@ fn op_codec_stem(service_name: &str, op_name: &str) -> String {
         .strip_suffix("Service")
         .filter(|s| !s.is_empty())
         .unwrap_or(&service_class);
-    format!("{}_{}", base.to_case(Case::Snake), op_name.to_case(Case::Snake))
+    format!(
+        "{}_{}",
+        base.to_case(Case::Snake),
+        op_name.to_case(Case::Snake)
+    )
 }
 
 /// One `encode_<helper>`/`decode_<helper>` byte-level pair built over the same value
@@ -3189,9 +3164,10 @@ fn emit_op_codec_pair(
     records: &HashSet<String>,
     aliases: &HashMap<String, CsilTypeExpression>,
     unions: &HashSet<String>,
+    enums: &HashSet<String>,
 ) -> String {
     let enc = py_enc_value(ty, "csil_value", records, aliases, unions);
-    let dec = py_dec_value(ty, "csil_tree", records, aliases, unions);
+    let dec = py_dec_value(ty, "csil_tree", records, aliases, unions, enums);
     format!(
         "def encode_{helper}(csil_value) -> bytes:\n    return cbor_encode({enc})\n\n\n\
          def decode_{helper}(data: bytes):\n    csil_tree = cbor_decode(data)\n    return {dec}\n\n\n"
@@ -3207,6 +3183,7 @@ fn emit_op_codecs(
     records: &HashSet<String>,
     aliases: &HashMap<String, CsilTypeExpression>,
     unions: &HashSet<String>,
+    enums: &HashSet<String>,
 ) -> String {
     let mut out = String::new();
     for rule in &spec.rules {
@@ -3232,6 +3209,7 @@ fn emit_op_codecs(
                     records,
                     aliases,
                     unions,
+                    enums,
                 ));
             }
             if !is_record_ref(&success, records) {
@@ -3241,6 +3219,7 @@ fn emit_op_codecs(
                     records,
                     aliases,
                     unions,
+                    enums,
                 ));
             }
         }
@@ -3410,64 +3389,99 @@ fn py_enc_value(
             }
             format!("[{}]", parts.join(", "))
         }
+        // A literal-typed union variant re-emits its own declared value rather than
+        // the passed-in expression, so the wire byte is the canonical literal even
+        // if a caller somehow got here with something merely `==`-equal to it.
+        CsilTypeExpression::Literal(lit) => csil_literal_to_python_str(lit),
+        // An inline (anonymous) choice — a record field, array element, map value,
+        // or tuple element typed directly as `a / b / c` rather than through a
+        // named rule — gets exactly the wire shape a reference to an equivalent
+        // named choice would: an all-literal choice is an enum (bare identity
+        // wire, matching a named enum's encode), and a choice with at least one
+        // non-literal arm is a union (tagged sum via the generic
+        // `_csil_encode_choice` runtime helper, built from the same
+        // classification `emit_union_codec` uses for a named union).
+        CsilTypeExpression::Choice(choices) => {
+            if all_literal(choices) {
+                expr.to_string()
+            } else {
+                py_choice_enc_call(choices, expr, records, aliases, unions)
+            }
+        }
         // An opaque value is carried as its value tree.
         _ => expr.to_string(),
     }
 }
 
 /// A Python expression reconstructing the typed value from `expr` (a CBOR value tree
-/// node). The inverse of `py_enc_value`.
+/// node), validating the tree node's runtime type against the CSIL declaration at
+/// every step — the decode inverse of `py_enc_value`, but never trusting. `unions`
+/// covers payload-carrying choices (`_decode_<suffix>_value` returns `[idx, value]`
+/// reconstructed); `enums` covers all-literal choices (`_decode_<suffix>_value`
+/// validates the bare scalar against the literal set). A CBOR value whose major type
+/// doesn't match raises `CsilDecodeError` (see `_csil_expect_*` in
+/// `CBOR_RUNTIME_PYTHON`) rather than silently handing back a mistyped Python value —
+/// this is the fix for the bytes/text confusion described in
+/// docs/csilgen-requests/python-codec-decode-skips-type-validation.md.
 fn py_dec_value(
     type_expr: &CsilTypeExpression,
     expr: &str,
     records: &HashSet<String>,
     aliases: &HashMap<String, CsilTypeExpression>,
     unions: &HashSet<String>,
+    enums: &HashSet<String>,
 ) -> String {
     match unwrap_constrained(type_expr) {
         CsilTypeExpression::Builtin(name) => match name.as_str() {
             "timestamp" => format!("_csil_ts_from_tree({expr})"),
             "decimal" => format!("_csil_decimal_from_tree({expr})"),
             "null" | "nil" | "undefined" => "None".to_string(),
+            "int" | "nint" => format!("_csil_expect_int({expr})"),
+            "uint" => format!("_csil_expect_uint({expr})"),
+            "float" | "float16" | "float32" | "float64" | "double" => {
+                format!("_csil_expect_float({expr})")
+            }
+            "bool" => format!("_csil_expect_bool({expr})"),
+            "text" | "tstr" => format!("_csil_expect_text({expr})"),
+            "bytes" | "bstr" => format!("_csil_expect_bytes({expr})"),
+            // "any" (and any other opaque builtin) carries the value tree through
+            // unchecked by design — there is no declared shape to validate against.
             _ => expr.to_string(),
         },
         CsilTypeExpression::Reference(name) => {
             let suffix = record_suffix(name);
-            if records.contains(&suffix) || unions.contains(&suffix) {
+            if records.contains(&suffix) || unions.contains(&suffix) || enums.contains(&suffix) {
                 format!("_decode_{suffix}_value({expr})")
             } else if let Some(underlying) = aliases.get(&suffix) {
                 // The inverse of the encode: resolve a transparent alias to its
                 // underlying type so a map/array-of-record alias reconstructs the
                 // record rather than leaving raw value-tree dicts in place.
-                py_dec_value(underlying, expr, records, aliases, unions)
+                py_dec_value(underlying, expr, records, aliases, unions, enums)
             } else {
                 expr.to_string()
             }
         }
+        // Every element is re-validated against `element_type`, so a wrong-typed
+        // element (e.g. one text entry in a `[* bytes]` array) is rejected even
+        // though the array's own shape (a CBOR array at all) is checked too.
         CsilTypeExpression::Array { element_type, .. } => {
-            if is_identity_type(element_type, records, aliases) {
-                expr.to_string()
-            } else {
-                let inner = py_dec_value(element_type, "csil_e", records, aliases, unions);
-                format!("[{inner} for csil_e in {expr}]")
-            }
+            let inner = py_dec_value(element_type, "csil_e", records, aliases, unions, enums);
+            format!("[{inner} for csil_e in _csil_expect_array({expr})]")
         }
         CsilTypeExpression::Map { key, value, .. } => {
-            if is_identity_type(key, records, aliases) && is_identity_type(value, records, aliases)
-            {
-                expr.to_string()
-            } else {
-                let dk = py_dec_value(key, "csil_k", records, aliases, unions);
-                let dv = py_dec_value(value, "csil_v", records, aliases, unions);
-                format!("{{{dk}: {dv} for csil_k, csil_v in {expr}.items()}}")
-            }
+            let dk = py_dec_value(key, "csil_k", records, aliases, unions, enums);
+            let dv = py_dec_value(value, "csil_v", records, aliases, unions, enums);
+            format!("{{{dk}: {dv} for csil_k, csil_v in _csil_expect_map({expr}).items()}}")
         }
-        // Reconstruct a fixed-shape tuple positionally from the decoded array.
+        // Reconstruct a fixed-shape tuple positionally from the decoded array, after
+        // confirming it actually is an array of the declared arity.
         CsilTypeExpression::Tuple(group) => {
+            let arity = group.entries.len();
+            let checked = format!("_csil_expect_tuple_array({expr}, {arity})");
             let mut parts = Vec::with_capacity(group.entries.len());
             for (i, entry) in group.entries.iter().enumerate() {
-                let elem = format!("{expr}[{i}]");
-                let dec = py_dec_value(&entry.value_type, &elem, records, aliases, unions);
+                let elem = format!("{checked}[{i}]");
+                let dec = py_dec_value(&entry.value_type, &elem, records, aliases, unions, enums);
                 if matches!(entry.occurrence, Some(CsilOccurrence::Optional)) {
                     parts.push(format!("(None if {elem} is None else {dec})"));
                 } else {
@@ -3478,8 +3492,127 @@ fn py_dec_value(
             let trailing = if parts.len() == 1 { "," } else { "" };
             format!("({}{trailing})", parts.join(", "))
         }
+        // A literal-typed union variant carries no shape of its own on the wire —
+        // the variant index already selects it — so decode only needs to confirm
+        // the payload actually equals the declared literal (`_csil_expect_literal`)
+        // rather than silently trusting whatever value arrived at this index.
+        CsilTypeExpression::Literal(lit) => format!(
+            "_csil_expect_literal({expr}, {})",
+            csil_literal_to_python_str(lit)
+        ),
+        // An inline choice decodes exactly like a reference to an equivalent named
+        // choice would (see the matching arm in `py_enc_value`): an all-literal
+        // choice validates the CBOR major type and declared-member membership
+        // (`_csil_decode_enum`, matching a named enum's `_decode_<suffix>_value`),
+        // and a mixed choice reads the tagged-sum `[variant_index, value]` and
+        // dispatches on the index (`_csil_decode_choice`, matching a named
+        // union's `_decode_<suffix>_value`). `all_literal` (not a uniform-kind
+        // check) decides the split, per THE contract: a mixed-kind literal
+        // vocabulary (`"pending" / "shipped" / 0 / 1`) is still an enum.
+        CsilTypeExpression::Choice(choices) => {
+            if all_literal(choices) {
+                let literals: Vec<&CsilLiteralValue> =
+                    choices.iter().filter_map(choice_arm_literal).collect();
+                let expect_fn = uniform_enum_expect_fn(&literals);
+                let members: Vec<String> = literals
+                    .iter()
+                    .map(|lit| csil_literal_to_python_str(lit))
+                    .collect();
+                let trailing = if members.len() == 1 { "," } else { "" };
+                format!(
+                    "_csil_decode_enum({expr}, ({}{trailing}), {expect_fn})",
+                    members.join(", ")
+                )
+            } else {
+                py_choice_dec_call(choices, expr, records, aliases, unions, enums)
+            }
+        }
         _ => expr.to_string(),
     }
+}
+
+/// An encode expression for an inline (mixed, non-enum) choice: a call to the
+/// generic `_csil_encode_choice` runtime helper, fed the same literal-first,
+/// type-grouped classification `emit_union_codec` builds into a named union's
+/// own top-level `_encode_<u>_value` function. An inline choice has no declared
+/// name to hang such a function off of, so the grouped arm data is built at the
+/// call site as a Python list-of-tuples literal instead.
+fn py_choice_enc_call(
+    choices: &[CsilTypeExpression],
+    expr: &str,
+    records: &HashSet<String>,
+    aliases: &HashMap<String, CsilTypeExpression>,
+    unions: &HashSet<String>,
+) -> String {
+    let mut type_order: Vec<String> = Vec::new();
+    let mut groups: HashMap<String, Vec<usize>> = HashMap::new();
+    for (i, variant) in choices.iter().enumerate() {
+        let ty = py_isinstance_type(variant, records);
+        let entry = groups.entry(ty.clone()).or_default();
+        if entry.is_empty() {
+            type_order.push(ty.clone());
+        }
+        entry.push(i);
+    }
+    // `bool` must be tested before `int` (Python's `bool` is an `int` subclass).
+    type_order.sort_by_key(|ty| usize::from(ty != "bool"));
+
+    let mut group_reprs = Vec::with_capacity(type_order.len());
+    for ty in &type_order {
+        let idxs = &groups[ty];
+        // Literal arms are listed first (their own declared index, checked by
+        // equality ahead of the general arm — the same literal-first precedence
+        // `emit_union_codec` applies), with the general arm — if present —
+        // trailing as the fallback for every other value of this shared type.
+        let mut arm_reprs = Vec::new();
+        let mut general_idx = None;
+        for &i in idxs {
+            if let Some(lit) = choice_arm_literal(&choices[i]) {
+                let lit_value = csil_literal_to_python_str(lit);
+                let enc = py_enc_value(&choices[i], "csil_x", records, aliases, unions);
+                arm_reprs.push(format!("({lit_value}, {i}, lambda csil_x: {enc})"));
+            } else if general_idx.is_none() {
+                // Two non-literal arms can share one Python `isinstance` group (e.g.
+                // two `Reference` arms that both decode to a `dict`); declaration
+                // order is CSIL's tie-break contract, so the FIRST general arm must
+                // win. This used to unconditionally overwrite `general_idx` on every
+                // non-literal arm, so the LAST one silently won and the first became
+                // unreachable dead code.
+                general_idx = Some(i);
+            }
+        }
+        if let Some(gi) = general_idx {
+            let enc = py_enc_value(&choices[gi], "csil_x", records, aliases, unions);
+            arm_reprs.push(format!(
+                "(_CSIL_CHOICE_GENERAL, {gi}, lambda csil_x: {enc})"
+            ));
+        }
+        group_reprs.push(format!("({ty}, [{}])", arm_reprs.join(", ")));
+    }
+    format!("_csil_encode_choice({expr}, [{}])", group_reprs.join(", "))
+}
+
+/// A decode expression for an inline (mixed, non-enum) choice: a call to the
+/// generic `_csil_decode_choice` runtime helper, fed a `{index: decode_fn}` map
+/// built the same way a named union's own `_decode_<u>_value` dispatches on the
+/// tagged-sum index.
+fn py_choice_dec_call(
+    choices: &[CsilTypeExpression],
+    expr: &str,
+    records: &HashSet<String>,
+    aliases: &HashMap<String, CsilTypeExpression>,
+    unions: &HashSet<String>,
+    enums: &HashSet<String>,
+) -> String {
+    let entries: Vec<String> = choices
+        .iter()
+        .enumerate()
+        .map(|(i, variant)| {
+            let dec = py_dec_value(variant, "csil_x", records, aliases, unions, enums);
+            format!("{i}: (lambda csil_x: {dec})")
+        })
+        .collect();
+    format!("_csil_decode_choice({expr}, {{{}}})", entries.join(", "))
 }
 
 /// One codec field: its dataclass attribute name, the verbatim wire key, the
@@ -3520,6 +3653,7 @@ fn emit_record_codec(
     records: &HashSet<String>,
     aliases: &HashMap<String, CsilTypeExpression>,
     unions: &HashSet<String>,
+    enums: &HashSet<String>,
 ) -> String {
     let class_name = name.to_case(Case::Pascal);
     let suffix = record_suffix(name);
@@ -3554,9 +3688,13 @@ fn emit_record_codec(
     out.push_str("    return csil_m\n\n");
 
     // Decoder: read by wire key in declaration order, then construct the dataclass.
+    // The tree must be a CBOR map before any field lookup makes sense — a wrong
+    // top-level shape (e.g. a nested record supplied as an int on the wire) fails
+    // clearly here rather than as an opaque `TypeError` from a raw `tree["field"]`.
     out.push_str(&format!(
         "def _decode_{suffix}_value(tree: Any) -> \"{class_name}\":\n"
     ));
+    out.push_str("    tree = _csil_expect_map(tree)\n");
     if fields.is_empty() {
         out.push_str(&format!("    return {class_name}()\n\n\n"));
     } else {
@@ -3570,6 +3708,7 @@ fn emit_record_codec(
                     records,
                     aliases,
                     unions,
+                    enums,
                 );
                 out.push_str(&format!(
                     "        {}=(None if tree.get(\"{}\") is None else {dec}),\n",
@@ -3582,6 +3721,7 @@ fn emit_record_codec(
                     records,
                     aliases,
                     unions,
+                    enums,
                 );
                 out.push_str(&format!("        {}={dec},\n", field.attr));
             }
@@ -3627,6 +3767,46 @@ fn codec_aliases(spec: &CsilSpecSerialized) -> HashMap<String, CsilTypeExpressio
         .collect()
 }
 
+/// The `_csil_expect_*` runtime validator ONE literal's CBOR-scalar kind gates
+/// decode through, if that kind has its own dedicated validator. `_csil_expect_
+/// enum_scalar` (the generic fallback) covers everything else: a `Bytes`/`Null`/
+/// `Array` literal, or — via `uniform_enum_expect_fn` below — a vocabulary that
+/// mixes kinds.
+fn literal_expect_kind(lit: &CsilLiteralValue) -> &'static str {
+    match lit {
+        CsilLiteralValue::Text(_) => "_csil_expect_text",
+        CsilLiteralValue::Integer(_) => "_csil_expect_int",
+        CsilLiteralValue::Float(_) => "_csil_expect_float",
+        CsilLiteralValue::Bool(_) => "_csil_expect_bool",
+        _ => "_csil_expect_enum_scalar",
+    }
+}
+
+/// The `_csil_expect_*` runtime validator an all-literal choice's decode routes
+/// through before the `_csil_decode_enum` membership check. THE contract
+/// (`csilgen_common::classify_choice`) says a choice where every arm is a
+/// literal is an `Enum` regardless of whether the arms share one kind —
+/// `"pending" / "shipped" / 0 / 1` is as much an enum as a uniform one — so this
+/// only picks the *validator*, never the enum/union classification, and it is
+/// only ever called once the caller has already confirmed `all_literal(choices)`.
+/// When every literal shares one CBOR-scalar kind, that kind's dedicated
+/// `_csil_expect_*` gate is used (matching the Go generator's
+/// `enum_scalar_builtin`); when the vocabulary mixes kinds, decode falls back to
+/// the generic `_csil_expect_enum_scalar` gate, and the membership check right
+/// after does the real per-member validation — a single hardcoded scalar gate
+/// would otherwise reject every value of a declared kind other than the first,
+/// which is the bug this function exists to avoid (previously the whole choice
+/// was misclassified as a union whenever its literals were not all one kind).
+fn uniform_enum_expect_fn(literals: &[&CsilLiteralValue]) -> &'static str {
+    let mut kinds = literals.iter().map(|lit| literal_expect_kind(lit));
+    let first = kinds.next().unwrap_or("_csil_expect_enum_scalar");
+    if kinds.all(|k| k == first) {
+        first
+    } else {
+        "_csil_expect_enum_scalar"
+    }
+}
+
 /// Named non-literal type-choices (unions) and their variant types, in declaration
 /// order. Literal-only choices are enums (encoded bare); a choice with a `null`
 /// variant is an optional. Both are excluded.
@@ -3639,16 +3819,47 @@ fn python_union_defs(spec: &CsilSpecSerialized) -> Vec<(String, Vec<CsilTypeExpr
                 CsilRuleType::TypeDef(CsilTypeExpression::Choice(c)) => c,
                 _ => return None,
             };
-            let all_literal = choices
-                .iter()
-                .all(|c| matches!(c, CsilTypeExpression::Literal(_)));
             let has_null = choices
                 .iter()
-                .any(|c| matches!(c, CsilTypeExpression::Literal(CsilLiteralValue::Null)));
-            if all_literal || has_null {
+                .any(|c| matches!(choice_arm_literal(c), Some(CsilLiteralValue::Null)));
+            if all_literal(choices) || has_null {
                 return None;
             }
             Some((record_suffix(&rule.name), choices.clone()))
+        })
+        .collect()
+}
+
+/// Named type-choice rules that are *enums*: every variant a literal, of any kind
+/// or mix of kinds (`all_literal`, THE contract in `csilgen_common::classify_choice`
+/// — not gated on kind uniformity the way this used to be). The wire value is the
+/// bare literal itself, so decode only needs to confirm CBOR-scalar shape and
+/// membership in the declared set (`uniform_enum_expect_fn` picks the validator).
+/// A choice with a non-literal variant is a union instead, handled by
+/// `python_union_defs`. Previously a mixed-kind literal choice (`"pending" /
+/// "shipped" / 0 / 1`) fell into neither list — not a union (it has no non-literal
+/// arm) and not an enum (its literals weren't all-text or all-int) — so a
+/// `Reference` to it resolved through no codec at all: encode happened to still be
+/// correct by accident (identity passthrough), but decode silently skipped
+/// membership validation entirely, accepting any out-of-vocabulary value of a
+/// declared kind.
+fn python_enum_defs(spec: &CsilSpecSerialized) -> Vec<(String, Vec<CsilLiteralValue>)> {
+    spec.rules
+        .iter()
+        .filter_map(|rule| {
+            let choices = match &rule.rule_type {
+                CsilRuleType::TypeChoice(c) => c,
+                CsilRuleType::TypeDef(CsilTypeExpression::Choice(c)) => c,
+                _ => return None,
+            };
+            if choices.is_empty() || !all_literal(choices) {
+                return None;
+            }
+            let lits: Vec<CsilLiteralValue> = choices
+                .iter()
+                .filter_map(|c| choice_arm_literal(c).cloned())
+                .collect();
+            Some((record_suffix(&rule.name), lits))
         })
         .collect()
 }
@@ -3672,35 +3883,104 @@ fn py_isinstance_type(variant: &CsilTypeExpression, records: &HashSet<String>) -
         }
         CsilTypeExpression::Array { .. } => "list".to_string(),
         CsilTypeExpression::Map { .. } => "dict".to_string(),
+        // A literal arm (`"pending"`) dispatches on its underlying scalar's Python
+        // type, not `object` — otherwise it groups apart from the general arm of
+        // the same base type (`text`) instead of sharing its `isinstance` clause,
+        // which is what lets the literal-first/general-fallback ordering apply.
+        CsilTypeExpression::Literal(lit) => match lit {
+            CsilLiteralValue::Bool(_) => "bool".to_string(),
+            CsilLiteralValue::Integer(_) => "int".to_string(),
+            CsilLiteralValue::Float(_) => "float".to_string(),
+            CsilLiteralValue::Text(_) => "str".to_string(),
+            CsilLiteralValue::Bytes(_) => "(bytes, bytearray)".to_string(),
+            CsilLiteralValue::Null | CsilLiteralValue::Array(_) => "object".to_string(),
+        },
         _ => "object".to_string(),
     }
 }
 
 /// Emit the tagged-sum codec helpers for a union: `_encode_<u>_value` dispatches on
 /// the Python runtime type to find the variant index and emits `[index, value]`;
-/// `_decode_<u>_value` reads the index and reconstructs that variant. `bool` is
-/// checked before `int` (Python's `bool` is an `int` subclass).
+/// `_decode_<u>_value` reads the index and reconstructs that variant.
 fn emit_union_codec(
     name: &str,
     variants: &[CsilTypeExpression],
     records: &HashSet<String>,
     aliases: &HashMap<String, CsilTypeExpression>,
     unions: &HashSet<String>,
+    enums: &HashSet<String>,
 ) -> String {
     let suffix = record_suffix(name);
     let mut out = String::new();
 
-    // Order so a `bool` variant is tested before any `int` variant.
-    let mut order: Vec<usize> = (0..variants.len()).collect();
-    order.sort_by_key(|&i| usize::from(py_isinstance_type(&variants[i], records) != "bool"));
+    // A mixed union (`text / "pending" / "confirmed" / ...`) has a general arm and
+    // several literal arms that all dispatch on the same Python `isinstance` type
+    // (`str`); grouping by that type — mirroring the Go generator's type-switch
+    // grouping — lets literal arms be checked by value ahead of the general arm
+    // within their shared type, instead of the general arm's `isinstance` shadowing
+    // every literal that would otherwise be unreachable.
+    let mut type_order: Vec<String> = Vec::new();
+    let mut groups: HashMap<String, Vec<usize>> = HashMap::new();
+    for (i, variant) in variants.iter().enumerate() {
+        let ty = py_isinstance_type(variant, records);
+        let entry = groups.entry(ty.clone()).or_default();
+        if entry.is_empty() {
+            type_order.push(ty.clone());
+        }
+        entry.push(i);
+    }
+    // `bool` must be tested before `int` (Python's `bool` is an `int` subclass).
+    type_order.sort_by_key(|ty| usize::from(ty != "bool"));
 
     out.push_str(&format!("def _encode_{suffix}_value(csil_v):\n"));
-    for &i in &order {
-        let ty = py_isinstance_type(&variants[i], records);
-        let enc = py_enc_value(&variants[i], "csil_v", records, aliases, unions);
-        out.push_str(&format!(
-            "    if isinstance(csil_v, {ty}):\n        return [{i}, {enc}]\n"
-        ));
+    for ty in &type_order {
+        let idxs = &groups[ty];
+        if idxs.len() == 1 {
+            let i = idxs[0];
+            let enc = py_enc_value(&variants[i], "csil_v", records, aliases, unions);
+            out.push_str(&format!(
+                "    if isinstance(csil_v, {ty}):\n        return [{i}, {enc}]\n"
+            ));
+            continue;
+        }
+        // Within one shared type, a literal arm (e.g. `"pending"`) is more specific
+        // than the general arm (e.g. `text`) and wins on value collision: literals
+        // are checked first by equality and keep their own declared index, and the
+        // general arm — if present — is the fallback for every other value of that
+        // type.
+        let mut literal_idxs = Vec::new();
+        let mut general_idx = None;
+        for &i in idxs {
+            if choice_arm_literal(&variants[i]).is_some() {
+                literal_idxs.push(i);
+            } else if general_idx.is_none() {
+                // Two non-literal variants can share one `isinstance` type group
+                // (e.g. two `Reference` variants both routing through the same
+                // record class); declaration order is CSIL's tie-break contract, so
+                // the FIRST general variant must win. This used to unconditionally
+                // overwrite `general_idx` on every non-literal variant, so the LAST
+                // one silently won and the first became unreachable dead code.
+                general_idx = Some(i);
+            }
+        }
+        out.push_str(&format!("    if isinstance(csil_v, {ty}):\n"));
+        for i in literal_idxs {
+            let lit = choice_arm_literal(&variants[i])
+                .expect("filtered to literal-carrying variants above");
+            let lit_value = csil_literal_to_python_str(lit);
+            let enc = py_enc_value(&variants[i], "csil_v", records, aliases, unions);
+            out.push_str(&format!(
+                "        if csil_v == {lit_value}:\n            return [{i}, {enc}]\n"
+            ));
+        }
+        // No general arm to fall back to (e.g. every literal in this type group is
+        // covered but the value matched none of them): fall out of the `isinstance`
+        // block to the shared "no variant matched" error below, rather than
+        // inventing a new failure mode.
+        if let Some(gi) = general_idx {
+            let enc = py_enc_value(&variants[gi], "csil_v", records, aliases, unions);
+            out.push_str(&format!("        return [{gi}, {enc}]\n"));
+        }
     }
     out.push_str(&format!(
         "    raise ValueError(\"csil cbor: value does not match any {name} variant\")\n\n\n"
@@ -3709,16 +3989,45 @@ fn emit_union_codec(
     out.push_str(&format!("def _decode_{suffix}_value(csil_tree):\n"));
     out.push_str("    if not isinstance(csil_tree, (list, tuple)) or len(csil_tree) != 2:\n");
     out.push_str(&format!(
-        "        raise ValueError(\"csil cbor: {name} union expects a 2-element array\")\n"
+        "        raise CsilDecodeError(\"csil cbor: {name} union expects a 2-element array\")\n"
     ));
     out.push_str("    csil_idx = csil_tree[0]\n    csil_val = csil_tree[1]\n");
     for (i, variant) in variants.iter().enumerate() {
-        let dec = py_dec_value(variant, "csil_val", records, aliases, unions);
+        let dec = py_dec_value(variant, "csil_val", records, aliases, unions, enums);
         out.push_str(&format!("    if csil_idx == {i}:\n        return {dec}\n"));
     }
     out.push_str(&format!(
-        "    raise ValueError(\"csil cbor: unknown {name} variant\")\n\n\n"
+        "    raise CsilDecodeError(\"csil cbor: unknown {name} variant\")\n\n\n"
     ));
+    out
+}
+
+/// Emit the bare-literal codec helpers for an enum: `_encode_<e>_value` is the
+/// identity (a validated literal already is its own CBOR value); `_decode_<e>_value`
+/// gates the CBOR-scalar shape (`uniform_enum_expect_fn` — a kind-specific gate when
+/// every literal shares one kind, else the generic `_csil_expect_enum_scalar`) and
+/// confirms the value is one of the declared members, matching the Rust generator's
+/// `csil_dec_<enum>`. `literals` may mix kinds (`"pending" / "shipped" / 0 / 1`) —
+/// THE contract treats that the same as a uniform-kind enum, so this must not
+/// assume (and previously did assume) every member is text or every member is int.
+fn emit_enum_codec(name: &str, literals: &[CsilLiteralValue]) -> String {
+    let suffix = record_suffix(name);
+    let literal_refs: Vec<&CsilLiteralValue> = literals.iter().collect();
+    let expect_fn = uniform_enum_expect_fn(&literal_refs);
+    let mut out = String::new();
+
+    out.push_str(&format!("def _decode_{suffix}_value(csil_v):\n"));
+    out.push_str(&format!("    csil_v = {expect_fn}(csil_v)\n"));
+    let members: Vec<String> = literals.iter().map(csil_literal_to_python_str).collect();
+    out.push_str(&format!(
+        "    if csil_v not in ({}{}):\n",
+        members.join(", "),
+        if members.len() == 1 { "," } else { "" }
+    ));
+    out.push_str(&format!(
+        "        raise CsilDecodeError(f\"csil cbor: unknown {name} value {{csil_v!r}}\")\n"
+    ));
+    out.push_str("    return csil_v\n\n\n");
     out
 }
 
@@ -3743,6 +4052,8 @@ fn generate_codec_file(
     let mut needs_tuple = false;
     let union_defs = python_union_defs(spec);
     let unions: HashSet<String> = union_defs.iter().map(|(n, _)| n.clone()).collect();
+    let enum_defs = python_enum_defs(spec);
+    let enums: HashSet<String> = enum_defs.iter().map(|(n, _)| n.clone()).collect();
     let mut body = String::new();
     for rule in &spec.rules {
         let group = match &rule.rule_type {
@@ -3761,7 +4072,7 @@ fn generate_codec_file(
                 );
             }
             body.push_str(&emit_record_codec(
-                &rule.name, group, records, &aliases, &unions,
+                &rule.name, group, records, &aliases, &unions, &enums,
             ));
         }
     }
@@ -3777,8 +4088,13 @@ fn generate_codec_file(
             );
         }
         body.push_str(&emit_union_codec(
-            name, variants, records, &aliases, &unions,
+            name, variants, records, &aliases, &unions, &enums,
         ));
+    }
+    // Bare-literal codec helpers for enums (all-literal type-choices) referenced by
+    // record fields — validates the CBOR major type and declared-member membership.
+    for (name, literals) in &enum_defs {
+        body.push_str(&emit_enum_codec(name, literals));
     }
     // Per-op byte helpers for non-record op boundaries. Their boundary types may pull
     // tagged core types (timestamp/decimal) or tuples no record field uses, so scan
@@ -3812,7 +4128,7 @@ fn generate_codec_file(
             }
         }
     }
-    body.push_str(&emit_op_codecs(spec, records, &aliases, &unions));
+    body.push_str(&emit_op_codecs(spec, records, &aliases, &unions, &enums));
 
     let mut content = String::new();
     content.push_str("# Generated CBOR codec from CSIL specification\n");
@@ -3828,6 +4144,15 @@ fn generate_codec_file(
     // The records are patched in place, so the type classes must be in scope.
     content.push_str("from .types import *\n\n\n");
     content.push_str(CBOR_RUNTIME_PYTHON);
+    // The mixed-kind enum gate rides outside the fixed runtime and is emitted only
+    // when some generated decode actually calls it (the same emitted-code-driven
+    // gating `needs_datetime`/`needs_decimal` apply to imports), so a spec with no
+    // mixed-kind literal choice keeps its codec byte-identical to before the
+    // mixed-kind fix existed.
+    if body.contains("_csil_expect_enum_scalar") {
+        content.push_str("\n\n");
+        content.push_str(ENUM_SCALAR_GATE_PYTHON);
+    }
     content.push_str("\n\n");
     content.push_str(body.trim_end());
     content.push('\n');
@@ -3992,6 +4317,153 @@ def cbor_decode(data: bytes) -> Any:
     return value
 
 
+class CsilDecodeError(ValueError):
+    """A decoded CBOR value's major type does not match its CSIL-declared type.
+
+    Subclasses ValueError so existing `except ValueError` call sites still
+    catch it; the distinct type lets a caller narrow on schema violations.
+    """
+
+
+# The value-tree type-check gate every scalar field decode passes through: the
+# tree already parsed the CBOR major type (bytes/str/int/float/bool/None/list/
+# dict/CborTag), so these only need to confirm the declared CSIL type matches
+# before the value is trusted by the generated dataclass — matching the Rust
+# generator's `cbor_as_*` strictness (e.g. `cbor_as_bytes` rejects Text).
+def _csil_expect_int(v: Any) -> int:
+    # bool is an int subclass in Python, so it is rejected explicitly here —
+    # CSIL's bool and int/nint are distinct wire types (CBOR major 7 vs 0/1).
+    if isinstance(v, bool) or not isinstance(v, int):
+        raise CsilDecodeError(f"csil cbor: expected int, got {type(v).__name__}")
+    return v
+
+
+def _csil_expect_uint(v: Any) -> int:
+    if isinstance(v, bool) or not isinstance(v, int) or v < 0:
+        raise CsilDecodeError(f"csil cbor: expected uint, got {type(v).__name__}")
+    return v
+
+
+def _csil_expect_float(v: Any) -> float:
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        raise CsilDecodeError(f"csil cbor: expected float, got {type(v).__name__}")
+    return float(v)
+
+
+def _csil_expect_bool(v: Any) -> bool:
+    if not isinstance(v, bool):
+        raise CsilDecodeError(f"csil cbor: expected bool, got {type(v).__name__}")
+    return v
+
+
+def _csil_expect_text(v: Any) -> str:
+    if not isinstance(v, str):
+        raise CsilDecodeError(f"csil cbor: expected text, got {type(v).__name__}")
+    return v
+
+
+def _csil_expect_bytes(v: Any) -> bytes:
+    if not isinstance(v, (bytes, bytearray)):
+        raise CsilDecodeError(f"csil cbor: expected bytes, got {type(v).__name__}")
+    return bytes(v)
+
+
+def _csil_expect_array(v: Any) -> list:
+    if not isinstance(v, list):
+        raise CsilDecodeError(f"csil cbor: expected array, got {type(v).__name__}")
+    return v
+
+
+def _csil_expect_map(v: Any) -> dict:
+    if not isinstance(v, dict):
+        raise CsilDecodeError(f"csil cbor: expected map, got {type(v).__name__}")
+    return v
+
+
+def _csil_expect_tuple_array(v: Any, arity: int) -> list:
+    arr = _csil_expect_array(v)
+    if len(arr) != arity:
+        raise CsilDecodeError(
+            f"csil cbor: expected {arity}-element tuple, got {len(arr)} elements"
+        )
+    return arr
+
+
+def _csil_expect_tag(v: Any, tag: int) -> Any:
+    if not isinstance(v, CborTag) or v.tag != tag:
+        raise CsilDecodeError(f"csil cbor: expected CBOR tag {tag}")
+    return v.value
+
+
+# A literal-typed union variant (e.g. `"pending"` in `text / "pending" / ...`) has
+# no CBOR shape of its own to check — its wire value is indistinguishable from its
+# base type's. The variant index already selects which literal was declared, so
+# this only needs to confirm the decoded value actually equals that literal,
+# rejecting a payload that claims an index but carries the wrong value.
+def _csil_expect_literal(v: Any, expected: Any) -> Any:
+    if v != expected:
+        raise CsilDecodeError(f"csil cbor: literal mismatch, expected {expected!r}, got {v!r}")
+    return expected
+
+
+# Marks the "general" (non-literal) arm within one isinstance-type group of an
+# inline choice — see `_csil_encode_choice`. Any distinct object works, since it
+# is only ever compared by identity.
+_CSIL_CHOICE_GENERAL = object()
+
+
+# Encodes an inline (anonymous) choice field — a record field, array element, map
+# value, or tuple element typed directly as `a / b / c` rather than through a
+# named rule — as a tagged sum `[variant_index, value]`. Mirrors a named union's
+# own `_encode_<u>_value`, but built from data supplied at the call site instead
+# of a per-name top-level function (an inline choice has no declared name to hang
+# one off of). `groups` is an ordered list of `(isinstance_type, arms)` pairs,
+# arms grouped by their shared Python runtime type exactly like a named union's
+# own grouping (Go forbids/`isinstance` would double-match on a shared type
+# otherwise); `arms` is an ordered list of `(literal_or_GENERAL, index,
+# encode_fn)` — a literal arm's own declared value is checked first and wins on
+# collision with the general arm, matching the named union's literal-first
+# precedence.
+def _csil_encode_choice(v: Any, groups: Any) -> list:
+    for py_type, arms in groups:
+        if isinstance(v, py_type):
+            general = None
+            for literal, idx, enc in arms:
+                if literal is _CSIL_CHOICE_GENERAL:
+                    general = (idx, enc)
+                    continue
+                if v == literal:
+                    return [idx, enc(v)]
+            if general is not None:
+                idx, enc = general
+                return [idx, enc(v)]
+    raise ValueError("csil cbor: value does not match any choice variant")
+
+
+# Decodes an inline choice's tagged sum `[variant_index, value]`, the decode
+# inverse of `_csil_encode_choice` and the inline mirror of a named union's own
+# `_decode_<u>_value`. `decoders` maps each declared arm's index to its decode
+# function.
+def _csil_decode_choice(tree: Any, decoders: Any) -> Any:
+    if not isinstance(tree, (list, tuple)) or len(tree) != 2:
+        raise CsilDecodeError("csil cbor: choice expects a 2-element array")
+    idx, val = tree[0], tree[1]
+    dec = decoders.get(idx)
+    if dec is None:
+        raise CsilDecodeError(f"csil cbor: unknown choice variant {idx!r}")
+    return dec(val)
+
+
+# Decodes an inline all-literal choice (an enum): validates the CBOR major type
+# via `expect` (one of the `_csil_expect_*` gates above) then confirms membership
+# in the declared literal set, matching a named enum's own `_decode_<e>_value`.
+def _csil_decode_enum(v: Any, members: Any, expect: Any) -> Any:
+    v = expect(v)
+    if v not in members:
+        raise CsilDecodeError(f"csil cbor: unknown value {v!r}")
+    return v
+
+
 def _csil_ts_to_text(dt: Any) -> str:
     # The contract pins tag-0 timestamps to RFC3339 UTC with a `Z` offset.
     text = dt.astimezone(timezone.utc).isoformat()
@@ -3999,7 +4471,11 @@ def _csil_ts_to_text(dt: Any) -> str:
 
 
 def _csil_ts_from_tree(node: Any) -> Any:
-    text = node.value if isinstance(node, CborTag) else node
+    text = _csil_expect_tag(node, 0)
+    if not isinstance(text, str):
+        raise CsilDecodeError(
+            f"csil cbor: timestamp content must be text, got {type(text).__name__}"
+        )
     return datetime.fromisoformat(text.replace("Z", "+00:00"))
 
 
@@ -4015,8 +4491,29 @@ def _csil_decimal_to_pair(d: Any) -> list:
 
 
 def _csil_decimal_from_tree(node: Any) -> Any:
-    exp, mant = node.value
-    return Decimal(mant).scaleb(exp)"#;
+    pair = _csil_expect_tag(node, 4)
+    if not isinstance(pair, list) or len(pair) != 2:
+        raise CsilDecodeError("csil cbor: tag 4 content must be [exponent, mantissa]")
+    exponent = _csil_expect_int(pair[0])
+    mantissa = _csil_expect_int(pair[1])
+    return Decimal(mantissa).scaleb(exponent)"#;
+
+/// The `expect` gate `uniform_enum_expect_fn` falls back to for an all-literal
+/// choice whose declared vocabulary mixes CBOR-scalar kinds (`"pending" /
+/// "shipped" / 0 / 1`). Kept out of `CBOR_RUNTIME_PYTHON` and emitted only when
+/// some generated decode references it, so a spec with no mixed-kind enum gets a
+/// codec byte-identical to output from before this gate existed.
+const ENUM_SCALAR_GATE_PYTHON: &str = r#"# The `expect` gate for an all-literal choice whose declared vocabulary mixes CBOR-
+# scalar kinds (e.g. `"pending" / "shipped" / 0 / 1` mixes text and int) — no single
+# `_csil_expect_*` gate covers every declared kind, so this only rejects a value
+# with no scalar shape any literal could hold (an array/map/CBOR-tag); the actual
+# per-member validation happens in the membership check that follows, in
+# `_csil_decode_enum` or a named enum's own `_decode_<e>_value`, which naturally
+# handles a mixed-type members tuple.
+def _csil_expect_enum_scalar(v: Any) -> Any:
+    if isinstance(v, (list, dict, CborTag)):
+        raise CsilDecodeError(f"csil cbor: expected a scalar enum value, got {type(v).__name__}")
+    return v"#;
 
 #[cfg(test)]
 mod tests {
@@ -4253,12 +4750,12 @@ mod tests {
         // Doc comment surfaces as the method docstring.
         assert!(content.contains("\"\"\"Open a play channel.\"\"\""));
 
-        // Router routes inbound by wire-method name (PascalCase, matches
+        // Router routes inbound by the verbatim CSIL operation name (matches
         // TS/Rust/Go so frames are cross-language compatible).
         assert!(content.contains(
             "def route_match_channel(handlers: MatchHandlers, codec: Codec, method: str, data: bytes, ctx: dict) -> None:"
         ));
-        assert!(content.contains("if method == \"Play\":"));
+        assert!(content.contains("if method == \"play\":"));
         assert!(content.contains("msg = codec.decode(data, str)"));
         assert!(content.contains("handlers.play(msg, ctx)"));
         assert!(content.contains("raise ServiceError(404, f\"unknown channel {method}\")"));
@@ -4267,7 +4764,7 @@ mod tests {
         assert!(
             content.contains("def encode_match_play(codec: Codec, msg: str) -> Tuple[str, bytes]:")
         );
-        assert!(content.contains("return (\"Play\", codec.encode(msg))"));
+        assert!(content.contains("return (\"play\", codec.encode(msg))"));
     }
 
     #[test]
@@ -4309,11 +4806,11 @@ mod tests {
         // No inbound method named `notify` on the server side.
         assert!(!content.contains("def notify(self, "));
 
-        // Router still exists for API consistency but has no `Notify` case.
+        // Router still exists for API consistency but has no `notify` case.
         assert!(content.contains("def route_callbacks_channel("));
         let router_start = content.find("def route_callbacks_channel(").unwrap();
         let router_body = &content[router_start..];
-        assert!(!router_body.contains("if method == \"Notify\":"));
+        assert!(!router_body.contains("if method == \"notify\":"));
 
         // The server-pushed encoder is present.
         assert!(
@@ -4321,7 +4818,7 @@ mod tests {
                 "def encode_callbacks_notify(codec: Codec, msg: str) -> Tuple[str, bytes]:"
             )
         );
-        assert!(content.contains("return (\"Notify\", codec.encode(msg))"));
+        assert!(content.contains("return (\"notify\", codec.encode(msg))"));
     }
 
     #[test]
@@ -4716,7 +5213,7 @@ mod tests {
                 .contains("def submit_task(self, req: SubmitTaskRequest) -> SubmitTaskResponse:")
         );
         assert!(client.content.contains(
-            "return SubmitTaskResponse.from_cbor(self._transport.call(\"corndogs\", \"SubmitTask\", req.to_cbor()))"
+            "return SubmitTaskResponse.from_cbor(self._transport.call(\"CorndogsService\", \"SubmitTask\", req.to_cbor()))"
         ));
         // The old object-passing seam must not reappear.
         assert!(!client.content.contains("\"SubmitTask\", req)"));
@@ -4770,7 +5267,7 @@ mod tests {
         ));
         // Only the seam is awaited; the codec `from_cbor` stays synchronous.
         assert!(twin.content.contains(
-            "return SubmitTaskResponse.from_cbor(await self._transport.call(\"corndogs\", \"SubmitTask\", req.to_cbor()))"
+            "return SubmitTaskResponse.from_cbor(await self._transport.call(\"CorndogsService\", \"SubmitTask\", req.to_cbor()))"
         ));
         // The twin must not redefine the sync names that would shadow on import.
         assert!(!twin.content.contains("class Transport(Protocol):"));
@@ -4817,7 +5314,7 @@ mod tests {
             "async def submit_task(self, req: SubmitTaskRequest) -> SubmitTaskResponse:"
         ));
         assert!(client.content.contains(
-            "return SubmitTaskResponse.from_cbor(await self._transport.call(\"corndogs\", \"SubmitTask\", req.to_cbor()))"
+            "return SubmitTaskResponse.from_cbor(await self._transport.call(\"CorndogsService\", \"SubmitTask\", req.to_cbor()))"
         ));
         // No async-marked symbols in drop-in mode.
         assert!(!client.content.contains("AsyncTransport"));
@@ -5970,7 +6467,10 @@ mod tests {
             "def delete_task(self, req: TaskId) -> bool:",
             "def member_names(self, req: ListMembersRequest) -> Dict[str, str]:",
         ] {
-            assert!(client.contains(sig), "missing method `{sig}`, got:\n{client}");
+            assert!(
+                client.contains(sig),
+                "missing method `{sig}`, got:\n{client}"
+            );
         }
         // No op is dropped with a note anymore.
         assert!(
@@ -6039,11 +6539,9 @@ mod tests {
         let result = generate_python_code_from_serialized(&spec, &config).unwrap();
         let client = result.iter().find(|f| f.path == "client.py").unwrap();
         assert!(client.content.contains("def ping(self) -> Pong:"));
-        assert!(
-            client
-                .content
-                .contains("return Pong.from_cbor(self._transport.call(\"ping\", \"Ping\", b\"\"))")
-        );
+        assert!(client.content.contains(
+            "return Pong.from_cbor(self._transport.call(\"PingService\", \"ping\", b\"\"))"
+        ));
     }
 
     fn wire_id_service(service_wire: Option<u64>, op_wire: Option<u64>) -> CsilSpecSerialized {
@@ -6435,12 +6933,10 @@ mod tests {
         // An optional field is conditionally inserted (absent → omitted from the map).
         assert!(codec.contains("if csil_x is not None:"));
         assert!(codec.contains("csil_m[\"priority\"] = csil_x"));
-        // A missing optional decodes to None.
-        assert!(
-            codec.contains(
-                "priority=(None if tree.get(\"priority\") is None else tree[\"priority\"])"
-            )
-        );
+        // A missing optional decodes to None; a present one is still type-checked.
+        assert!(codec.contains(
+            "priority=(None if tree.get(\"priority\") is None else _csil_expect_int(tree[\"priority\"]))"
+        ));
         // `payload` stays a Python `bytes` (scalar identity in the value tree).
         assert!(codec.contains("csil_m[\"payload\"] = v.payload"));
     }
@@ -6550,8 +7046,8 @@ assert back2.task.priority is None
 # Typed client over a loopback carrier: decode the request, encode its task back.
 class Loopback:
     def call(self, service, method, req):
-        assert service == "corndogs"
-        assert method == "SubmitTask"
+        assert service == "CorndogsService"
+        assert method == "submit-task"
         decoded = SubmitTaskRequest.from_cbor(req)
         assert decoded.counts == {"pending": 3, "done": 9}
         assert decoded.by_id["second"].priority == 2
@@ -6564,6 +7060,890 @@ assert result.payload == b"\xde\xad\xbe"
 assert result.priority == 7
 assert result.labels == {"a": 1, "b": 2}
 assert result.tags == ["x", "y"]
+
+print("ok")
+"#;
+
+    /// Torture spec for inline-choice codec coverage: a record field typed as an
+    /// inline MIXED choice whose trailing arm carries a `.default` control
+    /// operator (general `text` arm + literal arms, one Constrained-wrapped —
+    /// the confirmed degraded-to-untyped-bare-text-passthrough bug), a record
+    /// field typed as an inline ALL-LITERAL choice (an enum), a field
+    /// referencing a NAMED MIXED choice matching the task's own illustrative
+    /// example verbatim (`text / "low" / "high" .default "normal"`), and a
+    /// field referencing a NAMED ALL-LITERAL choice with the same
+    /// trailing-`.default` shape. The parser attaches `.default` to the
+    /// immediately preceding literal (`Constrained { base_type: Literal(..),
+    /// .. }`), so classification must strip that wrapper everywhere a choice
+    /// arm's literal-ness is inspected, or the wrapped arm is misclassified as
+    /// a second "general" (non-literal) arm.
+    fn torture_choice_spec() -> CsilSpecSerialized {
+        let text = || CsilTypeExpression::Builtin("text".to_string());
+        let lit = |s: &str| CsilTypeExpression::Literal(CsilLiteralValue::Text(s.to_string()));
+        let default_lit = |s: &str, default: &str| CsilTypeExpression::Constrained {
+            base_type: Box::new(lit(s)),
+            constraints: vec![CsilControlOperator::Default(CsilLiteralValue::Text(
+                default.to_string(),
+            ))],
+        };
+        // `Grade = text / "low" / "high" .default "normal"` — the task's own
+        // illustrative example verbatim: a mixed choice (`TypeDef(Choice(..))`,
+        // matching real specs like examples/real-world-api/e-commerce-api.csil's
+        // `OrderStatus`) whose last arm is Constrained.
+        let grade = CsilRule {
+            name: "Grade".to_string(),
+            rule_type: CsilRuleType::TypeDef(CsilTypeExpression::Choice(vec![
+                text(),
+                lit("low"),
+                default_lit("high", "normal"),
+            ])),
+            position: create_test_position(),
+            doc_comments: Vec::new(),
+        };
+        // `Priority = "low" / "high" .default "high"` — the all-literal (enum)
+        // analog of `Grade`'s trailing-default shape.
+        let priority = CsilRule {
+            name: "Priority".to_string(),
+            rule_type: CsilRuleType::TypeDef(CsilTypeExpression::Choice(vec![
+                lit("low"),
+                default_lit("high", "high"),
+            ])),
+            position: create_test_position(),
+            doc_comments: Vec::new(),
+        };
+        let torture = group_rule_entries(
+            "Torture",
+            vec![
+                bare(
+                    "mixed_choice",
+                    CsilTypeExpression::Choice(vec![
+                        text(),
+                        lit("not_found"),
+                        default_lit("permission_denied", "permission_denied"),
+                    ]),
+                ),
+                bare(
+                    "enum_choice",
+                    CsilTypeExpression::Choice(vec![lit("red"), lit("green"), lit("blue")]),
+                ),
+                bare("grade", CsilTypeExpression::Reference("Grade".to_string())),
+                bare(
+                    "priority",
+                    CsilTypeExpression::Reference("Priority".to_string()),
+                ),
+            ],
+        );
+        CsilSpecSerialized {
+            rules: vec![grade, priority, torture],
+            source_content: None,
+            service_count: 0,
+            fields_with_metadata_count: 0,
+        }
+    }
+
+    #[test]
+    fn inline_choice_fields_round_trip_through_python() {
+        let have = std::process::Command::new("python3")
+            .arg("--version")
+            .output()
+            .is_ok();
+        if !have {
+            eprintln!("skipping: no python3 on PATH");
+            return;
+        }
+
+        let config = create_test_config(false);
+        let files = generate_python_code_from_serialized(&torture_choice_spec(), &config).unwrap();
+
+        let dir =
+            std::env::temp_dir().join(format!("csilgen-python-choice-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let pkg = dir.join("csil_gen_pkg");
+        std::fs::create_dir_all(&pkg).unwrap();
+        for f in &files {
+            std::fs::write(pkg.join(&f.path), &f.content).unwrap();
+        }
+        std::fs::write(dir.join("driver.py"), CHOICE_DRIVER_PYTHON).unwrap();
+
+        // python3 -m py_compile from OUTSIDE the package dir: a generated
+        // `types.py` shadows the stdlib `types` module if run from inside it.
+        let compile = std::process::Command::new("python3")
+            .arg("-m")
+            .arg("py_compile")
+            .arg(pkg.join("types.py"))
+            .arg(pkg.join("codec.py"))
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        assert!(
+            compile.status.success(),
+            "py_compile failed:\n{}{}",
+            String::from_utf8_lossy(&compile.stdout),
+            String::from_utf8_lossy(&compile.stderr)
+        );
+
+        let run = std::process::Command::new("python3")
+            .arg("driver.py")
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        assert!(
+            run.status.success(),
+            "python inline-choice round-trip failed:\n{}{}",
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&run.stdout).trim(), "ok");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    const CHOICE_DRIVER_PYTHON: &str = r#"import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from csil_gen_pkg.types import Torture
+from csil_gen_pkg.codec import *  # binds to_cbor/from_cbor onto the dataclasses
+from csil_gen_pkg.codec import CsilDecodeError
+
+# A literal arm ("not_found") wins over the general `text` arm on encode
+# (literal-first precedence) and must still round-trip byte-for-byte — the
+# confirmed bug degraded this field to an untyped bare-text passthrough with no
+# tagged sum and no validation.
+t1 = Torture(mixed_choice="not_found", enum_choice="red", grade="low", priority="low")
+back1 = Torture.from_cbor(t1.to_cbor())
+assert back1.mixed_choice == "not_found"
+assert back1.enum_choice == "red"
+assert back1.grade == "low"
+assert back1.priority == "low"
+
+# A value matching no literal arm falls back to the general `text` arm, for
+# both the inline mixed_choice field and the named Grade union.
+t2 = Torture(
+    mixed_choice="some other reason",
+    enum_choice="blue",
+    grade="something_else",
+    priority="high",
+)
+back2 = Torture.from_cbor(t2.to_cbor())
+assert back2.mixed_choice == "some other reason"
+assert back2.enum_choice == "blue"
+assert back2.grade == "something_else"
+# Priority's trailing `.default "high"` arm is still a plain literal enum
+# member on the wire — bare text, not a tagged sum — and must still classify
+# (and round-trip) as an enum member despite the `.default` control-operator
+# wrapper the parser attaches to it.
+assert back2.priority == "high"
+
+# The Constrained-wrapped literal arm itself ("permission_denied" on
+# mixed_choice, "high" on Grade) must still classify and encode like a bare
+# literal arm: its own declared index, not folded into (or shadowed by) the
+# general arm.
+t3 = Torture(
+    mixed_choice="permission_denied", enum_choice="green", grade="high", priority="low"
+)
+back3 = Torture.from_cbor(t3.to_cbor())
+assert back3.mixed_choice == "permission_denied"
+assert back3.enum_choice == "green"
+assert back3.grade == "high"
+
+# The tagged sum's wire shape: [variant_index, value], literal-first indices in
+# declaration order (0 = the general `text` arm, 1 = "not_found", 2 =
+# "permission_denied").
+from csil_gen_pkg.codec import _encode_torture_value
+
+assert _encode_torture_value(t1)["mixed_choice"] == [1, "not_found"]
+assert _encode_torture_value(t2)["mixed_choice"] == [0, "some other reason"]
+assert _encode_torture_value(t3)["mixed_choice"] == [2, "permission_denied"]
+assert _encode_torture_value(t1)["grade"] == [1, "low"]
+assert _encode_torture_value(t3)["grade"] == [2, "high"]
+
+# Decode strictly validates membership on the enum-shaped field and rejects an
+# undeclared value ("purple" is not one of red/green/blue).
+bogus = cbor_encode(
+    {"mixed_choice": [1, "not_found"], "enum_choice": "purple", "grade": "low"}
+)
+try:
+    Torture.from_cbor(bogus)
+    raise AssertionError("expected CsilDecodeError for an undeclared enum member")
+except CsilDecodeError:
+    pass
+
+print("ok")
+"#;
+
+    /// A spec covering every field-type category the strict decode validation must
+    /// enforce: scalars (uint/bool/text/bytes/float), tagged core types
+    /// (timestamp/decimal), an array of bytes, a nested record, a positional tuple, a
+    /// payload-carrying union, and an enum (all-literal type-choice). Used by
+    /// `codec_decode_rejects_wrong_cbor_types` to craft CBOR payloads that lie about a
+    /// field's declared type and confirm the generated decoder rejects each one.
+    fn strict_decode_spec() -> CsilSpecSerialized {
+        let text = || CsilTypeExpression::Builtin("text".to_string());
+        let int_ = || CsilTypeExpression::Builtin("int".to_string());
+
+        let inner = group_rule_entries("Inner", vec![bare("n", int_())]);
+
+        let color = CsilRule {
+            name: "Color".to_string(),
+            rule_type: CsilRuleType::TypeChoice(vec![
+                CsilTypeExpression::Literal(CsilLiteralValue::Text("red".to_string())),
+                CsilTypeExpression::Literal(CsilLiteralValue::Text("green".to_string())),
+                CsilTypeExpression::Literal(CsilLiteralValue::Text("blue".to_string())),
+            ]),
+            position: create_test_position(),
+            doc_comments: Vec::new(),
+        };
+        let int_or_text = CsilRule {
+            name: "IntOrText".to_string(),
+            rule_type: CsilRuleType::TypeChoice(vec![int_(), text()]),
+            position: create_test_position(),
+            doc_comments: Vec::new(),
+        };
+
+        let widget = group_rule_entries(
+            "Widget",
+            vec![
+                bare("id", CsilTypeExpression::Builtin("uint".to_string())),
+                bare("flag", CsilTypeExpression::Builtin("bool".to_string())),
+                bare("name", text()),
+                bare("blob", CsilTypeExpression::Builtin("bytes".to_string())),
+                bare("ratio", CsilTypeExpression::Builtin("float".to_string())),
+                bare("ts", CsilTypeExpression::Builtin("timestamp".to_string())),
+                bare("amount", CsilTypeExpression::Builtin("decimal".to_string())),
+                bare(
+                    "items",
+                    CsilTypeExpression::Array {
+                        element_type: Box::new(CsilTypeExpression::Builtin("bytes".to_string())),
+                        occurrence: None,
+                    },
+                ),
+                bare("color", CsilTypeExpression::Reference("Color".to_string())),
+                bare(
+                    "choice",
+                    CsilTypeExpression::Reference("IntOrText".to_string()),
+                ),
+                bare("inner", CsilTypeExpression::Reference("Inner".to_string())),
+                bare(
+                    "pair",
+                    CsilTypeExpression::Tuple(tuple_group(vec![
+                        (None, text(), None),
+                        (None, int_(), None),
+                    ])),
+                ),
+            ],
+        );
+
+        CsilSpecSerialized {
+            rules: vec![color, int_or_text, inner, widget],
+            source_content: None,
+            service_count: 0,
+            fields_with_metadata_count: 0,
+        }
+    }
+
+    /// Craft CBOR payloads (via the generated codec's own unchecked `cbor_encode` over
+    /// a hand-built value tree — encode has no strictness by design) that lie about one
+    /// field's declared type, and confirm `Widget.from_cbor` rejects every one of them
+    /// with `CsilDecodeError` while the well-typed baseline still round-trips. This is
+    /// the regression test for
+    /// docs/csilgen-requests/python-codec-decode-skips-type-validation.md: a
+    /// `bytes`-declared field fed CBOR text (the linkkeys `claim_value` case) must not
+    /// silently decode to a `str`.
+    #[test]
+    fn codec_decode_rejects_wrong_cbor_types() {
+        let have = std::process::Command::new("python3")
+            .arg("--version")
+            .output()
+            .is_ok();
+        if !have {
+            eprintln!("skipping: no python3 on PATH");
+            return;
+        }
+
+        let config = create_test_config(false);
+        let files = generate_python_code_from_serialized(&strict_decode_spec(), &config).unwrap();
+
+        let dir =
+            std::env::temp_dir().join(format!("csilgen-python-strictdec-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let pkg = dir.join("csil_gen_pkg");
+        std::fs::create_dir_all(&pkg).unwrap();
+        for f in &files {
+            std::fs::write(pkg.join(&f.path), &f.content).unwrap();
+        }
+        std::fs::write(dir.join("driver.py"), STRICT_DECODE_DRIVER_PYTHON).unwrap();
+
+        let run = std::process::Command::new("python3")
+            .arg("driver.py")
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        assert!(
+            run.status.success(),
+            "python strict-decode check failed:\n{}{}",
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&run.stdout).trim(), "ok");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    const STRICT_DECODE_DRIVER_PYTHON: &str = r#"import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from csil_gen_pkg.types import Widget
+from csil_gen_pkg.codec import cbor_encode, CborTag, CsilDecodeError
+
+
+def base_tree():
+    return {
+        "id": 1,
+        "flag": True,
+        "name": "hello",
+        "blob": b"\x01\x02",
+        "ratio": 1.5,
+        "ts": CborTag(0, "2020-01-01T00:00:00Z"),
+        "amount": CborTag(4, [0, 100]),
+        "items": [b"\x01", b"\x02"],
+        "color": "red",
+        "choice": [0, 5],
+        "inner": {"n": 3},
+        "pair": ["x", 1],
+    }
+
+
+def expect_raises(tree, msg):
+    try:
+        Widget.from_cbor(cbor_encode(tree))
+    except CsilDecodeError:
+        return
+    except Exception as e:
+        raise AssertionError(
+            f"{msg}: expected CsilDecodeError, got {type(e).__name__}: {e}"
+        )
+    raise AssertionError(f"{msg}: expected decode to raise, but it succeeded")
+
+
+# The well-typed baseline must still decode cleanly (existing positive round-trips
+# are not collateral damage from the added strictness).
+w = Widget.from_cbor(cbor_encode(base_tree()))
+assert w.id == 1
+assert w.flag is True
+assert w.name == "hello"
+assert w.blob == b"\x01\x02"
+assert w.ratio == 1.5
+assert w.items == [b"\x01", b"\x02"]
+assert w.color == "red"
+assert w.choice == 5
+assert w.inner.n == 3
+assert w.pair == ("x", 1)
+
+# bytes-declared/text-supplied: the request's exact case (linkkeys claim_value).
+t = base_tree()
+t["blob"] = "not-bytes"
+expect_raises(t, "text where bytes declared")
+
+# text/int confusion.
+t = base_tree()
+t["name"] = 123
+expect_raises(t, "int where text declared")
+
+# bool/int confusion: an int must not pass where bool is declared.
+t = base_tree()
+t["flag"] = 1
+expect_raises(t, "int where bool declared")
+
+# bool/int confusion, the other direction: bool must not pass where int is declared
+# (Python's bool is an int subclass).
+t = base_tree()
+t["id"] = True
+expect_raises(t, "bool where uint declared")
+
+# wrong-type list element.
+t = base_tree()
+t["items"] = [b"\x01", "not-bytes"]
+expect_raises(t, "wrong-type list element")
+
+# wrong tag on timestamp.
+t = base_tree()
+t["ts"] = CborTag(1, "2020-01-01T00:00:00Z")
+expect_raises(t, "wrong tag on timestamp")
+
+# timestamp supplied bare, with no tag at all.
+t = base_tree()
+t["ts"] = "2020-01-01T00:00:00Z"
+expect_raises(t, "untagged timestamp")
+
+# wrong tag on decimal.
+t = base_tree()
+t["amount"] = CborTag(5, [0, 100])
+expect_raises(t, "wrong tag on decimal")
+
+# union with a bad variant index.
+t = base_tree()
+t["choice"] = [7, 5]
+expect_raises(t, "union with unknown variant index")
+
+# union payload mismatched for its declared index.
+t = base_tree()
+t["choice"] = [0, "not-an-int"]
+expect_raises(t, "union payload mismatched for its index")
+
+# enum value outside the declared set.
+t = base_tree()
+t["color"] = "purple"
+expect_raises(t, "enum value outside declared set")
+
+# enum wrong major type (int instead of the declared text kind).
+t = base_tree()
+t["color"] = 1
+expect_raises(t, "enum wrong major type")
+
+# nested record supplied as a non-map.
+t = base_tree()
+t["inner"] = "not-a-record"
+expect_raises(t, "nested record wrong shape")
+
+# tuple wrong arity.
+t = base_tree()
+t["pair"] = ["only-one"]
+expect_raises(t, "tuple wrong arity")
+
+# tuple element wrong type.
+t = base_tree()
+t["pair"] = [1, "wrong"]
+expect_raises(t, "tuple element wrong type")
+
+print("ok")
+"#;
+
+    /// A spec with one record field typed as a mixed union (`text / "pending" /
+    /// "confirmed" / "cancelled"`), matching `OrderStatus` in
+    /// examples/real-world-api/e-commerce-api.csil. Used by
+    /// `mixed_union_encode_prefers_literal_over_general_arm` to confirm the emitted
+    /// `_encode_<u>_value` checks literal arms (by value) before the shared general
+    /// arm, and that `_decode_<u>_value` accepts and correctly reconstructs every
+    /// declared index, literal arms included.
+    fn mixed_union_spec() -> CsilSpecSerialized {
+        let status = CsilRule {
+            name: "OrderStatus".to_string(),
+            rule_type: CsilRuleType::TypeChoice(vec![
+                CsilTypeExpression::Builtin("text".to_string()),
+                CsilTypeExpression::Literal(CsilLiteralValue::Text("pending".to_string())),
+                CsilTypeExpression::Literal(CsilLiteralValue::Text("confirmed".to_string())),
+                CsilTypeExpression::Literal(CsilLiteralValue::Text("cancelled".to_string())),
+            ]),
+            position: create_test_position(),
+            doc_comments: Vec::new(),
+        };
+        let order = group_rule_entries(
+            "Order",
+            vec![bare(
+                "status",
+                CsilTypeExpression::Reference("OrderStatus".to_string()),
+            )],
+        );
+
+        CsilSpecSerialized {
+            rules: vec![status, order],
+            source_content: None,
+            service_count: 0,
+            fields_with_metadata_count: 0,
+        }
+    }
+
+    /// Regression test for the general-arm-shadows-literals bug: before the fix, the
+    /// generated `_encode_order_status_value` checked `isinstance(csil_v, str)`
+    /// (the general `text` arm, index 0) before any literal arm, so every string —
+    /// including `"pending"` — took index 0 and indices 1-3 were unreachable dead
+    /// code. Confirms literal-first indices, the general-arm fallback for a
+    /// non-literal string, and that decode accepts (and validates) every declared
+    /// index.
+    #[test]
+    fn mixed_union_encode_prefers_literal_over_general_arm() {
+        let have = std::process::Command::new("python3")
+            .arg("--version")
+            .output()
+            .is_ok();
+        if !have {
+            eprintln!("skipping: no python3 on PATH");
+            return;
+        }
+
+        let config = create_test_config(false);
+        let files = generate_python_code_from_serialized(&mixed_union_spec(), &config).unwrap();
+
+        let dir =
+            std::env::temp_dir().join(format!("csilgen-python-mixedunion-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let pkg = dir.join("csil_gen_pkg");
+        std::fs::create_dir_all(&pkg).unwrap();
+        for f in &files {
+            std::fs::write(pkg.join(&f.path), &f.content).unwrap();
+        }
+        std::fs::write(dir.join("driver.py"), MIXED_UNION_DRIVER_PYTHON).unwrap();
+
+        let run = std::process::Command::new("python3")
+            .arg("driver.py")
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        assert!(
+            run.status.success(),
+            "python mixed-union check failed:\n{}{}",
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&run.stdout).trim(), "ok");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    const MIXED_UNION_DRIVER_PYTHON: &str = r#"import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from csil_gen_pkg.codec import (
+    _encode_order_status_value,
+    _decode_order_status_value,
+    CsilDecodeError,
+)
+
+# A declared literal must win its own index over the general `text` arm, even
+# though both dispatch on the same Python `str` type.
+assert _encode_order_status_value("pending") == [1, "pending"]
+assert _encode_order_status_value("confirmed") == [2, "confirmed"]
+assert _encode_order_status_value("cancelled") == [3, "cancelled"]
+
+# A string that matches no literal falls back to the general arm, index 0.
+assert _encode_order_status_value("on-hold") == [0, "on-hold"]
+
+# Every declared index decodes back to its value, literal arms included.
+assert _decode_order_status_value([0, "on-hold"]) == "on-hold"
+assert _decode_order_status_value([1, "pending"]) == "pending"
+assert _decode_order_status_value([2, "confirmed"]) == "confirmed"
+assert _decode_order_status_value([3, "cancelled"]) == "cancelled"
+
+# A literal arm still validates its payload rather than trusting the index: an
+# index that claims "pending" but carries a different string must be rejected.
+try:
+    _decode_order_status_value([1, "confirmed"])
+    raise AssertionError("expected CsilDecodeError for literal/value mismatch")
+except CsilDecodeError:
+    pass
+
+# An out-of-range index is rejected too.
+try:
+    _decode_order_status_value([99, "pending"])
+    raise AssertionError("expected CsilDecodeError for unknown variant index")
+except CsilDecodeError:
+    pass
+
+print("ok")
+"#;
+
+    /// A spec with a named union whose two variants are BOTH general (non-literal)
+    /// arms that share the same Python `isinstance` dispatch type — two `Map`
+    /// shapes both narrow to `dict`, so encode genuinely cannot tell them apart at
+    /// runtime and must fall back to CSIL's declaration-order tie-break: the FIRST
+    /// declared general arm wins, not the last. Also carries the same two-general-
+    /// arm shape as an INLINE choice field, exercising `py_choice_enc_call`'s
+    /// separate (but parallel) grouping logic.
+    fn general_arm_shadowing_spec() -> CsilSpecSerialized {
+        let map_of = |value_kind: &str| CsilTypeExpression::Map {
+            key: Box::new(CsilTypeExpression::Builtin("text".to_string())),
+            value: Box::new(CsilTypeExpression::Builtin(value_kind.to_string())),
+            occurrence: None,
+        };
+        let thing = CsilRule {
+            name: "Thing".to_string(),
+            rule_type: CsilRuleType::TypeChoice(vec![map_of("int"), map_of("text")]),
+            position: create_test_position(),
+            doc_comments: Vec::new(),
+        };
+        let holder = group_rule_entries(
+            "Holder",
+            vec![
+                bare("thing", CsilTypeExpression::Reference("Thing".to_string())),
+                bare(
+                    "inline_thing",
+                    CsilTypeExpression::Choice(vec![map_of("int"), map_of("text")]),
+                ),
+            ],
+        );
+        CsilSpecSerialized {
+            rules: vec![thing, holder],
+            source_content: None,
+            service_count: 0,
+            fields_with_metadata_count: 0,
+        }
+    }
+
+    /// Regression test for the last-wins `general_idx` overwrite bug in BOTH
+    /// `emit_union_codec` (named unions) and `py_choice_enc_call` (inline choices):
+    /// before the fix, the SECOND declared general arm silently overwrote the
+    /// first in the `dict`-typed group, so the first-declared variant (index 0)
+    /// was unreachable dead code on encode. Confirms the FIRST declared general
+    /// arm wins, per CSIL's declaration-order-is-priority contract, for both the
+    /// named union and the inline choice, with a live python3 round-trip proof.
+    #[test]
+    fn general_arm_first_wins_not_last_on_shared_dispatch_type() {
+        let have = std::process::Command::new("python3")
+            .arg("--version")
+            .output()
+            .is_ok();
+        if !have {
+            eprintln!("skipping: no python3 on PATH");
+            return;
+        }
+
+        let config = create_test_config(false);
+        let files =
+            generate_python_code_from_serialized(&general_arm_shadowing_spec(), &config).unwrap();
+
+        let dir = std::env::temp_dir().join(format!(
+            "csilgen-python-general-shadow-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let pkg = dir.join("csil_gen_pkg");
+        std::fs::create_dir_all(&pkg).unwrap();
+        for f in &files {
+            std::fs::write(pkg.join(&f.path), &f.content).unwrap();
+        }
+        std::fs::write(dir.join("driver.py"), GENERAL_ARM_DRIVER_PYTHON).unwrap();
+
+        let run = std::process::Command::new("python3")
+            .arg("driver.py")
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        assert!(
+            run.status.success(),
+            "python general-arm-shadowing check failed:\n{}{}",
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&run.stdout).trim(), "ok");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    const GENERAL_ARM_DRIVER_PYTHON: &str = r#"import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from csil_gen_pkg.types import Holder
+from csil_gen_pkg.codec import *  # binds to_cbor/from_cbor onto the dataclasses
+from csil_gen_pkg.codec import _encode_thing_value, _decode_thing_value, _encode_holder_value
+
+# Both variants of the named union are `Map`-shaped, so Python's isinstance sees
+# both as `dict` — encode cannot distinguish them structurally and must fall back
+# to CSIL's declaration order: the FIRST declared arm (index 0) wins, not the
+# last (index 1).
+assert _encode_thing_value({"a": 1}) == [0, {"a": 1}]
+
+# Decode still reconstructs each declared index correctly, independent of which
+# index encode happens to choose.
+assert _decode_thing_value([0, {"a": 1}]) == {"a": 1}
+assert _decode_thing_value([1, {"a": "x"}]) == {"a": "x"}
+
+# The same shape declared inline (no named rule) exercises the parallel
+# `py_choice_enc_call` grouping logic and must agree: index 0 wins there too.
+h = Holder(thing={"a": 1}, inline_thing={"b": 2})
+tree = _encode_holder_value(h)
+assert tree["thing"] == [0, {"a": 1}], tree["thing"]
+assert tree["inline_thing"] == [0, {"b": 2}], tree["inline_thing"]
+
+# Full round-trip through the dataclass confirms the encode choice survives CBOR.
+back = Holder.from_cbor(h.to_cbor())
+assert back.thing == {"a": 1}
+assert back.inline_thing == {"b": 2}
+
+print("ok")
+"#;
+
+    /// A spec pinning THE contract (`csilgen_common::classify_choice`): an
+    /// all-literal choice is an Enum regardless of whether its literals share one
+    /// CBOR-scalar kind. `Status = "pending" / "shipped" / 0 / 1` mixes text and
+    /// integer literals — both as a named rule (`python_enum_defs`/
+    /// `emit_enum_codec`) and as an inline field choice (`py_dec_value`/
+    /// `py_enc_value`'s `Choice` arm) — pinning that BOTH paths classify it as an
+    /// enum (bare wire value, membership-checked decode) rather than
+    /// misclassifying it as a union (a `[index, value]` tagged sum) or, for the
+    /// named case, silently skipping decode validation altogether (the confirmed
+    /// defect: a mixed-kind named choice previously matched neither
+    /// `python_enum_defs`, which required kind-uniform literals, nor
+    /// `python_union_defs`, which excludes all-literal choices — so it fell
+    /// through to NO codec at all, with decode performing zero membership check).
+    fn mixed_kind_enum_spec() -> CsilSpecSerialized {
+        let text_lit = |s: &str| CsilTypeExpression::Literal(CsilLiteralValue::Text(s.to_string()));
+        let int_lit = |n: i64| CsilTypeExpression::Literal(CsilLiteralValue::Integer(n));
+        let members = || {
+            vec![
+                text_lit("pending"),
+                text_lit("shipped"),
+                int_lit(0),
+                int_lit(1),
+            ]
+        };
+        let status = CsilRule {
+            name: "Status".to_string(),
+            rule_type: CsilRuleType::TypeDef(CsilTypeExpression::Choice(members())),
+            position: create_test_position(),
+            doc_comments: Vec::new(),
+        };
+        let order = group_rule_entries(
+            "Order",
+            vec![
+                bare(
+                    "status",
+                    CsilTypeExpression::Reference("Status".to_string()),
+                ),
+                bare("inline_status", CsilTypeExpression::Choice(members())),
+            ],
+        );
+        CsilSpecSerialized {
+            rules: vec![status, order],
+            source_content: None,
+            service_count: 0,
+            fields_with_metadata_count: 0,
+        }
+    }
+
+    /// The `_csil_expect_enum_scalar` runtime gate is pay-for-what-you-use: absent
+    /// from a codec whose spec has no mixed-kind literal choice (so pre-existing
+    /// specs keep byte-identical output), present exactly when some generated
+    /// decode calls it.
+    #[test]
+    fn enum_scalar_gate_emitted_only_for_mixed_kind_specs() {
+        let config = create_test_config(false);
+
+        let mixed = generate_python_code_from_serialized(&mixed_kind_enum_spec(), &config).unwrap();
+        let mixed_codec = &mixed.iter().find(|f| f.path == "codec.py").unwrap().content;
+        assert!(
+            mixed_codec.contains("def _csil_expect_enum_scalar"),
+            "a mixed-kind enum spec must carry the scalar gate its decode calls"
+        );
+
+        // `torture_choice_spec` exercises enums and unions heavily, but every
+        // literal vocabulary in it is kind-uniform (all text) — the gate must not
+        // appear.
+        let uniform =
+            generate_python_code_from_serialized(&torture_choice_spec(), &config).unwrap();
+        let uniform_codec = &uniform
+            .iter()
+            .find(|f| f.path == "codec.py")
+            .unwrap()
+            .content;
+        assert!(
+            !uniform_codec.contains("_csil_expect_enum_scalar"),
+            "a kind-uniform spec must not carry the unused scalar gate"
+        );
+    }
+
+    /// Live python3 round-trip proof for the mixed-kind-literal-choice defect:
+    /// every declared member of a text+int vocabulary encodes/decodes correctly
+    /// through both the named `Status` reference and an equivalent inline choice
+    /// field, the wire form is confirmed bare (not a tagged sum), and an
+    /// out-of-vocabulary value of EACH declared kind is rejected by decode.
+    #[test]
+    fn mixed_kind_literal_choice_is_enum_round_trips_through_python() {
+        let have = std::process::Command::new("python3")
+            .arg("--version")
+            .output()
+            .is_ok();
+        if !have {
+            eprintln!("skipping: no python3 on PATH");
+            return;
+        }
+
+        let config = create_test_config(false);
+        let files = generate_python_code_from_serialized(&mixed_kind_enum_spec(), &config).unwrap();
+
+        let dir =
+            std::env::temp_dir().join(format!("csilgen-python-mixed-enum-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let pkg = dir.join("csil_gen_pkg");
+        std::fs::create_dir_all(&pkg).unwrap();
+        for f in &files {
+            std::fs::write(pkg.join(&f.path), &f.content).unwrap();
+        }
+        std::fs::write(dir.join("driver.py"), MIXED_KIND_ENUM_DRIVER_PYTHON).unwrap();
+
+        let run = std::process::Command::new("python3")
+            .arg("driver.py")
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        assert!(
+            run.status.success(),
+            "python mixed-kind-enum check failed:\n{}{}",
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&run.stdout).trim(), "ok");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    const MIXED_KIND_ENUM_DRIVER_PYTHON: &str = r#"import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from csil_gen_pkg.types import Order
+from csil_gen_pkg.codec import *  # binds to_cbor/from_cbor onto the dataclasses
+from csil_gen_pkg.codec import CsilDecodeError, _decode_status_value, _encode_order_value
+
+# Every declared member of the mixed text+int vocabulary round-trips, for both
+# the named Status reference and the equivalent inline choice field.
+for member in ("pending", "shipped", 0, 1):
+    o = Order(status=member, inline_status=member)
+    back = Order.from_cbor(o.to_cbor())
+    assert back.status == member, (member, back.status)
+    assert back.inline_status == member, (member, back.inline_status)
+
+# The named enum's own decode function validates membership across both kinds.
+assert _decode_status_value("pending") == "pending"
+assert _decode_status_value(1) == 1
+
+# The wire form is the bare literal itself (an Enum), not a [index, value] tagged
+# sum (a Union) — this is the classification itself, not just the value.
+tree = _encode_order_value(Order(status="pending", inline_status=0))
+assert tree["status"] == "pending", tree["status"]
+assert tree["inline_status"] == 0, tree["inline_status"]
+
+# An out-of-vocabulary value of a DECLARED kind is rejected, for both kinds
+# present in the mixed vocabulary.
+try:
+    _decode_status_value("other")
+    raise AssertionError("expected CsilDecodeError for undeclared text member")
+except CsilDecodeError:
+    pass
+try:
+    _decode_status_value(2)
+    raise AssertionError("expected CsilDecodeError for undeclared int member")
+except CsilDecodeError:
+    pass
+
+# Same rejection through the full record decode path, for both the named and
+# inline fields.
+bogus_named = cbor_encode({"status": "other", "inline_status": "pending"})
+try:
+    Order.from_cbor(bogus_named)
+    raise AssertionError("expected CsilDecodeError for undeclared status")
+except CsilDecodeError:
+    pass
+
+bogus_inline = cbor_encode({"status": "pending", "inline_status": 2})
+try:
+    Order.from_cbor(bogus_inline)
+    raise AssertionError("expected CsilDecodeError for undeclared inline_status")
+except CsilDecodeError:
+    pass
 
 print("ok")
 "#;
@@ -6650,8 +8030,8 @@ def make_req(priority, queue="default"):
 # the await is a real suspension point, not a synchronous shortcut.
 class AsyncLoopback:
     async def call(self, service, method, req):
-        assert service == "corndogs"
-        assert method == "SubmitTask"
+        assert service == "CorndogsService"
+        assert method == "submit-task"
         await asyncio.sleep(0)
         decoded = SubmitTaskRequest.from_cbor(req)
         assert decoded.counts == {"pending": 3, "done": 9}
@@ -7177,8 +8557,8 @@ def _echo_urlopen(req, timeout=None):
     # Hermetic, socket-free stand-in for the server: decode the CSIL-RPC request via the
     # library and echo its payload back as a status-0 `Pong` reply (Ping/Pong share shape).
     rpc_req = RpcRequest.decode(req.data)
-    assert rpc_req.service == "echo", rpc_req
-    assert rpc_req.op == "Ping", rpc_req
+    assert rpc_req.service == "Echo", rpc_req
+    assert rpc_req.op == "ping", rpc_req
     return _FakeResp(RpcResponse.ok("Pong", rpc_req.payload).encode())
 
 

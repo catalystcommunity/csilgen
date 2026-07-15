@@ -38,7 +38,7 @@ from interop_api import (
     route_interop_channel,
 )
 
-SERVICE = "interop"
+SERVICE = "Interop"
 
 
 # ---------------------------------------------------------------------------
@@ -78,6 +78,22 @@ def scalars_ok() -> Scalars:
         flag=True,
         when=ts(),
         amount=Decimal("123.45"),
+        # mixed-union coverage: a value equal to a literal arm must wire as
+        # [1,"pending"]; a value with no literal match must wire as [0,...].
+        status_literal="pending",
+        status_free="unlisted",
+        # inline mixed choice (hoisted; literal arm match).
+        note="info",
+        # inline all-literal choice (not hoisted).
+        size="medium",
+        # named enum with a trailing `.default`-constrained last arm.
+        level="high",
+        # named enum assembled via base rule + `/=` extension.
+        season="autumn",
+        # named all-literal enum with mixed literal kinds (text + int arms);
+        # no wrapper type, bare Python value.
+        ship_text="ground",
+        ship_int=2,
     )
 
 
@@ -212,20 +228,20 @@ def rpc_server(listener: socket.socket) -> None:
     def dispatch(req):
         op = req.op
         try:
-            if op == "EchoScalars":
+            if op == "echo-scalars":
                 v = Scalars.from_cbor(req.payload)
                 return Reply("Scalars", handlers.echo_scalars(v, {}).to_cbor())
-            if op == "EchoCollections":
+            if op == "echo-collections":
                 v = Collections.from_cbor(req.payload)
                 return Reply(
                     "Collections", handlers.echo_collections(v, {}).to_cbor()
                 )
-            if op == "EchoNested":
+            if op == "echo-nested":
                 v = Nested.from_cbor(req.payload)
                 return Reply(
                     "EchoNestedResult", handlers.echo_nested(v, {}).to_cbor()
                 )
-            if op == "ValidateConstrained":
+            if op == "validate-constrained":
                 # Decode validates; an invalid payload raises and is returned as the
                 # typed ServiceError arm (status-0 variant), the failure-case path.
                 try:
@@ -352,7 +368,7 @@ def events_server(listener: socket.socket) -> None:
                     )
                 elif method == control.CLOSE_NAME:
                     break
-                elif method == "Duplex":
+                elif method == "duplex":
                     try:
                         s = Scalars.from_cbor(ev.payload)
                     except Exception:
@@ -403,9 +419,9 @@ def events_client(stream) -> Cases:
             break
         try:
             ev = Event.decode(frame, Profile.VERBOSE)
-            if ev.event != "OnTick":
+            if ev.event != "on-tick":
                 tick_ok = False
-                detail = f"expected OnTick got {ev.event!r}"
+                detail = f"expected on-tick got {ev.event!r}"
                 break
             t = Tick.from_cbor(ev.payload)
             if t.seq != expect:
@@ -427,7 +443,7 @@ def events_client(stream) -> Cases:
     else:
         try:
             ev = Event.decode(frame, Profile.VERBOSE)
-            if ev.event == "Duplex":
+            if ev.event == "duplex":
                 s = Scalars.from_cbor(ev.payload)
                 cases.check("duplex/success", s == scalars_ok(), "echo mismatch")
             else:

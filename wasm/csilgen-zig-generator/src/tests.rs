@@ -132,6 +132,21 @@ fn basic_struct_emits_struct_and_fields() {
 }
 
 #[test]
+fn fieldless_struct_collapses_to_one_line() {
+    let input = input_with_rules(
+        vec![group_rule("EmptyRequest", vec![])],
+        "zig",
+        HashMap::new(),
+    );
+    let config = ZigConfig::from_options(&input.config.options).unwrap();
+    let types = generate_types(&input, &config).unwrap();
+    // zig fmt rewrites `struct {\n};` to `struct {}`, so the emitter must
+    // produce the collapsed form itself to stay fmt-clean.
+    assert!(types.contains("pub const EmptyRequest = struct {};"));
+    assert!(!types.contains("pub const EmptyRequest = struct {\n"));
+}
+
+#[test]
 fn optional_scalar_becomes_optional_with_default() {
     let mut entry = bare_entry("count", builtin("uint"));
     entry.occurrence = Some(CsilOccurrence::Optional);
@@ -269,9 +284,12 @@ fn reference_choice_is_a_tagged_union_with_variant_names() {
 }
 
 #[test]
-fn text_choice_field_maps_to_string_slice() {
-    // `text / "a" / "b"` is a string with a suggested value set; on the wire it is a
-    // text string, so it must map to []const u8, not the opaque dynamic fallback.
+fn mixed_text_choice_is_a_tagged_union_not_a_string_alias() {
+    // `text / "a" / "b"` mixes the open `text` builtin with literal arms: per the CSIL
+    // wire contract, any non-literal arm makes the whole choice a tagged sum
+    // `[variant_index, value]`, so a NAMED top-level choice rule of this shape must
+    // become a `union(enum)`, not collapse to a bare `[]const u8` alias (that would
+    // drop the tag and break wire compatibility with the other language targets).
     let rule = CsilRule {
         name: "Status".to_string(),
         rule_type: CsilRuleType::TypeDef(CsilTypeExpression::Choice(vec![
@@ -285,8 +303,377 @@ fn text_choice_field_maps_to_string_slice() {
     let input = input_with_rules(vec![rule], "zig", HashMap::new());
     let config = ZigConfig::from_options(&input.config.options).unwrap();
     let types = generate_types(&input, &config).unwrap();
-    assert!(types.contains("pub const Status = []const u8;"));
-    assert!(!types.contains("anyopaque"));
+    assert!(types.contains("pub const Status = union(enum) {"));
+    assert!(!types.contains("pub const Status = []const u8;"));
+}
+
+#[test]
+fn order_status_mixed_choice_emits_tagged_union() {
+    // The real e-commerce-api.csil OrderStatus shape: a general `text` arm plus 7
+    // literal arms. This must emit a tagged `union(enum)`, matching Go/Python/Dart's
+    // wire form `[variant_index, value]`, not the open-string alias the bug produced.
+    let input = input_with_rules(vec![order_status_rule()], "zig", HashMap::new());
+    let config = ZigConfig::from_options(&input.config.options).unwrap();
+    let types = generate_types(&input, &config).unwrap();
+    assert!(types.contains("pub const OrderStatus = union(enum) {"));
+    assert!(!types.contains("pub const OrderStatus = []const u8;"));
+}
+
+/// `Rank = "gold" / 1 / -2 / true / 3.5 / bytes-literal`: every arm is a literal, but
+/// the kinds are NOT uniform (text, int, bool, float, bytes) — per the shared
+/// classifier's normative contract (`csilgen_common::choice`) this is STILL an
+/// `Enum`, not a `Union`. Covers the mixed-kind regression this module exists to fix:
+/// before it, Zig's own classifier required a uniform text-only or int-only
+/// vocabulary and fell through to a tagged `union(enum)` for any kind mix.
+fn rank_rule() -> CsilRule {
+    CsilRule {
+        name: "Rank".to_string(),
+        rule_type: CsilRuleType::TypeDef(CsilTypeExpression::Choice(vec![
+            text_lit("gold"),
+            CsilTypeExpression::Literal(CsilLiteralValue::Integer(1)),
+            CsilTypeExpression::Literal(CsilLiteralValue::Integer(-2)),
+            CsilTypeExpression::Literal(CsilLiteralValue::Bool(true)),
+            CsilTypeExpression::Literal(CsilLiteralValue::Float(3.5)),
+            CsilTypeExpression::Literal(CsilLiteralValue::Bytes(vec![0xde, 0xad])),
+        ])),
+        position: pos(),
+        doc_comments: vec![],
+    }
+}
+
+#[test]
+fn mixed_kind_literal_choice_emits_mixed_enum_not_union() {
+    let input = input_with_rules(vec![rank_rule()], "zig", HashMap::new());
+    let config = ZigConfig::from_options(&input.config.options).unwrap();
+    let types = generate_types(&input, &config).unwrap();
+    // A plain nullary `enum`, matching `Enum`/`IntEnum`'s shape — not a
+    // `union(enum)` (no arm carries a payload beyond its own literal, so there's
+    // nothing for a union payload to hold).
+    assert!(types.contains("pub const Rank = enum {"), "{types}");
+    assert!(!types.contains("pub const Rank = union(enum) {"));
+    assert!(types.contains("    gold,"));
+    assert!(types.contains("    v1,"));
+    assert!(types.contains("    v_neg2,"));
+    assert!(types.contains("    v_true,"));
+    assert!(types.contains("    v3_5,"));
+    // The bytes literal has no compact textual form; it falls back to the
+    // positional form (index 5, the last declared arm).
+    assert!(types.contains("    v5,"));
+
+    let mut warnings = Vec::new();
+    let codec = generate_codec(&input, &config, &mut warnings).unwrap();
+    assert!(
+        codec.contains(
+            "fn enc_Rank(out: *std.ArrayList(u8), v: *const types.Rank) CodecError!void {"
+        )
+    );
+    // Encode writes each member's own bare literal — no `[index, value]` wrapper.
+    assert!(codec.contains(".gold => {"));
+    assert!(codec.contains("try w_text(out, \"gold\");"));
+    assert!(codec.contains("try w_uint(out, @as(u64, 1));"));
+    assert!(codec.contains("try w_int(out, @as(i64, -2));"));
+    // Decode membership-matches the bare wire value across every declared literal,
+    // regardless of kind, rather than a single uniform accessor.
+    assert!(codec.contains("src == .text and std.mem.eql(u8, src.text, \"gold\")"));
+    assert!(codec.contains("src == .uint and src.uint == @as(u64, 1)"));
+    assert!(codec.contains("src == .int and src.int == @as(i64, -2)"));
+    assert!(codec.contains("src == .boolean and src.boolean == true"));
+    assert!(codec.contains("src == .float and src.float == @as(f64, 3.5)"));
+    assert!(codec.contains("return error.WrongType;"));
+    assert!(
+        warnings.is_empty(),
+        "unexpected codec warnings: {warnings:?}"
+    );
+}
+
+// ---- inline choice/group hoisting ------------------------------------------
+
+fn text_lit(s: &str) -> CsilTypeExpression {
+    CsilTypeExpression::Literal(CsilLiteralValue::Text(s.to_string()))
+}
+
+/// Build an input exactly like `input_with_rules`, but with the inline-composite
+/// hoisting pass already applied — the same rewrite `process_generation` runs before
+/// any other phase. The white-box `generate_types`/`generate_codec` tests below call
+/// this (rather than `process_generation`) so they can assert on one phase's output
+/// in isolation, matching the rest of this file's testing style.
+fn hoisted_input(
+    rules: Vec<CsilRule>,
+    target: &str,
+    options: HashMap<String, serde_json::Value>,
+) -> WasmGeneratorInput {
+    let mut input = input_with_rules(rules, target, options);
+    input.csil_spec = csilgen_common::hoist_inline_composites(
+        &input.csil_spec,
+        csilgen_common::HoistOptions {
+            hoist_all_literal_choices: true,
+        },
+    );
+    input
+}
+
+fn positional_entry(value_type: CsilTypeExpression) -> CsilGroupEntry {
+    CsilGroupEntry {
+        key: None,
+        value_type,
+        occurrence: None,
+        metadata: vec![],
+        doc_comments: vec![],
+    }
+}
+
+/// The `torture-inline-choice.csil` fixture: a record whose fields are inline
+/// (unnamed) choices in every position hoisting must reach — a direct field
+/// (`mixed_inline`), an all-literal direct field (`pure_literal_inline`), a direct
+/// field whose last arm carries a trailing `.default` control operator
+/// (`constrained_arm_inline` — the classification-bug regression shape, since CSIL
+/// attaches a trailing control operator to the immediately preceding arm, not the
+/// choice as a whole), an array element (`tag_list`), a map value (`label_map`), and
+/// a tuple element (`coord`).
+fn torture_inline_choice_rules() -> Vec<CsilRule> {
+    let mixed_inline = bare_entry(
+        "mixed_inline",
+        CsilTypeExpression::Choice(vec![
+            builtin("text"),
+            text_lit("not_found"),
+            text_lit("permission_denied"),
+            text_lit("invalid_input"),
+        ]),
+    );
+    let pure_literal_inline = bare_entry(
+        "pure_literal_inline",
+        CsilTypeExpression::Choice(vec![
+            text_lit("active"),
+            text_lit("inactive"),
+            text_lit("pending"),
+        ]),
+    );
+    let constrained_arm_inline = bare_entry(
+        "constrained_arm_inline",
+        CsilTypeExpression::Choice(vec![
+            builtin("text"),
+            text_lit("low"),
+            CsilTypeExpression::Constrained {
+                base_type: Box::new(text_lit("high")),
+                constraints: vec![CsilControlOperator::Default(CsilLiteralValue::Text(
+                    "normal".to_string(),
+                ))],
+            },
+        ]),
+    );
+    let tag_list = bare_entry(
+        "tag_list",
+        CsilTypeExpression::Array {
+            element_type: Box::new(CsilTypeExpression::Choice(vec![
+                builtin("text"),
+                text_lit("red"),
+                text_lit("green"),
+                text_lit("blue"),
+            ])),
+            occurrence: Some(CsilOccurrence::ZeroOrMore),
+        },
+    );
+    let label_map = bare_entry(
+        "label_map",
+        CsilTypeExpression::Map {
+            key: Box::new(builtin("text")),
+            value: Box::new(CsilTypeExpression::Choice(vec![
+                builtin("text"),
+                text_lit("urgent"),
+                text_lit("normal"),
+            ])),
+            occurrence: Some(CsilOccurrence::ZeroOrMore),
+        },
+    );
+    let coord = bare_entry(
+        "coord",
+        CsilTypeExpression::Tuple(CsilGroupExpression {
+            entries: vec![
+                positional_entry(CsilTypeExpression::Choice(vec![
+                    builtin("text"),
+                    text_lit("lat"),
+                    text_lit("lon"),
+                ])),
+                positional_entry(builtin("int")),
+            ],
+        }),
+    );
+    vec![group_rule(
+        "TortureInlineChoice",
+        vec![
+            mixed_inline,
+            pure_literal_inline,
+            constrained_arm_inline,
+            tag_list,
+            label_map,
+            coord,
+        ],
+    )]
+}
+
+#[test]
+fn inline_direct_field_choice_hoists_to_named_types() {
+    let input = hoisted_input(torture_inline_choice_rules(), "zig", HashMap::new());
+    let config = ZigConfig::from_options(&input.config.options).unwrap();
+    let types = generate_types(&input, &config).unwrap();
+
+    // The mixed choice (open `text` + literals) hoists to a tagged union, not a
+    // bare string: before hoisting, `map_zig_type`'s `arms.iter().all(is_text_like)`
+    // fallback (is_text_like accepts both the open `text` arm and literal arms)
+    // flattened this straight to `[]const u8`, silently dropping the tagged-sum
+    // shape the wire contract requires.
+    assert!(
+        types.contains("pub const TortureInlineChoice_mixed_inline = union(enum) {"),
+        "{types}"
+    );
+    assert!(types.contains("mixed_inline: TortureInlineChoice_mixed_inline,"));
+
+    // The all-literal choice hoists to a closed enum with wire_name, matching what a
+    // named choice rule of the same shape would emit.
+    assert!(
+        types.contains("pub const TortureInlineChoice_pure_literal_inline = enum {"),
+        "{types}"
+    );
+    assert!(types.contains("pure_literal_inline: TortureInlineChoice_pure_literal_inline,"));
+
+    // The `.default`-suffixed last arm must not fall out of the tagged-union shape.
+    assert!(
+        types.contains("pub const TortureInlineChoice_constrained_arm_inline = union(enum) {"),
+        "{types}"
+    );
+    assert!(types.contains("constrained_arm_inline: TortureInlineChoice_constrained_arm_inline,"));
+}
+
+#[test]
+fn inline_nested_choice_positions_hoist_to_named_types() {
+    let input = hoisted_input(torture_inline_choice_rules(), "zig", HashMap::new());
+    let config = ZigConfig::from_options(&input.config.options).unwrap();
+    let types = generate_types(&input, &config).unwrap();
+
+    // Array element position.
+    assert!(
+        types.contains("pub const TortureInlineChoice_tag_list_item = union(enum) {"),
+        "{types}"
+    );
+    assert!(types.contains("tag_list: []TortureInlineChoice_tag_list_item,"));
+
+    // Map value position.
+    assert!(
+        types.contains("pub const TortureInlineChoice_label_map_value = union(enum) {"),
+        "{types}"
+    );
+    assert!(
+        types.contains(
+            "label_map: std.StringHashMapUnmanaged(TortureInlineChoice_label_map_value),"
+        )
+    );
+
+    // Tuple element position (index-suffixed: more than one slot can hold a
+    // composite under the same field).
+    assert!(
+        types.contains("pub const TortureInlineChoice_coord_0 = union(enum) {"),
+        "{types}"
+    );
+    assert!(types.contains("coord: struct { TortureInlineChoice_coord_0, i64 },"));
+}
+
+#[test]
+fn inline_choice_codec_routes_through_synthesized_type() {
+    let input = hoisted_input(torture_inline_choice_rules(), "zig", HashMap::new());
+    let mut warnings = Vec::new();
+    let config = ZigConfig::from_options(&input.config.options).unwrap();
+    let codec = generate_codec(&input, &config, &mut warnings).unwrap();
+
+    // A hoisted field calls the synthesized type's own enc_/dec_, not the bare
+    // `w_text`/`as_text` stub the pre-fix bare-string collapse produced.
+    assert!(codec.contains("try enc_TortureInlineChoice_mixed_inline(out, &(v.mixed_inline));"));
+    assert!(codec.contains(
+        "try dec_TortureInlineChoice_mixed_inline(alloc, csil_fv, &(out.mixed_inline));"
+    ));
+    // Nothing fell through to the unrepresentable-shape/no-codec stub.
+    assert!(
+        warnings.is_empty(),
+        "unexpected codec warnings: {warnings:?}"
+    );
+}
+
+#[test]
+fn optional_inline_choice_field_hoists_and_stays_optional() {
+    // The real APIError.error_type shape from examples/real-world-api/e-commerce-api.csil
+    // line 360: an optional field whose type is an inline mixed choice.
+    let mut entry = bare_entry(
+        "error_type",
+        CsilTypeExpression::Choice(vec![
+            builtin("text"),
+            text_lit("not_found"),
+            text_lit("permission_denied"),
+        ]),
+    );
+    entry.occurrence = Some(CsilOccurrence::Optional);
+    let input = hoisted_input(
+        vec![group_rule("APIError", vec![entry])],
+        "zig",
+        HashMap::new(),
+    );
+    let config = ZigConfig::from_options(&input.config.options).unwrap();
+    let types = generate_types(&input, &config).unwrap();
+    assert!(types.contains("pub const APIError_error_type = union(enum) {"));
+    assert!(types.contains("error_type: ?APIError_error_type = null,"));
+}
+
+/// Case-insensitive collision regression (mirrors
+/// `csilgen-common::hoist::case_insensitive_collision_between_existing_and_synthesized_rule_is_disambiguated`),
+/// proven at the zig-output level rather than just against the intermediate spec: an
+/// existing rule `UserData` and a field `User.data` typed as an inline MIXED-kind
+/// literal choice (`"x" / 1`) would naively synthesize `User_data` — which
+/// case-insensitively collides with `UserData` (`canonical_key` strips separators and
+/// lowercases both to `"userdata"`). The shared hoister must disambiguate the
+/// synthesized name so zig's generated output declares two DISTINCT types rather than
+/// emitting `pub const User_data` twice (a non-compiling duplicate declaration).
+#[test]
+fn case_insensitive_collision_between_existing_and_synthesized_rule_is_disambiguated_in_output() {
+    let user_data = group_rule("UserData", vec![bare_entry("value", builtin("text"))]);
+    let user = group_rule(
+        "User",
+        vec![bare_entry(
+            "data",
+            CsilTypeExpression::Choice(vec![
+                text_lit("x"),
+                CsilTypeExpression::Literal(CsilLiteralValue::Integer(1)),
+            ]),
+        )],
+    );
+    let input = hoisted_input(vec![user_data, user], "zig", HashMap::new());
+    let config = ZigConfig::from_options(&input.config.options).unwrap();
+    let types = generate_types(&input, &config).unwrap();
+
+    // The original `UserData` rule survives unchanged.
+    assert!(types.contains("pub const UserData = struct {"), "{types}");
+    // The synthesized rule must NOT be the raw "User_data" (that collides); it must
+    // be disambiguated (e.g. "User_data_2" per the shared hoister's numeric suffix).
+    assert!(
+        !types.contains("pub const User_data ="),
+        "synthesized name collided with UserData but was not disambiguated: {types}"
+    );
+    // `User_data` still appears only as `UserData`'s disambiguated sibling's
+    // declaration marker is absent — check the actual declaration count of any
+    // `User_data`-prefixed type is exactly one (the disambiguated form), not a
+    // duplicate `pub const User_data` declaration that would fail to compile.
+    let declares_bare_user_data = types
+        .lines()
+        .filter(|line| line.trim_start().starts_with("pub const User_data ="))
+        .count();
+    assert_eq!(
+        declares_bare_user_data, 0,
+        "the raw (colliding) name must never be declared: {types}"
+    );
+    // The disambiguated synthesized type is present and is the field's referenced
+    // type, proving the field itself still routes through it correctly.
+    assert!(
+        types.contains("data: User_data_2,"),
+        "field must reference the disambiguated synthesized type: {types}"
+    );
+    assert!(types.contains("pub const User_data_2 = enum {"), "{types}");
 }
 
 #[test]
@@ -301,6 +688,12 @@ fn acronyms_snake_case_as_one_word() {
 
 #[test]
 fn reserved_word_field_is_quoted() {
+    // `error` is a true Zig keyword and stays `@"..."`-quoted as a field. `type` is
+    // only a primitive type name, not a keyword; empirically (zig 0.14 `zig fmt`)
+    // it is unambiguous in field-name position and `zig fmt` canonicalizes a quoted
+    // `@"type"` field down to bare `type`, so the generator must emit it bare too
+    // (see `zig_field_ident` / `ZIG_PRIMITIVE_NAMES` in lib.rs) or `zig fmt --check`
+    // rewrites the output.
     let input = input_with_rules(
         vec![group_rule(
             "Wrapper",
@@ -315,7 +708,7 @@ fn reserved_word_field_is_quoted() {
     let config = ZigConfig::from_options(&input.config.options).unwrap();
     let types = generate_types(&input, &config).unwrap();
     assert!(types.contains("@\"error\": []const u8,"));
-    assert!(types.contains("@\"type\": []const u8,"));
+    assert!(types.contains("    type: []const u8,"));
 }
 
 #[test]
@@ -373,14 +766,14 @@ fn client_emits_typed_struct_with_verbatim_wire_names() {
     let client = generate_client(&input).expect("client emitted");
     assert!(client.contains("pub const AttestationClient = struct"));
     // Typed seam: a typed request in, a typed response out, codec called internally;
-    // kebab -> snake for the Zig method, service base lowercased and op PascalCased
+    // kebab -> snake for the Zig method, verbatim CSIL service and operation names
     // for the wire strings.
     assert!(client.contains(
         "pub fn deposit_claim(self: AttestationClient, alloc: std.mem.Allocator, req: *const types.DepositClaimRequest, out: *types.DepositClaimResponse) anyerror!void"
     ));
     assert!(client.contains("codec.encode_DepositClaimRequest(alloc, req)"));
     assert!(client.contains("codec.decode_DepositClaimResponse(alloc, csil_respb, out)"));
-    assert!(client.contains("\"attestation\", \"DepositClaim\""));
+    assert!(client.contains("\"AttestationService\", \"deposit-claim\""));
     assert!(client.contains("CsilgenTransport"));
 }
 
@@ -422,7 +815,7 @@ fn server_emits_handlers_wire_ids_and_compact_router() {
     // Verbose + compact router twins.
     assert!(server.contains("pub fn route_chat_channel("));
     assert!(server.contains("pub fn route_chat_channel_compact("));
-    assert!(server.contains("std.mem.eql(u8, method, \"Say\")"));
+    assert!(server.contains("std.mem.eql(u8, method, \"say\")"));
     assert!(server.contains("        0 => {"));
 }
 
@@ -837,8 +1230,8 @@ const client = @import("client.gen.zig");
 // response, exercising decode and encode on the far side of the seam.
 fn stub_call(ptr: *anyopaque, alloc: std.mem.Allocator, service: []const u8, op: []const u8, reqb: []const u8) anyerror![]u8 {
     _ = ptr;
-    std.debug.assert(std.mem.eql(u8, service, "corndogs"));
-    std.debug.assert(std.mem.eql(u8, op, "SubmitTask"));
+    std.debug.assert(std.mem.eql(u8, service, "CorndogsService"));
+    std.debug.assert(std.mem.eql(u8, op, "submit-task"));
     var in: types.SubmitTaskRequest = undefined;
     try codec.decode_SubmitTaskRequest(alloc, reqb, &in);
     return codec.encode_Task(alloc, &in.task);
@@ -927,6 +1320,210 @@ pub fn main() !void {
     const empty_bytes = try codec.encode_GetQueuesRequest(a, &empty_req);
     var empty_back: types.GetQueuesRequest = undefined;
     try codec.decode_GetQueuesRequest(a, empty_bytes, &empty_back);
+
+    const stdout = std.io.getStdOut().writer();
+    try stdout.print("ok\n", .{});
+}
+"#;
+
+/// Empirically probe enum-decode membership validation with the real `zig`
+/// toolchain: decoding an out-of-set text value against an all-literal text choice
+/// (`"purple"` against `Color = "red" / "green" / "blue"`) and an out-of-set int
+/// value against an int choice (`99` against `Level = 1 / 2 / 3`) must both surface
+/// the codec's standard `error.WrongType`, and a valid member must still decode to
+/// the byte-identical variant. Skips cleanly when `zig` is not on PATH.
+#[test]
+fn enum_decode_rejects_out_of_set_value() {
+    let have_zig = std::process::Command::new("zig")
+        .arg("version")
+        .output()
+        .is_ok();
+    if !have_zig {
+        eprintln!("skipping: no zig on PATH");
+        return;
+    }
+
+    let color = CsilRule {
+        name: "Color".to_string(),
+        rule_type: CsilRuleType::TypeChoice(vec![
+            CsilTypeExpression::Literal(CsilLiteralValue::Text("red".to_string())),
+            CsilTypeExpression::Literal(CsilLiteralValue::Text("green".to_string())),
+            CsilTypeExpression::Literal(CsilLiteralValue::Text("blue".to_string())),
+        ]),
+        position: pos(),
+        doc_comments: vec![],
+    };
+    let level = CsilRule {
+        name: "Level".to_string(),
+        rule_type: CsilRuleType::TypeChoice(vec![
+            CsilTypeExpression::Literal(CsilLiteralValue::Integer(1)),
+            CsilTypeExpression::Literal(CsilLiteralValue::Integer(2)),
+            CsilTypeExpression::Literal(CsilLiteralValue::Integer(3)),
+        ]),
+        position: pos(),
+        doc_comments: vec![],
+    };
+    let input = input_with_rules(vec![color, level], "zig", HashMap::new());
+    let out = process_generation(input).unwrap();
+
+    let dir = std::env::temp_dir().join(format!("csilgen-zig-enum-decode-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    for file in &out.files {
+        std::fs::write(dir.join(&file.path), &file.content).unwrap();
+    }
+    std::fs::write(dir.join("driver.zig"), ENUM_DECODE_DRIVER_ZIG).unwrap();
+
+    let run = std::process::Command::new("zig")
+        .arg("run")
+        .arg(dir.join("driver.zig"))
+        .arg("--cache-dir")
+        .arg(dir.join("zig-cache"))
+        .output()
+        .unwrap();
+    assert!(
+        run.status.success(),
+        "zig enum-decode probe failed:\n{}{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&run.stdout).trim(), "ok");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+const ENUM_DECODE_DRIVER_ZIG: &str = r#"const std = @import("std");
+const types = @import("types.gen.zig");
+const codec = @import("codec.gen.zig");
+
+pub fn main() !void {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Valid member decodes to the byte-identical variant.
+    const red_bytes = try codec.encode_Color(a, &types.Color.red);
+    var red_back: types.Color = undefined;
+    try codec.decode_Color(a, red_bytes, &red_back);
+    std.debug.assert(red_back == .red);
+
+    // An out-of-set text value must be rejected with the codec's standard error.
+    // Hand-built canonical CBOR for the 6-byte text string "purple": major type 3
+    // (text string), length 6 in the initial byte, then the raw UTF-8 bytes.
+    const purple_bytes = [_]u8{ 0x66, 'p', 'u', 'r', 'p', 'l', 'e' };
+    var bad_color: types.Color = undefined;
+    const color_result = codec.decode_Color(a, &purple_bytes, &bad_color);
+    if (color_result) |_| {
+        return error.OutOfSetColorWasAccepted;
+    } else |err| {
+        std.debug.assert(err == error.WrongType);
+    }
+
+    // Valid int member decodes to the byte-identical variant.
+    const two_bytes = try codec.encode_Level(a, &types.Level.v2);
+    var two_back: types.Level = undefined;
+    try codec.decode_Level(a, two_bytes, &two_back);
+    std.debug.assert(two_back == .v2);
+
+    // An out-of-set int value must be rejected with the codec's standard error.
+    // Hand-built canonical CBOR for the unsigned int 99: major type 0, 1-byte
+    // extended length (additional info 24 = 0x18) then the raw value byte.
+    const ninetynine_bytes = [_]u8{ 0x18, 99 };
+    var bad_level: types.Level = undefined;
+    const level_result = codec.decode_Level(a, &ninetynine_bytes, &bad_level);
+    if (level_result) |_| {
+        return error.OutOfSetLevelWasAccepted;
+    } else |err| {
+        std.debug.assert(err == error.WrongType);
+    }
+
+    const stdout = std.io.getStdOut().writer();
+    try stdout.print("ok\n", .{});
+}
+"#;
+
+/// Empirically prove the `MixedEnum` codec with the real `zig` toolchain: every
+/// declared literal (`Rank`'s text/int/negative-int/bool/float/bytes members)
+/// round-trips through encode/decode, and a value outside the declared vocabulary
+/// — for each of a same-kind (an unlisted int) and a different-kind (a bool where
+/// none is declared true... covered above, so use an unlisted text) probe — is
+/// rejected with the codec's standard `error.WrongType`, proving decode is a
+/// membership check across the whole mixed vocabulary, not a same-kind runtime
+/// check. Skips cleanly when no zig toolchain is on PATH or pinned under
+/// catalyst-tools.
+#[test]
+fn mixed_enum_round_trips_and_rejects_out_of_vocabulary_through_zig() {
+    let Some(zig) = zig_bin() else {
+        eprintln!("skipping: no zig toolchain");
+        return;
+    };
+
+    let input = input_with_rules(vec![rank_rule()], "zig", HashMap::new());
+    let out = process_generation(input).unwrap();
+
+    let dir = std::env::temp_dir().join(format!("csilgen-zig-mixed-enum-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    for file in &out.files {
+        std::fs::write(dir.join(&file.path), &file.content).unwrap();
+    }
+    std::fs::write(dir.join("driver.zig"), MIXED_ENUM_DRIVER_ZIG).unwrap();
+
+    let run = std::process::Command::new(&zig)
+        .arg("run")
+        .arg(dir.join("driver.zig"))
+        .arg("--cache-dir")
+        .arg(dir.join("zig-cache"))
+        .output()
+        .unwrap();
+    assert!(
+        run.status.success(),
+        "zig mixed-enum round-trip failed:\n{}{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&run.stdout).trim(), "ok");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+const MIXED_ENUM_DRIVER_ZIG: &str = r#"const std = @import("std");
+const types = @import("types.gen.zig");
+const codec = @import("codec.gen.zig");
+
+pub fn main() !void {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Every declared literal round-trips to the byte-identical member.
+    const members = [_]types.Rank{ .gold, .v1, .v_neg2, .v_true, .v3_5, .v5 };
+    for (members) |m| {
+        const bytes = try codec.encode_Rank(a, &m);
+        var back: types.Rank = undefined;
+        try codec.decode_Rank(a, bytes, &back);
+        std.debug.assert(back == m);
+    }
+
+    // A same-kind, out-of-vocabulary int must be rejected.
+    // Hand-built canonical CBOR for the unsigned int 42: major type 0, 1-byte
+    // extended length (additional info 24 = 0x18) then the raw value byte.
+    const stray_int = [_]u8{ 0x18, 42 };
+    var bad_int: types.Rank = undefined;
+    if (codec.decode_Rank(a, &stray_int, &bad_int)) |_| {
+        return error.OutOfVocabularyIntWasAccepted;
+    } else |err| {
+        std.debug.assert(err == error.WrongType);
+    }
+
+    // A different-kind, out-of-vocabulary text value must also be rejected —
+    // decode must membership-match across every declared literal kind, not just
+    // reject-or-accept by runtime type.
+    const stray_text = [_]u8{ 0x66, 's', 'i', 'l', 'v', 'e', 'r' };
+    var bad_text: types.Rank = undefined;
+    if (codec.decode_Rank(a, &stray_text, &bad_text)) |_| {
+        return error.OutOfVocabularyTextWasAccepted;
+    } else |err| {
+        std.debug.assert(err == error.WrongType);
+    }
 
     const stdout = std.io.getStdOut().writer();
     try stdout.print("ok\n", .{});
@@ -1323,3 +1920,337 @@ fn genquickstart_sections_compile_with_zig() {
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// The real `OrderStatus` shape from examples/real-world-api/e-commerce-api.csil line
+/// 138: a general `text` arm (index 0) plus 7 literal arms (indices 1-7, in declaration
+/// order). Used by both the plain shape-assertion test above and the zig-toolchain
+/// wire-format proof below.
+fn order_status_rule() -> CsilRule {
+    CsilRule {
+        name: "OrderStatus".to_string(),
+        rule_type: CsilRuleType::TypeDef(CsilTypeExpression::Choice(vec![
+            builtin("text"),
+            CsilTypeExpression::Literal(CsilLiteralValue::Text("pending".to_string())),
+            CsilTypeExpression::Literal(CsilLiteralValue::Text("confirmed".to_string())),
+            CsilTypeExpression::Literal(CsilLiteralValue::Text("processing".to_string())),
+            CsilTypeExpression::Literal(CsilLiteralValue::Text("shipped".to_string())),
+            CsilTypeExpression::Literal(CsilLiteralValue::Text("delivered".to_string())),
+            CsilTypeExpression::Literal(CsilLiteralValue::Text("cancelled".to_string())),
+            CsilTypeExpression::Literal(CsilLiteralValue::Text("refunded".to_string())),
+        ])),
+        position: pos(),
+        doc_comments: vec![],
+    }
+}
+
+/// Proves the mixed-union wire contract end-to-end with the real `zig` compiler:
+/// the tagged sum is `[variant_index, value]` (0-based declaration order), a literal
+/// arm's own index wins on encode, the general `text` arm is index 0, decode dispatches
+/// by index, and a literal-typed arm validates its payload on decode (mismatch ->
+/// `error.WrongType`). Skips cleanly when no zig toolchain is on PATH or pinned under
+/// catalyst-tools, so the suite stays portable.
+#[test]
+fn order_status_mixed_union_wire_format_round_trips_through_zig() {
+    let Some(zig) = zig_bin() else {
+        eprintln!("skipping: no zig toolchain");
+        return;
+    };
+
+    let input = input_with_rules(vec![order_status_rule()], "zig", HashMap::new());
+    let out = process_generation(input).unwrap();
+
+    let dir = std::env::temp_dir().join(format!("csilgen-zig-order-status-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    for file in &out.files {
+        std::fs::write(dir.join(&file.path), &file.content).unwrap();
+    }
+    std::fs::write(dir.join("driver.zig"), ORDER_STATUS_DRIVER_ZIG).unwrap();
+
+    let run = std::process::Command::new(&zig)
+        .arg("run")
+        .arg(dir.join("driver.zig"))
+        .arg("--cache-dir")
+        .arg(dir.join("zig-cache"))
+        .output()
+        .unwrap();
+    assert!(
+        run.status.success(),
+        "zig mixed-union wire-format proof failed:\n{}{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&run.stdout).trim(), "ok");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+const ORDER_STATUS_DRIVER_ZIG: &str = r#"const std = @import("std");
+const types = @import("types.gen.zig");
+const codec = @import("codec.gen.zig");
+
+pub fn main() !void {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Encoding the literal arm `.choice1 = "pending"` (declared index 1) must let
+    // that arm's own index win: wire form `[1, "pending"]`.
+    const v1 = types.OrderStatus{ .choice1 = "pending" };
+    const b1 = try codec.encode_OrderStatus(a, &v1);
+    const expected1 = [_]u8{ 0x82, 0x01, 0x67 } ++ "pending".*;
+    std.debug.assert(std.mem.eql(u8, b1, &expected1));
+
+    // Encoding the general `text` arm (declared index 0, the fallback) must wire as
+    // `[0, "on-hold"]` even though "on-hold" is not one of the suggested literals.
+    const v0 = types.OrderStatus{ .text = "on-hold" };
+    const b0 = try codec.encode_OrderStatus(a, &v0);
+    const expected0 = [_]u8{ 0x82, 0x00, 0x67 } ++ "on-hold".*;
+    std.debug.assert(std.mem.eql(u8, b0, &expected0));
+
+    // All 8 indices (0 = general text arm, 1-7 = the 7 literal arms in declaration
+    // order) must round-trip through encode/decode.
+    const Case = struct { value: types.OrderStatus, text: []const u8 };
+    const cases = [_]Case{
+        .{ .value = .{ .text = "on-hold" }, .text = "on-hold" },
+        .{ .value = .{ .choice1 = "pending" }, .text = "pending" },
+        .{ .value = .{ .choice2 = "confirmed" }, .text = "confirmed" },
+        .{ .value = .{ .choice3 = "processing" }, .text = "processing" },
+        .{ .value = .{ .choice4 = "shipped" }, .text = "shipped" },
+        .{ .value = .{ .choice5 = "delivered" }, .text = "delivered" },
+        .{ .value = .{ .choice6 = "cancelled" }, .text = "cancelled" },
+        .{ .value = .{ .choice7 = "refunded" }, .text = "refunded" },
+    };
+    for (cases) |case| {
+        const bytes = try codec.encode_OrderStatus(a, &case.value);
+        var back: types.OrderStatus = undefined;
+        try codec.decode_OrderStatus(a, bytes, &back);
+        const back_text = switch (back) {
+            .text => |s| s,
+            .choice1 => |s| s,
+            .choice2 => |s| s,
+            .choice3 => |s| s,
+            .choice4 => |s| s,
+            .choice5 => |s| s,
+            .choice6 => |s| s,
+            .choice7 => |s| s,
+        };
+        std.debug.assert(std.mem.eql(u8, back_text, case.text));
+        std.debug.assert(std.meta.activeTag(back) == std.meta.activeTag(case.value));
+    }
+
+    // Decoding `[1, "confirmed"]` (index 1 declares the literal arm "pending" but the
+    // payload is "confirmed") must reject the mismatch, not silently accept it.
+    const bad = [_]u8{ 0x82, 0x01, 0x69 } ++ "confirmed".*;
+    var mismatch_out: types.OrderStatus = undefined;
+    const decoded = codec.decode_OrderStatus(a, &bad, &mismatch_out);
+    if (decoded) |_| {
+        @panic("expected error.WrongType decoding a literal-arm payload mismatch");
+    } else |err| {
+        std.debug.assert(err == error.WrongType);
+    }
+
+    const stdout = std.io.getStdOut().writer();
+    try stdout.print("ok\n", .{});
+}
+"#;
+
+/// Proves the inline-choice hoisting fix byte-for-byte against an independently
+/// computed ground truth: `mixed_inline`/`pure_literal_inline`/`constrained_arm_inline`
+/// are cross-checked against the OCaml generator's own CBOR output for the identical
+/// `torture-inline-choice.csil` shape (the OCaml generator implements this exact wire
+/// contract already and is the algorithmic reference); the nested array-element/
+/// map-value/tuple-element positions (a gap the OCaml reference itself doesn't cover)
+/// are checked against hand-derived bytes following the same `[variant_index, value]`
+/// contract the direct-field cases already prove correct, plus a full-record
+/// encode/decode/re-encode round trip proving the array/map/tuple container wiring
+/// itself routes through the synthesized codecs. Skips cleanly when no zig toolchain
+/// is on PATH or pinned under catalyst-tools.
+#[test]
+fn inline_choice_wire_bytes_match_ocaml_ground_truth_through_zig() {
+    let Some(zig) = zig_bin() else {
+        eprintln!("skipping: no zig toolchain");
+        return;
+    };
+
+    let input = input_with_rules(torture_inline_choice_rules(), "zig", HashMap::new());
+    let out = process_generation(input).unwrap();
+
+    let dir =
+        std::env::temp_dir().join(format!("csilgen-zig-inline-choice-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    for file in &out.files {
+        std::fs::write(dir.join(&file.path), &file.content).unwrap();
+    }
+    std::fs::write(dir.join("driver.zig"), INLINE_CHOICE_DRIVER_ZIG).unwrap();
+
+    let run = std::process::Command::new(&zig)
+        .arg("run")
+        .arg(dir.join("driver.zig"))
+        .arg("--cache-dir")
+        .arg(dir.join("zig-cache"))
+        .output()
+        .unwrap();
+    assert!(
+        run.status.success(),
+        "zig inline-choice wire-format proof failed:\n{}{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&run.stdout).trim(), "ok");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+const INLINE_CHOICE_DRIVER_ZIG: &str = r#"const std = @import("std");
+const types = @import("types.gen.zig");
+const codec = @import("codec.gen.zig");
+
+pub fn main() !void {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // ---- direct-field cross-check against the OCaml ground truth ----
+    // (computed via ocaml-crosscheck/bin/dump.ml over torture-inline-choice.csil)
+    {
+        const v = types.TortureInlineChoice_mixed_inline{ .choice1 = "not_found" };
+        const b = try codec.encode_TortureInlineChoice_mixed_inline(a, &v);
+        const expected = [_]u8{ 0x82, 0x01, 0x69 } ++ "not_found".*;
+        std.debug.assert(std.mem.eql(u8, b, &expected));
+    }
+    {
+        const v = types.TortureInlineChoice_mixed_inline{ .choice2 = "permission_denied" };
+        const b = try codec.encode_TortureInlineChoice_mixed_inline(a, &v);
+        const expected = [_]u8{ 0x82, 0x02, 0x71 } ++ "permission_denied".*;
+        std.debug.assert(std.mem.eql(u8, b, &expected));
+    }
+    {
+        const v = types.TortureInlineChoice_mixed_inline{ .choice3 = "invalid_input" };
+        const b = try codec.encode_TortureInlineChoice_mixed_inline(a, &v);
+        const expected = [_]u8{ 0x82, 0x03, 0x6d } ++ "invalid_input".*;
+        std.debug.assert(std.mem.eql(u8, b, &expected));
+    }
+    {
+        // The open `text` arm (index 0) carries a value that is not one of the
+        // suggested literals, proving the open arm stays reachable.
+        const v = types.TortureInlineChoice_mixed_inline{ .text = "banana" };
+        const b = try codec.encode_TortureInlineChoice_mixed_inline(a, &v);
+        const expected = [_]u8{ 0x82, 0x00, 0x66 } ++ "banana".*;
+        std.debug.assert(std.mem.eql(u8, b, &expected));
+    }
+    {
+        const v = types.TortureInlineChoice_pure_literal_inline.active;
+        const b = try codec.encode_TortureInlineChoice_pure_literal_inline(a, &v);
+        const expected = [_]u8{0x66} ++ "active".*;
+        std.debug.assert(std.mem.eql(u8, b, &expected));
+    }
+    {
+        const v = types.TortureInlineChoice_pure_literal_inline.inactive;
+        const b = try codec.encode_TortureInlineChoice_pure_literal_inline(a, &v);
+        const expected = [_]u8{0x68} ++ "inactive".*;
+        std.debug.assert(std.mem.eql(u8, b, &expected));
+    }
+    {
+        const v = types.TortureInlineChoice_pure_literal_inline.pending;
+        const b = try codec.encode_TortureInlineChoice_pure_literal_inline(a, &v);
+        const expected = [_]u8{0x67} ++ "pending".*;
+        std.debug.assert(std.mem.eql(u8, b, &expected));
+    }
+    {
+        const v = types.TortureInlineChoice_constrained_arm_inline{ .choice1 = "low" };
+        const b = try codec.encode_TortureInlineChoice_constrained_arm_inline(a, &v);
+        const expected = [_]u8{ 0x82, 0x01, 0x63 } ++ "low".*;
+        std.debug.assert(std.mem.eql(u8, b, &expected));
+    }
+    {
+        // `"high" .default "normal"`: the trailing control operator must not knock
+        // this arm out of literal classification (the classification-bug shape).
+        const v = types.TortureInlineChoice_constrained_arm_inline{ .choice2 = "high" };
+        const b = try codec.encode_TortureInlineChoice_constrained_arm_inline(a, &v);
+        const expected = [_]u8{ 0x82, 0x02, 0x64 } ++ "high".*;
+        std.debug.assert(std.mem.eql(u8, b, &expected));
+    }
+    {
+        const v = types.TortureInlineChoice_constrained_arm_inline{ .text = "orange" };
+        const b = try codec.encode_TortureInlineChoice_constrained_arm_inline(a, &v);
+        const expected = [_]u8{ 0x82, 0x00, 0x66 } ++ "orange".*;
+        std.debug.assert(std.mem.eql(u8, b, &expected));
+    }
+
+    // ---- nested-position hand-derived bytes (same [idx, value] wire contract,
+    // a case the OCaml reference itself does not implement) ----
+    {
+        const v = types.TortureInlineChoice_tag_list_item{ .choice1 = "red" };
+        const b = try codec.encode_TortureInlineChoice_tag_list_item(a, &v);
+        const expected = [_]u8{ 0x82, 0x01, 0x63 } ++ "red".*;
+        std.debug.assert(std.mem.eql(u8, b, &expected));
+    }
+    {
+        const v = types.TortureInlineChoice_label_map_value{ .choice1 = "urgent" };
+        const b = try codec.encode_TortureInlineChoice_label_map_value(a, &v);
+        const expected = [_]u8{ 0x82, 0x01, 0x66 } ++ "urgent".*;
+        std.debug.assert(std.mem.eql(u8, b, &expected));
+    }
+    {
+        const v = types.TortureInlineChoice_coord_0{ .choice1 = "lat" };
+        const b = try codec.encode_TortureInlineChoice_coord_0(a, &v);
+        const expected = [_]u8{ 0x82, 0x01, 0x63 } ++ "lat".*;
+        std.debug.assert(std.mem.eql(u8, b, &expected));
+    }
+
+    // ---- decode-time literal validation ----
+    {
+        var out: types.TortureInlineChoice_pure_literal_inline = undefined;
+        const bad = [_]u8{0x67} ++ "unknown".*;
+        const decoded = codec.decode_TortureInlineChoice_pure_literal_inline(a, &bad, &out);
+        if (decoded) |_| {
+            @panic("expected error.WrongType decoding an unknown enum literal");
+        } else |err| {
+            std.debug.assert(err == error.WrongType);
+        }
+    }
+    {
+        var out: types.TortureInlineChoice_mixed_inline = undefined;
+        // index 1 declares literal "not_found" but the payload disagrees.
+        const bad = [_]u8{ 0x82, 0x01, 0x66 } ++ "wrong!".*;
+        const decoded = codec.decode_TortureInlineChoice_mixed_inline(a, &bad, &out);
+        if (decoded) |_| {
+            @panic("expected error.WrongType decoding a literal-arm payload mismatch");
+        } else |err| {
+            std.debug.assert(err == error.WrongType);
+        }
+    }
+
+    // ---- full-record round trip through the array/map/tuple container wiring ----
+    var tags = [_]types.TortureInlineChoice_tag_list_item{
+        .{ .choice1 = "red" },
+        .{ .text = "cyan" },
+    };
+    var labels = std.StringHashMapUnmanaged(types.TortureInlineChoice_label_map_value){};
+    try labels.put(a, "k1", .{ .choice2 = "normal" });
+
+    const rec = types.TortureInlineChoice{
+        .mixed_inline = .{ .choice1 = "not_found" },
+        .pure_literal_inline = .pending,
+        .constrained_arm_inline = .{ .choice2 = "high" },
+        .tag_list = &tags,
+        .label_map = labels,
+        .coord = .{ .{ .choice2 = "lon" }, 42 },
+    };
+    const bytes = try codec.encode_TortureInlineChoice(a, &rec);
+    var back: types.TortureInlineChoice = undefined;
+    try codec.decode_TortureInlineChoice(a, bytes, &back);
+    const bytes2 = try codec.encode_TortureInlineChoice(a, &back);
+    std.debug.assert(std.mem.eql(u8, bytes, bytes2));
+
+    std.debug.assert(back.tag_list.len == 2);
+    std.debug.assert(std.mem.eql(u8, back.tag_list[0].choice1, "red"));
+    std.debug.assert(std.mem.eql(u8, back.tag_list[1].text, "cyan"));
+    std.debug.assert(std.mem.eql(u8, back.label_map.get("k1").?.choice2, "normal"));
+    std.debug.assert(std.mem.eql(u8, back.coord[0].choice2, "lon"));
+    std.debug.assert(back.coord[1] == 42);
+
+    const stdout = std.io.getStdOut().writer();
+    try stdout.print("ok\n", .{});
+}
+"#;

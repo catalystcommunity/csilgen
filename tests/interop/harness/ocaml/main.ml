@@ -9,7 +9,7 @@ module T = Interop_api.Types
 module C = Interop_api.Codec
 module CB = Interop_api.Csil_cbor
 
-let service = "interop"
+let service = "Interop"
 
 (* --------------------------------------------------------------------------- *)
 (* Fixed language-neutral test vectors (see README "Fixed test vectors").       *)
@@ -26,6 +26,22 @@ let scalars_ok () : T.scalars =
     flag = true;
     when_ = "2026-06-29T12:34:56Z";
     amount = "123.45";
+    (* mixed-union coverage: a value equal to a literal arm must wire as
+       [1,"pending"]; a value with no literal match must wire as [0,...]. *)
+    status_literal = T.Pending;
+    status_free = T.Other "unlisted";
+    (* inline mixed choice (hoisted; literal arm match). *)
+    note = T.Info;
+    (* inline all-literal choice (not hoisted). *)
+    size = T.Medium;
+    (* named enum with a trailing `.default`-constrained last arm. *)
+    level = T.High;
+    (* named enum assembled via base rule + `/=` extension. *)
+    season = T.Autumn;
+    (* named all-literal enum with mixed literal kinds (text + int arms);
+       renders as a real OCaml variant with nullary constructors. *)
+    ship_text = T.Ground;
+    ship_int = T.V_2;
   }
 
 let collections_ok () : T.collections =
@@ -187,21 +203,21 @@ let rpc_server listener =
   let handler (req : Rpc.request) : Rpc.handler_outcome =
     let malformed = Rpc.transport Conventions.status_malformed_envelope in
     match req.Rpc.op with
-    | "EchoScalars" -> (
+    | "echo-scalars" -> (
       match C.decode_scalars_bytes req.Rpc.payload with
       | v -> Rpc.reply "Scalars" (C.encode_scalars_bytes v)
       | exception Failure m -> malformed m)
-    | "EchoCollections" -> (
+    | "echo-collections" -> (
       match C.decode_collections_bytes req.Rpc.payload with
       | v -> Rpc.reply "Collections" (C.encode_collections_bytes v)
       | exception Failure m -> malformed m)
-    | "EchoNested" -> (
+    | "echo-nested" -> (
       match C.decode_nested_bytes req.Rpc.payload with
       | v ->
         let r : T.echo_nested_result = { ok = true; echo = v } in
         Rpc.reply "EchoNestedResult" (C.encode_echo_nested_result_bytes r)
       | exception Failure m -> malformed m)
-    | "ValidateConstrained" -> (
+    | "validate-constrained" -> (
       match C.decode_constrained_bytes req.Rpc.payload with
       | v ->
         if valid_constrained v then Rpc.reply "Constrained" (C.encode_constrained_bytes v)
@@ -276,10 +292,10 @@ let send_event (carrier : Carrier.frame_carrier) (ev : Events.event) =
   | Error _ -> ()
 
 let on_tick_event (t : T.tick) : Events.event =
-  Events.new_verbose_event (Some service) "OnTick" (C.encode_tick_bytes t)
+  Events.new_verbose_event (Some service) "on-tick" (C.encode_tick_bytes t)
 
 let duplex_event (s : T.scalars) : Events.event =
-  Events.new_verbose_event (Some service) "Duplex" (C.encode_scalars_bytes s)
+  Events.new_verbose_event (Some service) "duplex" (C.encode_scalars_bytes s)
 
 let events_server listener =
   let rec accept_loop () =
@@ -322,7 +338,7 @@ let events_server listener =
                 loop ()
               end
               else if name = Events.close_name then ()
-              else if name = "Duplex" then begin
+              else if name = "duplex" then begin
                 (match C.decode_scalars_bytes ev.Events.payload with
                  | s -> send_event carrier (duplex_event s)
                  | exception _ -> ());
@@ -372,7 +388,7 @@ let events_client fd =
     match carrier.Carrier.recv_frame () with
     | Ok (Some f) -> (
       match Events.decode_event f Events.Verbose with
-      | Ok ev when ev.Events.event = Some "OnTick" -> (
+      | Ok ev when ev.Events.event = Some "on-tick" -> (
         match C.decode_tick_bytes ev.Events.payload with
         | t when t.T.seq = Int64.of_int expect -> ()
         | t ->
@@ -384,7 +400,7 @@ let events_client fd =
       | Ok ev ->
         tick_ok := false;
         detail :=
-          Printf.sprintf "expected OnTick got %s"
+          Printf.sprintf "expected on-tick got %s"
             (match ev.Events.event with Some n -> n | None -> "<none>")
       | Error e ->
         tick_ok := false;
@@ -400,7 +416,7 @@ let events_client fd =
   (match carrier.Carrier.recv_frame () with
    | Ok (Some f) -> (
      match Events.decode_event f Events.Verbose with
-     | Ok ev when ev.Events.event = Some "Duplex" -> (
+     | Ok ev when ev.Events.event = Some "duplex" -> (
        match C.decode_scalars_bytes ev.Events.payload with
        | s -> check cs "duplex/success" (s = scalars_ok ()) "echo mismatch"
        | exception Failure m -> fail cs "duplex/success" m)

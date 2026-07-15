@@ -36,8 +36,8 @@ use csilgen_common::{
 };
 use std::collections::{BTreeSet, HashSet};
 
-const DEFAULT_TYPES_MODULE: &str = "./types.gen";
-const DEFAULT_CODEC_MODULE: &str = "./codec.gen";
+const TYPES_STEM: &str = "types.gen";
+const CODEC_STEM: &str = "codec.gen";
 const DEFAULT_AGGREGATE: &str = "ApiClient";
 
 // The dumb byte transport seam: the caller-owned carrier performs the call named by
@@ -71,6 +71,7 @@ fn codec_iface(shape: ClientShape) -> String {
 pub fn generate(input: &WasmGeneratorInput, shape: ClientShape) -> Result<String, String> {
     let mode = common::bidi_transport(input)?;
     let mapping = common::decimal_mapping(input)?;
+    let ext = common::import_extension(input)?;
     let spec = &input.csil_spec;
     let services = common::sorted_services(spec);
 
@@ -109,7 +110,8 @@ pub fn generate(input: &WasmGeneratorInput, shape: ClientShape) -> Result<String
     imports.dedup();
     let mut any_import = false;
     if !imports.is_empty() {
-        let module = string_option(input, "client_types_module", DEFAULT_TYPES_MODULE);
+        let default_types_module = ext.specifier(TYPES_STEM);
+        let module = string_option(input, "client_types_module", &default_types_module);
         out.push_str(&format!(
             "import type {{ {} }} from \"{module}\";\n",
             imports.join(", ")
@@ -119,7 +121,8 @@ pub fn generate(input: &WasmGeneratorInput, shape: ClientShape) -> Result<String
     // The typed methods call the generated `to<T>Cbor`/`from<T>Cbor` (and, for the
     // rpc-mode poll path, the value-tree helpers); import exactly those from the codec.
     if !codec_imports.is_empty() {
-        let module = string_option(input, "client_codec_module", DEFAULT_CODEC_MODULE);
+        let default_codec_module = ext.specifier(CODEC_STEM);
+        let module = string_option(input, "client_codec_module", &default_codec_module);
         out.push_str(&format!(
             "import {{ {} }} from \"{module}\";\n",
             codec_imports.into_iter().collect::<Vec<_>>().join(", ")

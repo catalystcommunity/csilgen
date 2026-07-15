@@ -494,16 +494,18 @@ pub struct WasmGeneratorError {
 /// Standard WASM function signatures that generators must implement:
 ///
 /// ```no_run
-/// // Core generator function - takes serialized input, returns serialized output
+/// // Core generator function - takes serialized input, returns a pointer to
+/// // length-prefixed (4-byte LE u32 + JSON) serialized output, or null on
+/// // failure. This is a two-argument function returning a single pointer, not
+/// // an out-parameter calling convention — see docs/generator-plugin-contract.md
+/// // §2 for the normative version of this signature.
 /// #[unsafe(no_mangle)]
 /// pub extern "C" fn generate(
 ///     input_ptr: *const u8,
 ///     input_len: usize,
-///     output_ptr: *mut *mut u8,
-///     output_len: *mut usize
-/// ) -> i32 {
+/// ) -> *mut u8 {
 ///     // Implementation would go here
-///     0 // Return success code
+///     std::ptr::null_mut() // null signals failure
 /// }
 ///
 /// // Memory management functions

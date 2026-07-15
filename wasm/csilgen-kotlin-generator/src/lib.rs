@@ -7,11 +7,12 @@
 //! `wasm/csilgen-go-generator`; feature coverage mirrors `wasm/csilgen-python-generator`.
 
 use csilgen_common::{
-    CsilControlOperator, CsilFieldMetadata, CsilGroupEntry, CsilGroupExpression, CsilGroupKey,
-    CsilLiteralValue, CsilOccurrence, CsilRuleType, CsilServiceDefinition, CsilServiceDirection,
-    CsilServiceOperation, CsilSizeConstraint, CsilTypeExpression, CsilValidationConstraint,
-    GeneratedFile, GenerationStats, GeneratorCapability, GeneratorMetadata, GeneratorWarning,
-    WarningLevel, WasmGeneratorInput, WasmGeneratorOutput, wasm_interface::*,
+    ChoiceClass, CsilControlOperator, CsilFieldMetadata, CsilGroupEntry, CsilGroupExpression,
+    CsilGroupKey, CsilLiteralValue, CsilOccurrence, CsilRuleType, CsilServiceDefinition,
+    CsilServiceDirection, CsilServiceOperation, CsilSizeConstraint, CsilTypeExpression,
+    CsilValidationConstraint, GeneratedFile, GenerationStats, GeneratorCapability,
+    GeneratorMetadata, GeneratorWarning, HoistOptions, WarningLevel, WasmGeneratorInput,
+    WasmGeneratorOutput, choice_arm_literal, hoist_inline_composites, wasm_interface::*,
 };
 use std::collections::HashMap;
 
@@ -149,7 +150,21 @@ impl ClientShape {
     }
 }
 
-fn process_generation(input: WasmGeneratorInput) -> Result<WasmGeneratorOutput, i32> {
+fn process_generation(mut input: WasmGeneratorInput) -> Result<WasmGeneratorOutput, i32> {
+    // Lift every inline (anonymous) group/choice to a synthesized named rule up front,
+    // so all downstream generation (types, codec, client, services) sees one uniform
+    // spec in which those shapes are ordinary named references with real codecs.
+    // Kotlin records and choices are nominal (`map_csil_type_to_kotlin`/`kotlin_enc_
+    // value`/`kotlin_dec_value` can only route a field through a *named* rule or the
+    // opaque `Any`/`CborValue.CNull` fallback), so an ALL-literal choice is hoisted
+    // too (`hoist_all_literal_choices: true`) — unlike TypeScript/Go, Kotlin has no
+    // bare-inline-enum rendering to fall back to; every choice needs a name.
+    input.csil_spec = hoist_inline_composites(
+        &input.csil_spec,
+        HoistOptions {
+            hoist_all_literal_choices: true,
+        },
+    );
     let config = KotlinConfig::from_options(&input.config.options);
     // Validate `client_style` early so a bad value fails the whole run regardless of the
     // requested surface, mirroring the TypeScript generator's option validation.
@@ -930,7 +945,7 @@ fn first_channel_example(input: &WasmGeneratorInput) -> Option<ChannelExample> {
             let iface = pascal_case(&rule.name);
             return Some(ChannelExample {
                 iface: iface.clone(),
-                service_wire: wire_service_name(&rule.name),
+                service_wire: rule.name.clone(),
                 route_fn: format!("route{iface}Channel"),
                 encode_fn: format!("encode{iface}{}", pascal_case(&op.name)),
                 inbound_type: pascal_case(reference_raw(&op.input_type)),
@@ -1051,6 +1066,10 @@ fn enum_default_kotlin(
             CsilLiteralValue::Integer(n) => Some(format!("{iface}.{}", enum_int_variant(*n))),
             _ => None,
         },
+        ChoiceKind::MixedEnum => mixed_enum_members(choices)
+            .into_iter()
+            .find(|(_, lit)| *lit == value)
+            .map(|(variant, _)| format!("{iface}.{variant}")),
         ChoiceKind::Union => None,
     }
 }
@@ -1420,9 +1439,6 @@ fn emit_client_class(
     let client = shape.client_name(&base);
     let transport = shape.transport_name();
     let suspend = shape.suspend_kw();
-    // Canonical wire service (the wire contract): the base name lowercased, so a
-    // Kotlin client routes to the same endpoint as the Go/Python/TS peers.
-    let wire_service = wire_service_name(name);
 
     body.push_str(&format!(
         "/** Typed client for the {name} service. The client owns (de)serialization;\n * the carrier only moves bytes. */\n"
@@ -1454,8 +1470,6 @@ fn emit_client_class(
             continue;
         }
         let method = kotlin_method_name(&operation.name);
-        // The wire op is PascalCased (the wire contract), matching the other targets.
-        let wire_op = wire_op_name(&operation.name);
         let output_type = map_csil_type_to_kotlin(&success, &None);
         let stem = op_codec_stem(name, operation);
         // A null input carries no request body (empty bytes); a record reuses the generic
@@ -1467,7 +1481,12 @@ fn emit_client_class(
         } else {
             format!("encode{stem}Request(request)")
         };
-        let call = format!("transport.call(\"{wire_service}\", \"{wire_op}\", {req_bytes})");
+        // Wire strings are the verbatim CSIL service and operation names
+        // (csil-rpc-transport.md §1.1/§1.3), distinct from the Kotlin identifiers.
+        let call = format!(
+            "transport.call(\"{name}\", \"{wire_op}\", {req_bytes})",
+            wire_op = operation.name
+        );
         // A record success reuses the generic reified `decode`; any other shape uses the
         // op's per-op response decoder.
         let decode_resp = if is_record_ref(&success, records) {
@@ -1658,11 +1677,9 @@ fn emit_channel_router(body: &mut String, name: &str, service: &CsilServiceDefin
         }
         let method = kotlin_method_name(&operation.name);
         let input_type = map_csil_type_to_kotlin(&operation.input_type, &None);
-        // The wire op is PascalCased (the wire contract), matching the other targets.
-        body.push_str(&format!(
-            "        \"{}\" -> {{\n",
-            wire_op_name(&operation.name)
-        ));
+        // The wire op key is the verbatim CSIL operation name (csil-rpc-transport.md
+        // §1.3), matching what the peer's op encoder frames.
+        body.push_str(&format!("        \"{}\" -> {{\n", operation.name));
         body.push_str(&format!(
             "            val message = codec.decode(data, {input_type}::class.java)\n"
         ));
@@ -1809,6 +1826,18 @@ fn unwrap_constrained(ty: &CsilTypeExpression) -> &CsilTypeExpression {
         other => other,
     }
 }
+
+// `choice_arm_literal` is shared machinery now (see `csilgen_common::choice`, THE
+// normative classification contract) — imported above so every existing
+// `choice_arm_literal(...)` call site in this file keeps working unchanged.
+
+// Inline (anonymous) group/choice hoisting now runs through the shared
+// `csilgen_common::hoist_inline_composites` (see `crates/csilgen-common/src/
+// hoist.rs`) — see `process_generation`'s call site. It generalizes past this
+// generator's own former local copy in one respect worth noting: the shared
+// hoister also hoists an inline composite that appears as a MAP KEY (this
+// generator's old local `hoist_type` recursed into a map's VALUE but passed a
+// map's KEY through unchanged — a real gap the shared pass closes for free).
 
 /// A Kotlin expression building a `CborValue` from `expr` (a typed value).
 fn kotlin_enc_value(
@@ -1969,36 +1998,56 @@ fn choice_is_stringy(choices: &[CsilTypeExpression]) -> bool {
     !choices.is_empty()
         && choices.iter().all(|c| match c {
             CsilTypeExpression::Builtin(n) => n == "text" || n == "tstr",
-            CsilTypeExpression::Literal(CsilLiteralValue::Text(_)) => true,
-            _ => false,
+            // See through a trailing-`.default` wrapper on the arm (see choice_arm_literal).
+            _ => matches!(choice_arm_literal(c), Some(CsilLiteralValue::Text(_))),
         })
 }
 
 /// How a named `A = X / Y / …` choice is realized in Kotlin: an all-text-literal or
-/// all-int-literal choice is a bare-literal enum (the literal is its own discriminant);
-/// anything else is a tagged-sum union (`[variant_index, value]` on the wire).
+/// all-int-literal choice is a bare-literal enum (the literal is its own discriminant,
+/// read/written via a single-kind CBOR accessor); a MIXED-kind all-literal choice
+/// (`"a" / 1`) is likewise a bare-literal enum, just compared by structural equality
+/// against each member's own `CborValue` rendering rather than a single-kind
+/// extractor (`mixed_enum_members`/`kotlin_literal_cbor_expr`) — same CSIL wire
+/// contract, no tag, just no uniform accessor to read it back with; anything else
+/// (at least one non-literal arm) is a tagged-sum union (`[variant_index, value]` on
+/// the wire).
 enum ChoiceKind {
     EnumText,
     EnumInt,
+    MixedEnum,
     Union,
 }
 
+/// Routes the ENUM-vs-UNION split through the shared `csilgen_common::classify_choice`
+/// (THE normative contract: ALL-literal, ANY kind mix — `"a" / 1` — is an enum, per
+/// `csilgen_common::choice`'s module docs) and only layers this generator's OWN
+/// literal-kind sub-classification on top: a uniform text/int vocabulary keeps its
+/// historical single-kind-accessor rendering; any other all-literal mix (including a
+/// uniform float/bool/bytes/null vocabulary, not just an actual kind MIX) is
+/// `MixedEnum`, since Kotlin has no dedicated bare-float/bare-bool enum rendering of
+/// its own to special-case the way EnumText/EnumInt do.
 fn classify_choice(choices: &[CsilTypeExpression]) -> ChoiceKind {
-    if !choices.is_empty()
-        && choices
-            .iter()
-            .all(|c| matches!(c, CsilTypeExpression::Literal(CsilLiteralValue::Text(_))))
-    {
-        return ChoiceKind::EnumText;
+    match csilgen_common::classify_choice(choices) {
+        ChoiceClass::Enum(literals) => classify_enum(&literals),
+        ChoiceClass::Union(_) => ChoiceKind::Union,
     }
-    if !choices.is_empty()
-        && choices
-            .iter()
-            .all(|c| matches!(c, CsilTypeExpression::Literal(CsilLiteralValue::Integer(_))))
+}
+
+fn classify_enum(literals: &[&CsilLiteralValue]) -> ChoiceKind {
+    if literals
+        .iter()
+        .all(|l| matches!(l, CsilLiteralValue::Text(_)))
     {
-        return ChoiceKind::EnumInt;
+        ChoiceKind::EnumText
+    } else if literals
+        .iter()
+        .all(|l| matches!(l, CsilLiteralValue::Integer(_)))
+    {
+        ChoiceKind::EnumInt
+    } else {
+        ChoiceKind::MixedEnum
     }
-    ChoiceKind::Union
 }
 
 /// The enum-constant name for a text literal: PascalCase of the literal text (mirrors the
@@ -2017,6 +2066,60 @@ fn enum_int_variant(n: i64) -> String {
     }
 }
 
+/// A name basis for a literal's enum constant in a `MixedEnum` — text/int reuse
+/// `enum_text_variant`/`enum_int_variant` so the SAME literal gets the SAME constant
+/// name whether or not the rest of the choice happens to share its kind. Bool/Float/
+/// Null/Bytes get their own basis; an Array literal choice arm does not occur from
+/// real CSIL source (see the module doc on `csilgen_common::choice`) but is handled
+/// defensively via a stable placeholder so this never panics.
+fn mixed_enum_variant_base(lit: &CsilLiteralValue) -> String {
+    match lit {
+        CsilLiteralValue::Text(s) => enum_text_variant(s),
+        CsilLiteralValue::Integer(n) => enum_int_variant(*n),
+        CsilLiteralValue::Bool(true) => "True".to_string(),
+        CsilLiteralValue::Bool(false) => "False".to_string(),
+        CsilLiteralValue::Float(f) => {
+            let sign = if *f < 0.0 { "Neg" } else { "" };
+            let digits = f.abs().to_string().replace('.', "_");
+            format!("F{sign}{digits}")
+        }
+        CsilLiteralValue::Null => "Null".to_string(),
+        CsilLiteralValue::Bytes(bytes) => {
+            let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+            format!("Bytes{hex}")
+        }
+        CsilLiteralValue::Array(_) => "Arr".to_string(),
+    }
+}
+
+/// Disambiguate `base` against every name already claimed in `seen` with a numeric
+/// suffix, and record the result — so two literals whose natural basis collides
+/// (`"true"` the text literal and `true` the bool literal both basing to `True`)
+/// still get distinct Kotlin enum constant names.
+fn unique_variant(seen: &mut Vec<String>, base: String) -> String {
+    let mut candidate = base.clone();
+    let mut n = 2;
+    while seen.contains(&candidate) {
+        candidate = format!("{base}{n}");
+        n += 1;
+    }
+    seen.push(candidate.clone());
+    candidate
+}
+
+/// The `(variant name, literal)` pairs for a `ChoiceKind::MixedEnum`, in declaration
+/// order, with duplicate-name disambiguation applied ONCE — `emit_named_choice_type`
+/// (the declaration) and `emit_choice_codec` (the wire) both call this so they can
+/// never disagree on what a given literal's constant is named.
+fn mixed_enum_members(choices: &[CsilTypeExpression]) -> Vec<(String, &CsilLiteralValue)> {
+    let mut seen: Vec<String> = Vec::new();
+    choices
+        .iter()
+        .filter_map(choice_arm_literal)
+        .map(|lit| (unique_variant(&mut seen, mixed_enum_variant_base(lit)), lit))
+        .collect()
+}
+
 /// Emit the Kotlin type for a named `TypeDef` choice rule: an enum for an all-literal
 /// choice, or a sealed-interface union for a mixed choice.
 fn emit_named_choice_type(body: &mut String, name: &str, choices: &[CsilTypeExpression]) {
@@ -2025,10 +2128,8 @@ fn emit_named_choice_type(body: &mut String, name: &str, choices: &[CsilTypeExpr
         ChoiceKind::EnumText => {
             let variants: Vec<String> = choices
                 .iter()
-                .filter_map(|c| match c {
-                    CsilTypeExpression::Literal(CsilLiteralValue::Text(s)) => {
-                        Some(enum_text_variant(s))
-                    }
+                .filter_map(|c| match choice_arm_literal(c) {
+                    Some(CsilLiteralValue::Text(s)) => Some(enum_text_variant(s)),
                     _ => None,
                 })
                 .collect();
@@ -2041,14 +2142,25 @@ fn emit_named_choice_type(body: &mut String, name: &str, choices: &[CsilTypeExpr
         ChoiceKind::EnumInt => {
             let variants: Vec<String> = choices
                 .iter()
-                .filter_map(|c| match c {
-                    CsilTypeExpression::Literal(CsilLiteralValue::Integer(n)) => {
-                        Some(enum_int_variant(*n))
-                    }
+                .filter_map(|c| match choice_arm_literal(c) {
+                    Some(CsilLiteralValue::Integer(n)) => Some(enum_int_variant(*n)),
                     _ => None,
                 })
                 .collect();
             body.push_str(&format!("/** {name} enum (bare-literal wire). */\n"));
+            body.push_str(&format!(
+                "enum class {iface} {{ {} }}\n\n",
+                variants.join(", ")
+            ));
+        }
+        ChoiceKind::MixedEnum => {
+            let variants: Vec<String> = mixed_enum_members(choices)
+                .into_iter()
+                .map(|(variant, _)| variant)
+                .collect();
+            body.push_str(&format!(
+                "/** {name} enum (bare-literal wire, mixed literal kinds). */\n"
+            ));
             body.push_str(&format!(
                 "enum class {iface} {{ {} }}\n\n",
                 variants.join(", ")
@@ -2086,10 +2198,8 @@ fn emit_choice_codec(
         ChoiceKind::EnumText => {
             let lits: Vec<(String, String)> = choices
                 .iter()
-                .filter_map(|c| match c {
-                    CsilTypeExpression::Literal(CsilLiteralValue::Text(s)) => {
-                        Some((enum_text_variant(s), s.clone()))
-                    }
+                .filter_map(|c| match choice_arm_literal(c) {
+                    Some(CsilLiteralValue::Text(s)) => Some((enum_text_variant(s), s.clone())),
                     _ => None,
                 })
                 .collect();
@@ -2125,10 +2235,8 @@ fn emit_choice_codec(
         ChoiceKind::EnumInt => {
             let lits: Vec<(String, i64)> = choices
                 .iter()
-                .filter_map(|c| match c {
-                    CsilTypeExpression::Literal(CsilLiteralValue::Integer(n)) => {
-                        Some((enum_int_variant(*n), *n))
-                    }
+                .filter_map(|c| match choice_arm_literal(c) {
+                    Some(CsilLiteralValue::Integer(n)) => Some((enum_int_variant(*n), *n)),
                     _ => None,
                 })
                 .collect();
@@ -2150,6 +2258,44 @@ fn emit_choice_codec(
             ));
             for (variant, n) in &lits {
                 body.push_str(&format!("    {n}L -> {tn}.{variant}\n"));
+            }
+            body.push_str(&format!(
+                "    else -> throw CborError(\"unknown {tn} value\")\n}}\n\n"
+            ));
+        }
+        ChoiceKind::MixedEnum => {
+            // No single-kind accessor (`asText`/`asLong`) covers a mixed literal
+            // vocabulary, so decode compares the whole `CborValue` against each
+            // member's own rendering (`kotlin_literal_cbor_expr`) — CBOR's major
+            // types are mutually exclusive, so this is unambiguous and, unlike a
+            // single-kind accessor, still rejects a well-typed-but-undeclared value
+            // (parity with the python/ocaml/go/php/ruby/elixir codecs' membership
+            // check on enum decode).
+            let members = mixed_enum_members(choices);
+            body.push_str(&format!(
+                "/** Encode a {tn} enum as its bare literal value. */\n"
+            ));
+            body.push_str(&format!(
+                "fun {tn}.toCborValue(): CborValue = when (this) {{\n"
+            ));
+            for (variant, lit) in &members {
+                body.push_str(&format!(
+                    "    {tn}.{variant} -> {}\n",
+                    kotlin_literal_cbor_expr(lit)
+                ));
+            }
+            body.push_str("}\n\n");
+            body.push_str(&format!(
+                "/** Decode a bare literal value into a {tn} enum. */\n"
+            ));
+            body.push_str(&format!(
+                "fun {dec}FromCborValue(cbor: CborValue): {tn} = when (cbor) {{\n"
+            ));
+            for (variant, lit) in &members {
+                body.push_str(&format!(
+                    "    {} -> {tn}.{variant}\n",
+                    kotlin_literal_cbor_expr(lit)
+                ));
             }
             body.push_str(&format!(
                 "    else -> throw CborError(\"unknown {tn} value\")\n}}\n\n"
@@ -3335,8 +3481,9 @@ fn service_has_channel_ops(def: &CsilServiceDefinition) -> bool {
         .any(|op| !matches!(op.direction, CsilServiceDirection::Unidirectional))
 }
 
-/// Strip a trailing `Service` suffix and PascalCase the remainder, matching the
-/// wire service base used across the other clients.
+/// Strip a trailing `Service` suffix and PascalCase the remainder, used only for
+/// Kotlin identifiers (the client class name and per-op codec stems). Wire strings
+/// carry the verbatim CSIL service name instead (csil-rpc-transport.md §1.1).
 fn service_base(name: &str) -> String {
     let pascal = pascal_case(name);
     pascal
@@ -3344,28 +3491,6 @@ fn service_base(name: &str) -> String {
         .filter(|s| !s.is_empty())
         .map(str::to_string)
         .unwrap_or(pascal)
-}
-
-/// The wire `service` string: the service base, **lowercased**, per
-/// `docs/cbor-wire-contract.md` (`CorndogsService` → `"corndogs"`) — distinct from
-/// the Kotlin class name, so a Kotlin client reaches the same endpoint as its peers.
-fn wire_service_name(name: &str) -> String {
-    service_base(name).to_lowercase()
-}
-
-/// The wire `op` string: the operation name PascalCased with the simple rule
-/// (capitalize after `_`/`-`, leave the rest), matching the other generators
-/// (`submit-task` → `"SubmitTask"`).
-fn wire_op_name(name: &str) -> String {
-    let mut out = String::new();
-    for word in name.split(['_', '-']) {
-        let mut chars = word.chars();
-        if let Some(first) = chars.next() {
-            out.extend(first.to_uppercase());
-            out.push_str(chars.as_str());
-        }
-    }
-    out
 }
 
 fn wire_name_from_key(key: &CsilGroupKey) -> String {
@@ -3863,6 +3988,165 @@ mod tests {
         assert!(types.contains("val y: String"));
     }
 
+    /// The confirmed mixed-kind misclassification bug: `"a" / 1` is ALL-literal
+    /// (a text literal and an integer literal), so per the shared
+    /// `csilgen_common::classify_choice` contract it must be an `Enum`, not a
+    /// `Union` — before this fix, `ChoiceKind` only had `EnumText`/`EnumInt`, so a
+    /// mixed-kind literal choice fell through to `Union` and rendered as a
+    /// `sealed interface` tagged sum instead of a bare-literal enum.
+    #[test]
+    fn mixed_kind_literal_choice_is_a_bare_enum_not_a_union() {
+        let grade = rule(
+            "Grade",
+            CsilRuleType::TypeDef(CsilTypeExpression::Choice(vec![
+                CsilTypeExpression::Literal(CsilLiteralValue::Text("a".to_string())),
+                CsilTypeExpression::Literal(CsilLiteralValue::Integer(1)),
+            ])),
+        );
+        // `generate_codec` only emits `Codec.kt` when the spec has at least one
+        // record; a holder field forces the codec (and thus the enum codec) to
+        // actually be emitted.
+        let holder = rule(
+            "Holder",
+            CsilRuleType::GroupDef(CsilGroupExpression {
+                entries: vec![entry("grade", reference("Grade"), None)],
+            }),
+        );
+        let out = process_generation(spec("kotlin", vec![grade, holder])).unwrap();
+        let types = content(&out, "Types.kt");
+        assert!(
+            types.contains("enum class Grade { A, V1 }"),
+            "expected a bare-literal enum, got:\n{types}"
+        );
+        assert!(
+            !types.contains("sealed interface Grade"),
+            "must not classify as a union, got:\n{types}"
+        );
+
+        let codec = content(&out, "Codec.kt");
+        assert!(codec.contains("Grade.A -> CborValue.CText(\"a\")"));
+        assert!(codec.contains("Grade.V1 -> CborValue.CUint(1uL)"));
+        assert!(codec.contains("CborValue.CText(\"a\") -> Grade.A"));
+        assert!(codec.contains("CborValue.CUint(1uL) -> Grade.V1"));
+        assert!(codec.contains("else -> throw CborError(\"unknown Grade value\")"));
+        // No tagged-sum union codec artifacts (variant wrapper classes/indices).
+        assert!(!codec.contains("GradeVariant"));
+    }
+
+    /// A choice mixing three-plus literal kinds, including a value whose natural
+    /// name basis would collide (`"true"` the text literal PascalCases to `True`,
+    /// the same basis `Bool(true)` uses) — `unique_variant` must disambiguate so
+    /// the emitted enum still compiles with two distinct constant names.
+    #[test]
+    fn mixed_kind_literal_choice_disambiguates_colliding_variant_names() {
+        let flexible = rule(
+            "Flexible",
+            CsilRuleType::TypeDef(CsilTypeExpression::Choice(vec![
+                CsilTypeExpression::Literal(CsilLiteralValue::Text("true".to_string())),
+                CsilTypeExpression::Literal(CsilLiteralValue::Bool(true)),
+                CsilTypeExpression::Literal(CsilLiteralValue::Float(1.5)),
+            ])),
+        );
+        let holder = rule(
+            "Holder",
+            CsilRuleType::GroupDef(CsilGroupExpression {
+                entries: vec![entry("flexible", reference("Flexible"), None)],
+            }),
+        );
+        let out = process_generation(spec("kotlin", vec![flexible, holder])).unwrap();
+        let types = content(&out, "Types.kt");
+        assert!(
+            types.contains("enum class Flexible { True, True2, F1_5 }"),
+            "expected disambiguated variant names, got:\n{types}"
+        );
+        let codec = content(&out, "Codec.kt");
+        assert!(codec.contains("Flexible.True -> CborValue.CText(\"true\")"));
+        assert!(codec.contains("Flexible.True2 -> CborValue.CBool(true)"));
+        assert!(codec.contains("Flexible.F1_5 -> CborValue.CFloat(1.5)"));
+    }
+
+    /// A `.default` on a mixed-kind enum field must render as the enum constant
+    /// (`Grade.V1`), not the raw wire literal — parity with the EnumText/EnumInt
+    /// default-rendering path (`enum_default_kotlin`).
+    #[test]
+    fn mixed_kind_enum_default_renders_as_enum_constant() {
+        let grade = rule(
+            "Grade",
+            CsilRuleType::TypeDef(CsilTypeExpression::Choice(vec![
+                CsilTypeExpression::Literal(CsilLiteralValue::Text("a".to_string())),
+                CsilTypeExpression::Literal(CsilLiteralValue::Integer(1)),
+            ])),
+        );
+        let holder = rule(
+            "Holder",
+            CsilRuleType::GroupDef(CsilGroupExpression {
+                entries: vec![CsilGroupEntry {
+                    key: Some(CsilGroupKey::Bare("grade".to_string())),
+                    value_type: CsilTypeExpression::Constrained {
+                        base_type: Box::new(reference("Grade")),
+                        constraints: vec![CsilControlOperator::Default(CsilLiteralValue::Integer(
+                            1,
+                        ))],
+                    },
+                    occurrence: Some(CsilOccurrence::Optional),
+                    metadata: vec![],
+                    doc_comments: Vec::new(),
+                }],
+            }),
+        );
+        let out = process_generation(spec("kotlin", vec![grade, holder])).unwrap();
+        let types = content(&out, "Types.kt");
+        assert!(
+            types.contains("Grade.V1"),
+            "expected the default to render as the Grade.V1 enum constant, got:\n{types}"
+        );
+    }
+
+    /// Pascal-collision regression (mirrors `crates/csilgen-common/src/hoist.rs`'s
+    /// own `case_insensitive_collision_between_existing_and_synthesized_rule_is_
+    /// disambiguated` test): an existing rule named `UserData` and a synthesized
+    /// name `User_data` (owner `User`, inline mixed-choice field `data`)
+    /// pascal-collide — both canonicalize to `"userdata"`. The shared hoister's
+    /// case-insensitive reservation must disambiguate the later one, or this
+    /// generator would emit two Kotlin declarations for the same identifier.
+    #[test]
+    fn hoisted_inline_composite_name_disambiguates_against_existing_collision() {
+        let user_data = rule(
+            "UserData",
+            CsilRuleType::GroupDef(CsilGroupExpression {
+                entries: vec![entry("value", builtin("text"), None)],
+            }),
+        );
+        // `User.data` is an inline mixed choice, so it hoists to a synthesized rule
+        // named `User_data` — which pascal-collides with `UserData` above.
+        let user = rule(
+            "User",
+            CsilRuleType::GroupDef(CsilGroupExpression {
+                entries: vec![entry(
+                    "data",
+                    CsilTypeExpression::Choice(vec![
+                        CsilTypeExpression::Literal(CsilLiteralValue::Text("x".to_string())),
+                        reference("UserData"),
+                    ]),
+                    None,
+                )],
+            }),
+        );
+        let out = process_generation(spec("kotlin", vec![user_data, user])).unwrap();
+        let types = content(&out, "Types.kt");
+        // `UserData` survives exactly once; the synthesized name must not also
+        // render as `UserData` (a duplicate, non-compiling declaration).
+        assert_eq!(
+            types.matches("data class UserData(").count(),
+            1,
+            "UserData must be declared exactly once, got:\n{types}"
+        );
+        assert!(
+            types.contains("val data: User"),
+            "expected the User record's data field, got:\n{types}"
+        );
+    }
+
     #[test]
     fn server_interface_routers_and_wire_ids() {
         let service = CsilServiceDefinition {
@@ -3901,7 +4185,7 @@ mod tests {
             "fun routeMatchServiceChannel(handlers: MatchService, codec: Codec, op: String, data: ByteArray)"
         ));
         // The verbose router dispatches on the verbatim (kebab-case) wire op name.
-        assert!(services.contains("\"Play\" -> {"));
+        assert!(services.contains("\"play\" -> {"));
         assert!(services.contains("handlers.play(message)"));
         assert!(services.contains("fun routeMatchServiceChannelCompact(handlers: MatchService, codec: Codec, op: ULong, data: ByteArray)"));
         assert!(services.contains("2uL -> {"));
@@ -3953,14 +4237,14 @@ mod tests {
         assert!(client.contains("class CorndogsClient(private val transport: Transport)"));
         assert!(client.contains("fun submitTask(request: SubmitTaskRequest): SubmitTaskResponse"));
         // Typed byte seam: the request serializes itself, the carrier moves bytes, the
-        // response decodes back. Canonical wire strings (service lowercased, op
-        // PascalCased) so a Kotlin client reaches the same endpoint as its peers.
+        // response decodes back. Wire strings are the verbatim CSIL service and op names
+        // so a Kotlin client reaches the same endpoint as its peers.
         assert!(client.contains(
-            "decode<SubmitTaskResponse>(transport.call(\"corndogs\", \"SubmitTask\", encode(request)))"
+            "decode<SubmitTaskResponse>(transport.call(\"CorndogsService\", \"submit-task\", encode(request)))"
         ));
         assert!(!client.contains(" as SubmitTaskResponse"));
-        assert!(!client.contains("\"Corndogs\""));
-        assert!(!client.contains("\"submit-task\""));
+        assert!(!client.contains("\"corndogs\""));
+        assert!(!client.contains("\"SubmitTask\""));
         assert!(!out.files.iter().any(|f| f.path.ends_with("Services.kt")));
     }
 
@@ -4217,7 +4501,7 @@ mod tests {
         let client = content(&out, "Client.kt");
         assert!(client.contains("fun submitTask(request: SubmitTaskRequest): Task"));
         assert!(client.contains(
-            "decode<Task>(transport.call(\"corndogs\", \"SubmitTask\", encode(request)))"
+            "decode<Task>(transport.call(\"CorndogsService\", \"submit-task\", encode(request)))"
         ));
         assert!(
             client.contains("fun call(service: String, op: String, request: ByteArray): ByteArray")
@@ -4243,7 +4527,7 @@ mod tests {
         // Methods suspend and route through the byte seam (no `await` in Kotlin coroutines).
         assert!(twin.contains("suspend fun submitTask(request: SubmitTaskRequest): Task {"));
         assert!(twin.contains(
-            "decode<Task>(transport.call(\"corndogs\", \"SubmitTask\", encode(request)))"
+            "decode<Task>(transport.call(\"CorndogsService\", \"submit-task\", encode(request)))"
         ));
         // The twin reuses the package's ClientError (declared in Client.kt), never redeclares it.
         assert!(!twin.contains("class ClientError("));
@@ -4488,11 +4772,9 @@ mod tests {
         let client = content(&out, "Client.kt");
         assert!(client.contains("fun roomDelta(): RoomDelta"));
         // A null-input op sends an empty request body.
-        assert!(
-            client.contains(
-                "decode<RoomDelta>(transport.call(\"world\", \"RoomDelta\", ByteArray(0)))"
-            )
-        );
+        assert!(client.contains(
+            "decode<RoomDelta>(transport.call(\"WorldService\", \"room-delta\", ByteArray(0)))"
+        ));
     }
 
     #[test]
@@ -4605,9 +4887,10 @@ mod tests {
     }
 
     #[test]
-    fn wire_service_strips_service_and_lowercases() {
-        // `CorndogsService` must hit the wire as "corndogs" (Service stripped,
-        // lowercased), and `submit-task` as "SubmitTask".
+    fn wire_strings_are_verbatim_csil_names() {
+        // `CorndogsService` must hit the wire as "CorndogsService" and `submit-task`
+        // as "submit-task" — verbatim CSIL names (csil-rpc-transport.md §1.1/§1.3),
+        // while the Kotlin class name still strips the `Service` suffix.
         let service = CsilServiceDefinition {
             operations: vec![op(
                 "submit-task",
@@ -4638,9 +4921,10 @@ mod tests {
         ))
         .unwrap();
         let client = content(&out, "Client.kt");
-        assert!(client.contains("\"corndogs\", \"SubmitTask\""));
-        assert!(!client.contains("CorndogsService\""));
-        assert!(!client.contains("submit-task"));
+        assert!(client.contains("\"CorndogsService\", \"submit-task\""));
+        assert!(client.contains("class CorndogsClient"));
+        assert!(!client.contains("\"corndogs\""));
+        assert!(!client.contains("\"SubmitTask\""));
     }
 
     #[test]
@@ -4951,12 +5235,15 @@ mod tests {
         assert!(c.contains("import community.catalyst.csilgen.transport.StreamCarrier"));
         assert!(c.contains("fun openTlsCarrier(host: String, port: Int): FrameCarrier"));
         // The $hello handshake + the $ping/$pong heartbeat from the lib.
-        assert!(c.contains("Hello(listOf(1uL), listOf(\"verbose\"), \"corndogs\").encode()"));
+        assert!(
+            c.contains("Hello(listOf(1uL), listOf(\"verbose\"), \"CorndogsService\").encode()")
+        );
         assert!(c.contains("HelloAck.decode(ackFrame).profile"));
         assert!(c.contains("if (ev.event == Control.PING_NAME)"));
         assert!(c.contains("Control.PONG_NAME, Heartbeat(ping.nonce).encode()"));
         // One outbound event via the generated encoder + dispatch into the generated router.
         assert!(c.contains("encodeCorndogsServiceWatchTasks(channelCodec, StatusUpdate("));
+        assert!(c.contains("Event.verbose(\"CorndogsService\", event, bytes).encode(profile)"));
         assert!(c.contains(
             "routeCorndogsServiceChannel(handlers, channelCodec, ev.event!!, ev.payload)"
         ));
@@ -5105,5 +5392,226 @@ mod tests {
         let tc = content(&typed, "genquickstart.md");
         assert!(tc.contains("no `->` operations"));
         assert!(!tc.contains(": Transport"));
+    }
+
+    fn lit_text(s: &str) -> CsilTypeExpression {
+        CsilTypeExpression::Literal(CsilLiteralValue::Text(s.to_string()))
+    }
+
+    fn lit_int(n: i64) -> CsilTypeExpression {
+        CsilTypeExpression::Literal(CsilLiteralValue::Integer(n))
+    }
+
+    // A choice arm carrying a trailing `.default`, exactly the `Constrained { Literal, .. }`
+    // shape CSIL's parser produces for the last arm of `a / b / c .default d`.
+    fn default_arm(s: &str, default: &str) -> CsilTypeExpression {
+        CsilTypeExpression::Constrained {
+            base_type: Box::new(lit_text(s)),
+            constraints: vec![CsilControlOperator::Default(CsilLiteralValue::Text(
+                default.to_string(),
+            ))],
+        }
+    }
+
+    // The torture record: an inline open string choice, an all-literal `.default` choice,
+    // a mixed union, and inline choices in an array element, a map value, a tuple element,
+    // and inside an inline group field.
+    fn inline_torture_spec() -> WasmGeneratorInput {
+        let payload = CsilGroupExpression {
+            entries: vec![entry("detail", builtin("text"), None)],
+        };
+        let open_status = CsilTypeExpression::Choice(vec![
+            builtin("text"),
+            lit_text("pending"),
+            lit_text("active"),
+            lit_text("closed"),
+        ]);
+        let closed_size = CsilTypeExpression::Choice(vec![
+            lit_text("small"),
+            lit_text("medium"),
+            default_arm("large", "medium"),
+        ]);
+        let mixed_payload = CsilTypeExpression::Choice(vec![
+            lit_text("none"),
+            lit_int(42),
+            reference("InlineChoicePayload"),
+        ]);
+        let tags = CsilTypeExpression::Array {
+            element_type: Box::new(CsilTypeExpression::Choice(vec![
+                builtin("text"),
+                lit_text("red"),
+                lit_text("green"),
+                lit_text("blue"),
+                builtin("int"),
+            ])),
+            occurrence: Some(CsilOccurrence::ZeroOrMore),
+        };
+        let labels = CsilTypeExpression::Map {
+            key: Box::new(builtin("text")),
+            value: Box::new(CsilTypeExpression::Choice(vec![
+                builtin("text"),
+                lit_text("yes"),
+                lit_text("no"),
+                builtin("bool"),
+            ])),
+            occurrence: Some(CsilOccurrence::ZeroOrMore),
+        };
+        let coord = CsilTypeExpression::Tuple(CsilGroupExpression {
+            entries: vec![
+                entry("_0", builtin("int"), None),
+                entry(
+                    "_1",
+                    CsilTypeExpression::Choice(vec![
+                        builtin("text"),
+                        lit_text("x"),
+                        lit_text("y"),
+                        lit_text("z"),
+                    ]),
+                    None,
+                ),
+            ],
+        });
+        let nested = CsilTypeExpression::Group(CsilGroupExpression {
+            entries: vec![entry(
+                "kind",
+                CsilTypeExpression::Choice(vec![
+                    builtin("text"),
+                    lit_text("a"),
+                    lit_text("b"),
+                    builtin("int"),
+                ]),
+                None,
+            )],
+        });
+        let record = CsilGroupExpression {
+            entries: vec![
+                entry("status", open_status, None),
+                entry(
+                    "priority",
+                    default_arm_choice(),
+                    Some(CsilOccurrence::Optional),
+                ),
+                entry("size", closed_size, Some(CsilOccurrence::Optional)),
+                entry("payload", mixed_payload, None),
+                entry("tags", tags, None),
+                entry("labels", labels, None),
+                entry("coord", coord, None),
+                entry("nested", nested, None),
+            ],
+        };
+        spec(
+            "kotlin",
+            vec![
+                rule("InlineChoicePayload", CsilRuleType::GroupDef(payload)),
+                rule("InlineChoiceRecord", CsilRuleType::GroupDef(record)),
+            ],
+        )
+    }
+
+    fn default_arm_choice() -> CsilTypeExpression {
+        CsilTypeExpression::Choice(vec![
+            builtin("text"),
+            lit_text("low"),
+            lit_text("normal"),
+            default_arm("high", "normal"),
+        ])
+    }
+
+    #[test]
+    fn inline_choice_fields_are_hoisted_to_named_types() {
+        let out = process_generation(inline_torture_spec()).unwrap();
+        let types = content(&out, "Types.kt");
+        // Every inline-composite position routes the field through a synthesized named type
+        // rather than the opaque `Any`/`List<Any>`/`Map<..,Any>` fallback.
+        assert!(types.contains("val status: InlineChoiceRecordStatus,"));
+        assert!(types.contains("val priority: InlineChoiceRecordPriority? = null,"));
+        assert!(types.contains("val size: InlineChoiceRecordSize? = null,"));
+        assert!(types.contains("val payload: InlineChoiceRecordPayload,"));
+        assert!(types.contains("val tags: List<InlineChoiceRecordTagsItem>,"));
+        assert!(types.contains("val labels: Map<String, InlineChoiceRecordLabelsValue>,"));
+        assert!(types.contains("val nested: InlineChoiceRecordNested"));
+        // The inline group's own inline-choice field is hoisted recursively.
+        assert!(types.contains("data class InlineChoiceRecordNested("));
+        assert!(types.contains("val kind: InlineChoiceRecordNestedKind"));
+        // The tuple element with no name of its own borrows an index suffix.
+        assert!(types.contains("sealed interface InlineChoiceRecordCoord1"));
+        // No field falls back to a bare opaque type.
+        assert!(!types.contains("val status: Any"));
+        assert!(!types.contains("val payload: Any"));
+    }
+
+    #[test]
+    fn inline_all_literal_choice_with_default_arm_is_bare_enum() {
+        // Regression for the `Constrained { Literal, .. }` arm bug: `.default` on the last
+        // arm must not knock a closed all-literal choice out of the bare-literal enum shape.
+        let out = process_generation(inline_torture_spec()).unwrap();
+        let types = content(&out, "Types.kt");
+        assert!(types.contains("enum class InlineChoiceRecordSize { Small, Medium, Large }"));
+        let codec = content(&out, "Codec.kt");
+        // Bare-literal wire on encode/decode, including the `.default`-wrapped `Large` arm.
+        assert!(codec.contains("InlineChoiceRecordSize.Large -> CborValue.CText(\"large\")"));
+        assert!(codec.contains("\"large\" -> InlineChoiceRecordSize.Large"));
+        // It must NOT have become a tagged-sum union.
+        assert!(!codec.contains("InlineChoiceRecordSizeVariant"));
+    }
+
+    #[test]
+    fn inline_union_codec_is_literal_first_index_dispatch() {
+        let out = process_generation(inline_torture_spec()).unwrap();
+        let codec = content(&out, "Codec.kt");
+        // Open string choice: the `text` base is arm 0 (bare text), the literals carry their
+        // declaration-order index and encode as their own literal value.
+        assert!(codec.contains(
+            "is InlineChoiceRecordStatusVariant0 -> CborValue.CArray(listOf(CborValue.CUint(0uL), CborValue.CText(this.value)))"
+        ));
+        assert!(codec.contains(
+            "is InlineChoiceRecordStatusVariant1 -> CborValue.CArray(listOf(CborValue.CUint(1uL), CborValue.CText(\"pending\")))"
+        ));
+        // Decode dispatches on the index and validates the literal by equality.
+        assert!(codec.contains(
+            "1uL -> InlineChoiceRecordStatusVariant1(CsilCbor.expectLiteral(csilArr[1], CborValue.CText(\"pending\"), \"pending\"))"
+        ));
+        // Mixed union: literal arms (text + int) plus a reference arm at its own index.
+        assert!(codec.contains(
+            "is InlineChoiceRecordPayloadVariant0 -> CborValue.CArray(listOf(CborValue.CUint(0uL), CborValue.CText(\"none\")))"
+        ));
+        assert!(codec.contains(
+            "is InlineChoiceRecordPayloadVariant1 -> CborValue.CArray(listOf(CborValue.CUint(1uL), CborValue.CUint(42uL)))"
+        ));
+        assert!(codec.contains(
+            "is InlineChoiceRecordPayloadVariant2 -> CborValue.CArray(listOf(CborValue.CUint(2uL), this.value.toCborValue()))"
+        ));
+        // The priority union's `.default`-wrapped `high` arm still encodes its literal.
+        assert!(codec.contains(
+            "is InlineChoiceRecordPriorityVariant3 -> CborValue.CArray(listOf(CborValue.CUint(3uL), CborValue.CText(\"high\")))"
+        ));
+    }
+
+    #[test]
+    fn inline_choice_container_positions_get_codecs() {
+        let out = process_generation(inline_torture_spec()).unwrap();
+        let codec = content(&out, "Codec.kt");
+        // Array element, map value, and tuple element each route through their hoisted codec
+        // rather than the dropped-value `CborValue.CNull` fallback.
+        assert!(codec.contains("csilE -> csilE.toCborValue()"));
+        assert!(codec.contains("CborValue.CText(csilK) to csilV.toCborValue()"));
+        assert!(codec.contains("((this.coord)[1] as InlineChoiceRecordCoord1).toCborValue()"));
+        assert!(codec.contains("inlineChoiceRecordCoord1FromCborValue(csilArr[1])"));
+        // No position silently drops its value to null anymore.
+        assert!(!codec.contains("csilE -> CborValue.CNull"));
+        assert!(!codec.contains("to CborValue.CNull))"));
+    }
+
+    #[test]
+    fn choice_arm_literal_sees_through_default_wrapper() {
+        assert!(matches!(
+            choice_arm_literal(&default_arm("large", "medium")),
+            Some(CsilLiteralValue::Text(s)) if s == "large"
+        ));
+        assert!(matches!(
+            choice_arm_literal(&lit_int(5)),
+            Some(CsilLiteralValue::Integer(5))
+        ));
+        assert!(choice_arm_literal(&builtin("text")).is_none());
     }
 }

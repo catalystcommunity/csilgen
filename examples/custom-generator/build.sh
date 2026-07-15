@@ -1,22 +1,29 @@
 #!/bin/bash
-
-# Build script for custom CSIL generator WASM module
+# Build script for the mdsummary example CSIL generator.
+#
+# Produces target/wasm32-unknown-unknown/release/csilgen_mdsummary_generator.wasm
+# using the real generator ABI (docs/generator-plugin-contract.md) — plain
+# `cargo build`, not wasm-pack/wasm-bindgen, which target a browser-JS
+# calling convention this host doesn't speak.
 
 set -e
 
-# Get the directory where this script is located
 SCRIPT_DIR="$(dirname "$(realpath "${BASH_SOURCE[0]}")")"
+cd "$SCRIPT_DIR"
 
-echo "Building custom CSIL generator WASM module..."
+WASM_FILE="target/wasm32-unknown-unknown/release/csilgen_mdsummary_generator.wasm"
 
-# Clean previous builds
-rm -rf "$SCRIPT_DIR/pkg/"
+echo "Building mdsummary example CSIL generator..."
+cargo build --release --target wasm32-unknown-unknown
 
-# Build the WASM module with wasm-pack
-wasm-pack build --target web --out-dir "$SCRIPT_DIR/pkg"
+if [ ! -f "$WASM_FILE" ]; then
+    echo "Build failed - $WASM_FILE not found" >&2
+    exit 1
+fi
 
-echo "WASM module built successfully!"
-echo "Output: $SCRIPT_DIR/pkg/custom_csil_generator.wasm"
+echo "Built: $SCRIPT_DIR/$WASM_FILE"
 echo ""
-echo "To test the generator:"
-echo "  csilgen generate --input $SCRIPT_DIR/example-input.csil --target $SCRIPT_DIR/pkg/custom_csil_generator.wasm --output $SCRIPT_DIR/generated/"
+echo "To use it with the CLI:"
+echo "  mkdir -p $SCRIPT_DIR/../../.generators"
+echo "  cp $SCRIPT_DIR/$WASM_FILE $SCRIPT_DIR/../../.generators/"
+echo "  csilgen generate --input $SCRIPT_DIR/example-input.csil --target mdsummary --output <output-dir>"

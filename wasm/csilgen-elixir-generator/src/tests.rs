@@ -261,12 +261,21 @@ fn test_client_target() {
         "@callback call(t(), service :: String.t(), method :: String.t(), req :: binary()) ::"
     ));
     // ServiceError half of the union is stripped; the success type is the response.
-    assert!(client.contains(":: Csilgen.Generated.DepositClaimResponse.t()"));
-    // Request is encoded to bytes, the reply decoded from bytes; wire service is the
-    // lowercased base and the wire method is PascalCase verbatim.
+    // The @spec line overflows 98 cols, so mix wraps after `::` onto its own line.
     assert!(client.contains(
-        "Csilgen.Generated.Transport.call(transport, \"attestation\", \"DepositClaim\", Csilgen.Generated.DepositClaimRequest.to_cbor(req))"
+        "@spec deposit_claim(t(), Csilgen.Generated.DepositClaimRequest.t()) ::\n          Csilgen.Generated.DepositClaimResponse.t()"
     ));
+    // Request is encoded to bytes, the reply decoded from bytes; the wire service and
+    // op strings are the CSIL names verbatim (csil-rpc-transport.md §1.1). The call
+    // overflows 98 cols flat, so mix breaks each argument onto its own line.
+    assert!(client.contains(concat!(
+        "      Csilgen.Generated.Transport.call(\n",
+        "        transport,\n",
+        "        \"Attestation\",\n",
+        "        \"deposit-claim\",\n",
+        "        Csilgen.Generated.DepositClaimRequest.to_cbor(req)\n",
+        "      )"
+    )));
     assert!(client.contains("Csilgen.Generated.DepositClaimResponse.from_cbor(resp)"));
     // The codec rides alongside; per-struct to_cbor/from_cbor are emitted.
     let codec = file(&out, "codec.gen.ex");
@@ -306,15 +315,70 @@ fn test_server_target_handlers_and_routers() {
     assert!(
         server.contains("@callback play(msg :: Csilgen.Generated.User.t(), ctx :: map()) :: :ok")
     );
-    // Verbose router dispatches by wire method name.
-    assert!(server.contains("def route(handler, codec, \"Play\" = _method, data, ctx) do"));
+    // Verbose router dispatches by the verbatim wire method name.
+    assert!(server.contains("def route(handler, codec, \"play\" = _method, data, ctx) do"));
     // Compact router (wire-id present) dispatches by ordinal.
     assert!(server.contains("def route_compact(handler, codec, 2 = _op, data, ctx) do"));
     // Wire-id accessors exposed.
     assert!(server.contains("def wire_id, do: 7"));
     assert!(server.contains("def wire_id(:play), do: 2"));
     // Outbound encoder for the bidi op.
-    assert!(server.contains("def encode_play(codec, msg), do: {\"Play\", codec.encode(msg)}"));
+    assert!(server.contains("def encode_play(codec, msg), do: {\"play\", codec.encode(msg)}"));
+}
+
+#[test]
+fn test_callback_success_union_breaks_like_mix() {
+    // Regression: a `@callback`'s `{:ok, A | B}` return tuple was spliced in as a
+    // raw string with no fit check, so it rode straight past mix's 98-column
+    // width instead of breaking the same way any other tuple-holding-a-union
+    // does. Pinned to the exact shape `mix format --check-formatted` accepts
+    // (verified against examples/build-integration/npm-project/api.csil's
+    // `get_notifications`/`delete_notification` callbacks): the tuple always
+    // opens onto its own line once it doesn't fit, and the union inside either
+    // stays flat at that deeper indent or itself breaks at `|`, independently.
+    let breaks_further = make_op(
+        "get-notifications",
+        "GetNotificationsRequest",
+        CsilTypeExpression::Choice(vec![
+            CsilTypeExpression::Reference("GetNotificationsResponse".to_string()),
+            CsilTypeExpression::Reference("NotificationError".to_string()),
+            CsilTypeExpression::Reference("ServiceError".to_string()),
+        ]),
+        CsilServiceDirection::Unidirectional,
+        None,
+    );
+    let stays_flat = make_op(
+        "delete-notification",
+        "NotificationID",
+        CsilTypeExpression::Choice(vec![
+            CsilTypeExpression::Reference("DeleteResponse".to_string()),
+            CsilTypeExpression::Reference("NotificationError".to_string()),
+            CsilTypeExpression::Reference("ServiceError".to_string()),
+        ]),
+        CsilServiceDirection::Unidirectional,
+        None,
+    );
+    let input = service_input(
+        "NotificationAPI",
+        vec![breaks_further, stays_flat],
+        None,
+        "elixir",
+    );
+    let out = process_generation(input).unwrap();
+    let server = file(&out, "server.gen.ex");
+    assert!(server.contains(concat!(
+        "  @callback get_notifications(req :: Csilgen.Generated.GetNotificationsRequest.t(), ctx :: map()) ::\n",
+        "              {:ok,\n",
+        "               Csilgen.Generated.GetNotificationsResponse.t()\n",
+        "               | Csilgen.Generated.NotificationError.t()}\n",
+        "              | {:error, Csilgen.Generated.ServiceError.t()}\n",
+    )));
+    assert!(server.contains(concat!(
+        "  @callback delete_notification(req :: Csilgen.Generated.NotificationID.t(), ctx :: map()) ::\n",
+        "              {:ok,\n",
+        "               Csilgen.Generated.DeleteResponse.t() | Csilgen.Generated.NotificationError.t()}\n",
+        "              | {:error, Csilgen.Generated.ServiceError.t()}\n",
+    )));
 }
 
 #[test]
@@ -402,6 +466,90 @@ fn test_optional_validation_skips_nil() {
 }
 
 #[test]
+fn test_optional_ordered_check_omits_redundant_parens() {
+    // Regression: `or` binds looser than every comparison this module emits, so
+    // mix strips parens around the right-hand condition as redundant. The
+    // generator used to always wrap it (`is_nil(v.count) or (v.count >= 0)`),
+    // which `mix format --check-formatted` rejects.
+    let entry = CsilGroupEntry {
+        key: Some(CsilGroupKey::Bare("count".to_string())),
+        value_type: CsilTypeExpression::Constrained {
+            base_type: Box::new(CsilTypeExpression::Builtin("int".to_string())),
+            constraints: vec![CsilControlOperator::GreaterEqual(
+                CsilLiteralValue::Integer(0),
+            )],
+        },
+        occurrence: Some(CsilOccurrence::Optional),
+        metadata: vec![],
+        doc_comments: vec![],
+    };
+    let input = group_input("T", vec![entry], HashMap::new());
+    let out = process_generation(input).unwrap();
+    let v = file(&out, "validation.gen.ex");
+    assert!(v.contains("is_nil(v.count) or v.count >= 0,"));
+    assert!(!v.contains("or (v.count >= 0)"));
+}
+
+#[test]
+fn test_large_bound_literal_gets_mix_underscore_grouping() {
+    // Regression: mix normalizes any integer literal with 6+ digits by grouping
+    // it in 3s from the right (`104857600` -> `104_857_600`); the generator used
+    // to emit the bare digit run for a `MaxValue`/`MinValue`/size bound, which
+    // `mix format --check-formatted` then rejected. The five-digit message text
+    // is untouched — grouping only applies inside a real Elixir integer literal,
+    // never inside a string.
+    let entry = CsilGroupEntry {
+        key: Some(CsilGroupKey::Bare("size_bytes".to_string())),
+        value_type: CsilTypeExpression::Constrained {
+            base_type: Box::new(CsilTypeExpression::Builtin("int".to_string())),
+            constraints: vec![CsilControlOperator::LessEqual(CsilLiteralValue::Integer(
+                104_857_600,
+            ))],
+        },
+        occurrence: None,
+        metadata: vec![],
+        doc_comments: vec![],
+    };
+    let input = group_input("T", vec![entry], HashMap::new());
+    let out = process_generation(input).unwrap();
+    let v = file(&out, "validation.gen.ex");
+    assert!(v.contains("v.size_bytes <= 104_857_600,"));
+    assert!(v.contains("must be at most 104857600"));
+}
+
+#[test]
+fn test_long_regex_guard_breaks_through_the_call_not_past_the_width() {
+    // Regression: a guard's `head` used to be spliced in as a raw string with no
+    // fit check, so a long regex pattern rode past mix's 98-column width on the
+    // `if(` line instead of breaking `Regex.match?`'s own arguments the way mix
+    // does — pinned to the exact shape `mix format --check-formatted` accepts
+    // (verified against examples/complex-metadata/advanced-api.csil). The error
+    // message's own string literal is left as one long line: mix cannot break a
+    // single string token, so it doesn't try, unlike the breakable call above it.
+    // The stored pattern carries a literal `\/` (as CSIL source escapes a forward
+    // slash inside `.regex "..."`, matching examples/complex-metadata/advanced-api.csil's
+    // `content_type` field) so it round-trips unescaped into the `~r/.../` sigil.
+    let pattern = "^[a-zA-Z0-9][a-zA-Z0-9!#$&\\-\\^_]*\\/[a-zA-Z0-9][a-zA-Z0-9!#$&\\-\\^_.]*$";
+    let entry = CsilGroupEntry {
+        key: Some(CsilGroupKey::Bare("content_type".to_string())),
+        value_type: CsilTypeExpression::Constrained {
+            base_type: Box::new(CsilTypeExpression::Builtin("text".to_string())),
+            constraints: vec![CsilControlOperator::Regex(pattern.to_string())],
+        },
+        occurrence: None,
+        metadata: vec![],
+        doc_comments: vec![],
+    };
+    let input = group_input("MediaAsset", vec![entry], HashMap::new());
+    let out = process_generation(input).unwrap();
+    let v = file(&out, "validation.gen.ex");
+    assert!(v.contains(
+        "           if(\n             Regex.match?(\n               ~r/^[a-zA-Z0-9][a-zA-Z0-9!#$&\\-\\^_]*\\/[a-zA-Z0-9][a-zA-Z0-9!#$&\\-\\^_.]*$/,\n               v.content_type\n             ),\n"
+    ));
+    assert!(v.contains("             do: :ok,\n             else:\n               {:error,\n"));
+}
+
+#[test]
 fn test_constructors_emission() {
     let entry = CsilGroupEntry {
         key: Some(CsilGroupKey::Bare("retries".to_string())),
@@ -424,9 +572,12 @@ fn test_constructors_emission() {
     let c = file(&out, "constructors.gen.ex");
     assert!(c.contains("def new_config() do"));
     assert!(c.contains("retries: 3"));
-    // A defaulted field is part of defstruct with its default, not enforced.
+    // A defaulted field is part of defstruct with its default, not enforced. Every
+    // field here has a default, so the whole list is a keyword list — mix elides the
+    // brackets on a call's sole keyword-list argument (`defstruct(retries: 3)` and
+    // `defstruct([retries: 3])` parse identically, and mix always prefers the former).
     let types = file(&out, "types.gen.ex");
-    assert!(types.contains("defstruct [retries: 3]"));
+    assert!(types.contains("defstruct retries: 3"));
     assert!(!types.contains("@enforce_keys"));
 }
 
@@ -791,7 +942,7 @@ fn test_struct_codec_canonical_order_and_shapes() {
     // bytes field uses the byte-string item; the optional priority is omitted when nil.
     assert!(types.contains("{{:text, \"payload\"}, {:bytes, v.payload}}"));
     assert!(types.contains(
-        "(if is_nil(v.priority), do: nil, else: {{:text, \"priority\"}, {:int, v.priority}}),"
+        "if(is_nil(v.priority), do: nil, else: {{:text, \"priority\"}, {:int, v.priority}}),"
     ));
     // map/list encode through the value tree; a nested record delegates.
     assert!(types.contains(
@@ -875,11 +1026,21 @@ fn test_optional_undecodable_field_underscores_bound_value() {
     );
     let out = process_generation(input).unwrap();
     let types = file(&out, "types.gen.ex");
-    assert!(
-        types
-            .contains("nil -> nil; _csil_v -> raise(\"csilgen: no codec for type ProjectStatus\")")
-    );
-    assert!(types.contains("nil -> nil; csil_v -> Csilgen.Generated.Cbor.to_text(csil_v)"));
+    // The `case` clauses overflow 98 cols flat (the module-qualified raise message is
+    // long), so mix breaks each clause body onto its own line instead of packing them
+    // with `;`.
+    assert!(types.contains(concat!(
+        "        case Map.get(csil_fields, {:text, \"status\"}) do\n",
+        "          nil -> nil\n",
+        "          _csil_v -> raise(\"csilgen: no codec for type ProjectStatus\")\n",
+        "        end"
+    )));
+    assert!(types.contains(concat!(
+        "        case Map.get(csil_fields, {:text, \"note\"}) do\n",
+        "          nil -> nil\n",
+        "          csil_v -> Csilgen.Generated.Cbor.to_text(csil_v)\n",
+        "        end"
+    )));
 }
 
 #[test]
@@ -930,6 +1091,665 @@ fn codec_round_trips_through_elixir() {
     assert_eq!(String::from_utf8_lossy(&run.stdout).trim(), "ok");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// `OrderStatus = text / "pending" / "confirmed" / "processing" / "shipped" /
+/// "delivered" / "cancelled" / "refunded"` (examples/real-world-api/e-commerce-api.csil
+/// line 138) held by a single-field `Order` record: the mixed-union shape whose literal
+/// arms used to be shadowed by the general `text` arm's blanket `is_binary` guard.
+fn mixed_union_input() -> WasmGeneratorInput {
+    let order_status = CsilRule {
+        name: "OrderStatus".to_string(),
+        rule_type: CsilRuleType::TypeDef(CsilTypeExpression::Choice(vec![
+            CsilTypeExpression::Builtin("text".to_string()),
+            CsilTypeExpression::Literal(CsilLiteralValue::Text("pending".to_string())),
+            CsilTypeExpression::Literal(CsilLiteralValue::Text("confirmed".to_string())),
+            CsilTypeExpression::Literal(CsilLiteralValue::Text("processing".to_string())),
+            CsilTypeExpression::Literal(CsilLiteralValue::Text("shipped".to_string())),
+            CsilTypeExpression::Literal(CsilLiteralValue::Text("delivered".to_string())),
+            CsilTypeExpression::Literal(CsilLiteralValue::Text("cancelled".to_string())),
+            CsilTypeExpression::Literal(CsilLiteralValue::Text("refunded".to_string())),
+        ])),
+        position: CsilPosition {
+            line: 1,
+            column: 1,
+            offset: 0,
+        },
+        doc_comments: vec![],
+    };
+    let order = CsilRule {
+        name: "Order".to_string(),
+        rule_type: CsilRuleType::GroupDef(CsilGroupExpression {
+            entries: vec![bare_entry(
+                "status",
+                CsilTypeExpression::Reference("OrderStatus".to_string()),
+            )],
+        }),
+        position: CsilPosition {
+            line: 1,
+            column: 1,
+            offset: 0,
+        },
+        doc_comments: vec![],
+    };
+    WasmGeneratorInput {
+        csil_spec: CsilSpecSerialized {
+            rules: vec![order_status, order],
+            source_content: None,
+            service_count: 0,
+            fields_with_metadata_count: 0,
+        },
+        config: GeneratorConfig {
+            target: "elixir-typesonly".to_string(),
+            output_dir: "/tmp".to_string(),
+            options: HashMap::new(),
+        },
+        generator_metadata: meta(),
+    }
+}
+
+/// Drives the mixed-union `OrderStatus` codec through real `elixir`: each literal
+/// wins its own declared index over the general `text` arm, an unmatched string falls
+/// back to the general arm's index 0, and decoding a literal index validates the
+/// payload equals the declared literal rather than trusting the wire. Skips cleanly
+/// when `elixir` is absent.
+#[test]
+fn mixed_union_round_trips_through_elixir() {
+    let have = std::process::Command::new("elixir")
+        .arg("--version")
+        .output()
+        .is_ok();
+    if !have {
+        eprintln!("skipping: no elixir on PATH");
+        return;
+    }
+    let out = process_generation(mixed_union_input()).unwrap();
+
+    let dir = std::env::temp_dir().join(format!("csilgen-elixir-union-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    for f in &out.files {
+        std::fs::write(dir.join(&f.path), &f.content).unwrap();
+    }
+    std::fs::write(dir.join("driver.exs"), MIXED_UNION_DRIVER_ELIXIR).unwrap();
+
+    let run = std::process::Command::new("elixir")
+        .arg(dir.join("driver.exs"))
+        .output()
+        .unwrap();
+    assert!(
+        run.status.success(),
+        "elixir mixed-union round-trip failed:\n{}{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&run.stdout).trim(), "ok");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+const MIXED_UNION_DRIVER_ELIXIR: &str = r#"Code.require_file("codec.gen.ex", __DIR__)
+Code.require_file("types.gen.ex", __DIR__)
+
+alias Csilgen.Generated.Order
+alias Csilgen.Generated.Cbor
+
+# Declaration order: text=0, pending=1, confirmed=2, processing=3, shipped=4,
+# delivered=5, cancelled=6, refunded=7.
+literals = ["pending", "confirmed", "processing", "shipped", "delivered", "cancelled", "refunded"]
+
+for {status, idx} <- Enum.with_index(literals, 1) do
+  order = struct(Order, status: status)
+  {:map, [{{:text, "status"}, value}]} = Order.to_cbor_value(order)
+  true = value == {:array, [{:int, idx}, {:text, status}]}
+
+  back = Order.from_cbor(Order.to_cbor(order))
+  true = back.status == status
+end
+
+# A string matching no literal falls back to the general `text` arm at index 0.
+order = struct(Order, status: "on-hold")
+{:map, [{{:text, "status"}, value}]} = Order.to_cbor_value(order)
+true = value == {:array, [{:int, 0}, {:text, "on-hold"}]}
+back = Order.from_cbor(Order.to_cbor(order))
+true = back.status == "on-hold"
+
+# Decode validates a literal-index payload against the declared literal: index 1 is
+# "pending", so a payload of "confirmed" at index 1 must raise rather than silently
+# returning the wrong value.
+bad_tree = {:map, [{{:text, "status"}, {:array, [{:int, 1}, {:text, "confirmed"}]}}]}
+
+raised =
+  try do
+    Order.from_cbor_value(bad_tree)
+    false
+  rescue
+    RuntimeError -> true
+  end
+
+true = raised
+
+# Round-tripping every declared index through raw bytes recovers the same tree.
+for idx <- 0..7 do
+  inner = if idx == 0, do: {:text, "on-hold"}, else: {:text, Enum.at(literals, idx - 1)}
+  bytes = Cbor.encode({:map, [{{:text, "status"}, {:array, [{:int, idx}, inner]}}]})
+  order = Order.from_cbor(bytes)
+  true = is_binary(order.status)
+end
+
+IO.puts("ok")
+"#;
+
+/// `Status = "pending" / "shipped" / 0 / 1` -- a named choice mixing text and
+/// integer literal arms, held by a single-field `Ticket` record. Regression
+/// fixture for the mixed-kind literal-enum defect: the old `enum_literal_kind`
+/// derived its ONE scalar codec kind from `variants.first()` alone (here,
+/// `Text("pending")`), so encode blindly wrapped every value -- including a `0`
+/// or `1` -- as `{:text, v.status}`, and decode always read the wire value
+/// through `Cbor.to_text`, both silently corrupting the integer arms.
+fn mixed_literal_enum_input() -> WasmGeneratorInput {
+    let pos = CsilPosition {
+        line: 1,
+        column: 1,
+        offset: 0,
+    };
+    let status = CsilRule {
+        name: "Status".to_string(),
+        rule_type: CsilRuleType::TypeDef(CsilTypeExpression::Choice(vec![
+            CsilTypeExpression::Literal(CsilLiteralValue::Text("pending".to_string())),
+            CsilTypeExpression::Literal(CsilLiteralValue::Text("shipped".to_string())),
+            CsilTypeExpression::Literal(CsilLiteralValue::Integer(0)),
+            CsilTypeExpression::Literal(CsilLiteralValue::Integer(1)),
+        ])),
+        position: pos.clone(),
+        doc_comments: vec![],
+    };
+    let ticket = CsilRule {
+        name: "Ticket".to_string(),
+        rule_type: CsilRuleType::GroupDef(CsilGroupExpression {
+            entries: vec![bare_entry(
+                "status",
+                CsilTypeExpression::Reference("Status".to_string()),
+            )],
+        }),
+        position: pos,
+        doc_comments: vec![],
+    };
+    WasmGeneratorInput {
+        csil_spec: CsilSpecSerialized {
+            rules: vec![status, ticket],
+            source_content: None,
+            service_count: 0,
+            fields_with_metadata_count: 0,
+        },
+        config: GeneratorConfig {
+            target: "elixir-typesonly".to_string(),
+            output_dir: "/tmp".to_string(),
+            options: HashMap::new(),
+        },
+        generator_metadata: meta(),
+    }
+}
+
+/// Pins the shared `classify_choice` contract now flowing through this generator
+/// (a mixed-kind-literal choice classifies as an `Enum`, not a `Union` -- no
+/// `[index, value]` tagged-sum array here) AND the per-crate fix: encode
+/// dispatches each literal to its OWN kind's wire wrap (`{:text, ...}` for the
+/// text arms, `{:int, ...}` for the integer arms, not one kind blindly applied
+/// to all four), and decode dispatches on the wire's own CBOR tag before
+/// validating membership within that tag's declared literals.
+#[test]
+fn mixed_literal_enum_dispatches_encode_and_decode_per_kind() {
+    let out = process_generation(mixed_literal_enum_input()).unwrap();
+    let types = file(&out, "types.gen.ex");
+
+    // Not a tagged-sum union: no `{:array, [{:int, i}, ...]}` wrapper for this
+    // field at all -- the whole mixed vocabulary is one bare-literal enum.
+    assert!(!types.contains(":array,"));
+
+    // Encode: each literal's OWN kind, chosen by runtime equality against the
+    // literal (not a blind wrap in one kind derived from the first arm).
+    assert!(types.contains("v.status === \"pending\" -> {:text, v.status}"));
+    assert!(types.contains("v.status === \"shipped\" -> {:text, v.status}"));
+    assert!(types.contains("v.status === 0 -> {:int, v.status}"));
+    assert!(types.contains("v.status === 1 -> {:int, v.status}"));
+    assert!(types.contains("raise(\"csilgen: value does not match any Status variant\")"));
+
+    // Decode: an outer dispatch on the wire's own CBOR tag, THEN membership
+    // validation within that tag's declared literals only.
+    assert!(types.contains("{:text, _} ->"));
+    assert!(types.contains("{:int, _} ->"));
+    assert!(
+        types.contains(
+            "Csilgen.Generated.Cbor.to_text(Map.fetch!(csil_fields, {:text, \"status\"}))"
+        )
+    );
+    assert!(
+        types.contains(
+            "Csilgen.Generated.Cbor.to_int(Map.fetch!(csil_fields, {:text, \"status\"}))"
+        )
+    );
+    assert!(types.contains("raise(\"csilgen: unknown Status literal #{inspect(csil_other)}\")"));
+}
+
+/// The mixed-kind literal enum's generated output is `mix format
+/// --check-formatted` clean. Skips cleanly when `mix` is absent.
+#[test]
+fn mixed_literal_enum_output_is_mix_format_clean() {
+    let have_mix = std::process::Command::new("mix")
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if !have_mix {
+        eprintln!("skipping: no mix on PATH");
+        return;
+    }
+    let out = process_generation(mixed_literal_enum_input()).unwrap();
+
+    let dir = std::env::temp_dir().join(format!(
+        "csilgen-elixir-mixed-enum-fmt-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    for f in &out.files {
+        std::fs::write(dir.join(&f.path), &f.content).unwrap();
+    }
+
+    let ex_files: Vec<String> = out
+        .files
+        .iter()
+        .filter(|f| f.path.ends_with(".ex"))
+        .map(|f| f.path.clone())
+        .collect();
+    let mut cmd = std::process::Command::new("mix");
+    cmd.arg("format")
+        .arg("--check-formatted")
+        .args(&ex_files)
+        .current_dir(&dir);
+    let run = cmd.output().unwrap();
+    assert!(
+        run.status.success(),
+        "mix format --check-formatted rejected generated output:\n{}{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Drives the mixed-kind literal enum's codec through real `elixir`:
+/// round-trips every declared literal of both kinds through raw CBOR bytes,
+/// confirms each wire wrap uses its own literal's kind, and confirms decode
+/// rejects (a) an out-of-vocabulary value of a declared kind (`2` when only
+/// `0`/`1` are declared integers), (b) an out-of-vocabulary value of the other
+/// declared kind (`"cancelled"` when only `"pending"`/`"shipped"` are declared
+/// text), and (c) a wire kind with no declared literal at all (`bool`). Skips
+/// cleanly when `elixir` is absent.
+#[test]
+fn mixed_literal_enum_round_trips_through_elixir() {
+    let have = std::process::Command::new("elixir")
+        .arg("--version")
+        .output()
+        .is_ok();
+    if !have {
+        eprintln!("skipping: no elixir on PATH");
+        return;
+    }
+    let out = process_generation(mixed_literal_enum_input()).unwrap();
+
+    let dir =
+        std::env::temp_dir().join(format!("csilgen-elixir-mixed-enum-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    for f in &out.files {
+        std::fs::write(dir.join(&f.path), &f.content).unwrap();
+    }
+    std::fs::write(dir.join("driver.exs"), MIXED_LITERAL_ENUM_DRIVER_ELIXIR).unwrap();
+
+    let run = std::process::Command::new("elixir")
+        .arg(dir.join("driver.exs"))
+        .output()
+        .unwrap();
+    assert!(
+        run.status.success(),
+        "elixir mixed-literal-enum round-trip failed:\n{}{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&run.stdout).trim(), "ok");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+const MIXED_LITERAL_ENUM_DRIVER_ELIXIR: &str = r#"Code.require_file("codec.gen.ex", __DIR__)
+Code.require_file("types.gen.ex", __DIR__)
+
+alias Csilgen.Generated.Ticket
+
+# Every declared literal of both kinds round-trips through raw CBOR bytes.
+for status <- ["pending", "shipped", 0, 1] do
+  ticket = struct(Ticket, status: status)
+  bytes = Ticket.to_cbor(ticket)
+  back = Ticket.from_cbor(bytes)
+  true = back.status == status
+end
+
+# Each literal's wire wrap uses its OWN kind, not one kind for the whole enum
+# (the bug: encode used to blindly wrap every value as {:text, ...}).
+{:map, [{{:text, "status"}, {:text, "pending"}}]} =
+  Ticket.to_cbor_value(struct(Ticket, status: "pending"))
+
+{:map, [{{:text, "status"}, {:int, 0}}]} = Ticket.to_cbor_value(struct(Ticket, status: 0))
+
+# An out-of-vocabulary value of a declared kind (2 when only 0/1 are declared
+# integers) must be rejected, not silently accepted.
+bad_int_tree = {:map, [{{:text, "status"}, {:int, 2}}]}
+
+raised_bad_int =
+  try do
+    Ticket.from_cbor_value(bad_int_tree)
+    false
+  rescue
+    RuntimeError -> true
+  end
+
+true = raised_bad_int
+
+# Likewise for the text kind ("cancelled" is not a declared literal).
+bad_text_tree = {:map, [{{:text, "status"}, {:text, "cancelled"}}]}
+
+raised_bad_text =
+  try do
+    Ticket.from_cbor_value(bad_text_tree)
+    false
+  rescue
+    RuntimeError -> true
+  end
+
+true = raised_bad_text
+
+# A wire kind with no declared literal at all (bool) must also be rejected.
+bad_kind_tree = {:map, [{{:text, "status"}, {:bool, true}}]}
+
+raised_bad_kind =
+  try do
+    Ticket.from_cbor_value(bad_kind_tree)
+    false
+  rescue
+    RuntimeError -> true
+  end
+
+true = raised_bad_kind
+
+IO.puts("ok")
+"#;
+
+/// Torture spec exercising: a named all-literal enum (`Grade`) and a named mixed
+/// choice (`Level`) whose *last* arm carries a trailing `.default` control
+/// operator -- the parser attaches it to that one arm (`Constrained { base_type:
+/// Literal, .. }`), which used to fall out of literal classification entirely
+/// (both crashed with "no codec for this field shape") -- plus inline (anonymous)
+/// choice fields at the record's own field position, as an array element, as a map
+/// value, and as a tuple element, mirroring `APIError.error_type` in
+/// examples/real-world-api/e-commerce-api.csil.
+fn constrained_arm_torture_input() -> WasmGeneratorInput {
+    let default_high = |lit: &str| CsilTypeExpression::Constrained {
+        base_type: Box::new(CsilTypeExpression::Literal(CsilLiteralValue::Text(
+            lit.to_string(),
+        ))),
+        constraints: vec![CsilControlOperator::Default(CsilLiteralValue::Text(
+            "normal".to_string(),
+        ))],
+    };
+    let lit = |s: &str| CsilTypeExpression::Literal(CsilLiteralValue::Text(s.to_string()));
+    let pos = CsilPosition {
+        line: 1,
+        column: 1,
+        offset: 0,
+    };
+
+    let grade = CsilRule {
+        name: "Grade".to_string(),
+        rule_type: CsilRuleType::TypeDef(CsilTypeExpression::Choice(vec![
+            lit("low"),
+            default_high("high"),
+        ])),
+        position: pos.clone(),
+        doc_comments: vec![],
+    };
+    let level = CsilRule {
+        name: "Level".to_string(),
+        rule_type: CsilRuleType::TypeDef(CsilTypeExpression::Choice(vec![
+            CsilTypeExpression::Builtin("text".to_string()),
+            lit("low"),
+            default_high("high"),
+        ])),
+        position: pos.clone(),
+        doc_comments: vec![],
+    };
+    let inline_status = CsilTypeExpression::Choice(vec![
+        CsilTypeExpression::Builtin("text".to_string()),
+        lit("queued"),
+        lit("shipped"),
+        lit("delivered"),
+    ]);
+    let inline_priority = CsilTypeExpression::Choice(vec![lit("low"), lit("medium"), lit("high")]);
+    let inline_color = CsilTypeExpression::Choice(vec![lit("red"), lit("green"), lit("blue")]);
+    let inline_flag = CsilTypeExpression::Choice(vec![lit("on"), lit("off")]);
+    let inline_yesno = CsilTypeExpression::Choice(vec![lit("yes"), lit("no")]);
+
+    let torture = CsilRule {
+        name: "Torture".to_string(),
+        rule_type: CsilRuleType::GroupDef(CsilGroupExpression {
+            entries: vec![
+                bare_entry("status", inline_status),
+                bare_entry("priority", inline_priority),
+                bare_entry(
+                    "colors",
+                    CsilTypeExpression::Array {
+                        element_type: Box::new(inline_color),
+                        occurrence: None,
+                    },
+                ),
+                bare_entry(
+                    "flags",
+                    CsilTypeExpression::Map {
+                        key: Box::new(CsilTypeExpression::Builtin("text".to_string())),
+                        value: Box::new(inline_flag),
+                        occurrence: None,
+                    },
+                ),
+                bare_entry(
+                    "pair",
+                    CsilTypeExpression::Tuple(CsilGroupExpression {
+                        entries: vec![
+                            CsilGroupEntry {
+                                key: None,
+                                value_type: CsilTypeExpression::Builtin("text".to_string()),
+                                occurrence: None,
+                                metadata: vec![],
+                                doc_comments: vec![],
+                            },
+                            CsilGroupEntry {
+                                key: None,
+                                value_type: inline_yesno,
+                                occurrence: None,
+                                metadata: vec![],
+                                doc_comments: vec![],
+                            },
+                        ],
+                    }),
+                ),
+                bare_entry("grade", CsilTypeExpression::Reference("Grade".to_string())),
+                bare_entry("level", CsilTypeExpression::Reference("Level".to_string())),
+            ],
+        }),
+        position: pos,
+        doc_comments: vec![],
+    };
+
+    WasmGeneratorInput {
+        csil_spec: CsilSpecSerialized {
+            rules: vec![grade, level, torture],
+            source_content: None,
+            service_count: 0,
+            fields_with_metadata_count: 0,
+        },
+        config: GeneratorConfig {
+            target: "elixir-typesonly".to_string(),
+            output_dir: "/tmp".to_string(),
+            options: HashMap::new(),
+        },
+        generator_metadata: meta(),
+    }
+}
+
+/// Drives the constrained-last-arm and inline-choice-field contract through real
+/// `elixir`. Skips cleanly when `elixir` is absent.
+#[test]
+fn constrained_arm_and_inline_choice_round_trip_through_elixir() {
+    let have = std::process::Command::new("elixir")
+        .arg("--version")
+        .output()
+        .is_ok();
+    if !have {
+        eprintln!("skipping: no elixir on PATH");
+        return;
+    }
+    let out = process_generation(constrained_arm_torture_input()).unwrap();
+
+    let dir = std::env::temp_dir().join(format!("csilgen-elixir-torture-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    for f in &out.files {
+        std::fs::write(dir.join(&f.path), &f.content).unwrap();
+    }
+    std::fs::write(dir.join("driver.exs"), TORTURE_DRIVER_ELIXIR).unwrap();
+
+    let run = std::process::Command::new("elixir")
+        .arg(dir.join("driver.exs"))
+        .output()
+        .unwrap();
+    assert!(
+        run.status.success(),
+        "elixir torture round-trip failed:\n{}{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&run.stdout).trim(), "ok");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+const TORTURE_DRIVER_ELIXIR: &str = r#"Code.require_file("codec.gen.ex", __DIR__)
+Code.require_file("types.gen.ex", __DIR__)
+
+alias Csilgen.Generated.Torture
+alias Csilgen.Generated.Cbor
+
+sample =
+  struct(Torture,
+    status: "queued",
+    priority: "medium",
+    colors: ["red", "blue"],
+    flags: %{"a" => "on", "b" => "off"},
+    pair: {"hi", "yes"},
+    grade: "low",
+    level: "low"
+  )
+
+# Grade is a closed literal enum (with a `.default`-suffixed last arm): bare-text
+# wire, not a tagged-sum array.
+{:map, kvs} = Torture.to_cbor_value(sample)
+fields = Map.new(kvs)
+true = fields[{:text, "grade"}] == {:text, "low"}
+
+back = Torture.from_cbor(Torture.to_cbor(sample))
+true = back == sample
+
+# Level's constrained last arm ("high" .default "normal") keeps its own declared
+# index (2) with literal-equality validation, and the general `text` arm (index 0)
+# stays reachable for values that aren't "low"/"high".
+for {level, want_idx} <- [{"low", 1}, {"high", 2}, {"other", 0}] do
+  v = %{sample | level: level}
+  {:map, kvs} = Torture.to_cbor_value(v)
+  fields = Map.new(kvs)
+  true = fields[{:text, "level"}] == {:array, [{:int, want_idx}, {:text, level}]}
+  back = Torture.from_cbor(Torture.to_cbor(v))
+  true = back.level == level
+end
+
+# Decode rejects a wrong-literal payload at a literal's declared index.
+bad = {:map, [
+  {{:text, "status"}, {:array, [{:int, 1}, {:text, "queued"}]}},
+  {{:text, "priority"}, {:text, "low"}},
+  {{:text, "colors"}, {:array, []}},
+  {{:text, "flags"}, {:map, []}},
+  {{:text, "pair"}, {:array, [{:text, "hi"}, {:text, "yes"}]}},
+  {{:text, "grade"}, {:text, "low"}},
+  {{:text, "level"}, {:array, [{:int, 2}, {:text, "not-high"}]}}
+]}
+
+raised =
+  try do
+    Torture.from_cbor_value(bad)
+    false
+  rescue
+    RuntimeError -> true
+  end
+
+true = raised
+
+# Grade decode validates enum membership: an unknown literal must raise, not
+# silently pass through.
+bad_grade = {:map, [
+  {{:text, "status"}, {:array, [{:int, 1}, {:text, "queued"}]}},
+  {{:text, "priority"}, {:text, "low"}},
+  {{:text, "colors"}, {:array, []}},
+  {{:text, "flags"}, {:map, []}},
+  {{:text, "pair"}, {:array, [{:text, "hi"}, {:text, "yes"}]}},
+  {{:text, "grade"}, {:text, "unknown"}},
+  {{:text, "level"}, {:array, [{:int, 1}, {:text, "low"}]}}
+]}
+
+raised_grade =
+  try do
+    Torture.from_cbor_value(bad_grade)
+    false
+  rescue
+    RuntimeError -> true
+  end
+
+true = raised_grade
+
+# Inline all-literal choices (priority / array element / map value / tuple
+# element) ride the wire as the bare literal, same as a named enum, and reject an
+# unknown literal on decode.
+true = fields[{:text, "priority"}] == {:text, "medium"}
+true = fields[{:text, "colors"}] == {:array, [{:text, "red"}, {:text, "blue"}]}
+true = fields[{:text, "flags"}] ==
+         {:map, [{{:text, "a"}, {:text, "on"}}, {{:text, "b"}, {:text, "off"}}]}
+true = fields[{:text, "pair"}] == {:array, [{:text, "hi"}, {:text, "yes"}]}
+
+bad_tree = {:map, [
+  {{:text, "status"}, {:array, [{:int, 1}, {:text, "queued"}]}},
+  {{:text, "priority"}, {:text, "unknown"}},
+  {{:text, "colors"}, {:array, []}},
+  {{:text, "flags"}, {:map, []}},
+  {{:text, "pair"}, {:array, [{:text, "hi"}, {:text, "yes"}]}},
+  {{:text, "grade"}, {:text, "low"}},
+  {{:text, "level"}, {:array, [{:int, 1}, {:text, "low"}]}}
+]}
+
+raised_priority =
+  try do
+    Torture.from_cbor_value(bad_tree)
+    false
+  rescue
+    RuntimeError -> true
+  end
+
+true = raised_priority
+
+IO.puts("ok")
+"#;
 
 // --- publishable Mix package mode ---------------------------------------------
 
@@ -1718,12 +2538,20 @@ fn non_record_op_boundaries_get_client_methods() {
     assert!(client.contains("Csilgen.Generated.Member.to_cbor(req)"));
     assert!(client.contains("Csilgen.Generated.Member.from_cbor(resp)"));
     // Non-record boundaries ride per-op helpers over the shared value codec.
-    assert!(client.contains("defp encode_get_member_request(req), do: Csilgen.Generated.Cbor.encode"));
+    assert!(client.contains(concat!(
+        "  defp encode_get_member_request(req) do\n",
+        "    Csilgen.Generated.Cbor.encode({:text, req})\n",
+        "  end"
+    )));
     assert!(client.contains("defp decode_list_members_response(csil_bytes) do"));
     assert!(client.contains("defp decode_delete_task_response(csil_bytes) do"));
     assert!(client.contains("decode_member_names_response(resp)"));
-    // Non-record response @specs map to their real shapes, not a record `.t()`.
-    assert!(client.contains(":: [Csilgen.Generated.Member.t()]"));
+    // Non-record response @specs map to their real shapes, not a record `.t()`. The
+    // list_members spec overflows 98 cols flat, so mix wraps after `::`.
+    assert!(client.contains(concat!(
+        "@spec list_members(t(), Csilgen.Generated.ListMembersRequest.t()) ::\n",
+        "          [Csilgen.Generated.Member.t()]"
+    )));
     assert!(client.contains(":: boolean()"));
 }
 

@@ -20,6 +20,8 @@ The architecture follows a plugin-based approach similar to protocgen for protob
 
 Every generator lives in `wasm/` and follows the same shape: a `cdylib` exporting `get_metadata`, `allocate`, `deallocate`, and `generate`. **Do not create a `lib` twin in `crates/` or anywhere else** — that's how `csilgen-rust` and `csilgen-typescript` drifted in the past, with features authored in the lib copy ("…like one does") then mirrored to the wasm copy ("also apply to the wasm rust generator") and inevitably falling out of sync. There is one crate per generator. Edits land where the code runs.
 
+`crates/csilgen-common` carries the classification/rewrite logic that is genuinely shared across every generator rather than per-language — the choice-arm classifier (`choice.rs`: literal-vs-general arm classification, enum-vs-union wire shape) and the inline-composite hoister (`hoist.rs`: synthesizing named rules for anonymous groups/choices). A generator must call into these, not re-derive its own copy of either — that reintroduces exactly the per-generator drift this section exists to prevent (see `choice.rs`'s module docs for a real historical bug: TypeScript and OCaml each grew their own, subtly wrong, literal-choice classifier before this module existed).
+
 ### Dynamic generator discovery
 
 The CLI and runtime do not maintain any hardcoded list of generators. At startup the runtime scans, in priority order:
@@ -31,6 +33,8 @@ The CLI and runtime do not maintain any hardcoded list of generators. At startup
 Discovery is **first-write-wins**: the first directory in this list that supplies a given generator id keeps it; later directories with the same id are ignored. That means a project can drop a specific build of a generator into `.generators/` to pin or replace whatever the user has installed system-wide, without touching `~/.csilgen/generators`. Files that don't match `csilgen_<target>_generator.wasm` are silently ignored everywhere.
 
 `--target <name>` resolves by finding the discovered generator whose target equals `<name>` (or that `<name>` is a sub-target of, e.g. `typescript-client` → the `typescript` generator). A third-party generator self-registers simply by being named correctly and dropped in any search path — no CLI patch needed.
+
+See `docs/generator-plugin-contract.md` for the normative, language-agnostic plugin interface (WASM ABI, JSON boundary shapes, conformance tiers) every generator implements.
 
 ### Other rules
 
@@ -58,11 +62,22 @@ csilgen/
 │   ├── csilgen-wasm-generators/       # Discovery + execution runtime
 │   ├── csilgen-noop-generator/        # No-op fixture
 │   ├── csilgen-simple-test/           # Internal runtime test fixture (not a target)
-│   ├── csilgen-rust-generator/        # --target rust
-│   ├── csilgen-go-generator/          # --target go
+│   ├── csilgen-rust-generator/        # --target rust (+ -typesonly/-client/-server)
+│   ├── csilgen-go-generator/          # --target go (+ -typesonly/-client/-server)
 │   ├── csilgen-typescript-generator/  # --target typescript (+ typescript-* sub-targets)
+│   ├── csilgen-python-generator/      # --target python (+ -typesonly/-client/-server)
+│   ├── csilgen-php-generator/         # --target php (+ -typesonly/-client/-server)
+│   ├── csilgen-java-generator/        # --target java
+│   ├── csilgen-csharp-generator/      # --target csharp (+ -client/-server)
+│   ├── csilgen-c-generator/           # --target c
+│   ├── csilgen-swift-generator/       # --target swift
+│   ├── csilgen-kotlin-generator/      # --target kotlin
+│   ├── csilgen-zig-generator/         # --target zig
+│   ├── csilgen-ocaml-generator/       # --target ocaml
+│   ├── csilgen-elixir-generator/      # --target elixir
+│   ├── csilgen-ruby-generator/        # --target ruby
+│   ├── csilgen-dart-generator/        # --target dart
 │   ├── csilgen-json-generator/        # --target json
-│   ├── csilgen-python-generator/      # --target python
 │   └── csilgen-openapi-generator/     # --target openapi
 ├── docs/csilgen-requests/        # Inbox for requests from consumer repos
 ├── examples/                     # Usage examples and demos

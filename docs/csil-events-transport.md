@@ -38,7 +38,7 @@ operation (`notify: <- Event`) is one-way server→client. The **direction of an
 event is implied by which side sent it**; the operation's `@wire-id` identifies
 *which* operation, and a type-choice (`/=`) union inside the declared type is
 resolved by the decoder. Generators already emit the inbound router and the
-outbound `(method, bytes)` encoders for these directions
+outbound `(op, bytes)` encoders for these directions
 (`csil-spec.md`); CSIL-Events pins the envelope those bytes ride in and adds the
 connection lifecycle.
 

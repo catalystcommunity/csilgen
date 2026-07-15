@@ -134,6 +134,13 @@ impl Parser {
             bail!("Parse errors:\n{}", error_messages.join("\n"));
         }
 
+        // Fold same-file `/=` extensions onto their real `=` base now (safe: a base
+        // present in this same rule set is unambiguous). Don't finalize orphans yet —
+        // this file might be a leaf that a not-yet-merged-in include supplies the base
+        // for; `ImportResolver::resolve_imports` does that finalization once the whole
+        // include graph is assembled.
+        crate::ast::merge_type_choice_extensions(&mut rules, false);
+
         Ok(CsilSpec {
             imports,
             options,
@@ -199,13 +206,18 @@ impl Parser {
                 self.advance(); // consume /=
                 self.skip_whitespace_and_comments();
 
-                let first_type = self.parse_type_expression()?;
-                let mut types = vec![first_type];
-
-                while self.match_token(&TokenType::Choice) {
-                    self.skip_whitespace_and_comments();
-                    types.push(self.parse_type_expression()?);
-                }
+                // `parse_type_expression` already consumes an entire `/`-chain into a
+                // single `Choice` (it has to, since `Name = a / b` needs that same
+                // collapsing). Flatten that result here instead of pushing it as one
+                // arm, or a two-arm `/=` ends up as a one-element
+                // `TypeChoice([Choice([a, b])])` instead of the flat
+                // `TypeChoice([a, b])` that `merge_type_choice_extensions` and every
+                // generator expect.
+                let type_expr = self.parse_type_expression()?;
+                let types = match type_expr {
+                    TypeExpression::Choice(arms) => arms,
+                    other => vec![other],
+                };
 
                 RuleType::TypeChoice(types)
             }
@@ -3865,5 +3877,122 @@ mod tests {
         let spec = parse_csil(input).unwrap();
 
         assert_eq!(spec.rules[0].doc_comments, vec!["the real doc".to_string()]);
+    }
+
+    /// A standalone `/=` (no `=` rule of the same name anywhere in the file) has no
+    /// local base to fold onto, so a bare `parse_csil` (no `ImportResolver` involved —
+    /// this file could still be a leaf that some future include supplies a base for)
+    /// leaves it tagged `TypeChoice`, but flat: `TypeChoice(["a","b","c"])`, not the
+    /// buggy one-element `TypeChoice([Choice(["a","b","c"])])` a naive `/`-chain parse
+    /// produces. Full collapse into `TypeDef(Choice(..))` only happens once
+    /// `ImportResolver::resolve_imports` confirms no base exists anywhere in the
+    /// resolved include graph — see the resolver tests for that.
+    #[test]
+    fn test_standalone_type_choice_flattens_without_nesting() {
+        let input = r#"Status /= "a" / "b" / "c""#;
+        let spec = parse_csil(input).unwrap();
+
+        assert_eq!(spec.rules.len(), 1);
+        match &spec.rules[0].rule_type {
+            RuleType::TypeChoice(arms) => {
+                let literals: Vec<&str> = arms
+                    .iter()
+                    .map(|arm| match arm {
+                        TypeExpression::Literal(LiteralValue::Text(s)) => s.as_str(),
+                        other => panic!("expected text literal arm, got {other:?}"),
+                    })
+                    .collect();
+                assert_eq!(literals, vec!["a", "b", "c"]);
+            }
+            other => panic!("expected a flat TypeChoice(..), got {other:?}"),
+        }
+    }
+
+    /// `/=` extending a rule already defined with `=` in the same file appends its arms
+    /// onto that rule (base becomes arm 0) rather than creating a second rule with the
+    /// same name.
+    #[test]
+    fn test_type_choice_extends_typedef_in_same_file() {
+        let input = "Status = \"a\"\nStatus /= \"b\" / \"c\"";
+        let spec = parse_csil(input).unwrap();
+
+        assert_eq!(spec.rules.len(), 1, "extension must merge, not add a rule");
+        match &spec.rules[0].rule_type {
+            RuleType::TypeDef(TypeExpression::Choice(arms)) => {
+                let literals: Vec<&str> = arms
+                    .iter()
+                    .map(|arm| match arm {
+                        TypeExpression::Literal(LiteralValue::Text(s)) => s.as_str(),
+                        other => panic!("expected text literal arm, got {other:?}"),
+                    })
+                    .collect();
+                assert_eq!(literals, vec!["a", "b", "c"]);
+            }
+            other => panic!("expected TypeDef(Choice(..)), got {other:?}"),
+        }
+    }
+
+    /// Multiple separate `/=` statements for the same name (no `=` base at all here)
+    /// accumulate arms in declaration order into a single still-`TypeChoice`-tagged
+    /// rule, rather than leaving several same-named rules behind for
+    /// `validate_unique_rule_names` to wrongly flag as duplicates.
+    #[test]
+    fn test_multiple_type_choice_extensions_accumulate_in_order() {
+        let input = "Status /= \"a\" / \"b\"\nStatus /= \"c\"\nStatus /= \"d\" / \"e\"";
+        let spec = parse_csil(input).unwrap();
+
+        assert_eq!(spec.rules.len(), 1);
+        match &spec.rules[0].rule_type {
+            RuleType::TypeChoice(arms) => {
+                let literals: Vec<&str> = arms
+                    .iter()
+                    .map(|arm| match arm {
+                        TypeExpression::Literal(LiteralValue::Text(s)) => s.as_str(),
+                        other => panic!("expected text literal arm, got {other:?}"),
+                    })
+                    .collect();
+                assert_eq!(literals, vec!["a", "b", "c", "d", "e"]);
+            }
+            other => panic!("expected TypeChoice(..), got {other:?}"),
+        }
+    }
+
+    /// A `/=` extension can precede its `=` base textually; CDDL rule order is
+    /// declaration-independent (forward references are fine everywhere else in CSIL).
+    #[test]
+    fn test_type_choice_extension_before_base_still_merges() {
+        let input = "Status /= \"b\" / \"c\"\nStatus = \"a\"";
+        let spec = parse_csil(input).unwrap();
+
+        assert_eq!(spec.rules.len(), 1);
+        match &spec.rules[0].rule_type {
+            RuleType::TypeDef(TypeExpression::Choice(arms)) => {
+                let literals: Vec<&str> = arms
+                    .iter()
+                    .map(|arm| match arm {
+                        TypeExpression::Literal(LiteralValue::Text(s)) => s.as_str(),
+                        other => panic!("expected text literal arm, got {other:?}"),
+                    })
+                    .collect();
+                // The `=` rule is arm 0 regardless of where it appears textually.
+                assert_eq!(literals, vec!["a", "b", "c"]);
+            }
+            other => panic!("expected TypeDef(Choice(..)), got {other:?}"),
+        }
+    }
+
+    /// Two genuine `=` rules sharing a name are a real collision (not something `/=`
+    /// merging should paper over) and must both survive parsing untouched, so
+    /// validation still reports the duplicate.
+    #[test]
+    fn test_duplicate_typedef_rules_are_not_merged_by_type_choice_logic() {
+        let input = "Status = text\nStatus = int";
+        let spec = parse_csil(input).unwrap();
+
+        assert_eq!(
+            spec.rules.iter().filter(|r| r.name == "Status").count(),
+            2,
+            "two real `=` rules must remain separate for validation to flag"
+        );
     }
 }

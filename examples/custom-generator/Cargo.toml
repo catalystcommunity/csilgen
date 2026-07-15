@@ -1,22 +1,28 @@
 [package]
-name = "custom-csil-generator"
+name = "csilgen-mdsummary-generator"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
+description = "Example CSIL generator: a Markdown summary of a spec's types and services"
+license = "Apache-2.0"
+
+# Standalone package, deliberately outside the root workspace — examples/ crates
+# follow the same pattern as tools/generator-template and its sub-examples: an
+# empty [workspace] table so this crate isn't pulled into the root workspace's
+# `cargo build --workspace` / `cargo test --workspace` / clippy gates, matching
+# how every wasm/csilgen-*-generator crate is the one and only copy of itself
+# (this one just isn't a shipped target, so it stays out of wasm/ entirely).
+[workspace]
 
 [lib]
 crate-type = ["cdylib"]
 
 [dependencies]
-wasm-bindgen = "0.2"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-
-# In a real implementation, this would reference published crates
-csilgen-core = { path = "../../crates/csilgen-core" }
 csilgen-common = { path = "../../crates/csilgen-common" }
 
-[dependencies.web-sys]
-version = "0.3"
-features = [
-  "console",
-]
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"

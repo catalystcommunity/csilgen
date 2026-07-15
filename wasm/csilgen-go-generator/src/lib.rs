@@ -4,12 +4,14 @@
 //! CSIL generator that produces Go code with struct definitions and service interfaces.
 
 use csilgen_common::{
-    CsilControlOperator, CsilDependsCompareOp, CsilDependsCondition, CsilFieldMetadata,
-    CsilFieldVisibility, CsilGroupEntry, CsilGroupExpression, CsilGroupKey, CsilLiteralValue,
-    CsilOccurrence, CsilRuleType, CsilServiceDefinition, CsilServiceDirection,
-    CsilServiceOperation, CsilSizeConstraint, CsilTypeExpression, CsilValidationConstraint,
-    GeneratedFile, GenerationStats, GeneratorCapability, GeneratorMetadata, GeneratorWarning,
-    WarningLevel, WasmGeneratorInput, WasmGeneratorOutput, wasm_interface::*,
+    ChoiceClass, CsilControlOperator, CsilDependsCompareOp, CsilDependsCondition,
+    CsilFieldMetadata, CsilFieldVisibility, CsilGroupEntry, CsilGroupExpression, CsilGroupKey,
+    CsilLiteralValue, CsilOccurrence, CsilRule, CsilRuleType, CsilServiceDefinition,
+    CsilServiceDirection, CsilServiceOperation, CsilSizeConstraint, CsilSpecSerialized,
+    CsilTypeExpression, CsilValidationConstraint, GeneratedFile, GenerationStats,
+    GeneratorCapability, GeneratorMetadata, GeneratorWarning, HoistOptions, WarningLevel,
+    WasmGeneratorInput, WasmGeneratorOutput, choice_arm_literal, classify_choice,
+    hoist_inline_composites, wasm_interface::*,
 };
 use std::collections::HashMap;
 
@@ -84,6 +86,22 @@ fn deserialize_input(input_ptr: *const u8, input_len: usize) -> Result<WasmGener
 }
 
 fn process_generation(input: WasmGeneratorInput) -> Result<WasmGeneratorOutput, i32> {
+    // Rewrite an inline (anonymous) record group — a field, array element, map
+    // value/key, or tuple element typed directly as `{ ... }` rather than through a
+    // named rule — to a `Reference` to a synthesized named rule, so it flows through
+    // the same `record_names`/`emit_record_codec` machinery a named record gets.
+    // Before this pass, `go_enc_value`/`go_dec_func` had no `Group` arm at all: an
+    // inline group silently encoded as `cborNull{}` and decoded to its zero value,
+    // a confirmed data-loss bug (`examples/multi-file/mixed/standalone.csil`'s
+    // `metadata: { created: int, version: text }` field hits it in a pinned example).
+    // A spec with no inline group is reproduced unchanged. See `hoist_inline_groups`
+    // for why this generator does NOT also hoist inline CHOICES the way TypeScript/
+    // OCaml/Kotlin do.
+    let input = {
+        let mut input = input;
+        input.csil_spec = hoist_inline_groups(&input.csil_spec);
+        input
+    };
     let mut config = GoConfig::from_options(&input.config.options)?;
     // A named type-choice with a non-literal variant is a union (a tagged sum); record
     // its name so the codec emits/calls its dedicated `csilEnc`/`csilDec` helper rather
@@ -228,6 +246,14 @@ fn process_generation(input: WasmGeneratorInput) -> Result<WasmGeneratorOutput, 
         }
     }
 
+    // Settle every Go source file on the gofmt fixpoint details no single
+    // emitter owns (import ordering, exactly one trailing newline).
+    for file in &mut files {
+        if file.path.ends_with(".go") {
+            file.content = gofmt_finish(std::mem::take(&mut file.content));
+        }
+    }
+
     let total_size: usize = files.iter().map(|f| f.content.len()).sum();
 
     let stats = GenerationStats {
@@ -303,7 +329,8 @@ fn resolve_module_path(input: &WasmGeneratorInput) -> String {
 }
 
 /// Fallback identifier used when neither a module path nor a package name was
-/// configured: the first service's lowercased wire base, else a generic client name.
+/// configured: the first service's lowercased identifier base, else a generic
+/// client name. Purely a package-naming concern — wire strings stay verbatim.
 fn default_package_token(input: &WasmGeneratorInput) -> String {
     input
         .csil_spec
@@ -531,7 +558,9 @@ fn first_channel_go_example(
             // handler) and the encoder serializes the op's success output (outbound).
             return Some(GoChannelExample {
                 service_iface: rule.name.clone(),
-                wire_service: go_service_base(&rule.name).to_lowercase(),
+                // The wire carries the CSIL service name verbatim
+                // (docs/cbor-wire-contract.md "RPC call naming").
+                wire_service: rule.name.clone(),
                 method: go_method_name(&op.name),
                 inbound_type: type_ref_name(&op.input_type),
                 outbound_type: type_ref_name(&success),
@@ -1332,6 +1361,7 @@ fn generate_types(
                 ));
                 content.push_str(&format!("type {} struct {{\n", rule.name));
 
+                let mut rows = Vec::new();
                 for entry in &group.entries {
                     if let Some(key) = &entry.key {
                         let field_name = go_field_name_from_key_with_metadata(key, &entry.metadata);
@@ -1345,22 +1375,14 @@ fn generate_types(
                         });
 
                         // Add field documentation
+                        let mut comments = Vec::new();
                         if let Some(description) = get_field_description(&entry.metadata) {
-                            content
-                                .push_str(&format!("{}// {}\n", config.indent_style, description));
+                            comments.push(format!("// {description}"));
                         }
 
                         if let Some(depends) = get_depends_comment(&entry.metadata) {
-                            content.push_str(&format!(
-                                "{}// depends-on: {depends}\n",
-                                config.indent_style
-                            ));
+                            comments.push(format!("// depends-on: {depends}"));
                         }
-
-                        content.push_str(&format!(
-                            "{}{} {}",
-                            config.indent_style, field_name, go_type
-                        ));
 
                         // Add struct tags
                         let mut tag_parts = Vec::new();
@@ -1413,13 +1435,16 @@ fn generate_types(
                             }
                         }
 
-                        if !tag_parts.is_empty() {
-                            content.push_str(&format!(" `{}`", tag_parts.join(" ")));
-                        }
-
-                        content.push('\n');
+                        rows.push(GoFieldRow {
+                            comments,
+                            name: field_name,
+                            ty: reflow_go_type(&go_type, 1),
+                            tag: (!tag_parts.is_empty())
+                                .then(|| format!("`{}`", tag_parts.join(" "))),
+                        });
                     }
                 }
+                content.push_str(&render_go_field_runs(&rows, 1));
 
                 content.push_str("}\n\n");
             }
@@ -1434,6 +1459,7 @@ fn generate_types(
                     ));
                     content.push_str(&format!("type {} struct {{\n", rule.name));
 
+                    let mut rows = Vec::new();
                     for entry in &group.entries {
                         if let Some(key) = &entry.key {
                             let field_name =
@@ -1448,24 +1474,14 @@ fn generate_types(
                                     )
                                 });
 
+                            let mut comments = Vec::new();
                             if let Some(description) = get_field_description(&entry.metadata) {
-                                content.push_str(&format!(
-                                    "{}// {}\n",
-                                    config.indent_style, description
-                                ));
+                                comments.push(format!("// {description}"));
                             }
 
                             if let Some(depends) = get_depends_comment(&entry.metadata) {
-                                content.push_str(&format!(
-                                    "{}// depends-on: {depends}\n",
-                                    config.indent_style
-                                ));
+                                comments.push(format!("// depends-on: {depends}"));
                             }
-
-                            content.push_str(&format!(
-                                "{}{} {}",
-                                config.indent_style, field_name, go_type
-                            ));
 
                             let mut tag_parts = Vec::new();
 
@@ -1493,18 +1509,24 @@ fn generate_types(
                                 }
                             }
 
-                            if !tag_parts.is_empty() {
-                                content.push_str(&format!(" `{}`", tag_parts.join(" ")));
-                            }
-
-                            content.push('\n');
+                            rows.push(GoFieldRow {
+                                comments,
+                                name: field_name,
+                                ty: reflow_go_type(&go_type, 1),
+                                tag: (!tag_parts.is_empty())
+                                    .then(|| format!("`{}`", tag_parts.join(" "))),
+                            });
                         }
                     }
+                    content.push_str(&render_go_field_runs(&rows, 1));
 
                     content.push_str("}\n\n");
                 } else {
                     // Regular type alias
-                    let go_type = map_csil_type_to_go(type_expr, &None, config.decimal_go_type());
+                    let go_type = reflow_go_type(
+                        &map_csil_type_to_go(type_expr, &None, config.decimal_go_type()),
+                        0,
+                    );
                     content.push_str(&format!("// {} is a type alias\n", rule.name));
                     content.push_str(&format!("type {} {}\n\n", rule.name, go_type));
                 }
@@ -1540,8 +1562,10 @@ func (e *ClientError) Error() string {
 
 // Transport is the caller-supplied byte carrier: it performs the call named by
 // (service, op) with the already-encoded request bytes and returns the response
-// bytes, or an error. The generated client owns (de)serialization via the codec;
-// the carrier only moves bytes, so it can be HTTP, a queue, or an in-process loop.
+// bytes, or an error. Both names are the verbatim CSIL names (service as written,
+// op in kebab-case as written), ready to go on the wire unmodified. The generated
+// client owns (de)serialization via the codec; the carrier only moves bytes, so
+// it can be HTTP, a queue, or an in-process loop.
 type Transport interface {
 \tCall(ctx context.Context, service string, op string, req []byte) ([]byte, error)
 }
@@ -1739,15 +1763,476 @@ fn codec_unwrap_constrained(ty: &CsilTypeExpression) -> &CsilTypeExpression {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Inline composite hoisting
+//
+// `csilgen_common::hoist_inline_composites` (see `crates/csilgen-common/src/
+// hoist.rs`) hoists BOTH inline groups and inline non-literal choices, matching
+// what TypeScript/OCaml/Kotlin want. Go wants only the first half: an inline
+// GROUP has no codec of its own here (`go_enc_value`/`go_dec_func` have no
+// `Group` arm — a confirmed data-loss bug, see `process_generation`), but an
+// inline non-literal CHOICE already has a correct, tested codec rendered in
+// place (`go_choice_enc_iife`/`go_choice_dec_closure`, a type-switch IIFE) —
+// exercised by every pinned interop/example spec with a `text / "a" / "b"`-
+// shaped field (`tests/interop/interop.csil`'s `note`/`size` fields,
+// `examples/*/*.csil`'s `priority`/`type`/`error_type`/... fields). Hoisting
+// those too would replace the inline type-switch with a named-reference
+// indirection to a separate top-level union codec — semantically equivalent but
+// NOT byte-identical output for shapes that already round-trip correctly today,
+// which the pinned-spec byte-identical bar forbids.
+//
+// So: run the shared hoister (to get its naming/collision-reservation machinery
+// — see `crates/csilgen-common/src/hoist.rs`'s `reserve`/`canonical_key` — for
+// free on the group side), then splice every synthesized CHOICE rule back
+// inline at its reference site(s) and drop the rule, leaving only the
+// synthesized GROUP rules the pass exists to add — renamed through this
+// generator's own `pascal_case` (this generator, unlike Kotlin, otherwise uses
+// every rule name verbatim as its Go identifier — `generate_types`, `map_csil_
+// type_to_go`'s `Reference` arm — trusting CSIL's own PascalCase-rule-name
+// convention; the hoister's synthesized `<Owner>_<field>` name needs the same
+// treatment applied explicitly, since nothing else in this generator's pipeline
+// ever runs `pascal_case` on a rule name). `canonical_key` (the hoister's
+// collision key) is alphanumeric-only and case-insensitive, so pascal-casing an
+// already-reserved name cannot introduce a NEW collision with anything else.
+fn hoist_inline_groups(spec: &CsilSpecSerialized) -> CsilSpecSerialized {
+    let hoisted = hoist_inline_composites(spec, HoistOptions::default());
+    let original_names: std::collections::HashSet<&str> =
+        spec.rules.iter().map(|r| r.name.as_str()).collect();
+    let mut drop_choices: HashMap<String, CsilTypeExpression> = HashMap::new();
+    let mut rename_groups: HashMap<String, String> = HashMap::new();
+    for rule in &hoisted.rules {
+        if original_names.contains(rule.name.as_str()) {
+            continue;
+        }
+        match &rule.rule_type {
+            CsilRuleType::TypeDef(choice @ CsilTypeExpression::Choice(_)) => {
+                drop_choices.insert(rule.name.clone(), choice.clone());
+            }
+            CsilRuleType::GroupDef(_) => {
+                rename_groups.insert(rule.name.clone(), pascal_case(&rule.name));
+            }
+            // The hoister only ever synthesizes the two shapes above (see
+            // `hoist.rs`'s `push_rule` call sites).
+            _ => {}
+        }
+    }
+    if drop_choices.is_empty() && rename_groups.is_empty() {
+        return hoisted;
+    }
+    let rewrite = HoistRewrite {
+        drop_choices,
+        rename_groups,
+    };
+    let rules: Vec<CsilRule> = hoisted
+        .rules
+        .into_iter()
+        .filter(|r| !rewrite.drop_choices.contains_key(&r.name))
+        .map(|r| rewrite.rule(&r))
+        .collect();
+    CsilSpecSerialized {
+        rules,
+        source_content: hoisted.source_content,
+        service_count: hoisted.service_count,
+        fields_with_metadata_count: hoisted.fields_with_metadata_count,
+    }
+}
+
+/// The two adjustments `hoist_inline_groups` makes to what the shared hoister
+/// produced: drop a synthesized CHOICE rule and splice its body back inline
+/// (`drop_choices`), and rename a KEPT synthesized GROUP rule's raw `<Owner>_
+/// <field>` name to its Go identifier (`rename_groups`).
+struct HoistRewrite {
+    drop_choices: HashMap<String, CsilTypeExpression>,
+    rename_groups: HashMap<String, String>,
+}
+
+impl HoistRewrite {
+    /// Rewrite one rule: its own name (if it is a kept synthesized group) and
+    /// every `Reference` reachable through its body.
+    fn rule(&self, rule: &CsilRule) -> CsilRule {
+        let rule_type = match &rule.rule_type {
+            CsilRuleType::GroupDef(g) => CsilRuleType::GroupDef(self.group(g)),
+            CsilRuleType::TypeDef(CsilTypeExpression::Group(g)) => {
+                CsilRuleType::TypeDef(CsilTypeExpression::Group(self.group(g)))
+            }
+            CsilRuleType::TypeDef(t) => CsilRuleType::TypeDef(self.ty(t)),
+            CsilRuleType::TypeChoice(arms) => {
+                CsilRuleType::TypeChoice(arms.iter().map(|a| self.ty(a)).collect())
+            }
+            CsilRuleType::GroupChoice(groups) => {
+                CsilRuleType::GroupChoice(groups.iter().map(|g| self.group(g)).collect())
+            }
+            // Service op signatures are untouched by the hoister itself (see
+            // `hoist.rs`'s `rewrite_rule`), so there is nothing to rewrite here.
+            CsilRuleType::ServiceDef(def) => CsilRuleType::ServiceDef(def.clone()),
+        };
+        CsilRule {
+            name: self
+                .rename_groups
+                .get(&rule.name)
+                .cloned()
+                .unwrap_or_else(|| rule.name.clone()),
+            rule_type,
+            position: rule.position.clone(),
+            doc_comments: rule.doc_comments.clone(),
+        }
+    }
+
+    fn group(&self, group: &CsilGroupExpression) -> CsilGroupExpression {
+        CsilGroupExpression {
+            entries: group
+                .entries
+                .iter()
+                .map(|entry| CsilGroupEntry {
+                    value_type: self.ty(&entry.value_type),
+                    ..entry.clone()
+                })
+                .collect(),
+        }
+    }
+
+    fn ty(&self, ty: &CsilTypeExpression) -> CsilTypeExpression {
+        match ty {
+            CsilTypeExpression::Reference(name) => {
+                if let Some(body) = self.drop_choices.get(name) {
+                    // Recurse into the spliced-back body too, in case it itself
+                    // referenced another synthesized choice (an arm that was
+                    // itself hoisted).
+                    return self.ty(body);
+                }
+                if let Some(renamed) = self.rename_groups.get(name) {
+                    return CsilTypeExpression::Reference(renamed.clone());
+                }
+                ty.clone()
+            }
+            CsilTypeExpression::Array {
+                element_type,
+                occurrence,
+            } => CsilTypeExpression::Array {
+                element_type: Box::new(self.ty(element_type)),
+                occurrence: occurrence.clone(),
+            },
+            CsilTypeExpression::Map {
+                key,
+                value,
+                occurrence,
+            } => CsilTypeExpression::Map {
+                key: Box::new(self.ty(key)),
+                value: Box::new(self.ty(value)),
+                occurrence: occurrence.clone(),
+            },
+            CsilTypeExpression::Tuple(g) => CsilTypeExpression::Tuple(self.group(g)),
+            CsilTypeExpression::Group(g) => CsilTypeExpression::Group(self.group(g)),
+            CsilTypeExpression::Choice(arms) => {
+                CsilTypeExpression::Choice(arms.iter().map(|a| self.ty(a)).collect())
+            }
+            CsilTypeExpression::Constrained {
+                base_type,
+                constraints,
+            } => CsilTypeExpression::Constrained {
+                base_type: Box::new(self.ty(base_type)),
+                constraints: constraints.clone(),
+            },
+            other => other.clone(),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// gofmt-fixpoint rendering
+//
+// Consumers check generated Go in and require a fresh regen to produce a zero
+// diff against `gofmt -w`-settled files, so emission must land on gofmt's
+// fixpoint rather than "close enough". The helpers below reproduce the two
+// go/printer decisions that shape this generator's output: the one-line
+// function-literal budget (`funcBody`, maxSize 100) and elastic-tab column
+// alignment (`text/tabwriter`, padding 1), including `exprList`'s
+// geometric-mean outlier break for composite-literal keys.
+// ---------------------------------------------------------------------------
+
+/// Renders a Go func literal on one line only when gofmt's `funcBody` would keep
+/// it there: at most 5 statements, none spanning lines, and
+/// `len(signature) + Σ len(stmt) + 2·(n−1) <= 100`. Anything else gets the block
+/// form, which gofmt preserves verbatim (a body whose braces sit on different
+/// lines is never re-joined). `indent` is the tab depth of the line the literal
+/// starts on; multi-line statements passed in must already be rendered at
+/// `indent + 1` (first line bare, continuation lines fully indented).
+fn go_closure(sig: &str, stmts: &[String], indent: usize) -> String {
+    const GOFMT_ONE_LINE_BUDGET: usize = 100;
+    let one_line = !sig.contains('\n')
+        && stmts.len() <= 5
+        && stmts.iter().all(|s| !s.contains('\n'))
+        && sig.len()
+            + stmts.iter().map(String::len).sum::<usize>()
+            + 2 * stmts.len().saturating_sub(1)
+            <= GOFMT_ONE_LINE_BUDGET;
+    if one_line {
+        return format!("{sig} {{ {} }}", stmts.join("; "));
+    }
+    let tabs = "\t".repeat(indent);
+    let mut out = format!("{sig} {{\n");
+    for stmt in stmts {
+        out.push_str(&format!("{tabs}\t{stmt}\n"));
+    }
+    out.push_str(&format!("{tabs}}}"));
+    out
+}
+
+/// Renders an `if` statement in block form. gofmt never fits a non-empty block
+/// statement on one line, so any closure carrying one of these is forced
+/// multi-line by construction — exactly the `nodeSize` newline rule.
+fn go_if(cond: &str, stmts: &[String], indent: usize) -> String {
+    let tabs = "\t".repeat(indent);
+    let mut out = format!("if {cond} {{\n");
+    for stmt in stmts {
+        out.push_str(&format!("{tabs}\t{stmt}\n"));
+    }
+    out.push_str(&format!("{tabs}}}"));
+    out
+}
+
+/// Re-renders anonymous `struct { … }` types (the one-line spelling
+/// `go_tuple_struct` builds) the way gofmt's `fieldList` would: a single field
+/// stays inline as `struct{ F T }` while it fits the 30-char one-line field-list
+/// budget; anything larger breaks one field per line with names column-aligned.
+/// Nested anonymous structs re-flow recursively at one more tab.
+fn reflow_go_type(ty: &str, indent: usize) -> String {
+    let Some(start) = ty.find("struct { ") else {
+        return ty.to_string();
+    };
+    let brace = start + "struct ".len();
+    let mut depth = 0usize;
+    let mut close = None;
+    for (i, ch) in ty[brace..].char_indices() {
+        match ch {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    close = Some(brace + i);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let Some(close) = close else {
+        return ty.to_string();
+    };
+    let inner = &ty[brace + 2..close - 1];
+    let mut fields = Vec::new();
+    let mut field_depth = 0usize;
+    let mut field_start = 0usize;
+    let bytes = inner.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'{' | b'[' | b'(' => field_depth += 1,
+            b'}' | b']' | b')' => field_depth -= 1,
+            b';' if field_depth == 0 && bytes.get(i + 1) == Some(&b' ') => {
+                fields.push(&inner[field_start..i]);
+                field_start = i + 2;
+                i += 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    fields.push(&inner[field_start..]);
+
+    // The suffix after this struct may hold further anonymous structs (a map
+    // value, another tuple parameter); re-flow it at the same depth.
+    let suffix = reflow_go_type(&ty[close + 1..], indent);
+
+    let reflowed: Vec<(String, String)> = fields
+        .iter()
+        .map(|f| {
+            let (name, field_ty) = f.split_once(' ').unwrap_or((f, ""));
+            (name.to_string(), reflow_go_type(field_ty, indent + 1))
+        })
+        .collect();
+
+    // gofmt's one-line field-list budget counts one blank plus the type size
+    // against 30, and only ever inlines a single untagged field.
+    if let [(name, field_ty)] = reflowed.as_slice()
+        && !field_ty.contains('\n')
+        && field_ty.len() < 30
+    {
+        return format!("{}struct{{ {name} {field_ty} }}{suffix}", &ty[..start]);
+    }
+
+    let tabs = "\t".repeat(indent);
+    let name_w = reflowed.iter().map(|(n, _)| n.len()).max().unwrap_or(0) + 1;
+    let mut out = format!("{}struct {{\n", &ty[..start]);
+    for (name, field_ty) in &reflowed {
+        out.push_str(&format!("{tabs}\t{name:<name_w$}{field_ty}\n"));
+    }
+    out.push_str(&format!("{tabs}}}{suffix}"));
+    out
+}
+
+/// One struct field for `render_go_field_runs`: any leading comment lines (which
+/// start a fresh alignment run, as gofmt aligns comment-separated runs
+/// independently), the field name, its (possibly multi-line) Go type, and the
+/// backtick tag if any.
+struct GoFieldRow {
+    comments: Vec<String>,
+    name: String,
+    ty: String,
+    tag: Option<String>,
+}
+
+/// Emits struct fields with gofmt's tabwriter alignment: within a run, the name
+/// column is padded to the widest name + 1 and the type column to the widest
+/// tagged single-line type + 1 (a line's last cell is never padded). A comment
+/// breaks the run before its field; a multi-line type ends the run after its own
+/// name has been aligned with it — both observed gofmt behaviors.
+fn render_go_field_runs(rows: &[GoFieldRow], indent: usize) -> String {
+    let tabs = "\t".repeat(indent);
+    let mut out = String::new();
+
+    fn flush(run: &mut Vec<&GoFieldRow>, out: &mut String, tabs: &str) {
+        if run.is_empty() {
+            return;
+        }
+        let name_w = run.iter().map(|r| r.name.len()).max().unwrap_or(0) + 1;
+        let type_w = run
+            .iter()
+            .filter(|r| r.tag.is_some() && !r.ty.contains('\n'))
+            .map(|r| r.ty.len())
+            .max()
+            .map(|w| w + 1);
+        for row in run.iter() {
+            out.push_str(tabs);
+            if row.ty.contains('\n') {
+                out.push_str(&format!("{:<name_w$}{}", row.name, row.ty));
+                if let Some(tag) = &row.tag {
+                    out.push_str(&format!(" {tag}"));
+                }
+            } else if let Some(tag) = &row.tag {
+                let type_w = type_w.unwrap_or(row.ty.len() + 1);
+                out.push_str(&format!("{:<name_w$}{:<type_w$}{tag}", row.name, row.ty));
+            } else {
+                out.push_str(&format!("{:<name_w$}{}", row.name, row.ty));
+            }
+            out.push('\n');
+        }
+        run.clear();
+    }
+
+    let mut run: Vec<&GoFieldRow> = Vec::new();
+    for row in rows {
+        if !row.comments.is_empty() {
+            flush(&mut run, &mut out, &tabs);
+            for comment in &row.comments {
+                out.push_str(&format!("{tabs}{comment}\n"));
+            }
+        }
+        run.push(row);
+        if row.ty.contains('\n') {
+            flush(&mut run, &mut out, &tabs);
+        }
+    }
+    flush(&mut run, &mut out, &tabs);
+    out
+}
+
+/// Emits the `Key: value,` lines of a composite literal with gofmt's alignment:
+/// go/printer's `exprList` aligns consecutive pairs unless a key is an outlier
+/// (over 40 chars and off the running geometric mean of key sizes by a factor of
+/// 2.5) or a pair spans lines — either starts a new alignment section. Within a
+/// section the value column sits at the widest `Key:` + 1.
+fn render_go_composite_pairs(pairs: &[(String, String)], indent: usize) -> String {
+    let tabs = "\t".repeat(indent);
+    let mut sections: Vec<Vec<&(String, String)>> = Vec::new();
+    let mut lnsum = 0.0f64;
+    let mut count = 0usize;
+    let mut prev_size = 0usize;
+    for (i, pair) in pairs.iter().enumerate() {
+        let (key, value) = pair;
+        let size = if key.contains('\n') || value.contains('\n') {
+            0
+        } else {
+            key.len()
+        };
+        let mut use_ff = true;
+        if prev_size > 0 && size > 0 {
+            const SMALL_SIZE: usize = 40;
+            if count == 0 || (prev_size <= SMALL_SIZE && size <= SMALL_SIZE) {
+                use_ff = false;
+            } else {
+                const RATIO_LIMIT: f64 = 2.5;
+                let geomean = (lnsum / count as f64).exp();
+                let ratio = size as f64 / geomean;
+                use_ff = RATIO_LIMIT * ratio <= 1.0 || RATIO_LIMIT <= ratio;
+            }
+        }
+        if i == 0 || use_ff {
+            sections.push(Vec::new());
+        }
+        sections.last_mut().expect("section exists").push(pair);
+        if size > 0 {
+            lnsum += (size as f64).ln();
+            count += 1;
+        }
+        prev_size = size;
+    }
+
+    let mut out = String::new();
+    for section in &sections {
+        let key_w = section.iter().map(|(k, _)| k.len() + 1).max().unwrap_or(0) + 1;
+        for (key, value) in section {
+            let cell = format!("{key}:");
+            out.push_str(&format!("{tabs}{cell:<key_w$}{value},\n"));
+        }
+    }
+    out
+}
+
+/// Settles a finished `.go` file on gofmt's fixpoint for the file-level details
+/// emission sites don't see: import paths sorted within their blank-line groups,
+/// and exactly one trailing newline.
+fn gofmt_finish(content: String) -> String {
+    let mut content = content;
+    if let Some(start) = content.find("import (\n") {
+        let block_start = start + "import (\n".len();
+        if let Some(end) = content[block_start..].find("\n)") {
+            let block = &content[block_start..block_start + end];
+            let mut groups: Vec<Vec<&str>> = vec![Vec::new()];
+            for line in block.lines() {
+                if line.trim().is_empty() {
+                    groups.push(Vec::new());
+                } else {
+                    groups.last_mut().expect("group exists").push(line);
+                }
+            }
+            for group in &mut groups {
+                group.sort_unstable();
+            }
+            let sorted = groups
+                .iter()
+                .map(|g| g.join("\n"))
+                .collect::<Vec<_>>()
+                .join("\n\n");
+            content.replace_range(block_start..block_start + end, &sorted);
+        }
+    }
+    let trimmed = content.trim_end_matches('\n');
+    format!("{trimmed}\n")
+}
+
 /// A Go expression building a `cborValue` from `expr` (a typed Go value of the
 /// field's mapped type). Composite types map via the generic `cborEncArray`/
-/// `cborEncMap` runtime helpers so nesting composes cleanly.
+/// `cborEncMap` runtime helpers so nesting composes cleanly. `indent` is the tab
+/// depth of the line the expression is embedded on, so any func literal it opens
+/// can land on gofmt's fixpoint.
 fn go_enc_value(
     ty: &CsilTypeExpression,
     expr: &str,
     records: &std::collections::HashSet<String>,
     aliases: &std::collections::HashMap<String, CsilTypeExpression>,
     config: &GoConfig,
+    indent: usize,
 ) -> String {
     match codec_unwrap_constrained(ty) {
         CsilTypeExpression::Builtin(name) => match name.as_str() {
@@ -1768,31 +2253,102 @@ fn go_enc_value(
         }
         // A reference to a transparent alias (`StringInt64Map = {* text => int}`,
         // `Tags = [* text]`, `Uuid = text`) has no codec of its own; encode it as its
-        // underlying type. The named Go type is assignable to the unnamed underlying
-        // the map/array/scalar encoder expects, so the same `expr` flows through.
+        // underlying type. Most scalar encoders (`cborText`/`cborUint`/...) are
+        // themselves Go type conversions, so a same-underlying-type alias flows
+        // through unchanged. `decimal`/`timestamp` encode via a genuine function
+        // (`csilEncDecimal`/`csilEncTimestamp`) that requires its exact declared
+        // parameter type (`CsilDecimal`/`time.Time`), which a distinct named alias
+        // (`type unit_price CsilDecimal`) is NOT implicitly assignable to — so the
+        // conversion must be made explicit at the alias boundary before recursing.
         CsilTypeExpression::Reference(name) if aliases.contains_key(name) => {
-            go_enc_value(&aliases[name], expr, records, aliases, config)
+            let target = &aliases[name];
+            let unwrapped = codec_unwrap_constrained(target);
+            let owned_expr;
+            let expr = if matches!(unwrapped, CsilTypeExpression::Builtin(b) if b == "decimal" || b == "timestamp")
+            {
+                let go_type = map_csil_type_to_go(unwrapped, &None, config.decimal_go_type());
+                owned_expr = format!("{go_type}({expr})");
+                owned_expr.as_str()
+            } else {
+                expr
+            };
+            go_enc_value(target, expr, records, aliases, config, indent)
         }
         // A union (non-literal type-choice) has its own tagged-sum codec helper.
         CsilTypeExpression::Reference(name) if config.union_names.contains(name) => {
             format!("csilEnc{name}({expr})")
         }
         CsilTypeExpression::Array { element_type, .. } => {
-            let elem_ty = map_csil_type_to_go(element_type, &None, config.decimal_go_type());
-            let inner = go_enc_value(element_type, "csilElem", records, aliases, config);
-            format!("cborEncArray({expr}, func(csilElem {elem_ty}) cborValue {{ return {inner} }})")
+            let elem_ty = reflow_go_type(
+                &map_csil_type_to_go(element_type, &None, config.decimal_go_type()),
+                indent,
+            );
+            let inner = go_enc_value(
+                element_type,
+                "csilElem",
+                records,
+                aliases,
+                config,
+                indent + 1,
+            );
+            let f = go_closure(
+                &format!("func(csilElem {elem_ty}) cborValue"),
+                &[format!("return {inner}")],
+                indent,
+            );
+            format!("cborEncArray({expr}, {f})")
         }
         CsilTypeExpression::Map { key, value, .. } => {
-            let key_ty = map_csil_type_to_go(key, &None, config.decimal_go_type());
-            let val_ty = map_csil_type_to_go(value, &None, config.decimal_go_type());
-            let kenc = go_enc_value(key, "csilK", records, aliases, config);
-            let venc = go_enc_value(value, "csilV", records, aliases, config);
-            format!(
-                "cborEncMap({expr}, func(csilK {key_ty}) cborValue {{ return {kenc} }}, func(csilV {val_ty}) cborValue {{ return {venc} }})"
-            )
+            let key_ty = reflow_go_type(
+                &map_csil_type_to_go(key, &None, config.decimal_go_type()),
+                indent,
+            );
+            let val_ty = reflow_go_type(
+                &map_csil_type_to_go(value, &None, config.decimal_go_type()),
+                indent,
+            );
+            let kenc = go_enc_value(key, "csilK", records, aliases, config, indent + 1);
+            let venc = go_enc_value(value, "csilV", records, aliases, config, indent + 1);
+            let kf = go_closure(
+                &format!("func(csilK {key_ty}) cborValue"),
+                &[format!("return {kenc}")],
+                indent,
+            );
+            let vf = go_closure(
+                &format!("func(csilV {val_ty}) cborValue"),
+                &[format!("return {venc}")],
+                indent,
+            );
+            format!("cborEncMap({expr}, {kf}, {vf})")
         }
-        CsilTypeExpression::Tuple(group) => go_tuple_enc(group, expr, records, aliases, config),
+        CsilTypeExpression::Tuple(group) => {
+            go_tuple_enc(group, expr, records, aliases, config, indent)
+        }
         CsilTypeExpression::Literal(lit) => go_literal_cbor_expr(lit),
+        // An inline (anonymous) choice — a record field, array element, map value,
+        // or tuple element typed directly as `a / b / c` rather than through a
+        // named rule — gets exactly the wire shape a reference to an equivalent
+        // named choice would: a UNIFORM-kind all-literal choice is a scalar-backed
+        // enum (bare scalar wire via `enum_scalar_builtin`, matching
+        // `codec_aliases`' treatment of a named enum); a MIXED-kind all-literal
+        // choice (`"a" / 1`, `choice_all_literal`) rides bare too — same CSIL wire
+        // contract, just boxed in `interface{}` since Go has no single scalar type
+        // spanning the mix (`go_mixed_enum_enc_expr`); a choice with at least one
+        // non-literal arm is a union (tagged sum, matching `emit_union_codec`).
+        // Named and inline choices share this classification so the two stay
+        // identical for the same arms.
+        CsilTypeExpression::Choice(choices) => match enum_scalar_builtin(choices) {
+            Some(builtin) => go_enc_value(
+                &CsilTypeExpression::Builtin(builtin),
+                expr,
+                records,
+                aliases,
+                config,
+                indent,
+            ),
+            None if choice_all_literal(choices) => go_mixed_enum_enc_expr(choices, expr, indent),
+            None => go_choice_enc_iife(choices, expr, records, aliases, config, indent),
+        },
         // A type the codec cannot model precisely (`any`, an unmodeled reference) is
         // carried as null rather than emitting uncompilable code.
         _ => "cborNull{}".to_string(),
@@ -1801,12 +2357,14 @@ fn go_enc_value(
 
 /// A Go expression of function type `func(cborValue) (<GoType>, error)` decoding a
 /// typed value from a `cborValue`. Builtins resolve to a bare runtime accessor
-/// name; composites wrap the generic `cborDecArray`/`cborDecMap` helpers.
+/// name; composites wrap the generic `cborDecArray`/`cborDecMap` helpers. `indent`
+/// is the tab depth of the line the expression is embedded on.
 fn go_dec_func(
     ty: &CsilTypeExpression,
     records: &std::collections::HashSet<String>,
     aliases: &std::collections::HashMap<String, CsilTypeExpression>,
     config: &GoConfig,
+    indent: usize,
 ) -> String {
     match codec_unwrap_constrained(ty) {
         CsilTypeExpression::Builtin(name) => match name.as_str() {
@@ -1837,41 +2395,310 @@ fn go_dec_func(
         // type — which also lets `cborDecArray`/`cborDecMap` infer the right element type
         // (`[]MemberID`, not `[]string`).
         CsilTypeExpression::Reference(name) if aliases.contains_key(name) => {
-            let inner = go_dec_func(&aliases[name], records, aliases, config);
+            let inner = go_dec_func(&aliases[name], records, aliases, config, indent + 1);
             let go_type = map_csil_type_to_go(ty, &None, config.decimal_go_type());
-            format!(
-                "func(csilV cborValue) ({go_type}, error) {{ csilInner, csilErr := ({inner})(csilV); return {go_type}(csilInner), csilErr }}"
+            go_closure(
+                &format!("func(csilV cborValue) ({go_type}, error)"),
+                &[
+                    format!("csilInner, csilErr := ({inner})(csilV)"),
+                    format!("return {go_type}(csilInner), csilErr"),
+                ],
+                indent,
             )
         }
         CsilTypeExpression::Array { element_type, .. } => {
-            let elem_ty = map_csil_type_to_go(element_type, &None, config.decimal_go_type());
-            let inner = go_dec_func(element_type, records, aliases, config);
-            format!(
-                "func(csilV cborValue) ([]{elem_ty}, error) {{ return cborDecArray(csilV, {inner}) }}"
+            let elem_ty = reflow_go_type(
+                &map_csil_type_to_go(element_type, &None, config.decimal_go_type()),
+                indent,
+            );
+            let inner = go_dec_func(element_type, records, aliases, config, indent + 1);
+            go_closure(
+                &format!("func(csilV cborValue) ([]{elem_ty}, error)"),
+                &[format!("return cborDecArray(csilV, {inner})")],
+                indent,
             )
         }
         CsilTypeExpression::Map { key, value, .. } => {
-            let key_ty = map_csil_type_to_go(key, &None, config.decimal_go_type());
-            let val_ty = map_csil_type_to_go(value, &None, config.decimal_go_type());
-            let kf = go_dec_func(key, records, aliases, config);
-            let vf = go_dec_func(value, records, aliases, config);
-            format!(
-                "func(csilV cborValue) (map[{key_ty}]{val_ty}, error) {{ return cborDecMap(csilV, {kf}, {vf}) }}"
+            let key_ty = reflow_go_type(
+                &map_csil_type_to_go(key, &None, config.decimal_go_type()),
+                indent,
+            );
+            let val_ty = reflow_go_type(
+                &map_csil_type_to_go(value, &None, config.decimal_go_type()),
+                indent,
+            );
+            let kf = go_dec_func(key, records, aliases, config, indent + 1);
+            let vf = go_dec_func(value, records, aliases, config, indent + 1);
+            go_closure(
+                &format!("func(csilV cborValue) (map[{key_ty}]{val_ty}, error)"),
+                &[format!("return cborDecMap(csilV, {kf}, {vf})")],
+                indent,
             )
         }
-        CsilTypeExpression::Tuple(group) => go_tuple_dec(group, records, aliases, config),
+        CsilTypeExpression::Tuple(group) => go_tuple_dec(group, records, aliases, config, indent),
         CsilTypeExpression::Literal(lit) => {
             let go_type = map_csil_type_to_go(ty, &None, config.decimal_go_type());
             let expected = go_literal_cbor_expr(lit);
             let value = literal_value_to_go_string(lit);
-            format!(
-                "func(csilV cborValue) ({go_type}, error) {{ if !cborEqual(csilV, {expected}) {{ var csilZero {go_type}; return csilZero, fmt.Errorf(\"csil cbor: literal mismatch\") }}; return {value}, nil }}"
+            go_closure(
+                &format!("func(csilV cborValue) ({go_type}, error)"),
+                &[
+                    go_if(
+                        &format!("!cborEqual(csilV, {expected})"),
+                        &[
+                            format!("var csilZero {go_type}"),
+                            "return csilZero, fmt.Errorf(\"csil cbor: literal mismatch\")"
+                                .to_string(),
+                        ],
+                        indent + 1,
+                    ),
+                    format!("return {value}, nil"),
+                ],
+                indent,
             )
         }
+        // An inline choice decodes exactly like a reference to an equivalent named
+        // choice would (see the matching arm in `go_enc_value`): a UNIFORM-kind
+        // all-literal choice (an enum) reads as its bare backing scalar but MUST
+        // also reject a well-typed wire value outside the declared literal set
+        // (parity with the python/ocaml/php/ruby/elixir codecs' membership check on
+        // enum decode) — otherwise any string/int/float/bool decodes successfully
+        // regardless of which enum members were actually declared. A MIXED-kind
+        // all-literal choice gets the same bare-plus-membership-check treatment,
+        // just probing each present literal kind's CBOR accessor in turn since no
+        // single one covers every arm (`go_mixed_enum_dec_func`). A choice with at
+        // least one non-literal arm reads the tagged-sum `[variant_index, value]`
+        // and dispatches on the index.
+        CsilTypeExpression::Choice(choices) => match enum_scalar_builtin(choices) {
+            Some(builtin) => go_enum_dec_func(choices, &builtin, records, aliases, config, indent),
+            None if choice_all_literal(choices) => go_mixed_enum_dec_func(choices, indent),
+            None => go_choice_dec_closure(choices, records, aliases, config, indent),
+        },
         // The codec cannot reconstruct this shape; yield its zero value so the
         // generated decoder still compiles against the field's Go type.
         other => codec_zero_decoder(&map_csil_type_to_go(other, &None, config.decimal_go_type())),
     }
+}
+
+/// A `func(cborValue) (<scalar>, error)` decoding a literal-only choice (an enum):
+/// reads the bare backing scalar, then rejects any well-typed value that isn't one
+/// of the declared literal members. Without this check a field typed `"red" /
+/// "green" / "blue"` would accept ANY string on the wire (`"purple"` decodes
+/// silently) because the enum has no codec of its own and otherwise decodes
+/// exactly like an untyped scalar alias — this is the parity gap with the python/
+/// ocaml/php/ruby/elixir codecs, which all raise their standard decode error on an
+/// out-of-set value. Shared by both a named enum (via `codec_aliases` routing a
+/// `Reference` here) and an inline enum (a field/element typed as the choice
+/// directly), so the fix applies uniformly to both spellings.
+fn go_enum_dec_func(
+    choices: &[CsilTypeExpression],
+    builtin: &str,
+    records: &std::collections::HashSet<String>,
+    aliases: &std::collections::HashMap<String, CsilTypeExpression>,
+    config: &GoConfig,
+    indent: usize,
+) -> String {
+    let go_type = literal_choice_scalar_go(choices).unwrap_or("interface{}");
+    let inner = go_dec_func(
+        &CsilTypeExpression::Builtin(builtin.to_string()),
+        records,
+        aliases,
+        config,
+        indent + 1,
+    );
+    let members: Vec<String> = choices
+        .iter()
+        .filter_map(choice_arm_literal)
+        .map(literal_value_to_go_string)
+        .collect();
+    let membership_cond = members
+        .iter()
+        .map(|m| format!("csilInner == {m}"))
+        .collect::<Vec<_>>()
+        .join(" || ");
+    go_closure(
+        &format!("func(csilV cborValue) ({go_type}, error)"),
+        &[
+            format!("csilInner, csilErr := ({inner})(csilV)"),
+            go_if(
+                "csilErr != nil",
+                &[
+                    format!("var csilZero {go_type}"),
+                    "return csilZero, csilErr".to_string(),
+                ],
+                indent + 1,
+            ),
+            go_if(
+                &format!("!({membership_cond})"),
+                &[
+                    format!("var csilZero {go_type}"),
+                    "return csilZero, fmt.Errorf(\"csil cbor: value %v is not a member of the declared enum\", csilInner)".to_string(),
+                ],
+                indent + 1,
+            ),
+            "return csilInner, nil".to_string(),
+        ],
+        indent,
+    )
+}
+
+/// The encoded value of an inline (mixed, non-enum) choice, as an immediately-
+/// invoked function literal (`func() cborValue { ... }()`). An inline choice has
+/// no declared name to hang a package-level `csilEnc<Name>` helper off of the way
+/// a named union does (`emit_union_codec`), so the same type-switch/literal-first
+/// shape is built as a closure over `expr` at the call site instead. `indent` is
+/// the tab depth of the line the call (`...()`) is embedded on.
+fn go_choice_enc_iife(
+    choices: &[CsilTypeExpression],
+    expr: &str,
+    records: &std::collections::HashSet<String>,
+    aliases: &std::collections::HashMap<String, CsilTypeExpression>,
+    config: &GoConfig,
+    indent: usize,
+) -> String {
+    let dec = config.decimal_go_type();
+    // Arms sharing a Go type (several literals plus a general arm, e.g. `text /
+    // "pending" / "confirmed"`) can't each get their own `case` in one type
+    // switch — Go forbids duplicate case types — so they are grouped and
+    // disambiguated by value within one shared `case`, mirroring
+    // `emit_union_codec`.
+    let mut type_order: Vec<String> = Vec::new();
+    let mut groups: std::collections::HashMap<String, Vec<usize>> =
+        std::collections::HashMap::new();
+    for (i, variant) in choices.iter().enumerate() {
+        let go_type = reflow_go_type(&map_csil_type_to_go(variant, &None, dec), indent + 1);
+        let entry = groups.entry(go_type.clone()).or_default();
+        if entry.is_empty() {
+            type_order.push(go_type.clone());
+        }
+        entry.push(i);
+    }
+
+    // `base` is the tab depth the `switch` keyword itself lands at once
+    // `go_closure` wraps this body in a func literal one level deeper than
+    // `indent` — matching `go_closure`'s "first line bare, continuation lines
+    // fully indented" convention for a multi-line statement.
+    let base = indent + 1;
+    let tb = "\t".repeat(base);
+    let tb1 = "\t".repeat(base + 1);
+    let tb2 = "\t".repeat(base + 2);
+    // Whether any case body actually references the type switch's bound variable —
+    // see the matching comment in `emit_union_codec`, which this mirrors exactly:
+    // an all-single-arm choice where every arm's own encode ignores its value (a
+    // bare `Literal`, or a `null`/`nil` builtin) never touches `csilX`, and Go
+    // rejects the type switch as "declared and not used" if so.
+    let mut uses_csil_x = false;
+    let mut body = String::new();
+    for go_type in &type_order {
+        let idxs = &groups[go_type];
+        if idxs.len() == 1 {
+            let i = idxs[0];
+            let enc = go_enc_value(&choices[i], "csilX", records, aliases, config, base + 1);
+            uses_csil_x = uses_csil_x || enc.contains("csilX");
+            body.push_str(&format!(
+                "{tb}case {go_type}:\n{tb1}return cborArray{{cborUint({i}), {enc}}}\n"
+            ));
+            continue;
+        }
+        uses_csil_x = true; // the grouped case's own `switch csilX { ... }` uses it.
+        let mut literal_idxs = Vec::new();
+        let mut general_idx = None;
+        for &i in idxs {
+            if choice_arm_literal(&choices[i]).is_some() {
+                literal_idxs.push(i);
+            } else if general_idx.is_none() {
+                // Reaching this `case` clause at all means every arm in `idxs`
+                // rendered to the SAME Go type (that's what put them in one group
+                // — Go's type switch forbids two `case SameType:` clauses), so two
+                // non-literal arms here are genuinely indistinguishable at runtime.
+                // The FIRST declared arm wins (lowest index) rather than the last:
+                // previously this unconditionally overwrote `general_idx` on every
+                // non-literal arm, so the LAST arm silently won instead, matching
+                // the analogous bug in `emit_union_codec` below.
+                general_idx = Some(i);
+            }
+        }
+        body.push_str(&format!("{tb}case {go_type}:\n{tb1}switch csilX {{\n"));
+        for i in literal_idxs {
+            let lit = choice_arm_literal(&choices[i])
+                .expect("filtered to literal-carrying variants above");
+            let lit_value = literal_value_to_go_string(lit);
+            let enc = go_enc_value(&choices[i], "csilX", records, aliases, config, base + 2);
+            body.push_str(&format!(
+                "{tb1}case {lit_value}:\n{tb2}return cborArray{{cborUint({i}), {enc}}}\n"
+            ));
+        }
+        body.push_str(&format!("{tb1}default:\n"));
+        match general_idx {
+            Some(gi) => {
+                let enc = go_enc_value(&choices[gi], "csilX", records, aliases, config, base + 2);
+                body.push_str(&format!("{tb2}return cborArray{{cborUint({gi}), {enc}}}\n"));
+            }
+            // No general arm to fall back to; matches the outer switch's own
+            // unmatched-value behavior rather than inventing a new failure mode.
+            None => body.push_str(&format!("{tb2}return cborNull{{}}\n")),
+        }
+        body.push_str(&format!("{tb1}}}\n"));
+    }
+    body.push_str(&format!("{tb}default:\n{tb1}return cborNull{{}}\n{tb}}}"));
+    let header = if uses_csil_x {
+        format!("switch csilX := {expr}.(type) {{\n")
+    } else {
+        format!("switch {expr}.(type) {{\n")
+    };
+    format!(
+        "{}()",
+        go_closure("func() cborValue", &[header + &body], indent)
+    )
+}
+
+/// A Go expression of function type `func(cborValue) (interface{}, error)`
+/// decoding an inline (mixed, non-enum) choice from a tagged-sum
+/// `[variant_index, value]`, the decode inverse of `go_choice_enc_iife`. A mixed
+/// choice's Go type is always `interface{}` (`map_csil_type_to_go`'s `Choice`
+/// case), matching a named union's own `interface{}` marker type.
+fn go_choice_dec_closure(
+    choices: &[CsilTypeExpression],
+    records: &std::collections::HashSet<String>,
+    aliases: &std::collections::HashMap<String, CsilTypeExpression>,
+    config: &GoConfig,
+    indent: usize,
+) -> String {
+    let base = indent + 1;
+    let tb = "\t".repeat(base);
+    let tb1 = "\t".repeat(base + 1);
+    let mut switch_stmt = "switch csilIdx {\n".to_string();
+    for (i, variant) in choices.iter().enumerate() {
+        let decf = go_dec_func(variant, records, aliases, config, base + 1);
+        switch_stmt.push_str(&format!(
+            "{tb}case {i}:\n{tb1}csilVal, csilErr := ({decf})(csilArr[1])\n{tb1}return csilVal, csilErr\n"
+        ));
+    }
+    switch_stmt.push_str(&format!(
+        "{tb}default:\n{tb1}return nil, fmt.Errorf(\"csil cbor: unknown choice variant %d\", csilIdx)\n{tb}}}"
+    ));
+    go_closure(
+        "func(csilV cborValue) (interface{}, error)",
+        &[
+            "csilArr, csilOk := csilV.(cborArray)".to_string(),
+            go_if(
+                "!csilOk || len(csilArr) != 2",
+                &[
+                    "return nil, fmt.Errorf(\"csil cbor: choice expects a 2-element array\")"
+                        .to_string(),
+                ],
+                indent + 1,
+            ),
+            "csilIdx, csilIdxErr := cborAsU64(csilArr[0])".to_string(),
+            go_if(
+                "csilIdxErr != nil",
+                &["return nil, csilIdxErr".to_string()],
+                indent + 1,
+            ),
+            switch_stmt,
+        ],
+        indent,
+    )
 }
 
 /// The transparent type aliases the codec resolves through: a `TypeDef` whose target
@@ -1888,13 +2715,22 @@ fn codec_aliases(
         .filter_map(|rule| match &rule.rule_type {
             CsilRuleType::TypeDef(t) => match t {
                 CsilTypeExpression::Group(_) => None,
-                // An enum (a choice of scalar literals) has no codec of its own, but it
-                // round-trips as its backing scalar: alias it to that builtin so the
-                // shared encode (`cborText`) and decode-with-conversion paths handle it
-                // exactly like a `Name = text` scalar alias. A true (non-literal) union
-                // stays unaliased and falls back to the null stub.
-                CsilTypeExpression::Choice(choices) => enum_scalar_builtin(choices)
-                    .map(|builtin| (rule.name.clone(), CsilTypeExpression::Builtin(builtin))),
+                // An enum (an ALL-literal choice — `choice_all_literal`, uniform OR
+                // mixed kind) has no codec of its own, but it round-trips as its
+                // bare wire value: alias it to the *choice itself* (not just a bare
+                // builtin, since a mixed-kind enum has no single builtin to alias
+                // to) so `go_dec_func`'s `Choice` arm — which decodes the backing
+                // scalar/`interface{}` AND validates wire-value membership in the
+                // declared literal set — runs for a named enum exactly as it does
+                // for an inline one. A true (non-literal) union, or a choice with a
+                // literal `null` arm (`choice_all_literal` excludes both — see its
+                // doc), stays unaliased and falls back to the null stub.
+                CsilTypeExpression::Choice(choices) => choice_all_literal(choices).then(|| {
+                    (
+                        rule.name.clone(),
+                        CsilTypeExpression::Choice(choices.clone()),
+                    )
+                }),
                 other => Some((rule.name.clone(), other.clone())),
             },
             _ => None,
@@ -1968,7 +2804,7 @@ fn emit_record_codec(
             } else {
                 format!("csilV.{member}")
             };
-            let enc = go_enc_value(&entry.value_type, &read, records, aliases, config);
+            let enc = go_enc_value(&entry.value_type, &read, records, aliases, config, 2);
             out.push_str(&format!(
                 "{i}if csilV.{member} != nil {{\n{i}{i}csilEntries = append(csilEntries, cborEntry{{cborText({wire_lit}), {enc}}})\n{i}}}\n"
             ));
@@ -1979,6 +2815,7 @@ fn emit_record_codec(
                 records,
                 aliases,
                 config,
+                1,
             );
             out.push_str(&format!(
                 "{i}csilEntries = append(csilEntries, cborEntry{{cborText({wire_lit}), {enc}}})\n"
@@ -1999,7 +2836,7 @@ fn emit_record_codec(
         // `go_dec_func` returns a decoder whose result is the field's exact Go type
         // (it converts a named scalar alias / enum to its named type), so the assignment
         // is a plain copy — no conversion needed here.
-        let dec = go_dec_func(&entry.value_type, records, aliases, config);
+        let dec = go_dec_func(&entry.value_type, records, aliases, config, 2);
         if matches!(entry.occurrence, Some(CsilOccurrence::Optional)) {
             // A missing optional key leaves the field at its zero value (nil); a
             // present one decodes into a fresh local. A pointer field stores its
@@ -2049,8 +2886,12 @@ fn emit_record_codec(
 /// Build `codec.gen.go`: the self-contained canonical-CBOR runtime plus an
 /// `Encode`/`Decode` pair per record. `None` when the spec declares no records.
 /// Named non-literal type-choices (unions) and their variant types, in declaration
-/// order. Literal-only choices are enums (aliased to a scalar elsewhere); a choice
-/// carrying a `null` variant is an optional, not a union — both are excluded.
+/// order. An ALL-literal choice is an enum — `enum_scalar_builtin`'s UNIFORM-kind
+/// case is aliased to a single Go scalar elsewhere, and `choice_all_literal`'s
+/// broader MIXED-kind case (`"a" / 1`) is excluded here too since it rides bare in
+/// `interface{}` (`go_mixed_enum_enc_expr`/`go_mixed_enum_dec_func`), same CSIL wire
+/// contract either way — a choice carrying a literal `null` variant is excluded as
+/// well (see `has_null` below). Both are excluded from union classification.
 fn union_defs(input: &WasmGeneratorInput) -> Vec<(String, Vec<CsilTypeExpression>)> {
     input
         .csil_spec
@@ -2062,12 +2903,24 @@ fn union_defs(input: &WasmGeneratorInput) -> Vec<(String, Vec<CsilTypeExpression
                 CsilRuleType::TypeDef(CsilTypeExpression::Choice(c)) => c,
                 _ => return None,
             };
-            if enum_scalar_builtin(choices).is_some() {
+            if choice_all_literal(choices) {
                 return None;
             }
+            // A bare `null` choice arm written in real CSIL source parses as
+            // `TypeExpression::Builtin("null")`, never `Literal(LiteralValue::Null)`
+            // (see `choice_all_literal`'s doc), so this guard is unreachable from
+            // any choice arm the parser itself produces — a choice like
+            // `"a" / 1 / null` from real source has a genuine non-literal `null`
+            // general arm and correctly becomes a 3-variant union below, matching
+            // the Python/TypeScript generators' empirically-observed behavior for
+            // the same source. `CsilLiteralValue::Null` remains constructible
+            // directly against this generator's `WasmGeneratorInput` API though
+            // (bypassing the parser), so this stays as a defensive guard — mirrors
+            // the Python generator's own `python_union_defs`, which excludes a
+            // literal `null` arm from union classification the same way.
             let has_null = choices
                 .iter()
-                .any(|c| matches!(c, CsilTypeExpression::Literal(CsilLiteralValue::Null)));
+                .any(|c| matches!(choice_arm_literal(c), Some(CsilLiteralValue::Null)));
             if has_null {
                 return None;
             }
@@ -2093,14 +2946,96 @@ fn emit_union_codec(
         "// csilEnc{name} encodes a {name} union as a tagged sum [variant_index, value].\n"
     ));
     out.push_str(&format!("func csilEnc{name}(csilV {name}) cborValue {{\n"));
-    out.push_str("\tswitch csilX := csilV.(type) {\n");
+    // A mixed union (`text / "pending" / "confirmed" / ...`) has a general arm and
+    // several literal arms that all share one Go type (`string`); Go's type switch
+    // forbids two `case string:` clauses, so arms are grouped by Go type first and
+    // a shared clause is emitted once per type, in first-occurrence order.
+    let mut type_order: Vec<String> = Vec::new();
+    let mut groups: std::collections::HashMap<String, Vec<usize>> =
+        std::collections::HashMap::new();
     for (i, variant) in variants.iter().enumerate() {
-        let go_type = map_csil_type_to_go(variant, &None, dec);
-        let enc = go_enc_value(variant, "csilX", records, aliases, config);
-        out.push_str(&format!(
-            "\tcase {go_type}:\n\t\treturn cborArray{{cborUint({i}), {enc}}}\n"
-        ));
+        let go_type = reflow_go_type(&map_csil_type_to_go(variant, &None, dec), 1);
+        let entry = groups.entry(go_type.clone()).or_default();
+        if entry.is_empty() {
+            type_order.push(go_type.clone());
+        }
+        entry.push(i);
     }
+    // Whether any case body actually references the type switch's bound variable —
+    // a union whose every arm is either a bare `Literal` (`go_enc_value` re-emits
+    // the literal's own hardcoded CBOR expression, ignoring the passed-in value
+    // entirely) or a `null`/`nil` builtin (same — always `cborNull{}`, unconditionally)
+    // never touches it, and Go's compiler rejects `switch csilX := csilV.(type)` as
+    // "declared and not used" if `csilX` is dead in EVERY case (a multi-arm group's
+    // own `switch csilX { ... }` value-switch always counts as a use, since it
+    // switches ON `csilX` directly — this only trips for an all-single-arm union
+    // where every arm's own encode ignores its value, e.g. `"a" / 1 / null`).
+    let mut uses_csil_x = false;
+    let mut switch_body = String::new();
+    for go_type in &type_order {
+        let idxs = &groups[go_type];
+        if idxs.len() == 1 {
+            let i = idxs[0];
+            let enc = go_enc_value(&variants[i], "csilX", records, aliases, config, 2);
+            uses_csil_x = uses_csil_x || enc.contains("csilX");
+            switch_body.push_str(&format!(
+                "\tcase {go_type}:\n\t\treturn cborArray{{cborUint({i}), {enc}}}\n"
+            ));
+            continue;
+        }
+        uses_csil_x = true; // the grouped case's own `switch csilX { ... }` uses it.
+        // Within one shared Go-type clause, a literal arm (e.g. `"pending"`) is more
+        // specific than the general arm (e.g. `text`) and wins on value collision:
+        // the literal is checked first and returns its own variant index, and the
+        // general arm — if present — becomes the fallback for every other value.
+        let mut literal_idxs = Vec::new();
+        let mut general_idx = None;
+        for &i in idxs {
+            if choice_arm_literal(&variants[i]).is_some() {
+                literal_idxs.push(i);
+            } else if general_idx.is_none() {
+                // Reaching this `case` clause at all means every arm in `idxs`
+                // rendered to the SAME Go type (Go's type switch forbids two
+                // `case SameType:` clauses), so two non-literal arms here are
+                // genuinely indistinguishable at runtime. The FIRST declared arm
+                // wins (lowest index) rather than the last: previously this
+                // unconditionally overwrote `general_idx` on every non-literal arm,
+                // so the LAST arm silently won instead — matching the analogous bug
+                // in `go_choice_enc_iife` above, which used the same pattern for
+                // inline choices.
+                general_idx = Some(i);
+            }
+        }
+        switch_body.push_str(&format!("\tcase {go_type}:\n\t\tswitch csilX {{\n"));
+        for i in literal_idxs {
+            let lit = choice_arm_literal(&variants[i])
+                .expect("filtered to literal-carrying variants above");
+            let lit_value = literal_value_to_go_string(lit);
+            let enc = go_enc_value(&variants[i], "csilX", records, aliases, config, 3);
+            switch_body.push_str(&format!(
+                "\t\tcase {lit_value}:\n\t\t\treturn cborArray{{cborUint({i}), {enc}}}\n"
+            ));
+        }
+        switch_body.push_str("\t\tdefault:\n");
+        match general_idx {
+            Some(gi) => {
+                let enc = go_enc_value(&variants[gi], "csilX", records, aliases, config, 3);
+                switch_body.push_str(&format!(
+                    "\t\t\treturn cborArray{{cborUint({gi}), {enc}}}\n"
+                ));
+            }
+            // No general arm to fall back to; matches the outer switch's own
+            // unmatched-value behavior rather than inventing a new failure mode.
+            None => switch_body.push_str("\t\t\treturn cborNull{}\n"),
+        }
+        switch_body.push_str("\t\t}\n");
+    }
+    out.push_str(if uses_csil_x {
+        "\tswitch csilX := csilV.(type) {\n"
+    } else {
+        "\tswitch csilV.(type) {\n"
+    });
+    out.push_str(&switch_body);
     out.push_str("\tdefault:\n\t\treturn cborNull{}\n\t}\n}\n\n");
 
     out.push_str(&format!(
@@ -2117,7 +3052,7 @@ fn emit_union_codec(
     ));
     out.push_str("\tswitch csilIdx {\n");
     for (i, variant) in variants.iter().enumerate() {
-        let decf = go_dec_func(variant, records, aliases, config);
+        let decf = go_dec_func(variant, records, aliases, config, 2);
         out.push_str(&format!(
             "\tcase {i}:\n\t\tcsilVal, csilErr := ({decf})(csilArr[1])\n\t\treturn csilVal, csilErr\n"
         ));
@@ -2192,13 +3127,32 @@ fn emit_op_codecs(
             }
             let success = go_success_type(&op.output_type);
             let null_input = op_input_is_null(&op.input_type);
-            let req_ok =
-                null_input || go_op_boundary_expressible(&op.input_type, records, aliases, config);
-            if !req_ok || !go_op_boundary_expressible(&success, records, aliases, config) {
+            // A bare reference to an already-defined record already has its own
+            // Encode<T>/Decode<T> pair from the record-codec emission pass (see
+            // `is_record_ref` callers elsewhere in this file, and the analogous
+            // guard in csilgen-rust-generator's / csilgen-python-generator's
+            // `emit_op_codecs`). Synthesizing a second, op-keyed pair for that
+            // same shape is always redundant, and when an operation's request or
+            // response type happens to be named exactly `<ServiceBase><Method>`
+            // (e.g. service `Rp`, op `issue-attestation`, type
+            // `RpIssueAttestationRequest`) the synthesized helper name collides
+            // byte-for-byte with the real type's own Encode/Decode functions,
+            // producing a Go "redeclared in this block" compile error. Skip
+            // synthesis whenever the boundary type is already a record
+            // reference, exactly as the other two generators do.
+            let req_is_record = !null_input && is_record_ref(&op.input_type, records);
+            let resp_is_record = is_record_ref(&success, records);
+            let req_ok = null_input
+                || req_is_record
+                || go_op_boundary_expressible(&op.input_type, records, aliases, config);
+            if !req_ok
+                || !(resp_is_record
+                    || go_op_boundary_expressible(&success, records, aliases, config))
+            {
                 continue;
             }
             let stem = op_codec_stem(&rule.name, op);
-            if !null_input {
+            if !null_input && !req_is_record {
                 out.push_str(&emit_op_codec_pair(
                     &format!("{stem}Request"),
                     &op.input_type,
@@ -2207,13 +3161,15 @@ fn emit_op_codecs(
                     config,
                 ));
             }
-            out.push_str(&emit_op_codec_pair(
-                &format!("{stem}Response"),
-                &success,
-                records,
-                aliases,
-                config,
-            ));
+            if !resp_is_record {
+                out.push_str(&emit_op_codec_pair(
+                    &format!("{stem}Response"),
+                    &success,
+                    records,
+                    aliases,
+                    config,
+                ));
+            }
         }
     }
     out
@@ -2229,16 +3185,20 @@ fn emit_op_codec_pair(
     aliases: &std::collections::HashMap<String, CsilTypeExpression>,
     config: &GoConfig,
 ) -> String {
-    let go_type = map_csil_type_to_go(ty, &None, config.decimal_go_type());
-    let enc = go_enc_value(ty, "csilV", records, aliases, config);
-    let dec = go_dec_func(ty, records, aliases, config);
+    let one_line = map_csil_type_to_go(ty, &None, config.decimal_go_type());
+    // The boundary type is spelled at two depths: in the func signatures (fields
+    // one tab in) and in the `var csilZero` statement (fields two tabs in).
+    let go_type = reflow_go_type(&one_line, 0);
+    let go_type_stmt = reflow_go_type(&one_line, 1);
+    let enc = go_enc_value(ty, "csilV", records, aliases, config, 1);
+    let dec = go_dec_func(ty, records, aliases, config, 1);
     let i = config.indent_style.as_str();
     format!(
         "// Encode{helper} encodes the {helper} payload to canonical CSIL CBOR bytes.\n\
          func Encode{helper}(csilV {go_type}) []byte {{\n{i}return cborEncode({enc})\n}}\n\n\
          // Decode{helper} decodes canonical CSIL CBOR bytes into the {helper} payload.\n\
          func Decode{helper}(csilData []byte) ({go_type}, error) {{\n\
-         {i}var csilZero {go_type}\n\
+         {i}var csilZero {go_type_stmt}\n\
          {i}csilRoot, csilErr := cborDecode(csilData)\n\
          {i}if csilErr != nil {{\n{i}{i}return csilZero, csilErr\n{i}}}\n\
          {i}return ({dec})(csilRoot)\n}}\n\n"
@@ -2978,8 +3938,10 @@ func csilAsDecimal(v cborValue) (decimal.Decimal, error) {
 }
 "#;
 
-/// Strip a trailing `Service` suffix and PascalCase the remainder, matching the
-/// wire service base used across the TypeScript/Rust/Python clients.
+/// Strip a trailing `Service` suffix and PascalCase the remainder — the Go
+/// identifier stem for generated names (`CorndogsService` -> `CorndogsClient`),
+/// matching the sibling generators. Wire strings never derive from this: they
+/// carry the CSIL names verbatim (docs/cbor-wire-contract.md "RPC call naming").
 fn go_service_base(name: &str) -> String {
     let pascal = pascal_case(name);
     pascal
@@ -3052,8 +4014,10 @@ fn emit_client_struct(
 ) {
     let base = go_service_base(name);
     let client = format!("{base}Client");
-    // Canonical wire strings (the wire contract): service lowercased, op PascalCased.
-    let wire_service = base.to_lowercase();
+    // Canonical wire strings (docs/cbor-wire-contract.md "RPC call naming"): the CSIL
+    // service and operation names verbatim, so a transport places them on the wire
+    // unmodified — no casing transform a receiver would have to undo.
+    let wire_service = name;
 
     content.push_str(&format!(
         "// {client} is a typed client for the {name} service. The client owns\n\
@@ -3097,21 +4061,26 @@ fn emit_client_struct(
             continue;
         }
         let method_name = go_method_name(&operation.name);
+        let wire_op = &operation.name;
         let stem = op_codec_stem(name, operation);
         let output_type = map_csil_type_to_go(&success, &None, config.decimal_go_type());
         let params = if null_input {
             "ctx context.Context".to_string()
         } else {
-            let input_type =
-                map_csil_type_to_go(&operation.input_type, &None, config.decimal_go_type());
+            let input_type = reflow_go_type(
+                &map_csil_type_to_go(&operation.input_type, &None, config.decimal_go_type()),
+                0,
+            );
             format!("ctx context.Context, req {input_type}")
         };
         content.push_str(&format!(
-            "func (c *{client}) {method_name}({params}) ({output_type}, error) {{\n"
+            "func (c *{client}) {method_name}({params}) ({}, error) {{\n",
+            reflow_go_type(&output_type, 0)
         ));
         content.push_str(&format!(
-            "{}var csilZero {output_type}\n",
-            config.indent_style
+            "{}var csilZero {}\n",
+            config.indent_style,
+            reflow_go_type(&output_type, 1)
         ));
         // A null input carries no request body (nil payload); a record reuses its
         // `Encode<T>` wrapper; any other shape uses the op's per-op request encoder.
@@ -3123,7 +4092,7 @@ fn emit_client_struct(
             format!("Encode{stem}Request(req)")
         };
         content.push_str(&format!(
-            "{}csilResp, csilErr := c.transport.Call(ctx, \"{wire_service}\", \"{method_name}\", {req_bytes})\n",
+            "{}csilResp, csilErr := c.transport.Call(ctx, \"{wire_service}\", \"{wire_op}\", {req_bytes})\n",
             config.indent_style
         ));
         content.push_str(&format!(
@@ -3240,16 +4209,25 @@ fn emit_service_interface(
         let method_name = go_method_name(&operation.name);
         match operation.direction {
             CsilServiceDirection::Unidirectional => {
-                let output_type = map_csil_type_to_go(
-                    &go_success_type(&operation.output_type),
-                    &None,
-                    config.decimal_go_type(),
+                let output_type = reflow_go_type(
+                    &map_csil_type_to_go(
+                        &go_success_type(&operation.output_type),
+                        &None,
+                        config.decimal_go_type(),
+                    ),
+                    1,
                 );
                 let params = if op_input_is_null(&operation.input_type) {
                     "ctx context.Context".to_string()
                 } else {
-                    let input_type =
-                        map_csil_type_to_go(&operation.input_type, &None, config.decimal_go_type());
+                    let input_type = reflow_go_type(
+                        &map_csil_type_to_go(
+                            &operation.input_type,
+                            &None,
+                            config.decimal_go_type(),
+                        ),
+                        1,
+                    );
                     format!("ctx context.Context, req {input_type}")
                 };
                 content.push_str(&format!(
@@ -3261,8 +4239,10 @@ fn emit_service_interface(
                 // Fire-and-forget inbound: the implementer's plumbing pulls a
                 // frame off the wire, hands it to Route<Service>Channel, which
                 // decodes and dispatches here.
-                let input_type =
-                    map_csil_type_to_go(&operation.input_type, &None, config.decimal_go_type());
+                let input_type = reflow_go_type(
+                    &map_csil_type_to_go(&operation.input_type, &None, config.decimal_go_type()),
+                    1,
+                );
                 content.push_str(&format!(
                     "{}{}(ctx context.Context, msg {}) error\n",
                     config.indent_style, method_name, input_type
@@ -3326,9 +4306,14 @@ fn emit_channel_router(
             continue;
         }
         let method_name = go_method_name(&operation.name);
-        let input_type =
-            map_csil_type_to_go(&operation.input_type, &None, config.decimal_go_type());
-        content.push_str(&format!("{}case \"{method_name}\":\n", config.indent_style));
+        // The verbose wire carries the CSIL operation name verbatim
+        // (docs/cbor-wire-contract.md "RPC call naming"), not the Go method name.
+        let wire_op = &operation.name;
+        let input_type = reflow_go_type(
+            &map_csil_type_to_go(&operation.input_type, &None, config.decimal_go_type()),
+            2,
+        );
+        content.push_str(&format!("{}case \"{wire_op}\":\n", config.indent_style));
         content.push_str(&format!(
             "{}{}var msg {input_type}\n",
             config.indent_style, config.indent_style
@@ -3395,8 +4380,10 @@ fn emit_channel_router_compact(
             continue;
         };
         let method_name = go_method_name(&operation.name);
-        let input_type =
-            map_csil_type_to_go(&operation.input_type, &None, config.decimal_go_type());
+        let input_type = reflow_go_type(
+            &map_csil_type_to_go(&operation.input_type, &None, config.decimal_go_type()),
+            2,
+        );
         content.push_str(&format!("{}case {op_id}:\n", config.indent_style));
         content.push_str(&format!(
             "{}{}var msg {input_type}\n",
@@ -3442,11 +4429,17 @@ fn emit_channel_encoders(
             continue;
         }
         let method_name = go_method_name(&operation.name);
-        let output_type =
-            map_csil_type_to_go(&operation.output_type, &None, config.decimal_go_type());
+        // The returned wire method is the CSIL operation name verbatim
+        // (docs/cbor-wire-contract.md "RPC call naming"); only the Go function
+        // name uses the PascalCase identifier.
+        let wire_op = &operation.name;
+        let output_type = reflow_go_type(
+            &map_csil_type_to_go(&operation.output_type, &None, config.decimal_go_type()),
+            0,
+        );
         let fn_name = format!("Encode{service_name}{method_name}");
         content.push_str(&format!(
-            "// {fn_name} encodes a `{method_name}` message the server pushes to a peer;\n\
+            "// {fn_name} encodes a `{wire_op}` message the server pushes to a peer;\n\
              // the implementer frames (method, bytes) onto its connection.\n"
         ));
         content.push_str(&format!(
@@ -3456,7 +4449,7 @@ fn emit_channel_encoders(
         content.push_str("\tif err != nil {\n");
         content.push_str("\t\treturn \"\", nil, err\n");
         content.push_str("\t}\n");
-        content.push_str(&format!("\treturn \"{method_name}\", data, nil\n"));
+        content.push_str(&format!("\treturn \"{wire_op}\", data, nil\n"));
         content.push_str("}\n\n");
     }
 }
@@ -3499,11 +4492,15 @@ fn generate_validation(
             for entry in &group.entries {
                 if let Some(key) = &entry.key {
                     let field_name = go_field_name_from_key_with_metadata(key, &entry.metadata);
-                    // An optional field is a Go pointer; every check on it is guarded
-                    // and dereferenced so a nil optional is skipped rather than panicking.
+                    // An optional field is always nil-guarded; whether it is also a Go
+                    // pointer (and thus needs a deref) depends on its representation —
+                    // a slice/map stays bare (see `optional_field_is_pointer`), so only
+                    // guard+deref when the type emitter actually emitted a pointer.
+                    let optional = matches!(entry.occurrence, Some(CsilOccurrence::Optional));
                     let field = FieldRef {
                         name: &field_name,
-                        optional: matches!(entry.occurrence, Some(CsilOccurrence::Optional)),
+                        optional,
+                        pointer: optional && optional_field_is_pointer(&entry.value_type),
                     };
 
                     for metadata in &entry.metadata {
@@ -3659,20 +4656,26 @@ fn go_string_lit(s: &str) -> String {
     format!("\"{}\"", go_escape(s))
 }
 
-/// A field's Go name plus whether it is optional (a Go pointer). Threaded through
-/// the check emitters so each can consistently guard and dereference a nil optional.
+/// A field's Go name, whether it is optional (nil-guarded), and whether that
+/// optionality is represented as a Go pointer. Threaded through the check emitters
+/// so each can consistently guard and, only when actually a pointer, dereference.
+/// A slice/map field stays a nil-able bare `[]T`/`map[K]V` even when optional (this
+/// mirrors `optional_field_is_pointer`, the same rule the type emitter uses), so
+/// `pointer` can be false while `optional` is true.
 #[derive(Clone, Copy)]
 struct FieldRef<'a> {
     name: &'a str,
     optional: bool,
+    pointer: bool,
 }
 
 impl FieldRef<'_> {
-    /// The expression that reads the field's value inside a check. An optional field
-    /// is a pointer, so it is dereferenced explicitly; the surrounding check is
-    /// guarded so the deref is never reached on a nil pointer.
+    /// The expression that reads the field's value inside a check. Only a field
+    /// actually represented as a Go pointer is dereferenced; the surrounding check
+    /// is guarded so the deref is never reached on a nil pointer. A nil-able bare
+    /// slice/map reads directly — `len(nil-slice)` is valid Go, so no deref needed.
     fn read_expr(&self) -> String {
-        if self.optional {
+        if self.pointer {
             format!("(*v.{})", self.name)
         } else {
             format!("v.{}", self.name)
@@ -4101,19 +5104,17 @@ fn generate_constructors(
             body.push_str(&format!("//   - {field_name}: {value_str}\n"));
         }
         body.push_str(&format!("func New{}() *{} {{\n", rule.name, rule.name));
-        body.push_str(&format!(
-            "{}return &{} {{\n",
-            config.indent_style, rule.name
-        ));
+        body.push_str(&format!("{}return &{}{{\n", config.indent_style, rule.name));
 
-        for (key, value, value_type, occurrence, metadata) in &fields_with_defaults {
-            let field_name = go_field_name_from_key_with_metadata(key, metadata);
-            let go_value = literal_value_to_go_value(value, value_type, occurrence, config);
-            body.push_str(&format!(
-                "{}{}{}: {},\n",
-                config.indent_style, config.indent_style, field_name, go_value
-            ));
-        }
+        let pairs: Vec<(String, String)> = fields_with_defaults
+            .iter()
+            .map(|(key, value, value_type, occurrence, metadata)| {
+                let field_name = go_field_name_from_key_with_metadata(key, metadata);
+                let go_value = literal_value_to_go_value(value, value_type, occurrence, config);
+                (field_name, go_value)
+            })
+            .collect();
+        body.push_str(&render_go_composite_pairs(&pairs, 2));
 
         body.push_str(&format!("{}}}\n", config.indent_style));
         body.push_str("}\n\n");
@@ -4262,6 +5263,8 @@ fn type_uses_builtin(type_expr: &CsilTypeExpression, builtin: &str) -> bool {
     }
 }
 
+/// The literal a choice arm carries, if any, stripping a trailing control-operator
+/// wrapper first. CSIL's grammar attaches a control operator to the immediately
 /// The scalar Go type backing a literal-only choice (an enum), or `None` when the
 /// choice mixes non-literal members (a true union, which has no single scalar form).
 /// Every literal kind is checked so a numeric or boolean enum maps to its matching Go
@@ -4269,10 +5272,9 @@ fn type_uses_builtin(type_expr: &CsilTypeExpression, builtin: &str) -> bool {
 fn literal_choice_scalar_go(choices: &[CsilTypeExpression]) -> Option<&'static str> {
     let all = |pred: fn(&CsilLiteralValue) -> bool| {
         !choices.is_empty()
-            && choices.iter().all(|c| match c {
-                CsilTypeExpression::Literal(v) => pred(v),
-                _ => false,
-            })
+            && choices
+                .iter()
+                .all(|c| choice_arm_literal(c).is_some_and(pred))
     };
     if all(|v| matches!(v, CsilLiteralValue::Text(_))) {
         Some("string")
@@ -4290,7 +5292,13 @@ fn literal_choice_scalar_go(choices: &[CsilTypeExpression]) -> Option<&'static s
 /// The CSIL builtin an enum's literals back, for aliasing the enum to a scalar in the
 /// codec. `None` when the choice is not a uniform literal enum. The builtin names line
 /// up with what `go_enc_value`/`go_dec_func`/`scalar_alias_go_type` already handle.
+/// Routes the ENUM-vs-UNION split through the shared `classify_choice` (THE
+/// normative contract: ALL-literal, any kind mix, is an enum) and only layers
+/// this generator's own uniform-kind sub-classification on top.
 fn enum_scalar_builtin(choices: &[CsilTypeExpression]) -> Option<String> {
+    let ChoiceClass::Enum(literals) = classify_choice(choices) else {
+        return None;
+    };
     let kind = |v: &CsilLiteralValue| match v {
         CsilLiteralValue::Text(_) => Some("text"),
         CsilLiteralValue::Integer(_) => Some("int"),
@@ -4298,14 +5306,149 @@ fn enum_scalar_builtin(choices: &[CsilTypeExpression]) -> Option<String> {
         CsilLiteralValue::Bool(_) => Some("bool"),
         _ => None,
     };
-    let first = match choices.first()? {
-        CsilTypeExpression::Literal(v) => kind(v)?,
-        _ => return None,
-    };
-    choices
+    let first = kind(literals.first()?)?;
+    literals
         .iter()
-        .all(|c| matches!(c, CsilTypeExpression::Literal(v) if kind(v) == Some(first)))
+        .all(|lit| kind(lit) == Some(first))
         .then(|| first.to_string())
+}
+
+/// The CSIL builtin (and matching Go dynamic type, once boxed into the shared
+/// `interface{}` a mixed-kind enum field is typed as — see `map_csil_type_to_go`'s
+/// `Choice` case) backing ONE arm of a MIXED-kind all-literal choice. Kept separate
+/// from `enum_scalar_builtin`'s `kind` closure, which additionally requires every
+/// arm to share the SAME kind (that narrower, uniform-kind case aliases the whole
+/// enum to a single Go scalar type instead — see `literal_choice_scalar_go`). `None`
+/// for a literal kind this can't classify (bytes, or a `null`/array literal),
+/// matching `enum_scalar_builtin`'s restriction to the same four kinds.
+fn mixed_enum_literal_kind(lit: &CsilLiteralValue) -> Option<(&'static str, &'static str)> {
+    match lit {
+        CsilLiteralValue::Text(_) => Some(("text", "string")),
+        CsilLiteralValue::Integer(_) => Some(("int", "int64")),
+        CsilLiteralValue::Float(_) => Some(("float", "float64")),
+        CsilLiteralValue::Bool(_) => Some(("bool", "bool")),
+        _ => None,
+    }
+}
+
+/// Whether every arm of a choice is a literal go's bare-wire mixed-enum renderer
+/// (`go_mixed_enum_enc_expr`/`go_mixed_enum_dec_func`) can classify a Go dynamic
+/// type for. Routes the ENUM-vs-UNION split through the shared `classify_choice`
+/// (THE normative contract: ALL-literal, ANY kind mix — `"a" / 1` — is an enum,
+/// matching `csilgen_common::choice`'s module docs), then layers this generator's
+/// OWN narrower kind restriction on top via `mixed_enum_literal_kind` — text/int/
+/// float/bool only. A choice classified `Enum` by the shared contract but mixing
+/// in a bytes/null/array literal (not reachable from real CSIL source today: the
+/// core parser only ever produces a `Literal` choice arm of those four kinds, plus
+/// `.default null`, which `choice_arm_literal` also strips through) still falls
+/// through to the tagged-sum union path here rather than the bare-wire enum path
+/// — safe (never silently drops data), just not maximally compact for a kind
+/// combination no pinned spec exercises. Mirrors the PHP generator's
+/// `choice_is_enum`.
+fn choice_all_literal(choices: &[CsilTypeExpression]) -> bool {
+    let ChoiceClass::Enum(literals) = classify_choice(choices) else {
+        return false;
+    };
+    literals
+        .iter()
+        .all(|lit| mixed_enum_literal_kind(lit).is_some())
+}
+
+/// Bare-wire encode for a MIXED-kind all-literal choice (`choice_all_literal`, where
+/// `enum_scalar_builtin` returned `None` because the literal kinds aren't uniform):
+/// the CBOR wire value is just the literal itself, so this only needs to know which
+/// Go dynamic type is boxed inside the field's `interface{}` at encode time (a type
+/// switch), not which specific literal it is — same "no membership check on encode"
+/// posture every other enum encode path in this generator has (a value that reached
+/// here is trusted to already be one of the declared literals).
+fn go_mixed_enum_enc_expr(choices: &[CsilTypeExpression], expr: &str, indent: usize) -> String {
+    let mut kinds: Vec<&'static str> = Vec::new();
+    for c in choices {
+        let lit =
+            choice_arm_literal(c).expect("choice_all_literal guarantees every arm is literal");
+        let (kind, _) = mixed_enum_literal_kind(lit)
+            .expect("choice_all_literal guarantees a classifiable literal kind");
+        if !kinds.contains(&kind) {
+            kinds.push(kind);
+        }
+    }
+    let base = indent + 1;
+    let tb = "\t".repeat(base);
+    let mut body = format!("switch csilX := {expr}.(type) {{\n");
+    for kind in &kinds {
+        let (go_type, cbor_ctor) = match *kind {
+            "text" => ("string", "cborText(csilX)"),
+            "int" => ("int64", "cborInt(csilX)"),
+            "float" => ("float64", "cborFloat(csilX)"),
+            "bool" => ("bool", "cborBool(csilX)"),
+            _ => unreachable!("mixed_enum_literal_kind only yields text/int/float/bool"),
+        };
+        body.push_str(&format!("{tb}case {go_type}:\n{tb}\treturn {cbor_ctor}\n"));
+    }
+    body.push_str(&format!("{tb}}}\n{tb}return cborNull{{}}"));
+    format!("{}()", go_closure("func() cborValue", &[body], indent))
+}
+
+/// Bare-wire decode for a MIXED-kind all-literal choice (`choice_all_literal`), the
+/// decode inverse of `go_mixed_enum_enc_expr`. CBOR major types are mutually
+/// exclusive, so each present literal kind's `cborAs*` accessor is tried in turn:
+/// the one whose major type actually matches succeeds structurally (the others
+/// return an error and are skipped), and its declared-member set is then checked —
+/// parity with every other enum decode path in this generator (`go_enum_dec_func`),
+/// which all reject a well-typed-but-undeclared value rather than accepting it
+/// silently. The field's Go type is always `interface{}` (`map_csil_type_to_go`'s
+/// `Choice` case), matching a named union's own `interface{}` marker type.
+fn go_mixed_enum_dec_func(choices: &[CsilTypeExpression], indent: usize) -> String {
+    let mut order: Vec<&'static str> = Vec::new();
+    let mut groups: std::collections::HashMap<&'static str, Vec<&CsilLiteralValue>> =
+        std::collections::HashMap::new();
+    for c in choices {
+        let lit =
+            choice_arm_literal(c).expect("choice_all_literal guarantees every arm is literal");
+        let (kind, _) = mixed_enum_literal_kind(lit)
+            .expect("choice_all_literal guarantees a classifiable literal kind");
+        let entry = groups.entry(kind).or_default();
+        if entry.is_empty() {
+            order.push(kind);
+        }
+        entry.push(lit);
+    }
+    let mut stmts: Vec<String> = Vec::new();
+    for kind in &order {
+        let lits = &groups[kind];
+        let accessor = match *kind {
+            "text" => "cborAsText",
+            "int" => "cborAsI64",
+            "float" => "cborAsF64",
+            "bool" => "cborAsBool",
+            _ => unreachable!("mixed_enum_literal_kind only yields text/int/float/bool"),
+        };
+        let membership = lits
+            .iter()
+            .map(|l| format!("csilInner == {}", literal_value_to_go_string(l)))
+            .collect::<Vec<_>>()
+            .join(" || ");
+        stmts.push(go_if(
+            &format!("csilInner, csilErr := {accessor}(csilV); csilErr == nil"),
+            &[
+                go_if(
+                    &format!("!({membership})"),
+                    &[
+                        "return nil, fmt.Errorf(\"csil cbor: value %v is not a member of the declared enum\", csilInner)"
+                            .to_string(),
+                    ],
+                    indent + 2,
+                ),
+                "return csilInner, nil".to_string(),
+            ],
+            indent + 1,
+        ));
+    }
+    stmts.push(
+        "return nil, fmt.Errorf(\"csil cbor: value has no matching declared enum literal kind\")"
+            .to_string(),
+    );
+    go_closure("func(csilV cborValue) (interface{}, error)", &stmts, indent)
 }
 
 fn map_csil_type_to_go(
@@ -4404,16 +5547,38 @@ fn go_tuple_enc(
     records: &std::collections::HashSet<String>,
     aliases: &std::collections::HashMap<String, CsilTypeExpression>,
     config: &GoConfig,
+    indent: usize,
 ) -> String {
-    let st = go_tuple_struct(&group.entries, config.decimal_go_type());
+    let st = reflow_go_type(
+        &go_tuple_struct(&group.entries, config.decimal_go_type()),
+        indent,
+    );
     let mut parts = Vec::with_capacity(group.entries.len());
     for (i, entry) in group.entries.iter().enumerate() {
         let field = go_tuple_field_name(entry, i);
         if matches!(entry.occurrence, Some(CsilOccurrence::Optional)) {
-            let inner = go_enc_value(&entry.value_type, "csilDeref", records, aliases, config);
-            parts.push(format!(
-                "func() cborValue {{ if csilT.{field} == nil {{ return cborNull{{}} }}; csilDeref := *csilT.{field}; return {inner} }}()"
-            ));
+            let inner = go_enc_value(
+                &entry.value_type,
+                "csilDeref",
+                records,
+                aliases,
+                config,
+                indent + 2,
+            );
+            let deref = go_closure(
+                "func() cborValue",
+                &[
+                    go_if(
+                        &format!("csilT.{field} == nil"),
+                        &["return cborNull{}".to_string()],
+                        indent + 2,
+                    ),
+                    format!("csilDeref := *csilT.{field}"),
+                    format!("return {inner}"),
+                ],
+                indent + 1,
+            );
+            parts.push(format!("{deref}()"));
         } else {
             let inner = go_enc_value(
                 &entry.value_type,
@@ -4421,14 +5586,17 @@ fn go_tuple_enc(
                 records,
                 aliases,
                 config,
+                indent + 1,
             );
             parts.push(inner);
         }
     }
-    format!(
-        "func(csilT {st}) cborValue {{ return cborArray{{{}}} }}({expr})",
-        parts.join(", ")
-    )
+    let f = go_closure(
+        &format!("func(csilT {st}) cborValue"),
+        &[format!("return cborArray{{{}}}", parts.join(", "))],
+        indent,
+    );
+    format!("{f}({expr})")
 }
 
 /// Decode a fixed-shape tuple positionally from a CBOR array into the anonymous Go
@@ -4438,31 +5606,61 @@ fn go_tuple_dec(
     records: &std::collections::HashSet<String>,
     aliases: &std::collections::HashMap<String, CsilTypeExpression>,
     config: &GoConfig,
+    indent: usize,
 ) -> String {
-    let st = go_tuple_struct(&group.entries, config.decimal_go_type());
+    // The struct type is spelled twice at different depths: in the signature
+    // (fields one tab past the expression's line) and in `var` statements inside
+    // the body (one tab deeper still).
+    let one_line = go_tuple_struct(&group.entries, config.decimal_go_type());
+    let st_sig = reflow_go_type(&one_line, indent);
+    let st_body = reflow_go_type(&one_line, indent + 1);
     let n = group.entries.len();
-    let mut body = String::new();
-    body.push_str(&format!("var csilZero {st}; "));
-    body.push_str("csilArr, csilOk := csilV.(cborArray); ");
-    body.push_str(&format!(
-        "if !csilOk || len(csilArr) != {n} {{ return csilZero, fmt.Errorf(\"csil cbor: tuple expects {n} elements\") }}; "
-    ));
-    body.push_str(&format!("var csilOut {st}; "));
+    let mut stmts = vec![
+        format!("var csilZero {st_body}"),
+        "csilArr, csilOk := csilV.(cborArray)".to_string(),
+        go_if(
+            &format!("!csilOk || len(csilArr) != {n}"),
+            &[format!(
+                "return csilZero, fmt.Errorf(\"csil cbor: tuple expects {n} elements\")"
+            )],
+            indent + 1,
+        ),
+        format!("var csilOut {st_body}"),
+    ];
     for (i, entry) in group.entries.iter().enumerate() {
         let field = go_tuple_field_name(entry, i);
-        let dec = go_dec_func(&entry.value_type, records, aliases, config);
         if matches!(entry.occurrence, Some(CsilOccurrence::Optional)) {
-            body.push_str(&format!(
-                "if _, csilNull{i} := csilArr[{i}].(cborNull); !csilNull{i} {{ csilV{i}, csilErr{i} := ({dec})(csilArr[{i}]); if csilErr{i} != nil {{ return csilZero, csilErr{i} }}; csilOut.{field} = &csilV{i} }}; "
+            let dec = go_dec_func(&entry.value_type, records, aliases, config, indent + 2);
+            stmts.push(go_if(
+                &format!("_, csilNull{i} := csilArr[{i}].(cborNull); !csilNull{i}"),
+                &[
+                    format!("csilV{i}, csilErr{i} := ({dec})(csilArr[{i}])"),
+                    go_if(
+                        &format!("csilErr{i} != nil"),
+                        &[format!("return csilZero, csilErr{i}")],
+                        indent + 2,
+                    ),
+                    format!("csilOut.{field} = &csilV{i}"),
+                ],
+                indent + 1,
             ));
         } else {
-            body.push_str(&format!(
-                "csilV{i}, csilErr{i} := ({dec})(csilArr[{i}]); if csilErr{i} != nil {{ return csilZero, csilErr{i} }}; csilOut.{field} = csilV{i}; "
+            let dec = go_dec_func(&entry.value_type, records, aliases, config, indent + 1);
+            stmts.push(format!("csilV{i}, csilErr{i} := ({dec})(csilArr[{i}])"));
+            stmts.push(go_if(
+                &format!("csilErr{i} != nil"),
+                &[format!("return csilZero, csilErr{i}")],
+                indent + 1,
             ));
+            stmts.push(format!("csilOut.{field} = csilV{i}"));
         }
     }
-    body.push_str("return csilOut, nil");
-    format!("func(csilV cborValue) ({st}, error) {{ {body} }}")
+    stmts.push("return csilOut, nil".to_string());
+    go_closure(
+        &format!("func(csilV cborValue) ({st_sig}, error)"),
+        &stmts,
+        indent,
+    )
 }
 
 fn go_tuple_struct(entries: &[CsilGroupEntry], decimal_type: &str) -> String {
@@ -4705,7 +5903,7 @@ fn literal_value_to_go_value(
                 };
                 let go_type = config.decimal_go_type();
                 return if optional {
-                    format!("func() *{go_type} {{ v := {expr}; return &v }}()")
+                    format!("{}()", go_optional_default_closure(go_type, &expr))
                 } else {
                     expr
                 };
@@ -4715,7 +5913,7 @@ fn literal_value_to_go_value(
             if let Some(text) = literal_as_timestamp_text(value) {
                 let expr = format!("mustParseTimestamp({})", go_string_lit(&text));
                 return if optional {
-                    format!("func() *time.Time {{ v := {expr}; return &v }}()")
+                    format!("{}()", go_optional_default_closure("time.Time", &expr))
                 } else {
                     expr
                 };
@@ -4754,10 +5952,24 @@ fn literal_value_to_go_value(
                 CsilLiteralValue::Bool(b) => b.to_string(),
                 _ => return "nil".to_string(),
             };
-            format!("func() *{go_type} {{ v := {go_type}({lit}); return &v }}()")
+            format!(
+                "{}()",
+                go_optional_default_closure(&go_type, &format!("{go_type}({lit})"))
+            )
         }
         _ => base_value,
     }
+}
+
+/// The `func() *T { v := …; return &v }` literal an optional default constructs
+/// through, split per gofmt's budget for the rare oversized default expression.
+/// Constructor pairs sit two tabs deep, which fixes the literal's indent.
+fn go_optional_default_closure(go_type: &str, expr: &str) -> String {
+    go_closure(
+        &format!("func() *{go_type}"),
+        &[format!("v := {expr}"), "return &v".to_string()],
+        2,
+    )
 }
 
 fn estimate_memory_usage() -> usize {
@@ -4980,6 +6192,7 @@ mod tests {
             &records,
             &aliases,
             &config,
+            2,
         );
         assert!(
             dec.contains("MemberID(csilInner)"),
@@ -5105,17 +6318,17 @@ mod tests {
         assert!(!services.contains("Send(User) error"));
         assert!(!services.contains("Recv() (User, error)"));
 
-        // Router dispatches by wire method name.
+        // Router dispatches by the verbatim CSIL operation name, not the Go method.
         assert!(services.contains("func RouteMatchChannel(handlers Match, ctx context.Context, codec Codec, method string, data []byte) error"));
-        assert!(services.contains("case \"Play\":"));
+        assert!(services.contains("case \"play\":"));
         assert!(services.contains("return handlers.Play(ctx, msg)"));
 
-        // Outbound encoder for the bidi op.
+        // Outbound encoder for the bidi op returns the verbatim wire event name.
         assert!(
             services
                 .contains("func EncodeMatchPlay(codec Codec, msg User) (string, []byte, error)")
         );
-        assert!(services.contains("return \"Play\", data, nil"));
+        assert!(services.contains("return \"play\", data, nil"));
     }
 
     #[test]
@@ -5141,7 +6354,7 @@ mod tests {
         // Router exists but has no Notify case (no inbound to dispatch).
         let router_start = services.find("func RouteCallbacksChannel").unwrap();
         let router_block = &services[router_start..];
-        assert!(!router_block.contains("case \"Notify\":"));
+        assert!(!router_block.contains("case \"notify\":"));
 
         // The server-pushed encoder is present.
         assert!(
@@ -5420,7 +6633,7 @@ mod tests {
             "func (c *CorndogsClient) SubmitTask(ctx context.Context, req SubmitTaskRequest) (Task, error)"
         ));
         assert!(client.content.contains(
-            "csilResp, csilErr := c.transport.Call(ctx, \"corndogs\", \"SubmitTask\", EncodeSubmitTaskRequest(req))"
+            "csilResp, csilErr := c.transport.Call(ctx, \"CorndogsService\", \"submit-task\", EncodeSubmitTaskRequest(req))"
         ));
         assert!(client.content.contains("return DecodeTask(csilResp)"));
         // The codec ships alongside the client.
@@ -5702,6 +6915,376 @@ mod tests {
             string_opts(&[("decimal_mapping", "bogus")]),
         );
         assert!(super::process_generation(input).is_err());
+    }
+
+    #[test]
+    fn mixed_union_encode_groups_shared_go_type_into_one_case() {
+        // `OrderStatus = text / "pending" / "confirmed" / ...` (examples/real-world-api/
+        // e-commerce-api.csil) is a MIXED union: a general `text` arm plus several
+        // string-literal arms all map to the same Go type (`string`). A `case string:`
+        // per variant would be a duplicate-case compile error, so the emitter must
+        // group same-type arms into one clause and dispatch by value inside it —
+        // literal arms first (more specific), the general arm as the fallback.
+        let input = WasmGeneratorInput {
+            csil_spec: CsilSpecSerialized {
+                rules: vec![
+                    CsilRule {
+                        name: "OrderStatus".to_string(),
+                        rule_type: CsilRuleType::TypeChoice(vec![
+                            CsilTypeExpression::Builtin("text".to_string()),
+                            CsilTypeExpression::Literal(CsilLiteralValue::Text(
+                                "pending".to_string(),
+                            )),
+                            CsilTypeExpression::Literal(CsilLiteralValue::Text(
+                                "confirmed".to_string(),
+                            )),
+                        ]),
+                        position: CsilPosition {
+                            line: 1,
+                            column: 1,
+                            offset: 0,
+                        },
+                        doc_comments: Vec::new(),
+                    },
+                    // `generate_codec` only runs when the spec has at least one record;
+                    // this also mirrors the real spec, where `Order.status` is what
+                    // actually references the union.
+                    CsilRule {
+                        name: "Order".to_string(),
+                        rule_type: CsilRuleType::GroupDef(CsilGroupExpression {
+                            entries: vec![bare_entry(
+                                "status",
+                                CsilTypeExpression::Reference("OrderStatus".to_string()),
+                            )],
+                        }),
+                        position: CsilPosition {
+                            line: 2,
+                            column: 1,
+                            offset: 0,
+                        },
+                        doc_comments: Vec::new(),
+                    },
+                ],
+                source_content: None,
+                service_count: 0,
+                fields_with_metadata_count: 0,
+            },
+            config: GeneratorConfig {
+                target: "go".to_string(),
+                output_dir: "/tmp".to_string(),
+                options: HashMap::new(),
+            },
+            generator_metadata: GeneratorMetadata {
+                name: "go".to_string(),
+                version: "1.0.0".to_string(),
+                description: String::new(),
+                target: "go".to_string(),
+                capabilities: vec![],
+                author: None,
+                homepage: None,
+            },
+        };
+        let output = super::process_generation(input).expect("generation ok");
+        let codec = output
+            .files
+            .iter()
+            .find(|f| f.path == "codec.gen.go")
+            .expect("codec emitted");
+
+        // Exactly one `case string:` clause in the encode type switch — never two.
+        assert_eq!(codec.content.matches("case string:").count(), 1);
+        // Literal arms match by value and keep their own declared variant index.
+        assert!(codec.content.contains("case \"pending\":"));
+        assert!(codec.content.contains("cborUint(1)"));
+        assert!(codec.content.contains("case \"confirmed\":"));
+        assert!(codec.content.contains("cborUint(2)"));
+        // The general `text` arm (index 0) is the fallback for every other string.
+        assert!(codec.content.contains("cborUint(0)"));
+    }
+
+    /// A minimal spec with one named choice rule plus a record field referencing it
+    /// (`generate_codec` only runs when the spec has at least one record), for the
+    /// choice-classification/union-grouping tests below.
+    fn choice_record_input(
+        choice_name: &str,
+        choices: Vec<CsilTypeExpression>,
+    ) -> WasmGeneratorInput {
+        WasmGeneratorInput {
+            csil_spec: CsilSpecSerialized {
+                rules: vec![
+                    CsilRule {
+                        name: choice_name.to_string(),
+                        // A plain `Name = a / b` declaration parses to
+                        // `TypeDef(Choice(..))` (csilgen-core's `parser.rs`,
+                        // `TokenType::Assign` branch) — `RuleType::TypeChoice` is
+                        // only the transient shape a `/=` GROUP-EXTENSION line
+                        // parses to before `merge_type_choice_extensions` folds it
+                        // back into the base rule, so it never actually reaches a
+                        // generator as a standalone top-level rule. Matching the
+                        // real post-parse shape here (not `TypeChoice`) is what
+                        // makes `generate_types` — which only handles `TypeDef`
+                        // (and `GroupDef`) at the top level — emit a declaration
+                        // for it at all.
+                        rule_type: CsilRuleType::TypeDef(CsilTypeExpression::Choice(choices)),
+                        position: CsilPosition {
+                            line: 1,
+                            column: 1,
+                            offset: 0,
+                        },
+                        doc_comments: Vec::new(),
+                    },
+                    CsilRule {
+                        name: "Holder".to_string(),
+                        rule_type: CsilRuleType::GroupDef(CsilGroupExpression {
+                            entries: vec![bare_entry(
+                                "value",
+                                CsilTypeExpression::Reference(choice_name.to_string()),
+                            )],
+                        }),
+                        position: CsilPosition {
+                            line: 2,
+                            column: 1,
+                            offset: 0,
+                        },
+                        doc_comments: Vec::new(),
+                    },
+                ],
+                source_content: None,
+                service_count: 0,
+                fields_with_metadata_count: 0,
+            },
+            config: GeneratorConfig {
+                target: "go".to_string(),
+                output_dir: "/tmp".to_string(),
+                options: HashMap::new(),
+            },
+            generator_metadata: GeneratorMetadata {
+                name: "go".to_string(),
+                version: "1.0.0".to_string(),
+                description: String::new(),
+                target: "go".to_string(),
+                capabilities: vec![],
+                author: None,
+                homepage: None,
+            },
+        }
+    }
+
+    #[test]
+    fn mixed_kind_literal_choice_rides_bare_not_a_tagged_union() {
+        // `"a" / 1`: two literal arms of DIFFERENT kinds. The CSIL wire contract
+        // says an ALL-literal choice always rides bare, self-discriminating by its
+        // own CBOR major type, regardless of whether the declared literal kinds
+        // happen to match — matches the Go/PHP/Python/TypeScript generators'
+        // shared contract decision: only a choice with a non-literal arm is a
+        // tagged-sum union.
+        let input = choice_record_input(
+            "MixedLit",
+            vec![
+                CsilTypeExpression::Literal(CsilLiteralValue::Text("a".to_string())),
+                CsilTypeExpression::Literal(CsilLiteralValue::Integer(1)),
+            ],
+        );
+        let output = super::process_generation(input).expect("generation ok");
+        let types = output
+            .files
+            .iter()
+            .find(|f| f.path == "types.gen.go")
+            .expect("types emitted");
+        let codec = output
+            .files
+            .iter()
+            .find(|f| f.path == "codec.gen.go")
+            .expect("codec emitted");
+
+        // Field type is `interface{}` (no single Go scalar spans a mixed-kind set)
+        // — never the tagged-sum union's own struct/interface marker shape.
+        assert!(types.content.contains("type MixedLit interface{}"));
+        // No `csilEncMixedLit`/`csilDecMixedLit` tagged-sum codec pair — a
+        // mixed-kind bare enum has no codec of its own, it decodes through the
+        // generic alias-conversion closure (`go_dec_func`'s alias-to-named-type
+        // wrapper) exactly like a uniform-kind enum reference does.
+        assert!(!codec.content.contains("func csilEncMixedLit("));
+        assert!(!codec.content.contains("func csilDecMixedLit("));
+        // Decode probes each present literal kind's accessor and validates
+        // membership — never the `[variant_index, value]` tagged-sum shape.
+        assert!(codec.content.contains("cborAsText(csilV)"));
+        assert!(codec.content.contains("cborAsI64(csilV)"));
+        assert!(
+            codec
+                .content
+                .contains("is not a member of the declared enum")
+        );
+        assert!(
+            !codec
+                .content
+                .contains("MixedLit union expects a 2-element array")
+        );
+    }
+
+    #[test]
+    fn mixed_kind_literal_choice_with_null_arm_is_a_compiling_union() {
+        // `"a" / 1 / null`: a bare `null` choice arm always parses as
+        // `Builtin("null")` (never `Literal(Null)`), so it is a genuine
+        // non-literal "general" arm — the whole choice fails the all-literal test
+        // on that arm alone and is a proper 3-variant tagged-sum union, matching
+        // the Python/TypeScript generators' empirically-observed output for the
+        // same CSIL source: `[0, "a"]` / `[1, 1]` / `[2, null]`. Every arm here is
+        // either a hardcoded `Literal` (whose own `go_enc_value` ignores the
+        // passed-in value) or the `null` builtin (whose `go_enc_value` also
+        // ignores it), so the encode switch's bound `csilX` would be unused in
+        // EVERY case — this guards the fix that drops the `csilX :=` binding
+        // instead of emitting Go that fails to compile.
+        let input = choice_record_input(
+            "MixedLitNull",
+            vec![
+                CsilTypeExpression::Literal(CsilLiteralValue::Text("a".to_string())),
+                CsilTypeExpression::Literal(CsilLiteralValue::Integer(1)),
+                CsilTypeExpression::Builtin("null".to_string()),
+            ],
+        );
+        let output = super::process_generation(input).expect("generation ok");
+        let codec = output
+            .files
+            .iter()
+            .find(|f| f.path == "codec.gen.go")
+            .expect("codec emitted");
+
+        assert!(
+            codec
+                .content
+                .contains("func csilEncMixedLitNull(csilV MixedLitNull) cborValue {")
+        );
+        // No case body references `csilX` for this all-single-arm union (every
+        // arm is a hardcoded literal or the value-ignoring `null` builtin), so the
+        // switch must not bind it -- `switch csilV.(type) {`, not
+        // `switch csilX := csilV.(type) {`, or `go build` fails with "declared
+        // and not used".
+        assert!(codec.content.contains("switch csilV.(type) {"));
+        assert!(!codec.content.contains("switch csilX := csilV.(type) {"));
+        assert!(codec.content.contains("cborArray{cborUint(2), cborNull{}}"));
+    }
+
+    #[test]
+    fn same_go_type_union_arms_pick_the_first_declared_arm_on_encode() {
+        // Two DIFFERENT record types both map to distinct Go struct types
+        // normally, so construct a collision the way this generator actually can:
+        // two arms that both render to `interface{}` (an unmodeled/opaque shape),
+        // landing in the same type-switch `case interface{}:` clause. The FIRST
+        // declared arm must win on encode; before the fix, the grouping loop
+        // unconditionally overwrote `general_idx` for every non-literal arm
+        // sharing the Go type, so the LAST arm silently won instead.
+        let input = choice_record_input(
+            "Opaque",
+            vec![
+                CsilTypeExpression::Builtin("null".to_string()),
+                CsilTypeExpression::Builtin("nil".to_string()),
+            ],
+        );
+        let output = super::process_generation(input).expect("generation ok");
+        let codec = output
+            .files
+            .iter()
+            .find(|f| f.path == "codec.gen.go")
+            .expect("codec emitted");
+
+        // Single shared `case interface{}:` clause, returning the FIRST arm's own
+        // index (0) unconditionally -- the second arm (index 1) never gets its
+        // own reachable branch on encode.
+        assert_eq!(codec.content.matches("case interface{}:").count(), 1);
+        assert!(codec.content.contains("cborArray{cborUint(0), cborNull{}}"));
+        assert!(!codec.content.contains("cborArray{cborUint(1), cborNull{}}"));
+    }
+
+    #[test]
+    fn decimal_and_timestamp_aliases_convert_at_the_encode_boundary() {
+        // `unit_price = decimal .ge "0.00"` (examples/tagged-types/orders.csil) makes
+        // `unit_price` a distinct named Go type (`type unit_price CsilDecimal`), not a
+        // bare alias. `csilEncDecimal`/`csilEncTimestamp` are genuine functions (unlike
+        // `cborText`/`cborUint`, which are Go type CONVERSIONS any same-underlying-type
+        // alias flows through unchanged), so passing a `unit_price` value where
+        // `CsilDecimal` is required needs an explicit conversion or Go refuses to
+        // compile it. Same class of bug for a `timestamp` alias against `time.Time`.
+        let pos = || CsilPosition {
+            line: 1,
+            column: 1,
+            offset: 0,
+        };
+        let alias = |name: &str, base: &str, bound: &str| CsilRule {
+            name: name.to_string(),
+            rule_type: CsilRuleType::TypeDef(CsilTypeExpression::Constrained {
+                base_type: Box::new(CsilTypeExpression::Builtin(base.to_string())),
+                constraints: vec![CsilControlOperator::GreaterEqual(CsilLiteralValue::Text(
+                    bound.to_string(),
+                ))],
+            }),
+            position: pos(),
+            doc_comments: Vec::new(),
+        };
+        let record = CsilRule {
+            name: "LineItem".to_string(),
+            rule_type: CsilRuleType::GroupDef(CsilGroupExpression {
+                entries: vec![
+                    bare_entry(
+                        "unit_price",
+                        CsilTypeExpression::Reference("unit_price".to_string()),
+                    ),
+                    bare_entry(
+                        "start",
+                        CsilTypeExpression::Reference("not_before".to_string()),
+                    ),
+                ],
+            }),
+            position: pos(),
+            doc_comments: Vec::new(),
+        };
+        let input = WasmGeneratorInput {
+            csil_spec: CsilSpecSerialized {
+                rules: vec![
+                    alias("unit_price", "decimal", "0.00"),
+                    alias("not_before", "timestamp", "2000-01-01T00:00:00Z"),
+                    record,
+                ],
+                source_content: None,
+                service_count: 0,
+                fields_with_metadata_count: 0,
+            },
+            config: GeneratorConfig {
+                target: "go".to_string(),
+                output_dir: "/tmp".to_string(),
+                options: HashMap::new(),
+            },
+            generator_metadata: GeneratorMetadata {
+                name: "go".to_string(),
+                version: "1.0.0".to_string(),
+                description: String::new(),
+                target: "go".to_string(),
+                capabilities: vec![],
+                author: None,
+                homepage: None,
+            },
+        };
+        let output = super::process_generation(input).expect("generation ok");
+        let codec = output
+            .files
+            .iter()
+            .find(|f| f.path == "codec.gen.go")
+            .expect("codec emitted");
+
+        // Encode: the alias is converted to the function's exact required type.
+        assert!(
+            codec
+                .content
+                .contains("csilEncDecimal(CsilDecimal(csilV.UnitPrice))")
+        );
+        assert!(
+            codec
+                .content
+                .contains("csilEncTimestamp(time.Time(csilV.Start))")
+        );
+        // Decode: the raw decoded value converts back into the named alias type.
+        assert!(codec.content.contains("unit_price(csilInner)"));
+        assert!(codec.content.contains("not_before(csilInner)"));
     }
 
     #[test]
@@ -6060,6 +7643,54 @@ mod tests {
     }
 
     #[test]
+    fn optional_slice_and_map_fields_are_nil_guarded_but_not_dereferenced() {
+        // An optional array/map field stays a bare `[]T`/`map[K]V` (see
+        // `optional_field_is_pointer`) — unlike a scalar/record optional, it is NOT
+        // a Go pointer, so a check must still nil-guard it (a nil slice/map is a
+        // valid "absent" state) but must read it directly rather than dereferencing,
+        // or the emitted Go fails to compile (`cannot indirect`, bug: validation
+        // hard-coded the scalar-optional deref for every optional field).
+        let tags = CsilGroupEntry {
+            key: Some(CsilGroupKey::Bare("tags".to_string())),
+            value_type: CsilTypeExpression::Array {
+                element_type: Box::new(CsilTypeExpression::Builtin("text".to_string())),
+                occurrence: None,
+            },
+            occurrence: Some(CsilOccurrence::Optional),
+            metadata: vec![CsilFieldMetadata::Constraint(
+                CsilValidationConstraint::MaxItems(20),
+            )],
+            doc_comments: Vec::new(),
+        };
+        let custom_metadata = CsilGroupEntry {
+            key: Some(CsilGroupKey::Bare("custom_metadata".to_string())),
+            value_type: CsilTypeExpression::Map {
+                key: Box::new(CsilTypeExpression::Builtin("text".to_string())),
+                value: Box::new(CsilTypeExpression::Builtin("any".to_string())),
+                occurrence: None,
+            },
+            occurrence: Some(CsilOccurrence::Optional),
+            metadata: vec![CsilFieldMetadata::Constraint(
+                CsilValidationConstraint::MaxItems(10),
+            )],
+            doc_comments: Vec::new(),
+        };
+        let input = group_input("Document", vec![tags, custom_metadata], HashMap::new());
+        let config = GoConfig::from_options(&input.config.options).unwrap();
+        let validation = super::generate_validation(&input, &config, &mut Vec::new())
+            .unwrap()
+            .expect("validation emitted");
+
+        assert!(validation.contains("if v.Tags != nil {"));
+        assert!(validation.contains("if len(v.Tags) > 20 {"));
+        assert!(!validation.contains("(*v.Tags)"));
+
+        assert!(validation.contains("if v.CustomMetadata != nil {"));
+        assert!(validation.contains("if len(v.CustomMetadata) > 10 {"));
+        assert!(!validation.contains("(*v.CustomMetadata)"));
+    }
+
+    #[test]
     fn typed_defaults_construct_decimal_and_timestamp_values() {
         // A `decimal`/`timestamp` default must build the typed Go value, never a bare
         // string literal assigned to a CsilDecimal/time.Time field (a compile error).
@@ -6087,10 +7718,11 @@ mod tests {
             .find(|f| f.path == "constructors.gen.go")
             .expect("constructors emitted");
 
+        // Keys are column-aligned the way gofmt's tabwriter settles them.
         assert!(
             ctors
                 .content
-                .contains("Balance: mustParseCsilDecimal(\"0.00\"),")
+                .contains("Balance:   mustParseCsilDecimal(\"0.00\"),")
         );
         assert!(
             ctors
@@ -6406,7 +8038,9 @@ mod tests {
         let types = super::generate_types(&input, &config, &mut Vec::new())
             .unwrap()
             .expect("types emitted");
-        assert!(types.contains("type MixedArray struct { Field0 string; Field1 int64 }"));
+        // The two-field anonymous struct breaks one field per line, since gofmt
+        // never keeps a multi-field field-list inline.
+        assert!(types.contains("type MixedArray struct {\n\tField0 string\n\tField1 int64\n}"));
     }
 
     #[test]
@@ -6594,7 +8228,7 @@ mod tests {
         assert!(!client.contains("Ping(ctx context.Context, req"));
         // A null input carries no body: the transport gets a nil payload, and the
         // response bytes decode through the codec.
-        assert!(client.contains("c.transport.Call(ctx, \"health\", \"Ping\", nil)"));
+        assert!(client.contains("c.transport.Call(ctx, \"HealthService\", \"ping\", nil)"));
         assert!(client.contains("return DecodePong(csilResp)"));
     }
 
@@ -6831,7 +8465,7 @@ import (
 type loopback struct{}
 
 func (loopback) Call(ctx context.Context, service, op string, req []byte) ([]byte, error) {
-	if service != "corndogs" || op != "SubmitTask" {
+	if service != "CorndogsService" || op != "submit-task" {
 		return nil, fmt.Errorf("unexpected route %s/%s", service, op)
 	}
 	in, err := api.DecodeSubmitTaskRequest(req)
@@ -6901,6 +8535,639 @@ func main() {
 	fmt.Println("ok")
 }
 "#;
+
+    /// Torture spec for inline-choice codec coverage: a record field typed as an
+    /// inline MIXED choice whose trailing arm carries a `.default` control
+    /// operator (general `text` arm + literal arms, one Constrained-wrapped —
+    /// the confirmed silent-data-loss bug, `cborNull{}` on encode), a record
+    /// field typed as an inline ALL-LITERAL choice (an enum), a field
+    /// referencing a NAMED MIXED choice matching the task's own illustrative
+    /// example verbatim (`text / "low" / "high" .default "normal"`), and a
+    /// field referencing a NAMED ALL-LITERAL choice with the same
+    /// trailing-`.default` shape. The parser attaches `.default` to the
+    /// immediately preceding literal (`Constrained { base_type: Literal(..),
+    /// .. }`), so classification must strip that wrapper everywhere a choice
+    /// arm's literal-ness is inspected, or the wrapped arm is misclassified as
+    /// a second "general" (non-literal) arm.
+    fn torture_choice_input() -> WasmGeneratorInput {
+        let pos = || CsilPosition {
+            line: 1,
+            column: 1,
+            offset: 0,
+        };
+        let text = || CsilTypeExpression::Builtin("text".to_string());
+        let lit = |s: &str| CsilTypeExpression::Literal(CsilLiteralValue::Text(s.to_string()));
+        let default_lit = |s: &str, default: &str| CsilTypeExpression::Constrained {
+            base_type: Box::new(lit(s)),
+            constraints: vec![CsilControlOperator::Default(CsilLiteralValue::Text(
+                default.to_string(),
+            ))],
+        };
+        // `Grade = text / "low" / "high" .default "normal"` — the task's own
+        // illustrative example verbatim: a mixed choice (`TypeDef(Choice(..))`,
+        // matching real specs like examples/real-world-api/e-commerce-api.csil's
+        // `OrderStatus`) whose last arm is Constrained.
+        let grade = CsilRule {
+            name: "Grade".to_string(),
+            rule_type: CsilRuleType::TypeDef(CsilTypeExpression::Choice(vec![
+                text(),
+                lit("low"),
+                default_lit("high", "normal"),
+            ])),
+            position: pos(),
+            doc_comments: Vec::new(),
+        };
+        // `Priority = "low" / "high" .default "high"` — the all-literal (enum)
+        // analog of `Grade`'s trailing-default shape.
+        let priority = CsilRule {
+            name: "Priority".to_string(),
+            rule_type: CsilRuleType::TypeDef(CsilTypeExpression::Choice(vec![
+                lit("low"),
+                default_lit("high", "high"),
+            ])),
+            position: pos(),
+            doc_comments: Vec::new(),
+        };
+        let torture = CsilRule {
+            name: "Torture".to_string(),
+            rule_type: CsilRuleType::GroupDef(CsilGroupExpression {
+                entries: vec![
+                    bare_entry(
+                        "mixed_choice",
+                        CsilTypeExpression::Choice(vec![
+                            text(),
+                            lit("not_found"),
+                            default_lit("permission_denied", "permission_denied"),
+                        ]),
+                    ),
+                    bare_entry(
+                        "enum_choice",
+                        CsilTypeExpression::Choice(vec![lit("red"), lit("green"), lit("blue")]),
+                    ),
+                    bare_entry("grade", CsilTypeExpression::Reference("Grade".to_string())),
+                    bare_entry(
+                        "priority",
+                        CsilTypeExpression::Reference("Priority".to_string()),
+                    ),
+                ],
+            }),
+            position: pos(),
+            doc_comments: Vec::new(),
+        };
+        WasmGeneratorInput {
+            csil_spec: CsilSpecSerialized {
+                rules: vec![grade, priority, torture],
+                source_content: None,
+                service_count: 0,
+                fields_with_metadata_count: 0,
+            },
+            config: GeneratorConfig {
+                target: "go".to_string(),
+                output_dir: "/tmp".to_string(),
+                options: HashMap::new(),
+            },
+            generator_metadata: GeneratorMetadata {
+                name: "go".to_string(),
+                version: "1.0.0".to_string(),
+                description: String::new(),
+                target: "go".to_string(),
+                capabilities: vec![],
+                author: None,
+                homepage: None,
+            },
+        }
+    }
+
+    #[test]
+    fn inline_choice_fields_round_trip_and_stay_gofmt_clean() {
+        let probe = std::process::Command::new("go").arg("version").output();
+        if probe.map(|o| !o.status.success()).unwrap_or(true) {
+            eprintln!("skipping: no go toolchain on PATH");
+            return;
+        }
+
+        let output = super::process_generation(torture_choice_input()).expect("generation ok");
+
+        let dir = std::env::temp_dir().join(format!("csilgen-go-choice-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let api_dir = dir.join("api");
+        std::fs::create_dir_all(&api_dir).unwrap();
+        for file in &output.files {
+            std::fs::write(api_dir.join(&file.path), &file.content).unwrap();
+        }
+        std::fs::write(dir.join("go.mod"), "module csilchoice\n\ngo 1.18\n").unwrap();
+        std::fs::write(dir.join("main.go"), GO_CHOICE_DRIVER).unwrap();
+
+        // Gate: every regenerated .go file must be gofmt-clean.
+        match std::process::Command::new("gofmt")
+            .arg("-l")
+            .arg(&api_dir)
+            .output()
+        {
+            Ok(listing) => {
+                let unformatted = String::from_utf8_lossy(&listing.stdout);
+                assert!(
+                    unformatted.trim().is_empty(),
+                    "gofmt -l found unformatted files:\n{unformatted}"
+                );
+            }
+            Err(_) => eprintln!("skipping gofmt -l check: no gofmt on PATH"),
+        }
+
+        let run = std::process::Command::new("go")
+            .arg("run")
+            .arg(".")
+            .current_dir(&dir)
+            .env("GOTOOLCHAIN", "local")
+            .env("GOFLAGS", "-mod=mod")
+            .env("GOPROXY", "off")
+            .env("GO111MODULE", "on")
+            .env("GOCACHE", dir.join(".gocache"))
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&run.stdout);
+        let stderr = String::from_utf8_lossy(&run.stderr);
+        assert!(
+            run.status.success(),
+            "go run failed:\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        assert_eq!(
+            stdout.trim(),
+            "ok",
+            "unexpected output:\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    const GO_CHOICE_DRIVER: &str = r#"package main
+
+import (
+	"fmt"
+	"os"
+
+	"csilchoice/api"
+)
+
+func check(cond bool, msg string) {
+	if !cond {
+		fmt.Println("FAIL:", msg)
+		os.Exit(1)
+	}
+}
+
+func must(err error) {
+	if err != nil {
+		fmt.Println("ERR:", err)
+		os.Exit(1)
+	}
+}
+
+func main() {
+	// A literal arm ("not_found") wins over the general `text` arm on encode
+	// (literal-first precedence) and must still round-trip byte-for-byte — the
+	// confirmed bug silently replaced this field with `cborNull{}` on encode,
+	// which would surface here as a decode failure or an empty string.
+	t1 := api.Torture{MixedChoice: "not_found", EnumChoice: "red", Grade: "low", Priority: "low"}
+	back1, err := api.DecodeTorture(api.EncodeTorture(t1))
+	must(err)
+	check(back1.MixedChoice == "not_found", "mixed_choice literal round-trip")
+	check(back1.EnumChoice == "red", "enum_choice round-trip")
+	check(back1.Grade == "low", "grade round-trip (non-default arm)")
+	check(back1.Priority == "low", "priority round-trip (non-default arm)")
+
+	// A value matching no literal arm falls back to the general `text` arm, for
+	// both the inline mixed_choice field and the named Grade union.
+	t2 := api.Torture{MixedChoice: "some other reason", EnumChoice: "blue", Grade: "something_else", Priority: "high"}
+	back2, err := api.DecodeTorture(api.EncodeTorture(t2))
+	must(err)
+	check(back2.MixedChoice == "some other reason", "mixed_choice general-arm round-trip")
+	check(back2.EnumChoice == "blue", "enum_choice round-trip 2")
+	check(back2.Grade == "something_else", "grade general-arm round-trip")
+	// Priority's trailing `.default "high"` arm is still a plain literal enum
+	// member on the wire — bare text, not a tagged sum — and must still
+	// classify (and round-trip) as an enum member despite the `.default`
+	// control-operator wrapper the parser attaches to it.
+	check(back2.Priority == "high", "priority round-trip (default-constrained arm)")
+
+	// The Constrained-wrapped literal arm itself ("permission_denied" on
+	// mixed_choice, "high" on Grade) must still classify and encode like a bare
+	// literal arm: its own declared index, not folded into (or shadowed by) the
+	// general arm.
+	t3 := api.Torture{MixedChoice: "permission_denied", EnumChoice: "green", Grade: "high", Priority: "low"}
+	back3, err := api.DecodeTorture(api.EncodeTorture(t3))
+	must(err)
+	check(back3.MixedChoice == "permission_denied", "mixed_choice default-constrained literal arm round-trip")
+	check(back3.EnumChoice == "green", "enum bare-wire round-trip")
+	check(back3.Grade == "high", "grade default-constrained literal arm round-trip")
+
+	fmt.Println("ok")
+}
+"#;
+
+    /// Enum decode must validate wire-value membership in the declared literal set
+    /// (parity with the python/ocaml/php/ruby/elixir codecs' `_csil_decode_enum`-style
+    /// check), for both a named enum reached through the `codec_aliases` alias path
+    /// (`Priority`) and an inline enum decoded straight from `Choice` (`enum_choice`
+    /// on `Torture`). A well-typed-but-undeclared value (`"purple"` for a text enum,
+    /// or an out-of-range int for an int enum) must fail decode; every declared
+    /// member must still round-trip.
+    #[test]
+    fn enum_decode_rejects_out_of_set_value() {
+        let probe = std::process::Command::new("go").arg("version").output();
+        if probe.map(|o| !o.status.success()).unwrap_or(true) {
+            eprintln!("skipping: no go toolchain on PATH");
+            return;
+        }
+
+        let output = super::process_generation(torture_choice_input()).expect("generation ok");
+
+        let dir = std::env::temp_dir().join(format!("csilgen-go-enumval-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let api_dir = dir.join("api");
+        std::fs::create_dir_all(&api_dir).unwrap();
+        for file in &output.files {
+            std::fs::write(api_dir.join(&file.path), &file.content).unwrap();
+        }
+        std::fs::write(dir.join("go.mod"), "module csilenumval\n\ngo 1.18\n").unwrap();
+        std::fs::write(dir.join("main.go"), GO_ENUM_MEMBERSHIP_DRIVER).unwrap();
+
+        let run = std::process::Command::new("go")
+            .arg("run")
+            .arg(".")
+            .current_dir(&dir)
+            .env("GOTOOLCHAIN", "local")
+            .env("GOFLAGS", "-mod=mod")
+            .env("GOPROXY", "off")
+            .env("GO111MODULE", "on")
+            .env("GOCACHE", dir.join(".gocache"))
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&run.stdout);
+        let stderr = String::from_utf8_lossy(&run.stderr);
+        assert!(
+            run.status.success(),
+            "go run failed:\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        assert_eq!(
+            stdout.trim(),
+            "ok",
+            "unexpected output:\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    const GO_ENUM_MEMBERSHIP_DRIVER: &str = r#"package main
+
+import (
+	"fmt"
+	"os"
+
+	"csilenumval/api"
+)
+
+func check(cond bool, msg string) {
+	if !cond {
+		fmt.Println("FAIL:", msg)
+		os.Exit(1)
+	}
+}
+
+func mustFail(err error, msg string) {
+	if err == nil {
+		fmt.Println("FAIL (expected error):", msg)
+		os.Exit(1)
+	}
+}
+
+func must(err error) {
+	if err != nil {
+		fmt.Println("ERR:", err)
+		os.Exit(1)
+	}
+}
+
+func main() {
+	valid := api.Torture{MixedChoice: "not_found", EnumChoice: "red", Grade: "low", Priority: "low"}
+	back, err := api.DecodeTorture(api.EncodeTorture(valid))
+	must(err)
+	check(back.EnumChoice == "red", "valid enum_choice member round-trips")
+	check(back.Priority == "low", "valid named-enum (Priority) member round-trips")
+
+	// A named enum (Priority) reached through the codec_aliases alias path: a
+	// well-typed string that is NOT one of "low"/"high" must fail decode rather
+	// than pass through unchecked.
+	badPriority := api.Torture{MixedChoice: "not_found", EnumChoice: "red", Grade: "low", Priority: api.Priority("medium")}
+	_, err = api.DecodeTorture(api.EncodeTorture(badPriority))
+	mustFail(err, "out-of-set Priority value \"medium\" must fail decode")
+
+	// An inline (hoisted) enum field: same contract, no named alias involved.
+	badEnumChoice := api.Torture{MixedChoice: "not_found", EnumChoice: "purple", Grade: "low", Priority: "low"}
+	_, err = api.DecodeTorture(api.EncodeTorture(badEnumChoice))
+	mustFail(err, "out-of-set enum_choice value \"purple\" must fail decode")
+
+	fmt.Println("ok")
+}
+"#;
+
+    /// Spec for the confirmed inline-GROUP data-loss bug: a direct inline-group
+    /// field (`Widget.detail`, mirroring `examples/multi-file/mixed/standalone.csil`'s
+    /// pinned `metadata: { created: int, version: text }` shape) and an
+    /// array-of-inline-group field (`Widget.tags`). Before `hoist_inline_groups`,
+    /// `go_enc_value`/`go_dec_func` had no `Group` arm: both fields silently
+    /// encoded as `cborNull{}`/`[]` and decoded to their zero value.
+    fn inline_group_input() -> WasmGeneratorInput {
+        let pos = || CsilPosition {
+            line: 1,
+            column: 1,
+            offset: 0,
+        };
+        let text = || CsilTypeExpression::Builtin("text".to_string());
+        let int = || CsilTypeExpression::Builtin("int".to_string());
+        let detail_group = CsilTypeExpression::Group(CsilGroupExpression {
+            entries: vec![bare_entry("created", int()), bare_entry("version", text())],
+        });
+        let tag_group = CsilTypeExpression::Group(CsilGroupExpression {
+            entries: vec![bare_entry("key", text()), bare_entry("count", int())],
+        });
+        let widget = CsilRule {
+            name: "Widget".to_string(),
+            rule_type: CsilRuleType::GroupDef(CsilGroupExpression {
+                entries: vec![
+                    bare_entry("name", text()),
+                    bare_entry("detail", detail_group),
+                    CsilGroupEntry {
+                        key: Some(CsilGroupKey::Bare("tags".to_string())),
+                        value_type: CsilTypeExpression::Array {
+                            element_type: Box::new(tag_group),
+                            occurrence: None,
+                        },
+                        occurrence: None,
+                        metadata: vec![],
+                        doc_comments: vec![],
+                    },
+                ],
+            }),
+            position: pos(),
+            doc_comments: Vec::new(),
+        };
+        WasmGeneratorInput {
+            csil_spec: CsilSpecSerialized {
+                rules: vec![widget],
+                source_content: None,
+                service_count: 0,
+                fields_with_metadata_count: 0,
+            },
+            config: GeneratorConfig {
+                target: "go".to_string(),
+                output_dir: "/tmp".to_string(),
+                options: HashMap::new(),
+            },
+            generator_metadata: GeneratorMetadata {
+                name: "go".to_string(),
+                version: "1.0.0".to_string(),
+                description: String::new(),
+                target: "go".to_string(),
+                capabilities: vec![],
+                author: None,
+                homepage: None,
+            },
+        }
+    }
+
+    #[test]
+    fn inline_group_fields_hoist_to_named_records_not_null() {
+        let output = super::process_generation(inline_group_input()).expect("generation ok");
+        let types = &output
+            .files
+            .iter()
+            .find(|f| f.path == "types.gen.go")
+            .expect("types file")
+            .content;
+        // The synthesized records exist as real named structs, not `interface{}`.
+        assert!(
+            types.contains("type WidgetDetail struct"),
+            "expected a hoisted WidgetDetail record, got:\n{types}"
+        );
+        assert!(
+            types.contains("type WidgetTagsItem struct"),
+            "expected a hoisted WidgetTagsItem record, got:\n{types}"
+        );
+        assert!(
+            types.contains("Detail   WidgetDetail")
+                || types.contains("Detail WidgetDetail")
+                || types.contains("Detail    WidgetDetail"),
+            "expected Widget.Detail to be typed WidgetDetail, got:\n{types}"
+        );
+
+        let codec = &output
+            .files
+            .iter()
+            .find(|f| f.path == "codec.gen.go")
+            .expect("codec file")
+            .content;
+        // The confirmed bug: before the fix, the field's encoder was `cborNull{}`.
+        assert!(
+            !codec.contains(r#"cborEntry{cborText("detail"), cborNull{}}"#),
+            "detail field must not silently encode as null, got:\n{codec}"
+        );
+        assert!(
+            codec.contains("csilEncWidgetDetail") && codec.contains("csilDecWidgetDetail"),
+            "expected a real WidgetDetail codec pair, got:\n{codec}"
+        );
+    }
+
+    #[test]
+    fn inline_group_fields_round_trip_through_go() {
+        let probe = std::process::Command::new("go").arg("version").output();
+        if probe.map(|o| !o.status.success()).unwrap_or(true) {
+            eprintln!("skipping: no go toolchain on PATH");
+            return;
+        }
+
+        let output = super::process_generation(inline_group_input()).expect("generation ok");
+
+        let dir =
+            std::env::temp_dir().join(format!("csilgen-go-inlinegroup-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let api_dir = dir.join("api");
+        std::fs::create_dir_all(&api_dir).unwrap();
+        for file in &output.files {
+            std::fs::write(api_dir.join(&file.path), &file.content).unwrap();
+        }
+        std::fs::write(dir.join("go.mod"), "module csilinlinegroup\n\ngo 1.18\n").unwrap();
+        std::fs::write(dir.join("main.go"), GO_INLINE_GROUP_DRIVER).unwrap();
+
+        // Gate: every regenerated .go file must be gofmt-clean.
+        match std::process::Command::new("gofmt")
+            .arg("-l")
+            .arg(&api_dir)
+            .output()
+        {
+            Ok(listing) => {
+                let dirty = String::from_utf8_lossy(&listing.stdout);
+                assert!(
+                    dirty.trim().is_empty(),
+                    "gofmt -l reports unformatted files:\n{dirty}"
+                );
+            }
+            Err(e) => eprintln!("skipping gofmt check: {e}"),
+        }
+
+        let run = std::process::Command::new("go")
+            .arg("run")
+            .arg(".")
+            .current_dir(&dir)
+            .env("GOTOOLCHAIN", "local")
+            .env("GOFLAGS", "-mod=mod")
+            .env("GOPROXY", "off")
+            .env("GO111MODULE", "on")
+            .env("GOCACHE", dir.join(".gocache"))
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&run.stdout);
+        let stderr = String::from_utf8_lossy(&run.stderr);
+        assert!(
+            run.status.success(),
+            "go run failed:\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        assert_eq!(
+            stdout.trim(),
+            "ok",
+            "unexpected output:\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    const GO_INLINE_GROUP_DRIVER: &str = r#"package main
+
+import (
+	"fmt"
+	"os"
+
+	"csilinlinegroup/api"
+)
+
+func check(cond bool, msg string) {
+	if !cond {
+		fmt.Println("FAIL:", msg)
+		os.Exit(1)
+	}
+}
+
+func must(err error) {
+	if err != nil {
+		fmt.Println("ERR:", err)
+		os.Exit(1)
+	}
+}
+
+func main() {
+	w := api.Widget{
+		Name: "gizmo",
+		Detail: api.WidgetDetail{
+			Created: 2024,
+			Version: "v1",
+		},
+		Tags: []api.WidgetTagsItem{
+			{Key: "color", Count: 3},
+			{Key: "size", Count: 7},
+		},
+	}
+	back, err := api.DecodeWidget(api.EncodeWidget(w))
+	must(err)
+	// The confirmed bug: these fields silently decoded to their zero value
+	// (Detail == WidgetDetail{}, Tags == nil) before the inline-group hoist fix.
+	check(back.Detail.Created == 2024, "inline-group field: created")
+	check(back.Detail.Version == "v1", "inline-group field: version")
+	check(len(back.Tags) == 2, "array-of-inline-group: length")
+	check(back.Tags[0].Key == "color" && back.Tags[0].Count == 3, "array-of-inline-group[0]")
+	check(back.Tags[1].Key == "size" && back.Tags[1].Count == 7, "array-of-inline-group[1]")
+
+	fmt.Println("ok")
+}
+"#;
+
+    /// Pascal-collision regression (Finding (a) in `crates/csilgen-common/src/
+    /// hoist.rs`'s own test suite, recast for Go's group-only hoisting): an
+    /// existing rule named `UserData` and a synthesized name `User_data` (owner
+    /// `User`, inline-group field `data`) pascal-collide — both canonicalize to
+    /// `"userdata"`. The shared hoister's case-insensitive reservation must catch
+    /// this and disambiguate the later one, or this generator would emit two Go
+    /// declarations for the same exported identifier (`UserData` twice — does not
+    /// compile).
+    #[test]
+    fn hoisted_inline_group_name_disambiguates_against_existing_collision() {
+        let pos = || CsilPosition {
+            line: 1,
+            column: 1,
+            offset: 0,
+        };
+        let text = || CsilTypeExpression::Builtin("text".to_string());
+        let user_data = CsilRule {
+            name: "UserData".to_string(),
+            rule_type: CsilRuleType::GroupDef(CsilGroupExpression {
+                entries: vec![bare_entry("value", text())],
+            }),
+            position: pos(),
+            doc_comments: Vec::new(),
+        };
+        // `User.data` is an inline group, so it hoists to a synthesized rule named
+        // `User_data` — which pascal-collides with `UserData` above.
+        let user = CsilRule {
+            name: "User".to_string(),
+            rule_type: CsilRuleType::GroupDef(CsilGroupExpression {
+                entries: vec![bare_entry(
+                    "data",
+                    CsilTypeExpression::Group(CsilGroupExpression {
+                        entries: vec![bare_entry("x", text())],
+                    }),
+                )],
+            }),
+            position: pos(),
+            doc_comments: Vec::new(),
+        };
+        let input = WasmGeneratorInput {
+            csil_spec: CsilSpecSerialized {
+                rules: vec![user_data, user],
+                source_content: None,
+                service_count: 0,
+                fields_with_metadata_count: 0,
+            },
+            config: GeneratorConfig {
+                target: "go".to_string(),
+                output_dir: "/tmp".to_string(),
+                options: HashMap::new(),
+            },
+            generator_metadata: GeneratorMetadata {
+                name: "go".to_string(),
+                version: "1.0.0".to_string(),
+                description: String::new(),
+                target: "go".to_string(),
+                capabilities: vec![],
+                author: None,
+                homepage: None,
+            },
+        };
+        let output = super::process_generation(input).expect("generation ok");
+        let types = &output
+            .files
+            .iter()
+            .find(|f| f.path == "types.gen.go")
+            .expect("types file")
+            .content;
+        // Both records exist, under distinct Go type names — `UserData` survives
+        // unchanged, and the synthesized name must NOT also render as `UserData`.
+        let user_data_count = types.matches("type UserData struct").count();
+        assert_eq!(
+            user_data_count, 1,
+            "UserData must be declared exactly once (no duplicate from the hoisted \
+             field), got:\n{types}"
+        );
+        assert!(
+            types.contains("type User struct"),
+            "expected the User record, got:\n{types}"
+        );
+    }
 
     #[test]
     fn non_record_op_boundaries_get_client_methods_and_per_op_codecs() {
@@ -7016,5 +9283,309 @@ func main() {
         );
         assert!(codec.contains("func EncodeMemberListMembersResponse(csilV []Member) []byte"));
         assert!(codec.contains("func EncodeMemberDeleteTaskResponse(csilV bool) []byte"));
+    }
+
+    // ---- gofmt-fixpoint rendering ----
+    //
+    // These pin the emitted text to what `gofmt -w` settles on, so a fresh regen
+    // over unchanged CSIL produces a zero diff against checked-in output. The
+    // expected strings were captured from real gofmt (go1.26) fixpoints.
+
+    #[test]
+    fn go_closure_respects_gofmt_one_line_budget() {
+        // gofmt keeps a func literal on one line while header+body <= 100.
+        let sig = "f".repeat(50);
+        let at_budget = go_closure(&sig, &["s".repeat(50)], 1);
+        assert_eq!(at_budget, format!("{sig} {{ {} }}", "s".repeat(50)));
+        let over_budget = go_closure(&sig, &["s".repeat(51)], 1);
+        assert_eq!(
+            over_budget,
+            format!("{sig} {{\n\t\t{}\n\t}}", "s".repeat(51))
+        );
+        // Two statements cost an extra 2 (semicolon + blank) against the budget.
+        let two = go_closure(&sig, &["s".repeat(24), "t".repeat(24)], 0);
+        assert_eq!(
+            two,
+            format!("{sig} {{ {}; {} }}", "s".repeat(24), "t".repeat(24))
+        );
+        let two_over = go_closure(&sig, &["s".repeat(24), "t".repeat(25)], 0);
+        assert!(two_over.contains('\n'));
+        // More than five statements never fits on one line.
+        let six: Vec<String> = (0..6).map(|i| format!("s{i}")).collect();
+        assert!(go_closure("func()", &six, 0).contains('\n'));
+        // A block statement (rendered multi-line) forces the block form.
+        let with_if = go_closure(
+            "func() bool",
+            &[go_if("x", &["return true".to_string()], 1)],
+            0,
+        );
+        assert_eq!(with_if, "func() bool {\n\tif x {\n\t\treturn true\n\t}\n}");
+    }
+
+    #[test]
+    fn struct_fields_align_like_gofmt_tabwriter() {
+        // The linkkeys repro from the request: name and type columns pad to the
+        // widest member + 1, tags ride unpadded as the last cell.
+        let rows = vec![
+            GoFieldRow {
+                comments: vec![],
+                name: "Result".to_string(),
+                ty: "bool".to_string(),
+                tag: Some("`json:\"result\" yaml:\"result\"`".to_string()),
+            },
+            GoFieldRow {
+                comments: vec![],
+                name: "Entries".to_string(),
+                ty: "CheckEntries".to_string(),
+                tag: Some("`json:\"entries\" yaml:\"entries\"`".to_string()),
+            },
+        ];
+        assert_eq!(
+            render_go_field_runs(&rows, 1),
+            "\tResult  bool         `json:\"result\" yaml:\"result\"`\n\
+             \tEntries CheckEntries `json:\"entries\" yaml:\"entries\"`\n"
+        );
+    }
+
+    #[test]
+    fn struct_field_comment_starts_a_new_alignment_run() {
+        // gofmt aligns comment-separated runs independently: `A int` keeps a
+        // single space while the run below the comment aligns to LongerName.
+        let rows = vec![
+            GoFieldRow {
+                comments: vec![],
+                name: "A".to_string(),
+                ty: "int".to_string(),
+                tag: Some("`json:\"a\"`".to_string()),
+            },
+            GoFieldRow {
+                comments: vec!["// comment between".to_string()],
+                name: "LongerName".to_string(),
+                ty: "string".to_string(),
+                tag: Some("`json:\"longer_name\"`".to_string()),
+            },
+            GoFieldRow {
+                comments: vec![],
+                name: "B".to_string(),
+                ty: "bool".to_string(),
+                tag: None,
+            },
+        ];
+        assert_eq!(
+            render_go_field_runs(&rows, 1),
+            "\tA int `json:\"a\"`\n\
+             \t// comment between\n\
+             \tLongerName string `json:\"longer_name\"`\n\
+             \tB          bool\n"
+        );
+    }
+
+    #[test]
+    fn multi_line_field_type_aligns_its_name_then_breaks_the_run() {
+        // Captured from the interop fixpoint: `Pair` pads with the run above it,
+        // the anonymous struct opens in place, and the next field starts fresh.
+        let rows = vec![
+            GoFieldRow {
+                comments: vec![],
+                name: "AtLeastOne".to_string(),
+                ty: "[]int64".to_string(),
+                tag: Some("`json:\"at_least_one\"`".to_string()),
+            },
+            GoFieldRow {
+                comments: vec![],
+                name: "Pair".to_string(),
+                ty: reflow_go_type("struct { Field0 string; Field1 int64 }", 1),
+                tag: Some("`json:\"pair\"`".to_string()),
+            },
+            GoFieldRow {
+                comments: vec![],
+                name: "Extra".to_string(),
+                ty: "map[string]any".to_string(),
+                tag: Some("`json:\"extra\"`".to_string()),
+            },
+        ];
+        assert_eq!(
+            render_go_field_runs(&rows, 1),
+            "\tAtLeastOne []int64 `json:\"at_least_one\"`\n\
+             \tPair       struct {\n\
+             \t\tField0 string\n\
+             \t\tField1 int64\n\
+             \t} `json:\"pair\"`\n\
+             \tExtra map[string]any `json:\"extra\"`\n"
+        );
+    }
+
+    #[test]
+    fn composite_pairs_align_and_break_on_outlier_keys() {
+        // Small keys align; a key past gofmt's 40-char smallSize whose length is
+        // 2.5x off the running geometric mean starts a new section, and so does
+        // whatever follows it.
+        let pairs = vec![
+            ("Offset".to_string(), "int64(0)".to_string()),
+            ("Limit".to_string(), "int64(20)".to_string()),
+            (
+                "AVeryVeryVeryLongKeyNameHereThatIsAnOutlierForSure".to_string(),
+                "1".to_string(),
+            ),
+            ("X".to_string(), "2".to_string()),
+        ];
+        assert_eq!(
+            render_go_composite_pairs(&pairs, 2),
+            "\t\tOffset: int64(0),\n\
+             \t\tLimit:  int64(20),\n\
+             \t\tAVeryVeryVeryLongKeyNameHereThatIsAnOutlierForSure: 1,\n\
+             \t\tX: 2,\n"
+        );
+    }
+
+    #[test]
+    fn reflow_splits_multi_field_anonymous_structs() {
+        // gofmt never inlines a multi-field field-list; a single short field stays
+        // inline in gofmt's `struct{ F T }` spelling (no blank after `struct`).
+        assert_eq!(
+            reflow_go_type("struct { Field0 string; Field1 int64 }", 1),
+            "struct {\n\t\tField0 string\n\t\tField1 int64\n\t}"
+        );
+        assert_eq!(
+            reflow_go_type("struct { Only text }", 0),
+            "struct{ Only text }"
+        );
+        // Over the 30-char one-line field-list budget, a single field splits too.
+        assert_eq!(
+            reflow_go_type("struct { Only map[string][]VeryLongElementName }", 0),
+            "struct {\n\tOnly map[string][]VeryLongElementName\n}"
+        );
+        // Non-struct types pass through untouched; nesting re-flows recursively.
+        assert_eq!(reflow_go_type("map[string]int64", 0), "map[string]int64");
+        assert_eq!(
+            reflow_go_type("[]struct { A string; B struct { C int64; D bool } }", 0),
+            "[]struct {\n\tA string\n\tB struct {\n\t\tC int64\n\t\tD bool\n\t}\n}"
+        );
+    }
+
+    #[test]
+    fn gofmt_finish_sorts_imports_and_trims_trailing_blank_lines() {
+        let content = "package p\n\nimport (\n\t\"fmt\"\n\t\"math\"\n\t\"time\"\n\t\"math/big\"\n\n\t\"github.com/shopspring/decimal\"\n)\n\nfunc f() {}\n\n\n";
+        assert_eq!(
+            gofmt_finish(content.to_string()),
+            "package p\n\nimport (\n\t\"fmt\"\n\t\"math\"\n\t\"math/big\"\n\t\"time\"\n\n\t\"github.com/shopspring/decimal\"\n)\n\nfunc f() {}\n"
+        );
+    }
+
+    #[test]
+    fn over_budget_decoder_closures_render_gofmt_block_form() {
+        use std::collections::{HashMap, HashSet};
+        let config = GoConfig::from_options(&HashMap::new()).unwrap();
+        let mut records = HashSet::new();
+        records.insert("RevocationCertificate".to_string());
+        let aliases = HashMap::new();
+        // 55-char header + 57-char body = 112 > 100: gofmt splits this one
+        // (captured from the linkkeys fixpoint).
+        let long = go_dec_func(
+            &CsilTypeExpression::Array {
+                element_type: Box::new(CsilTypeExpression::Reference(
+                    "RevocationCertificate".to_string(),
+                )),
+                occurrence: None,
+            },
+            &records,
+            &aliases,
+            &config,
+            2,
+        );
+        assert_eq!(
+            long,
+            "func(csilV cborValue) ([]RevocationCertificate, error) {\n\
+             \t\t\treturn cborDecArray(csilV, csilDecRevocationCertificate)\n\
+             \t\t}"
+        );
+        // 48-char header + 46-char body = 94 <= 100: stays on one line.
+        let short = go_dec_func(
+            &CsilTypeExpression::Array {
+                element_type: Box::new(CsilTypeExpression::Builtin("text".to_string())),
+                occurrence: None,
+            },
+            &records,
+            &aliases,
+            &config,
+            2,
+        );
+        assert_eq!(
+            short,
+            "func(csilV cborValue) ([]string, error) { return cborDecArray(csilV, cborAsText) }"
+        );
+    }
+
+    #[test]
+    fn literal_decoder_closure_always_renders_block_form() {
+        use std::collections::{HashMap, HashSet};
+        let config = GoConfig::from_options(&HashMap::new()).unwrap();
+        let records = HashSet::new();
+        let aliases = HashMap::new();
+        // The literal check carries an `if` block, which gofmt never inlines.
+        let dec = go_dec_func(
+            &CsilTypeExpression::Literal(CsilLiteralValue::Text("pending".to_string())),
+            &records,
+            &aliases,
+            &config,
+            2,
+        );
+        assert_eq!(
+            dec,
+            "func(csilV cborValue) (string, error) {\n\
+             \t\t\tif !cborEqual(csilV, cborText(\"pending\")) {\n\
+             \t\t\t\tvar csilZero string\n\
+             \t\t\t\treturn csilZero, fmt.Errorf(\"csil cbor: literal mismatch\")\n\
+             \t\t\t}\n\
+             \t\t\treturn \"pending\", nil\n\
+             \t\t}"
+        );
+    }
+
+    #[test]
+    fn generated_struct_fields_come_out_gofmt_aligned() {
+        // End to end through generate_types: mixed-width members, optional
+        // pointers, and blank-run-free structs land exactly where gofmt would.
+        let input = group_input(
+            "CheckResult",
+            vec![
+                bare_entry("result", CsilTypeExpression::Builtin("bool".to_string())),
+                bare_entry(
+                    "entries",
+                    CsilTypeExpression::Reference("CheckEntries".to_string()),
+                ),
+            ],
+            HashMap::new(),
+        );
+        let config = GoConfig::from_options(&input.config.options).unwrap();
+        let types = super::generate_types(&input, &config, &mut Vec::new())
+            .unwrap()
+            .expect("types emitted");
+        assert!(types.contains(
+            "type CheckResult struct {\n\
+             \tResult  bool         `json:\"result\" yaml:\"result\"`\n\
+             \tEntries CheckEntries `json:\"entries\" yaml:\"entries\"`\n\
+             }"
+        ));
+    }
+
+    #[test]
+    fn generated_go_files_end_with_exactly_one_newline() {
+        let input = group_input(
+            "Thing",
+            vec![bare_entry(
+                "name",
+                CsilTypeExpression::Builtin("text".to_string()),
+            )],
+            HashMap::new(),
+        );
+        let output = super::process_generation(input).expect("generation ok");
+        for file in output.files.iter().filter(|f| f.path.ends_with(".go")) {
+            assert!(
+                file.content.ends_with('\n') && !file.content.ends_with("\n\n"),
+                "{} must end with exactly one newline",
+                file.path
+            );
+        }
     }
 }

@@ -8,8 +8,8 @@
 
 use convert_case::{Case, Casing};
 use csilgen_common::{
-    CsilGroupEntry, CsilGroupExpression, CsilGroupKey, CsilLiteralValue, CsilOccurrence,
-    CsilRuleType, CsilServiceDefinition, CsilServiceDirection, CsilSpecSerialized,
+    ChoiceClass, CsilGroupEntry, CsilGroupExpression, CsilGroupKey, CsilLiteralValue,
+    CsilOccurrence, CsilRuleType, CsilServiceDefinition, CsilServiceDirection, CsilSpecSerialized,
     CsilTypeExpression, GeneratedFile, GenerationStats, GeneratorCapability, GeneratorConfig,
     GeneratorMetadata, WasmGeneratorInput, WasmGeneratorOutput, wasm_interface::*,
 };
@@ -135,6 +135,22 @@ fn generate_ocaml(
 ) -> Result<Vec<GeneratedFile>, i32> {
     let surface = resolve_surface(config.target.as_str())?;
     let mut files = Vec::new();
+
+    // Every emitter below reads from this single hoisted spec so types, codec,
+    // client, services, and the package readme all agree on the same synthesized
+    // names for an inline (anonymous) composite in any position — field, array
+    // element, map key/value, or tuple slot, at any nesting depth. See
+    // `csilgen_common::hoist_inline_composites`. `hoist_all_literal_choices: true`
+    // because OCaml has no anonymous sum-type field syntax at all — even a closed
+    // all-literal choice (`Pending | Shipped | Delivered`) must be a *named* `type`
+    // (see the crate's original hoist-pass module doc, preserved in git history).
+    let hoisted_spec = csilgen_common::hoist_inline_composites(
+        spec,
+        csilgen_common::HoistOptions {
+            hoist_all_literal_choices: true,
+        },
+    );
+    let spec = &hoisted_spec;
 
     // Types are shared by every surface (the client/server reference them), so the
     // typesonly surface is simply "stop after types".
@@ -991,8 +1007,8 @@ fn first_channel_example(spec: &CsilSpecSerialized) -> Option<ChannelExample> {
             let out_group = ocaml_find_record(spec, out_name)?;
             return Some(ChannelExample {
                 service_module: ocaml_module_name(&rule.name),
-                wire_service: wire_service_name(&rule.name),
-                wire_op: wire_op_name(&op.name),
+                wire_service: rule.name.clone(),
+                wire_op: op.name.clone(),
                 out_codec,
                 out_type: ocaml_type_name(out_name),
                 out_sample: ocaml_record_literal(spec, out_group),
@@ -1023,7 +1039,7 @@ fn ocaml_handler_record(
         if op.name == channel_op {
             fields.push(format!(
                 "{field} = (fun payload -> let msg = Codec.decode_{in_codec}_bytes payload in ignore msg; print_endline \"event {wire}\")",
-                wire = wire_op_name(&op.name)
+                wire = op.name
             ));
         } else {
             match op.direction {
@@ -1172,34 +1188,6 @@ fn capitalize(s: &str) -> String {
     }
 }
 
-/// The wire `service` string: strip a trailing `Service` suffix and **lowercase**,
-/// per `docs/cbor-wire-contract.md` (`CorndogsService` → `"corndogs"`), so an OCaml
-/// client reaches the same endpoint as the Go/Python/Rust peers.
-fn wire_service_name(name: &str) -> String {
-    let pascal = name.to_case(Case::Pascal);
-    pascal
-        .strip_suffix("Service")
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
-        .unwrap_or(pascal)
-        .to_lowercase()
-}
-
-/// The wire `op` string: the operation name PascalCased with the simple rule
-/// (capitalize after `_`/`-`, leave the rest), matching the other generators
-/// (`submit-task` → `"SubmitTask"`).
-fn wire_op_name(name: &str) -> String {
-    let mut out = String::new();
-    for word in name.split(['_', '-']) {
-        let mut chars = word.chars();
-        if let Some(first) = chars.next() {
-            out.extend(first.to_uppercase());
-            out.push_str(chars.as_str());
-        }
-    }
-    out
-}
-
 // ---------------------------------------------------------------------------
 // Type mapping
 // ---------------------------------------------------------------------------
@@ -1300,17 +1288,24 @@ fn entry_field_name(entry: &CsilGroupEntry) -> Option<String> {
     }
 }
 
+// `choice_arm_literal` is shared machinery now (see `csilgen_common::choice`, THE
+// normative classification contract) — re-exported here so every existing
+// `choice_arm_literal(...)` call site in this file keeps working unchanged.
+use csilgen_common::choice_arm_literal;
+
 /// A constructor name and optional payload type for one arm of a (named) type
 /// choice. A text literal becomes a nullary constructor named after the literal
 /// (the string-enum case); a reference/builtin carries its mapped type.
 fn choice_ctor(type_expr: &CsilTypeExpression) -> (String, Option<String>) {
+    if let Some(CsilLiteralValue::Text(text)) = choice_arm_literal(type_expr) {
+        return (ocaml_ctor_name(text), None);
+    }
     match type_expr {
         CsilTypeExpression::Reference(name) => (ocaml_ctor_name(name), Some(ocaml_type_name(name))),
         CsilTypeExpression::Builtin(name) => match name.as_str() {
             "nil" | "null" => (capitalize(&ocaml_ident(name)), None),
             _ => (ocaml_ctor_name(name), Some(map_type(type_expr))),
         },
-        CsilTypeExpression::Literal(CsilLiteralValue::Text(text)) => (ocaml_ctor_name(text), None),
         _ => ("Other".to_string(), Some(map_type(type_expr))),
     }
 }
@@ -1336,7 +1331,11 @@ fn unique_ctor(seen: &mut Vec<String>, base: &str) -> String {
 
 /// Build `types.ml` and `types.mli` together so the implementation and its
 /// interface always agree on the same declarations (the `.mli` is the
-/// abstraction boundary the research mandates).
+/// abstraction boundary the research mandates). `spec` has already been through
+/// `csilgen_common::hoist_inline_composites` (see `generate_ocaml`), so every inline
+/// group/choice — field, array element, map key/value, or tuple slot, at any
+/// nesting depth — already arrives here as its own named `GroupDef`/`TypeDef`
+/// rule; this function needs no special-casing to reach it.
 fn generate_types(spec: &CsilSpecSerialized) -> (String, String) {
     let header = "(* Code generated by csilgen; DO NOT EDIT. *)\n\n";
     let mut decls: Vec<String> = Vec::new();
@@ -1423,6 +1422,11 @@ fn generate_record(name: &str, group: &CsilGroupExpression) -> String {
         return format!("type {type_name} = unit");
     }
 
+    // `spec` has already been through `csilgen_common::hoist_inline_composites` (see
+    // `generate_ocaml`), so an entry whose source type was an inline group/choice
+    // already carries a `Reference` to the synthesized rule here — plain
+    // `map_field_type` is enough, with no separate hoisted-type lookup.
+
     // Single-line fast path: the formatter collapses a comment-free record that
     // fits the 80-column margin onto one line, so emit that shape directly to keep
     // the generated source format-stable. `collect()` yields `None` if any entry
@@ -1489,6 +1493,17 @@ enum ChoiceShape {
     },
     /// All-integer-literal enum: nullary constructors, the bare integer on the wire.
     IntEnum { arms: Vec<(String, i64)> },
+    /// An all-literal enum whose members are NOT a uniform text-only or int-only
+    /// vocabulary (`"a" / 1`, or any other kind mix, per the shared classifier's
+    /// contract — see `csilgen_common::choice`): nullary constructors, one per
+    /// literal, discriminated on the wire by comparing the decoded `Cbor.t`
+    /// against each literal's own rendering (`literal_cbor_expr`) rather than a
+    /// single `Cbor.to_text`/`Cbor.to_i64` extractor. Previously a choice like
+    /// this required a uniform kind to be recognized as an enum at all and fell
+    /// through to `Union` — a real bug this shape fixes.
+    MixedEnum {
+        arms: Vec<(String, CsilLiteralValue)>,
+    },
     /// A tagged-sum union: one constructor per arm carrying its mapped payload (or
     /// nullary for a `nil`/`null` arm). On the wire it is `[variant_index, value]`.
     Union {
@@ -1498,42 +1513,97 @@ enum ChoiceShape {
 
 /// Classify a type-choice into the OCaml variant shape it maps to, performing all
 /// constructor-name disambiguation once so `generate_type_choice` (the declaration)
-/// and `emit_choice_codec` (the wire) stay in lockstep.
+/// and `emit_choice_codec` (the wire) stay in lockstep. Routes the ENUM-vs-UNION
+/// split through the shared `csilgen_common::classify_choice` (THE normative
+/// contract: ALL-literal, any kind mix, is an enum) and only layers OCaml's own
+/// sub-shapes (uniform string/int/mixed enum; the open-string-enum optimization
+/// within `Union`) on top.
 fn classify_choice(choices: &[CsilTypeExpression]) -> ChoiceShape {
+    match csilgen_common::classify_choice(choices) {
+        ChoiceClass::Enum(literals) => classify_enum(&literals),
+        ChoiceClass::Union(_) => classify_union(choices),
+    }
+}
+
+/// Sub-classify an ALL-literal choice into the enum shape OCaml renders: a pure
+/// string or pure integer vocabulary keeps its historical bare-wire discriminant
+/// (the literal itself IS the CBOR item); any other kind mix is a `MixedEnum`.
+fn classify_enum(literals: &[&CsilLiteralValue]) -> ChoiceShape {
+    if literals
+        .iter()
+        .all(|l| matches!(l, CsilLiteralValue::Text(_)))
+    {
+        let mut seen: Vec<String> = Vec::new();
+        let arms: Vec<(String, String)> = literals
+            .iter()
+            .map(|l| {
+                let CsilLiteralValue::Text(t) = l else {
+                    unreachable!("filtered to Text above")
+                };
+                (unique_ctor(&mut seen, &ocaml_ctor_name(t)), t.clone())
+            })
+            .collect();
+        ChoiceShape::StringEnum {
+            arms,
+            open_other: None,
+        }
+    } else if literals
+        .iter()
+        .all(|l| matches!(l, CsilLiteralValue::Integer(_)))
+    {
+        let mut seen: Vec<String> = Vec::new();
+        let arms: Vec<(String, i64)> = literals
+            .iter()
+            .map(|l| {
+                let CsilLiteralValue::Integer(n) = l else {
+                    unreachable!("filtered to Integer above")
+                };
+                (unique_ctor(&mut seen, &ocaml_ctor_name(&n.to_string())), *n)
+            })
+            .collect();
+        ChoiceShape::IntEnum { arms }
+    } else {
+        let mut seen: Vec<String> = Vec::new();
+        let arms: Vec<(String, CsilLiteralValue)> = literals
+            .iter()
+            .map(|l| {
+                (
+                    unique_ctor(&mut seen, &ocaml_ctor_name(&literal_ctor_base(l))),
+                    (*l).clone(),
+                )
+            })
+            .collect();
+        ChoiceShape::MixedEnum { arms }
+    }
+}
+
+/// Sub-classify a choice with at least one non-literal arm (`ChoiceClass::Union`)
+/// into either the OPEN string-enum optimization (`text / "a" / "b"`:
+/// text-derived constructor names plus one `Other of string` catch-all) or the
+/// generic tagged-sum `Union`. This is the SAME condition the pre-shared-classifier
+/// code used, just now only reachable once the top-level Enum/Union split is
+/// already known to be Union (so `non_literals` here is never empty).
+fn classify_union(choices: &[CsilTypeExpression]) -> ChoiceShape {
     let text_literals: Vec<&str> = choices
         .iter()
-        .filter_map(|c| match c {
-            CsilTypeExpression::Literal(CsilLiteralValue::Text(t)) => Some(t.as_str()),
+        .filter_map(|c| match choice_arm_literal(c) {
+            Some(CsilLiteralValue::Text(t)) => Some(t.as_str()),
             _ => None,
         })
         .collect();
-    let int_literals: Vec<i64> = choices
+    let has_int_literal = choices
         .iter()
-        .filter_map(|c| match c {
-            CsilTypeExpression::Literal(CsilLiteralValue::Integer(n)) => Some(*n),
-            _ => None,
-        })
-        .collect();
+        .any(|c| matches!(choice_arm_literal(c), Some(CsilLiteralValue::Integer(_))));
     let non_literals: Vec<&CsilTypeExpression> = choices
         .iter()
-        .filter(|c| {
-            !matches!(
-                c,
-                CsilTypeExpression::Literal(CsilLiteralValue::Text(_))
-                    | CsilTypeExpression::Literal(CsilLiteralValue::Integer(_))
-            )
-        })
+        .filter(|c| choice_arm_literal(c).is_none())
         .collect();
     let open_base = matches!(
         non_literals.as_slice(),
         [CsilTypeExpression::Builtin(n)] if n == "text" || n == "tstr"
     );
 
-    // A pure string enum (optionally led by a `text` base that opens it).
-    if !text_literals.is_empty()
-        && int_literals.is_empty()
-        && (non_literals.is_empty() || open_base)
-    {
+    if !text_literals.is_empty() && !has_int_literal && open_base {
         let mut seen: Vec<String> = Vec::new();
         let arms: Vec<(String, String)> = text_literals
             .iter()
@@ -1544,18 +1614,8 @@ fn classify_choice(choices: &[CsilTypeExpression]) -> ChoiceShape {
                 )
             })
             .collect();
-        let open_other = open_base.then(|| unique_ctor(&mut seen, "Other"));
+        let open_other = Some(unique_ctor(&mut seen, "Other"));
         return ChoiceShape::StringEnum { arms, open_other };
-    }
-
-    // A pure integer enum: the bare integer is its own discriminant on the wire.
-    if !int_literals.is_empty() && text_literals.is_empty() && non_literals.is_empty() {
-        let mut seen: Vec<String> = Vec::new();
-        let arms: Vec<(String, i64)> = int_literals
-            .iter()
-            .map(|n| (unique_ctor(&mut seen, &ocaml_ctor_name(&n.to_string())), *n))
-            .collect();
-        return ChoiceShape::IntEnum { arms };
     }
 
     // Otherwise a tagged-sum union over the alternatives in declaration order.
@@ -1570,6 +1630,60 @@ fn classify_choice(choices: &[CsilTypeExpression]) -> ChoiceShape {
     ChoiceShape::Union { arms }
 }
 
+/// A name basis for a literal's synthesized nullary constructor in a `MixedEnum`
+/// (fed through `ocaml_ctor_name`, which capitalizes/sanitizes it into a legal
+/// identifier and disambiguates a leading digit).
+fn literal_ctor_base(lit: &CsilLiteralValue) -> String {
+    match lit {
+        CsilLiteralValue::Text(s) => s.clone(),
+        CsilLiteralValue::Integer(n) => n.to_string(),
+        CsilLiteralValue::Float(f) => f.to_string(),
+        CsilLiteralValue::Bool(b) => b.to_string(),
+        CsilLiteralValue::Null => "null".to_string(),
+        CsilLiteralValue::Bytes(_) => "bytes".to_string(),
+        CsilLiteralValue::Array(_) => "arr".to_string(),
+    }
+}
+
+/// The literal rendered as the `Cbor.t` OCaml expression that IS its wire form —
+/// a `MixedEnum`'s bare-literal discriminant, compared by structural equality
+/// (`=`) on decode since there is no single-kind extractor (`Cbor.to_text`/
+/// `Cbor.to_i64`) that fits every member.
+fn literal_cbor_expr(lit: &CsilLiteralValue) -> String {
+    match lit {
+        CsilLiteralValue::Text(s) => format!("Cbor.Text \"{s}\""),
+        CsilLiteralValue::Integer(n) => format!("Cbor.int64 {n}L"),
+        CsilLiteralValue::Float(f) => format!("Cbor.Float {}", ocaml_float_literal(*f)),
+        CsilLiteralValue::Bool(b) => format!("Cbor.Bool {b}"),
+        CsilLiteralValue::Null => "Cbor.Null".to_string(),
+        CsilLiteralValue::Bytes(b) => format!(
+            "Cbor.Bytes (Bytes.of_string \"{}\")",
+            b.iter()
+                .map(|byte| format!("\\x{byte:02x}"))
+                .collect::<String>()
+        ),
+        CsilLiteralValue::Array(items) => format!(
+            "Cbor.Array [{}]",
+            items
+                .iter()
+                .map(literal_cbor_expr)
+                .collect::<Vec<_>>()
+                .join("; ")
+        ),
+    }
+}
+
+/// An OCaml float literal for `f`: OCaml requires a decimal point or exponent in
+/// a float literal, so a whole-number value (`1.0`, not the bare `1` Rust's
+/// `Display` would produce) needs an explicit `.0`.
+fn ocaml_float_literal(f: f64) -> String {
+    if f.is_finite() && f.fract() == 0.0 {
+        format!("{f:.1}")
+    } else {
+        f.to_string()
+    }
+}
+
 fn generate_type_choice(name: &str, choices: &[CsilTypeExpression]) -> String {
     let type_name = ocaml_type_name(name);
     match classify_choice(choices) {
@@ -1581,6 +1695,10 @@ fn generate_type_choice(name: &str, choices: &[CsilTypeExpression]) -> String {
             render_variant(&type_name, &rendered)
         }
         ChoiceShape::IntEnum { arms } => {
+            let rendered: Vec<String> = arms.into_iter().map(|(ctor, _)| ctor).collect();
+            render_variant(&type_name, &rendered)
+        }
+        ChoiceShape::MixedEnum { arms } => {
             let rendered: Vec<String> = arms.into_iter().map(|(ctor, _)| ctor).collect();
             render_variant(&type_name, &rendered)
         }
@@ -1673,11 +1791,11 @@ fn cbor_text_key_bytes(name: &str) -> Vec<u8> {
 
 /// One codec field: its OCaml record label, the verbatim CBOR wire key, its value
 /// type, and whether it is optional.
-struct CodecField<'a> {
+struct CodecField {
     label: String,
     wire: String,
     key_bytes: Vec<u8>,
-    value_type: &'a CsilTypeExpression,
+    value_type: CsilTypeExpression,
     optional: bool,
 }
 
@@ -1697,7 +1815,11 @@ fn entry_wire_key(entry: &CsilGroupEntry) -> Option<String> {
     }
 }
 
-fn codec_fields(group: &CsilGroupExpression) -> Vec<CodecField<'_>> {
+/// `spec` has already been through `csilgen_common::hoist_inline_composites` (see
+/// `generate_ocaml`), so `entry.value_type` already carries a `Reference` to the
+/// synthesized rule for any field that was originally an inline group/choice —
+/// no separate hoisted-type lookup is needed here.
+fn codec_fields(group: &CsilGroupExpression) -> Vec<CodecField> {
     let mut fields: Vec<CodecField> = group
         .entries
         .iter()
@@ -1708,7 +1830,7 @@ fn codec_fields(group: &CsilGroupExpression) -> Vec<CodecField<'_>> {
                 key_bytes: cbor_text_key_bytes(&wire),
                 label,
                 wire,
-                value_type: &entry.value_type,
+                value_type: entry.value_type.clone(),
                 optional: matches!(entry.occurrence, Some(CsilOccurrence::Optional)),
             })
         })
@@ -1757,8 +1879,13 @@ fn codec_choice_names(spec: &CsilSpecSerialized) -> std::collections::HashSet<St
 }
 
 /// Emit `encode_<tn>` / `decode_<tn>` clause bodies for one named type-choice. A
-/// string/integer enum codes as the bare literal (its own discriminant); a union
-/// codes as the locked tagged sum `[variant_index, value]` (0-based ordinal).
+/// closed string/integer enum codes as the bare literal (its own discriminant,
+/// unchanged by the union fix below); every other shape — including an *open*
+/// string enum (`text / "a" / "b"`, the `StringEnum { open_other: Some(_), .. }`
+/// case) and a genuine multi-type union — codes as the locked tagged sum
+/// `[variant_index, value]` (0-based declaration order), with a literal arm's
+/// payload validated by equality on decode rather than trusted from the index
+/// alone. Mirrors the Go/Python generators' `emit_union_codec`.
 fn emit_choice_codec(
     name: &str,
     choices: &[CsilTypeExpression],
@@ -1768,8 +1895,13 @@ fn emit_choice_codec(
 ) -> (String, String) {
     let tn = ocaml_type_name(name);
     match classify_choice(choices) {
-        ChoiceShape::StringEnum { arms, open_other } => {
-            let mut enc_arms: Vec<String> = arms
+        ChoiceShape::StringEnum {
+            arms,
+            open_other: None,
+        } => {
+            // A closed string enum (every arm a text literal): the bare CBOR text is
+            // its own discriminant, matching the locked ALL-literal wire contract.
+            let enc_arms: Vec<String> = arms
                 .iter()
                 .map(|(ctor, lit)| format!("{ctor} -> Cbor.Text \"{lit}\""))
                 .collect();
@@ -1777,20 +1909,63 @@ fn emit_choice_codec(
                 .iter()
                 .map(|(ctor, lit)| format!("\"{lit}\" -> {ctor}"))
                 .collect();
-            if let Some(other) = &open_other {
-                enc_arms.push(format!("{other} csil_s -> Cbor.Text csil_s"));
-                dec_arms.push(format!("csil_s -> {other} csil_s"));
-            } else {
-                dec_arms.push(
-                    "csil_s -> failwith (\"csilgen: unknown enum literal \" ^ csil_s)".to_string(),
-                );
-            }
+            dec_arms.push(
+                "csil_s -> failwith (\"csilgen: unknown enum literal \" ^ csil_s)".to_string(),
+            );
             let enc = format!(
                 "encode_{tn} (v : {tn}) : Cbor.t =\n  match v with {}",
                 enc_arms.join(" | ")
             );
             let dec = format!(
                 "decode_{tn} (csil_c : Cbor.t) : {tn} =\n  match Cbor.to_text csil_c with {}",
+                dec_arms.join(" | ")
+            );
+            (enc, dec)
+        }
+        ChoiceShape::StringEnum {
+            arms,
+            open_other: Some(other_ctor),
+        } => {
+            // An *open* string enum (`text / "pending" / ...`, e.g. `OrderStatus` in
+            // examples/real-world-api/e-commerce-api.csil): a closed set of literal
+            // arms plus one general `text` fallback arm. This has a non-literal arm,
+            // so the wire contract requires the tagged sum here too, not the bare
+            // text this shape used to emit — literal arms keep their own declared
+            // index and validate their payload on decode; the general arm carries the
+            // index `choices` gave it (its declaration position).
+            let mut lit_arms = arms.iter();
+            let mut enc_arms: Vec<String> = Vec::new();
+            let mut dec_arms: Vec<String> = Vec::new();
+            for (idx, choice) in choices.iter().enumerate() {
+                if let Some(CsilLiteralValue::Text(lit)) = choice_arm_literal(choice) {
+                    // `arms` holds exactly the choice's literal-Text entries, in the
+                    // same relative order as `choices` — walking both in lockstep
+                    // recovers each literal's absolute declaration index.
+                    let (ctor, _) = lit_arms
+                        .next()
+                        .expect("StringEnum arms and choices' literal arms are in lockstep");
+                    enc_arms.push(format!(
+                        "{ctor} -> Cbor.Array [Cbor.int64 {idx}L; Cbor.Text \"{lit}\"]"
+                    ));
+                    dec_arms.push(format!(
+                        "{idx}L -> if Cbor.to_text csil_v = \"{lit}\" then {ctor} else failwith (Printf.sprintf \"csilgen: {tn} literal mismatch at variant {idx}\")"
+                    ));
+                } else {
+                    enc_arms.push(format!(
+                        "{other_ctor} csil_s -> Cbor.Array [Cbor.int64 {idx}L; Cbor.Text csil_s]"
+                    ));
+                    dec_arms.push(format!("{idx}L -> {other_ctor} (Cbor.to_text csil_v)"));
+                }
+            }
+            dec_arms.push(format!(
+                "csil_n -> failwith (Printf.sprintf \"csilgen: unknown {tn} variant %Ld\" csil_n)"
+            ));
+            let enc = format!(
+                "encode_{tn} (v : {tn}) : Cbor.t =\n  match v with {}",
+                enc_arms.join(" | ")
+            );
+            let dec = format!(
+                "decode_{tn} (csil_c : Cbor.t) : {tn} =\n  match csil_c with\n  | Cbor.Array [ csil_idx; csil_v ] -> (match Cbor.to_i64 csil_idx with {})\n  | _ -> failwith \"csilgen: expected union array for {tn}\"",
                 dec_arms.join(" | ")
             );
             (enc, dec)
@@ -1818,27 +1993,81 @@ fn emit_choice_codec(
             );
             (enc, dec)
         }
+        // A mixed-kind all-literal enum (`"a" / 1`): still a bare-literal wire value
+        // (no tagged-sum wrapper — it is an Enum per the shared classifier's
+        // contract, not a Union), but no single `Cbor.to_text`/`Cbor.to_i64`
+        // extractor fits every member's kind, so decode compares the whole decoded
+        // `Cbor.t` against each literal's own rendering by structural equality.
+        ChoiceShape::MixedEnum { arms } => {
+            let enc_arms: Vec<String> = arms
+                .iter()
+                .map(|(ctor, lit)| format!("{ctor} -> {}", literal_cbor_expr(lit)))
+                .collect();
+            let mut dec_arms: Vec<String> = arms
+                .iter()
+                .map(|(ctor, lit)| {
+                    format!("csil_c when csil_c = {} -> {ctor}", literal_cbor_expr(lit))
+                })
+                .collect();
+            dec_arms.push(format!(
+                "_ -> failwith \"csilgen: unknown {tn} enum literal\""
+            ));
+            let enc = format!(
+                "encode_{tn} (v : {tn}) : Cbor.t =\n  match v with {}",
+                enc_arms.join(" | ")
+            );
+            let dec = format!(
+                "decode_{tn} (csil_c : Cbor.t) : {tn} =\n  match csil_c with {}",
+                dec_arms.join(" | ")
+            );
+            (enc, dec)
+        }
         ChoiceShape::Union { arms } => {
             let enc_arms: Vec<String> = arms
                 .iter()
                 .enumerate()
-                .map(|(idx, (ctor, choice))| match choice_ctor(choice).1 {
-                    Some(_) => {
-                        let inner = enc_value(choice, "csil_x", records, choice_set, aliases);
-                        format!("{ctor} csil_x -> Cbor.Array [Cbor.int64 {idx}L; {inner}]")
+                .map(|(idx, (ctor, choice))| {
+                    // A literal arm carries no payload of its own choosing — decode
+                    // dispatches by index alone, so the wire byte must be the
+                    // literal's own canonical value (mirroring the Go/Python
+                    // generators' `emit_union_codec`), not the placeholder `Cbor.Null`
+                    // this used to emit. `choice_arm_literal` sees through a
+                    // `.default`-style control-operator wrapper on the arm.
+                    if let Some(CsilLiteralValue::Text(text)) = choice_arm_literal(choice) {
+                        format!("{ctor} -> Cbor.Array [Cbor.int64 {idx}L; Cbor.Text \"{text}\"]")
+                    } else {
+                        match choice_ctor(choice).1 {
+                            Some(_) => {
+                                let inner =
+                                    enc_value(choice, "csil_x", records, choice_set, aliases);
+                                format!("{ctor} csil_x -> Cbor.Array [Cbor.int64 {idx}L; {inner}]")
+                            }
+                            None => format!("{ctor} -> Cbor.Array [Cbor.int64 {idx}L; Cbor.Null]"),
+                        }
                     }
-                    None => format!("{ctor} -> Cbor.Array [Cbor.int64 {idx}L; Cbor.Null]"),
                 })
                 .collect();
             let mut dec_arms: Vec<String> = arms
                 .iter()
                 .enumerate()
-                .map(|(idx, (ctor, choice))| match choice_ctor(choice).1 {
-                    Some(_) => {
-                        let inner = dec_value(choice, "csil_v", records, choice_set, aliases);
-                        format!("{idx}L -> {ctor} {inner}")
+                .map(|(idx, (ctor, choice))| {
+                    // A literal arm's payload is validated against the declared value
+                    // rather than trusted from the index alone (mirrors the Go/Python
+                    // generators' decode).
+                    if let Some(CsilLiteralValue::Text(text)) = choice_arm_literal(choice) {
+                        format!(
+                            "{idx}L -> if Cbor.to_text csil_v = \"{text}\" then {ctor} else failwith (Printf.sprintf \"csilgen: {tn} literal mismatch at variant {idx}\")"
+                        )
+                    } else {
+                        match choice_ctor(choice).1 {
+                            Some(_) => {
+                                let inner =
+                                    dec_value(choice, "csil_v", records, choice_set, aliases);
+                                format!("{idx}L -> {ctor} {inner}")
+                            }
+                            None => format!("{idx}L -> {ctor}"),
+                        }
                     }
-                    None => format!("{idx}L -> {ctor}"),
                 })
                 .collect();
             dec_arms.push(
@@ -2043,7 +2272,10 @@ fn dec_value(
 }
 
 /// Emit `encode_<tn>` / `decode_<tn>` clause bodies for one record (joined into the
-/// mutually-recursive `let rec … and …` groups by the caller).
+/// mutually-recursive `let rec … and …` groups by the caller). `group`'s entries
+/// have already been through `csilgen_common::hoist_inline_composites`, so a field's inline
+/// group/choice already carries a `Reference` to its synthesized rule, matching the
+/// type its `types.ml` declaration actually carries.
 fn emit_record_codec(
     name: &str,
     group: &CsilGroupExpression,
@@ -2067,14 +2299,14 @@ fn emit_record_codec(
     enc.push_str("  Cbor.Map\n    (List.filter_map\n       (fun x -> x)\n       [\n");
     for f in &fields {
         if f.optional {
-            let inner = enc_value(f.value_type, "csil_x", records, choices, aliases);
+            let inner = enc_value(&f.value_type, "csil_x", records, choices, aliases);
             enc.push_str(&format!(
                 "         (match v.{} with Some csil_x -> Some (Cbor.Text \"{}\", {inner}) | None -> None);\n",
                 f.label, f.wire
             ));
         } else {
             let inner = enc_value(
-                f.value_type,
+                &f.value_type,
                 &format!("v.{}", f.label),
                 records,
                 choices,
@@ -2097,14 +2329,14 @@ fn emit_record_codec(
     dec.push_str("      {\n");
     for f in &fields {
         if f.optional {
-            let inner = dec_value(f.value_type, "csil_v", records, choices, aliases);
+            let inner = dec_value(&f.value_type, "csil_v", records, choices, aliases);
             dec.push_str(&format!(
                 "        {} = (match csil_field \"{}\" with Some csil_v -> Some {inner} | None -> None);\n",
                 f.label, f.wire
             ));
         } else {
             let inner = dec_value(
-                f.value_type,
+                &f.value_type,
                 &format!("(csil_req \"{}\")", f.wire),
                 records,
                 choices,
@@ -2123,7 +2355,12 @@ fn emit_record_codec(
 
 /// Build `codec.ml`: a self-contained canonical-CBOR module plus per-record
 /// `encode_<t>`/`decode_<t>` and the `encode_<t>_bytes`/`decode_<t>_bytes` wrappers
-/// the typed client calls. `None` when the spec declares no record types.
+/// the typed client calls. `None` when the spec declares no record types. `spec` has
+/// already been through `csilgen_common::hoist_inline_composites` (see `generate_ocaml`), so
+/// every inline group/choice — field, array element, map key/value, or tuple slot,
+/// at any nesting depth — already arrives here as its own `GroupDef`/`TypeDef`
+/// rule and is covered by the same loop as a hand-written named rule, with no
+/// separate hoisted-type pass.
 fn generate_codec(spec: &CsilSpecSerialized) -> Option<String> {
     let records = codec_record_names(spec);
     if records.is_empty() {
@@ -2343,7 +2580,9 @@ fn emit_client_module(
     records: &std::collections::HashSet<String>,
 ) -> String {
     let module = ocaml_module_name(name);
-    let wire_service = wire_service_name(name);
+    // Wire strings carry the CSIL service/op names verbatim
+    // (docs/csil-rpc-transport.md §1.1) — no case transform may leak onto the wire.
+    let wire_service = name;
     let mut out = String::new();
     out.push_str(&format!("module {module} = struct\n"));
     out.push_str(&emit_wire_ids(service));
@@ -2384,7 +2623,7 @@ fn emit_client_module(
                 }
                 out.push_str(&format!(
                     "    match c.call ~service:\"{wire_service}\" ~op:\"{}\" ~payload:Bytes.empty with\n",
-                    wire_op_name(&op.name)
+                    op.name
                 ));
             }
             (false, Some(req_tn), _) => {
@@ -2400,7 +2639,7 @@ fn emit_client_module(
                 }
                 out.push_str(&format!(
                     "    match c.call ~service:\"{wire_service}\" ~op:\"{}\" ~payload:(Codec.encode_{req_tn}_bytes req) with\n",
-                    wire_op_name(&op.name)
+                    op.name
                 ));
             }
             (false, None, _) => {
@@ -2415,7 +2654,7 @@ fn emit_client_module(
                 ));
                 out.push_str(&format!(
                     "    match c.call ~service:\"{wire_service}\" ~op:\"{}\" ~payload:(encode_request req) with\n",
-                    wire_op_name(&op.name)
+                    op.name
                 ));
             }
         }
@@ -2553,13 +2792,10 @@ fn emit_router_verbose(service: &CsilServiceDefinition) -> String {
         if op_input_is_null(&op.input_type) {
             out.push_str(&format!(
                 "    | \"{}\" -> ignore payload; h.{field} Bytes.empty\n",
-                wire_op_name(&op.name)
+                op.name
             ));
         } else {
-            out.push_str(&format!(
-                "    | \"{}\" -> h.{field} payload\n",
-                wire_op_name(&op.name)
-            ));
+            out.push_str(&format!("    | \"{}\" -> h.{field} payload\n", op.name));
         }
     }
     out.push_str("    | other -> transport_error ~status:2L ~message:(\"unknown op: \" ^ other)\n");

@@ -8,14 +8,15 @@
 //! Each record gets a deep `to<T>CborValue`/`from<T>CborValue` pair plus the
 //! byte-level `to<T>Cbor`/`from<T>Cbor` the typed client calls.
 
-use crate::common::{self, DecimalMapping, ts_string_literal};
+use crate::common::{self, DecimalMapping, ImportExtension, ts_string_literal};
 use csilgen_common::{
-    CsilGroupExpression, CsilGroupKey, CsilLiteralValue, CsilOccurrence, CsilRuleType,
-    CsilSpecSerialized, CsilTypeExpression, WasmGeneratorInput,
+    ChoiceClass, CsilGroupExpression, CsilGroupKey, CsilLiteralValue, CsilOccurrence, CsilRuleType,
+    CsilSpecSerialized, CsilTypeExpression, WasmGeneratorInput, classify_choice,
+    union_encode_order,
 };
 use std::collections::{BTreeSet, HashMap, HashSet};
 
-const DEFAULT_TYPES_MODULE: &str = "./types.gen";
+const TYPES_STEM: &str = "types.gen";
 
 /// The PascalCase names of every record rule (a group, or a `Name = { ... }`
 /// type alias) — the rules whose CBOR form is a map and which therefore get a
@@ -53,16 +54,44 @@ pub fn record_ref_name(ty: &CsilTypeExpression) -> String {
 /// referencing one carries no codec of its own, so it must encode/decode as the
 /// underlying type rather than fall through to the blind cast a bare non-record
 /// reference would emit — the named-map-alias regression.
-fn aliases(spec: &CsilSpecSerialized) -> HashMap<String, &CsilTypeExpression> {
+fn aliases(spec: &CsilSpecSerialized) -> HashMap<String, CsilTypeExpression> {
     spec.rules
         .iter()
         .filter_map(|r| match &r.rule_type {
-            // A `Name = { ... }` group is a record (its own codec path), and a
-            // `Name = A / B` choice has no single underlying value to recurse into;
-            // neither is a transparent alias the value handlers resolve through.
-            CsilRuleType::TypeDef(CsilTypeExpression::Group(_))
-            | CsilRuleType::TypeDef(CsilTypeExpression::Choice(_)) => None,
-            CsilRuleType::TypeDef(t) => Some((common::to_pascal(&r.name), t)),
+            // A `Name = { ... }` group is a record (its own codec path); a mixed
+            // (non-literal) choice is a union with its own tagged-sum codec
+            // (`unions()`, checked before the aliases fallback) — neither is a
+            // transparent alias the value handlers recurse through.
+            CsilRuleType::TypeDef(CsilTypeExpression::Group(_)) => None,
+            CsilRuleType::TypeDef(CsilTypeExpression::Choice(choices))
+                if matches!(classify_choice(choices), ChoiceClass::Union(_)) =>
+            {
+                None
+            }
+            // A named enum (a literal-only choice) has no codec of its own — it
+            // aliases straight through to `ts_dec_value`/`ts_enc_value`'s `Choice`
+            // arm, the same one an inline enum field hits, so a `Reference` to it
+            // gets the SAME `asEnumMember` wire-membership validation on decode
+            // as an inline enum. Without this the aliases lookup misses (a
+            // literal-only choice used to be excluded here entirely) and the
+            // `Reference` decode fallback below is a blind, unvalidated cast.
+            // NOTE: `Name /= "a" / "b"` (a rule declared with `/=` rather than `=`)
+            // parses to a *different* shape than the naive `TypeChoice([lit, lit])`
+            // one might expect: `parse_type_expression` (csilgen-core's parser)
+            // already consumes an entire `/`-chain into one `Choice` node before the
+            // `/=` handler's own choice-accumulation loop ever runs, so the real AST
+            // is `TypeChoice(vec![Choice(["a", "b"])])` — a one-element `Vec` wrapping
+            // a NESTED `Choice`, not a flat literal list. That mismatch is a parser-
+            // level issue (see docs/csilgen-requests), not something to special-case
+            // here: a naive `TypeChoice(choices) if all_literal(choices)` arm never
+            // matches the real shape (its single element is a `Choice`, not a
+            // `Literal`), and a naive `!all_literal` arm matches but has no
+            // corresponding codec function ever emitted (the top-level codec loop
+            // below only walks `TypeDef`), producing a worse failure — a reference to
+            // an undefined `to<Name>CborValue`. So `TypeChoice` intentionally falls
+            // through to the untyped-cast fallback here, same as before this file's
+            // enum-membership fix; a `/=`-declared type needs the parser fixed first.
+            CsilRuleType::TypeDef(t) => Some((common::to_pascal(&r.name), t.clone())),
             _ => None,
         })
         .collect()
@@ -71,12 +100,15 @@ fn aliases(spec: &CsilSpecSerialized) -> HashMap<String, &CsilTypeExpression> {
 /// The named multi-variant unions (`Name = A / B`, not all-literal) the codec
 /// covers with a tagged-sum (`[variant_index, value]`) (de)serializer. A literal-only
 /// choice is an enum (bare-literal wire) and is excluded; those carry no discriminator
-/// and resolve through the scalar/enum paths instead.
+/// and resolve through the scalar/enum paths instead. `TypeChoice` (`/=`) rules are
+/// deliberately not handled here — see the comment in `aliases()`.
 fn unions(spec: &CsilSpecSerialized) -> HashMap<String, &[CsilTypeExpression]> {
     spec.rules
         .iter()
         .filter_map(|r| match &r.rule_type {
-            CsilRuleType::TypeDef(CsilTypeExpression::Choice(choices)) if !all_literal(choices) => {
+            CsilRuleType::TypeDef(CsilTypeExpression::Choice(choices))
+                if matches!(classify_choice(choices), ChoiceClass::Union(_)) =>
+            {
                 Some((common::to_pascal(&r.name), choices.as_slice()))
             }
             _ => None,
@@ -86,7 +118,7 @@ fn unions(spec: &CsilSpecSerialized) -> HashMap<String, &[CsilTypeExpression]> {
 
 struct Ctx<'a> {
     records: &'a HashSet<String>,
-    aliases: &'a HashMap<String, &'a CsilTypeExpression>,
+    aliases: &'a HashMap<String, CsilTypeExpression>,
     unions: &'a HashMap<String, &'a [CsilTypeExpression]>,
     mapping: DecimalMapping,
 }
@@ -382,20 +414,91 @@ fn ts_dec_value(
                 common::ts_type(ty, ctx.mapping)
             )
         }
-        // An inline literal choice (`x: "a" / "b"`) now narrows to a precise TS union,
-        // so the decoded scalar must be cast to it; pick the reader from the literal
-        // kind so a numeric enum reads a number rather than a string (a `string as
-        // 1 | 2` cast would not typecheck). A choice of non-literals keeps the prior
-        // permissive string read.
-        CsilTypeExpression::Choice(choices) if all_literal(choices) => {
-            let reader = literal_choice_reader(choices);
-            imports.insert(reader.to_string());
-            format!("({reader}({expr}) as {})", common::ts_type(ty, ctx.mapping))
+        // An inline literal choice (`x: "a" / "b"`) narrows to a precise TS union,
+        // so the decoded scalar is validated against the declared vocabulary and cast
+        // to it; pick the reader from the literal kind so a numeric enum reads a number
+        // rather than a string (a `string as 1 | 2` cast would not typecheck). When a
+        // member cannot be rendered as a runtime value (a byte-string/array literal),
+        // fall back to the permissive read + cast — there is nothing to compare against.
+        // A choice of non-literals keeps the prior permissive string read.
+        CsilTypeExpression::Choice(choices) if common::all_literal(choices) => {
+            let members: Option<Vec<String>> = choices
+                .iter()
+                .map(|c| common::choice_arm_literal(c).and_then(literal_value_ts))
+                .collect();
+            match (literal_choice_reader(choices), members) {
+                (Some(reader), Some(members)) => {
+                    imports.insert(reader.to_string());
+                    imports.insert("asEnumMember".to_string());
+                    format!(
+                        "(asEnumMember({reader}({expr}), [{}]) as {})",
+                        members.join(", "),
+                        common::ts_type(ty, ctx.mapping)
+                    )
+                }
+                (Some(reader), None) => {
+                    imports.insert(reader.to_string());
+                    format!("({reader}({expr}) as {})", common::ts_type(ty, ctx.mapping))
+                }
+                // A MIXED-kind literal choice (`"a" / 1`): no single `asNumber`/
+                // `asString`/`asBool` reader fits every member's JS runtime type (a
+                // uniform-kind choice above always found one), so read the value
+                // generically — normalizing a decoded integer `bigint` to `number`
+                // the same way `asNumber` does — and let `asEnumMember`'s membership
+                // check do the real narrowing. Previously this fell to the uniform-kind
+                // `else` branch's `asString` reader, which threw at runtime on any
+                // non-string member (e.g. decoding the `1` in `"a" / 1`).
+                (None, Some(members)) => {
+                    imports.insert("asEnumScalar".to_string());
+                    imports.insert("asEnumMember".to_string());
+                    format!(
+                        "(asEnumMember(asEnumScalar({expr}), [{}]) as {})",
+                        members.join(", "),
+                        common::ts_type(ty, ctx.mapping)
+                    )
+                }
+                // Mixed-kind AND at least one member has no runtime literal spelling
+                // (a byte-string/array literal) — nothing to validate membership
+                // against, so keep the generic scalar read without it.
+                (None, None) => {
+                    imports.insert("asEnumScalar".to_string());
+                    format!(
+                        "(asEnumScalar({expr}) as {})",
+                        common::ts_type(ty, ctx.mapping)
+                    )
+                }
+            }
         }
         CsilTypeExpression::Choice(_) => {
             imports.insert("asString".to_string());
             format!("asString({expr})")
         }
+        // A mixed union's decode dispatch (see `emit_union_codec`) reaches this arm
+        // once per literal index: the payload must equal the declared literal, not
+        // merely share its scalar type, so a mismatched value at the right index
+        // (e.g. `[1, "confirmed"]` when index 1 is declared `"pending"`) errors
+        // instead of silently returning the wrong value.
+        CsilTypeExpression::Literal(v) => match v {
+            CsilLiteralValue::Text(_)
+            | CsilLiteralValue::Integer(_)
+            | CsilLiteralValue::Float(_)
+            | CsilLiteralValue::Bool(_)
+            | CsilLiteralValue::Null => {
+                let expected = common::ts_literal_type(v);
+                let ts_ty = common::ts_type(ty, ctx.mapping);
+                imports.insert("asLiteral".to_string());
+                format!("asLiteral<{ts_ty}>({expr}, {expected})")
+            }
+            // `ts_literal_type` renders a byte-string/array literal as its TYPE
+            // spelling (e.g. `Uint8Array`), not a runtime value, so it can't be
+            // passed to `asLiteral` as the expected value; fall back to the same
+            // permissive cast the encode-side predicate already uses for these
+            // kinds (see `ts_variant_predicate`).
+            CsilLiteralValue::Bytes(_) | CsilLiteralValue::Array(_) => format!(
+                "({expr} as unknown as {})",
+                common::ts_type(ty, ctx.mapping)
+            ),
+        },
         _ => format!(
             "({expr} as unknown as {})",
             common::ts_type(ty, ctx.mapping)
@@ -403,32 +506,41 @@ fn ts_dec_value(
     }
 }
 
-/// Whether every member of a choice is a literal value — i.e. the choice is an
-/// enum (`"a" / "b"`, `1 / 2`) rather than a union of structured types.
-fn all_literal(choices: &[CsilTypeExpression]) -> bool {
-    !choices.is_empty()
-        && choices
-            .iter()
-            .all(|c| matches!(c, CsilTypeExpression::Literal(_)))
-}
-
-/// The scalar CBOR reader for a literal enum: `asNumber` when every member is
-/// numeric, `asBool` when every member is a boolean, else `asString`. The cast that
-/// follows narrows the read scalar to the precise union, so the reader must produce
-/// the union's underlying runtime type.
-fn literal_choice_reader(choices: &[CsilTypeExpression]) -> &'static str {
+/// The scalar CBOR reader for a UNIFORM-kind literal enum: `asNumber` when every
+/// member is numeric, `asBool` when every member is boolean, `asString` when
+/// every member is text. `None` when the kinds are mixed (`"a" / 1`) — no single
+/// reader's runtime type fits every member, so the caller falls back to a
+/// generic scalar read (`asEnumScalar`) instead. The cast that follows a `Some`
+/// reader narrows the read scalar to the precise union, so the reader must
+/// produce the union's underlying runtime type.
+fn literal_choice_reader(choices: &[CsilTypeExpression]) -> Option<&'static str> {
     let all = |pred: fn(&CsilLiteralValue) -> bool| {
-        choices.iter().all(|c| match c {
-            CsilTypeExpression::Literal(v) => pred(v),
-            _ => false,
-        })
+        choices
+            .iter()
+            .all(|c| common::choice_arm_literal(c).is_some_and(pred))
     };
     if all(|v| matches!(v, CsilLiteralValue::Integer(_) | CsilLiteralValue::Float(_))) {
-        "asNumber"
+        Some("asNumber")
     } else if all(|v| matches!(v, CsilLiteralValue::Bool(_))) {
-        "asBool"
+        Some("asBool")
+    } else if all(|v| matches!(v, CsilLiteralValue::Text(_))) {
+        Some("asString")
     } else {
-        "asString"
+        None
+    }
+}
+
+/// A CSIL literal rendered as a runtime TypeScript value (for an enum membership
+/// list). `None` for a byte-string/array literal, which has no scalar runtime
+/// spelling to compare against — the caller then skips membership validation.
+fn literal_value_ts(value: &CsilLiteralValue) -> Option<String> {
+    match value {
+        CsilLiteralValue::Text(s) => Some(ts_string_literal(s)),
+        CsilLiteralValue::Integer(i) => Some(i.to_string()),
+        CsilLiteralValue::Float(f) => Some(f.to_string()),
+        CsilLiteralValue::Bool(b) => Some(b.to_string()),
+        CsilLiteralValue::Null => Some("null".to_string()),
+        CsilLiteralValue::Bytes(_) | CsilLiteralValue::Array(_) => None,
     }
 }
 
@@ -487,7 +599,26 @@ fn emit_union_codec(name: &str, choices: &[CsilTypeExpression], ctx: &Ctx) -> St
     out.push_str(&format!(
         "export function to{type_name}CborValue(v: {type_name}): CborValue {{\n"
     ));
-    for (i, variant) in choices.iter().enumerate() {
+    // A mixed union (`text / "pending" / "confirmed" / ...`) has a general arm whose
+    // predicate (`typeof v === "string"`) matches every value of that base type,
+    // including the ones a literal arm of the same union declares more specifically.
+    // Emitting arms in declaration order would let the general arm's broader `if`
+    // shadow every literal arm that follows it, making those declared indices
+    // unreachable on encode. Checking every literal arm first — stable within each
+    // group, so relative order among literals and among general arms is unchanged —
+    // gives literal-over-general precedence: a literal keeps its own declared index,
+    // and a general arm becomes the fallback for every other value of its type.
+    // Mirrors the Go/Python union codecs' literal-first grouping (see
+    // `csilgen_common::union_encode_order`'s docs for why only a sequential
+    // predicate-chain dispatcher like this one needs this reordering at all).
+    let ChoiceClass::Union(arm_kinds) = classify_choice(choices) else {
+        unreachable!(
+            "emit_union_codec is only called for a choice `unions()` already classified as Union"
+        );
+    };
+    let order = union_encode_order(&arm_kinds);
+    for &i in &order {
+        let variant = &choices[i];
         let pred = ts_variant_predicate(variant, "v", ctx);
         let cast = common::ts_type(variant, ctx.mapping);
         let enc = ts_enc_value(variant, "csilV", ctx, &mut ignored_imports);
@@ -656,7 +787,7 @@ fn expressible(ty: &CsilTypeExpression, ctx: &Ctx, codec_has_decimal: bool) -> b
             expressible(element_type, ctx, codec_has_decimal)
         }
         CsilTypeExpression::Map { value, .. } => expressible(value, ctx, codec_has_decimal),
-        CsilTypeExpression::Choice(choices) if all_literal(choices) => true,
+        CsilTypeExpression::Choice(choices) if common::all_literal(choices) => true,
         // A single-variant choice resolves to that variant; multiple non-literal
         // variants have no discriminator on the wire.
         CsilTypeExpression::Choice(choices) => {
@@ -752,6 +883,9 @@ pub fn generate(input: &WasmGeneratorInput) -> Option<String> {
         return None;
     }
     let mapping = common::decimal_mapping(input).unwrap_or(DecimalMapping::Csil);
+    // Already validated (Err would have aborted generation before this emitter
+    // ever runs) — see `generate_files`'s eager option validation in lib.rs.
+    let ext = common::import_extension(input).unwrap_or(ImportExtension::Ts);
     let aliases = aliases(spec);
     let unions = unions(spec);
     let ctx = Ctx {
@@ -793,7 +927,8 @@ pub fn generate(input: &WasmGeneratorInput) -> Option<String> {
     // value import, not a type-only one.
     imports.remove("CsilDecimal");
 
-    let module = string_option(input, "codec_types_module", DEFAULT_TYPES_MODULE);
+    let default_types_module = ext.specifier(TYPES_STEM);
+    let module = string_option(input, "codec_types_module", &default_types_module);
     if uses_decimal && mapping == DecimalMapping::Library {
         out.push_str("import Decimal from \"decimal.js\";\n");
     }
@@ -820,7 +955,7 @@ pub fn generate(input: &WasmGeneratorInput) -> Option<String> {
         if let Some(group) = rule_group(&rule.rule_type) {
             out.push_str(&emit_record_codec(&rule.name, group, &ctx));
         } else if let CsilRuleType::TypeDef(CsilTypeExpression::Choice(choices)) = &rule.rule_type
-            && !all_literal(choices)
+            && !common::all_literal(choices)
         {
             out.push_str(&emit_union_codec(&rule.name, choices, &ctx));
         }
@@ -1136,6 +1271,46 @@ export function asArray(value: CborValue): CborValue[] {
 export function asMap(value: CborValue): Map<CborValue, CborValue> {
   if (value instanceof Map) return value;
   throw new Error("expected a map");
+}
+
+/** A decoded integer may surface as `bigint` (see `decInto`'s large-value path), so a
+ * numeric literal's expected `number` is compared against the `bigint`-normalized form
+ * rather than failing on a type mismatch that isn't a value mismatch. */
+export function asLiteral<T extends CborValue>(value: CborValue, expected: T): T {
+  const norm = typeof value === "bigint" && typeof expected === "number" ? Number(value) : value;
+  if (norm !== expected) throw new Error(`literal mismatch: expected ${JSON.stringify(expected)}`);
+  return expected;
+}
+
+/** Validate a decoded scalar against a literal-enum's declared vocabulary, erroring
+ * on an unknown value. The caller reads through `asNumber`/`asString`/`asBool`, which
+ * already normalize a decoded `bigint` to `number`, so a plain membership check suffices. */
+export function asEnumMember<T extends number | string | boolean | null>(
+  value: T,
+  members: readonly T[],
+): T {
+  if (!members.includes(value)) {
+    throw new Error(`unknown enum value: ${JSON.stringify(value)}`);
+  }
+  return value;
+}
+
+/** Read a decoded CBOR scalar without narrowing to one JS type, normalizing a
+ * decoded integer `bigint` to `number` the same way `asNumber` does. Used for a
+ * MIXED-kind literal enum (`"a" / 1`), where no single `asNumber`/`asString`/
+ * `asBool` reader fits every member's runtime type — `asEnumMember`'s membership
+ * check does the real narrowing instead. */
+export function asEnumScalar(value: CborValue): string | number | boolean | null {
+  if (typeof value === "bigint") return Number(value);
+  if (
+    typeof value === "string" ||
+    typeof value === "number" ||
+    typeof value === "boolean" ||
+    value === null
+  ) {
+    return value;
+  }
+  throw new Error("expected an enum scalar (string, number, boolean, or null)");
 }
 
 function asTagged(value: CborValue, tag: number): CborValue {

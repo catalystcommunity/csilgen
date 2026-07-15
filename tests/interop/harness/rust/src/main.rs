@@ -17,14 +17,16 @@ use csilgen_transport::rpc::{HandlerOutcome, RpcClient, RpcRequest, RpcServer};
 use csilgen_transport::Status;
 
 use interop_api::{
-    decode_collections, decode_constrained, decode_nested, decode_scalars, decode_tick,
-    decode_service_error, encode_collections, encode_constrained, encode_interop_on_tick,
-    encode_scalars, encode_service_error, route_interop_channel, ClientError, Collections, Color,
-    Constrained, CsilCborValue, EchoNestedResult, IdOrName, Interop, Nested, Priority, Scalars,
-    ServiceError, Tick, Transport,
+    decode_collections, decode_constrained, decode_nested, decode_scalars, decode_service_error,
+    decode_tick, encode_collections, encode_constrained, encode_interop_on_tick, encode_scalars,
+    encode_service_error, route_interop_channel, ClientError, Collections, Color, Constrained,
+    CsilCborValue, EchoNestedResult, IdOrName, Interop, Level, MixedStatus, Nested, Priority,
+    Scalars, Scalars_note, Scalars_size, Season, ServiceError, ShipMode, Tick, Transport,
 };
 
-const SERVICE: &str = "interop";
+// The wire carries the CSIL service name verbatim as written in interop.csil
+// (docs/cbor-wire-contract.md "RPC call naming").
+const SERVICE: &str = "Interop";
 
 // ---------------------------------------------------------------------------
 // Fixed language-neutral test vectors (see README "Fixed test vectors").
@@ -47,6 +49,22 @@ fn scalars_ok() -> Scalars {
         flag: true,
         when: ts(),
         amount: interop_api::CsilDecimal::from_str("123.45").unwrap(),
+        // mixed-union coverage: a value equal to a literal arm must wire as
+        // [1,"pending"]; a value with no literal match must wire as [0,...].
+        status_literal: MixedStatus::Variant1("pending".to_string()),
+        status_free: MixedStatus::Variant0("unlisted".to_string()),
+        // inline mixed choice (hoisted; literal arm match).
+        note: Scalars_note::Variant1("info".to_string()),
+        // inline all-literal choice (hoisted to an enum).
+        size: Scalars_size::Medium,
+        // named enum with a trailing `.default`-constrained last arm.
+        level: Level::High,
+        // named enum assembled via base rule + `/=` extension.
+        season: Season::Autumn,
+        // named all-literal enum with mixed literal kinds (text + int arms);
+        // wires bare (no tag) with kind+value membership validation on decode.
+        ship_text: ShipMode::Ground,
+        ship_int: ShipMode::V2,
     }
 }
 
@@ -256,29 +274,32 @@ fn rpc_server(listener: TcpListener) {
                 variant: variant.to_string(),
                 payload,
             };
+            // Dispatch keys are the CSIL operation names verbatim (kebab-case, as written
+            // in interop.csil) — docs/cbor-wire-contract.md "RPC call naming". The reply
+            // `variant` strings below are output-type arm names, unrelated to wire naming.
             match req.op.as_str() {
-                "EchoScalars" => match decode_scalars(&req.payload) {
+                "echo-scalars" => match decode_scalars(&req.payload) {
                     Ok(v) => match handlers.echo_scalars(&(), v) {
                         Ok(r) => reply("Scalars", encode_scalars(&r)),
                         Err(e) => HandlerOutcome::Transport(Status::Internal, e.message),
                     },
                     Err(e) => HandlerOutcome::Transport(Status::MalformedEnvelope, e.to_string()),
                 },
-                "EchoCollections" => match decode_collections(&req.payload) {
+                "echo-collections" => match decode_collections(&req.payload) {
                     Ok(v) => match handlers.echo_collections(&(), v) {
                         Ok(r) => reply("Collections", encode_collections(&r)),
                         Err(e) => HandlerOutcome::Transport(Status::Internal, e.message),
                     },
                     Err(e) => HandlerOutcome::Transport(Status::MalformedEnvelope, e.to_string()),
                 },
-                "EchoNested" => match decode_nested(&req.payload) {
+                "echo-nested" => match decode_nested(&req.payload) {
                     Ok(v) => match handlers.echo_nested(&(), v) {
                         Ok(r) => reply("EchoNestedResult", encode_nested_result(&r)),
                         Err(e) => HandlerOutcome::Transport(Status::Internal, e.message),
                     },
                     Err(e) => HandlerOutcome::Transport(Status::MalformedEnvelope, e.to_string()),
                 },
-                "ValidateConstrained" => match decode_constrained(&req.payload) {
+                "validate-constrained" => match decode_constrained(&req.payload) {
                     Ok(v) => match handlers.validate_constrained(&(), v) {
                         Ok(r) => reply("Constrained", encode_constrained(&r)),
                         // The typed error arm rides as a status-0 `ServiceError` variant.
@@ -292,12 +313,7 @@ fn rpc_server(listener: TcpListener) {
                 ),
             }
         };
-        loop {
-            match server.serve_one(&mut dispatch) {
-                Ok(true) => continue,
-                _ => break,
-            }
-        }
+        while let Ok(true) = server.serve_one(&mut dispatch) {}
     }
 }
 
@@ -345,7 +361,10 @@ fn rpc_client(stream: TcpStream) -> Cases {
         Err(e) => cases.fail("validate-constrained/success", e.to_string()),
     }
     match client.validate_constrained(constrained_bad()) {
-        Ok(_) => cases.fail("validate-constrained/failure", "server accepted invalid input"),
+        Ok(_) => cases.fail(
+            "validate-constrained/failure",
+            "server accepted invalid input",
+        ),
         // The typed error arm must surface as a service error, not a transport error.
         Err(ClientError::Service { .. }) => cases.pass("validate-constrained/failure"),
         Err(e) => cases.fail(
@@ -397,14 +416,13 @@ fn events_server(listener: TcpListener) {
         // Push N ticks (on-tick / server push).
         for seq in 0..TICKS {
             let (method, bytes) = encode_interop_on_tick(&Tick { seq });
-            send_event(&mut carrier, &Event::verbose(Some(SERVICE.into()), method, bytes));
+            send_event(
+                &mut carrier,
+                &Event::verbose(Some(SERVICE.into()), method, bytes),
+            );
         }
         // React loop.
-        loop {
-            let frame = match carrier.recv_frame() {
-                Ok(Some(f)) => f,
-                _ => break,
-            };
+        while let Ok(Some(frame)) = carrier.recv_frame() {
             let ev = match Event::decode(&frame, Profile::Verbose) {
                 Ok(e) => e,
                 Err(_) => break,
@@ -418,7 +436,7 @@ fn events_server(listener: TcpListener) {
                     );
                 }
                 control::CLOSE_NAME => break,
-                "Duplex" => {
+                "duplex" => {
                     if let Ok(s) = decode_scalars(&ev.payload) {
                         let _ = handlers.duplex(&(), s.clone());
                         let (m, b) = interop_api::encode_interop_duplex(&s);
@@ -453,11 +471,13 @@ fn events_client(stream: TcpStream) -> Cases {
         &Event::verbose(None, control::HELLO_NAME, hello.encode().unwrap()),
     );
     let ack_ok = match carrier.recv_frame() {
-        Ok(Some(f)) => Event::decode(&f, Profile::Verbose)
-            .ok()
-            .and_then(|e| e.event)
-            .as_deref()
-            == Some(control::HELLO_ACK_NAME),
+        Ok(Some(f)) => {
+            Event::decode(&f, Profile::Verbose)
+                .ok()
+                .and_then(|e| e.event)
+                .as_deref()
+                == Some(control::HELLO_ACK_NAME)
+        }
         _ => false,
     };
     cases.check("events/handshake", ack_ok, "no $hello-ack");
@@ -468,7 +488,7 @@ fn events_client(stream: TcpStream) -> Cases {
     for expect in 0..TICKS {
         match carrier.recv_frame() {
             Ok(Some(f)) => match Event::decode(&f, Profile::Verbose) {
-                Ok(e) if e.event.as_deref() == Some("OnTick") => match decode_tick(&e.payload) {
+                Ok(e) if e.event.as_deref() == Some("on-tick") => match decode_tick(&e.payload) {
                     Ok(t) if t.seq == expect => {}
                     Ok(t) => {
                         tick_ok = false;
@@ -481,7 +501,7 @@ fn events_client(stream: TcpStream) -> Cases {
                 },
                 Ok(e) => {
                     tick_ok = false;
-                    detail = format!("expected OnTick got {:?}", e.event);
+                    detail = format!("expected on-tick got {:?}", e.event);
                 }
                 Err(err) => {
                     tick_ok = false;
@@ -501,7 +521,7 @@ fn events_client(stream: TcpStream) -> Cases {
     send_event(&mut carrier, &Event::verbose(Some(SERVICE.into()), m, b));
     match carrier.recv_frame() {
         Ok(Some(f)) => match Event::decode(&f, Profile::Verbose) {
-            Ok(e) if e.event.as_deref() == Some("Duplex") => match decode_scalars(&e.payload) {
+            Ok(e) if e.event.as_deref() == Some("duplex") => match decode_scalars(&e.payload) {
                 Ok(s) => cases.check("duplex/success", s == scalars_ok(), "echo mismatch"),
                 Err(err) => cases.fail("duplex/success", err.to_string()),
             },
@@ -587,9 +607,19 @@ fn datagram_client(sock: UdpSocket) -> Cases {
         Datagram::decode(&buf[..n]).map_err(|e| e.to_string())
     };
 
-    match roundtrip(&sock, &mut buf, OP_ECHO_SCALARS, 1, encode_scalars(&scalars_ok())) {
+    match roundtrip(
+        &sock,
+        &mut buf,
+        OP_ECHO_SCALARS,
+        1,
+        encode_scalars(&scalars_ok()),
+    ) {
         Ok(d) if d.op_ord == OP_ECHO_SCALARS => match decode_scalars(&d.payload) {
-            Ok(s) => cases.check("echo-scalars/success", s == scalars_ok(), "payload mismatch"),
+            Ok(s) => cases.check(
+                "echo-scalars/success",
+                s == scalars_ok(),
+                "payload mismatch",
+            ),
             Err(e) => cases.fail("echo-scalars/success", e.to_string()),
         },
         Ok(d) => cases.fail("echo-scalars/success", format!("op_ord {}", d.op_ord)),

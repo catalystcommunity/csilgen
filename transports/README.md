@@ -54,6 +54,17 @@ needed (no binaries/packages are published yet).
 > plan is a **Mac, once one can be acquired** — before it can be trusted. See
 > `transports/swift/README.md`.
 
+> **PHP is mixed-version.** `transports/php/src/Rpc.php` speaks CSIL-RPC v1 (the
+> `{v, id?, service, op, payload}` / `{v, id?, status, variant?, error?, payload}`
+> envelopes in `csil-rpc-transport.md`), matching Rust and Go. `Events.php` and
+> `Datagrams.php` in the same package are still pre-v1 draft shapes (they key on
+> `method` rather than `service`/`event` or `op`, with no `$hello` handshake or
+> compact-array profile) — they predate `csil-events-transport.md` /
+> `csil-datagrams-transport.md` and have not yet been migrated. `Carrier.php`
+> likewise only offers a bare in-memory carrier, not the built-in
+> stream/length-prefix carrier the other reference libraries provide. Do not
+> treat PHP's Events/Datagrams/Carrier as spec-conformant yet.
+
 ## Reference libraries
 
 Each library is **hand-maintained** (not generated, not a wasm generator) and
