@@ -59,14 +59,148 @@ pub struct Rule {
 pub enum RuleType {
     /// Type definition rule (=)
     TypeDef(TypeExpression),
-    /// Group definition rule (=)  
+    /// Group definition rule (=)
     GroupDef(GroupExpression),
-    /// Type choice rule (/=)
+    /// Type choice rule (/=). The parser produces this for a raw `/=` statement, and
+    /// `merge_type_choice_extensions` folds it onto the `TypeDef` it extends — per RFC
+    /// 8610 socket-extension semantics, a standalone `/=` is sugar for `=` with a
+    /// choice, and a `/=` on an existing name appends arms to it. That fold only
+    /// finalizes (collapsing an extension with no `=` base into its own `TypeDef`) once
+    /// the whole reachable include graph is merged in, i.e. by the top-level
+    /// `ImportResolver::resolve_imports` call — so a `CsilSpec` produced by bare
+    /// `parse_csil`/`parse_csil_file` (as `csilgen format`/`csilgen lint` do, and as a
+    /// leaf file mid-resolution does) can still carry a `TypeChoice` rule whose arms
+    /// are merged but not yet homed. Every consumer that also resolves imports (the
+    /// `validate`/`generate` CLI paths, and so every WASM generator) never sees this
+    /// variant constructed from source.
     TypeChoice(Vec<TypeExpression>),
     /// Group choice rule (//=)
     GroupChoice(Vec<GroupExpression>),
     /// Service definition
     ServiceDef(ServiceDefinition),
+}
+
+/// Fold every `/=` (type choice) rule into the `TypeDef` it extends, per CDDL's
+/// socket-extension semantics (RFC 8610 SS3.8): a rule name may be defined once with
+/// `=` and extended any number of times with `/=`, in any order and across files — all
+/// `/=` arms for a name become alternatives of that name's choice.
+///
+/// Two real `=` (or `//=`/service) definitions sharing a name are left untouched: that
+/// is a genuine collision, not an extension, and `validate_unique_rule_names` reports
+/// it as `DuplicateRule`.
+///
+/// `collapse_orphans` controls what happens to a name that has `/=` rules but no real
+/// `=` base *in the rule set passed in*: with `collapse_orphans: false`, those arms are
+/// merged together but the rule stays tagged `TypeChoice` (its arms may yet find a base
+/// once more files are merged in); with `true`, a name that still has no base is
+/// finalized as its own `TypeDef` — a standalone `Name /= a / b` then produces exactly
+/// the same AST as `Name = a / b`. `true` must only run once the whole include graph
+/// reachable from the file under resolution has been merged in, since a leaf file
+/// resolved in isolation can't tell "no base anywhere" from "the base is in whichever
+/// file includes me" (see `ImportResolver::resolve_imports` vs
+/// `resolve_imports_uncollapsed`).
+pub(crate) fn merge_type_choice_extensions(rules: &mut Vec<Rule>, collapse_orphans: bool) {
+    use std::collections::HashMap;
+
+    // The first non-`/=` rule for a name is the real base every `/=` arm folds onto.
+    let mut base_index: HashMap<String, usize> = HashMap::new();
+    for (idx, rule) in rules.iter().enumerate() {
+        if !matches!(rule.rule_type, RuleType::TypeChoice(_))
+            && !base_index.contains_key(&rule.name)
+        {
+            base_index.insert(rule.name.clone(), idx);
+        }
+    }
+
+    // Group every `/=` rule's index by name, preserving first-seen order, so arms from
+    // separate `/=` statements for the same name concatenate in declaration order.
+    let mut extension_order: Vec<String> = Vec::new();
+    let mut extensions_by_name: HashMap<String, Vec<usize>> = HashMap::new();
+    for (idx, rule) in rules.iter().enumerate() {
+        if matches!(rule.rule_type, RuleType::TypeChoice(_)) {
+            extensions_by_name
+                .entry(rule.name.clone())
+                .or_insert_with(|| {
+                    extension_order.push(rule.name.clone());
+                    Vec::new()
+                })
+                .push(idx);
+        }
+    }
+
+    if extension_order.is_empty() {
+        return;
+    }
+
+    let mut to_remove: Vec<usize> = Vec::new();
+
+    for name in extension_order {
+        let idxs = extensions_by_name
+            .remove(&name)
+            .expect("just collected above");
+
+        let mut combined_arms: Vec<TypeExpression> = Vec::new();
+        for &idx in &idxs {
+            if let RuleType::TypeChoice(arms) = &rules[idx].rule_type {
+                combined_arms.extend(arms.iter().cloned());
+            }
+        }
+
+        if let Some(&target_idx) = base_index.get(&name) {
+            // Take the base's type by value so the merge can move its arms in without a
+            // second live borrow of `rules[target_idx]`.
+            let existing = std::mem::replace(
+                &mut rules[target_idx].rule_type,
+                RuleType::TypeDef(TypeExpression::Builtin(String::new())),
+            );
+            let merged = match existing {
+                RuleType::TypeDef(TypeExpression::Choice(mut existing_arms)) => {
+                    existing_arms.extend(combined_arms);
+                    TypeExpression::Choice(existing_arms)
+                }
+                RuleType::TypeDef(base_type) => {
+                    let mut merged_arms = vec![base_type];
+                    merged_arms.extend(combined_arms);
+                    TypeExpression::Choice(merged_arms)
+                }
+                other => {
+                    // Not actually a type rule (group/service): restore it untouched
+                    // and leave every `/=` rule in place too, so a `/=` on a
+                    // group/service name surfaces as a name collision instead of
+                    // silently vanishing.
+                    rules[target_idx].rule_type = other;
+                    continue;
+                }
+            };
+            rules[target_idx].rule_type = RuleType::TypeDef(merged);
+            to_remove.extend(idxs);
+        } else if collapse_orphans {
+            // No `=` base anywhere in the fully resolved rule set: the first `/=`
+            // becomes the base. A single arm collapses to a plain type instead of a
+            // one-arm choice, matching what `Name = <that type>` would parse to.
+            let keep_idx = idxs[0];
+            let type_expr = if combined_arms.len() == 1 {
+                combined_arms.into_iter().next().expect("len checked above")
+            } else {
+                TypeExpression::Choice(combined_arms)
+            };
+            rules[keep_idx].rule_type = RuleType::TypeDef(type_expr);
+            to_remove.extend(idxs.into_iter().skip(1));
+        } else {
+            // Not the final resolution pass: keep the rule tagged `TypeChoice` (merged
+            // arms, still no base) so a later pass — either this same file included
+            // from elsewhere, or the top-level `resolve_imports` finalize pass — can
+            // still recognize it as an extension in need of a base.
+            let keep_idx = idxs[0];
+            rules[keep_idx].rule_type = RuleType::TypeChoice(combined_arms);
+            to_remove.extend(idxs.into_iter().skip(1));
+        }
+    }
+
+    to_remove.sort_unstable();
+    for idx in to_remove.into_iter().rev() {
+        rules.remove(idx);
+    }
 }
 
 /// CSIL type expressions

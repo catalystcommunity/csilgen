@@ -24,6 +24,12 @@ pub struct TypeMapper {
     custom_mappings: HashMap<String, String>,
 }
 
+impl Default for TypeMapper {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl TypeMapper {
     /// Create a new type mapper with default mappings for common languages
     pub fn new() -> Self {
@@ -158,6 +164,25 @@ impl TypeMapper {
             CsilTypeExpression::Plug(name) => {
                 format!("Plug<{}>", name)
             }
+            CsilTypeExpression::Tuple(group) => {
+                // Fixed-shape/keyed array (`[a, b, c]` or `[tag: text, value: any]`),
+                // distinct from `Group` only in wire shape; a real generator maps
+                // this to its target's tuple/fixed-array construct.
+                format!("Tuple<{}>", group.entries.len())
+            }
+            CsilTypeExpression::Constrained {
+                base_type,
+                constraints,
+            } => {
+                // Constraints (size/regex/range/`.and`/etc.) don't change the mapped
+                // base type here; a real generator should translate `constraints`
+                // into target-language validation code alongside this type.
+                format!(
+                    "{}/* constrained: {} */",
+                    self.map_type(base_type),
+                    constraints.len()
+                )
+            }
         }
     }
 
@@ -185,16 +210,12 @@ impl TypeMapper {
 #[derive(Debug)]
 pub struct ServiceIterator<'a> {
     spec: &'a CsilSpecSerialized,
-    current_index: usize,
 }
 
 impl<'a> ServiceIterator<'a> {
     /// Create a new service iterator
     pub fn new(spec: &'a CsilSpecSerialized) -> Self {
-        Self {
-            spec,
-            current_index: 0,
-        }
+        Self { spec }
     }
 
     /// Get all services in the specification
@@ -651,11 +672,7 @@ impl WarningGenerator {
     /// Detect the naming style of an identifier
     fn detect_naming_style(&self, name: &str) -> NamingStyle {
         if name.chars().any(|c| c.is_ascii_uppercase()) {
-            if name
-                .chars()
-                .nth(0)
-                .map_or(false, |c| c.is_ascii_uppercase())
-            {
+            if name.chars().nth(0).is_some_and(|c| c.is_ascii_uppercase()) {
                 NamingStyle::PascalCase
             } else {
                 NamingStyle::CamelCase
@@ -827,13 +844,17 @@ mod tests {
                             column: 1,
                             offset: 0,
                         },
+                        doc_comments: Vec::new(),
+                        wire_id: None,
                     }],
+                    wire_id: None,
                 }),
                 position: CsilPosition {
                     line: 1,
                     column: 1,
                     offset: 0,
                 },
+                doc_comments: Vec::new(),
             }],
             source_content: None,
             service_count: 1,
@@ -851,6 +872,7 @@ mod tests {
                         value_type: CsilTypeExpression::Builtin("text".to_string()),
                         occurrence: None,
                         metadata: vec![], // No visibility annotation
+                        doc_comments: Vec::new(),
                     }],
                 }),
                 position: CsilPosition {
@@ -858,6 +880,7 @@ mod tests {
                     column: 1,
                     offset: 0,
                 },
+                doc_comments: Vec::new(),
             }],
             source_content: None,
             service_count: 0,

@@ -30,9 +30,10 @@ const Collections = gen_types.Collections;
 const Constrained = gen_types.Constrained;
 const Nested = gen_types.Nested;
 const EchoNestedResult = gen_types.EchoNestedResult;
+const MixedStatus = gen_types.MixedStatus;
 const CsilValue = gen_codec.CsilValue;
 
-const SERVICE = "interop";
+const SERVICE = "Interop";
 
 fn streq(a: []const u8, b: []const u8) bool {
     return std.mem.eql(u8, a, b);
@@ -54,6 +55,22 @@ fn scalarsOk() Scalars {
         .when = .{ .rfc3339 = "2026-06-29T12:34:56Z", .epoch_seconds = 0 },
         // 123.45 == 12345 * 10^-2.
         .amount = .{ .exponent = -2, .mantissa = 12345 },
+        // mixed-union coverage: a value equal to a literal arm must wire as
+        // [1,"pending"]; a value with no literal match must wire as [0,...].
+        .status_literal = .{ .choice1 = "pending" },
+        .status_free = .{ .text = "unlisted" },
+        // inline mixed choice (hoisted; literal arm match).
+        .note = .{ .choice1 = "info" },
+        // inline all-literal choice (not hoisted).
+        .size = .medium,
+        // named enum with a trailing `.default`-constrained last arm.
+        .level = .high,
+        // named enum assembled via base rule + `/=` extension.
+        .season = .autumn,
+        // named all-literal enum with mixed literal kinds (text + int arms);
+        // renders as a plain nullary Zig enum.
+        .ship_text = .ground,
+        .ship_int = .v2,
     };
 }
 
@@ -137,11 +154,32 @@ fn valueEql(a: CsilValue, b: CsilValue) bool {
     };
 }
 
+fn mixedStatusEql(a: MixedStatus, b: MixedStatus) bool {
+    return switch (a) {
+        .text => |x| b == .text and streq(x, b.text),
+        .choice1 => |x| b == .choice1 and streq(x, b.choice1),
+        .choice2 => |x| b == .choice2 and streq(x, b.choice2),
+        .choice3 => |x| b == .choice3 and streq(x, b.choice3),
+    };
+}
+
+fn scalarsNoteEql(a: gen_types.Scalars_note, b: gen_types.Scalars_note) bool {
+    return switch (a) {
+        .text => |x| b == .text and streq(x, b.text),
+        .choice1 => |x| b == .choice1 and streq(x, b.choice1),
+        .choice2 => |x| b == .choice2 and streq(x, b.choice2),
+    };
+}
+
 fn scalarsEql(a: Scalars, b: Scalars) bool {
     return a.i == b.i and a.u == b.u and a.n == b.n and a.f == b.f and
         streq(a.t, b.t) and std.mem.eql(u8, a.raw, b.raw) and a.flag == b.flag and
         streq(a.when.rfc3339, b.when.rfc3339) and
-        a.amount.exponent == b.amount.exponent and a.amount.mantissa == b.amount.mantissa;
+        a.amount.exponent == b.amount.exponent and a.amount.mantissa == b.amount.mantissa and
+        mixedStatusEql(a.status_literal, b.status_literal) and
+        mixedStatusEql(a.status_free, b.status_free) and
+        scalarsNoteEql(a.note, b.note) and a.size == b.size and a.level == b.level and
+        a.season == b.season and a.ship_text == b.ship_text and a.ship_int == b.ship_int;
 }
 
 fn constrainedEql(a: Constrained, b: Constrained) bool {
@@ -280,21 +318,21 @@ const ServerCtx = struct {
 fn rpcHandle(ptr: *anyopaque, req: *const rpc.RpcRequest) rpc.HandlerOutcome {
     const self: *ServerCtx = @ptrCast(@alignCast(ptr));
     const a = self.arena.allocator();
-    if (streq(req.op, "EchoScalars")) {
+    if (streq(req.op, "echo-scalars")) {
         var v: Scalars = undefined;
         gen_codec.decode_Scalars(a, req.payload, &v) catch
             return rpc.HandlerOutcome.make_transport(Status.malformed_envelope, "decode");
         const b = gen_codec.encode_Scalars(a, &v) catch
             return rpc.HandlerOutcome.make_transport(Status.internal, "encode");
         return rpc.HandlerOutcome.make_reply("Scalars", b);
-    } else if (streq(req.op, "EchoCollections")) {
+    } else if (streq(req.op, "echo-collections")) {
         var v: Collections = undefined;
         gen_codec.decode_Collections(a, req.payload, &v) catch
             return rpc.HandlerOutcome.make_transport(Status.malformed_envelope, "decode");
         const b = gen_codec.encode_Collections(a, &v) catch
             return rpc.HandlerOutcome.make_transport(Status.internal, "encode");
         return rpc.HandlerOutcome.make_reply("Collections", b);
-    } else if (streq(req.op, "EchoNested")) {
+    } else if (streq(req.op, "echo-nested")) {
         var v: Nested = undefined;
         gen_codec.decode_Nested(a, req.payload, &v) catch
             return rpc.HandlerOutcome.make_transport(Status.malformed_envelope, "decode");
@@ -302,7 +340,7 @@ fn rpcHandle(ptr: *anyopaque, req: *const rpc.RpcRequest) rpc.HandlerOutcome {
         const b = gen_codec.encode_EchoNestedResult(a, &r) catch
             return rpc.HandlerOutcome.make_transport(Status.internal, "encode");
         return rpc.HandlerOutcome.make_reply("EchoNestedResult", b);
-    } else if (streq(req.op, "ValidateConstrained")) {
+    } else if (streq(req.op, "validate-constrained")) {
         var v: Constrained = undefined;
         gen_codec.decode_Constrained(a, req.payload, &v) catch
             return rpc.HandlerOutcome.make_transport(Status.malformed_envelope, "decode");
@@ -468,7 +506,7 @@ fn eventsServeConn(base: std.mem.Allocator, stream: std.net.Stream) void {
     while (seq < TICKS) : (seq += 1) {
         const t = gen_types.Tick{ .seq = seq };
         const tb = gen_codec.encode_Tick(a, &t) catch return;
-        sendEvent(c, a, events.Event.verbose(SERVICE, "OnTick", tb));
+        sendEvent(c, a, events.Event.verbose(SERVICE, "on-tick", tb));
     }
 
     // React loop.
@@ -490,11 +528,11 @@ fn eventsServeConn(base: std.mem.Allocator, stream: std.net.Stream) void {
             sendEvent(c, a, events.Event.verbose(null, events.PONG_NAME, ev.payload));
         } else if (streq(method, events.CLOSE_NAME)) {
             break;
-        } else if (streq(method, "Duplex")) {
+        } else if (streq(method, "duplex")) {
             var s: Scalars = undefined;
             if (gen_codec.decode_Scalars(a, ev.payload, &s)) {
                 const sb = gen_codec.encode_Scalars(a, &s) catch continue;
-                sendEvent(c, a, events.Event.verbose(SERVICE, "Duplex", sb));
+                sendEvent(c, a, events.Event.verbose(SERVICE, "duplex", sb));
             } else |_| {}
         } else {
             // Exercise the generated router's unknown-method path.
@@ -540,9 +578,9 @@ fn eventsClient(a: std.mem.Allocator, stream: std.net.Stream) Cases {
             detail = "tick decode";
             break;
         };
-        if (ev.event == null or !streq(ev.event.?, "OnTick")) {
+        if (ev.event == null or !streq(ev.event.?, "on-tick")) {
             tick_ok = false;
-            detail = "expected OnTick";
+            detail = "expected on-tick";
             break;
         }
         var t: gen_types.Tick = undefined;
@@ -563,10 +601,10 @@ fn eventsClient(a: std.mem.Allocator, stream: std.net.Stream) Cases {
     {
         const want = scalarsOk();
         const sb = gen_codec.encode_Scalars(a, &want) catch unreachable;
-        sendEvent(c, a, events.Event.verbose(SERVICE, "Duplex", sb));
+        sendEvent(c, a, events.Event.verbose(SERVICE, "duplex", sb));
         if (c.recv(a) catch null) |f| {
             if (events.decode_event(a, f, .verbose)) |ev| {
-                if (ev.event != null and streq(ev.event.?, "Duplex")) {
+                if (ev.event != null and streq(ev.event.?, "duplex")) {
                     var s: Scalars = undefined;
                     if (gen_codec.decode_Scalars(a, ev.payload, &s)) {
                         cases.check("duplex/success", scalarsEql(s, want), "echo mismatch");

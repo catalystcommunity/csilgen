@@ -1,49 +1,138 @@
-# Custom Generator Example
+# Custom Generator Example: `mdsummary`
 
-This example demonstrates authoring a CSIL generator from scratch — emitting Go code, including how to handle services and field metadata. For the **canonical reference and the full interface spec**, see [`tools/generator-template/README.md`](../../tools/generator-template/README.md) and [`tools/generator-template/GENERATOR_INTERFACE.md`](../../tools/generator-template/GENERATOR_INTERFACE.md); this example is a working specimen, not the authoring docs.
+This is a **real, buildable, discoverable** CSIL generator — the walkthrough
+companion to [`docs/generator-plugin-contract.md`](../../docs/generator-plugin-contract.md)
+(the normative plugin contract; read that first for the full spec). Where
+[`wasm/csilgen-noop-generator/`](../../wasm/csilgen-noop-generator/) is the
+minimal reference implementation of the four required exports, this crate
+goes one step further: it actually reads the CSIL AST (rules, field
+metadata, doc comments, service operations) and produces something a human
+would want to read — a Markdown summary of the spec's types and services.
 
-## What This Generator Does
+The point of shipping a docs generator, not another code generator, is to
+make Tier 0 of the contract concrete: a CSIL generator doesn't have to emit
+language bindings. `wasm/csilgen-json-generator` and
+`wasm/csilgen-openapi-generator` make the same point in-repo; this is the
+minimal version of it, small enough to read top to bottom in one sitting.
 
-- **Input**: a CSIL specification (services + field metadata).
-- **Output**: Go source files (structs, service interfaces, etc.).
-- Demonstrates field-visibility handling (`@send-only` / `@receive-only` / `@bidirectional`), the per-direction service-operation emission model (handler + router + outbound encoders for `<->` / `<-`, not the gRPC-style send/recv streams), and idiomatic Go naming.
+## What it does
+
+- **Input**: a CSIL specification (types, groups, services, field metadata,
+  `;;;` doc comments).
+- **Output**: a single `SUMMARY.md` file — a Markdown table of contents for
+  the spec's types (with field visibility and descriptions) and services
+  (with operation direction arrows: `->`, `<->`, `<-`).
+- **Target name**: `mdsummary`. The crate is named `csilgen-mdsummary-generator`
+  so it builds to `csilgen_mdsummary_generator.wasm`, and that filename is the
+  entire registration — see "Discovery & naming" in the contract doc.
 
 ## Files
 
-- `Cargo.toml` — wasm `cdylib` crate config; the package is named `csilgen-<target>-generator` so the build output filename derives the `--target` name.
-- `src/lib.rs` — generator implementation with the four required WASM exports.
-- `example-input.csil` — sample CSIL to exercise it.
-- `build.sh` — convenience script to build the wasm module.
+- `Cargo.toml` — a `cdylib` crate, deliberately outside the root workspace
+  (own `[workspace]` table, same as `tools/generator-template` and its
+  sub-examples) so it doesn't get pulled into the root `cargo build
+  --workspace` / clippy / test gates.
+- `src/lib.rs` — the four required WASM exports
+  (`get_metadata`/`allocate`/`deallocate`/`generate`), plus the Markdown
+  rendering logic and a `#[cfg(test)]` module that exercises
+  `process_generation` directly (no wasmtime needed for unit tests — see
+  "Testing" below).
+- `example-input.csil` — a CSIL fixture with types, a group with field
+  visibility/description metadata, doc comments, and a service with all
+  three operation directions.
+- `build.sh` — builds the wasm module and prints the install/run commands.
 
-## Building & Using
+## Building & using it
 
 ```bash
 cd examples/custom-generator
 ./build.sh
-# Produces target/wasm32-unknown-unknown/release/csilgen_<target>_generator.wasm
+# Produces target/wasm32-unknown-unknown/release/csilgen_mdsummary_generator.wasm
 ```
 
-To use it with the CLI, drop the built `.wasm` into a discovery directory. Discovery is **first-write-wins** across three paths:
-
-1. `target/wasm32-unknown-unknown/release/` — local dev build.
-2. `./.generators/` — project-local override.
-3. `~/.csilgen/generators/` — per-user baseline.
+Discovery is filename-based and first-write-wins across three search paths
+(see the contract doc §1); the project-local override is the simplest way to
+try a generator without touching your homedir install:
 
 ```bash
-# Per-project pin (overrides any homedir copy without touching it):
 mkdir -p ../../.generators
-cp target/wasm32-unknown-unknown/release/csilgen_<target>_generator.wasm ../../.generators/
+cp target/wasm32-unknown-unknown/release/csilgen_mdsummary_generator.wasm ../../.generators/
 
-# Now `--target <target>` resolves dynamically — no CLI change required:
 csilgen generate \
     --input example-input.csil \
-    --target <target> \
+    --target mdsummary \
     --output ./generated/
 ```
 
-`<target>` is whatever string sits between `csilgen_` and `_generator.wasm` in the filename. That's the entire registration mechanism — no `csilgen generator install` command exists, and none is needed.
+No `csilgen generator install` command exists, and none is needed — the
+`.wasm` file's presence and filename are the whole registration.
 
-## Interface (Summary)
+### Verified output
+
+Running exactly the commands above (from a scratch checkout, wasm32 target
+already installed) produces:
+
+```
+Info: Generating mdsummary code from: example-input.csil
+
+Generation Summary:
+  Processed: 1 CSIL file
+  Generated: 1 file (932 B)
+
+Info: Output written to: ./generated
+```
+
+and `./generated/SUMMARY.md` contains:
+
+```markdown
+# CSIL Specification Summary
+
+Generated by `csilgen-mdsummary-generator` v1.0.0 for target `mdsummary`.
+
+## Types
+
+### UserID
+
+`UserID = text (constrained)`
+
+### Username
+
+`Username = text (constrained)`
+
+### User
+
+> A registered user account.
+
+`User = {6 fields}`
+
+### CreateUserRequest
+
+`CreateUserRequest = {3 fields}`
+
+...
+
+## Services
+
+### UserAPI
+
+> The public user account API.
+
+| Operation | Input | Output | Direction |
+|-----------|-------|--------|-----------|
+| `get-user` | `UserID` | `User / UserError` | `->` |
+| `create-user` | `CreateUserRequest` | `User / UserError` | `->` |
+| `list-users` | `ListUsersRequest` | `ListUsersResponse / UserError` | `->` |
+| `watch-user-events` | `UserID` | `UserEvent / UserError` | `<->` |
+```
+
+(`User = {6 fields}` rather than a field table is correct, not a bug: CSIL
+parses a top-level `Name = { ... }` as `TypeDef(Group(...))`, not `GroupDef` —
+only a group *nested inside* another rule via `GroupDef` gets the full
+field-by-field table this generator also knows how to render, in
+`format_group_table`. Read `src/lib.rs`'s `format_type_rule` if you want to
+see both code paths.)
+
+## Interface (summary)
 
 A generator is a `cdylib` exporting four C-ABI functions:
 
@@ -54,51 +143,81 @@ A generator is a `cdylib` exporting four C-ABI functions:
 #[unsafe(no_mangle)] pub extern "C" fn generate(input_ptr: *const u8, input_len: usize) -> *mut u8;
 ```
 
-The host serializes a `WasmGeneratorInput` (your spec + config + generator metadata) into wasm memory and calls `generate`. You return a length-prefixed JSON-serialized `WasmGeneratorOutput` containing `files: Vec<GeneratedFile>` (each with `path` and `content`), warnings, and stats. See `GENERATOR_INTERFACE.md` for the full spec.
+The host writes a JSON-serialized `WasmGeneratorInput` (spec + config +
+generator metadata) directly into this module's memory and calls `generate`
+with a pointer and length — it does **not** call this module's `allocate` for
+that. `generate` returns a pointer to a length-prefixed (4-byte LE `u32` +
+JSON) `WasmGeneratorOutput`, obtained through this module's own `allocate`; a
+null return means failure. See
+[`docs/generator-plugin-contract.md`](../../docs/generator-plugin-contract.md)
+§2 for the full, verified calling convention — who allocates what, when
+`deallocate` is (and isn't) called, fuel-based execution limits, and error
+signaling.
 
-## Key Implementation Patterns
+## Key implementation patterns
 
-### Field metadata (visibility, descriptions, constraints)
+### Field metadata (visibility, descriptions)
 
 ```rust
-for entry in &group.entries {
-    for meta in &entry.metadata {
-        match meta {
-            CsilFieldMetadata::Visibility(CsilFieldVisibility::SendOnly) => { /* … */ }
-            CsilFieldMetadata::Visibility(CsilFieldVisibility::ReceiveOnly) => { /* … */ }
-            CsilFieldMetadata::Description(text) => { /* doc comment */ }
-            CsilFieldMetadata::Constraint(c) => { /* validation */ }
-            _ => {}
-        }
-    }
-}
+let visibility = entry
+    .metadata
+    .iter()
+    .find_map(|m| match m {
+        CsilFieldMetadata::Visibility(CsilFieldVisibility::SendOnly) => Some("send-only"),
+        CsilFieldMetadata::Visibility(CsilFieldVisibility::ReceiveOnly) => Some("receive-only"),
+        CsilFieldMetadata::Visibility(CsilFieldVisibility::Bidirectional) => Some("bidirectional"),
+        _ => None,
+    })
+    .unwrap_or("bidirectional");
 ```
 
 ### Service operations by direction
 
 ```rust
-for op in &service.operations {
-    match op.direction {
-        CsilServiceDirection::Unidirectional => {
-            // Emit: handler returns Output (server) / method calls transport (client).
-        }
-        CsilServiceDirection::Bidirectional => {
-            // Emit: per-side inbound handler + outbound encoder + router entry.
-            // Generators emit shapes + routing; the implementer owns the wire.
-        }
-        CsilServiceDirection::Reverse => {
-            // Server pushes Output; client handles Output. No server inbound,
-            // no client outbound.
-        }
-    }
-}
+let arrow = match op.direction {
+    CsilServiceDirection::Unidirectional => "->",
+    CsilServiceDirection::Bidirectional => "<->",
+    CsilServiceDirection::Reverse => "<-",
+};
 ```
 
-See `csil-spec.md` "Operation Directions" for the contract every generator follows.
+This generator only *renders* the direction — it doesn't emit handlers or
+routers, because it isn't a codec/transport generator. See `csil-spec.md`
+"Operation Directions" for the full contract a code-emitting generator would
+implement for each direction.
 
-## Tips
+### Doc comments
 
-1. **Start with type generation**; add services once your AST traversal is solid.
-2. **Test against small CSIL fixtures** in `#[cfg(test)]` modules in `src/lib.rs` — you can call `process_generation` directly without going through wasmtime.
-3. **Match the cross-generator wire convention**: PascalCase method names in router switches so frames are interoperable.
-4. **Don't open the connection**: emit handler interfaces and `(method, bytes)` from encoders; let the implementer wire those to their WebSocket/TCP/etc.
+`;;;` comments preceding a rule land in `rule.doc_comments: Vec<String>`; this
+generator renders each line as a Markdown blockquote (see the `> A registered
+user account.` line in the verified output above).
+
+## Testing
+
+`src/lib.rs`'s `#[cfg(test)] mod tests` calls `process_generation` and
+`build_summary` directly with hand-built `WasmGeneratorInput` values — no
+wasmtime involved, matching the pattern in
+`wasm/csilgen-noop-generator/src/lib.rs`. Run them with:
+
+```bash
+cargo test
+```
+
+For an end-to-end check against the real CLI, use the build/install/run
+sequence above, or `cargo build --release --target wasm32-unknown-unknown`
+directly followed by copying the resulting `.wasm` into any discovery
+directory.
+
+## Tips for authoring your own generator
+
+1. Start with `wasm/csilgen-noop-generator/` if you just want the ABI
+   skeleton; start here if you want a worked example that actually walks the
+   AST.
+2. `tools/generator-template/` has a fuller Rust-authoring walkthrough
+   ([`README.md`](../../tools/generator-template/README.md) and
+   [`GENERATOR_INTERFACE.md`](../../tools/generator-template/GENERATOR_INTERFACE.md))
+   if you want more type-mapping and configuration-option examples.
+3. Options come **only** from the CSIL source file's `options { … }` block —
+   there is no `--option` CLI flag.
+4. Test against `process_generation` in `#[cfg(test)]` before ever going
+   through wasmtime; it's faster and gives you real stack traces.

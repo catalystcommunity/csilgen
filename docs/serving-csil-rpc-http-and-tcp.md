@@ -27,7 +27,7 @@ codec (`encode_<t>` / `decode_<t>`, or `to_cbor` / `from_cbor`). They do **not**
 the request→response loop — that is the host's, and it is exactly what both carriers
 share. It maps one decoded `RpcRequest` to a `HandlerOutcome`:
 
-- match `req.op` (the PascalCase operation id, e.g. `"EchoScalars"`),
+- match `req.op` (the CSIL operation id verbatim, kebab-case, e.g. `"echo-scalars"`),
 - `decode_*` the request payload, call your handler method, `encode_*` the result,
 - return `Reply { variant, payload }` on success (variant = the chosen output-arm
   type name, e.g. `"Scalars"`, or `"ServiceError"` for a declared error arm — see
@@ -111,7 +111,7 @@ use interop_api::*; // generated codec + handler trait
 // (1) shared dispatch
 fn dispatch(h: &Handlers, req: &RpcRequest) -> HandlerOutcome {
     match req.op.as_str() {
-        "EchoScalars" => match decode_scalars(&req.payload) {
+        "echo-scalars" => match decode_scalars(&req.payload) {
             Ok(v) => match h.echo_scalars(&(), v) {
                 Ok(r) => HandlerOutcome::Reply { variant: "Scalars".into(), payload: encode_scalars(&r) },
                 Err(e) => HandlerOutcome::Transport(Status::Internal, e.message),

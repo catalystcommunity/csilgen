@@ -31,7 +31,7 @@ import 'dart:typed_data';
 import 'package:csilgen_transport/csilgen_transport.dart';
 import 'package:interop_api/interop_api.dart';
 
-const String service = 'interop';
+const String service = 'Interop';
 
 // ---------------------------------------------------------------------------
 // Fixed language-neutral test vectors (see README "Fixed test vectors").
@@ -47,6 +47,22 @@ Scalars scalarsOk() => Scalars(
       flag: true,
       when_: DateTime.parse('2026-06-29T12:34:56Z').toUtc(),
       amount: CsilDecimal.parse('123.45'),
+      // mixed-union coverage: a value equal to a literal arm must wire as
+      // [1,"pending"]; a value with no literal match must wire as [0,...].
+      statusLiteral: const MixedStatusVariant1('pending'),
+      statusFree: const MixedStatusVariant0('unlisted'),
+      // inline mixed choice (hoisted; literal arm match).
+      note: const ScalarsNoteVariant1('info'),
+      // inline all-literal choice (not hoisted).
+      size: 'medium',
+      // named enum with a trailing `.default`-constrained last arm.
+      level: 'high',
+      // named enum assembled via base rule + `/=` extension.
+      season: 'autumn',
+      // named all-literal enum with mixed literal kinds (text + int arms);
+      // renders as `typedef ShipMode = Object?;`, bare value.
+      shipText: 'ground',
+      shipInt: 2,
     );
 
 Collections collectionsOk() => Collections(
@@ -116,12 +132,14 @@ bool treeEqual(Object? a, Object? b) {
   return a == b;
 }
 
-bool scalarsEq(Scalars a, Scalars b) => treeEqual(a.toCborValue(), b.toCborValue());
+bool scalarsEq(Scalars a, Scalars b) =>
+    treeEqual(a.toCborValue(), b.toCborValue());
 bool collectionsEq(Collections a, Collections b) =>
     treeEqual(a.toCborValue(), b.toCborValue());
 bool constrainedEq(Constrained a, Constrained b) =>
     treeEqual(a.toCborValue(), b.toCborValue());
-bool nestedEq(Nested a, Nested b) => treeEqual(a.toCborValue(), b.toCborValue());
+bool nestedEq(Nested a, Nested b) =>
+    treeEqual(a.toCborValue(), b.toCborValue());
 
 // ---------------------------------------------------------------------------
 // Result accumulation + JSON output.
@@ -144,7 +162,8 @@ class Cases {
     for (var i = 0; i < out.length; i++) {
       if (i > 0) sb.write(',');
       final (name, ok, detail) = out[i];
-      sb.write('{"name":${_jsonStr(name)},"ok":$ok,"detail":${_jsonStr(detail)}}');
+      sb.write(
+          '{"name":${_jsonStr(name)},"ok":$ok,"detail":${_jsonStr(detail)}}');
     }
     sb.write(']}\n');
     stdout.write(sb.toString());
@@ -195,6 +214,7 @@ final class Handlers implements InteropHandler {
     request.validate();
     return request;
   }
+
   @override
   void duplex(Scalars message) {}
 }
@@ -218,7 +238,8 @@ final class SyncStreamFrameCarrier implements FrameCarrier {
   SyncStreamFrameCarrier(this.sock);
 
   @override
-  void sendFrame(Uint8List frame) => sock.writeFromSync(frameLengthPrefixed(frame));
+  void sendFrame(Uint8List frame) =>
+      sock.writeFromSync(frameLengthPrefixed(frame));
 
   @override
   Uint8List? recvFrame() {
@@ -333,25 +354,31 @@ final class RpcServiceTransport implements CsilTransport {
 HandlerOutcome rpcDispatch(Handlers handlers, RpcRequest req) {
   try {
     switch (req.op) {
-      case 'EchoScalars':
-        return Reply('Scalars', handlers.echoScalars(Scalars.fromCbor(req.payload)).toCbor());
-      case 'EchoCollections':
-        return Reply('Collections',
-            handlers.echoCollections(Collections.fromCbor(req.payload)).toCbor());
-      case 'EchoNested':
+      case 'echo-scalars':
+        return Reply('Scalars',
+            handlers.echoScalars(Scalars.fromCbor(req.payload)).toCbor());
+      case 'echo-collections':
+        return Reply(
+            'Collections',
+            handlers
+                .echoCollections(Collections.fromCbor(req.payload))
+                .toCbor());
+      case 'echo-nested':
         return Reply('EchoNestedResult',
             handlers.echoNested(Nested.fromCbor(req.payload)).toCbor());
-      case 'ValidateConstrained':
+      case 'validate-constrained':
         final input = Constrained.fromCbor(req.payload);
         try {
           // The typed error arm rides as a status-0 `ServiceError` variant.
-          return Reply('Constrained', handlers.validateConstrained(input).toCbor());
+          return Reply(
+              'Constrained', handlers.validateConstrained(input).toCbor());
         } on ArgumentError catch (e) {
           return Reply('ServiceError',
               ServiceError(code: 422, message: '${e.message}').toCbor());
         }
       default:
-        return TransportOutcome(Status.unknownServiceOrOp, 'unknown op ${req.op}');
+        return TransportOutcome(
+            Status.unknownServiceOrOp, 'unknown op ${req.op}');
     }
   } on TransportException catch (e) {
     return TransportOutcome(Status.malformedEnvelope, e.message);
@@ -384,8 +411,8 @@ Cases rpcClient(SyncStreamFrameCarrier carrier) {
   }
   try {
     final r = client.echoCollections(collectionsOk());
-    cases.check(
-        'echo-collections/success', collectionsEq(r, collectionsOk()), 'mismatch');
+    cases.check('echo-collections/success', collectionsEq(r, collectionsOk()),
+        'mismatch');
   } catch (e) {
     cases.fail('echo-collections/success', '$e');
   }
@@ -410,7 +437,8 @@ Cases rpcClient(SyncStreamFrameCarrier carrier) {
     // The typed error arm must surface as a service error.
     cases.pass('validate-constrained/failure');
   } catch (e) {
-    cases.fail('validate-constrained/failure', 'expected service error, got $e');
+    cases.fail(
+        'validate-constrained/failure', 'expected service error, got $e');
   }
   return cases;
 }
@@ -435,12 +463,15 @@ Future<void> eventsServeConnection(InboxFrameCarrier carrier) async {
   final helloEv = Event.decode(helloFrame, Profile.verbose);
   if (helloEv.event != Control.helloName) return;
   Hello.decode(helloEv.payload);
-  sendEvent(carrier,
-      Event.verbose(null, Control.helloAckName, HelloAck(1, 'verbose').encode()));
+  sendEvent(
+      carrier,
+      Event.verbose(
+          null, Control.helloAckName, HelloAck(1, 'verbose').encode()));
 
   // Push N ticks (on-tick / server push).
   for (var seq = 0; seq < ticks; seq++) {
-    sendEvent(carrier, Event.verbose(service, 'OnTick', Tick(seq: seq).toCbor()));
+    sendEvent(
+        carrier, Event.verbose(service, 'on-tick', Tick(seq: seq).toCbor()));
   }
 
   // React loop.
@@ -459,11 +490,11 @@ Future<void> eventsServeConnection(InboxFrameCarrier carrier) async {
       sendEvent(carrier, Event.verbose(null, Control.pongName, ev.payload));
     } else if (method == Control.closeName) {
       break;
-    } else if (method == 'Duplex') {
+    } else if (method == 'duplex') {
       try {
         final s = Scalars.fromCbor(ev.payload);
         handlers.duplex(s);
-        sendEvent(carrier, Event.verbose(service, 'Duplex', s.toCbor()));
+        sendEvent(carrier, Event.verbose(service, 'duplex', s.toCbor()));
       } catch (_) {
         // a malformed duplex frame is ignored, as in the reference
       }
@@ -491,7 +522,8 @@ Cases eventsClient(SyncStreamFrameCarrier carrier) {
   var ackOk = false;
   if (ackFrame != null) {
     try {
-      ackOk = Event.decode(ackFrame, Profile.verbose).event == Control.helloAckName;
+      ackOk =
+          Event.decode(ackFrame, Profile.verbose).event == Control.helloAckName;
     } catch (_) {
       ackOk = false;
     }
@@ -510,9 +542,9 @@ Cases eventsClient(SyncStreamFrameCarrier carrier) {
     }
     try {
       final ev = Event.decode(frame, Profile.verbose);
-      if (ev.event != 'OnTick') {
+      if (ev.event != 'on-tick') {
         tickOk = false;
-        detail = 'expected OnTick got ${ev.event}';
+        detail = 'expected on-tick got ${ev.event}';
         break;
       }
       final t = Tick.fromCbor(ev.payload);
@@ -530,16 +562,17 @@ Cases eventsClient(SyncStreamFrameCarrier carrier) {
   cases.check('on-tick/success', tickOk, detail);
 
   // duplex: send Scalars, expect echo.
-  sendEvent(carrier, Event.verbose(service, 'Duplex', scalarsOk().toCbor()));
+  sendEvent(carrier, Event.verbose(service, 'duplex', scalarsOk().toCbor()));
   final dupFrame = carrier.recvFrame();
   if (dupFrame == null) {
     cases.fail('duplex/success', 'no echo');
   } else {
     try {
       final ev = Event.decode(dupFrame, Profile.verbose);
-      if (ev.event == 'Duplex') {
+      if (ev.event == 'duplex') {
         final s = Scalars.fromCbor(ev.payload);
-        cases.check('duplex/success', scalarsEq(s, scalarsOk()), 'echo mismatch');
+        cases.check(
+            'duplex/success', scalarsEq(s, scalarsOk()), 'echo mismatch');
       } else {
         cases.fail('duplex/success', 'got ${ev.event}');
       }
@@ -556,7 +589,8 @@ Cases eventsClient(SyncStreamFrameCarrier carrier) {
   } else {
     var isErr = false;
     try {
-      isErr = Event.decode(errFrame, Profile.verbose).event == Control.errorName;
+      isErr =
+          Event.decode(errFrame, Profile.verbose).event == Control.errorName;
     } catch (_) {
       isErr = false;
     }
@@ -661,8 +695,10 @@ Future<Cases> datagramClient(RawDatagramSocket sock, int port) async {
     if (d.opOrd != opEchoScalars) {
       cases.fail('echo-scalars/success', 'op_ord ${d.opOrd}');
     } else {
-      cases.check('echo-scalars/success',
-          scalarsEq(Scalars.fromCbor(d.payload), scalarsOk()), 'payload mismatch');
+      cases.check(
+          'echo-scalars/success',
+          scalarsEq(Scalars.fromCbor(d.payload), scalarsOk()),
+          'payload mismatch');
     }
   } catch (e) {
     cases.fail('echo-scalars/success', '$e');
@@ -696,7 +732,8 @@ Future<Cases> datagramClient(RawDatagramSocket sock, int port) async {
 
 Future<void> main(List<String> args) async {
   if (args.length < 3) {
-    stderr.writeln('usage: main.dart <server|client> <rpc|events|datagrams> <port>');
+    stderr.writeln(
+        'usage: main.dart <server|client> <rpc|events|datagrams> <port>');
     exitCode = 2;
     return;
   }
@@ -793,7 +830,8 @@ Future<ServerSocket> bindRetry(int port) async {
 Future<RawSynchronousSocket> connectRetry(int port) async {
   for (var attempt = 0; attempt < 400; attempt++) {
     try {
-      return RawSynchronousSocket.connectSync(InternetAddress.loopbackIPv4, port);
+      return RawSynchronousSocket.connectSync(
+          InternetAddress.loopbackIPv4, port);
     } catch (_) {
       await Future<void>.delayed(const Duration(milliseconds: 15));
     }

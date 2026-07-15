@@ -373,16 +373,24 @@ match type_expr {
 
 ## Configuration Options
 
-Your generator can accept custom configuration through the CLI:
+Your generator can accept custom configuration, but **only from the CSIL
+source file's `options { … }` block** — the CLI has no `--option` flag, so
+there is no way to pass options on the command line itself:
 
-```bash
-csilgen generate --input api.csil --target my-generator --output ./gen/ \
-  --option use_tabs=true \
-  --option max_line_length=120 \
-  --option generate_docs=true
+```csil
+options {
+  use_tabs: true,
+  max_line_length: 120,
+  generate_docs: true,
+}
 ```
 
-Process these in your generator:
+```bash
+csilgen generate --input api.csil --target my-generator --output ./gen/
+```
+
+These flow through to your generator as `WasmGeneratorInput.config.options:
+HashMap<String, serde_json::Value>`. Process them in your generator:
 
 ```rust
 fn process_config(options: &HashMap<String, serde_json::Value>) -> MyConfig {
@@ -431,17 +439,21 @@ for rule in &input.csil_spec.rules {
 
 ## Memory Management
 
-The WASM interface requires careful memory management:
+Output (from your `generate`/`get_metadata`) is length-prefixed:
 
-- **allocate()**: Create memory for host to write input
-- **deallocate()**: Clean up allocated memory
-- **Length-prefixed data**: All data is prefixed with 4-byte length (little-endian)
-- **JSON serialization**: All data is exchanged as JSON strings
-
-Example memory layout:
 ```
 [4 bytes: length (u32 LE)] [length bytes: JSON data]
 ```
+
+Input is not — the host writes the raw `WasmGeneratorInput` JSON straight into
+your module's memory and passes the length as a separate argument, without
+ever calling your `allocate`; you only need `allocate` to produce the *output*
+buffer, and the host never calls your `deallocate` at all (each generation
+runs in its own disposable `wasmtime::Store`). See
+[`GENERATOR_INTERFACE.md`](GENERATOR_INTERFACE.md#memory-allocation-flow) for
+the full call-by-call breakdown and
+[`docs/generator-plugin-contract.md`](../../docs/generator-plugin-contract.md)
+§2 for the normative version.
 
 ## Testing Your Generator
 

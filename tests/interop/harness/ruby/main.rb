@@ -16,7 +16,7 @@ require "interop_api"
 require "csilgen/transport"
 
 T = Csilgen::Transport
-SERVICE = "interop"
+SERVICE = "Interop"
 
 # ---------------------------------------------------------------------------
 # Codec adapter -- the generated router/encoders are codec-agnostic; wire them
@@ -53,7 +53,23 @@ def scalars_ok
     raw: "\x01\x02\xf0\xff".b,
     flag: true,
     when: ts,
-    amount: BigDecimal("123.45")
+    amount: BigDecimal("123.45"),
+    # mixed-union coverage: a value equal to a literal arm must wire as
+    # [1,"pending"]; a value with no literal match must wire as [0,...].
+    status_literal: "pending",
+    status_free: "unlisted",
+    # inline mixed choice (hoisted; literal arm match).
+    note: "info",
+    # inline all-literal choice (not hoisted).
+    size: "medium",
+    # named enum with a trailing `.default`-constrained last arm.
+    level: "high",
+    # named enum assembled via base rule + `/=` extension.
+    season: "autumn",
+    # named all-literal enum with mixed literal kinds (text + int arms); no
+    # wrapper class, bare Ruby value.
+    ship_text: "ground",
+    ship_int: 2
   )
 end
 
@@ -185,16 +201,16 @@ end
 
 def rpc_dispatch(handlers, req)
   case req.op
-  when "EchoScalars"
+  when "echo-scalars"
     v = Scalars.from_cbor(req.payload)
     T::RPC::Reply.new("Scalars", handlers.echo_scalars(v).to_cbor)
-  when "EchoCollections"
+  when "echo-collections"
     v = Collections.from_cbor(req.payload)
     T::RPC::Reply.new("Collections", handlers.echo_collections(v).to_cbor)
-  when "EchoNested"
+  when "echo-nested"
     v = Nested.from_cbor(req.payload)
     T::RPC::Reply.new("EchoNestedResult", handlers.echo_nested(v).to_cbor)
-  when "ValidateConstrained"
+  when "validate-constrained"
     v = Constrained.from_cbor(req.payload)
     begin
       # The typed error arm rides as a status-0 `ServiceError` variant.
@@ -319,7 +335,7 @@ def events_server(listener)
           send_event(carrier, T::Events::Event.verbose(nil, ctrl::PONG_NAME, ev.payload))
         when ctrl::CLOSE_NAME
           break
-        when "Duplex"
+        when "duplex"
           begin
             s = Scalars.from_cbor(ev.payload)
           rescue T::Error
@@ -378,9 +394,9 @@ def events_client(conn)
     end
     begin
       ev = T::Events::Event.decode(frame, verbose)
-      if ev.event != "OnTick"
+      if ev.event != "on-tick"
         tick_ok = false
-        detail = "expected OnTick got #{ev.event.inspect}"
+        detail = "expected on-tick got #{ev.event.inspect}"
         break
       end
       t = Tick.from_cbor(ev.payload)
@@ -406,7 +422,7 @@ def events_client(conn)
   else
     begin
       ev = T::Events::Event.decode(frame, verbose)
-      if ev.event == "Duplex"
+      if ev.event == "duplex"
         s = Scalars.from_cbor(ev.payload)
         cases.check("duplex/success", s == scalars_ok, "echo mismatch")
       else

@@ -398,17 +398,23 @@ fn map_type(
     }
 }
 
-/// A choice whose members are all `text`/`tstr` and string literals — a closed
-/// string set. Mapped to `String` (see `map_type`) rather than a sealed class,
-/// because the wire form is the literal string itself.
 /// A choice whose members are all integer literals (`1 / 2 / 3`) — a closed int
 /// set (an int enum). Mapped to `int` (see `map_type`) rather than a sealed class,
 /// because the wire carries the bare integer, which is its own discriminant.
+///
+/// This is a SUB-classifier, used only to pick the precise Dart static type once
+/// `csilgen_common::all_literal` has already confirmed the choice is an enum at
+/// all (any-kind-mix) — never as an enum-vs-union proxy on its own, since it
+/// returns `false` for a mixed-kind all-literal choice like `"a" / 1` (that is
+/// still an `Enum` per the shared contract, just not a uniform-int one).
 fn is_int_choice(choices: &[CsilTypeExpression]) -> bool {
     !choices.is_empty()
-        && choices
-            .iter()
-            .all(|c| matches!(c, CsilTypeExpression::Literal(CsilLiteralValue::Integer(_))))
+        && choices.iter().all(|c| {
+            matches!(
+                csilgen_common::choice_arm_literal(c),
+                Some(CsilLiteralValue::Integer(_))
+            )
+        })
 }
 
 /// The declaration-order arm class name for one union variant: a reference member
@@ -422,9 +428,13 @@ fn union_arm_name(base: &str, index: usize, choice: &CsilTypeExpression) -> Stri
     }
 }
 
-/// The unions (real tagged-sum choices, not string/int enums) keyed by the raw rule
-/// name a `Reference` carries, with their declaration-ordered variant types. The
-/// codec encodes/decodes a union as `[variant_index, value]`.
+/// The unions (real tagged-sum choices — at least one non-literal arm, per
+/// `csilgen_common::all_literal`, NOT merely "not a uniform string/int enum")
+/// keyed by the raw rule name a `Reference` carries, with their declaration-
+/// ordered variant types. The codec encodes/decodes a union as
+/// `[variant_index, value]`. A mixed-kind all-literal choice (`"a" / 1`) is
+/// excluded here — it is an `Enum` per the shared classifier, not a `Union`,
+/// even though neither `is_string_choice` nor `is_int_choice` holds for it.
 fn union_choices(
     spec: &CsilSpecSerialized,
 ) -> std::collections::HashMap<String, Vec<CsilTypeExpression>> {
@@ -436,7 +446,7 @@ fn union_choices(
                 CsilRuleType::TypeDef(CsilTypeExpression::Choice(cs)) => cs.clone(),
                 _ => return None,
             };
-            if is_string_choice(&choices) || is_int_choice(&choices) {
+            if csilgen_common::all_literal(&choices) {
                 None
             } else {
                 Some((rule.name.clone(), choices))
@@ -445,14 +455,30 @@ fn union_choices(
         .collect()
 }
 
+/// A choice whose members are ALL string literals (`"a" / "b" / "c"`) — a closed
+/// string set (a string enum). Mapped to `String` (see `map_type`) rather than a
+/// sealed class, because the wire form is the literal string itself, which is its
+/// own discriminant.
+///
+/// A choice that ALSO has a general `text`/`tstr` arm (`text / "a" / "b"`) is a
+/// MIXED union, not a closed set: the general arm accepts any string, so the wire
+/// form must be a tagged sum `[variant_index, value]` to disambiguate "the literal
+/// `a`" from "some other string that merely equals `a`". Collapsing that case to a
+/// bare `String` (as this function used to, by only requiring at least one text
+/// literal rather than requiring every arm to be one) silently dropped the tag and
+/// broke the wire contract for the mixed shape.
+///
+/// This is a SUB-classifier (see `is_int_choice`'s doc comment) — it returns
+/// `false` for a mixed-kind all-literal choice (`"a" / 1`), which is still an
+/// `Enum`, just not a uniform-string one; callers deciding enum-vs-union must use
+/// `csilgen_common::all_literal` instead.
 fn is_string_choice(choices: &[CsilTypeExpression]) -> bool {
     !choices.is_empty()
-        && choices
-            .iter()
-            .any(|c| matches!(c, CsilTypeExpression::Literal(CsilLiteralValue::Text(_))))
         && choices.iter().all(|c| {
-            matches!(c, CsilTypeExpression::Builtin(n) if n == "text" || n == "tstr")
-                || matches!(c, CsilTypeExpression::Literal(CsilLiteralValue::Text(_)))
+            matches!(
+                csilgen_common::choice_arm_literal(c),
+                Some(CsilLiteralValue::Text(_))
+            )
         })
 }
 
@@ -484,6 +510,31 @@ fn dart_record_type(group: &CsilGroupExpression, decimal: &str) -> String {
 fn wire_key_of_entry(entry: &CsilGroupEntry) -> Option<String> {
     entry.key.as_ref().and_then(wire_key)
 }
+
+// ---------------------------------------------------------------------------
+// Hoisting inline (anonymous) choices/groups to synthesized named types
+// ---------------------------------------------------------------------------
+//
+// A record field (or array element / map value / tuple element) whose type is
+// an inline `Choice` with at least one non-literal arm has no nameable Dart
+// type: `map_type` can emit `String`/`int` for an all-literal choice (the wire
+// is the bare literal, its own discriminant), but a *mixed* choice needs a
+// `sealed class` hierarchy, and Dart's sealed classes must be nominal — there
+// is no such thing as an anonymous sealed class inline in a field position.
+// Likewise an inline `Group` (`{ ... }` with no rule behind it) has no record
+// class to route through. `csilgen_common::hoist_inline_composites` (called
+// from `DartGenerator::generate`) synthesizes a named type for each such
+// position (`<OwnerRuleName>_<field>[_item|_key|_value|_<slot>]`), appends it
+// to the spec as an ordinary rule, and rewrites the field's type to a
+// `Reference` to it — so every existing code path that already knows how to
+// emit/codec a *named* choice or record (generate_sealed_choice/generate_record,
+// the `records`/`unions`/`aliases` maps, dart_to_cbor_expr/dart_from_cbor_expr's
+// Reference branches) picks it up with zero further changes. An all-literal
+// choice (uniform-kind OR mixed-kind — any arm mix, per the shared classifier's
+// contract) is deliberately left un-hoisted (`hoist_all_literal_choices:
+// false`, matching TypeScript/Java): `map_type`/`dart_to_cbor_expr`/
+// `dart_from_cbor_expr` already special-case a direct all-literal `Choice` in
+// that shape — hoisting would only detour through a pointless `typedef` alias.
 
 // ---------------------------------------------------------------------------
 // Spec walking helpers
@@ -606,6 +657,39 @@ fn dart_string_lit(s: &str) -> String {
     }
     out.push('\'');
     out
+}
+
+/// `dart format`'s default page width (verified empirically against Dart 3.x's
+/// "tall style" formatter: a rendered line at or under 80 columns is kept on one
+/// line; over 80 it splits, with a single-argument call's sole argument moved to
+/// its own indented line with a trailing comma — see `dart_wrap_call`).
+const DART_PAGE_WIDTH: usize = 80;
+
+/// Render `prefix + literal + suffix` on one line if that fits `DART_PAGE_WIDTH`,
+/// otherwise the multi-line form `dart format` itself produces once a call's sole
+/// string-literal argument doesn't fit inline: the literal alone on the next line,
+/// two spaces deeper, with a trailing comma; `suffix` follows the closing paren at
+/// `prefix`'s own indent. `prefix` must already include the line's leading
+/// indentation and end at the open paren (e.g. `"    if (!RegExp("`).
+fn dart_wrap_call(prefix: &str, literal: &str, suffix: &str) -> String {
+    let one_line = format!("{prefix}{literal}{suffix}");
+    if one_line.chars().count() <= DART_PAGE_WIDTH {
+        format!("{one_line}\n")
+    } else {
+        let indent: String = prefix.chars().take_while(|c| *c == ' ').collect();
+        format!("{prefix}\n  {indent}{literal},\n{indent}{suffix}\n")
+    }
+}
+
+/// A `throw ArgumentError(message);` statement at the guard body's fixed 6-space
+/// indent, wrapped the same way `dart format` would if `message` makes the line
+/// overflow the page width (see `dart_wrap_call`).
+fn dart_throw_argument_error(message: &str) -> String {
+    dart_wrap_call(
+        "      throw ArgumentError(",
+        &dart_string_lit(message),
+        ");",
+    )
 }
 
 fn literal_to_dart(value: &CsilLiteralValue) -> String {
@@ -1036,8 +1120,8 @@ fn dart_first_channel_example(
                 continue;
             }
             return Some(DartChannelExample {
-                service_wire: wire_service_string(name),
-                op_wire: wire_op_string(&op.name),
+                service_wire: name.to_string(),
+                op_wire: op.name.clone(),
                 handler_iface: format!("{}Handler", dart_type_name(name)),
                 route_fn: format!("route{}Channel", dart_type_name(name)),
                 message_type,
@@ -1634,6 +1718,22 @@ impl DartGenerator {
         surface: Surface,
         pkg_mode: bool,
     ) -> Result<GeneratedFiles> {
+        // Every downstream pass (record/type declaration, the records/aliases/
+        // unions maps, the codec) walks `spec.rules` — hoisting inline mixed-
+        // choice/group fields to synthesized named rules FIRST means none of
+        // those passes need to know about "inline" as a concept at all; a
+        // hoisted field is, from here on, just a Reference to an ordinary rule.
+        // An all-literal choice (uniform or mixed-kind) stays inline
+        // (`hoist_all_literal_choices: false`) — `map_type`/`dart_to_cbor_expr`/
+        // `dart_from_cbor_expr` already render a correct bare-literal enum for it
+        // in the field position itself.
+        let spec = csilgen_common::hoist_inline_composites(
+            spec,
+            csilgen_common::HoistOptions {
+                hoist_all_literal_choices: false,
+            },
+        );
+        let spec = &spec;
         let mut files = Vec::new();
 
         let records = record_names(spec);
@@ -1863,6 +1963,11 @@ impl DartGenerator {
             out.push('\n');
         }
         out.push_str(body);
+        // The formatter ends every file with exactly one newline — no trailing
+        // blank line survives, so trim what the section joiners left behind.
+        while out.ends_with("\n\n") {
+            out.pop();
+        }
         out
     }
 
@@ -1921,9 +2026,14 @@ impl DartGenerator {
             .filter_map(|e| entry_names(e).map(|(m, w)| (m, w, e)))
             .collect();
 
-        // Fields.
-        for (member, _wire, entry) in &named {
+        // Fields. dart format demands a blank line before a doc-commented member
+        // that follows another member (never after the opening brace), so emitting
+        // it here keeps the output `dart format --set-exit-if-changed`-clean.
+        for (index, (member, _wire, entry)) in named.iter().enumerate() {
             if let Some(desc) = field_description(&entry.metadata) {
+                if index > 0 {
+                    out.push('\n');
+                }
                 out.push_str(&format!("  /// {desc}\n"));
             }
             let ty = map_type(&entry.value_type, &entry.occurrence, decimal);
@@ -1935,24 +2045,19 @@ impl DartGenerator {
         out.push('\n');
 
         // Const constructor with required named params (optional fields are not
-        // required so a caller can omit them). A fieldless record uses a plain
-        // unnamed constructor — Dart rejects an empty named-parameter list
-        // (`const X({});` is a syntax error), so the `({ ... })` form is only
-        // emitted when there is at least one field.
-        if named.is_empty() {
-            out.push_str(&format!("  const {class_name}();\n\n"));
-        } else {
-            out.push_str(&format!("  const {class_name}({{\n"));
-            for (member, _wire, entry) in &named {
-                let optional = matches!(entry.occurrence, Some(CsilOccurrence::Optional));
-                if optional {
-                    out.push_str(&format!("    this.{member},\n"));
+        // required so a caller can omit them).
+        let params: Vec<String> = named
+            .iter()
+            .map(|(member, _wire, entry)| {
+                if matches!(entry.occurrence, Some(CsilOccurrence::Optional)) {
+                    format!("this.{member}")
                 } else {
-                    out.push_str(&format!("    required this.{member},\n"));
+                    format!("required this.{member}")
                 }
-            }
-            out.push_str("  });\n\n");
-        }
+            })
+            .collect();
+        out.push_str(&dart_ctor_decl(2, &class_name, &params));
+        out.push('\n');
 
         out.push_str(&self.generate_to_map(&named));
         out.push_str(&self.generate_from_map(&class_name, &named));
@@ -1998,13 +2103,17 @@ impl DartGenerator {
             } else {
                 member.clone()
             };
-            let value = dart_to_cbor_value(&entry.value_type, &access, records, aliases, unions);
+            let value = dart_to_cbor_expr(&entry.value_type, &access, records, aliases, unions);
             if optional {
-                out.push_str(&format!(
-                    "    if ({member} != null) map[{wire_lit}] = {value};\n"
+                out.push_str(&dart_if_stmt(
+                    4,
+                    &format!("{member} != null"),
+                    &format!("map[{wire_lit}] = "),
+                    &value,
+                    ";",
                 ));
             } else {
-                out.push_str(&format!("    map[{wire_lit}] = {value};\n"));
+                out.push_str(&dart_stmt(4, &format!("map[{wire_lit}] = "), &value, ";"));
             }
         }
         out.push_str("    return map;\n  }\n\n");
@@ -2018,34 +2127,63 @@ impl DartGenerator {
         if !named.is_empty() {
             out.push_str("    final map = cbor as Map;\n");
         }
-        out.push_str(&format!("    return {class_name}(\n"));
-        for (member, wire, entry) in named {
-            let wire_lit = dart_string_lit(wire);
-            let optional = matches!(entry.occurrence, Some(CsilOccurrence::Optional));
-            let read = dart_from_cbor_value(
-                &entry.value_type,
-                &format!("map[{wire_lit}]"),
-                records,
-                decimal,
-                aliases,
-                unions,
-            );
-            if optional {
-                out.push_str(&format!(
-                    "      {member}: map[{wire_lit}] == null ? null : {read},\n"
-                ));
-            } else {
-                out.push_str(&format!("      {member}: {read},\n"));
-            }
-        }
-        out.push_str("    );\n  }\n\n");
+        let args: Vec<DExpr> = named
+            .iter()
+            .map(|(member, wire, entry)| {
+                let wire_lit = dart_string_lit(wire);
+                let optional = matches!(entry.occurrence, Some(CsilOccurrence::Optional));
+                let read = dart_from_cbor_expr(
+                    &entry.value_type,
+                    &format!("map[{wire_lit}]"),
+                    records,
+                    decimal,
+                    aliases,
+                    unions,
+                );
+                let value = if optional {
+                    DExpr::CondNull {
+                        cond: format!("map[{wire_lit}] == null"),
+                        else_: Box::new(read),
+                    }
+                } else {
+                    read
+                };
+                DExpr::Named {
+                    name: member.clone(),
+                    value: Box::new(value),
+                }
+            })
+            .collect();
+        out.push_str(&dart_stmt(
+            4,
+            "return ",
+            &DExpr::Call {
+                callee: class_name.to_string(),
+                args,
+            },
+            ";",
+        ));
+        out.push_str("  }\n\n");
 
         out.push_str("  /// Encode this record to canonical CSIL CBOR bytes.\n");
         out.push_str("  Uint8List toCbor() => CsilCbor.encodeValue(toCborValue());\n\n");
         out.push_str("  /// Decode a CSIL CBOR byte payload into this record.\n");
-        out.push_str(&format!(
-            "  factory {class_name}.fromCbor(List<int> bytes) =>\n      {class_name}.fromCborValue(CsilCbor.decode(bytes));\n"
-        ));
+        let from_cbor_flat = format!(
+            "  factory {class_name}.fromCbor(List<int> bytes) => {class_name}.fromCborValue(CsilCbor.decode(bytes));"
+        );
+        let arrow_body = format!("      {class_name}.fromCborValue(CsilCbor.decode(bytes));");
+        if from_cbor_flat.len() <= DART_WIDTH {
+            out.push_str(&from_cbor_flat);
+            out.push('\n');
+        } else if arrow_body.len() <= DART_WIDTH {
+            out.push_str(&format!(
+                "  factory {class_name}.fromCbor(List<int> bytes) =>\n{arrow_body}\n"
+            ));
+        } else {
+            out.push_str(&format!(
+                "  factory {class_name}.fromCbor(List<int> bytes) =>\n      {class_name}.fromCborValue(\n        CsilCbor.decode(bytes),\n      );\n"
+            ));
+        }
         out
     }
 
@@ -2065,8 +2203,12 @@ impl DartGenerator {
             }
             let wire_lit = dart_string_lit(wire);
             if matches!(entry.occurrence, Some(CsilOccurrence::Optional)) {
-                out.push_str(&format!(
-                    "    if ({member} != null) map[{wire_lit}] = {member};\n"
+                out.push_str(&dart_if_stmt(
+                    4,
+                    &format!("{member} != null"),
+                    &format!("map[{wire_lit}] = "),
+                    &DExpr::Atom(member.clone()),
+                    ";",
                 ));
             } else {
                 out.push_str(&format!("    map[{wire_lit}] = {member};\n"));
@@ -2083,26 +2225,49 @@ impl DartGenerator {
     ) -> String {
         let decimal = self.cfg.decimal_dart_type();
         let mut out = String::new();
-        out.push_str(&format!(
-            "  factory {class_name}.fromMap(Map<String, Object?> map) {{\n"
+        out.push_str(&dart_signature(
+            2,
+            &format!("factory {class_name}.fromMap"),
+            &["Map<String, Object?> map".to_string()],
+            " {",
         ));
-        out.push_str(&format!("    return {class_name}(\n"));
         // Every declared field is read back: the const constructor's `required`
         // named params must all be supplied, so visibility can't drop a field here
         // the way `toMap` drops a receive-only one (a map has no such obligation).
-        for (member, wire, entry) in named {
-            let wire_lit = dart_string_lit(wire);
-            let ty = map_type(&entry.value_type, &entry.occurrence, decimal);
-            // A cast keeps the typed field honest; `as T?` tolerates an absent key.
-            // A field already typed `Object?` matches the map's own value type, so
-            // casting it would be a redundant (lint-flagged) no-op.
-            if ty == "Object?" {
-                out.push_str(&format!("      {member}: map[{wire_lit}],\n"));
-            } else {
-                out.push_str(&format!("      {member}: map[{wire_lit}] as {ty},\n"));
-            }
-        }
-        out.push_str("    );\n  }\n\n");
+        let args: Vec<DExpr> = named
+            .iter()
+            .map(|(member, wire, entry)| {
+                let wire_lit = dart_string_lit(wire);
+                let ty = map_type(&entry.value_type, &entry.occurrence, decimal);
+                // A cast keeps the typed field honest; `as T?` tolerates an absent key.
+                // A field already typed `Object?` matches the map's own value type, so
+                // casting it would be a redundant (lint-flagged) no-op. `Cast` (not a
+                // bare `Atom`) so a long hoisted/synthesized `ty` still splits the way
+                // `dart format` would rather than overflowing the page width.
+                let value = if ty == "Object?" {
+                    DExpr::Atom(format!("map[{wire_lit}]"))
+                } else {
+                    DExpr::Cast {
+                        expr: Box::new(DExpr::Atom(format!("map[{wire_lit}]"))),
+                        ty,
+                    }
+                };
+                DExpr::Named {
+                    name: member.clone(),
+                    value: Box::new(value),
+                }
+            })
+            .collect();
+        out.push_str(&dart_stmt(
+            4,
+            "return ",
+            &DExpr::Call {
+                callee: class_name.to_string(),
+                args,
+            },
+            ";",
+        ));
+        out.push_str("  }\n\n");
         out
     }
 
@@ -2136,9 +2301,30 @@ impl DartGenerator {
         // Braces (not a bare `if (..) throw`) so the body never reads as an
         // awkwardly-wrapped line and the output honors `curly_braces_in_flow_control`.
         format!(
-            "    if ({condition}) {{\n      throw ArgumentError({});\n    }}\n",
-            dart_string_lit(message)
+            "    if ({condition}) {{\n{}    }}\n",
+            dart_throw_argument_error(message)
         )
+    }
+
+    /// The regex-constraint guard, split out from `guard` because `RegExp(pattern)`
+    /// is the one condition whose sole argument (an arbitrary CSIL `.match()`
+    /// pattern) is long enough in practice to cross Dart's page width — `guard`'s
+    /// generic `condition: &str` can't itself decide to wrap only that inner call.
+    fn regex_guard(&self, member: &str, bang: &str, optional: bool, pattern: &str) -> String {
+        let pat = dart_string_lit(pattern);
+        let prefix = if optional {
+            format!("    if ({member} != null && !RegExp(")
+        } else {
+            "    if (!RegExp(".to_string()
+        };
+        let suffix = format!(").hasMatch({member}{bang})) {{");
+        let mut out = String::new();
+        out.push_str(&dart_wrap_call(&prefix, &pat, &suffix));
+        out.push_str(&dart_throw_argument_error(&format!(
+            "'{member}' must match pattern {pattern}"
+        )));
+        out.push_str("    }\n");
+        out
     }
 
     /// A length/count guard that prefers `isEmpty`/`isNotEmpty` at the
@@ -2262,11 +2448,7 @@ impl DartGenerator {
         match op {
             CsilControlOperator::Size(size) => self.size_guard(member, size, optional),
             CsilControlOperator::Regex(pattern) => {
-                let pat = dart_string_lit(pattern);
-                self.guard(
-                    &g(&format!("!RegExp({pat}).hasMatch({member}{bang})")),
-                    &format!("'{member}' must match pattern {pattern}"),
-                )
+                self.regex_guard(member, bang, optional, pattern)
             }
             CsilControlOperator::GreaterEqual(v) => self.guard(
                 &g(&format!(
@@ -2425,11 +2607,19 @@ impl DartGenerator {
                     }
                 })
                 .collect();
-            out.push_str(&parts.join(" &&\n        "));
+            // The `&&` chain collapses onto one line when it fits; otherwise every
+            // operand lands on its own line, exactly as the formatter splits infix
+            // chains (all-or-nothing).
+            // Measured as `    return {joined};` — indent, keyword, semicolon.
+            let joined = parts.join(" && ");
+            if 4 + "return ".len() + joined.len() + ";".len() <= DART_WIDTH {
+                out.push_str(&joined);
+            } else {
+                out.push_str(&parts.join(" &&\n        "));
+            }
         }
         out.push_str(";\n  }\n\n");
 
-        out.push_str("  @override\n  int get hashCode => Object.hashAll([");
         let hash_parts: Vec<String> = named
             .iter()
             .map(|(member, _wire, entry)| {
@@ -2447,8 +2637,25 @@ impl DartGenerator {
                 }
             })
             .collect();
-        out.push_str(&hash_parts.join(", "));
-        out.push_str("]);\n");
+        out.push_str("  @override\n");
+        // Three tiers, matching the formatter's preferences for an `=>` member:
+        // one line; split at the arrow with the body flat on the next line; keep
+        // the arrow and block-split the list, one element per line.
+        let joined = hash_parts.join(", ");
+        let flat = format!("  int get hashCode => Object.hashAll([{joined}]);");
+        let arrow_body = format!("      Object.hashAll([{joined}]);");
+        if flat.len() <= DART_WIDTH {
+            out.push_str(&flat);
+            out.push('\n');
+        } else if arrow_body.len() <= DART_WIDTH {
+            out.push_str(&format!("  int get hashCode =>\n{arrow_body}\n"));
+        } else {
+            out.push_str("  int get hashCode => Object.hashAll([\n");
+            for part in &hash_parts {
+                out.push_str(&format!("    {part},\n"));
+            }
+            out.push_str("  ]);\n");
+        }
 
         // A small content-equality helper, emitted only for records that actually
         // carry a byte field so it never lands as an unused declaration. It stays
@@ -2482,6 +2689,15 @@ impl DartGenerator {
         if is_int_choice(choices) {
             return format!("typedef {base} = int;\n\n");
         }
+        // An all-literal choice that is neither a uniform string set nor a uniform
+        // int set is a MIXED-kind enum (`"a" / 1`, per `csilgen_common::all_literal`
+        // — still an `Enum`, just not a uniform-kind one). The runtime value can be
+        // any Dart type depending on which literal was decoded, so `Object?` is the
+        // only static type that fits every member; the wire is still the bare
+        // literal (its own discriminant), never a tagged sum.
+        if csilgen_common::all_literal(choices) {
+            return format!("typedef {base} = Object?;\n\n");
+        }
         // A real union: a `sealed class` base with one `final class` arm per variant
         // in declaration order, so the host pattern-matches exhaustively and the
         // arm's position is the tagged-sum discriminant the codec writes.
@@ -2492,8 +2708,9 @@ impl DartGenerator {
         for (index, choice) in choices.iter().enumerate() {
             let arm = union_arm_name(&base, index, choice);
             let inner = map_type(choice, &None, self.cfg.decimal_dart_type());
+            out.push_str(&dart_class_header(0, "final class", &arm, &base));
             out.push_str(&format!(
-                "final class {arm} extends {base} {{\n  final {inner} value;\n  const {arm}(this.value);\n}}\n\n"
+                "  final {inner} value;\n  const {arm}(this.value);\n}}\n\n"
             ));
         }
         out
@@ -2508,7 +2725,7 @@ impl DartGenerator {
         for (i, group) in groups.iter().enumerate() {
             let arm = format!("{base}Variant{i}");
             // Each variant is its own record-shaped final class extending the base.
-            out.push_str(&format!("final class {arm} extends {base} {{\n"));
+            out.push_str(&dart_class_header(0, "final class", &arm, &base));
             let named: Vec<(String, String, &CsilGroupEntry)> = group
                 .entries
                 .iter()
@@ -2522,26 +2739,18 @@ impl DartGenerator {
                 );
                 out.push_str(&format!("  final {ty} {member};\n"));
             }
-            // A fieldless variant uses a plain unnamed constructor — Dart rejects
-            // an empty named-parameter list (`const X({});`), so the `({ ... })`
-            // form is only emitted when the variant carries at least one field.
-            if named.is_empty() {
-                out.push_str(&format!("  const {arm}();\n}}\n\n"));
-            } else {
-                out.push_str(&format!("  const {arm}({{"));
-                let params: Vec<String> = named
-                    .iter()
-                    .map(|(member, _wire, entry)| {
-                        if matches!(entry.occurrence, Some(CsilOccurrence::Optional)) {
-                            format!("this.{member}")
-                        } else {
-                            format!("required this.{member}")
-                        }
-                    })
-                    .collect();
-                out.push_str(&params.join(", "));
-                out.push_str("});\n}\n\n");
-            }
+            let params: Vec<String> = named
+                .iter()
+                .map(|(member, _wire, entry)| {
+                    if matches!(entry.occurrence, Some(CsilOccurrence::Optional)) {
+                        format!("this.{member}")
+                    } else {
+                        format!("required this.{member}")
+                    }
+                })
+                .collect();
+            out.push_str(&dart_ctor_decl(2, &arm, &params));
+            out.push_str("}\n\n");
         }
         out
     }
@@ -2619,9 +2828,10 @@ impl DartGenerator {
         let decimal = self.cfg.decimal_dart_type();
         let aw = shape.await_kw();
         let asy = shape.async_kw();
-        // The wire service is lowercased and the op PascalCased (the wire contract),
-        // so a Dart client reaches the same endpoint as a Go/Python/TS peer.
-        let wire_service = dart_string_lit(&wire_service_string(name));
+        // Wire strings carry the verbatim CSIL service and op names
+        // (csil-rpc-transport.md §1.1), so a Dart client reaches the same
+        // endpoint as a Go/Python/TS peer.
+        let wire_service = dart_string_lit(name);
         let mut out = String::new();
         out.push_str(&format!(
             "/// A typed, transport-agnostic client for the {name} service. The client owns\n/// (de)serialization; the carrier only moves bytes.\nfinal class {client} {{\n"
@@ -2638,10 +2848,10 @@ impl DartGenerator {
                 continue;
             }
             let method = dart_member_name(&op.name);
-            let wire_op = dart_string_lit(&wire_op_string(&op.name));
+            let wire_op = dart_string_lit(&op.name);
             let out_type = map_type(&success_type(&op.output_type), &None, decimal);
             let ret = shape.ret(&out_type);
-            let out_decode = dart_from_cbor_value(
+            let out_decode = dart_from_cbor_expr(
                 &success_type(&op.output_type),
                 "CsilCbor.decode(csilResp)",
                 records,
@@ -2649,31 +2859,56 @@ impl DartGenerator {
                 aliases,
                 unions,
             );
-            if is_null_input(&op.input_type) {
-                out.push_str(&format!("  {ret} {method}() {asy}{{\n"));
-                out.push_str(&format!(
-                    "    final csilResp = {aw}transport.call({wire_service}, {wire_op}, const <int>[]);\n"
-                ));
-                out.push_str(&format!("    return {out_decode};\n  }}\n\n"));
-            } else {
-                let in_type = map_type(&op.input_type, &None, decimal);
+            let req_bytes = if is_null_input(&op.input_type) {
+                DExpr::Atom("const <int>[]".to_string())
+            } else if matches!(&op.input_type, CsilTypeExpression::Reference(n) if records.contains(&dart_type_name(n)))
+            {
                 // A record request serializes itself; a scalar/list request goes
                 // through the encoder directly.
-                let req_bytes = if matches!(&op.input_type, CsilTypeExpression::Reference(n) if records.contains(&dart_type_name(n)))
-                {
-                    "request.toCbor()".to_string()
-                } else {
-                    format!(
-                        "CsilCbor.encodeValue({})",
-                        dart_to_cbor_value(&op.input_type, "request", records, aliases, unions)
-                    )
-                };
-                out.push_str(&format!("  {ret} {method}({in_type} request) {asy}{{\n"));
-                out.push_str(&format!(
-                    "    final csilResp = {aw}transport.call({wire_service}, {wire_op}, {req_bytes});\n"
-                ));
-                out.push_str(&format!("    return {out_decode};\n  }}\n\n"));
-            }
+                DExpr::Atom("request.toCbor()".to_string())
+            } else {
+                DExpr::Call {
+                    callee: "CsilCbor.encodeValue".to_string(),
+                    args: vec![dart_to_cbor_expr(
+                        &op.input_type,
+                        "request",
+                        records,
+                        aliases,
+                        unions,
+                    )],
+                }
+            };
+            let sig_params = if is_null_input(&op.input_type) {
+                Vec::new()
+            } else {
+                let in_type = map_type(&op.input_type, &None, decimal);
+                vec![format!("{in_type} request")]
+            };
+            out.push_str(&dart_signature(
+                2,
+                &format!("{ret} {method}"),
+                &sig_params,
+                &format!(" {asy}{{"),
+            ));
+            out.push_str(&dart_stmt(
+                4,
+                &format!("final csilResp = {aw}"),
+                &DExpr::Call {
+                    callee: "transport.call".to_string(),
+                    args: vec![
+                        DExpr::Atom(wire_service.clone()),
+                        DExpr::Atom(wire_op),
+                        req_bytes,
+                    ],
+                },
+                ";",
+            ));
+            out.push_str(&dart_stmt(4, "return ", &out_decode, ";"));
+            out.push_str("  }\n\n");
+        }
+        // The formatter allows no blank line before a closing class brace.
+        if out.ends_with("\n\n") {
+            out.pop();
         }
         out.push_str("}\n\n");
         out
@@ -2699,12 +2934,22 @@ impl DartGenerator {
                         out.push_str(&format!("  {out_type} {method}();\n"));
                     } else {
                         let in_type = map_type(&op.input_type, &None, decimal);
-                        out.push_str(&format!("  {out_type} {method}({in_type} request);\n"));
+                        out.push_str(&dart_signature(
+                            2,
+                            &format!("{out_type} {method}"),
+                            &[format!("{in_type} request")],
+                            ";",
+                        ));
                     }
                 }
                 CsilServiceDirection::Bidirectional => {
                     let in_type = map_type(&op.input_type, &None, decimal);
-                    out.push_str(&format!("  void {method}({in_type} message);\n"));
+                    out.push_str(&dart_signature(
+                        2,
+                        &format!("void {method}"),
+                        &[format!("{in_type} message")],
+                        ";",
+                    ));
                 }
                 CsilServiceDirection::Reverse => {
                     // Server pushes only; no inbound handler method.
@@ -2733,21 +2978,37 @@ impl DartGenerator {
         let fn_name = format!("route{}Channel", dart_type_name(name));
         let mut out = String::new();
         out.push_str(&format!(
-            "/// Decode one inbound channel frame and dispatch to the matching {name}\n/// method by its verbatim wire op name (verbose profile).\nvoid {fn_name}({handler} handler, CsilCodec codec, String op, List<int> data) {{\n  switch (op) {{\n"
+            "/// Decode one inbound channel frame and dispatch to the matching {name}\n/// method by its verbatim wire op name (verbose profile).\n"
         ));
+        out.push_str(&dart_signature(
+            0,
+            &format!("void {fn_name}"),
+            &[
+                format!("{handler} handler"),
+                "CsilCodec codec".to_string(),
+                "String op".to_string(),
+                "List<int> data".to_string(),
+            ],
+            " {",
+        ));
+        out.push_str("  switch (op) {\n");
         for op in &service.operations {
             if !matches!(op.direction, CsilServiceDirection::Bidirectional) {
                 continue;
             }
             let method = dart_member_name(&op.name);
             let in_type = map_type(&op.input_type, &None, decimal);
-            out.push_str(&format!(
-                "    case {}:\n",
-                dart_string_lit(&wire_op_string(&op.name))
+            out.push_str(&format!("    case {}:\n", dart_string_lit(&op.name)));
+            out.push_str(&dart_stmt(
+                6,
+                "",
+                &DExpr::Call {
+                    callee: format!("handler.{method}"),
+                    args: vec![DExpr::Atom(format!("codec.decode(data) as {in_type}"))],
+                },
+                ";",
             ));
-            out.push_str(&format!(
-                "      handler.{method}(codec.decode(data) as {in_type});\n      return;\n"
-            ));
+            out.push_str("      return;\n");
         }
         out.push_str(
             "    default:\n      throw ArgumentError('unknown channel op: $op');\n  }\n}\n\n",
@@ -2765,9 +3026,21 @@ impl DartGenerator {
         let fn_name = format!("route{}ChannelCompact", dart_type_name(name));
         let mut out = String::new();
         out.push_str(&format!(
-            "/// Compact-profile twin of route{0}Channel: dispatch by @wire-id ordinal.\n/// The profile is negotiated on the wire, so a host keeps both routers.\nvoid {fn_name}({handler} handler, CsilCodec codec, int op, List<int> data) {{\n  switch (op) {{\n",
+            "/// Compact-profile twin of route{0}Channel: dispatch by @wire-id ordinal.\n/// The profile is negotiated on the wire, so a host keeps both routers.\n",
             dart_type_name(name)
         ));
+        out.push_str(&dart_signature(
+            0,
+            &format!("void {fn_name}"),
+            &[
+                format!("{handler} handler"),
+                "CsilCodec codec".to_string(),
+                "int op".to_string(),
+                "List<int> data".to_string(),
+            ],
+            " {",
+        ));
+        out.push_str("  switch (op) {\n");
         for op in &service.operations {
             if !matches!(op.direction, CsilServiceDirection::Bidirectional) {
                 continue;
@@ -2776,9 +3049,16 @@ impl DartGenerator {
             let method = dart_member_name(&op.name);
             let in_type = map_type(&op.input_type, &None, decimal);
             out.push_str(&format!("    case {op_id}:\n"));
-            out.push_str(&format!(
-                "      handler.{method}(codec.decode(data) as {in_type});\n      return;\n"
+            out.push_str(&dart_stmt(
+                6,
+                "",
+                &DExpr::Call {
+                    callee: format!("handler.{method}"),
+                    args: vec![DExpr::Atom(format!("codec.decode(data) as {in_type}"))],
+                },
+                ";",
             ));
+            out.push_str("      return;\n");
         }
         out.push_str(
             "    default:\n      throw ArgumentError('unknown channel ordinal: $op');\n  }\n}\n\n",
@@ -2815,32 +3095,434 @@ fn is_bytes_type(type_expr: &CsilTypeExpression) -> bool {
     matches!(type_expr, CsilTypeExpression::Builtin(name) if name == "bytes" || name == "bstr")
 }
 
-/// The wire `service` string: the service base (trailing `Service` stripped),
-/// **lowercased**, per `docs/cbor-wire-contract.md`. Distinct from the Dart class
-/// name (`service_base`), which stays PascalCase — a case transform must never reach
-/// the wire differently from the other targets.
-fn wire_service_string(name: &str) -> String {
-    let pascal = name.to_case(Case::Pascal);
-    let base = pascal
-        .strip_suffix("Service")
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
-        .unwrap_or(pascal);
-    base.to_lowercase()
+// ---------------------------------------------------------------------------
+// Width-aware Dart rendering (dart format "tall style" parity)
+// ---------------------------------------------------------------------------
+//
+// Consumers gate generated code on `dart format --set-exit-if-changed`, and the
+// generator cannot shell out to the formatter (it runs sandboxed in WASM), so
+// the emitters measure each would-be line against the formatter's 80-column
+// page width and produce the same split shape the Dart 3.7+ "tall" formatter
+// would choose: fully-split argument lists with a trailing comma, method
+// chains one call per line at +4, conditional operands on their own lines at
+// +4 (a chain nested in a branch lands at +6 from the operand, matching the
+// formatter's extra expression indent), block-formatted trailing switch /
+// collection arguments, and always-split statement blocks (an IIFE body never
+// stays on one line even when it would fit).
+
+const DART_WIDTH: usize = 80;
+
+fn pad(n: usize) -> String {
+    " ".repeat(n)
 }
 
-/// The wire `op`/method string: the operation name PascalCased with the simple rule
-/// (capitalize after `_`/`-`, leave the rest as written so acronym runs survive),
-/// matching the other targets so a Dart client reaches the same endpoint.
-fn wire_op_string(name: &str) -> String {
-    let mut out = String::new();
-    for word in name.split(['_', '-']) {
-        let mut chars = word.chars();
-        if let Some(first) = chars.next() {
-            out.extend(first.to_uppercase());
-            out.push_str(chars.as_str());
+/// A class declaration header (`{kw} {name} extends {base} {`) at `indent`:
+/// flat when it fits, otherwise `extends` moves to its own continuation line
+/// at `indent + 4` — mirrors how `dart format` wraps a long `extends` clause.
+/// A synthesized (hoisted) union arm's name is `<Owner>_<field>Variant<N>`-
+/// shaped and routinely overflows the page width, so this can't just be a
+/// bare `format!`.
+fn dart_class_header(indent: usize, kw: &str, name: &str, base: &str) -> String {
+    let flat = format!("{kw} {name} extends {base} {{");
+    if indent + flat.len() <= DART_WIDTH {
+        format!("{}{flat}\n", pad(indent))
+    } else {
+        format!(
+            "{}{kw} {name}\n{}extends {base} {{\n",
+            pad(indent),
+            pad(indent + 4)
+        )
+    }
+}
+
+/// The Dart expressions the codec/client emitters produce, shaped so each node
+/// can render itself flat or in the exact split form `dart format` would pick.
+#[derive(Debug, Clone)]
+enum DExpr {
+    /// Never splits, whatever its width (member reads, literals, short casts —
+    /// a long cast that needs to *split* is `Cast`, not this).
+    Atom(String),
+    /// `(inner)` — the tuple decoder's parenthesized optional element.
+    Paren(Box<DExpr>),
+    /// `expr as ty` — a cast, splittable (unlike `Atom`) for a long `ty`: a
+    /// hoisted/synthesized type name (`<Owner>_<field>`-shaped) routinely
+    /// overflows the page width where a short named-rule type never did.
+    Cast { expr: Box<DExpr>, ty: String },
+    /// `name: value` — a named argument.
+    Named { name: String, value: Box<DExpr> },
+    /// `callee(args...)`.
+    Call { callee: String, args: Vec<DExpr> },
+    /// `recv.m1(args).m2(args)...` — a method chain (splits every call at once).
+    Chain {
+        recv: String,
+        calls: Vec<(String, Vec<DExpr>)>,
+    },
+    /// `params => body`.
+    Lambda { params: String, body: Box<DExpr> },
+    /// `cond ? null : else` — the optional-field guard.
+    CondNull { cond: String, else_: Box<DExpr> },
+    /// `switch (head) { pat => value, ... }`, parenthesized in value position.
+    Switch {
+        head: String,
+        arms: Vec<(String, DExpr)>,
+        parens: bool,
+    },
+    /// `(() { bind return ret; })()` — statement blocks always split.
+    Iife { bind: String, ret: Box<DExpr> },
+    /// `prefix[elems...]`.
+    ListLit { prefix: String, elems: Vec<DExpr> },
+    /// `(elems...)` — a Dart 3 record literal; `trailing` keeps the mandatory
+    /// comma of a one-element positional record.
+    RecordLit { elems: Vec<DExpr>, trailing: bool },
+}
+
+impl DExpr {
+    fn flat(&self) -> String {
+        match self {
+            DExpr::Atom(s) => s.clone(),
+            DExpr::Paren(e) => format!("({})", e.flat()),
+            DExpr::Cast { expr, ty } => format!("{} as {ty}", expr.flat()),
+            DExpr::Named { name, value } => format!("{name}: {}", value.flat()),
+            DExpr::Call { callee, args } => format!("{callee}({})", join_flat(args)),
+            DExpr::Chain { recv, calls } => {
+                let mut out = recv.clone();
+                for (name, args) in calls {
+                    out.push_str(&format!(".{name}({})", join_flat(args)));
+                }
+                out
+            }
+            DExpr::Lambda { params, body } => format!("{params} => {}", body.flat()),
+            DExpr::CondNull { cond, else_ } => format!("{cond} ? null : {}", else_.flat()),
+            DExpr::Switch { head, arms, parens } => {
+                let body: Vec<String> = arms
+                    .iter()
+                    .map(|(pat, val)| format!("{pat} => {}", val.flat()))
+                    .collect();
+                let inner = format!("switch ({head}) {{ {} }}", body.join(", "));
+                if *parens { format!("({inner})") } else { inner }
+            }
+            DExpr::Iife { bind, ret } => {
+                format!("(() {{ {bind} return {}; }})()", ret.flat())
+            }
+            DExpr::ListLit { prefix, elems } => format!("{prefix}[{}]", join_flat(elems)),
+            DExpr::RecordLit { elems, trailing } => {
+                if *trailing {
+                    format!("({},)", join_flat(elems))
+                } else {
+                    format!("({})", join_flat(elems))
+                }
+            }
         }
     }
+
+    /// The formatter never keeps a statement block on one line, so anything
+    /// containing an IIFE must render split even when its flat form would fit.
+    fn force_split(&self) -> bool {
+        match self {
+            DExpr::Atom(_) => false,
+            DExpr::Paren(e) => e.force_split(),
+            DExpr::Cast { expr, .. } => expr.force_split(),
+            DExpr::Named { value, .. } => value.force_split(),
+            DExpr::Call { args, .. } => args.iter().any(DExpr::force_split),
+            DExpr::Chain { calls, .. } => calls
+                .iter()
+                .any(|(_, args)| args.iter().any(DExpr::force_split)),
+            DExpr::Lambda { body, .. } => body.force_split(),
+            DExpr::CondNull { else_, .. } => else_.force_split(),
+            DExpr::Switch { arms, .. } => arms.iter().any(|(_, v)| v.force_split()),
+            DExpr::Iife { .. } => true,
+            DExpr::ListLit { elems, .. } | DExpr::RecordLit { elems, .. } => {
+                elems.iter().any(DExpr::force_split)
+            }
+        }
+    }
+
+    /// The opening line a "block argument" contributes when the formatter keeps
+    /// a call's leading arguments in place and splits only its trailing switch /
+    /// collection / lambda-over-block argument. `None` for shapes the formatter
+    /// refuses to block-format (an IIFE is an invocation, not a block).
+    fn block_head(&self) -> Option<String> {
+        match self {
+            DExpr::Switch { head, parens, .. } => {
+                let open = if *parens { "(" } else { "" };
+                Some(format!("{open}switch ({head}) {{"))
+            }
+            DExpr::ListLit { prefix, .. } => Some(format!("{prefix}[")),
+            // A lambda argument is never block-head-merged into the
+            // enclosing call: `dart format` always fully splits a call whose
+            // argument is an arrow function with a multi-line body (e.g.
+            // `.map((x) => [...])` becomes `.map(\n  (x) => [...],\n)`, never
+            // `.map((x) => [`), even though the very same collection/switch
+            // WOULD merge as a plain (non-lambda-wrapped) trailing argument
+            // of an ordinary call — e.g. `MapEntry(k, [...])` does merge.
+            // Confirmed empirically against `dart format` rather than
+            // theorized: a lambda's body block-formats on its own via the
+            // fully-split argument path (`render`), not via this merge path.
+            DExpr::Lambda { .. } => None,
+            DExpr::Call { callee, args } => {
+                let (last, leading) = args.split_last()?;
+                if leading.iter().any(DExpr::force_split) {
+                    return None;
+                }
+                let head = last.block_head()?;
+                let mut lead = join_flat(leading);
+                if !lead.is_empty() {
+                    lead.push_str(", ");
+                }
+                Some(format!("{callee}({lead}{head}"))
+            }
+            _ => None,
+        }
+    }
+
+    /// Render starting at `col` on a line indented `li`, with `tail` trailing
+    /// characters (comma/semicolon) still to come on the final line. `cont` is
+    /// the continuation indent split chains and conditionals hang at.
+    fn render(&self, li: usize, col: usize, tail: usize, cont: usize) -> String {
+        let flat = self.flat();
+        if !self.force_split() && col + flat.len() + tail <= DART_WIDTH {
+            return flat;
+        }
+        match self {
+            DExpr::Atom(s) => s.clone(),
+            DExpr::Paren(e) => format!("({})", e.render(li, col + 1, tail + 1, cont)),
+            // Reached only when `expr as ty` doesn't already fit at `col` — a
+            // generic fallback (`Cast` is a Named-argument value in practice;
+            // see the special case below, which is what actually fires for
+            // that shape).
+            DExpr::Cast { expr, ty } => format!(
+                "{}\n{}as {ty}",
+                expr.render(li, col, 0, cont),
+                pad(cont + 4)
+            ),
+            DExpr::Named { name, value } => {
+                // A cast breaks after the colon (never continues inline) once
+                // it stops fitting: `dart format` puts the receiver alone on
+                // its own line rather than trailing a long `name: ` prefix.
+                if let DExpr::Cast { expr, ty } = value.as_ref() {
+                    let inline = format!("{} as {ty}", expr.flat());
+                    if !expr.force_split() && cont + inline.len() + tail <= DART_WIDTH {
+                        return format!("{name}:\n{}{inline}", pad(cont));
+                    }
+                    return format!(
+                        "{name}:\n{}{}\n{}as {ty}",
+                        pad(cont),
+                        expr.render(cont, cont, 0, cont + 4),
+                        pad(cont + 4)
+                    );
+                }
+                format!(
+                    "{name}: {}",
+                    value.render(li, col + name.len() + 2, tail, li + 4)
+                )
+            }
+            DExpr::Call { callee, args } => render_call(li, col, tail, callee, args),
+            DExpr::Chain { recv, calls } => {
+                if calls.len() == 1 {
+                    let (name, args) = &calls[0];
+                    return render_call(li, col, tail, &format!("{recv}.{name}"), args);
+                }
+                let mut out = recv.clone();
+                for (i, (name, args)) in calls.iter().enumerate() {
+                    let seg_tail = if i + 1 == calls.len() { tail } else { 0 };
+                    out.push_str(&format!("\n{}.", pad(cont)));
+                    out.push_str(&render_call(cont, cont + 1, seg_tail, name, args));
+                }
+                out
+            }
+            DExpr::Lambda { params, body } => format!(
+                "{params} => {}",
+                body.render(li, col + params.len() + 4, tail, li + 4)
+            ),
+            DExpr::CondNull { cond, else_ } => format!(
+                "{cond}\n{}? null\n{}: {}",
+                pad(cont),
+                pad(cont),
+                // `else_` starts right after `": "` (column `cont + 2`), so a
+                // block-rendered value (e.g. the `Iife` a union/tuple decode
+                // wraps itself in) must use `cont + 2` as ITS OWN indent base
+                // too, or its closing delimiter lands two columns short of
+                // the column its opening line actually started at.
+                else_.render(cont + 2, cont + 2, tail, cont + 6)
+            ),
+            DExpr::Switch { .. } => self.render_block(li),
+            DExpr::Iife { bind, ret } => format!(
+                "(() {{\n{}{bind}\n{}return {};\n{}}})()",
+                pad(li + 2),
+                pad(li + 2),
+                ret.render(li + 2, li + 9, 1, li + 6),
+                pad(li)
+            ),
+            DExpr::ListLit { .. } | DExpr::RecordLit { .. } => self.render_block(li),
+        }
+    }
+
+    /// The split form of a block-formattable node: contents at `li + 2`, the
+    /// closing delimiter back at `li`.
+    fn render_block(&self, li: usize) -> String {
+        match self {
+            DExpr::Switch { head, arms, parens } => {
+                let open = if *parens { "(" } else { "" };
+                let close = if *parens { ")" } else { "" };
+                let mut out = format!("{open}switch ({head}) {{\n");
+                for (pat, val) in arms {
+                    out.push_str(&format!(
+                        "{}{pat} => {},\n",
+                        pad(li + 2),
+                        val.render(li + 2, li + 2 + pat.len() + 4, 1, li + 6)
+                    ));
+                }
+                out.push_str(&format!("{}}}{close}", pad(li)));
+                out
+            }
+            DExpr::ListLit { prefix, elems } => {
+                let mut out = format!("{prefix}[\n");
+                for e in elems {
+                    out.push_str(&format!(
+                        "{}{},\n",
+                        pad(li + 2),
+                        e.render(li + 2, li + 2, 1, li + 6)
+                    ));
+                }
+                out.push_str(&format!("{}]", pad(li)));
+                out
+            }
+            DExpr::RecordLit { elems, .. } => {
+                let mut out = String::from("(\n");
+                for e in elems {
+                    out.push_str(&format!(
+                        "{}{},\n",
+                        pad(li + 2),
+                        e.render(li + 2, li + 2, 1, li + 6)
+                    ));
+                }
+                out.push_str(&format!("{})", pad(li)));
+                out
+            }
+            DExpr::Lambda { params, body } => {
+                format!("{params} => {}", body.render_block(li))
+            }
+            DExpr::Call { callee, args } => match args.split_last() {
+                Some((last, leading)) => {
+                    let mut lead = join_flat(leading);
+                    if !lead.is_empty() {
+                        lead.push_str(", ");
+                    }
+                    format!("{callee}({lead}{})", last.render_block(li))
+                }
+                None => self.flat(),
+            },
+            other => other.flat(),
+        }
+    }
+}
+
+fn join_flat(args: &[DExpr]) -> String {
+    let parts: Vec<String> = args.iter().map(DExpr::flat).collect();
+    parts.join(", ")
+}
+
+/// `callee(args)` starting at `col` on a line indented `li`: flat when it fits;
+/// block-formatted when only a trailing switch/collection argument overflows;
+/// otherwise fully split, one argument per line with a trailing comma.
+fn render_call(li: usize, col: usize, tail: usize, callee: &str, args: &[DExpr]) -> String {
+    let flat_args = join_flat(args);
+    let forced = args.iter().any(DExpr::force_split);
+    if !forced && col + callee.len() + 2 + flat_args.len() + tail <= DART_WIDTH {
+        return format!("{callee}({flat_args})");
+    }
+    if let Some((last, leading)) = args.split_last()
+        && !leading.iter().any(DExpr::force_split)
+        && let Some(head) = last.block_head()
+    {
+        let mut lead = join_flat(leading);
+        if !lead.is_empty() {
+            lead.push_str(", ");
+        }
+        if col + callee.len() + 1 + lead.len() + head.len() <= DART_WIDTH {
+            return format!("{callee}({lead}{})", last.render_block(li));
+        }
+    }
+    if args.is_empty() {
+        return format!("{callee}()");
+    }
+    let mut out = format!("{callee}(\n");
+    for arg in args {
+        out.push_str(&format!(
+            "{}{},\n",
+            pad(li + 2),
+            arg.render(li + 2, li + 2, 1, li + 6)
+        ));
+    }
+    out.push_str(&format!("{})", pad(li)));
+    out
+}
+
+/// One statement line `prefix expr suffix` at `indent`, split per the tall
+/// style when it exceeds the page width. Returns the line(s) with trailing `\n`.
+fn dart_stmt(indent: usize, prefix: &str, expr: &DExpr, suffix: &str) -> String {
+    let flat = expr.flat();
+    if !expr.force_split() && indent + prefix.len() + flat.len() + suffix.len() <= DART_WIDTH {
+        return format!("{}{prefix}{flat}{suffix}\n", pad(indent));
+    }
+    format!(
+        "{}{prefix}{}{suffix}\n",
+        pad(indent),
+        expr.render(indent, indent + prefix.len(), suffix.len(), indent + 4)
+    )
+}
+
+/// A braceless `if (cond) prefix expr suffix;` guard: one line when it fits,
+/// otherwise the condition alone with the body statement at +2 (the formatter
+/// preserves the braceless form and only wraps it).
+fn dart_if_stmt(indent: usize, cond: &str, prefix: &str, expr: &DExpr, suffix: &str) -> String {
+    let flat = expr.flat();
+    let head_len = indent + 4 + cond.len() + 2;
+    if !expr.force_split() && head_len + prefix.len() + flat.len() + suffix.len() <= DART_WIDTH {
+        return format!("{}if ({cond}) {prefix}{flat}{suffix}\n", pad(indent));
+    }
+    format!(
+        "{}if ({cond})\n{}",
+        pad(indent),
+        dart_stmt(indent + 2, prefix, expr, suffix)
+    )
+}
+
+/// A declaration signature `head(params)tail` at `indent`: flat when it fits,
+/// otherwise each parameter on its own line with a trailing comma.
+fn dart_signature(indent: usize, head: &str, params: &[String], tail: &str) -> String {
+    let flat = format!("{}{head}({}){tail}\n", pad(indent), params.join(", "));
+    if params.is_empty() || flat.len() - 1 <= DART_WIDTH {
+        return flat;
+    }
+    let mut out = format!("{}{head}(\n", pad(indent));
+    for p in params {
+        out.push_str(&format!("{}{p},\n", pad(indent + 2)));
+    }
+    out.push_str(&format!("{}){tail}\n", pad(indent)));
+    out
+}
+
+/// A const constructor with named parameters: flat when it fits, otherwise one
+/// parameter per line. A fieldless record uses the unnamed form — Dart rejects
+/// an empty named-parameter list (`const X({});` is a syntax error).
+fn dart_ctor_decl(indent: usize, class_name: &str, params: &[String]) -> String {
+    if params.is_empty() {
+        return format!("{}const {class_name}();\n", pad(indent));
+    }
+    let flat = format!(
+        "{}const {class_name}({{{}}});\n",
+        pad(indent),
+        params.join(", ")
+    );
+    if flat.len() - 1 <= DART_WIDTH {
+        return flat;
+    }
+    let mut out = format!("{}const {class_name}({{\n", pad(indent));
+    for p in params {
+        out.push_str(&format!("{}{p},\n", pad(indent + 2)));
+    }
+    out.push_str(&format!("{}}});\n", pad(indent)));
     out
 }
 
@@ -2863,10 +3545,15 @@ fn record_names(spec: &CsilSpecSerialized) -> std::collections::HashSet<String> 
 
 /// The transparent type aliases the codec resolves through, keyed by the raw rule
 /// name a `Reference` carries: a `TypeDef` whose target is a map / array / scalar /
-/// reference (NOT a record group or a choice, which have their own handling). A
-/// field referencing one is typed as the alias (`typedef StringInt64Map = Map<...>`),
-/// so its value IS the underlying shape — the codec must recurse into that shape
-/// rather than pass the bare reference straight through and drop nested records.
+/// reference (NOT a record group), plus an all-literal choice — uniform (a closed
+/// string/int enum) OR mixed-kind (`"a" / 1`), per `csilgen_common::all_literal`
+/// — `union_choices` deliberately excludes these, since their wire form is the
+/// bare literal rather than a tagged sum. A field referencing a scalar/collection
+/// alias is typed as the alias (`typedef StringInt64Map = Map<...>`), so its value
+/// IS the underlying shape — the codec must recurse into that shape rather than pass
+/// the bare reference straight through (which, for a record-carrying collection,
+/// would drop the nested records; for a closed enum, would skip `dart_from_cbor_expr`'s
+/// `expectOneOf` membership check entirely and silently accept an out-of-set value).
 fn codec_aliases(
     spec: &CsilSpecSerialized,
 ) -> std::collections::HashMap<String, CsilTypeExpression> {
@@ -2874,9 +3561,13 @@ fn codec_aliases(
         .iter()
         .filter_map(|rule| match &rule.rule_type {
             CsilRuleType::TypeDef(t) => match t {
-                CsilTypeExpression::Group(_) | CsilTypeExpression::Choice(_) => None,
+                CsilTypeExpression::Group(_) => None,
+                CsilTypeExpression::Choice(cs) if !csilgen_common::all_literal(cs) => None,
                 other => Some((rule.name.clone(), other.clone())),
             },
+            CsilRuleType::TypeChoice(cs) if csilgen_common::all_literal(cs) => {
+                Some((rule.name.clone(), CsilTypeExpression::Choice(cs.clone())))
+            }
             _ => None,
         })
         .collect()
@@ -2920,49 +3611,70 @@ fn contains_record(
 /// encoder consumes: scalars/bytes/DateTime pass straight through (the encoder keys
 /// on runtime type); a nested record becomes its `toCborValue()` map; lists and maps
 /// recurse only when they carry records.
-fn dart_to_cbor_value(
+fn dart_to_cbor_expr(
     ty: &CsilTypeExpression,
     expr: &str,
     records: &std::collections::HashSet<String>,
     aliases: &std::collections::HashMap<String, CsilTypeExpression>,
     unions: &std::collections::HashMap<String, Vec<CsilTypeExpression>>,
-) -> String {
+) -> DExpr {
     match ty {
         CsilTypeExpression::Constrained { base_type, .. } => {
-            dart_to_cbor_value(base_type, expr, records, aliases, unions)
+            dart_to_cbor_expr(base_type, expr, records, aliases, unions)
         }
         CsilTypeExpression::Reference(name) if records.contains(&dart_type_name(name)) => {
-            format!("{expr}.toCborValue()")
+            DExpr::Atom(format!("{expr}.toCborValue()"))
         }
         // A union is a tagged sum on the wire: `[variant_index, value]`, the index in
         // declaration order, the value that variant's own lowered form (recursive).
         CsilTypeExpression::Reference(name) if unions.contains_key(name) => {
             let base = dart_type_name(name);
-            let arms: Vec<String> = unions[name]
+            let arms: Vec<(String, DExpr)> = unions[name]
                 .iter()
                 .enumerate()
                 .map(|(i, choice)| {
                     let arm = union_arm_name(&base, i, choice);
-                    let val = dart_to_cbor_value(choice, "csilV.value", records, aliases, unions);
-                    format!("{arm} csilV => <Object?>[{i}, {val}]")
+                    let val = dart_to_cbor_expr(choice, "csilV.value", records, aliases, unions);
+                    // A literal arm's own codec ignores the bound value (its
+                    // wire byte is the literal's own canonical value, not
+                    // whatever `.value` happens to hold) — binding `csilV`
+                    // for it would be an unused-variable warning under `dart
+                    // analyze`, so only bind the pattern variable when the
+                    // arm's codec actually reads it.
+                    let binding = if val.flat().contains("csilV") {
+                        "csilV"
+                    } else {
+                        "_"
+                    };
+                    (
+                        format!("{arm} {binding}"),
+                        DExpr::ListLit {
+                            prefix: "<Object?>".to_string(),
+                            elems: vec![DExpr::Atom(i.to_string()), val],
+                        },
+                    )
                 })
                 .collect();
-            format!("(switch ({expr}) {{ {} }})", arms.join(", "))
+            DExpr::Switch {
+                head: expr.to_string(),
+                arms,
+                parens: true,
+            }
         }
         // A transparent alias is typed as its underlying shape, so the value flowing
         // here IS that shape: recurse into it (a map-of-record alias then maps each
         // value through `toCborValue` instead of passing the bare map straight on,
         // which would drop the nested records).
         CsilTypeExpression::Reference(name) if aliases.contains_key(name) => {
-            dart_to_cbor_value(&aliases[name], expr, records, aliases, unions)
+            dart_to_cbor_expr(&aliases[name], expr, records, aliases, unions)
         }
-        CsilTypeExpression::Literal(value) => literal_to_dart(value),
+        CsilTypeExpression::Literal(value) => DExpr::Atom(literal_to_dart(value)),
         // A tuple is a positional CBOR array; an absent optional element is `null` in
         // place (the array keeps its fixed length).
         CsilTypeExpression::Tuple(group) => {
             let all_keyed = !group.entries.is_empty()
                 && group.entries.iter().all(|e| wire_key_of_entry(e).is_some());
-            let elems: Vec<String> = group
+            let elems: Vec<DExpr> = group
                 .entries
                 .iter()
                 .enumerate()
@@ -2975,51 +3687,83 @@ fn dart_to_cbor_value(
                     } else {
                         format!("{expr}.${}", i + 1)
                     };
-                    let conv = dart_to_cbor_value(&e.value_type, &access, records, aliases, unions);
-                    if matches!(e.occurrence, Some(CsilOccurrence::Optional)) && conv != access {
-                        format!("{access} == null ? null : {conv}")
+                    let conv = dart_to_cbor_expr(&e.value_type, &access, records, aliases, unions);
+                    if matches!(e.occurrence, Some(CsilOccurrence::Optional))
+                        && conv.flat() != access
+                    {
+                        DExpr::CondNull {
+                            cond: format!("{access} == null"),
+                            else_: Box::new(conv),
+                        }
                     } else {
                         conv
                     }
                 })
                 .collect();
-            format!("<Object?>[{}]", elems.join(", "))
+            DExpr::ListLit {
+                prefix: "<Object?>".to_string(),
+                elems,
+            }
         }
         CsilTypeExpression::Array { element_type, .. }
             if contains_record(element_type, records, aliases, unions) =>
         {
-            let inner = dart_to_cbor_value(element_type, "csilE", records, aliases, unions);
-            format!("{expr}.map((csilE) => {inner}).toList()")
+            let inner = dart_to_cbor_expr(element_type, "csilE", records, aliases, unions);
+            DExpr::Chain {
+                recv: expr.to_string(),
+                calls: vec![
+                    (
+                        "map".to_string(),
+                        vec![DExpr::Lambda {
+                            params: "(csilE)".to_string(),
+                            body: Box::new(inner),
+                        }],
+                    ),
+                    ("toList".to_string(), vec![]),
+                ],
+            }
         }
         CsilTypeExpression::Map { key, value, .. }
             if contains_record(key, records, aliases, unions)
                 || contains_record(value, records, aliases, unions) =>
         {
-            let k = dart_to_cbor_value(key, "csilK", records, aliases, unions);
-            let v = dart_to_cbor_value(value, "csilV", records, aliases, unions);
-            format!("{expr}.map((csilK, csilV) => MapEntry({k}, {v}))")
+            let k = dart_to_cbor_expr(key, "csilK", records, aliases, unions);
+            let v = dart_to_cbor_expr(value, "csilV", records, aliases, unions);
+            DExpr::Chain {
+                recv: expr.to_string(),
+                calls: vec![(
+                    "map".to_string(),
+                    vec![DExpr::Lambda {
+                        params: "(csilK, csilV)".to_string(),
+                        body: Box::new(DExpr::Call {
+                            callee: "MapEntry".to_string(),
+                            args: vec![k, v],
+                        }),
+                    }],
+                )],
+            }
         }
         // Scalars, bytes, DateTime, decimal, string-choices, and record-free
         // lists/maps are already a shape the encoder handles by runtime type.
-        _ => expr.to_string(),
+        _ => DExpr::Atom(expr.to_string()),
     }
 }
 
 /// A Dart expression reconstructing a typed value from `expr` (the decoded dynamic
 /// tree node).
-fn dart_from_cbor_value(
+fn dart_from_cbor_expr(
     ty: &CsilTypeExpression,
     expr: &str,
     records: &std::collections::HashSet<String>,
     decimal: &str,
     aliases: &std::collections::HashMap<String, CsilTypeExpression>,
     unions: &std::collections::HashMap<String, Vec<CsilTypeExpression>>,
-) -> String {
+) -> DExpr {
     match ty {
         CsilTypeExpression::Constrained { base_type, .. } => {
-            dart_from_cbor_value(base_type, expr, records, decimal, aliases, unions)
+            dart_from_cbor_expr(base_type, expr, records, decimal, aliases, unions)
         }
-        CsilTypeExpression::Builtin(name) => match name.as_str() {
+        CsilTypeExpression::Builtin(name) => DExpr::Atom(match name.as_str() {
             // `nint` is signed; the codec decodes the negative major to a Dart int.
             "int" | "uint" | "nint" => format!("{expr} as int"),
             "float" | "float16" | "float32" | "float64" => format!("({expr} as num).toDouble()"),
@@ -3029,54 +3773,83 @@ fn dart_from_cbor_value(
             "timestamp" => format!("{expr} as DateTime"),
             "decimal" => format!("{expr} as {decimal}"),
             _ => expr.to_string(),
-        },
+        }),
         CsilTypeExpression::Reference(name) if records.contains(&dart_type_name(name)) => {
-            format!("{}.fromCborValue({expr})", dart_type_name(name))
+            DExpr::Call {
+                callee: format!("{}.fromCborValue", dart_type_name(name)),
+                args: vec![DExpr::Atom(expr.to_string())],
+            }
         }
         // A union decodes from its tagged sum `[variant_index, value]`: read the index,
         // dispatch to that variant's constructor over its own decoded value.
         CsilTypeExpression::Reference(name) if unions.contains_key(name) => {
             let base = dart_type_name(name);
-            let arms: Vec<String> = unions[name]
+            let mut arms: Vec<(String, DExpr)> = unions[name]
                 .iter()
                 .enumerate()
                 .map(|(i, choice)| {
                     let arm = union_arm_name(&base, i, choice);
                     let val =
-                        dart_from_cbor_value(choice, "csilU[1]", records, decimal, aliases, unions);
-                    format!("{i} => {arm}({val})")
+                        dart_from_cbor_expr(choice, "csilU[1]", records, decimal, aliases, unions);
+                    (
+                        i.to_string(),
+                        DExpr::Call {
+                            callee: arm,
+                            args: vec![val],
+                        },
+                    )
                 })
                 .collect();
-            format!(
-                "(() {{ final csilU = {expr} as List; return switch (csilU[0] as int) {{ {}, _ => throw ArgumentError('unknown {base} variant') }}; }})()",
-                arms.join(", ")
-            )
+            arms.push((
+                "_".to_string(),
+                // A `Call` (not a bare `Atom`) so a long hoisted/synthesized
+                // base name still renders `dart format`-clean — an `Atom`
+                // never splits, but this message routinely overflows the
+                // page width once the base name is a hoisted
+                // `<Owner>_<field>`-style synthesized name.
+                DExpr::Call {
+                    callee: "throw ArgumentError".to_string(),
+                    args: vec![DExpr::Atom(dart_string_lit(&format!(
+                        "unknown {base} variant"
+                    )))],
+                },
+            ));
+            DExpr::Iife {
+                bind: format!("final csilU = {expr} as List;"),
+                ret: Box::new(DExpr::Switch {
+                    head: "csilU[0] as int".to_string(),
+                    arms,
+                    parens: false,
+                }),
+            }
         }
         // A transparent alias decodes as its underlying shape (the field is typed as
         // that shape), so a map-of-record alias reconstructs each value through
         // `fromCborValue` and casts to the named-typed map rather than yielding the
         // raw decoded dynamic map, which mistypes the entries and drops the records.
         CsilTypeExpression::Reference(name) if aliases.contains_key(name) => {
-            dart_from_cbor_value(&aliases[name], expr, records, decimal, aliases, unions)
+            dart_from_cbor_expr(&aliases[name], expr, records, decimal, aliases, unions)
         }
-        CsilTypeExpression::Literal(value) => format!(
-            "CsilCbor.expectLiteral({}, {}, {})",
-            expr,
-            literal_to_dart(value),
-            literal_to_dart(value)
-        ),
+        CsilTypeExpression::Literal(value) => DExpr::Call {
+            callee: "CsilCbor.expectLiteral".to_string(),
+            args: vec![
+                DExpr::Atom(expr.to_string()),
+                DExpr::Atom(literal_to_dart(value)),
+                DExpr::Atom(literal_to_dart(value)),
+            ],
+        },
         // A tuple reconstructs the Dart 3 record from the positional array; an absent
         // optional element stays `null` in place.
         CsilTypeExpression::Tuple(group) => {
             let all_keyed = !group.entries.is_empty()
                 && group.entries.iter().all(|e| wire_key_of_entry(e).is_some());
-            let elems: Vec<String> = group
+            let elems: Vec<DExpr> = group
                 .entries
                 .iter()
                 .enumerate()
                 .map(|(i, e)| {
                     let elem_expr = format!("csilT[{i}]");
-                    let dec = dart_from_cbor_value(
+                    let dec = dart_from_cbor_expr(
                         &e.value_type,
                         &elem_expr,
                         records,
@@ -3085,48 +3858,113 @@ fn dart_from_cbor_value(
                         unions,
                     );
                     let val = if matches!(e.occurrence, Some(CsilOccurrence::Optional)) {
-                        format!("{elem_expr} == null ? null : ({dec})")
+                        DExpr::CondNull {
+                            cond: format!("{elem_expr} == null"),
+                            else_: Box::new(DExpr::Paren(Box::new(dec))),
+                        }
                     } else {
                         dec
                     };
                     if all_keyed {
-                        format!(
-                            "{}: {val}",
-                            dart_member_name(&wire_key_of_entry(e).unwrap())
-                        )
+                        DExpr::Named {
+                            name: dart_member_name(&wire_key_of_entry(e).unwrap()),
+                            value: Box::new(val),
+                        }
                     } else {
                         val
                     }
                 })
                 .collect();
             // A single-element positional record needs the trailing-comma form.
-            let record = if !all_keyed && elems.len() == 1 {
-                format!("({},)", elems[0])
-            } else {
-                format!("({})", elems.join(", "))
-            };
-            format!("(() {{ final csilT = {expr} as List; return {record}; }})()")
+            let trailing = !all_keyed && elems.len() == 1;
+            DExpr::Iife {
+                bind: format!("final csilT = {expr} as List;"),
+                ret: Box::new(DExpr::RecordLit { elems, trailing }),
+            }
         }
         CsilTypeExpression::Array { element_type, .. } => {
             let inner =
-                dart_from_cbor_value(element_type, "csilE", records, decimal, aliases, unions);
+                dart_from_cbor_expr(element_type, "csilE", records, decimal, aliases, unions);
             let et = map_type(element_type, &None, decimal);
-            format!("({expr} as List).map((csilE) => {inner}).cast<{et}>().toList()")
+            DExpr::Chain {
+                recv: format!("({expr} as List)"),
+                calls: vec![
+                    (
+                        "map".to_string(),
+                        vec![DExpr::Lambda {
+                            params: "(csilE)".to_string(),
+                            body: Box::new(inner),
+                        }],
+                    ),
+                    (format!("cast<{et}>"), vec![]),
+                    ("toList".to_string(), vec![]),
+                ],
+            }
         }
         CsilTypeExpression::Map { key, value, .. } => {
             let kt = map_type(key, &None, decimal);
             let vt = map_type(value, &None, decimal);
-            let k = dart_from_cbor_value(key, "csilK", records, decimal, aliases, unions);
-            let v = dart_from_cbor_value(value, "csilV", records, decimal, aliases, unions);
-            format!("({expr} as Map).map((csilK, csilV) => MapEntry({k}, {v})).cast<{kt}, {vt}>()")
+            let k = dart_from_cbor_expr(key, "csilK", records, decimal, aliases, unions);
+            let v = dart_from_cbor_expr(value, "csilV", records, decimal, aliases, unions);
+            DExpr::Chain {
+                recv: format!("({expr} as Map)"),
+                calls: vec![
+                    (
+                        "map".to_string(),
+                        vec![DExpr::Lambda {
+                            params: "(csilK, csilV)".to_string(),
+                            body: Box::new(DExpr::Call {
+                                callee: "MapEntry".to_string(),
+                                args: vec![k, v],
+                            }),
+                        }],
+                    ),
+                    (format!("cast<{kt}, {vt}>"), vec![]),
+                ],
+            }
         }
-        CsilTypeExpression::Choice(choices) if is_string_choice(choices) => {
-            format!("{expr} as String")
+        // An all-literal choice's wire form is the bare literal (its own
+        // discriminant) — decode has no index to dispatch on the way a tagged-
+        // sum union does, so membership in the closed set is the only check
+        // available. `choice_arm_literal` sees through a `.default`-style
+        // control-operator wrapper on the last arm.
+        CsilTypeExpression::Choice(choices) if is_string_choice(choices) => DExpr::Call {
+            callee: "CsilCbor.expectOneOf<String>".to_string(),
+            args: vec![DExpr::Atom(expr.to_string()), choice_literal_list(choices)],
+        },
+        CsilTypeExpression::Choice(choices) if is_int_choice(choices) => DExpr::Call {
+            callee: "CsilCbor.expectOneOf<int>".to_string(),
+            args: vec![DExpr::Atom(expr.to_string()), choice_literal_list(choices)],
+        },
+        // A mixed-kind all-literal choice (`"a" / 1`) — still an `Enum` per
+        // `csilgen_common::all_literal`, just not a uniform string/int one. Its
+        // runtime value can be any Dart type, so the membership check is generic
+        // over `Object?`; `CsilCbor.expectOneOf` (and `_valueEquals` underneath
+        // it) already handle a heterogeneous `List<Object?>` with no changes.
+        CsilTypeExpression::Choice(choices) if csilgen_common::all_literal(choices) => {
+            DExpr::Call {
+                callee: "CsilCbor.expectOneOf<Object?>".to_string(),
+                args: vec![DExpr::Atom(expr.to_string()), choice_literal_list(choices)],
+            }
         }
-        CsilTypeExpression::Choice(choices) if is_int_choice(choices) => {
-            format!("{expr} as int")
-        }
-        _ => expr.to_string(),
+        _ => DExpr::Atom(expr.to_string()),
+    }
+}
+
+/// `const [<lit1>, <lit2>, ...]` — the closed set of literal values for an
+/// all-literal choice, in declaration order, for `CsilCbor.expectOneOf`'s
+/// membership check. `literal_to_dart` renders every `CsilLiteralValue` kind
+/// (not just `Text`), so this already produces a valid Dart literal expression
+/// for a mixed-kind enum's members (e.g. `const ['pending', 42]`).
+fn choice_literal_list(choices: &[CsilTypeExpression]) -> DExpr {
+    let elems = choices
+        .iter()
+        .filter_map(csilgen_common::choice_arm_literal)
+        .map(|lit| DExpr::Atom(literal_to_dart(lit)))
+        .collect();
+    DExpr::ListLit {
+        prefix: "const ".to_string(),
+        elems,
     }
 }
 
@@ -3285,12 +4123,13 @@ fn csil_cbor_dart(emit_decimal: bool) -> String {
         "        if (arg == 4 && inner.value is List) {\n\
 \x20         final parts = inner.value as List;\n\
 \x20         return _CsilDecoded(\n\
-\x20             CsilDecimal(parts[0] as int, _bigIntFrom(parts[1])), inner.next);\n\
+\x20           CsilDecimal(parts[0] as int, _bigIntFrom(parts[1])),\n\
+\x20           inner.next,\n\
+\x20         );\n\
 \x20       }\n\
 \x20       if (arg == 2 || arg == 3) {\n\
 \x20         final mag = _bytesToBigInt(inner.value as Uint8List);\n\
-\x20         return _CsilDecoded(\n\
-\x20             arg == 3 ? (-mag) - BigInt.one : mag, inner.next);\n\
+\x20         return _CsilDecoded(arg == 3 ? (-mag) - BigInt.one : mag, inner.next);\n\
 \x20       }\n\
 \x20       return _CsilDecoded(inner.value, inner.next);\n      default:",
     );
@@ -3418,7 +4257,10 @@ class CsilCbor {
       // Canonical RFC3339 (tag 0): Dart's toIso8601String always emits a
       // fractional-seconds part (.000); the wire form omits it when it is zero, so
       // strip an all-zero fraction to match the other languages byte-for-byte.
-      final iso = v.toUtc().toIso8601String().replaceFirst(RegExp(r'\.0+Z$'), 'Z');
+      final iso = v.toUtc().toIso8601String().replaceFirst(
+        RegExp(r'\.0+Z$'),
+        'Z',
+      );
       final u = utf8.encode(iso);
       _head(b, 3, u.length);
       b.add(u);
@@ -3452,6 +4294,18 @@ class CsilCbor {
       throw ArgumentError('CsilCbor: literal mismatch');
     }
     return value;
+  }
+
+  /// Validate that a decoded closed-set (all-literal choice) value is one of
+  /// its declared members, returning it cast to `T`. The wire carries the bare
+  /// literal for this shape (it is its own discriminant), so decode has no
+  /// index to dispatch on the way a tagged-sum union does — membership is the
+  /// only check available.
+  static T expectOneOf<T>(Object? actual, List<T> allowed) {
+    for (final a in allowed) {
+      if (_valueEquals(actual, a)) return a;
+    }
+    throw ArgumentError('CsilCbor: value not a member of the closed set');
   }
 
   static bool _valueEquals(Object? a, Object? b) {
@@ -3546,7 +4400,9 @@ class CsilCbor {
         final inner = _dec(b, p);
         if (arg == 0 && inner.value is String) {
           return _CsilDecoded(
-              DateTime.parse(inner.value as String).toUtc(), inner.next);
+            DateTime.parse(inner.value as String).toUtc(),
+            inner.next,
+          );
         }
         return _CsilDecoded(inner.value, inner.next);
       default:

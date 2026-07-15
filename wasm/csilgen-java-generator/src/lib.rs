@@ -7,8 +7,8 @@
 
 use convert_case::{Case, Casing};
 use csilgen_common::{
-    CsilControlOperator, CsilGroupEntry, CsilGroupExpression, CsilGroupKey, CsilLiteralValue,
-    CsilOccurrence, CsilRuleType, CsilServiceDefinition, CsilServiceDirection,
+    ChoiceClass, CsilControlOperator, CsilGroupEntry, CsilGroupExpression, CsilGroupKey,
+    CsilLiteralValue, CsilOccurrence, CsilRuleType, CsilServiceDefinition, CsilServiceDirection,
     CsilServiceOperation, CsilSizeConstraint, CsilTypeExpression, CsilValidationConstraint,
     GeneratedFile, GenerationStats, GeneratorCapability, GeneratorMetadata, WasmGeneratorInput,
     WasmGeneratorOutput, wasm_interface::*,
@@ -838,8 +838,8 @@ fn first_channel_example(input: &WasmGeneratorInput) -> Option<ChannelExample> {
             }
             let iface = rule.name.to_case(Case::Pascal);
             return Some(ChannelExample {
-                service_wire: service_base(&rule.name).to_lowercase(),
-                op_wire: wire_method_name(&op.name),
+                service_wire: rule.name.clone(),
+                op_wire: op.name.clone(),
                 iface: iface.clone(),
                 router_class: format!("{iface}Router"),
                 route_fn: format!("route{iface}Channel"),
@@ -974,6 +974,24 @@ fn find_alias(input: &WasmGeneratorInput, name: &str) -> Option<CsilTypeExpressi
 
 fn generate_java(input: &WasmGeneratorInput) -> Result<Vec<GeneratedFile>, i32> {
     let config = JavaConfig::from_input(input)?;
+    // Inline group/choice fields have no named rule to hang a Java class and codec on, so
+    // synthesize one per inline shape up front (the shared `csilgen_common::hoist` pass);
+    // everything downstream then sees only named rules and references, no anonymous-
+    // composite special cases. An all-literal choice is left inline
+    // (`hoist_all_literal_choices: false`) — it already renders as a bare record wrapper
+    // via `map_type`/`java_enc_value`/`java_dec_value`'s `Choice` handling, so there is
+    // nothing to hoist.
+    let hoisted = {
+        let mut cloned = input.clone();
+        cloned.csil_spec = csilgen_common::hoist_inline_composites(
+            &input.csil_spec,
+            csilgen_common::HoistOptions {
+                hoist_all_literal_choices: false,
+            },
+        );
+        cloned
+    };
+    let input = &hoisted;
     let mut files = Vec::new();
 
     for rule in &input.csil_spec.rules {
@@ -1721,11 +1739,7 @@ fn java_op_boundary_expressible(
 /// The `<Base><Method>` stem shared by an op's per-op codec helpers and the client
 /// method that calls them, so the two never drift.
 fn op_codec_stem(service_name: &str, op: &CsilServiceOperation) -> String {
-    format!(
-        "{}{}",
-        service_base(service_name),
-        wire_method_name(&op.name)
-    )
+    format!("{}{}", service_base(service_name), pascal_op_name(&op.name))
 }
 
 /// The CBOR encoding of a text key. Comparing these byte slices lexicographically is
@@ -1756,17 +1770,42 @@ fn codec_unwrap_constrained(ty: &CsilTypeExpression) -> &CsilTypeExpression {
     }
 }
 
-/// Collapse a choice the way `map_type` does: a single non-literal arm narrows to that
-/// arm's type (so the codec agrees with the field's declared Java type); anything else
-/// has no precise model and is carried as `null`/`CborNull`.
+// `choice_arm_literal` is shared machinery now (see `csilgen_common::choice`, THE
+// normative literal-arm/enum-vs-union contract every generator must agree on) — every
+// `choice_arm_literal(...)` call site below keeps working unchanged.
+use csilgen_common::choice_arm_literal;
+
+/// Collapse a choice the way `map_type` does: a single non-literal arm whose Java type
+/// every literal arm also shares narrows to that arm's type (so the codec agrees with
+/// the field's declared Java type); a mixed-Java-type union has no precise single model
+/// and is carried through the `Object`-wrapper union path instead.
 fn codec_collapse_choice(choices: &[CsilTypeExpression]) -> Option<&CsilTypeExpression> {
     let non_literal: Vec<&CsilTypeExpression> = choices
         .iter()
-        .filter(|c| !matches!(c, CsilTypeExpression::Literal(_)))
+        .filter(|c| choice_arm_literal(c).is_none())
         .collect();
     match non_literal.as_slice() {
-        [only] => Some(only),
+        [only]
+            if choices
+                .iter()
+                .all(|c| map_type_boxed(c) == map_type_boxed(only)) =>
+        {
+            Some(only)
+        }
         _ => None,
+    }
+}
+
+/// The literals of a `Choice` left un-hoisted at a field/array/map/tuple position — by
+/// construction of `HoistOptions::hoist_all_literal_choices: false` (see
+/// `generate_java`), the only shape this can be once `codec_collapse_choice` has
+/// already declined it is a closed, all-literal enum with no name of its own. `None` for
+/// a genuine union (>=1 non-literal arm), which `codec_collapse_choice`'s caller already
+/// handles or, failing that, falls back to the unmodeled `CborNull`/`null` placeholder.
+fn inline_enum_literals(choices: &[CsilTypeExpression]) -> Option<Vec<&CsilLiteralValue>> {
+    match csilgen_common::classify_choice(choices) {
+        ChoiceClass::Enum(literals) => Some(literals),
+        ChoiceClass::Union(_) => None,
     }
 }
 
@@ -1882,9 +1921,21 @@ fn java_enc_value(
                 elems.join(", ")
             )
         }
+        // A choice left un-hoisted at this field/element position is, by construction of
+        // `HoistOptions::hoist_all_literal_choices: false` (see `generate_java`), always
+        // either a narrowed-scalar union (>=1 non-literal arm sharing every literal's
+        // Java type — `codec_collapse_choice`) or a closed, all-literal enum with no name
+        // of its own to hang a wrapper class/codec on (`inline_enum_literals`). The
+        // latter dispatches through the same generic `encEnumScalar` helper
+        // `emit_mixed_enum_codec` uses for a NAMED mixed-kind enum — kind-agnostic, since
+        // an inline enum's value is always one of the same handful of boxed scalar types
+        // regardless of which specific literals are declared.
         CsilTypeExpression::Choice(choices_inline) => match codec_collapse_choice(choices_inline) {
             Some(only) => java_enc_value(only, expr, records, aliases, choices, depth),
-            None => "new CborNull()".to_string(),
+            None => match inline_enum_literals(choices_inline) {
+                Some(_) => format!("encEnumScalar({expr})"),
+                None => "new CborNull()".to_string(),
+            },
         },
         CsilTypeExpression::Literal(lit) => java_literal_cbor_expr(lit),
         // A type the codec cannot model precisely is carried as null rather than emitting
@@ -1970,9 +2021,28 @@ fn java_dec_value(
             }
             format!("java.util.Arrays.<Object>asList({})", elems.join(", "))
         }
+        // See the matching comment in `java_enc_value`: the only un-hoisted `Choice`
+        // shapes reaching here are a narrowed-scalar union or a closed all-literal enum.
+        // The latter reads generically (`asEnumScalar`) then validates against THIS
+        // choice's own declared vocabulary via `requireEnumMember`, closing the same
+        // membership gap `emit_mixed_enum_codec`/`emit_uniform_enum_codec` close for a
+        // NAMED choice — without this, an inline enum field silently decoded to `null`
+        // rather than its actual value.
         CsilTypeExpression::Choice(choices_inline) => match codec_collapse_choice(choices_inline) {
             Some(only) => java_dec_value(only, expr, records, aliases, choices, depth),
-            None => "null".to_string(),
+            None => match inline_enum_literals(choices_inline) {
+                Some(literals) => {
+                    let p = format!("csilEnumScalar{depth}");
+                    let membership = literals
+                        .iter()
+                        .enumerate()
+                        .map(|(i, lit)| java_literal_equals_object_expr(lit, &p, i))
+                        .collect::<Vec<_>>()
+                        .join(" || ");
+                    format!("requireEnumMember(asEnumScalar({expr}), {p} -> {membership})")
+                }
+                None => "null".to_string(),
+            },
         },
         CsilTypeExpression::Literal(lit) => {
             let expected = java_literal_cbor_expr(lit);
@@ -2086,23 +2156,45 @@ fn emit_record_codec(
     out
 }
 
-/// The bare-literal CBOR kind an all-literal choice (an enum) encodes to, taken from its
-/// first literal arm. `None` if the choice has no literal arms (not an enum).
-fn enum_literal_kind(choices: &[CsilTypeExpression]) -> Option<&'static str> {
-    choices.iter().find_map(|c| match c {
-        CsilTypeExpression::Literal(CsilLiteralValue::Text(_)) => Some("text"),
-        CsilTypeExpression::Literal(CsilLiteralValue::Integer(_)) => Some("int"),
-        CsilTypeExpression::Literal(CsilLiteralValue::Float(_)) => Some("float"),
-        CsilTypeExpression::Literal(CsilLiteralValue::Bool(_)) => Some("bool"),
+/// The CBOR scalar kind a literal maps to under the single-scalar-read happy path
+/// (`asI64`/`asF64`/`asBool`/`asText` plus one `CborXxx` wrapper). `None` for a kind
+/// that path cannot represent at all (`Bytes`/`Null`/`Array`), which — like a genuine
+/// kind mix — routes to the generic per-member dispatch below.
+fn literal_scalar_kind(lit: &CsilLiteralValue) -> Option<&'static str> {
+    match lit {
+        CsilLiteralValue::Text(_) => Some("text"),
+        CsilLiteralValue::Integer(_) => Some("int"),
+        CsilLiteralValue::Float(_) => Some("float"),
+        CsilLiteralValue::Bool(_) => Some("bool"),
         _ => None,
-    })
+    }
+}
+
+/// The single CBOR scalar kind every literal in an all-literal choice shares, if any.
+/// `None` when the vocabulary mixes kinds (`"a" / 1`) or contains a kind the single-
+/// scalar-read path cannot represent (`Bytes`/`Null`/`Array`) — either way the closed
+/// enum needs `emit_mixed_enum_codec`'s generic per-member dispatch, not a single
+/// `CborXxx`/`asXxx` pair picked from one arm and wrongly applied to every member (the
+/// confirmed defect this function exists to detect).
+fn uniform_literal_kind(literals: &[&CsilLiteralValue]) -> Option<&'static str> {
+    let first = literal_scalar_kind(literals.first()?)?;
+    literals
+        .iter()
+        .all(|lit| literal_scalar_kind(lit) == Some(first))
+        .then_some(first)
 }
 
 /// Emit the `enc<Name>`/`dec<Name>` helper pair for a named `Name = A / B / ...` choice.
-/// Three shapes, mirroring the locked wire: an all-literal **enum** rides as the bare
-/// literal (its own discriminant); a single-real-arm **literal-narrowed scalar** is a
-/// transparent wrapper over that arm; a multi-arm **union** rides as a `[variant_index,
-/// value]` tagged sum with the index being the arm's 0-based declaration position.
+/// Two shapes, mirroring the locked wire contract: an all-literal choice is an **enum**
+/// and rides as the bare literal (its own discriminant); a choice with one or more
+/// non-literal arms is a **union** and rides as a `[variant_index, value]` tagged sum,
+/// the index being the arm's 0-based declaration position — this covers both a
+/// single-real-arm literal-narrowed scalar (e.g. `text / "a" / "b"`, OrderStatus in
+/// examples/real-world-api/e-commerce-api.csil) and a genuine multi-type union. A
+/// literal arm's payload is its own declared value (not a placeholder), matches by
+/// value equality ahead of any general arm sharing its Java dispatch type on encode,
+/// and is validated by equality against the declared literal on decode — mirroring the
+/// Go/Python generators' `emit_union_codec`.
 fn emit_choice_codec(
     name: &str,
     choices: &[CsilTypeExpression],
@@ -2111,83 +2203,332 @@ fn emit_choice_codec(
     choices_map: &std::collections::HashMap<String, Vec<CsilTypeExpression>>,
 ) -> String {
     let class = name.to_case(Case::Pascal);
-    let non_literal: Vec<&CsilTypeExpression> = choices
-        .iter()
-        .filter(|c| !matches!(c, CsilTypeExpression::Literal(_)))
-        .collect();
+    // The ENUM/UNION split is delegated to the shared, normative classifier (THE
+    // contract: EVERY arm a literal, of any kind — even mixed, `"a" / 1` counts — is an
+    // Enum; at least one non-literal arm is a Union), not re-derived locally.
+    // `choice_arm_literal` (imported above) already sees through a `.default`-suffixed
+    // arm's `Constrained` wrapper, so a closed enum's last arm is still recognized here.
+    match csilgen_common::classify_choice(choices) {
+        ChoiceClass::Enum(literals) => emit_enum_codec(&class, &literals),
+        ChoiceClass::Union(_) => {
+            // Union (>=1 non-literal arm): the locked tagged sum. A single non-literal
+            // arm whose Java type every literal arm also shares collapses the wrapper's
+            // value to that one Java type (`map_type` agrees, via `codec_collapse_choice`),
+            // so encode needs no runtime type dispatch — only the literal-vs-general value
+            // check. A mixed-Java-type union (a lone non-literal the literals don't
+            // type-match, e.g. `"none" / 42 / Rec`, or two or more non-literal arms) keeps
+            // the wrapper's value `Object` and needs the instanceof-grouped dispatch to
+            // tell its arms apart at runtime.
+            let mut out = if codec_collapse_choice(choices).is_some() {
+                emit_scalar_union_encode(&class, choices, records, aliases, choices_map)
+            } else {
+                emit_object_union_encode(&class, choices, records, aliases, choices_map)
+            };
+            out.push_str(&emit_union_decode(
+                &class,
+                choices,
+                records,
+                aliases,
+                choices_map,
+            ));
+            out
+        }
+    }
+}
+
+/// Emit `enc<Class>`/`dec<Class>` for a closed literal-only choice (a
+/// `ChoiceClass::Enum`). `Color` is a plain `record Color(Object value) {}` wrapper
+/// (`generate_alias`), not a closed Java enum type — nothing at the type level rejects a
+/// well-typed value outside the declared literal set, so decode must check membership
+/// itself (parity with the python/ocaml/php/ruby/elixir codecs' `_csil_decode_enum`-style
+/// check). Without this, `decColor` would accept ANY string on the wire, not just
+/// "red"/"green"/"blue". A uniform-kind vocabulary keeps the single `CborXxx`/`asXxx`
+/// happy path; a mixed-kind vocabulary (`"a" / 1`) has no single wrapper/reader that
+/// fits every member and needs the generic per-member dispatch instead — see
+/// `emit_mixed_enum_codec`'s docs for the defect this fixes.
+fn emit_enum_codec(class: &str, literals: &[&CsilLiteralValue]) -> String {
+    match uniform_literal_kind(literals) {
+        Some(kind) => emit_uniform_enum_codec(class, kind, literals),
+        None => emit_mixed_enum_codec(class, literals),
+    }
+}
+
+/// The happy path for a closed enum whose literals all share one CBOR scalar kind: a
+/// single `CborXxx` wrapper on encode and a single `asXxx` reader on decode, with
+/// membership validated against the (necessarily uniform-kind) full literal list.
+fn emit_uniform_enum_codec(class: &str, kind: &str, literals: &[&CsilLiteralValue]) -> String {
+    let (enc, read) = match kind {
+        "int" => (
+            "new CborInt((Long) v.value())".to_string(),
+            "asI64(csilRoot)".to_string(),
+        ),
+        "float" => (
+            "new CborFloat((Double) v.value())".to_string(),
+            "asF64(csilRoot)".to_string(),
+        ),
+        "bool" => (
+            "new CborBool((Boolean) v.value())".to_string(),
+            "asBool(csilRoot)".to_string(),
+        ),
+        _ => (
+            "new CborText((String) v.value())".to_string(),
+            "asText(csilRoot)".to_string(),
+        ),
+    };
     let mut out = String::new();
+    out.push_str(&format!(
+        "    static CborValue enc{class}({class} v) {{\n        return {enc};\n    }}\n\n"
+    ));
+    let membership = literals
+        .iter()
+        .map(|lit| java_literal_equals_expr(lit, "csilVal"))
+        .collect::<Vec<_>>()
+        .join(" || ");
+    out.push_str(&format!(
+        "    static {class} dec{class}(CborValue csilRoot) {{\n\
+         \x20       var csilVal = {read};\n\
+         \x20       if (!({membership})) {{\n\
+         \x20           throw new CsilCborException(\"csil cbor: {class} value \" + csilVal + \" is not a member of the declared enum\");\n\
+         \x20       }}\n\
+         \x20       return new {class}(csilVal);\n    }}\n\n"
+    ));
+    out
+}
 
-    // Literal-narrowed scalar (e.g. `text / "a" / "b"`): a transparent wrapper over the
-    // one real arm — `map_type` already collapsed it to that scalar.
-    if non_literal.len() == 1 {
-        let arm = non_literal[0];
-        let enc = java_enc_value(arm, "v.value()", records, aliases, choices_map, 0);
-        let dec = java_dec_value(arm, "csilRoot", records, aliases, choices_map, 0);
-        out.push_str(&format!(
-            "    static CborValue enc{class}({class} v) {{\n        return {enc};\n    }}\n\n"
-        ));
-        out.push_str(&format!(
-            "    static {class} dec{class}(CborValue csilRoot) {{\n        return new {class}({dec});\n    }}\n\n"
-        ));
-        return out;
+/// A mixed-kind literal enum (`"a" / 1`, or any literal-only choice whose members don't
+/// share one CBOR scalar kind — including a `Bytes`/`Null`/`Array` literal, which the
+/// single-scalar-read happy path above cannot represent at all): no single `CborXxx`
+/// wrapper or `asXxx` reader fits every member. Before this function existed,
+/// `emit_choice_codec` picked ONE kind from the choice's FIRST literal arm and applied
+/// it to every member — encoding a member of a different kind cast `v.value()` to the
+/// wrong boxed type (a `ClassCastException` at runtime), and decoding silently dropped
+/// every member whose kind wasn't the winning one from the membership check (a
+/// legitimately-encoded value was rejected as "not a member" even though it was
+/// declared). The fix: encode dispatches on the boxed value's own runtime Java type via
+/// the shared `encEnumScalar` helper (the same one an un-hoisted inline all-literal
+/// choice field uses — see `java_enc_value`'s `Choice` arm — since a mixed-kind enum's
+/// value is boxed the same handful of runtime types regardless of which specific
+/// literals are declared), and decode reads the CBOR item generically (`asEnumScalar`,
+/// keyed on the item's own CBOR major type) then validates the result against the FULL
+/// declared vocabulary using each literal's own kind-appropriate equality check. Mirrors
+/// the OCaml generator's `MixedEnum` and the TypeScript generator's `asEnumScalar`
+/// handling of this same shape.
+fn emit_mixed_enum_codec(class: &str, literals: &[&CsilLiteralValue]) -> String {
+    let mut out = String::new();
+    out.push_str(&format!(
+        "    static CborValue enc{class}({class} v) {{\n        return encEnumScalar(v.value());\n    }}\n\n"
+    ));
+
+    out.push_str(&format!(
+        "    static {class} dec{class}(CborValue csilRoot) {{\n"
+    ));
+    out.push_str("        Object csilVal = asEnumScalar(csilRoot);\n");
+    let membership = literals
+        .iter()
+        .enumerate()
+        .map(|(idx, lit)| java_literal_equals_object_expr(lit, "csilVal", idx))
+        .collect::<Vec<_>>()
+        .join(" || ");
+    out.push_str(&format!(
+        "        if (!({membership})) {{\n\
+         \x20           throw new CsilCborException(\"csil cbor: {class} value \" + csilVal + \" is not a member of the declared enum\");\n\
+         \x20       }}\n\
+         \x20       return new {class}(csilVal);\n    }}\n\n"
+    ));
+    out
+}
+
+/// The Java equality expression checking `expr` (the union wrapper's dispatched
+/// value, already known compatible with `lit`'s kind by construction — see
+/// `map_type`'s literal-narrowed-scalar collapse) against a literal arm's own
+/// declared value. `Objects.equals` autoboxes a primitive `expr` for free and is
+/// null-safe; a byte string needs `Arrays.equals` instead since array equality is
+/// reference identity under `Object.equals`.
+fn java_literal_equals_expr(lit: &CsilLiteralValue, expr: &str) -> String {
+    if let CsilLiteralValue::Bytes(bytes) = lit {
+        let values = bytes
+            .iter()
+            .map(|b| b.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        return format!("java.util.Arrays.equals({expr}, new byte[] {{ {values} }})");
     }
+    format!(
+        "java.util.Objects.equals({expr}, {})",
+        java_literal_value_expr(lit)
+    )
+}
 
-    // All-literal enum: the bare literal is its own discriminant.
-    if non_literal.is_empty() {
-        let (enc, dec) = match enum_literal_kind(choices).unwrap_or("text") {
-            "int" => (
-                "new CborInt((Long) v.value())".to_string(),
-                format!("new {class}(asI64(csilRoot))"),
-            ),
-            "float" => (
-                "new CborFloat((Double) v.value())".to_string(),
-                format!("new {class}(asF64(csilRoot))"),
-            ),
-            "bool" => (
-                "new CborBool((Boolean) v.value())".to_string(),
-                format!("new {class}(asBool(csilRoot))"),
-            ),
-            _ => (
-                "new CborText((String) v.value())".to_string(),
-                format!("new {class}(asText(csilRoot))"),
-            ),
-        };
-        out.push_str(&format!(
-            "    static CborValue enc{class}({class} v) {{\n        return {enc};\n    }}\n\n"
-        ));
-        out.push_str(&format!(
-            "    static {class} dec{class}(CborValue csilRoot) {{\n        return {dec};\n    }}\n\n"
-        ));
-        return out;
+/// Like `java_literal_equals_expr`, but for comparing a statically-`Object`-typed
+/// decoded scalar (`asEnumScalar`'s result, used by a mixed-kind enum's decode — see
+/// `emit_mixed_enum_codec`) against one declared literal. Every kind but `Bytes` already
+/// works through `java_literal_equals_expr`'s `Objects.equals` unchanged (it autoboxes a
+/// bare `Object` operand for free); only `Bytes` needs its own `instanceof`-guarded cast
+/// first, since `Arrays.equals(byte[], byte[])` does not accept an `Object` operand the
+/// way `Objects.equals` does. `idx` keeps the `instanceof` pattern variable unique
+/// across the membership OR-chain's arms (Java requires distinct pattern-variable names
+/// among sibling `||` operands sharing one enclosing statement).
+fn java_literal_equals_object_expr(lit: &CsilLiteralValue, expr: &str, idx: usize) -> String {
+    if let CsilLiteralValue::Bytes(bytes) = lit {
+        let values = bytes
+            .iter()
+            .map(|b| b.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        return format!(
+            "({expr} instanceof byte[] csilMB{idx} && java.util.Arrays.equals(csilMB{idx}, new byte[] {{ {values} }}))"
+        );
     }
+    java_literal_equals_expr(lit, expr)
+}
 
-    // Union: a `[variant_index, value]` tagged sum. Encode dispatches on the value's Java
-    // type to its declaration-order index; decode reads the index and dispatches back.
-    out.push_str(&format!("    static CborValue enc{class}({class} v) {{\n"));
-    out.push_str("        Object csilInner = v.value();\n");
+/// Encode body for a union collapsed to a single concrete Java type (exactly one
+/// non-literal arm): each literal arm is checked by value equality in declaration
+/// order ahead of the general arm's fallback, matching the Go/Python generators'
+/// literal-first precedence for a shared dispatch type.
+fn emit_scalar_union_encode(
+    class: &str,
+    choices: &[CsilTypeExpression],
+    records: &std::collections::HashSet<String>,
+    aliases: &std::collections::HashMap<String, CsilTypeExpression>,
+    choices_map: &std::collections::HashMap<String, Vec<CsilTypeExpression>>,
+) -> String {
+    let vexpr = "v.value()";
+    let mut out = format!("    static CborValue enc{class}({class} v) {{\n");
+    let mut general_idx = None;
     for (idx, arm) in choices.iter().enumerate() {
-        if matches!(arm, CsilTypeExpression::Literal(_)) {
+        let Some(lit) = choice_arm_literal(arm) else {
+            general_idx = Some(idx);
+            continue;
+        };
+        let cmp = java_literal_equals_expr(lit, vexpr);
+        let enc = java_enc_value(arm, vexpr, records, aliases, choices_map, 0);
+        out.push_str(&format!(
+            "        if ({cmp}) {{\n            return new CborArray(java.util.Arrays.asList(new CborUint({idx}L), {enc}));\n        }}\n"
+        ));
+    }
+    let general_idx = general_idx.expect("a scalar union has exactly one non-literal arm");
+    let genc = java_enc_value(
+        &choices[general_idx],
+        vexpr,
+        records,
+        aliases,
+        choices_map,
+        0,
+    );
+    out.push_str(&format!(
+        "        return new CborArray(java.util.Arrays.asList(new CborUint({general_idx}L), {genc}));\n    }}\n\n"
+    ));
+    out
+}
+
+/// Encode body for a union with two or more non-literal arms (the wrapper's value
+/// stays `Object`): arms are grouped by their dispatch Java type (`map_type_boxed`,
+/// which already maps a literal arm to the boxed form of its own scalar kind), so a
+/// literal sharing its general arm's type is checked by value equality first and the
+/// general arm is the fallback for every other value of that type — mirroring the
+/// Go/Python generators' type-switch/`isinstance` grouping.
+fn emit_object_union_encode(
+    class: &str,
+    choices: &[CsilTypeExpression],
+    records: &std::collections::HashSet<String>,
+    aliases: &std::collections::HashMap<String, CsilTypeExpression>,
+    choices_map: &std::collections::HashMap<String, Vec<CsilTypeExpression>>,
+) -> String {
+    let mut out = format!("    static CborValue enc{class}({class} v) {{\n");
+    out.push_str("        Object csilInner = v.value();\n");
+
+    let mut type_order: Vec<String> = Vec::new();
+    let mut groups: std::collections::HashMap<String, Vec<usize>> =
+        std::collections::HashMap::new();
+    for (idx, arm) in choices.iter().enumerate() {
+        let ty = map_type_boxed(arm);
+        let entry = groups.entry(ty.clone()).or_default();
+        if entry.is_empty() {
+            type_order.push(ty.clone());
+        }
+        entry.push(idx);
+    }
+
+    for ty in &type_order {
+        let idxs = &groups[ty];
+        let cast = format!("csilCast{}", idxs[0]);
+        if idxs.len() == 1 {
+            let idx = idxs[0];
+            let arm = &choices[idx];
+            let enc = java_enc_value(arm, &cast, records, aliases, choices_map, 0);
+            if let Some(lit) = choice_arm_literal(arm) {
+                let cmp = java_literal_equals_expr(lit, &cast);
+                out.push_str(&format!(
+                    "        if (csilInner instanceof {ty} {cast} && {cmp}) {{\n            return new CborArray(java.util.Arrays.asList(new CborUint({idx}L), {enc}));\n        }}\n"
+                ));
+            } else {
+                out.push_str(&format!(
+                    "        if (csilInner instanceof {ty} {cast}) {{\n            return new CborArray(java.util.Arrays.asList(new CborUint({idx}L), {enc}));\n        }}\n"
+                ));
+            }
             continue;
         }
-        let boxed = map_type_boxed(arm);
-        let cast = format!("csilCast{idx}");
-        let enc = java_enc_value(arm, &cast, records, aliases, choices_map, 0);
+        // Multiple arms share this Java type: literal arms win by value equality
+        // ahead of the general arm, which is the fallback for every other value.
+        let mut literal_idxs = Vec::new();
+        let mut general_idx = None;
+        for &idx in idxs {
+            if choice_arm_literal(&choices[idx]).is_some() {
+                literal_idxs.push(idx);
+            } else if general_idx.is_none() {
+                // Declaration order must be preserved: a later general arm in the same
+                // dispatch group is unreachable dead code once the first one already
+                // matches every value of that runtime type, so silently keeping the LAST
+                // one instead of the FIRST (the previous behavior here) would
+                // non-deterministically change which arm's payload shape callers observe,
+                // and would contradict every other generator's declaration-order dispatch.
+                general_idx = Some(idx);
+            }
+        }
         out.push_str(&format!(
-            "        if (csilInner instanceof {boxed} {cast}) {{\n            return new CborArray(java.util.Arrays.asList(new CborUint({idx}L), {enc}));\n        }}\n"
+            "        if (csilInner instanceof {ty} {cast}) {{\n"
         ));
+        for idx in literal_idxs {
+            let Some(lit) = choice_arm_literal(&choices[idx]) else {
+                unreachable!("filtered to literal arms above")
+            };
+            let cmp = java_literal_equals_expr(lit, &cast);
+            let enc = java_enc_value(&choices[idx], &cast, records, aliases, choices_map, 0);
+            out.push_str(&format!(
+                "            if ({cmp}) {{\n                return new CborArray(java.util.Arrays.asList(new CborUint({idx}L), {enc}));\n            }}\n"
+            ));
+        }
+        if let Some(gi) = general_idx {
+            let enc = java_enc_value(&choices[gi], &cast, records, aliases, choices_map, 0);
+            out.push_str(&format!(
+                "            return new CborArray(java.util.Arrays.asList(new CborUint({gi}L), {enc}));\n"
+            ));
+        }
+        out.push_str("        }\n");
     }
     out.push_str(&format!(
         "        throw new CsilCborException(\"csil cbor: {class} value matches no variant\");\n    }}\n\n"
     ));
+    out
+}
 
-    out.push_str(&format!("    static {class} dec{class}(CborValue v) {{\n"));
+/// Decode body shared by both union shapes: read the tagged sum's index and dispatch
+/// to the arm declared at that position. A literal arm's `java_dec_value` already
+/// validates the payload equals the declared literal (`expectLiteral`), erroring on a
+/// mismatch rather than trusting the index alone.
+fn emit_union_decode(
+    class: &str,
+    choices: &[CsilTypeExpression],
+    records: &std::collections::HashSet<String>,
+    aliases: &std::collections::HashMap<String, CsilTypeExpression>,
+    choices_map: &std::collections::HashMap<String, Vec<CsilTypeExpression>>,
+) -> String {
+    let mut out = format!("    static {class} dec{class}(CborValue v) {{\n");
     out.push_str("        java.util.List<CborValue> csilArr = asArray(v);\n");
     out.push_str("        long csilIdx = asU64(csilArr.get(0));\n");
     out.push_str("        CborValue csilPayload = csilArr.get(1);\n");
     for (idx, arm) in choices.iter().enumerate() {
-        if matches!(arm, CsilTypeExpression::Literal(_)) {
-            continue;
-        }
         let dec = java_dec_value(arm, "csilPayload", records, aliases, choices_map, 0);
         out.push_str(&format!(
             "        if (csilIdx == {idx}L) {{\n            return new {class}({dec});\n        }}\n"
@@ -2331,6 +2672,18 @@ fn generate_codec(input: &WasmGeneratorInput, config: &JavaConfig) -> Option<Gen
         code.push('\n');
         code.push_str(CODEC_DECIMAL_JAVA);
     }
+    // `asEnumScalar`/`encEnumScalar`/`requireEnumMember` are only referenced by a
+    // mixed-kind named enum's codec (`emit_mixed_enum_codec`) or an un-hoisted inline
+    // all-literal choice field (`java_enc_value`/`java_dec_value`'s `Choice` arm); most
+    // specs have neither, so they stay out of the JDK import surface entirely, matching
+    // the Timestamp/Decimal conditionals above.
+    if body.contains("asEnumScalar(")
+        || body.contains("encEnumScalar(")
+        || body.contains("requireEnumMember(")
+    {
+        code.push('\n');
+        code.push_str(CODEC_ENUM_SCALAR_JAVA);
+    }
     code.push('\n');
     code.push_str(&body);
     code.push_str("}\n");
@@ -2399,7 +2752,6 @@ fn generate_client(
 ) -> GeneratedFile {
     let base = service_base(name);
     let class = format!("{base}Client");
-    let wire_service = base.to_lowercase();
 
     let mut code = config.header();
     let mut prose = clean_doc(doc);
@@ -2436,7 +2788,6 @@ fn generate_client(
             ));
             continue;
         }
-        let method = wire_method_name(&op.name);
         let camel = op.name.to_case(Case::Camel);
         let stem = op_codec_stem(name, op);
         let resp_type = map_type_boxed(&success);
@@ -2466,7 +2817,8 @@ fn generate_client(
             "    public {resp_type} {camel}({params}) throws ClientException {{\n"
         ));
         code.push_str(&format!(
-            "        return {decode_resp}(transport.call(\"{wire_service}\", \"{method}\", {req_bytes}));\n"
+            "        return {decode_resp}(transport.call(\"{name}\", \"{op_name}\", {req_bytes}));\n",
+            op_name = op.name
         ));
         code.push_str("    }\n");
     }
@@ -2612,7 +2964,7 @@ fn generate_router(
         ));
         for op in &service.operations {
             if let Some(op_id) = op.wire_id {
-                let m = wire_method_name(&op.name);
+                let m = pascal_op_name(&op.name);
                 code.push_str(&format!(
                     "    public static final long {iface}Op{m}WireId = {op_id}L;\n"
                 ));
@@ -2633,7 +2985,7 @@ fn generate_router(
             if !matches!(op.direction, CsilServiceDirection::Bidirectional) {
                 continue;
             }
-            let m = wire_method_name(&op.name);
+            let m = &op.name;
             let camel = op.name.to_case(Case::Camel);
             let input = map_type(&op.input_type);
             code.push_str(&format!("            case \"{m}\" -> {{\n"));
@@ -2695,13 +3047,14 @@ fn generate_router(
         ) {
             continue;
         }
-        let m = wire_method_name(&op.name);
+        let m = pascal_op_name(&op.name);
         let output = map_type(&op.output_type);
         code.push_str(&format!(
             "    public static EncodedMessage encode{iface}{m}(Codec codec, {output} msg) {{\n"
         ));
         code.push_str(&format!(
-            "        return new EncodedMessage(\"{m}\", codec.encode(msg));\n"
+            "        return new EncodedMessage(\"{event}\", codec.encode(msg));\n",
+            event = op.name
         ));
         code.push_str("    }\n\n");
     }
@@ -2764,17 +3117,15 @@ fn map_type(type_expr: &CsilTypeExpression) -> String {
         CsilTypeExpression::Constrained { base_type, .. } => map_type(base_type),
         // A `text / "a" / "b"` style choice (a base scalar narrowed by string literals)
         // collapses to that one underlying scalar — the literals constrain values, not the
-        // Java type. A genuine multi-type union has no single Java type, so it stays Object.
-        CsilTypeExpression::Choice(choices) => {
-            let non_literal: Vec<&CsilTypeExpression> = choices
-                .iter()
-                .filter(|c| !matches!(c, CsilTypeExpression::Literal(_)))
-                .collect();
-            match non_literal.as_slice() {
-                [only] => map_type(only),
-                _ => "Object".to_string(),
-            }
-        }
+        // Java type. A genuine multi-type union (a lone non-literal arm whose Java type the
+        // literal arms do NOT share, or more than one non-literal arm) has no single Java
+        // type, so it stays Object. A `.default`-suffixed literal arm parses as
+        // `Constrained { Literal, .. }`, so membership is tested through `choice_arm_literal`
+        // rather than a bare `Literal` match.
+        CsilTypeExpression::Choice(choices) => match codec_collapse_choice(choices) {
+            Some(only) => map_type(only),
+            None => "Object".to_string(),
+        },
         _ => "Object".to_string(),
     }
 }
@@ -2831,8 +3182,9 @@ fn service_has_pushable_ops(def: &CsilServiceDefinition) -> bool {
     })
 }
 
-/// Strip a trailing `Service` suffix and PascalCase the remainder, matching the
-/// wire service base used across the other-language clients.
+/// Strip a trailing `Service` suffix and PascalCase the remainder, used only for
+/// Java identifiers (the client class name and per-op codec stems). Wire strings
+/// carry the verbatim CSIL service name instead (csil-rpc-transport.md §1.1).
 fn service_base(name: &str) -> String {
     let pascal = name.to_case(Case::Pascal);
     pascal
@@ -2842,9 +3194,9 @@ fn service_base(name: &str) -> String {
         .unwrap_or(pascal)
 }
 
-/// PascalCase an operation name for the wire, matching the Go/TS/Python clients so
-/// all generators agree on the method string passed to the transport.
-fn wire_method_name(name: &str) -> String {
+/// PascalCase an operation name for Java identifiers (codec stems, wire-id constant
+/// names). Wire strings carry the verbatim kebab-case CSIL operation name instead.
+fn pascal_op_name(name: &str) -> String {
     name.to_case(Case::Pascal)
 }
 
@@ -3449,6 +3801,59 @@ const CODEC_TIMESTAMP_JAVA: &str = r#"    public static CborValue encTimestamp(j
     }
 "#;
 
+/// Generic enum-scalar helpers shared by a mixed-kind NAMED enum's codec
+/// (`emit_mixed_enum_codec`) and an un-hoisted inline all-literal choice field
+/// (`java_enc_value`/`java_dec_value`'s `Choice` arm, via `inline_enum_literals`): no
+/// single `CborXxx`/`asXxx` pair fits every member's CBOR kind, so `asEnumScalar` reads
+/// an item by its own CBOR major type and `encEnumScalar` writes a boxed Java value back
+/// by its own runtime type — both recursing element-by-element through a `CborArray`/
+/// `List` so an `Array` literal member is representable too. `requireEnumMember`
+/// validates a decoded scalar against ONE choice's own declared vocabulary (the caller
+/// supplies the membership predicate, since the vocabulary differs per choice).
+/// Appended only when a generated enum decoder actually calls one of these.
+const CODEC_ENUM_SCALAR_JAVA: &str = r#"    public static Object asEnumScalar(CborValue v) {
+        if (v instanceof CborUint x) return x.value();
+        if (v instanceof CborInt x) return x.value();
+        if (v instanceof CborFloat x) return x.value();
+        if (v instanceof CborBool x) return x.value();
+        if (v instanceof CborText x) return x.value();
+        if (v instanceof CborBytes x) return x.value();
+        if (v instanceof CborNull) return null;
+        if (v instanceof CborArray x) {
+            java.util.List<Object> csilItems = new java.util.ArrayList<>();
+            for (CborValue csilItem : x.items()) {
+                csilItems.add(asEnumScalar(csilItem));
+            }
+            return csilItems;
+        }
+        throw new CsilCborException("csil cbor: expected an enum scalar");
+    }
+
+    public static CborValue encEnumScalar(Object v) {
+        if (v instanceof Long x) return new CborInt(x);
+        if (v instanceof Double x) return new CborFloat(x);
+        if (v instanceof Boolean x) return new CborBool(x);
+        if (v instanceof String x) return new CborText(x);
+        if (v instanceof byte[] x) return new CborBytes(x);
+        if (v == null) return new CborNull();
+        if (v instanceof java.util.List<?> x) {
+            java.util.List<CborValue> csilItems = new java.util.ArrayList<>();
+            for (Object csilItem : x) {
+                csilItems.add(encEnumScalar(csilItem));
+            }
+            return new CborArray(csilItems);
+        }
+        throw new CsilCborException("csil cbor: enum value has an unsupported runtime type");
+    }
+
+    public static <T> T requireEnumMember(T value, java.util.function.Predicate<T> member) {
+        if (!member.test(value)) {
+            throw new CsilCborException("csil cbor: value " + value + " is not a member of the declared enum");
+        }
+        return value;
+    }
+"#;
+
 /// Decimal (CBOR tag 4 `[exponent, mantissa]`, exact) codec, appended only when the
 /// spec uses `decimal`. `BigDecimal` is Java's exact decimal; its unscaled value and
 /// scale map straight onto the tag-4 wire form, with a bignum fallback (tag 2/3) when
@@ -3779,9 +4184,9 @@ mod tests {
             "public SubmitTaskResponse submitTask(SubmitTaskRequest req) throws ClientException"
         ));
         // The client encodes the request and decodes the response through the codec over
-        // a dumb byte seam: service lowercased, op PascalCased, matching peers.
+        // a dumb byte seam: verbatim CSIL service and op names, matching peers.
         assert!(f.content.contains(
-            "return CsilCbor.decodeSubmitTaskResponse(transport.call(\"corndogs\", \"SubmitTask\", CsilCbor.encodeSubmitTaskRequest(req)));"
+            "return CsilCbor.decodeSubmitTaskResponse(transport.call(\"CorndogsService\", \"submit-task\", CsilCbor.encodeSubmitTaskRequest(req)));"
         ));
         // no server interface for the client target.
         assert!(!files.iter().any(|f| f.path.ends_with("Corndogs.java")));
@@ -4004,7 +4409,7 @@ mod tests {
         assert!(router
             .content
             .contains("public static void routeMatchChannel(Match handlers, Codec codec, String method, byte[] data)"));
-        assert!(router.content.contains("case \"Play\" -> {"));
+        assert!(router.content.contains("case \"play\" -> {"));
         assert!(router.content.contains("handlers.play(msg);"));
         // compact router twin dispatches on the ordinal
         assert!(router
@@ -4020,7 +4425,7 @@ mod tests {
         assert!(
             router
                 .content
-                .contains("return new EncodedMessage(\"Play\", codec.encode(msg));")
+                .contains("return new EncodedMessage(\"play\", codec.encode(msg));")
         );
     }
 
@@ -4057,7 +4462,7 @@ mod tests {
         // A null-input op sends a null payload; the response decodes through the codec.
         assert!(
             f.content.contains(
-                "return CsilCbor.decodePong(transport.call(\"health\", \"Ping\", null));"
+                "return CsilCbor.decodePong(transport.call(\"Health\", \"ping\", null));"
             )
         );
     }
@@ -4439,7 +4844,7 @@ public final class Driver {
     // request, then encodes its task as the typed response, exercising both directions.
     static final class Loopback implements Transport {
         public byte[] call(String service, String op, byte[] req) throws ClientException {
-            if (!service.equals("corndogs") || !op.equals("SubmitTask")) {
+            if (!service.equals("CorndogsService") || !op.equals("submit-task")) {
                 throw new ClientException("unexpected route " + service + "/" + op);
             }
             SubmitTaskRequest in = CsilCbor.decodeSubmitTaskRequest(req);
@@ -4506,6 +4911,943 @@ public final class Driver {
         check(rt.inner() instanceof CsilCbor.CborBytes
             && java.util.Arrays.equals(((CsilCbor.CborBytes) rt.inner()).value(), tagPayload),
             "tag inner bytes");
+
+        System.out.println("ok");
+    }
+}
+"#;
+
+    /// Compatibility guard: an all-literal choice (`Color = "red" / "green" /
+    /// "blue"`, matching `Color` in tests/interop/interop.csil) must keep encoding as
+    /// the bare literal, never the tagged sum — the union fix must not touch this
+    /// shape at all.
+    #[test]
+    fn all_literal_choice_codec_stays_bare_literal() {
+        let choices = vec![
+            CsilTypeExpression::Literal(CsilLiteralValue::Text("red".to_string())),
+            CsilTypeExpression::Literal(CsilLiteralValue::Text("green".to_string())),
+            CsilTypeExpression::Literal(CsilLiteralValue::Text("blue".to_string())),
+        ];
+        let out = emit_choice_codec(
+            "Color",
+            &choices,
+            &std::collections::HashSet::new(),
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+        );
+        assert!(out.contains(
+            "static CborValue encColor(Color v) {\n        return new CborText((String) v.value());\n    }"
+        ));
+        // Decode reads the bare literal AND validates it against the declared set —
+        // an arbitrary string must not silently become a `Color` (see
+        // `enum_decode_rejects_out_of_set_value` for the compiled, run proof).
+        assert!(
+            out.contains("var csilVal = asText(csilRoot);"),
+            "got:\n{out}"
+        );
+        assert!(
+            out.contains("java.util.Objects.equals(csilVal, \"red\")")
+                && out.contains("java.util.Objects.equals(csilVal, \"green\")")
+                && out.contains("java.util.Objects.equals(csilVal, \"blue\")"),
+            "got:\n{out}"
+        );
+        assert!(
+            out.contains("throw new CsilCborException(\"csil cbor: Color value \" + csilVal + \" is not a member of the declared enum\");"),
+            "got:\n{out}"
+        );
+        assert!(out.contains("return new Color(csilVal);"), "got:\n{out}");
+        assert!(!out.contains("CborArray"));
+    }
+
+    /// Compatibility guard: a genuine (non-mixed) union with no literal arms must
+    /// still dispatch one `instanceof`-guarded case per arm, in declaration order —
+    /// the type-grouping added to support literal arms in a mixed union must not
+    /// perturb a union that has none.
+    #[test]
+    fn non_literal_union_dispatches_each_arm_by_its_own_type() {
+        let choices = vec![
+            CsilTypeExpression::Reference("Task".to_string()),
+            CsilTypeExpression::Reference("ServiceError".to_string()),
+        ];
+        let mut records = std::collections::HashSet::new();
+        records.insert("Task".to_string());
+        records.insert("ServiceError".to_string());
+        let out = emit_choice_codec(
+            "Result",
+            &choices,
+            &records,
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+        );
+        assert!(out.contains("if (csilInner instanceof Task csilCast0) {"));
+        assert!(out.contains(
+            "return new CborArray(java.util.Arrays.asList(new CborUint(0L), encTask(csilCast0)));"
+        ));
+        assert!(out.contains("if (csilInner instanceof ServiceError csilCast1) {"));
+        assert!(out.contains(
+            "return new CborArray(java.util.Arrays.asList(new CborUint(1L), encServiceError(csilCast1)));"
+        ));
+        assert!(out.contains(
+            "if (csilIdx == 0L) {\n            return new Result(decTask(csilPayload));\n        }"
+        ));
+        assert!(out.contains(
+            "if (csilIdx == 1L) {\n            return new Result(decServiceError(csilPayload));\n        }"
+        ));
+    }
+
+    /// A spec with a mixed-union type-choice (`OrderStatus = text / "pending" /
+    /// "confirmed" / "cancelled"`), matching `OrderStatus` in
+    /// examples/real-world-api/e-commerce-api.csil, referenced by a minimal `Order`
+    /// record so `generate_codec` emits the choice's own `enc`/`dec` pair.
+    fn mixed_union_rules() -> Vec<CsilRule> {
+        let status = rule(
+            "OrderStatus",
+            CsilRuleType::TypeDef(CsilTypeExpression::Choice(vec![
+                builtin("text"),
+                CsilTypeExpression::Literal(CsilLiteralValue::Text("pending".to_string())),
+                CsilTypeExpression::Literal(CsilLiteralValue::Text("confirmed".to_string())),
+                CsilTypeExpression::Literal(CsilLiteralValue::Text("cancelled".to_string())),
+            ])),
+        );
+        let order = rule(
+            "Order",
+            CsilRuleType::GroupDef(CsilGroupExpression {
+                entries: vec![bare(
+                    "status",
+                    CsilTypeExpression::Reference("OrderStatus".to_string()),
+                    None,
+                )],
+            }),
+        );
+        vec![status, order]
+    }
+
+    /// Regression test for the general-arm-shadows-literals bug: before the fix,
+    /// `OrderStatus` (a single-non-literal-arm choice) collapsed to a transparent
+    /// `String` wrapper and encoded/decoded the bare literal, which is
+    /// wire-incompatible with the locked union contract every other generator
+    /// (go/python/rust/c/csharp/kotlin) already implements for this shape. Confirms
+    /// literal-first indices, the general-arm fallback for a non-literal string, that
+    /// every declared index decodes (literal arms included), and that a literal arm's
+    /// payload is still validated on decode rather than trusted from the index alone.
+    #[test]
+    fn mixed_union_encode_prefers_literal_over_general_arm() {
+        let have = std::process::Command::new("javac")
+            .arg("-version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if !have {
+            eprintln!("skipping: no javac on PATH");
+            return;
+        }
+
+        let files = generate_java(&input_for(mixed_union_rules(), "java-client")).unwrap();
+
+        let dir =
+            std::env::temp_dir().join(format!("csilgen-java-mixedunion-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut sources: Vec<std::path::PathBuf> = Vec::new();
+        for f in &files {
+            let path = dir.join(&f.path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, &f.content).unwrap();
+            sources.push(path);
+        }
+        let driver = dir.join("csilgen/generated/MixedUnionDriver.java");
+        std::fs::write(&driver, JAVA_MIXED_UNION_DRIVER).unwrap();
+        sources.push(driver);
+
+        let classes = dir.join("classes");
+        std::fs::create_dir_all(&classes).unwrap();
+        let compile = std::process::Command::new("javac")
+            .arg("-d")
+            .arg(&classes)
+            .args(&sources)
+            .output()
+            .unwrap();
+        assert!(
+            compile.status.success(),
+            "javac failed:\n{}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+
+        let run = std::process::Command::new("java")
+            .arg("-cp")
+            .arg(&classes)
+            .arg("csilgen.generated.MixedUnionDriver")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&run.stdout);
+        let stderr = String::from_utf8_lossy(&run.stderr);
+        assert!(
+            run.status.success(),
+            "java run failed:\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        assert_eq!(
+            stdout.trim(),
+            "ok",
+            "unexpected output:\n{stdout}\n{stderr}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    const JAVA_MIXED_UNION_DRIVER: &str = r#"package csilgen.generated;
+
+public final class MixedUnionDriver {
+    static void check(boolean cond, String msg) {
+        if (!cond) {
+            System.out.println("FAIL: " + msg);
+            System.exit(1);
+        }
+    }
+
+    public static void main(String[] args) throws Exception {
+        // A declared literal must win its own index over the general `text` arm,
+        // even though both dispatch on the same Java `String`.
+        CsilCbor.CborValue pendingCbor = CsilCbor.encOrderStatus(new OrderStatus("pending"));
+        check(pendingCbor instanceof CsilCbor.CborArray, "pending is an array");
+        java.util.List<CsilCbor.CborValue> pendingArr = ((CsilCbor.CborArray) pendingCbor).items();
+        check(((CsilCbor.CborUint) pendingArr.get(0)).value() == 1L, "pending index 1");
+        check(((CsilCbor.CborText) pendingArr.get(1)).value().equals("pending"), "pending payload");
+
+        java.util.List<CsilCbor.CborValue> confirmedArr =
+            ((CsilCbor.CborArray) CsilCbor.encOrderStatus(new OrderStatus("confirmed"))).items();
+        check(((CsilCbor.CborUint) confirmedArr.get(0)).value() == 2L, "confirmed index 2");
+
+        java.util.List<CsilCbor.CborValue> cancelledArr =
+            ((CsilCbor.CborArray) CsilCbor.encOrderStatus(new OrderStatus("cancelled"))).items();
+        check(((CsilCbor.CborUint) cancelledArr.get(0)).value() == 3L, "cancelled index 3");
+
+        // A string matching no literal falls back to the general arm, index 0.
+        java.util.List<CsilCbor.CborValue> onHoldArr =
+            ((CsilCbor.CborArray) CsilCbor.encOrderStatus(new OrderStatus("on-hold"))).items();
+        check(((CsilCbor.CborUint) onHoldArr.get(0)).value() == 0L, "on-hold index 0");
+        check(((CsilCbor.CborText) onHoldArr.get(1)).value().equals("on-hold"), "on-hold payload");
+
+        // Every declared index decodes back to its value, literal arms included.
+        check(CsilCbor.decOrderStatus(CsilCbor.encOrderStatus(new OrderStatus("on-hold"))).value().equals("on-hold"), "decode index 0");
+        check(CsilCbor.decOrderStatus(CsilCbor.encOrderStatus(new OrderStatus("pending"))).value().equals("pending"), "decode index 1");
+        check(CsilCbor.decOrderStatus(CsilCbor.encOrderStatus(new OrderStatus("confirmed"))).value().equals("confirmed"), "decode index 2");
+        check(CsilCbor.decOrderStatus(CsilCbor.encOrderStatus(new OrderStatus("cancelled"))).value().equals("cancelled"), "decode index 3");
+
+        // A full round-trip through a record field.
+        Order order = new Order(new OrderStatus("pending"));
+        Order orderBack = CsilCbor.decodeOrder(CsilCbor.encodeOrder(order));
+        check(orderBack.status().value().equals("pending"), "record field round-trip");
+
+        // A literal arm still validates its payload rather than trusting the index: an
+        // index that claims "pending" but carries a different string must be rejected.
+        CsilCbor.CborValue bad = new CsilCbor.CborArray(java.util.Arrays.asList(
+            new CsilCbor.CborUint(1L), new CsilCbor.CborText("confirmed")));
+        boolean threw = false;
+        try {
+            CsilCbor.decOrderStatus(bad);
+        } catch (CsilCbor.CsilCborException e) {
+            threw = true;
+        }
+        check(threw, "literal mismatch rejected");
+
+        // An out-of-range index is rejected too.
+        CsilCbor.CborValue unknown = new CsilCbor.CborArray(java.util.Arrays.asList(
+            new CsilCbor.CborUint(99L), new CsilCbor.CborText("pending")));
+        boolean threw2 = false;
+        try {
+            CsilCbor.decOrderStatus(unknown);
+        } catch (CsilCbor.CsilCborException e) {
+            threw2 = true;
+        }
+        check(threw2, "unknown variant rejected");
+
+        System.out.println("ok");
+    }
+}
+"#;
+
+    fn lit_text(s: &str) -> CsilTypeExpression {
+        CsilTypeExpression::Literal(CsilLiteralValue::Text(s.to_string()))
+    }
+
+    /// A spec with a MIXED-KIND all-literal choice (`MixedKindStatus = "pending" / 42`,
+    /// text and integer literals in the same closed enum), referenced by a minimal
+    /// holder record so `generate_codec` emits the choice's own `enc`/`dec` pair through
+    /// `emit_mixed_enum_codec`.
+    fn mixed_kind_enum_rules() -> Vec<CsilRule> {
+        let status = rule(
+            "MixedKindStatus",
+            CsilRuleType::TypeDef(CsilTypeExpression::Choice(vec![
+                lit_text("pending"),
+                CsilTypeExpression::Literal(CsilLiteralValue::Integer(42)),
+            ])),
+        );
+        let holder = rule(
+            "MixedKindHolder",
+            CsilRuleType::GroupDef(CsilGroupExpression {
+                entries: vec![bare(
+                    "status",
+                    CsilTypeExpression::Reference("MixedKindStatus".to_string()),
+                    None,
+                )],
+            }),
+        );
+        vec![status, holder]
+    }
+
+    /// Regression test for defect (a): before the fix, `emit_choice_codec` derived the
+    /// SOLE codec kind from the choice's FIRST literal arm (`enum_literal_kind`) and
+    /// applied it to every member — encoding the `42` member of `"pending" / 42` cast
+    /// `v.value()` to `String` (a `ClassCastException`), and decoding rejected a
+    /// legitimately-encoded `42` as "not a member of the declared enum" because the
+    /// membership check was filtered down to text-only literals. Confirms both kinds
+    /// round-trip byte-identically through the named choice's own codec AND through a
+    /// record field, and that an out-of-set value of EITHER kind is rejected on decode.
+    #[test]
+    fn mixed_kind_enum_round_trips_through_javac() {
+        let have = std::process::Command::new("javac")
+            .arg("-version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if !have {
+            eprintln!("skipping: no javac on PATH");
+            return;
+        }
+
+        let files = generate_java(&input_for(mixed_kind_enum_rules(), "java-client")).unwrap();
+
+        let dir =
+            std::env::temp_dir().join(format!("csilgen-java-mixedenum-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut sources: Vec<std::path::PathBuf> = Vec::new();
+        for f in &files {
+            let path = dir.join(&f.path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, &f.content).unwrap();
+            sources.push(path);
+        }
+        let driver = dir.join("csilgen/generated/MixedKindEnumDriver.java");
+        std::fs::write(&driver, JAVA_MIXED_KIND_ENUM_DRIVER).unwrap();
+        sources.push(driver);
+
+        let classes = dir.join("classes");
+        std::fs::create_dir_all(&classes).unwrap();
+        let compile = std::process::Command::new("javac")
+            .arg("-d")
+            .arg(&classes)
+            .args(&sources)
+            .output()
+            .unwrap();
+        assert!(
+            compile.status.success(),
+            "javac failed:\n{}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+
+        let run = std::process::Command::new("java")
+            .arg("-cp")
+            .arg(&classes)
+            .arg("csilgen.generated.MixedKindEnumDriver")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&run.stdout);
+        let stderr = String::from_utf8_lossy(&run.stderr);
+        assert!(
+            run.status.success(),
+            "java run failed:\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        assert_eq!(
+            stdout.trim(),
+            "ok",
+            "unexpected output:\n{stdout}\n{stderr}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    const JAVA_MIXED_KIND_ENUM_DRIVER: &str = r#"package csilgen.generated;
+
+public final class MixedKindEnumDriver {
+    static void check(boolean cond, String msg) {
+        if (!cond) {
+            System.out.println("FAIL: " + msg);
+            System.exit(1);
+        }
+    }
+
+    public static void main(String[] args) throws Exception {
+        // The text member round-trips through the named choice's own codec.
+        MixedKindStatus pending = new MixedKindStatus("pending");
+        byte[] pendingBytes = CsilCbor.encode(CsilCbor.encMixedKindStatus(pending));
+        MixedKindStatus pendingBack = CsilCbor.decMixedKindStatus(CsilCbor.decode(pendingBytes));
+        check(pendingBack.value().equals("pending"), "text member round-trip");
+
+        // The integer member round-trips too — before the fix this cast `v.value()` to
+        // String on encode (ClassCastException) since "text" was the winning kind from
+        // the first literal arm.
+        MixedKindStatus fortyTwo = new MixedKindStatus(42L);
+        byte[] intBytes = CsilCbor.encode(CsilCbor.encMixedKindStatus(fortyTwo));
+        MixedKindStatus intBack = CsilCbor.decMixedKindStatus(CsilCbor.decode(intBytes));
+        check(((Long) intBack.value()) == 42L, "int member round-trip");
+
+        // Both kinds round-trip through a record field too.
+        MixedKindHolder h1Back = CsilCbor.decodeMixedKindHolder(
+            CsilCbor.encodeMixedKindHolder(new MixedKindHolder(pending)));
+        check(h1Back.status().value().equals("pending"), "record field text round-trip");
+
+        MixedKindHolder h2Back = CsilCbor.decodeMixedKindHolder(
+            CsilCbor.encodeMixedKindHolder(new MixedKindHolder(fortyTwo)));
+        check(((Long) h2Back.status().value()) == 42L, "record field int round-trip");
+
+        // An out-of-set value of EITHER kind is rejected on decode — before the fix, a
+        // legitimately out-of-vocabulary int like `7` (or, worse, an in-vocabulary-kind
+        // int at all) was checked against a text-only-filtered membership list.
+        boolean threwText = false;
+        try {
+            CsilCbor.decMixedKindStatus(new CsilCbor.CborText("nope"));
+        } catch (CsilCbor.CsilCborException e) {
+            threwText = true;
+        }
+        check(threwText, "out-of-set text value rejected");
+
+        boolean threwInt = false;
+        try {
+            CsilCbor.decMixedKindStatus(new CsilCbor.CborInt(7L));
+        } catch (CsilCbor.CsilCborException e) {
+            threwInt = true;
+        }
+        check(threwInt, "out-of-set int value rejected");
+
+        System.out.println("ok");
+    }
+}
+"#;
+
+    /// A choice arm carrying a trailing `.default` control operator, the shape CSIL's
+    /// parser produces for the last arm of `a / b .default "b"`.
+    fn default_arm(inner: CsilTypeExpression, def: &str) -> CsilTypeExpression {
+        CsilTypeExpression::Constrained {
+            base_type: Box::new(inner),
+            constraints: vec![CsilControlOperator::Default(CsilLiteralValue::Text(
+                def.to_string(),
+            ))],
+        }
+    }
+
+    fn tuple_entry(ty: CsilTypeExpression) -> CsilGroupEntry {
+        CsilGroupEntry {
+            key: None,
+            value_type: ty,
+            occurrence: None,
+            metadata: vec![],
+            doc_comments: vec![],
+        }
+    }
+
+    /// The inline-choice torture record, matching the shared `inline-choice-torture.csil`:
+    /// every position an inline group/choice can appear (direct field, optional field with
+    /// a trailing `.default` arm, closed all-literal enum with a `.default` arm, mixed
+    /// union, array element, map value, tuple element, inline group field).
+    fn inline_choice_rules() -> Vec<CsilRule> {
+        let payload = rule(
+            "InlineChoicePayload",
+            CsilRuleType::GroupDef(CsilGroupExpression {
+                entries: vec![bare("detail", builtin("text"), None)],
+            }),
+        );
+        let status = CsilTypeExpression::Choice(vec![
+            builtin("text"),
+            lit_text("pending"),
+            lit_text("active"),
+            lit_text("closed"),
+        ]);
+        let priority = CsilTypeExpression::Choice(vec![
+            builtin("text"),
+            lit_text("low"),
+            lit_text("normal"),
+            default_arm(lit_text("high"), "normal"),
+        ]);
+        let size = CsilTypeExpression::Choice(vec![
+            lit_text("small"),
+            lit_text("medium"),
+            default_arm(lit_text("large"), "medium"),
+        ]);
+        let payload_choice = CsilTypeExpression::Choice(vec![
+            lit_text("none"),
+            CsilTypeExpression::Literal(CsilLiteralValue::Integer(42)),
+            CsilTypeExpression::Reference("InlineChoicePayload".to_string()),
+        ]);
+        let tags = CsilTypeExpression::Array {
+            element_type: Box::new(CsilTypeExpression::Choice(vec![
+                builtin("text"),
+                lit_text("red"),
+                lit_text("green"),
+                lit_text("blue"),
+                builtin("int"),
+            ])),
+            occurrence: Some(CsilOccurrence::ZeroOrMore),
+        };
+        let labels = CsilTypeExpression::Map {
+            key: Box::new(builtin("text")),
+            value: Box::new(CsilTypeExpression::Choice(vec![
+                builtin("text"),
+                lit_text("yes"),
+                lit_text("no"),
+                builtin("bool"),
+            ])),
+            occurrence: Some(CsilOccurrence::ZeroOrMore),
+        };
+        let coord = CsilTypeExpression::Tuple(CsilGroupExpression {
+            entries: vec![
+                tuple_entry(builtin("int")),
+                tuple_entry(CsilTypeExpression::Choice(vec![
+                    builtin("text"),
+                    lit_text("x"),
+                    lit_text("y"),
+                    lit_text("z"),
+                ])),
+            ],
+        });
+        let nested = CsilTypeExpression::Group(CsilGroupExpression {
+            entries: vec![bare(
+                "kind",
+                CsilTypeExpression::Choice(vec![
+                    builtin("text"),
+                    lit_text("a"),
+                    lit_text("b"),
+                    builtin("int"),
+                ]),
+                None,
+            )],
+        });
+        let record = rule(
+            "InlineChoiceRecord",
+            CsilRuleType::GroupDef(CsilGroupExpression {
+                entries: vec![
+                    bare("status", status, None),
+                    bare("priority", priority, Some(CsilOccurrence::Optional)),
+                    bare("size", size, Some(CsilOccurrence::Optional)),
+                    bare("payload", payload_choice, None),
+                    bare("tags", tags, None),
+                    bare("labels", labels, None),
+                    bare("coord", coord, None),
+                    bare("nested", nested, None),
+                ],
+            }),
+        );
+        vec![payload, record]
+    }
+
+    /// Every inline group/choice position with at least one non-literal arm gets its own
+    /// synthesized named type (and codec), and the owning record field routes through it
+    /// — those anonymous-composite fields no longer collapse to `Object`/`CborNull`. A
+    /// PURE all-literal choice (`size`, matching neither `codec_collapse_choice`'s
+    /// narrowed-scalar shape nor a genuine union) is deliberately left un-hoisted
+    /// (`HoistOptions::hoist_all_literal_choices: false` — Java already renders it inline
+    /// via the generic `encEnumScalar`/`asEnumScalar`/`requireEnumMember` helpers, no
+    /// synthesized wrapper class needed).
+    #[test]
+    fn inline_composites_are_hoisted_to_named_types() {
+        let files = generate_java(&input_for(inline_choice_rules(), "java")).unwrap();
+        let names: std::collections::HashSet<&str> = files
+            .iter()
+            .filter_map(|f| f.path.rsplit('/').next())
+            .collect();
+        for expected in [
+            "InlineChoiceRecordStatus.java",
+            "InlineChoiceRecordPriority.java",
+            "InlineChoiceRecordPayload.java",
+            "InlineChoiceRecordTagsItem.java",
+            "InlineChoiceRecordLabelsValue.java",
+            "InlineChoiceRecordCoord1.java",
+            "InlineChoiceRecordNested.java",
+            "InlineChoiceRecordNestedKind.java",
+        ] {
+            assert!(
+                names.contains(expected),
+                "missing synthesized file {expected}"
+            );
+        }
+        assert!(
+            !names.contains("InlineChoiceRecordSize.java"),
+            "a pure all-literal choice must stay un-hoisted"
+        );
+
+        let record = files
+            .iter()
+            .find(|f| f.path.ends_with("InlineChoiceRecord.java"))
+            .unwrap();
+        assert!(record.content.contains("InlineChoiceRecordStatus status"));
+        assert!(
+            record
+                .content
+                .contains("List<InlineChoiceRecordTagsItem> tags")
+        );
+        assert!(
+            record
+                .content
+                .contains("Map<String, InlineChoiceRecordLabelsValue> labels")
+        );
+        assert!(record.content.contains("InlineChoiceRecordNested nested"));
+        // The un-hoisted pure-literal choice keeps the field position's `Object` type.
+        assert!(record.content.contains("Object size"));
+
+        let codec = files
+            .iter()
+            .find(|f| f.path.ends_with("CsilCbor.java"))
+            .unwrap();
+        // The record field routes through the synthesized codec, not a `CborNull` stub.
+        assert!(
+            codec
+                .content
+                .contains("encInlineChoiceRecordStatus(v.status())")
+        );
+        assert!(
+            codec.content.contains(
+                "encArray(v.tags(), csilElem0 -> encInlineChoiceRecordTagsItem(csilElem0))"
+            )
+        );
+        assert!(codec.content.contains("encInlineChoiceRecordNestedKind"));
+        // The un-hoisted `size` field routes through the generic enum-scalar helpers
+        // instead of a synthesized `encInlineChoiceRecordSize`/`decInlineChoiceRecordSize`
+        // pair — and still validates membership, not a `CborNull`/`null` stub.
+        assert!(codec.content.contains("encEnumScalar(v.size())"));
+        assert!(
+            codec
+                .content
+                .contains("requireEnumMember(asEnumScalar(csilField)")
+        );
+        assert!(
+            codec
+                .content
+                .contains("Objects.equals(csilEnumScalar0, \"small\")")
+                && codec
+                    .content
+                    .contains("Objects.equals(csilEnumScalar0, \"medium\")")
+                && codec
+                    .content
+                    .contains("Objects.equals(csilEnumScalar0, \"large\")")
+        );
+        assert!(!codec.content.contains("encInlineChoiceRecord(InlineChoiceRecord v) {\n        List<CborEntry> csilEntries = new ArrayList<>(8);\n        if (v.size() != null) {\n            csilEntries.add(new CborEntry(new CborText(\"size\"), new CborText(\"large\")));"));
+    }
+
+    /// The Constrained-arm classification fix: a closed all-literal choice whose last arm
+    /// carries a trailing `.default` (parsed as `Constrained { Literal, .. }`) stays a
+    /// bare-literal enum — it must NOT flip into the tagged-sum union shape.
+    #[test]
+    fn default_suffixed_literal_arm_stays_closed_enum() {
+        let choices = vec![
+            lit_text("small"),
+            lit_text("medium"),
+            default_arm(lit_text("large"), "medium"),
+        ];
+        let out = emit_choice_codec(
+            "Size",
+            &choices,
+            &std::collections::HashSet::new(),
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+        );
+        assert!(out.contains(
+            "static CborValue encSize(Size v) {\n        return new CborText((String) v.value());\n    }"
+        ));
+        assert!(
+            !out.contains("CborArray"),
+            "closed enum must not become a tagged sum"
+        );
+    }
+
+    /// A mixed union whose lone non-literal arm's Java type the literal arms do NOT share
+    /// (`"none" / 42 / Record`) keeps an `Object` wrapper and dispatches each arm by its
+    /// own runtime type — the single-non-literal scalar collapse must not swallow the
+    /// literal arms into the record's type.
+    #[test]
+    fn mixed_java_type_union_uses_object_dispatch() {
+        let choices = vec![
+            lit_text("none"),
+            CsilTypeExpression::Literal(CsilLiteralValue::Integer(42)),
+            CsilTypeExpression::Reference("InlineChoicePayload".to_string()),
+        ];
+        let mut records = std::collections::HashSet::new();
+        records.insert("InlineChoicePayload".to_string());
+        let out = emit_choice_codec(
+            "Payload",
+            &choices,
+            &records,
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+        );
+        assert!(out.contains("Object csilInner = v.value();"));
+        assert!(out.contains("csilInner instanceof String csilCast0 && "));
+        assert!(out.contains("csilInner instanceof Long csilCast1 && "));
+        assert!(out.contains("csilInner instanceof InlineChoicePayload csilCast2"));
+        assert!(out.contains(
+            "if (csilIdx == 2L) {\n            return new Payload(decInlineChoicePayload(csilPayload));\n        }"
+        ));
+    }
+
+    /// Regression test for defect (b): in a dispatch group of arms sharing one Java
+    /// runtime type, `general_idx` used to be overwritten on every iteration of the
+    /// group's arms (last-wins) instead of only when still unset (first-wins). Two
+    /// general (non-literal) `text`-typed arms sharing the dispatch type `String` force
+    /// the multi-arm branch of `emit_object_union_encode`; declaration order requires the
+    /// FIRST (index 0) to be the one whose payload/index the encoder actually returns —
+    /// the second is unreachable dead code once the first already matches every `String`
+    /// value, so keeping it instead would non-deterministically change which arm's index
+    /// callers observe on the wire.
+    #[test]
+    fn union_with_duplicate_dispatch_type_arms_prefers_first_declared_index() {
+        let choices = vec![
+            builtin("text"),
+            builtin("text"),
+            CsilTypeExpression::Reference("Marker".to_string()),
+        ];
+        let mut records = std::collections::HashSet::new();
+        records.insert("Marker".to_string());
+        let out = emit_choice_codec(
+            "DupArms",
+            &choices,
+            &records,
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+        );
+        assert!(
+            out.contains(
+                "if (csilInner instanceof String csilCast0) {\n            return new CborArray(java.util.Arrays.asList(new CborUint(0L), new CborText(csilCast0)));\n        }"
+            ),
+            "the first general arm of the shared-type group must win, got:\n{out}"
+        );
+        assert!(
+            !out.contains("new CborUint(1L), new CborText"),
+            "the second same-type arm must not be reachable, got:\n{out}"
+        );
+    }
+
+    /// Mirrors `crates/csilgen-common/src/hoist.rs`'s
+    /// `case_insensitive_collision_between_existing_and_synthesized_rule_is_disambiguated`:
+    /// an existing `UserData` rule and a `User` rule whose `data` field is an inline
+    /// MIXED choice (so it hoists regardless of `hoist_all_literal_choices`) referencing
+    /// `UserData` — the synthesized name (`User_data`, owner `User` + field `data`)
+    /// pascal-collides with the existing `UserData` rule.
+    fn case_insensitive_collision_rules() -> Vec<CsilRule> {
+        let user_data = rule(
+            "UserData",
+            CsilRuleType::GroupDef(CsilGroupExpression {
+                entries: vec![bare("value", builtin("text"), None)],
+            }),
+        );
+        let user = rule(
+            "User",
+            CsilRuleType::GroupDef(CsilGroupExpression {
+                entries: vec![bare(
+                    "data",
+                    CsilTypeExpression::Choice(vec![
+                        lit_text("x"),
+                        CsilTypeExpression::Reference("UserData".to_string()),
+                    ]),
+                    None,
+                )],
+            }),
+        );
+        vec![user_data, user]
+    }
+
+    /// Migration-proof: this asserts the shared hoist pass's case-insensitive name
+    /// reservation is actually wired through `generate_java` (via
+    /// `csilgen_common::hoist_inline_composites`/`HoistOptions`), not merely that the
+    /// crate compiles against the new signature. Before the shared-module migration, a
+    /// per-generator hoist that only checked collisions against the RAW (not
+    /// case-normalized) name could emit two Java files that both compile to the class
+    /// name `UserData` — a duplicate, non-compiling declaration.
+    #[test]
+    fn case_insensitive_collision_is_disambiguated_in_generated_java() {
+        let files = generate_java(&input_for(case_insensitive_collision_rules(), "java")).unwrap();
+        let class_names: Vec<String> = files
+            .iter()
+            .filter_map(|f| f.path.rsplit('/').next())
+            .filter(|n| n.ends_with(".java"))
+            .map(|n| n.trim_end_matches(".java").to_string())
+            .collect();
+        // The original `UserData` rule survives unchanged.
+        assert!(
+            class_names.iter().any(|n| n == "UserData"),
+            "got: {class_names:?}"
+        );
+        // The synthesized rule must NOT be the raw "User_data" spelling verbatim (its
+        // PascalCase form collides with `UserData`) — it must be disambiguated instead.
+        assert!(
+            !class_names.iter().any(|n| n == "User_data"),
+            "synthesized name collided with UserData but was not disambiguated: {class_names:?}"
+        );
+        // No two emitted Java source files declare the same PascalCase class name.
+        let mut canonical: Vec<String> = class_names
+            .iter()
+            .map(|n| n.to_case(Case::Pascal))
+            .collect();
+        let before = canonical.len();
+        canonical.sort();
+        canonical.dedup();
+        assert_eq!(
+            canonical.len(),
+            before,
+            "two emitted classes share a PascalCase name: {class_names:?}"
+        );
+    }
+
+    /// End-to-end: generate the torture record, compile it, and confirm the encoded bytes
+    /// for every inline-choice position match the canonical wire (byte cross-checked
+    /// against the OCaml generator for the record-field positions, and against the
+    /// `[variant_index, value]` / bare-literal contract for the array/map/tuple positions),
+    /// plus a full-record round-trip. Skips gracefully when javac is unavailable.
+    #[test]
+    fn inline_choice_torture_roundtrips_and_matches_wire() {
+        let have = std::process::Command::new("javac")
+            .arg("-version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if !have {
+            eprintln!("skipping: no javac on PATH");
+            return;
+        }
+
+        let files = generate_java(&input_for(inline_choice_rules(), "java")).unwrap();
+        let dir =
+            std::env::temp_dir().join(format!("csilgen-java-inlinechoice-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut sources: Vec<std::path::PathBuf> = Vec::new();
+        for f in &files {
+            let path = dir.join(&f.path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, &f.content).unwrap();
+            sources.push(path);
+        }
+        let driver = dir.join("csilgen/generated/InlineChoiceDriver.java");
+        std::fs::write(&driver, JAVA_INLINE_CHOICE_DRIVER).unwrap();
+        sources.push(driver);
+
+        let classes = dir.join("classes");
+        std::fs::create_dir_all(&classes).unwrap();
+        let compile = std::process::Command::new("javac")
+            .arg("-d")
+            .arg(&classes)
+            .args(&sources)
+            .output()
+            .unwrap();
+        assert!(
+            compile.status.success(),
+            "javac failed:\n{}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+        let run = std::process::Command::new("java")
+            .arg("-cp")
+            .arg(&classes)
+            .arg("csilgen.generated.InlineChoiceDriver")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&run.stdout);
+        let stderr = String::from_utf8_lossy(&run.stderr);
+        assert!(
+            run.status.success() && stdout.trim() == "ok",
+            "java run failed:\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    const JAVA_INLINE_CHOICE_DRIVER: &str = r#"package csilgen.generated;
+
+public final class InlineChoiceDriver {
+    static String hex(byte[] b) {
+        StringBuilder sb = new StringBuilder();
+        for (byte x : b) sb.append(String.format("%02x", x & 0xff));
+        return sb.toString();
+    }
+
+    static void eq(String label, byte[] bytes, String expect) {
+        String got = hex(bytes);
+        if (!got.equals(expect)) {
+            System.out.println("FAIL " + label + " = " + got + " expected " + expect);
+            System.exit(1);
+        }
+    }
+
+    public static void main(String[] args) {
+        // Record-field positions: byte-identical to the OCaml oracle.
+        eq("status.pending", CsilCbor.encode(CsilCbor.encInlineChoiceRecordStatus(new InlineChoiceRecordStatus("pending"))), "82016770656e64696e67");
+        eq("status.free", CsilCbor.encode(CsilCbor.encInlineChoiceRecordStatus(new InlineChoiceRecordStatus("free"))), "82006466726565");
+        eq("priority.high", CsilCbor.encode(CsilCbor.encInlineChoiceRecordPriority(new InlineChoiceRecordPriority("high"))), "82036468696768");
+        // `size` is a PURE all-literal choice (no non-literal arm), left un-hoisted
+        // (`HoistOptions::hoist_all_literal_choices: false`): no synthesized
+        // `InlineChoiceRecordSize` wrapper/codec exists, so its wire shape is exercised
+        // directly through the generic `encEnumScalar` helper instead.
+        eq("size.medium", CsilCbor.encode(CsilCbor.encEnumScalar("medium")), "666d656469756d");
+        eq("payload.none", CsilCbor.encode(CsilCbor.encInlineChoiceRecordPayload(new InlineChoiceRecordPayload("none"))), "8200646e6f6e65");
+        eq("payload.inline", CsilCbor.encode(CsilCbor.encInlineChoiceRecordPayload(new InlineChoiceRecordPayload(new InlineChoicePayload("hi")))), "8202a16664657461696c626869");
+        eq("nested.a", CsilCbor.encode(CsilCbor.encInlineChoiceRecordNestedKind(new InlineChoiceRecordNestedKind("a"))), "82016161");
+        eq("nested.free", CsilCbor.encode(CsilCbor.encInlineChoiceRecordNestedKind(new InlineChoiceRecordNestedKind("free"))), "82006466726565");
+        eq("nested.int7", CsilCbor.encode(CsilCbor.encInlineChoiceRecordNestedKind(new InlineChoiceRecordNestedKind(7L))), "820307");
+
+        // Array/map/tuple positions: the [variant_index, value] / bare-literal contract.
+        eq("tags.red", CsilCbor.encode(CsilCbor.encInlineChoiceRecordTagsItem(new InlineChoiceRecordTagsItem("red"))), "820163726564");
+        eq("tags.int7", CsilCbor.encode(CsilCbor.encInlineChoiceRecordTagsItem(new InlineChoiceRecordTagsItem(7L))), "820407");
+        eq("labels.yes", CsilCbor.encode(CsilCbor.encInlineChoiceRecordLabelsValue(new InlineChoiceRecordLabelsValue("yes"))), "820163796573");
+        eq("labels.true", CsilCbor.encode(CsilCbor.encInlineChoiceRecordLabelsValue(new InlineChoiceRecordLabelsValue(Boolean.TRUE))), "8203f5");
+        eq("coord.x", CsilCbor.encode(CsilCbor.encInlineChoiceRecordCoord1(new InlineChoiceRecordCoord1("x"))), "82016178");
+
+        // Full-record round-trip through the composed record codec.
+        InlineChoiceRecord rec = new InlineChoiceRecord(
+            new InlineChoiceRecordStatus("pending"),
+            new InlineChoiceRecordPriority("high"),
+            "medium",
+            new InlineChoiceRecordPayload(new InlineChoicePayload("hi")),
+            java.util.List.of(new InlineChoiceRecordTagsItem("red"), new InlineChoiceRecordTagsItem(7L)),
+            java.util.Map.of("k", new InlineChoiceRecordLabelsValue("yes")),
+            java.util.List.of(42L, new InlineChoiceRecordCoord1("x")),
+            new InlineChoiceRecordNested(new InlineChoiceRecordNestedKind(7L)));
+        InlineChoiceRecord back = CsilCbor.decodeInlineChoiceRecord(CsilCbor.encodeInlineChoiceRecord(rec));
+        boolean rt = back.status().value().equals("pending")
+            && back.priority().value().equals("high")
+            && back.size().equals("medium")
+            && ((InlineChoicePayload) back.payload().value()).detail().equals("hi")
+            && back.tags().get(0).value().equals("red")
+            && ((Long) back.tags().get(1).value()) == 7L
+            && back.labels().get("k").value().equals("yes")
+            && back.coord().get(0).equals(42L)
+            && ((InlineChoiceRecordCoord1) back.coord().get(1)).value().equals("x")
+            && ((Long) back.nested().kind().value()) == 7L;
+        if (!rt) { System.out.println("FAIL round-trip"); System.exit(1); }
+
+        // A union arm's payload is validated against its declared literal on decode: an
+        // index claiming "pending" that carries a different string must be rejected.
+        boolean threw2 = false;
+        try {
+            CsilCbor.decInlineChoiceRecordStatus(new CsilCbor.CborArray(java.util.Arrays.asList(
+                new CsilCbor.CborUint(1L), new CsilCbor.CborText("nope"))));
+        } catch (CsilCbor.CsilCborException e) { threw2 = true; }
+        if (!threw2) { System.out.println("FAIL literal validation"); System.exit(1); }
+
+        // A closed all-literal enum (`size: "small" / "medium" / "large"`) left un-hoisted
+        // is a plain `Object`-typed field position, not a native Java enum or a synthesized
+        // wrapper class — decode must still reject a well-typed but undeclared value rather
+        // than let it through, so tamper with an otherwise-valid record's encoded `size`
+        // entry and confirm the full-record decode rejects it.
+        java.util.List<CsilCbor.CborEntry> csilTampered = new java.util.ArrayList<>(
+            ((CsilCbor.CborMap) CsilCbor.decode(CsilCbor.encodeInlineChoiceRecord(rec))).entries());
+        for (int i = 0; i < csilTampered.size(); i++) {
+            CsilCbor.CborEntry e = csilTampered.get(i);
+            if (e.key() instanceof CsilCbor.CborText k && k.value().equals("size")) {
+                csilTampered.set(i, new CsilCbor.CborEntry(e.key(), new CsilCbor.CborText("huge")));
+            }
+        }
+        boolean threw3 = false;
+        try {
+            CsilCbor.decodeInlineChoiceRecord(CsilCbor.encode(new CsilCbor.CborMap(csilTampered)));
+        } catch (CsilCbor.CsilCborException e) { threw3 = true; }
+        if (!threw3) { System.out.println("FAIL enum membership validation (size)"); System.exit(1); }
+        // Every declared member still decodes through the full record.
+        InlineChoiceRecord small = CsilCbor.decodeInlineChoiceRecord(CsilCbor.encodeInlineChoiceRecord(
+            new InlineChoiceRecord(rec.status(), rec.priority(), "small", rec.payload(), rec.tags(), rec.labels(), rec.coord(), rec.nested())));
+        if (!small.size().equals("small")) {
+            System.out.println("FAIL valid enum member decode (size)"); System.exit(1);
+        }
 
         System.out.println("ok");
     }
@@ -4928,7 +6270,9 @@ public final class PomCheck {
             "events dispatches to the generated router in package mode"
         );
         assert!(
-            c.contains("new Events.Hello(List.of(1L), List.of(\"verbose\"), \"demo\", null)"),
+            c.contains(
+                "new Events.Hello(List.of(1L), List.of(\"verbose\"), \"DemoService\", null)"
+            ),
             "events handshake names the service"
         );
     }
@@ -4950,7 +6294,9 @@ public final class PomCheck {
             "events dispatches to the generated router"
         );
         assert!(
-            c.contains("new Events.Hello(List.of(1L), List.of(\"verbose\"), \"demo\", null)"),
+            c.contains(
+                "new Events.Hello(List.of(1L), List.of(\"verbose\"), \"DemoService\", null)"
+            ),
             "events handshake names the service"
         );
         assert!(
@@ -4959,7 +6305,7 @@ public final class PomCheck {
         );
         assert!(
             c.contains(
-                "Events.Event.verbose(\"demo\", \"Chat\", CsilCbor.encodeChatMsg(outbound))"
+                "Events.Event.verbose(\"DemoService\", \"chat\", CsilCbor.encodeChatMsg(outbound))"
             ),
             "events sends one outbound event via the generated codec"
         );

@@ -8,11 +8,12 @@
 //! generators exactly; only `process_generation` and its helpers are C-specific.
 
 use csilgen_common::{
-    CsilControlOperator, CsilFieldMetadata, CsilGroupEntry, CsilGroupExpression, CsilGroupKey,
-    CsilLiteralValue, CsilOccurrence, CsilRuleType, CsilServiceDefinition, CsilServiceDirection,
-    CsilSizeConstraint, CsilTypeExpression, CsilValidationConstraint, GeneratedFile,
-    GenerationStats, GeneratorCapability, GeneratorMetadata, GeneratorWarning, WarningLevel,
-    WasmGeneratorInput, WasmGeneratorOutput, wasm_interface::*,
+    ChoiceClass, CsilControlOperator, CsilFieldMetadata, CsilGroupEntry, CsilGroupExpression,
+    CsilGroupKey, CsilLiteralValue, CsilOccurrence, CsilRuleType, CsilServiceDefinition,
+    CsilServiceDirection, CsilSizeConstraint, CsilTypeExpression, CsilValidationConstraint,
+    GeneratedFile, GenerationStats, GeneratorCapability, GeneratorMetadata, GeneratorWarning,
+    HoistOptions, WarningLevel, WasmGeneratorInput, WasmGeneratorOutput, hoist_inline_composites,
+    wasm_interface::*,
 };
 use std::collections::HashMap;
 
@@ -157,8 +158,25 @@ enum Surface {
     TypesOnly,
 }
 
-fn process_generation(input: WasmGeneratorInput) -> Result<WasmGeneratorOutput, i32> {
+fn process_generation(mut input: WasmGeneratorInput) -> Result<WasmGeneratorOutput, i32> {
     let config = CConfig::from_options(&input.config.options)?;
+    // Rewrite every inline (anonymous) choice/group field position to a synthesized
+    // named rule up front, so every downstream emitter (types/validation/codec/
+    // client/server) only ever sees ordinary fully-resolved types with no lookup
+    // table of its own — exactly as if the CSIL source had named the shape and
+    // referenced it. Unlike TypeScript (whose field emitter can render an
+    // all-literal choice as a bare enum type in place), C's `emit_field`/
+    // `base_c_type` only ever route a FIELD's type through `Reference`/`Builtin`/
+    // `Literal`/`Array`/`Map`/`Tuple` — there is no inline-enum-in-a-struct-member
+    // rendering path — so an all-literal choice needs the same synthesized name a
+    // mixed-kind or type-bearing choice does (`hoist_all_literal_choices: true`,
+    // matching OCaml's setting and rationale, not TypeScript's).
+    input.csil_spec = hoist_inline_composites(
+        &input.csil_spec,
+        HoistOptions {
+            hoist_all_literal_choices: true,
+        },
+    );
     let surface = match input.config.target.as_str() {
         "c" | "c-server" => Surface::Server,
         "c-client" => Surface::Client,
@@ -331,35 +349,61 @@ enum TypeKind<'a> {
     Alias(&'a CsilTypeExpression),
     Enum(Vec<String>),
     IntEnum(Vec<i64>),
+    /// An all-literal choice whose vocabulary is NOT uniformly text-only or
+    /// int-only (any other kind or mix, e.g. `"a" / 1`, `1 / true`) — still an
+    /// `Enum` per `csilgen_common::choice`'s normative contract, just one C can't
+    /// give a single bare-scalar backing to. See `emit_mixed_enum`.
+    MixedEnum(Vec<&'a CsilLiteralValue>),
     Union(&'a [CsilTypeExpression]),
     GroupUnion(&'a [CsilGroupExpression]),
 }
 
-/// Classify a type-choice's arms. An all-text-literal choice (`"red"/"green"`) is a
-/// bare-text enum; an all-integer-literal choice (`1/2/3`) is a bare-integer enum;
-/// anything else (type-bearing arms) is a tagged-sum union. The two enum kinds
-/// differ only in their bare wire scalar, matching the rust/go/python wire.
+/// Classify a type-choice's arms via the shared, normative
+/// `csilgen_common::classify_choice` (every arm a literal, of any kind or mix, is
+/// an `Enum`; at least one non-literal arm is a `Union`) and layer C's own
+/// sub-shape on an `Enum`: a uniform-text vocabulary is a bare-text `Enum`, a
+/// uniform-integer vocabulary is a bare-integer `IntEnum`, and any other kind mix
+/// is a `MixedEnum` — mirrors the ocaml generator's `classify_choice` wrapping
+/// `classify_enum`.
 fn classify_choice(arms: &[CsilTypeExpression]) -> TypeKind<'_> {
-    let text: Option<Vec<String>> = arms
-        .iter()
-        .map(|a| match a {
-            CsilTypeExpression::Literal(CsilLiteralValue::Text(t)) => Some(t.clone()),
-            _ => None,
-        })
-        .collect();
-    if let Some(names) = text {
-        return TypeKind::Enum(names);
+    match csilgen_common::classify_choice(arms) {
+        ChoiceClass::Enum(literals) => classify_enum(literals),
+        ChoiceClass::Union(_) => TypeKind::Union(arms),
     }
-    let ints: Option<Vec<i64>> = arms
+}
+
+/// Sub-classify an all-literal vocabulary into the enum shape C renders: a pure
+/// text or pure integer vocabulary keeps its historical bare-scalar backing
+/// (`Enum`/`IntEnum`); any other kind or mix becomes a `MixedEnum`.
+fn classify_enum(literals: Vec<&CsilLiteralValue>) -> TypeKind<'_> {
+    if literals
         .iter()
-        .map(|a| match a {
-            CsilTypeExpression::Literal(CsilLiteralValue::Integer(n)) => Some(*n),
-            _ => None,
-        })
-        .collect();
-    match ints {
-        Some(values) => TypeKind::IntEnum(values),
-        None => TypeKind::Union(arms),
+        .all(|l| matches!(l, CsilLiteralValue::Text(_)))
+    {
+        TypeKind::Enum(
+            literals
+                .iter()
+                .map(|l| match l {
+                    CsilLiteralValue::Text(t) => t.clone(),
+                    _ => unreachable!("filtered to Text above"),
+                })
+                .collect(),
+        )
+    } else if literals
+        .iter()
+        .all(|l| matches!(l, CsilLiteralValue::Integer(_)))
+    {
+        TypeKind::IntEnum(
+            literals
+                .iter()
+                .map(|l| match l {
+                    CsilLiteralValue::Integer(n) => *n,
+                    _ => unreachable!("filtered to Integer above"),
+                })
+                .collect(),
+        )
+    } else {
+        TypeKind::MixedEnum(literals)
     }
 }
 
@@ -390,18 +434,73 @@ fn entry_value_dep(entry: &CsilGroupEntry) -> Option<String> {
     }
 }
 
+/// The names a record type's non-optional by-value members depend on. Optional,
+/// array, and map members are pointers and impose no order. A tuple's own
+/// non-optional elements are embedded by value the same way, so they are walked
+/// too (closing a gap `entry_value_dep` alone leaves: it never looks inside a
+/// tuple). Every field here is already a fully-resolved type — an inline
+/// choice/group position was rewritten to a `Reference` by
+/// `csilgen_common::hoist_inline_composites` before this ever runs (see
+/// `process_generation`), so there is no lookup table to consult.
+fn struct_value_deps(group: &CsilGroupExpression) -> Vec<String> {
+    let mut deps = Vec::new();
+    for entry in &group.entries {
+        let optional = matches!(entry.occurrence, Some(CsilOccurrence::Optional));
+        match unwrap_constrained(&entry.value_type) {
+            CsilTypeExpression::Reference(n) if !optional => deps.push(n.clone()),
+            CsilTypeExpression::Tuple(tgroup) => {
+                for (_, tentry) in tuple_members(tgroup) {
+                    if matches!(tentry.occurrence, Some(CsilOccurrence::Optional)) {
+                        continue;
+                    }
+                    if let CsilTypeExpression::Reference(n) = unwrap_constrained(&tentry.value_type)
+                    {
+                        deps.push(n.clone());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    deps
+}
+
 fn generate_types(input: &WasmGeneratorInput, config: &CConfig) -> Option<String> {
-    // Gather the named type rules and their by-value dependencies.
-    let typed: Vec<(&str, TypeKind)> = input
+    // Every named type rule, including any inline choice/group already rewritten to
+    // a synthesized named rule by `csilgen_common::hoist_inline_composites` in
+    // `process_generation` — from here on a hoisted type is an ordinary rule and
+    // needs no special-casing.
+    let typed: Vec<(String, TypeKind)> = input
         .csil_spec
         .rules
         .iter()
-        .filter_map(|r| classify_rule(&r.rule_type).map(|k| (r.name.as_str(), k)))
+        .filter_map(|r| classify_rule(&r.rule_type).map(|k| (r.name.clone(), k)))
         .collect();
     if typed.is_empty() {
         return None;
     }
-    let names: std::collections::HashSet<&str> = typed.iter().map(|(n, _)| *n).collect();
+    // Only a Struct/Union/GroupUnion/MixedEnum kind ever joins `order`/`deps`/`defs`
+    // below; an Enum/IntEnum/Alias dependency is always satisfied positionally
+    // (enums are emitted unconditionally before any struct, aliases carry no
+    // members), so including one in a `deps` filter would make it a dependency
+    // Kahn's algorithm can never mark ready, needlessly deferring the depending
+    // type to the best-effort remnants pass. A `MixedEnum` joins this set (unlike
+    // `Enum`/`IntEnum`) because — like `Union` — it is a struct wrapping a tagged
+    // union, so another struct embedding it BY VALUE needs its full definition
+    // (not merely the forward declaration) to precede.
+    let struct_kind_names: std::collections::HashSet<&str> = typed
+        .iter()
+        .filter(|(_, k)| {
+            matches!(
+                k,
+                TypeKind::Struct(_)
+                    | TypeKind::Union(_)
+                    | TypeKind::GroupUnion(_)
+                    | TypeKind::MixedEnum(_)
+            )
+        })
+        .map(|(n, _)| n.as_str())
+        .collect();
 
     let mut enums = String::new();
     let mut forwards = String::new();
@@ -455,13 +554,21 @@ fn generate_types(input: &WasmGeneratorInput, config: &CConfig) -> Option<String
                 order.push(name.to_string());
                 deps.insert(
                     name.to_string(),
-                    group
-                        .entries
-                        .iter()
-                        .filter_map(entry_value_dep)
-                        .filter(|d| names.contains(d.as_str()))
+                    struct_value_deps(group)
+                        .into_iter()
+                        .filter(|d| struct_kind_names.contains(d.as_str()))
                         .collect(),
                 );
+            }
+            TypeKind::MixedEnum(literals) => {
+                forwards.push_str(&format!("typedef struct {name} {name};\n"));
+                let mut s = String::new();
+                emit_mixed_enum(&mut s, name, literals);
+                defs.insert(name.to_string(), s);
+                order.push(name.to_string());
+                // All-literal by definition, so no arm can ever be a `Reference` —
+                // this always joins `order`/`defs` with an empty dependency list.
+                deps.insert(name.to_string(), Vec::new());
             }
             TypeKind::Union(arms) => {
                 forwards.push_str(&format!("typedef struct {name} {name};\n"));
@@ -474,7 +581,9 @@ fn generate_types(input: &WasmGeneratorInput, config: &CConfig) -> Option<String
                     name.to_string(),
                     arms.iter()
                         .filter_map(|a| match a {
-                            CsilTypeExpression::Reference(n) if names.contains(n.as_str()) => {
+                            CsilTypeExpression::Reference(n)
+                                if struct_kind_names.contains(n.as_str()) =>
+                            {
                                 Some(n.clone())
                             }
                             _ => None,
@@ -492,7 +601,7 @@ fn generate_types(input: &WasmGeneratorInput, config: &CConfig) -> Option<String
                     name.to_string(),
                     arms.iter()
                         .flat_map(|g| g.entries.iter().filter_map(entry_value_dep))
-                        .filter(|d| names.contains(d.as_str()))
+                        .filter(|d| struct_kind_names.contains(d.as_str()))
                         .collect(),
                 );
             }
@@ -632,7 +741,7 @@ fn emit_struct(content: &mut String, name: &str, group: &CsilGroupExpression, co
             }
             emit_field(
                 content,
-                &field,
+                &c_member(&field),
                 &entry.value_type,
                 &entry.occurrence,
                 config,
@@ -680,8 +789,9 @@ fn emit_list_alias_struct(
 }
 
 /// Emit one struct member (or the member group an array/map field expands to).
-/// Snake_case CSIL field names map verbatim to C member names — the wire key is
-/// already idiomatic C — so no case mangling happens here.
+/// Snake_case CSIL field names map to C member names with no case mangling — the
+/// wire key is already idiomatic C — the only reshaping being the keyword escape
+/// the caller applies via `c_member` (a field named `int` still has to declare).
 fn emit_field(
     content: &mut String,
     field: &str,
@@ -760,7 +870,45 @@ fn emit_choice(content: &mut String, name: &str, arms: &[CsilTypeExpression], co
         let c_type = base_c_type(arm, config);
         content.push_str(&format!(
             "        {};\n",
-            declarator(&c_type, 0, &to_snake(&arm_name(arm, i)))
+            declarator(&c_type, 0, &arm_member(arm, i))
+        ));
+    }
+    content.push_str("    } u;\n");
+    content.push_str(&format!("}} {name};\n\n"));
+}
+
+/// A mixed-kind all-literal choice (`"a" / 1`, `1 / true`, ...) as C: the same
+/// `typedef struct { <Tag> tag; union {...} u; } Name;` shape `emit_choice` uses
+/// for a general tagged-sum union, but every union payload member is a literal's
+/// own scalar/text/bytes C type (never a `Reference` — an all-literal choice can't
+/// carry one) and the wire is the BARE literal value, no `[index, value]`
+/// discriminator (see `emit_mixed_enum_codec`). This is the C rendering of the
+/// `TypeKind::MixedEnum` shape the shared `csilgen_common::classify_choice`
+/// contract carves out for an all-literal vocabulary that is not uniformly
+/// text-only or int-only (which stay the simpler bare `emit_enum`/`emit_int_enum`
+/// C enums).
+fn emit_mixed_enum(content: &mut String, name: &str, literals: &[&CsilLiteralValue]) {
+    let arms = mixed_arm_names(literals);
+    content.push_str(&format!(
+        "/* {name} is a mixed-literal enumeration (bare wire value, closed vocabulary). */\n"
+    ));
+    content.push_str(&format!("typedef enum {name}Tag {{\n"));
+    for arm in &arms {
+        content.push_str(&format!(
+            "    {}_{},\n",
+            to_upper_snake(name),
+            to_upper_snake(arm)
+        ));
+    }
+    content.push_str(&format!("}} {name}Tag;\n\n"));
+    content.push_str(&format!("typedef struct {name} {{\n"));
+    content.push_str(&format!("    {name}Tag tag;\n"));
+    content.push_str("    union {\n");
+    for (lit, arm) in literals.iter().zip(&arms) {
+        let c_type = literal_c_type(lit);
+        content.push_str(&format!(
+            "        {};\n",
+            declarator(&c_type, 0, &mixed_arm_member(arm))
         ));
     }
     content.push_str("    } u;\n");
@@ -797,6 +945,9 @@ fn emit_group_choice(
 
 fn generate_validation(input: &WasmGeneratorInput) -> Option<String> {
     let mut body = String::new();
+    // Length checks must know whether a field is text or bytes even through a
+    // transparent alias (`Key = bytes`), so the alias map rides along.
+    let aliases = codec_aliases(input);
     for rule in &input.csil_spec.rules {
         let group = match &rule.rule_type {
             CsilRuleType::GroupDef(group) => Some(group),
@@ -806,7 +957,7 @@ fn generate_validation(input: &WasmGeneratorInput) -> Option<String> {
         if let Some(group) = group
             && group.entries.iter().any(entry_has_check)
         {
-            emit_validate_fn(&mut body, &rule.name, group);
+            emit_validate_fn(&mut body, &rule.name, group, &aliases);
         }
     }
     if body.is_empty() {
@@ -834,19 +985,25 @@ fn generate_validation(input: &WasmGeneratorInput) -> Option<String> {
 /// unused-function warning when a translation unit ignores it. The function is
 /// emitted only when at least one check line is produced, so a type with only
 /// unsupported constraints does not leave `v` unused.
-fn emit_validate_fn(content: &mut String, name: &str, group: &CsilGroupExpression) {
+fn emit_validate_fn(
+    content: &mut String,
+    name: &str,
+    group: &CsilGroupExpression,
+    aliases: &HashMap<String, CsilTypeExpression>,
+) {
     let mut checks = String::new();
     for entry in &group.entries {
         if let Some(field) = entry_field_name(&entry.key) {
             let optional = matches!(entry.occurrence, Some(CsilOccurrence::Optional));
+            let fc = FieldCheck::new(&field, &entry.value_type, optional, aliases);
             for metadata in &entry.metadata {
                 if let CsilFieldMetadata::Constraint(constraint) = metadata {
-                    emit_metadata_check(&mut checks, &field, optional, constraint);
+                    emit_metadata_check(&mut checks, &fc, constraint);
                 }
             }
             if let CsilTypeExpression::Constrained { constraints, .. } = &entry.value_type {
                 for op in constraints {
-                    emit_control_check(&mut checks, &field, optional, op);
+                    emit_control_check(&mut checks, &fc, op);
                 }
             }
         }
@@ -864,12 +1021,98 @@ fn emit_validate_fn(content: &mut String, name: &str, group: &CsilGroupExpressio
     content.push_str("    return true;\n}\n\n");
 }
 
+/// What a length-style constraint (`.size`, minlength/maxlength) measures on a
+/// field: `strlen` of a NUL-terminated text, the `len` member of a `CsilBytes` —
+/// where `strlen` would be a type error and wrong for binary data anyway — or
+/// nothing (a `.size` on an integer bounds its encoded width, which has no
+/// in-memory length to test).
+enum LenKind {
+    Text,
+    Bytes,
+    Other,
+}
+
+/// Everything a per-field check needs to spell a correct member access: the
+/// keyword-escaped member, optionality, the length kind resolved through
+/// transparent aliases, and whether the member sits behind the extra pointer an
+/// optional value-typed field gains (mirroring `emit_field`'s `extra_ptr`).
+struct FieldCheck {
+    member: String,
+    optional: bool,
+    kind: LenKind,
+    deref: bool,
+}
+
+impl FieldCheck {
+    fn new(
+        field: &str,
+        value_type: &CsilTypeExpression,
+        optional: bool,
+        aliases: &HashMap<String, CsilTypeExpression>,
+    ) -> Self {
+        let base = unwrap_constrained(value_type);
+        let mut resolved = base;
+        // Bounded so a (malformed) alias cycle cannot spin the generator.
+        for _ in 0..16 {
+            match resolved {
+                CsilTypeExpression::Reference(name) if aliases.contains_key(name) => {
+                    resolved = unwrap_constrained(&aliases[name]);
+                }
+                _ => break,
+            }
+        }
+        let kind = match resolved {
+            CsilTypeExpression::Builtin(n) if n == "text" || n == "tstr" => LenKind::Text,
+            CsilTypeExpression::Builtin(n) if n == "bytes" || n == "bstr" => LenKind::Bytes,
+            _ => LenKind::Other,
+        };
+        FieldCheck {
+            member: c_member(field),
+            optional,
+            deref: optional && !base_c_type(base, &default_config()).ends_with('*'),
+            kind,
+        }
+    }
+}
+
+/// A length check dispatched on what the field actually is; a kind with no
+/// runtime length emits nothing rather than a check that cannot compile.
+fn len_check(out: &mut String, fc: &FieldCheck, op: &str, n: u64) {
+    match fc.kind {
+        LenKind::Text => text_check(out, fc, op, n),
+        LenKind::Bytes => bytes_check(out, fc, op, n),
+        LenKind::Other => {}
+    }
+}
+
 /// A string-length check against a NUL-terminated field; the NULL guard covers
 /// both an absent optional and an unset required pointer.
-fn text_check(out: &mut String, field: &str, op: &str, n: u64) {
+fn text_check(out: &mut String, fc: &FieldCheck, op: &str, n: u64) {
+    let member = &fc.member;
+    let val = if fc.deref {
+        format!("(*v->{member})")
+    } else {
+        format!("v->{member}")
+    };
     out.push_str(&format!(
-        "    if (v->{field} != NULL && strlen(v->{field}) {op} {n}u) return false;\n"
+        "    if (v->{member} != NULL && strlen({val}) {op} {n}u) return false;\n"
     ));
+}
+
+/// A byte-length check against a `CsilBytes` field's `len` member. A required
+/// bytes field is held by value, so its unset state is a NULL `data` pointer; an
+/// optional one is behind the extra pointer, NULL when absent.
+fn bytes_check(out: &mut String, fc: &FieldCheck, op: &str, n: u64) {
+    let member = &fc.member;
+    if fc.deref {
+        out.push_str(&format!(
+            "    if (v->{member} != NULL && v->{member}->len {op} {n}u) return false;\n"
+        ));
+    } else {
+        out.push_str(&format!(
+            "    if (v->{member}.data != NULL && v->{member}.len {op} {n}u) return false;\n"
+        ));
+    }
 }
 
 /// A numeric comparison. The read is cast to int64_t so the comparison never
@@ -887,47 +1130,44 @@ fn numeric_check(out: &mut String, field: &str, optional: bool, op: &str, n: i64
     }
 }
 
-fn emit_metadata_check(
-    out: &mut String,
-    field: &str,
-    optional: bool,
-    constraint: &CsilValidationConstraint,
-) {
+fn emit_metadata_check(out: &mut String, fc: &FieldCheck, constraint: &CsilValidationConstraint) {
+    let member = &fc.member;
     match constraint {
-        CsilValidationConstraint::MinLength(n) => text_check(out, field, "<", *n),
-        CsilValidationConstraint::MaxLength(n) => text_check(out, field, ">", *n),
-        CsilValidationConstraint::MinItems(n) => {
-            out.push_str(&format!("    if (v->{field}_count < {n}u) return false;\n"))
-        }
-        CsilValidationConstraint::MaxItems(n) => {
-            out.push_str(&format!("    if (v->{field}_count > {n}u) return false;\n"))
-        }
+        CsilValidationConstraint::MinLength(n) => len_check(out, fc, "<", *n),
+        CsilValidationConstraint::MaxLength(n) => len_check(out, fc, ">", *n),
+        CsilValidationConstraint::MinItems(n) => out.push_str(&format!(
+            "    if (v->{member}_count < {n}u) return false;\n"
+        )),
+        CsilValidationConstraint::MaxItems(n) => out.push_str(&format!(
+            "    if (v->{member}_count > {n}u) return false;\n"
+        )),
         CsilValidationConstraint::MinValue(CsilLiteralValue::Integer(n)) => {
-            numeric_check(out, field, optional, "<", *n)
+            numeric_check(out, member, fc.optional, "<", *n)
         }
         CsilValidationConstraint::MaxValue(CsilLiteralValue::Integer(n)) => {
-            numeric_check(out, field, optional, ">", *n)
+            numeric_check(out, member, fc.optional, ">", *n)
         }
         _ => {}
     }
 }
 
-fn emit_control_check(out: &mut String, field: &str, optional: bool, op: &CsilControlOperator) {
+fn emit_control_check(out: &mut String, fc: &FieldCheck, op: &CsilControlOperator) {
+    let member = &fc.member;
     match op {
-        CsilControlOperator::Size(CsilSizeConstraint::Min(n)) => text_check(out, field, "<", *n),
-        CsilControlOperator::Size(CsilSizeConstraint::Max(n)) => text_check(out, field, ">", *n),
-        CsilControlOperator::Size(CsilSizeConstraint::Exact(n)) => text_check(out, field, "!=", *n),
+        CsilControlOperator::Size(CsilSizeConstraint::Min(n)) => len_check(out, fc, "<", *n),
+        CsilControlOperator::Size(CsilSizeConstraint::Max(n)) => len_check(out, fc, ">", *n),
+        CsilControlOperator::Size(CsilSizeConstraint::Exact(n)) => len_check(out, fc, "!=", *n),
         CsilControlOperator::GreaterEqual(CsilLiteralValue::Integer(n)) => {
-            numeric_check(out, field, optional, "<", *n)
+            numeric_check(out, member, fc.optional, "<", *n)
         }
         CsilControlOperator::LessEqual(CsilLiteralValue::Integer(n)) => {
-            numeric_check(out, field, optional, ">", *n)
+            numeric_check(out, member, fc.optional, ">", *n)
         }
         CsilControlOperator::GreaterThan(CsilLiteralValue::Integer(n)) => {
-            numeric_check(out, field, optional, "<=", *n)
+            numeric_check(out, member, fc.optional, "<=", *n)
         }
         CsilControlOperator::LessThan(CsilLiteralValue::Integer(n)) => {
-            numeric_check(out, field, optional, ">=", *n)
+            numeric_check(out, member, fc.optional, ">=", *n)
         }
         // Encoding-only and structural operators carry no runtime predicate.
         _ => {}
@@ -940,10 +1180,13 @@ fn emit_control_check(out: &mut String, field: &str, optional: bool, op: &CsilCo
 /// so fields are ordered canonically (by the bytewise order of their encoded keys)
 /// at generation time, never at runtime — the wire map comes out deterministic
 /// without a runtime sort.
-struct CodecField<'a> {
+struct CodecField {
     name: String,
+    // The C struct member the value lives in: the wire name with the keyword
+    // escape applied, matching what `emit_field` declared.
+    member: String,
     key_bytes: Vec<u8>,
-    value_type: &'a CsilTypeExpression,
+    value_type: CsilTypeExpression,
     optional: bool,
 }
 
@@ -972,15 +1215,16 @@ fn cbor_text_key_bytes(name: &str) -> Vec<u8> {
 
 /// The record fields a codec emits, in canonical key order. Entries with a
 /// non-name key (a typed map key) are skipped, exactly as the struct emitter does.
-fn codec_fields(group: &CsilGroupExpression) -> Vec<CodecField<'_>> {
+fn codec_fields(group: &CsilGroupExpression) -> Vec<CodecField> {
     let mut fields: Vec<CodecField> = group
         .entries
         .iter()
         .filter_map(|entry| {
             entry_field_name(&entry.key).map(|name| CodecField {
                 key_bytes: cbor_text_key_bytes(&name),
+                member: c_member(&name),
                 name,
-                value_type: &entry.value_type,
+                value_type: entry.value_type.clone(),
                 optional: matches!(entry.occurrence, Some(CsilOccurrence::Optional)),
             })
         })
@@ -1330,7 +1574,7 @@ fn emit_dec_literal(
 /// array/map keeps its pointer+count shape and is "present" when its count is
 /// non-zero.
 fn enc_presence(field: &CodecField, member: &str) -> String {
-    match unwrap_constrained(field.value_type) {
+    match unwrap_constrained(&field.value_type) {
         CsilTypeExpression::Array { .. } | CsilTypeExpression::Map { .. } => {
             format!("v->{member}_count")
         }
@@ -1338,18 +1582,22 @@ fn enc_presence(field: &CodecField, member: &str) -> String {
     }
 }
 
-/// Emit the key + CBOR array head + per-element encode loop for a list field.
+/// Emit the key + CBOR array head + per-element encode loop for a list field. The
+/// wire key and the C member travel separately: a keyword-named field escapes only
+/// its member, never its key.
 fn emit_enc_array_body(
     out: &mut String,
     indent: &str,
-    member: &str,
-    klen: usize,
+    field: &CodecField,
     element_type: &CsilTypeExpression,
     scope: &CodecScope,
     warnings: &mut Vec<GeneratorWarning>,
 ) {
+    let member = &field.member;
     out.push_str(&format!(
-        "{indent}if (csilc_w_text(b, \"{member}\", {klen})) return -1;\n"
+        "{indent}if (csilc_w_text(b, \"{}\", {})) return -1;\n",
+        field.name,
+        key_len(&field.name)
     ));
     out.push_str(&format!(
         "{indent}if (csilc_w_array_head(b, v->{member}_count)) return -1;\n"
@@ -1374,15 +1622,17 @@ fn emit_enc_array_body(
 fn emit_enc_map_body(
     out: &mut String,
     indent: &str,
-    member: &str,
-    klen: usize,
+    field: &CodecField,
     kv: (&CsilTypeExpression, &CsilTypeExpression),
     scope: &CodecScope,
     warnings: &mut Vec<GeneratorWarning>,
 ) {
     let (key, value) = kv;
+    let member = &field.member;
     out.push_str(&format!(
-        "{indent}if (csilc_w_text(b, \"{member}\", {klen})) return -1;\n"
+        "{indent}if (csilc_w_text(b, \"{}\", {})) return -1;\n",
+        field.name,
+        key_len(&field.name)
     ));
     out.push_str(&format!(
         "{indent}if (csilc_w_map_head(b, v->{member}_count)) return -1;\n"
@@ -1418,27 +1668,30 @@ fn emit_enc_field(
     scope: &CodecScope,
     warnings: &mut Vec<GeneratorWarning>,
 ) {
-    let member = &field.name;
-    let klen = key_len(member);
-    let key_write = format!("    if (csilc_w_text(b, \"{member}\", {klen})) return -1;\n");
-    let base = unwrap_constrained(field.value_type);
+    let member = &field.member;
+    let klen = key_len(&field.name);
+    let key_write = format!(
+        "    if (csilc_w_text(b, \"{}\", {klen})) return -1;\n",
+        field.name
+    );
+    let base = unwrap_constrained(&field.value_type);
     match base {
         CsilTypeExpression::Array { element_type, .. } => {
             if field.optional {
                 out.push_str(&format!("    if (v->{member}_count) {{\n"));
-                emit_enc_array_body(out, "        ", member, klen, element_type, scope, warnings);
+                emit_enc_array_body(out, "        ", field, element_type, scope, warnings);
                 out.push_str("    }\n");
             } else {
-                emit_enc_array_body(out, "    ", member, klen, element_type, scope, warnings);
+                emit_enc_array_body(out, "    ", field, element_type, scope, warnings);
             }
         }
         CsilTypeExpression::Map { key, value, .. } => {
             if field.optional {
                 out.push_str(&format!("    if (v->{member}_count) {{\n"));
-                emit_enc_map_body(out, "        ", member, klen, (key, value), scope, warnings);
+                emit_enc_map_body(out, "        ", field, (key, value), scope, warnings);
                 out.push_str("    }\n");
             } else {
-                emit_enc_map_body(out, "    ", member, klen, (key, value), scope, warnings);
+                emit_enc_map_body(out, "    ", field, (key, value), scope, warnings);
             }
         }
         // A tuple writes a fixed-length positional CBOR array; an absent optional
@@ -1500,9 +1753,12 @@ fn emit_dec_field(
     scope: &CodecScope,
     warnings: &mut Vec<GeneratorWarning>,
 ) {
-    let member = &field.name;
-    out.push_str(&format!("    csilc_f = csilc_map_get(m, \"{member}\");\n"));
-    let base = unwrap_constrained(field.value_type);
+    let member = &field.member;
+    out.push_str(&format!(
+        "    csilc_f = csilc_map_get(m, \"{}\");\n",
+        field.name
+    ));
+    let base = unwrap_constrained(&field.value_type);
     match base {
         CsilTypeExpression::Array { element_type, .. } => {
             let elem = base_c_type(element_type, &default_config());
@@ -1697,7 +1953,7 @@ fn emit_record_codec(
     for field in fields.iter().filter(|f| f.optional) {
         out.push_str(&format!(
             "    if ({}) csilc_n++;\n",
-            enc_presence(field, &field.name)
+            enc_presence(field, &field.member)
         ));
     }
     out.push_str("    if (csilc_w_map_head(b, csilc_n)) return -1;\n");
@@ -1955,7 +2211,7 @@ fn emit_union_codec(
             to_upper_snake(name),
             to_upper_snake(&arm_name(arm, i))
         );
-        let member = to_snake(&arm_name(arm, i));
+        let member = arm_member(arm, i);
         out.push_str(&format!("    case {tag}:\n"));
         out.push_str(&format!("        if (csilc_w_uint(b, {i})) return -1;\n"));
         emit_enc_value(
@@ -1986,7 +2242,7 @@ fn emit_union_codec(
             to_upper_snake(name),
             to_upper_snake(&arm_name(arm, i))
         );
-        let member = to_snake(&arm_name(arm, i));
+        let member = arm_member(arm, i);
         out.push_str(&format!("    case {i}:\n"));
         out.push_str(&format!("        out->tag = {tag};\n"));
         emit_dec_value(
@@ -2001,6 +2257,115 @@ fn emit_union_codec(
         out.push_str("        return 0;\n");
     }
     out.push_str("    default: return -1;\n    }\n}\n\n");
+}
+
+/// One membership-scan arm of `emit_mixed_enum_codec`'s decode: a `{ ...; if
+/// (<src matches this literal>) { commit tag + payload; return 0; } }` block.
+/// Unlike `emit_dec_literal` (which unconditionally rejects the WHOLE field on a
+/// mismatch, correct for a single required literal), a mixed-enum arm must fall
+/// through to try the NEXT literal on a mismatch, so the match test and the
+/// commit are gated behind one `if` instead of an early `return -1`; the caller
+/// appends a final `return -1;` once every arm has had its turn.
+fn emit_mixed_dec_arm(
+    out: &mut String,
+    tag: &str,
+    member: &str,
+    lit: &CsilLiteralValue,
+    warnings: &mut Vec<GeneratorWarning>,
+) {
+    match lit {
+        CsilLiteralValue::Integer(i) if *i >= 0 => out.push_str(&format!(
+            "    {{ uint64_t csilc_v; if (csilc_as_u64(src, &csilc_v) && csilc_v == (uint64_t){i}) {{ out->tag = {tag}; out->u.{member} = (int64_t){i}; return 0; }} }}\n"
+        )),
+        CsilLiteralValue::Integer(i) => out.push_str(&format!(
+            "    {{ int64_t csilc_v; if (csilc_as_i64(src, &csilc_v) && csilc_v == (int64_t){i}) {{ out->tag = {tag}; out->u.{member} = (int64_t){i}; return 0; }} }}\n"
+        )),
+        CsilLiteralValue::Float(f) => out.push_str(&format!(
+            "    {{ double csilc_v; if (csilc_as_f64(src, &csilc_v) && csilc_v == (double){f}) {{ out->tag = {tag}; out->u.{member} = (double){f}; return 0; }} }}\n"
+        )),
+        CsilLiteralValue::Text(s) => out.push_str(&format!(
+            "    {{ char *csilc_v; if (csilc_get_text(src, &csilc_v) && strcmp(csilc_v, \"{}\") == 0) {{ out->tag = {tag}; out->u.{member} = csilc_v; return 0; }} }}\n",
+            c_escape(s)
+        )),
+        CsilLiteralValue::Bool(b) => out.push_str(&format!(
+            "    {{ bool csilc_v; if (csilc_as_bool(src, &csilc_v) && csilc_v == {b}) {{ out->tag = {tag}; out->u.{member} = {b}; return 0; }} }}\n"
+        )),
+        CsilLiteralValue::Bytes(bytes) => {
+            let values = bytes
+                .iter()
+                .map(|b| format!("0x{b:02x}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            out.push_str(&format!(
+                "    {{ static const uint8_t csilc_lit[] = {{ {values} }}; uint8_t *csilc_b; size_t csilc_len; if (csilc_get_bytes(src, &csilc_b, &csilc_len) && csilc_len == {n} && memcmp(csilc_b, csilc_lit, {n}) == 0) {{ out->tag = {tag}; out->u.{member}.data = csilc_b; out->u.{member}.len = csilc_len; return 0; }} }}\n",
+                n = bytes.len()
+            ));
+        }
+        CsilLiteralValue::Null => out.push_str(&format!(
+            "    if (src && src->kind == CSILC_NULL) {{ out->tag = {tag}; out->u.{member} = NULL; return 0; }}\n"
+        )),
+        // An array literal has no CBOR-tree membership test this codec can express
+        // (see `emit_enc_literal`'s matching warned degrade); the arm simply never
+        // matches on decode, same as it never round-trips on encode.
+        CsilLiteralValue::Array(_) => {
+            warnings.push(GeneratorWarning {
+                message: "c codec: array literal in mixed enum never matches on decode"
+                    .to_string(),
+                level: WarningLevel::Warning,
+                location: None,
+                suggestion: None,
+            });
+        }
+    }
+}
+
+/// Emit the codec for a `TypeKind::MixedEnum` (see `emit_mixed_enum`). The wire
+/// form is the BARE literal value — no `[index, value]` wrapper, unlike
+/// `emit_union_codec` — so encode writes the tag's own known literal directly via
+/// `emit_enc_literal` (the same per-kind writer a literal choice arm uses
+/// anywhere else in this codec) and decode reads the one bare CBOR value and
+/// scans every declared literal (`emit_mixed_dec_arm`) for a kind-and-value
+/// match, rejecting anything outside the declared vocabulary — mirroring
+/// `emit_int_enum_codec`'s switch, generalized across literal kinds since no
+/// single `csilc_as_*` accessor spans them all.
+fn emit_mixed_enum_codec(
+    out: &mut String,
+    name: &str,
+    literals: &[&CsilLiteralValue],
+    warnings: &mut Vec<GeneratorWarning>,
+) {
+    let arms = mixed_arm_names(literals);
+    out.push_str(&format!(
+        "/* csilc_enc_{name} writes the {name} variant's own bare literal value (no [index, value] wrapper). */\n"
+    ));
+    out.push_str(&format!(
+        "static inline int csilc_enc_{name}(csilc_buf *b, const {name} *v) {{\n"
+    ));
+    out.push_str("    switch (v->tag) {\n");
+    for (lit, arm) in literals.iter().zip(&arms) {
+        out.push_str(&format!(
+            "    case {}_{}:\n",
+            to_upper_snake(name),
+            to_upper_snake(arm)
+        ));
+        emit_enc_literal(out, "        ", lit, warnings);
+        out.push_str("        return 0;\n");
+    }
+    out.push_str("    default: return -1;\n    }\n}\n\n");
+
+    out.push_str(&format!(
+        "/* csilc_dec_{name} matches the bare wire value back to a {name} variant, rejecting anything outside the declared vocabulary. */\n"
+    ));
+    out.push_str(&format!(
+        "static inline int csilc_dec_{name}(const csilc_value *src, CsilCodecArena *a, {name} *out) {{\n"
+    ));
+    out.push_str("    (void)a;\n");
+    for (lit, arm) in literals.iter().zip(&arms) {
+        let tag = format!("{}_{}", to_upper_snake(name), to_upper_snake(arm));
+        let member = mixed_arm_member(arm);
+        emit_mixed_dec_arm(out, &tag, &member, lit, warnings);
+    }
+    out.push_str("    return -1;\n}\n\n");
 }
 
 /// Escape a string for a C string literal.
@@ -2026,11 +2391,14 @@ fn generate_codec(
 ) -> Option<String> {
     // The codec covers records (CBOR maps) and enums (wire text); aliases and
     // unions are not codec'd and a field referencing one degrades to a warned null.
-    let typed: Vec<(&str, TypeKind)> = input
+    // Every named type rule, including any inline choice/group already rewritten
+    // to a synthesized named rule by `csilgen_common::hoist_inline_composites` in
+    // `process_generation`, gets exactly the same codec treatment.
+    let typed: Vec<(String, TypeKind)> = input
         .csil_spec
         .rules
         .iter()
-        .filter_map(|r| classify_rule(&r.rule_type).map(|k| (r.name.as_str(), k)))
+        .filter_map(|r| classify_rule(&r.rule_type).map(|k| (r.name.clone(), k)))
         .collect();
     // Records, enums, and named map/list aliases all carry a generated codec, so a
     // field referencing any of them flows through the record-reference codec arm.
@@ -2080,6 +2448,15 @@ fn generate_codec(
                 ));
                 emit_int_enum_codec(&mut bodies, name, values);
             }
+            TypeKind::MixedEnum(literals) => {
+                decls.push_str(&format!(
+                    "static inline int csilc_enc_{name}(csilc_buf *b, const {name} *v);\n"
+                ));
+                decls.push_str(&format!(
+                    "static inline int csilc_dec_{name}(const csilc_value *src, CsilCodecArena *a, {name} *out);\n"
+                ));
+                emit_mixed_enum_codec(&mut bodies, name, literals, warnings);
+            }
             TypeKind::Union(arms) => {
                 decls.push_str(&format!(
                     "static inline int csilc_enc_{name}(csilc_buf *b, const {name} *v);\n"
@@ -2119,7 +2496,11 @@ fn generate_codec(
     for (name, kind) in &typed {
         if !matches!(
             kind,
-            TypeKind::Struct(_) | TypeKind::Enum(_) | TypeKind::IntEnum(_) | TypeKind::Union(_)
+            TypeKind::Struct(_)
+                | TypeKind::Enum(_)
+                | TypeKind::IntEnum(_)
+                | TypeKind::MixedEnum(_)
+                | TypeKind::Union(_)
         ) && alias_aggregate(kind).is_none()
         {
             continue;
@@ -2268,7 +2649,11 @@ fn codec_type_names(input: &WasmGeneratorInput) -> std::collections::HashSet<Str
             let kind = classify_rule(&rule.rule_type)?;
             let codecd = matches!(
                 kind,
-                TypeKind::Struct(_) | TypeKind::Enum(_) | TypeKind::IntEnum(_) | TypeKind::Union(_)
+                TypeKind::Struct(_)
+                    | TypeKind::Enum(_)
+                    | TypeKind::IntEnum(_)
+                    | TypeKind::MixedEnum(_)
+                    | TypeKind::Union(_)
             ) || alias_aggregate(&kind).is_some();
             codecd.then(|| rule.name.clone())
         })
@@ -2477,7 +2862,6 @@ fn emit_client_calls(
 ) {
     let base = service_base(name);
     let prefix = to_snake(&base);
-    let wire_service = base.to_lowercase();
     for op in &service.operations {
         // Only unary request/response ops belong on the RPC client; channel ops
         // ride the router surface the server target emits.
@@ -2489,7 +2873,7 @@ fn emit_client_calls(
             continue;
         }
         let fn_name = format!("csil_{prefix}_{}", to_snake(&op.name));
-        let wire_op = simple_pascal(&op.name);
+        let wire_op = &op.name;
         let success = success_type(&op.output_type);
         let resp = classify_boundary(&success, codec_names, config);
         let req = classify_boundary(&op.input_type, codec_names, config);
@@ -2498,7 +2882,7 @@ fn emit_client_calls(
         let req_type = req.c_type;
 
         content.push_str(&doc_comment(&[
-            &format!("Invoke {wire_service}/{wire_op} with a typed request and decode the typed"),
+            &format!("Invoke {name}/{wire_op} with a typed request and decode the typed"),
             "response. *resp_owner holds the response's backing storage; free it once",
             "with csil_codec_arena_free when done with *resp. Returns non-zero on failure.",
         ]));
@@ -2521,7 +2905,7 @@ fn emit_client_calls(
         }
         content.push_str("    uint8_t *csil_respb = NULL;\n    size_t csil_respn = 0;\n");
         content.push_str(&format!(
-            "    int csil_rc = t->call(t->self, \"{wire_service}\", \"{wire_op}\", csil_reqb, csil_reqn, &csil_respb, &csil_respn);\n"
+            "    int csil_rc = t->call(t->self, \"{name}\", \"{wire_op}\", csil_reqb, csil_reqn, &csil_respb, &csil_respn);\n"
         ));
         content.push_str("    free(csil_reqb);\n");
         content.push_str("    if (csil_rc != 0) { free(csil_respb); return csil_rc; }\n");
@@ -2673,7 +3057,7 @@ fn emit_channel_router(content: &mut String, name: &str, service: &CsilServiceDe
             continue;
         }
         let method = to_snake(&op.name);
-        let wire_op = simple_pascal(&op.name);
+        let wire_op = &op.name;
         content.push_str(&format!("    if (strcmp(method, \"{wire_op}\") == 0) {{\n"));
         content.push_str("        void *msg = NULL;\n");
         content
@@ -2734,7 +3118,7 @@ fn emit_push_encoders(content: &mut String, name: &str, service: &CsilServiceDef
             continue;
         }
         let method = to_snake(&op.name);
-        let wire_op = simple_pascal(&op.name);
+        let wire_op = &op.name;
         let snake = to_snake(&service_base(name));
         content.push_str(&doc_comment(&[
             &format!(
@@ -2774,14 +3158,7 @@ fn base_c_type(type_expr: &CsilTypeExpression, config: &CConfig) -> String {
             "any" => "const csilc_value *".to_string(),
             other => other.to_string(),
         },
-        CsilTypeExpression::Literal(value) => match value {
-            CsilLiteralValue::Integer(_) => "int64_t".to_string(),
-            CsilLiteralValue::Float(_) => "double".to_string(),
-            CsilLiteralValue::Text(_) => "char *".to_string(),
-            CsilLiteralValue::Bytes(_) => "CsilBytes".to_string(),
-            CsilLiteralValue::Bool(_) => "bool".to_string(),
-            CsilLiteralValue::Null | CsilLiteralValue::Array(_) => "void *".to_string(),
-        },
+        CsilTypeExpression::Literal(value) => literal_c_type(value),
         CsilTypeExpression::Reference(name) => name.clone(),
         CsilTypeExpression::Array { element_type, .. } => {
             format!("{} *", base_c_type(element_type, config))
@@ -2951,6 +3328,84 @@ fn arm_name(arm: &CsilTypeExpression, index: usize) -> String {
     }
 }
 
+/// The union payload member for a choice arm — the single derivation shared by the
+/// type emitter and both codec directions, so an arm named after a C keyword
+/// (`int` / `float`) is escaped identically everywhere it is declared or accessed.
+fn arm_member(arm: &CsilTypeExpression, index: usize) -> String {
+    c_member(&to_snake(&arm_name(arm, index)))
+}
+
+/// The C arm-name fragment for one arm of a `TypeKind::MixedEnum` — the literal's
+/// own value rendered as an identifier, so a tag like `Priority_PENDING` or
+/// `Priority_NEG1` reads back to its wire value (mirrors `arm_name`'s use of a
+/// reference/builtin's own name; `int_variant_suffix` gives the same negative-safe
+/// spelling `emit_int_enum`'s tags already use). A kind with no meaningful
+/// identifier spelling (float/bytes/null/array) falls back to a positional
+/// `Value<N>`, matching `arm_name`'s `Choice<N>` fallback for a non-nameable arm.
+fn mixed_arm_name(lit: &CsilLiteralValue, index: usize) -> String {
+    match lit {
+        CsilLiteralValue::Text(s) => s.clone(),
+        CsilLiteralValue::Integer(n) => int_variant_suffix(*n),
+        CsilLiteralValue::Bool(b) => b.to_string(),
+        CsilLiteralValue::Float(_)
+        | CsilLiteralValue::Bytes(_)
+        | CsilLiteralValue::Null
+        | CsilLiteralValue::Array(_) => format!("Value{index}"),
+    }
+}
+
+/// The unique per-arm names for a `TypeKind::MixedEnum`'s literals, disambiguating
+/// a spelling collision (e.g. text `"1"` and integer `1` both naming their arm
+/// `1`) with the same positional fallback `mixed_arm_name` uses for an unnameable
+/// kind, so every tag/union-member name this type declares is guaranteed unique.
+fn mixed_arm_names(literals: &[&CsilLiteralValue]) -> Vec<String> {
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    literals
+        .iter()
+        .enumerate()
+        .map(|(i, lit)| {
+            let base = mixed_arm_name(lit, i);
+            if seen.insert(base.clone()) {
+                base
+            } else {
+                let fallback = format!("Value{i}");
+                seen.insert(fallback.clone());
+                fallback
+            }
+        })
+        .collect()
+}
+
+/// The union payload member for one already-disambiguated `TypeKind::MixedEnum`
+/// arm name, escaped exactly like `arm_member` so a name colliding with a C
+/// keyword still declares. Unlike a choice arm's `Reference`/`Builtin` name (never
+/// digit-leading), a positive-integer literal's arm name IS its bare digits (e.g.
+/// `1`) — a valid ENUM TAG SUFFIX (always prefixed by the type name, `..._1`) but
+/// not a valid bare C identifier on its own, so a digit-leading result here gets a
+/// `v` prefix.
+fn mixed_arm_member(arm_name: &str) -> String {
+    let member = c_member(&to_snake(arm_name));
+    if member.starts_with(|c: char| c.is_ascii_digit()) {
+        format!("v{member}")
+    } else {
+        member
+    }
+}
+
+/// The C type one literal value's union payload member carries — the same mapping
+/// `base_c_type`'s `Literal` arm uses for a bare literal-typed field, factored out
+/// so `emit_mixed_enum`'s union members and `base_c_type` agree exactly.
+fn literal_c_type(value: &CsilLiteralValue) -> String {
+    match value {
+        CsilLiteralValue::Integer(_) => "int64_t".to_string(),
+        CsilLiteralValue::Float(_) => "double".to_string(),
+        CsilLiteralValue::Text(_) => "char *".to_string(),
+        CsilLiteralValue::Bytes(_) => "CsilBytes".to_string(),
+        CsilLiteralValue::Bool(_) => "bool".to_string(),
+        CsilLiteralValue::Null | CsilLiteralValue::Array(_) => "void *".to_string(),
+    }
+}
+
 /// The positional members of a tuple, paired with their entries. A keyed tuple entry
 /// (`[tag: text, value: any]`) keeps its name; an unnamed positional element becomes
 /// `f<index>`. The same naming is used by the struct, encoder, and decoder.
@@ -2960,7 +3415,11 @@ fn tuple_members(group: &CsilGroupExpression) -> Vec<(String, &CsilGroupEntry)> 
         .iter()
         .enumerate()
         .map(|(i, entry)| {
-            let name = entry_field_name(&entry.key).unwrap_or_else(|| format!("f{i}"));
+            // Tuple members are positional on the wire, so the keyword escape
+            // costs nothing in wire fidelity.
+            let name = entry_field_name(&entry.key)
+                .map(|n| c_member(&n))
+                .unwrap_or_else(|| format!("f{i}"));
             (name, entry)
         })
         .collect()
@@ -2968,9 +3427,9 @@ fn tuple_members(group: &CsilGroupExpression) -> Vec<(String, &CsilGroupEntry)> 
 
 // ---- naming (wire names verbatim; C symbols cased) ------------------------
 
-/// PascalCase by the same simple rule the other generators use for *wire* method
-/// names, so a C client and a Go/Rust/Python/TS server agree byte-for-byte: break
-/// on `_`/`-`, uppercase the letter after each break, keep the rest.
+/// PascalCase by a simple rule — break on `_`/`-`, uppercase the letter after
+/// each break, keep the rest — used only to shape C identifiers (via
+/// `service_base`). Wire strings carry the verbatim CSIL names instead.
 fn simple_pascal(s: &str) -> String {
     let mut out = String::new();
     for word in s.split(['_', '-']) {
@@ -3010,8 +3469,32 @@ fn to_upper_snake(s: &str) -> String {
     to_snake(s).to_uppercase()
 }
 
-/// Strip a trailing `Service` suffix and PascalCase the remainder, matching the
-/// wire service base used across the other clients.
+/// C keywords (plus the `<stdbool.h>` macros, which macro-expand inside any
+/// declaration that names them) that can collide with a snake_case member name
+/// derived from CSIL. The `_X`-spelled C11 keywords are omitted: `to_snake`
+/// can never produce a leading-underscore-capital spelling.
+const C_RESERVED_MEMBER_NAMES: &[&str] = &[
+    "auto", "break", "case", "char", "const", "continue", "default", "do", "double", "else",
+    "enum", "extern", "float", "for", "goto", "if", "inline", "int", "long", "register",
+    "restrict", "return", "short", "signed", "sizeof", "static", "struct", "switch", "typedef",
+    "union", "unsigned", "void", "volatile", "while", "bool", "true", "false",
+];
+
+/// A C member identifier for a derived name: reserved words take a trailing
+/// underscore (`int` -> `int_`) so a CSIL field or choice arm named after a C
+/// keyword still declares. Wire keys are never routed through here — they stay
+/// verbatim.
+fn c_member(name: &str) -> String {
+    if C_RESERVED_MEMBER_NAMES.contains(&name) {
+        format!("{name}_")
+    } else {
+        name.to_string()
+    }
+}
+
+/// Strip a trailing `Service` suffix and PascalCase the remainder, used only for
+/// C identifiers (handler structs, function prefixes, wire-id macros). Wire
+/// strings carry the verbatim CSIL service name instead (csil-rpc-transport.md §1.1).
 fn service_base(name: &str) -> String {
     let pascal = simple_pascal(name);
     pascal
@@ -3104,8 +3587,8 @@ fn first_unary_example(input: &WasmGeneratorInput, config: &CConfig) -> Option<C
         let has_request = !op_input_is_null(&op.input_type);
         return Some(CUnaryExample {
             fn_name: format!("csil_{prefix}_{}", to_snake(&op.name)),
-            wire_service: base.to_lowercase(),
-            wire_op: simple_pascal(&op.name),
+            wire_service: rule.name.clone(),
+            wire_op: op.name.clone(),
             req_type: base_c_type(&op.input_type, config),
             resp_type: base_c_type(&success, config),
             has_request,
@@ -3180,13 +3663,13 @@ fn first_channel_example(input: &WasmGeneratorInput, config: &CConfig) -> Option
             return Some(CChannelExample {
                 handlers_struct: format!("{base}Handlers"),
                 service_snake: snake.clone(),
-                wire_service: base.to_lowercase(),
+                wire_service: rule.name.clone(),
                 route_fn: format!("route_{snake}_channel"),
                 encode_fn: format!("encode_{snake}_{method}"),
                 handler_method: method,
                 inbound_type: inbound,
                 outbound_type: outbound,
-                outbound_wire_op: simple_pascal(&op.name),
+                outbound_wire_op: op.name.clone(),
                 outbound_sample: c_request_literal(input, &success, config),
             });
         }
@@ -3214,8 +3697,13 @@ fn c_request_literal(
         .iter()
         .filter(|e| !matches!(e.occurrence, Some(CsilOccurrence::Optional)))
         .filter_map(|e| {
-            entry_field_name(&e.key)
-                .map(|field| format!(".{field} = {}", c_sample_value(&e.value_type, config)))
+            entry_field_name(&e.key).map(|field| {
+                format!(
+                    ".{} = {}",
+                    c_member(&field),
+                    c_sample_value(&e.value_type, config)
+                )
+            })
         })
         .collect();
     if fields.is_empty() {
@@ -3252,7 +3740,7 @@ fn first_text_field(input: &WasmGeneratorInput, ty: &CsilTypeExpression) -> Opti
     group.entries.iter().find_map(|e| {
         let is_text = matches!(unwrap_constrained(&e.value_type), CsilTypeExpression::Builtin(n) if n == "text" || n == "tstr");
         if is_text && !matches!(e.occurrence, Some(CsilOccurrence::Optional)) {
-            entry_field_name(&e.key)
+            entry_field_name(&e.key).map(|n| c_member(&n))
         } else {
             None
         }

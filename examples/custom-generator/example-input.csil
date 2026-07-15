@@ -1,8 +1,9 @@
-;; Example CSIL file for testing the custom Go generator
+;; Example CSIL file for exercising the mdsummary example generator.
 
 UserID = text .size (8..16)
 Username = text .size (3..50)
 
+;;; A registered user account.
 User = {
     @receive-only
     id: UserID,
@@ -27,6 +28,7 @@ User = {
     ? role: text / "user" / "admin" / "moderator"
 }
 
+;;; The public user account API.
 service UserAPI {
     get-user: UserID -> User / UserError,
     create-user: CreateUserRequest -> User / UserError,

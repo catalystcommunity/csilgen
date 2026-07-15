@@ -18,7 +18,7 @@ use glob::glob;
 use indicatif::ProgressBar;
 use std::collections::HashMap;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 /// Result type for CLI operations
 pub type CliResult<T> = Result<T, Box<dyn std::error::Error>>;
@@ -250,7 +250,8 @@ fn process_single_file(
     }
 
     // Write generated files
-    let (files_written, total_size) = write_generated_files(&generated_files, output_dir)?;
+    let (files_written, total_size) =
+        write_generated_files(&generator_id, &generated_files, output_dir)?;
 
     // Finish progress bar
     if let Some(pb) = &progress_bar {
@@ -409,7 +410,7 @@ fn process_entry_points(
         }
 
         // Write generated files for this input
-        match write_generated_files(&generated_files, output_dir) {
+        match write_generated_files(&generator_id, &generated_files, output_dir) {
             Ok((files_written, size)) => {
                 total_files_written += files_written;
                 total_size += size;
@@ -500,8 +501,63 @@ fn resolve_generator_for_target(runtime: &WasmGeneratorRuntime, target: &str) ->
     .into())
 }
 
+/// Resolve a generator-supplied relative path onto `output_dir`, rejecting
+/// anything that could write outside it.
+///
+/// The plugin contract (docs/generator-plugin-contract.md §3) obligates
+/// generators to emit only relative, traversal-safe paths, but that's a MUST on
+/// the generator side, not something the host can trust — a generator is an
+/// arbitrary third-party WASM module, and a buggy or malicious one emitting
+/// `../../.bashrc` or `/etc/passwd` would otherwise write wherever
+/// `output_dir.join(path)` (or plain `Path::join`, which discards the base
+/// entirely when `path` is absolute) lands. We can't `canonicalize` the result
+/// to double check, because the file doesn't exist yet — canonicalize requires
+/// an existing path. Instead we walk `Path::components()` and reject anything
+/// that isn't a plain relative path: a `..` component, a root/prefix component
+/// (covers both leading `/` and Windows drive letters like `C:\`), or a path
+/// with no real components at all (empty, or only `.`). `CurDir` components are
+/// dropped rather than rejected since `./foo` is a harmless, if odd, way to
+/// spell `foo`.
+fn sanitize_output_path(
+    generator_id: &str,
+    output_dir: &Path,
+    raw_path: &str,
+) -> CliResult<PathBuf> {
+    let mut sanitized = PathBuf::new();
+    let mut has_component = false;
+
+    for component in Path::new(raw_path).components() {
+        match component {
+            Component::Normal(part) => {
+                sanitized.push(part);
+                has_component = true;
+            }
+            Component::CurDir => {}
+            Component::ParentDir => {
+                return Err(format!(
+                    "Generator '{generator_id}' emitted an output path that escapes the output directory via '..': '{raw_path}'"
+                )
+                .into());
+            }
+            Component::RootDir | Component::Prefix(_) => {
+                return Err(format!(
+                    "Generator '{generator_id}' emitted an absolute output path, which is not allowed: '{raw_path}'"
+                )
+                .into());
+            }
+        }
+    }
+
+    if !has_component {
+        return Err(format!("Generator '{generator_id}' emitted an empty output path").into());
+    }
+
+    Ok(output_dir.join(sanitized))
+}
+
 /// Write generated files to the output directory
 fn write_generated_files(
+    generator_id: &str,
     generated_files: &[csilgen_common::GeneratedFile],
     output_dir: &Path,
 ) -> CliResult<(usize, usize)> {
@@ -509,7 +565,7 @@ fn write_generated_files(
     let mut total_size = 0;
 
     for generated_file in generated_files {
-        let file_path = output_dir.join(&generated_file.path);
+        let file_path = sanitize_output_path(generator_id, output_dir, &generated_file.path)?;
 
         // Ensure parent directories exist
         if let Some(parent) = file_path.parent() {
@@ -973,5 +1029,100 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn test_sanitize_output_path_nested_relative_ok() {
+        let output_dir = Path::new("/tmp/csilgen-out");
+        let resolved = sanitize_output_path("java", output_dir, "csilgen/api/Types.java").unwrap();
+        assert_eq!(
+            resolved,
+            output_dir.join("csilgen").join("api").join("Types.java")
+        );
+    }
+
+    #[test]
+    fn test_sanitize_output_path_current_dir_component_ok() {
+        let output_dir = Path::new("/tmp/csilgen-out");
+        let resolved = sanitize_output_path("java", output_dir, "./nested/./File.java").unwrap();
+        assert_eq!(resolved, output_dir.join("nested").join("File.java"));
+    }
+
+    #[test]
+    fn test_sanitize_output_path_rejects_traversal() {
+        let output_dir = Path::new("/tmp/csilgen-out");
+        let err = sanitize_output_path("evil-gen", output_dir, "../../.bashrc").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("evil-gen"));
+        assert!(msg.contains(".."));
+    }
+
+    #[test]
+    fn test_sanitize_output_path_rejects_traversal_mid_path() {
+        let output_dir = Path::new("/tmp/csilgen-out");
+        let err =
+            sanitize_output_path("evil-gen", output_dir, "nested/../../escape.txt").unwrap_err();
+        assert!(err.to_string().contains("evil-gen"));
+    }
+
+    #[test]
+    fn test_sanitize_output_path_rejects_absolute() {
+        let output_dir = Path::new("/tmp/csilgen-out");
+        let err = sanitize_output_path("evil-gen", output_dir, "/etc/passwd").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("evil-gen"));
+        assert!(msg.contains("absolute"));
+    }
+
+    #[test]
+    fn test_sanitize_output_path_rejects_empty() {
+        let output_dir = Path::new("/tmp/csilgen-out");
+        let err = sanitize_output_path("evil-gen", output_dir, "").unwrap_err();
+        assert!(err.to_string().contains("empty"));
+    }
+
+    #[test]
+    fn test_sanitize_output_path_rejects_current_dir_only() {
+        let output_dir = Path::new("/tmp/csilgen-out");
+        let err = sanitize_output_path("evil-gen", output_dir, ".").unwrap_err();
+        assert!(err.to_string().contains("empty"));
+    }
+
+    #[test]
+    fn test_write_generated_files_rejects_traversal_end_to_end() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let output_dir = temp_dir.path().join("output");
+        fs::create_dir_all(&output_dir).expect("Failed to create output dir");
+
+        let files = vec![csilgen_common::GeneratedFile {
+            path: "../escape.txt".to_string(),
+            content: "malicious".to_string(),
+        }];
+
+        let result = write_generated_files("evil-gen", &files, &output_dir);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("evil-gen"));
+
+        // Nothing should have been written outside the output directory.
+        assert!(!temp_dir.path().join("escape.txt").exists());
+    }
+
+    #[test]
+    fn test_write_generated_files_nested_relative_end_to_end() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let output_dir = temp_dir.path().join("output");
+        fs::create_dir_all(&output_dir).expect("Failed to create output dir");
+
+        let files = vec![csilgen_common::GeneratedFile {
+            path: "csilgen/api/Types.java".to_string(),
+            content: "class Types {}".to_string(),
+        }];
+
+        let (files_written, total_size) =
+            write_generated_files("java", &files, &output_dir).expect("write should succeed");
+        assert_eq!(files_written, 1);
+        assert_eq!(total_size, "class Types {}".len());
+        assert!(output_dir.join("csilgen/api/Types.java").exists());
     }
 }

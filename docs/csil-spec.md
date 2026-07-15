@@ -257,6 +257,38 @@ value = int / float / text / bool
 response = Success / Error / Redirect
 ```
 
+`status` above (every arm a literal) and `value`/`response` (at least one
+non-literal arm) are the two wire shapes every generator agrees on — a
+bare-literal enum vs. a `[variant_index, value]` tagged sum, respectively. See
+"Choices: enum vs. union on the wire" in `cbor-wire-contract.md` for the
+normative, byte-level rule (including the mixed-literal-kind and encode-order
+edge cases).
+
+#### Type Choice Extension (`/=`)
+
+`/=` follows RFC 8610's socket-extension semantics (CDDL §3.8), not a plain
+assignment:
+
+```csil
+;; Standalone: `/=` with no `=` base for the same name is sugar for `=` with a
+;; choice — `Status /= "pending" / "approved"` alone is exactly `Status =
+;; "pending" / "approved"`.
+Status /= "pending" / "approved"
+
+;; Extension: a `/=` whose name matches an EXISTING `=` (or an earlier `/=`)
+;; rule APPENDS its arms to that name's choice, in declaration order, with the
+;; original `=` base always becoming arm 0. This works across `include`d
+;; files too — a base file can declare `Status = "pending"` and a file that
+;; includes it can extend it with `Status /= "approved" / "rejected"`.
+Status = "pending"
+Status /= "approved" / "rejected"
+;; ...is equivalent to: Status = "pending" / "approved" / "rejected"
+```
+
+A genuine collision — two real `=` (or `//=`/`service`) definitions sharing a
+name — is **not** an extension; it is a hard `DuplicateRule` validation error.
+Only `/=` rules merge; repeating `=` never does.
+
 ## Control Operators
 
 Control operators constrain types with additional validation rules:
@@ -490,9 +522,11 @@ CSIL generators only emit **shapes and routing** — never the wire. The impleme
 | `<->` | Inbound handler for `Input` + outbound encoder for `Output` | Inbound handler for `Output` + outbound encoder for `Input` |
 | `<-` | Outbound encoder for `Output` only | Inbound handler for `Output` only |
 
-A *router* function decodes inbound bytes for the channel and dispatches to the right handler. *Encoders* return `(method, bytes)` for the implementer to put on the wire. Generators never open, frame, or close the connection.
+A *router* function decodes inbound bytes for the channel and dispatches to the right handler. *Encoders* return `(op, bytes)` for the implementer to put on the wire — `op` is the CSIL operation name exactly as written (kebab-case), never a case-transformed or method-cased derivative. Generators never open, frame, or close the connection.
 
-The TypeScript generator additionally accepts `ts_bidirectional_transport: "connection"` (default) or `"rpc"` in the CSIL options block. `"connection"` is the handler+router shape above; `"rpc"` is a degraded poll model (`checkOp(): Promise<Output[]>` + `sendOp()`) that rides the unary transport for environments without a persistent channel. `ts_ws_base_url` is a hint constant. These options are TypeScript-specific; other generators ignore them.
+The TypeScript generator additionally accepts `ts_bidirectional_transport: "connection"` (default) or `"rpc"` in the CSIL options block. `"connection"` is the handler+router shape above; `"rpc"` is a degraded poll model (`checkOp(): Promise<Output[]>` + `sendOp()`) that rides the unary transport for environments without a persistent channel. `ts_ws_base_url` is a hint constant. It also accepts `import_extension: "ts"` (default) | `"js"` | `"none"`, controlling the extension on every relative import specifier the generator emits between its own generated modules (types/codec/client/server/index barrel) — `"ts"` targets Node ESM + `nodenext` with no extra `tsc` flags, `"js"` matches what a `tsc` build actually writes to disk (for a drop-in on an older TypeScript or a plain `tsc`-build consumer), and `"none"` omits the extension entirely. An unrecognized value is a hard generation error (same validate-early idiom as `decimal_mapping`). These options are TypeScript-specific; other generators ignore them.
+
+Generators with an async language surface (Rust, TypeScript, Python, C#, Kotlin, Swift, Dart) also accept `client_style: "sync"` | `"async"` | `"both"` (default `"both"`) in the options block, selecting which typed-client surface is emitted. `"both"` emits the sync client plus an async twin whose symbols carry an Async marker (e.g. `client_async.py`, `ClientAsync.gen.cs`); `"async"` emits the async client alone at the canonical module path as a drop-in; `"sync"` omits the async twin. Only the transport seam changes shape — the generated codec stays synchronous in every style. Unrecognized values are a hard generation error.
 
 ### Error Handling
 
@@ -599,10 +633,42 @@ order = {
 
 ### Import Resolution
 
-1. Relative paths are resolved from the current file's directory
-2. Absolute paths are resolved from the project root
-3. Circular imports are detected and reported as errors
-4. Import cycles must be broken using forward declarations
+1. Relative paths are resolved from the current file's directory (falling back
+   to any additional search paths the caller registered).
+2. An absolute path is checked directly on the filesystem.
+3. Circular imports (a file that transitively includes itself) are detected
+   and reported as a hard `Circular dependency detected` error — there is no
+   forward-declaration escape hatch; restructure the files so the cycle does
+   not exist (e.g. move the shared type both sides need into a third file they
+   both include).
+
+#### Include-guard semantics (diamond dependencies)
+
+A rule merges into the consuming spec **at most once**, even when the same
+underlying file is reached by more than one include path:
+
+- **Diamond includes.** If `entry` includes both `mid` (which itself includes
+  `common`) and `common` directly, `common`'s rules are merged exactly once —
+  by the rule's *true origin* (the file that actually defines it with `=`, not
+  whichever file re-exported it), not by which include statement happened to
+  reach it first. This holds regardless of include order.
+- **Plain include + selective import of the same file, unaliased.** `include
+  "f.csil"` and `from "f.csil" include X` (in either order) dedupe together —
+  `X` is merged once, not twice.
+- **Aliased includes are fully materialized.** `include "f.csil" as ns` puts
+  every rule from `f.csil` under the `ns.`-prefixed name regardless of whether
+  the same underlying rules already arrived unaliased (or under a different
+  alias) elsewhere — an alias produces a genuinely separate, fully-populated
+  namespace, not a reference to the unaliased copy. Mixing an aliased include
+  of a file with an unaliased selective import of the same file therefore
+  intentionally keeps **both**: they are different final names (`ns.X` vs
+  `X`), not a diamond.
+- **Genuine name collisions still error.** Two *different* source rules that
+  happen to resolve to the same final name (not a diamond of the *same*
+  origin) are left in place for validation to catch: `validate_spec` (and so
+  every CLI path that validates — `validate` and `generate` both call it)
+  reports a `DuplicateRule` error rather than silently keeping one and
+  dropping the other.
 
 ### Multi-file Example
 
@@ -684,21 +750,34 @@ Generators can produce:
 
 ### Language Support
 
-Current and planned language targets:
+Current language targets (18, run `csilgen generate --target <bogus>` for the
+authoritative list straight from the CLI):
 
-- **Rust**: Structs with serde
+- **Rust**: Structs with serde, a per-type CBOR codec, and a typed client/server (`-typesonly` / `-client` / `-server` sub-targets)
 - **TypeScript**: Interfaces, a transport-agnostic client, and server handlers. Four targets:
   - `typescript` — emits everything (types + client + server)
   - `typescript-typesonly` — interfaces and type aliases only
   - `typescript-client` — types plus a typed client (`client.gen.ts`)
   - `typescript-server` — types plus handler interfaces and a `dispatch` helper (`server.gen.ts`)
-- **Python**: Dataclasses with pydantic
-- **PHP**: PHP 7.x classes, Composer package layout, typed clients, and server routers
-- **Go**: Structs with tags
+- **Python**: Dataclasses, optionally with pydantic (`use_pydantic` option) (`-typesonly` / `-client` / `-server` sub-targets)
+- **PHP**: PHP 7.x classes, Composer package layout, typed clients, and server routers (`-typesonly` / `-client` / `-server` sub-targets)
+- **Go**: Structs with tags (`-typesonly` / `-client` / `-server` sub-targets)
 - **Java**: POJOs with annotations
-- **C#**: Classes with attributes
+- **C#**: Classes with attributes (`-client` / `-server` sub-targets)
+- **C**: Structs + a generated CBOR codec (C11, no dependencies)
+- **Swift**: Structs with a generated `Codec` (not `Codable` — see `cbor-wire-contract.md`)
+- **Kotlin**: Data classes
+- **Zig**: Structs + a generated codec (Zig 0.14)
+- **OCaml**: Records/variants + a generated codec
+- **Elixir**: Structs + a generated codec
+- **Ruby**: Classes + a generated codec
+- **Dart**: Classes + a generated codec (Flutter-compatible)
 - **OpenAPI**: OpenAPI 3.0 specifications
 - **JSON Schema**: JSON Schema draft 7+
+
+Every one of the 14 non-schema targets emits a self-contained, per-type CBOR
+codec and a typed client/server over a dumb byte-transport seam — see
+`cbor-wire-contract.md`.
 
 ### Generation Examples
 

@@ -4,12 +4,14 @@
 //! service trait definitions, and proper handling of CSIL metadata.
 
 use csilgen_common::{
-    CsilControlOperator, CsilDependsCompareOp, CsilDependsCondition, CsilFieldMetadata,
-    CsilGroupEntry, CsilGroupExpression, CsilGroupKey, CsilLiteralValue, CsilOccurrence,
-    CsilRuleType, CsilServiceDefinition, CsilServiceDirection, CsilServiceOperation,
-    CsilSizeConstraint, CsilTypeExpression, CsilValidationConstraint, GeneratedFile,
-    GenerationStats, GeneratorCapability, GeneratorMetadata, GeneratorWarning, WarningLevel,
-    WasmGeneratorInput, WasmGeneratorOutput, wasm_interface::*,
+    ChoiceClass, CsilControlOperator, CsilDependsCompareOp, CsilDependsCondition,
+    CsilFieldMetadata, CsilGroupEntry, CsilGroupExpression, CsilGroupKey, CsilLiteralValue,
+    CsilOccurrence, CsilPosition, CsilRule, CsilRuleType, CsilServiceDefinition,
+    CsilServiceDirection, CsilServiceOperation, CsilSizeConstraint, CsilSpecSerialized,
+    CsilTypeExpression, CsilValidationConstraint, GeneratedFile, GenerationStats,
+    GeneratorCapability, GeneratorMetadata, GeneratorWarning, HoistOptions, WarningLevel,
+    WasmGeneratorInput, WasmGeneratorOutput, choice_arm_literal, classify_choice,
+    hoist_inline_composites, wasm_interface::*,
 };
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -237,11 +239,11 @@ impl CsilDecimal {
     /// differing weights settle the order outright and equal weights reduce to a
     /// trailing-zero-padded digit-string compare.
     fn cmp_magnitude(mut ma: u128, mut ea: i64, mut mb: u128, mut eb: i64) -> std::cmp::Ordering {
-        while ma % 10 == 0 {
+        while ma.is_multiple_of(10) {
             ma /= 10;
             ea += 1;
         }
-        while mb % 10 == 0 {
+        while mb.is_multiple_of(10) {
             mb /= 10;
             eb += 1;
         }
@@ -352,7 +354,11 @@ pub struct ValidationError {
 
 impl std::fmt::Display for ValidationError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "validation failed for `{}`: {}", self.field, self.message)
+        write!(
+            f,
+            "validation failed for `{}`: {}",
+            self.field, self.message
+        )
     }
 }
 
@@ -1025,10 +1031,14 @@ fn csil_enc_timestamp(t: &chrono::DateTime<chrono::Utc>) -> CsilCborValue {
 /// Decode a CBOR tag 0 RFC3339 timestamp back to a UTC instant.
 fn csil_as_timestamp(v: &CsilCborValue) -> Result<chrono::DateTime<chrono::Utc>, CsilCborError> {
     let CsilCborValue::Tag(0, inner) = v else {
-        return Err(CsilCborError("csil cbor: expected CBOR tag 0 timestamp".to_string()));
+        return Err(CsilCborError(
+            "csil cbor: expected CBOR tag 0 timestamp".to_string(),
+        ));
     };
     let CsilCborValue::Text(s) = inner.as_ref() else {
-        return Err(CsilCborError("csil cbor: timestamp content must be text".to_string()));
+        return Err(CsilCborError(
+            "csil cbor: timestamp content must be text".to_string(),
+        ));
     };
     chrono::DateTime::parse_from_rfc3339(s)
         .map(|dt| dt.with_timezone(&chrono::Utc))
@@ -1054,7 +1064,9 @@ const CODEC_BIGINT_RUST: &str = r#"fn csil_bigint_be_bytes(mut n: u128) -> Vec<u
 
 fn csil_be_bytes_to_u128(bytes: &[u8]) -> Result<u128, CsilCborError> {
     if bytes.len() > 16 {
-        return Err(CsilCborError("csil cbor: bignum exceeds 128 bits".to_string()));
+        return Err(CsilCborError(
+            "csil cbor: bignum exceeds 128 bits".to_string(),
+        ));
     }
     let mut n: u128 = 0;
     for &b in bytes {
@@ -1071,7 +1083,10 @@ fn csil_enc_bigint(m: i128) -> CsilCborValue {
     } else if let Ok(v) = u64::try_from(m) {
         CsilCborValue::Uint(v)
     } else if m >= 0 {
-        CsilCborValue::Tag(2, Box::new(CsilCborValue::Bytes(csil_bigint_be_bytes(m as u128))))
+        CsilCborValue::Tag(
+            2,
+            Box::new(CsilCborValue::Bytes(csil_bigint_be_bytes(m as u128))),
+        )
     } else {
         // A negative bignum encodes the magnitude of -1 - value.
         let mag = (-(m + 1)) as u128;
@@ -1085,21 +1100,29 @@ fn csil_dec_bigint(v: &CsilCborValue) -> Result<i128, CsilCborError> {
         CsilCborValue::Int(x) => Ok(*x as i128),
         CsilCborValue::Tag(num, inner) => {
             let CsilCborValue::Bytes(bytes) = inner.as_ref() else {
-                return Err(CsilCborError("csil cbor: bignum content must be a byte string".to_string()));
+                return Err(CsilCborError(
+                    "csil cbor: bignum content must be a byte string".to_string(),
+                ));
             };
             let mag = csil_be_bytes_to_u128(bytes)?;
             match num {
-                2 => i128::try_from(mag)
-                    .map_err(|_| CsilCborError("csil cbor: decimal mantissa overflows i128".to_string())),
+                2 => i128::try_from(mag).map_err(|_| {
+                    CsilCborError("csil cbor: decimal mantissa overflows i128".to_string())
+                }),
                 3 => {
-                    let val = i128::try_from(mag)
-                        .map_err(|_| CsilCborError("csil cbor: decimal mantissa overflows i128".to_string()))?;
+                    let val = i128::try_from(mag).map_err(|_| {
+                        CsilCborError("csil cbor: decimal mantissa overflows i128".to_string())
+                    })?;
                     Ok(-1 - val)
                 }
-                _ => Err(CsilCborError(format!("csil cbor: unexpected bignum tag {num}"))),
+                _ => Err(CsilCborError(format!(
+                    "csil cbor: unexpected bignum tag {num}"
+                ))),
             }
         }
-        _ => Err(CsilCborError("csil cbor: expected integer mantissa".to_string())),
+        _ => Err(CsilCborError(
+            "csil cbor: expected integer mantissa".to_string(),
+        )),
     }
 }"#;
 
@@ -1119,13 +1142,19 @@ fn csil_enc_decimal(d: &CsilDecimal) -> CsilCborValue {
 /// Decode a CBOR tag 4 decimal fraction into an exact `CsilDecimal`.
 fn csil_as_decimal(v: &CsilCborValue) -> Result<CsilDecimal, CsilCborError> {
     let CsilCborValue::Tag(4, inner) = v else {
-        return Err(CsilCborError("csil cbor: expected CBOR tag 4 decimal".to_string()));
+        return Err(CsilCborError(
+            "csil cbor: expected CBOR tag 4 decimal".to_string(),
+        ));
     };
     let CsilCborValue::Array(arr) = inner.as_ref() else {
-        return Err(CsilCborError("csil cbor: tag 4 content must be [exponent, mantissa]".to_string()));
+        return Err(CsilCborError(
+            "csil cbor: tag 4 content must be [exponent, mantissa]".to_string(),
+        ));
     };
     if arr.len() != 2 {
-        return Err(CsilCborError("csil cbor: tag 4 content must be [exponent, mantissa]".to_string()));
+        return Err(CsilCborError(
+            "csil cbor: tag 4 content must be [exponent, mantissa]".to_string(),
+        ));
     }
     let exponent = cbor_as_i64(&arr[0])?;
     let mantissa = csil_dec_bigint(&arr[1])?;
@@ -1149,13 +1178,19 @@ fn csil_enc_decimal(d: &rust_decimal::Decimal) -> CsilCborValue {
 /// Decode a CBOR tag 4 decimal fraction into a `rust_decimal::Decimal`.
 fn csil_as_decimal(v: &CsilCborValue) -> Result<rust_decimal::Decimal, CsilCborError> {
     let CsilCborValue::Tag(4, inner) = v else {
-        return Err(CsilCborError("csil cbor: expected CBOR tag 4 decimal".to_string()));
+        return Err(CsilCborError(
+            "csil cbor: expected CBOR tag 4 decimal".to_string(),
+        ));
     };
     let CsilCborValue::Array(arr) = inner.as_ref() else {
-        return Err(CsilCborError("csil cbor: tag 4 content must be [exponent, mantissa]".to_string()));
+        return Err(CsilCborError(
+            "csil cbor: tag 4 content must be [exponent, mantissa]".to_string(),
+        ));
     };
     if arr.len() != 2 {
-        return Err(CsilCborError("csil cbor: tag 4 content must be [exponent, mantissa]".to_string()));
+        return Err(CsilCborError(
+            "csil cbor: tag 4 content must be [exponent, mantissa]".to_string(),
+        ));
     }
     let exponent = cbor_as_i64(&arr[0])?;
     let mantissa = csil_dec_bigint(&arr[1])?;
@@ -1176,6 +1211,87 @@ fn csil_as_decimal(v: &CsilCborValue) -> Result<rust_decimal::Decimal, CsilCborE
         ))
     }
 }"#;
+
+/// A just-enough model of the expressions the codec emitters build, so they can
+/// be laid out the way rustfmt would lay them out. rustfmt reformats from the
+/// AST, so the only emission that survives `rustfmt --check` unchanged is
+/// rustfmt's own canonical form — which depends on widths the emitter can only
+/// judge with the whole expression tree in hand.
+#[derive(Clone)]
+enum RustExpr {
+    /// Text that never wraps internally.
+    Atom(String),
+    /// `head(args...)`. `macro_like` marks `format!`-style invocations, whose
+    /// stacked arguments rustfmt leaves without trailing commas.
+    Call {
+        head: String,
+        args: Vec<RustExpr>,
+        macro_like: bool,
+    },
+    /// `|params| body`.
+    Closure { params: String, body: Box<RustExpr> },
+    /// `CsilCborValue::Array(vec![elems...])`.
+    ArrayVec(Vec<RustExpr>),
+    /// `match &place { Some(csil_t) => inner, None => CsilCborValue::Null }`.
+    MatchOpt { place: String, inner: Box<RustExpr> },
+    /// The positional tuple decoder's multi-statement closure body.
+    TupleDec {
+        arity: usize,
+        elems: Vec<(RustExpr, bool)>,
+    },
+    /// The literal decoder's two-statement closure body.
+    LitDec { expected: String, value: String },
+}
+
+impl RustExpr {
+    fn call(head: &str, args: Vec<RustExpr>) -> RustExpr {
+        RustExpr::Call {
+            head: head.to_string(),
+            args,
+            macro_like: false,
+        }
+    }
+
+    fn closure(params: &str, body: RustExpr) -> RustExpr {
+        RustExpr::Closure {
+            params: params.to_string(),
+            body: Box::new(body),
+        }
+    }
+
+    /// The one-line rendering, when rustfmt would accept one: every call's
+    /// argument list within `fn_call_width` (60) and every array literal within
+    /// `array_width` (60). Line fit against `max_width` is the caller's check,
+    /// since only the caller knows the column.
+    fn flat(&self) -> Option<String> {
+        match self {
+            RustExpr::Atom(s) => Some(s.clone()),
+            RustExpr::Call { head, args, .. } => {
+                let parts: Option<Vec<String>> = args.iter().map(RustExpr::flat).collect();
+                let joined = parts?.join(", ");
+                if joined.len() <= 60 {
+                    Some(format!("{head}({joined})"))
+                } else {
+                    None
+                }
+            }
+            RustExpr::Closure { params, body } => {
+                let b = body.flat()?;
+                Some(format!("{params} {b}"))
+            }
+            RustExpr::ArrayVec(elems) => {
+                let parts: Option<Vec<String>> = elems.iter().map(RustExpr::flat).collect();
+                let joined = parts?.join(", ");
+                if joined.len() <= 60 {
+                    Some(format!("CsilCborValue::Array(vec![{joined}])"))
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+}
 
 /// Get generator metadata (WASM export)
 #[unsafe(no_mangle)]
@@ -1319,6 +1435,14 @@ fn process_generation(input_ptr: *const u8, input_len: usize) -> Result<WasmGene
 /// Rust code generator implementation
 struct RustCodeGenerator<'a> {
     input: &'a WasmGeneratorInput,
+    /// The spec every generation method actually reads: `input.csil_spec` with
+    /// every inline (anonymous) choice reachable through a record field (or an
+    /// array element/map key-value/tuple element inside one) hoisted out to its
+    /// own synthesized `TypeChoice` rule (see `hoist_inline`). Computed
+    /// once here so every `records`/`aliases`/`type_choice` lookup — all keyed by
+    /// rule name against this field — sees the hoisted rules exactly like any
+    /// other named choice, with no second inline-shape code path required.
+    spec: CsilSpecSerialized,
     warnings: Vec<GeneratorWarning>,
     type_definitions: HashSet<String>,
     /// In-memory type chosen for `decimal`; validated once in `generate`.
@@ -1334,12 +1458,313 @@ struct RustCodeGenerator<'a> {
 impl<'a> RustCodeGenerator<'a> {
     fn new(input: &'a WasmGeneratorInput) -> Self {
         Self {
+            spec: Self::hoist_inline(&input.csil_spec),
             input,
             warnings: Vec::new(),
             type_definitions: HashSet::new(),
             decimal_mapping: DecimalMapping::Csil,
             needs_validation_error: false,
             uses_regex: false,
+        }
+    }
+
+    /// Hoist every inline (anonymous) composite in the spec to a synthesized named
+    /// rule, so `records`/`aliases`/`type_choice`/`map_type_to_rust` — all of which
+    /// dispatch purely off `CsilTypeExpression::Reference` resolved by rule name —
+    /// can reach it with no second inline-shape code path.
+    ///
+    /// A `ServiceDef` rule's inline op `input_type`/`output_type` still needs this
+    /// crate's own hoist (`rewrite_hoisted_choices`, unchanged from the
+    /// pre-migration local hoist): the shared `csilgen_common::hoist_inline_composites`
+    /// deliberately leaves `ServiceDef` completely untouched (see `hoist.rs`'s
+    /// `rewrite_rule`) — an op boundary's `Success / ServiceError` shape is a
+    /// generator-specific idiom the shared pass has no business special-casing —
+    /// so a service op is skipped when it IS that shape (see
+    /// `choice_needs_error_split`; hoisting it would corrupt the split the
+    /// client/server emitters rely on) and otherwise hoisted locally. Without
+    /// this, an op boundary like `create-user: Req -> User / UserError` (a
+    /// genuine union, not the reserved `ServiceError`-splitting idiom) fell
+    /// through `map_type_to_rust`'s generic-choice fallback to
+    /// `serde_json::Value` — a type the generated crate never declares a
+    /// dependency on, so it fails to compile. Every other rule kind
+    /// (`GroupDef`/`TypeDef`/`TypeChoice`/`GroupChoice`) delegates to the shared
+    /// hoist. `hoist_all_literal_choices: true` because Rust has no
+    /// anonymous-sum-type field syntax: an inline `"a" / "b"` in a field position
+    /// must become a synthesized named `enum` exactly like the pre-migration
+    /// local hoist always did (its `Choice(arms)` arm hoisted unconditionally,
+    /// with no all-literal check).
+    ///
+    /// The two kinds of hoisting are interleaved ONE ORIGINAL RULE AT A TIME, in
+    /// original declaration order, to reproduce the pre-migration single pass's
+    /// declaration order byte-for-byte: that pass visited every rule
+    /// (`GroupDef`/`TypeDef`/`TypeChoice`/`GroupChoice`/`ServiceDef` alike) in one
+    /// loop and appended every synthesized rule to one combined list in that
+    /// visitation order, so a service's op-hoisted rules and a record's
+    /// field-hoisted rules landed interleaved by original declaration order —
+    /// e.g. `examples/build-integration/npm-project/api.csil` declares a
+    /// hoistable record (`Notification`) BEFORE its `service` block and another
+    /// (`CreateNotificationRequest`) AFTER it, so neither "service first" nor
+    /// "records first" as two whole-spec passes reproduces this (proven by an
+    /// earlier attempt at each, both left a declaration-order-only diff against
+    /// the pre-migration baseline on a real `examples/` spec). The shared hoist
+    /// has no per-rule entry point — `hoist_inline_composites` only takes a whole
+    /// spec — so each original rule is run through it ONE AT A TIME: every OTHER
+    /// rule (both remaining originals and everything hoisted by an earlier
+    /// iteration) is swapped for a `name_reservation_stub`, so the shared hoist's
+    /// name-collision avoidance (`canonical_key`-keyed, whole-spec) still sees
+    /// the full universe of names in play even though only rule `i` is actually
+    /// hoisted per call. `service_count`/`fields_with_metadata_count` don't
+    /// affect hoisting and are irrelevant to the scratch spec, so a fixed `0` is
+    /// fine there.
+    fn hoist_inline(spec: &CsilSpecSerialized) -> CsilSpecSerialized {
+        let mut rules: Vec<CsilRule> = spec.rules.clone();
+        let original_len = rules.len();
+        let mut synthesized: Vec<CsilRule> = Vec::new();
+
+        for i in 0..original_len {
+            if let CsilRuleType::ServiceDef(service) = rules[i].rule_type.clone() {
+                let owner = rules[i].name.clone();
+                let mut service = service;
+                for op in &mut service.operations {
+                    let op_snake = Self::to_snake_case(&op.name);
+                    if !Self::choice_needs_error_split(&op.input_type) {
+                        op.input_type = Self::rewrite_hoisted_choices(
+                            op.input_type.clone(),
+                            &format!("{owner}_{op_snake}_request"),
+                            &mut synthesized,
+                        );
+                    }
+                    if !Self::choice_needs_error_split(&op.output_type) {
+                        op.output_type = Self::rewrite_hoisted_choices(
+                            op.output_type.clone(),
+                            &format!("{owner}_{op_snake}_response"),
+                            &mut synthesized,
+                        );
+                    }
+                }
+                rules[i].rule_type = CsilRuleType::ServiceDef(service);
+                continue;
+            }
+
+            let mut scratch_rules: Vec<CsilRule> = rules
+                .iter()
+                .enumerate()
+                .map(|(j, r)| {
+                    if j == i {
+                        r.clone()
+                    } else {
+                        Self::name_reservation_stub(r)
+                    }
+                })
+                .collect();
+            scratch_rules.extend(synthesized.iter().map(Self::name_reservation_stub));
+            let scratch_len = scratch_rules.len();
+            let scratch = CsilSpecSerialized {
+                rules: scratch_rules,
+                source_content: None,
+                service_count: 0,
+                fields_with_metadata_count: 0,
+            };
+            let hoisted = hoist_inline_composites(
+                &scratch,
+                HoistOptions {
+                    hoist_all_literal_choices: true,
+                },
+            );
+            // The shared hoist rewrites every input rule in place (same index,
+            // same length) and appends any newly synthesized rule after that —
+            // `rules[i]` and the new tail are exactly where they land here.
+            rules[i] = hoisted.rules[i].clone();
+            synthesized.extend(hoisted.rules[scratch_len..].iter().cloned());
+        }
+
+        rules.extend(synthesized);
+        CsilSpecSerialized {
+            rules,
+            source_content: spec.source_content.clone(),
+            service_count: spec.service_count,
+            fields_with_metadata_count: spec.fields_with_metadata_count,
+        }
+    }
+
+    /// A name-only stand-in for `rule` fed to a per-rule `hoist_inline_composites`
+    /// call (see `hoist_inline`): reserves `rule.name`'s canonical key in the
+    /// shared hoist's collision-avoidance set without contributing any hoisting
+    /// of its own. `ServiceDef` is the shared hoist's own designated no-op rule
+    /// kind (`hoist.rs`'s `rewrite_rule` clones it untouched, see the module
+    /// docs), so an empty one is a deliberate, guaranteed-inert stub rather than
+    /// a repurposed "normal" rule kind that would need to stay empty by
+    /// convention only.
+    fn name_reservation_stub(rule: &CsilRule) -> CsilRule {
+        CsilRule {
+            name: rule.name.clone(),
+            rule_type: CsilRuleType::ServiceDef(CsilServiceDefinition {
+                operations: Vec::new(),
+                wire_id: None,
+            }),
+            position: rule.position.clone(),
+            doc_comments: Vec::new(),
+        }
+    }
+
+    /// Whether `ty` is the `Success / ServiceError` shape that `success_type`
+    /// (and every op codepath that calls it) already splits into
+    /// `Result<Success, ServiceError>`. That convention owns this exact shape —
+    /// hoisting must leave it alone, or the split silently stops firing and a
+    /// perfectly good `Result` return type turns into an opaque union.
+    fn choice_needs_error_split(ty: &CsilTypeExpression) -> bool {
+        match ty {
+            CsilTypeExpression::Constrained { base_type, .. } => {
+                Self::choice_needs_error_split(base_type)
+            }
+            CsilTypeExpression::Choice(arms) => arms.iter().any(is_service_error),
+            _ => false,
+        }
+    }
+
+    /// Hoist every field of one inline group body in place; `owner` names the
+    /// synthesized type `<owner>_<field>`, matching a hand-written named-choice
+    /// rule for that field. Only reached now via `rewrite_hoisted_choices`'s own
+    /// `Group` arm (see `hoist_inline` — the general `GroupDef`/`TypeDef(Group)`
+    /// case is the shared hoist's job; this is the service-op-signature-scoped
+    /// leftover), so this stays as the mutually-recursive pair it always was with
+    /// `rewrite_hoisted_choices` rather than being folded into it.
+    fn hoist_group_fields(
+        owner: &str,
+        group: &mut CsilGroupExpression,
+        synthesized: &mut Vec<CsilRule>,
+    ) {
+        for entry in &mut group.entries {
+            let Some(wire) = Self::entry_wire_name(entry) else {
+                continue;
+            };
+            // Deliberately NOT `escape_rust_ident`: that produces `r#type` for a
+            // keyword field, which is only valid syntax as a whole identifier. Here
+            // the field name is just a component glued onto `owner` (`Notification`
+            // + `type` -> `Notification_type`), and the combined name is never
+            // itself a keyword, so no raw-identifier escaping is needed — applying
+            // it anyway produced the unparseable `Notification_r#type`.
+            let field = Self::to_snake_case(&wire);
+            let synth_stem = format!("{owner}_{field}");
+            entry.value_type =
+                Self::rewrite_hoisted_choices(entry.value_type.clone(), &synth_stem, synthesized);
+        }
+    }
+
+    /// Recursively hoist every inline choice/group reachable through `ty` — a
+    /// service operation's `input_type`/`output_type` (see `hoist_service_ops`),
+    /// directly, or nested through an array element / map key / map value / tuple
+    /// element / inline group field — into a synthesized rule named `synth_stem`
+    /// (suffixed `_item`/`_key`/`_value`/`_<index>`/`_<field>` per nesting step so
+    /// nested hoists stay unique), replacing it with a `Reference` to that rule. A
+    /// `Constrained` wrapper is preserved around the rewritten base so a
+    /// field-level constraint on an inline choice is not silently dropped. Any
+    /// other shape (scalar, `Reference`, an already-named choice's own arms)
+    /// passes through unchanged. This is the op-signature-scoped remnant of what
+    /// was, pre-migration, this crate's only hoist pass — the general
+    /// `GroupDef`/`TypeDef`/`TypeChoice`/`GroupChoice` traversal now lives in
+    /// `csilgen_common::hoist_inline_composites` (see `hoist_inline`).
+    fn rewrite_hoisted_choices(
+        ty: CsilTypeExpression,
+        synth_stem: &str,
+        synthesized: &mut Vec<CsilRule>,
+    ) -> CsilTypeExpression {
+        match ty {
+            CsilTypeExpression::Constrained {
+                base_type,
+                constraints,
+            } => {
+                let base = Self::rewrite_hoisted_choices(*base_type, synth_stem, synthesized);
+                CsilTypeExpression::Constrained {
+                    base_type: Box::new(base),
+                    constraints,
+                }
+            }
+            CsilTypeExpression::Choice(arms) => {
+                synthesized.push(CsilRule {
+                    name: synth_stem.to_string(),
+                    rule_type: CsilRuleType::TypeChoice(arms),
+                    position: CsilPosition {
+                        line: 0,
+                        column: 0,
+                        offset: 0,
+                    },
+                    doc_comments: Vec::new(),
+                });
+                CsilTypeExpression::Reference(synth_stem.to_string())
+            }
+            // An inline (anonymous) group has exactly the same problem an inline
+            // choice does: `generate_struct`/`map_type_to_rust` have no nominal
+            // route for it (no `Reference` name to hang a `csil_enc_`/`csil_dec_`
+            // pair off), so it fell to the generic `serde_json::Value` fallback —
+            // a type the generated crate never declares a dependency on. Hoist it
+            // to a synthesized `GroupDef` the exact same way, recursing into the
+            // new group's own fields first (with `synth_stem` as their owner) so a
+            // doubly-nested inline group/choice gets the same treatment one level
+            // deeper — mirrors the OCaml generator's `hoist_inline_composites`.
+            CsilTypeExpression::Group(mut group) => {
+                Self::hoist_group_fields(synth_stem, &mut group, synthesized);
+                synthesized.push(CsilRule {
+                    name: synth_stem.to_string(),
+                    rule_type: CsilRuleType::GroupDef(group),
+                    position: CsilPosition {
+                        line: 0,
+                        column: 0,
+                        offset: 0,
+                    },
+                    doc_comments: Vec::new(),
+                });
+                CsilTypeExpression::Reference(synth_stem.to_string())
+            }
+            CsilTypeExpression::Array {
+                element_type,
+                occurrence,
+            } => {
+                let elem = Self::rewrite_hoisted_choices(
+                    *element_type,
+                    &format!("{synth_stem}_item"),
+                    synthesized,
+                );
+                CsilTypeExpression::Array {
+                    element_type: Box::new(elem),
+                    occurrence,
+                }
+            }
+            CsilTypeExpression::Map {
+                key,
+                value,
+                occurrence,
+            } => {
+                let k =
+                    Self::rewrite_hoisted_choices(*key, &format!("{synth_stem}_key"), synthesized);
+                let v = Self::rewrite_hoisted_choices(
+                    *value,
+                    &format!("{synth_stem}_value"),
+                    synthesized,
+                );
+                CsilTypeExpression::Map {
+                    key: Box::new(k),
+                    value: Box::new(v),
+                    occurrence,
+                }
+            }
+            CsilTypeExpression::Tuple(group) => {
+                let entries = group
+                    .entries
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, mut entry)| {
+                        entry.value_type = Self::rewrite_hoisted_choices(
+                            entry.value_type,
+                            &format!("{synth_stem}_{i}"),
+                            synthesized,
+                        );
+                        entry
+                    })
+                    .collect();
+                CsilTypeExpression::Tuple(CsilGroupExpression { entries })
+            }
+            other => other,
         }
     }
 
@@ -1402,7 +1827,7 @@ impl<'a> RustCodeGenerator<'a> {
         let want_server = matches!(surface, Surface::Server)
             || (package && !matches!(surface, Surface::TypesOnly));
 
-        if self.input.csil_spec.service_count > 0 {
+        if self.spec.service_count > 0 {
             if want_client {
                 // `Both` (default) ships the blocking client at the canonical
                 // `client.rs` plus an async twin (marked symbols) at
@@ -1709,13 +2134,13 @@ impl<'a> RustCodeGenerator<'a> {
         ch: &RustChannelExample,
         operations: &[CsilServiceOperation],
     ) -> Result<String, String> {
-        let demo_snake = self.to_snake_case(&ch.op_name);
+        let demo_snake = Self::to_snake_case(&ch.op_name);
         let mut out = format!(
             "struct QuickstartHandlers;\n\nimpl {} for QuickstartHandlers {{\n    type Context = ();\n",
             ch.service_trait
         );
         for op in operations {
-            let op_snake = self.to_snake_case(&op.name);
+            let op_snake = Self::to_snake_case(&op.name);
             match op.direction {
                 CsilServiceDirection::Unidirectional => {
                     let output_type =
@@ -1773,8 +2198,7 @@ impl<'a> RustCodeGenerator<'a> {
         // Clone the operations so the handler impl can call `&mut self` mapping helpers
         // without holding a borrow on `self.input`.
         let operations: Vec<CsilServiceOperation> = self
-            .input
-            .csil_spec
+            .spec
             .rules
             .iter()
             .find_map(|r| match &r.rule_type {
@@ -1785,8 +2209,8 @@ impl<'a> RustCodeGenerator<'a> {
             })
             .unwrap_or_default();
         let handler_impl = self.rust_handler_impl(ch, &operations)?;
-        let service_snake = self.to_snake_case(&ch.service_trait);
-        let op_snake = self.to_snake_case(&ch.op_name);
+        let service_snake = Self::to_snake_case(&ch.service_trait);
+        let op_snake = Self::to_snake_case(&ch.op_name);
         Ok(format!(
             r#"{handler_impl}
 fn session(carrier: &mut impl FrameCarrier) -> Result<(), Box<dyn std::error::Error>> {{
@@ -1932,7 +2356,7 @@ fn main() {{
     /// the example never names a method the client did not emit.
     fn first_unary_example(&self) -> Option<RustExample> {
         let records = self.record_names();
-        for rule in &self.input.csil_spec.rules {
+        for rule in &self.spec.rules {
             let CsilRuleType::ServiceDef(service) = &rule.rule_type else {
                 continue;
             };
@@ -1950,7 +2374,7 @@ fn main() {{
                 let base = Self::service_base(&rule.name);
                 return Some(RustExample {
                     client_struct: format!("{base}Client"),
-                    method: self.to_snake_case(&op.name),
+                    method: Self::to_snake_case(&op.name),
                     null_input,
                     sample: if null_input {
                         String::new()
@@ -1958,8 +2382,8 @@ fn main() {{
                         self.rust_sample(&op.input_type)
                     },
                     req_snake: (!null_input)
-                        .then(|| self.to_snake_case(&Self::type_ref_name(&op.input_type))),
-                    res_snake: Some(self.to_snake_case(&Self::type_ref_name(&success))),
+                        .then(|| Self::to_snake_case(&Self::type_ref_name(&op.input_type))),
+                    res_snake: Some(Self::to_snake_case(&Self::type_ref_name(&success))),
                     // The datagram ordinal is the op's @wire-id when present; otherwise a
                     // channel-agreed placeholder the user fills in.
                     op_ord: op.wire_id.unwrap_or(1),
@@ -1975,7 +2399,7 @@ fn main() {{
     /// Events section then shows the handshake/heartbeat without typed dispatch.
     fn first_channel_example(&self) -> Option<RustChannelExample> {
         let records = self.record_names();
-        for rule in &self.input.csil_spec.rules {
+        for rule in &self.spec.rules {
             let CsilRuleType::ServiceDef(service) = &rule.rule_type else {
                 continue;
             };
@@ -1994,7 +2418,9 @@ fn main() {{
                 // a handler) and the encoder serializes the op's success output (outbound).
                 return Some(RustChannelExample {
                     service_trait: rule.name.clone(),
-                    wire_service: Self::service_base(&rule.name).to_lowercase(),
+                    // The wire carries the CSIL service name verbatim
+                    // (docs/cbor-wire-contract.md "RPC call naming").
+                    wire_service: rule.name.clone(),
                     op_name: op.name.clone(),
                     outbound_sample: self.rust_sample(&success),
                 });
@@ -2059,7 +2485,7 @@ fn main() {{
                 };
                 fields.push(format!("{field_name}: {value}"));
             } else if let Some(spread) = Self::group_spread_reference(&entry.value_type) {
-                let field_name = Self::escape_rust_ident(&self.to_snake_case(&spread));
+                let field_name = Self::escape_rust_ident(&Self::to_snake_case(&spread));
                 let value = self.rust_sample(&CsilTypeExpression::Reference(spread));
                 fields.push(format!("{field_name}: {value}"));
             }
@@ -2074,8 +2500,7 @@ fn main() {{
     /// The record a type reference names, if any. `Name = {{ ... }}` parses as a
     /// `TypeDef(Group)` while a bare group rule is a `GroupDef`; both are records.
     fn find_record(&self, name: &str) -> Option<&CsilGroupExpression> {
-        self.input
-            .csil_spec
+        self.spec
             .rules
             .iter()
             .filter(|r| r.name == name)
@@ -2091,7 +2516,11 @@ fn main() {{
         // `needs_validation_error` / `uses_regex` flags that decide which shared
         // helpers to inject ahead of them.
         let mut body = String::new();
-        for rule in &self.input.csil_spec.rules {
+        // Cloned so the loop body can call `&mut self` emitters: `self.spec` is now
+        // owned data (the hoisted spec), so `&self.spec.rules` would otherwise
+        // borrow `self` itself for the loop's whole lifetime.
+        let rules = self.spec.rules.clone();
+        for rule in &rules {
             match &rule.rule_type {
                 CsilRuleType::GroupDef(group) => {
                     let struct_code = self.generate_struct(&rule.name, group)?;
@@ -2117,6 +2546,29 @@ fn main() {{
 
         let mut content = String::new();
         content.push_str("//! Generated types from CSIL specification\n\n");
+        // Every CSIL rule name — and every `<Record>_<field>`/`<Service>_<op>_...`
+        // name `hoist_inline` synthesizes for a hoisted inline choice — is
+        // emitted verbatim as the Rust type identifier (see `Reference(name) =>
+        // name.clone()` in `map_type_to_rust`, and the struct/enum declarations
+        // above, which both use `rule.name` as-is with no PascalCasing). That is
+        // deliberate: CSIL is CDDL-flavored, so rule names are conventionally
+        // snake_case or kebab-case, and Rust-casing them here would mean every
+        // codec/client/server emitter also has to re-derive and agree on the same
+        // casing at every reference site — a much larger, riskier change than
+        // allowing the lint once. Unconditional like `codec.gen.rs`'s own
+        // `#![allow(dead_code, ...)]`: cheap to always emit, and correct whether or
+        // not this particular spec happens to use non-CamelCase rule names.
+        //
+        // `clippy::large_enum_variant` is allowed for the same reason a union's
+        // shape is not ours to choose: a type-choice's variant payload sizes come
+        // straight from the CSIL spec (e.g. a large record next to a small error
+        // type), and the wire format is a tagged sum over the *value*, not a
+        // pointer — boxing a variant to appease the lint would mean the codec
+        // encode/decode paths route through `Box<T>` for exactly one variant of
+        // exactly the enums whose sibling arms happen to be small, an asymmetry
+        // that buys nothing at the wire and would ripple through every
+        // `rust_enc_value`/`rust_dec_func` call site that touches a union.
+        content.push_str("#![allow(non_camel_case_types, clippy::large_enum_variant)]\n\n");
 
         // The exact-decimal helper is emitted only when the spec uses `decimal`
         // under the default mapping; under `library` mode the type is
@@ -2209,7 +2661,7 @@ fn main() {{
                 // fields, so surface the referenced group as a named field rather
                 // than dropping it silently (which would leave the spread's fields
                 // unrepresentable). The field is named after the referenced type.
-                let field_name = Self::escape_rust_ident(&self.to_snake_case(&spread));
+                let field_name = Self::escape_rust_ident(&Self::to_snake_case(&spread));
                 content.push_str("    /// Inlined from group spread; flattened on the wire.\n");
                 content.push_str(&format!("    pub {field_name}: {spread},\n"));
             }
@@ -2370,7 +2822,7 @@ fn main() {{
     /// The choices of a named type-choice rule (`X = a / b / ...`), whether the
     /// parser modeled it as a `TypeChoice` rule or a `TypeDef` of a `Choice`.
     fn type_choice(&self, name: &str) -> Option<&Vec<CsilTypeExpression>> {
-        self.input.csil_spec.rules.iter().find_map(|r| {
+        self.spec.rules.iter().find_map(|r| {
             if r.name != name {
                 return None;
             }
@@ -2382,32 +2834,31 @@ fn main() {{
         })
     }
 
-    /// A type-choice whose every variant is a literal of one consistent scalar kind
-    /// is an *enum*: it carries no payload, so each literal is its own wire value and
-    /// discriminant. Returns the literals (in declaration order) when so, else `None`
-    /// — a `None` choice is a *union* (a tagged sum, see `emit_choice_codec`).
+    // `choice_arm_literal` is shared machinery now (see `csilgen_common::choice`,
+    // THE normative classification contract): it sees through a trailing
+    // control-operator wrapper the same way this crate's former local copy did
+    // (`text / "a" / "b" .default "b"` parses its last arm as `Constrained {
+    // base_type: Literal("b"), .. }`, not a bare `Literal` — the `.default` binds
+    // to that one arm, not to the choice as a whole), so every existing
+    // `choice_arm_literal(...)` call site below keeps its exact behavior via the
+    // `use` import at the top of this file.
+
+    /// A type-choice whose every variant is a literal — of any kind, or a MIX of
+    /// kinds (`"a" / 1` is a text literal and an int literal, both literals) — is
+    /// an *enum*: it carries no payload, so each literal is its own wire value and
+    /// discriminant. Returns the literals (in declaration order) when so, else
+    /// `None` — a `None` choice is a *union* (a tagged sum, see
+    /// `emit_choice_codec`). Delegates the classification itself to
+    /// `csilgen_common::classify_choice` (THE normative contract): a mixed-kind
+    /// literal choice used to fall through here to `None` (this function required
+    /// EVERY literal to be text, or EVERY literal to be int) and land in the
+    /// generic union path, where `map_type_to_rust` wraps each literal in a
+    /// per-arm payload type instead of emitting the unit-variant bare-literal enum
+    /// its all-literal vocabulary actually is.
     fn enum_literals(choices: &[CsilTypeExpression]) -> Option<Vec<CsilLiteralValue>> {
-        if choices.is_empty() {
-            return None;
-        }
-        let lits: Vec<CsilLiteralValue> = choices
-            .iter()
-            .filter_map(|c| match c {
-                CsilTypeExpression::Literal(l) => Some(l.clone()),
-                _ => None,
-            })
-            .collect();
-        if lits.len() != choices.len() {
-            return None;
-        }
-        let all_text = lits.iter().all(|l| matches!(l, CsilLiteralValue::Text(_)));
-        let all_int = lits
-            .iter()
-            .all(|l| matches!(l, CsilLiteralValue::Integer(_)));
-        if all_text || all_int {
-            Some(lits)
-        } else {
-            None
+        match classify_choice(choices) {
+            ChoiceClass::Enum(lits) => Some(lits.into_iter().cloned().collect()),
+            ChoiceClass::Union(_) => None,
         }
     }
 
@@ -2498,56 +2949,66 @@ fn main() {{
     }
 
     fn generate_services(&mut self) -> Result<String, String> {
-        let mut content = String::new();
-
-        content.push_str("//! Generated service traits from CSIL specification\n\n");
-        // The channel router/encoders ride the generated per-type CBOR codec directly
-        // (it owns the wire), so pull it in whenever the spec has channel ops. Gated so
-        // a channel-free spec keeps a clean, unused-import-free module.
-        if self.spec_has_channel_ops() {
-            content.push_str("use super::codec::*;\n");
-        }
-        content.push_str("use super::types::*;\n");
-        content.push('\n');
+        // Built before the header so the `use super::codec::*;` import (below) can
+        // be gated on whether the body actually ended up calling into the codec —
+        // "the spec has a channel op" over-approximates that: a channel op whose
+        // request type the router can't decode (e.g. a bare scalar/`Reference`
+        // boundary `generate_service_router` has no dispatch arm for) still emits
+        // a router stub that touches no codec symbol, leaving the import unused.
+        let mut body = String::new();
 
         // Only emit the fallback `ServiceError` when the spec doesn't declare its
         // own; otherwise it collides with the type from `types.rs` (both are
         // re-exported through `mod.rs`). A spec-defined `ServiceError` is used
         // verbatim via the `use super::types::*` import above.
         if !self.spec_defines_service_error() {
-            self.generate_service_error(&mut content);
-            content.push('\n');
+            self.generate_service_error(&mut body);
+            body.push('\n');
         }
 
-        for rule in &self.input.csil_spec.rules {
+        let rules = self.spec.rules.clone();
+        for rule in &rules {
             if let CsilRuleType::ServiceDef(service) = &rule.rule_type {
                 let trait_code = self.generate_service_trait(&rule.name, service)?;
-                content.push_str(&trait_code);
-                content.push_str("\n\n");
+                body.push_str(&trait_code);
+                body.push_str("\n\n");
 
                 // Purely additive: only specs carrying `@wire-id(N)` ordinals get
                 // a `wire_ids` module, so wire-id-free specs stay byte-identical.
                 if let Some(wire_ids) = self.generate_wire_ids(&rule.name, service) {
-                    content.push_str(&wire_ids);
-                    content.push_str("\n\n");
+                    body.push_str(&wire_ids);
+                    body.push_str("\n\n");
                 }
 
                 if Self::service_has_channel_ops(service) {
-                    content.push_str(&self.generate_service_router(&rule.name, service)?);
-                    content.push('\n');
+                    body.push_str(&self.generate_service_router(&rule.name, service)?);
+                    body.push('\n');
                     // Compact-profile twin, emitted only for wire-id-bearing
                     // services so wire-id-free specs stay byte-identical.
                     if let Some(compact) =
                         self.generate_service_router_compact(&rule.name, service)?
                     {
-                        content.push_str(&compact);
-                        content.push('\n');
+                        body.push_str(&compact);
+                        body.push('\n');
                     }
-                    content.push_str(&self.generate_service_encoders(&rule.name, service)?);
-                    content.push('\n');
+                    body.push_str(&self.generate_service_encoders(&rule.name, service)?);
+                    body.push('\n');
                 }
             }
         }
+
+        let mut content = String::new();
+        content.push_str("//! Generated service traits from CSIL specification\n\n");
+        // The channel router/encoders ride the generated per-type CBOR codec
+        // directly (it owns the wire); a textual scan of the body for any codec
+        // symbol (see `body_uses_codec`) pins the import to exactly the specs
+        // whose generated trait/router/encoder code actually references it.
+        if Self::body_uses_codec(&body) {
+            content.push_str("use super::codec::*;\n");
+        }
+        content.push_str("use super::types::*;\n");
+        content.push('\n');
+        content.push_str(&body);
 
         Ok(content)
     }
@@ -2557,8 +3018,25 @@ fn main() {{
     /// caller-supplied `Transport` and returns the typed success response, with
     /// the `/ ServiceError` half surfaced through `ClientError`.
     fn generate_client(&mut self, shape: ClientShape) -> Result<String, String> {
-        let mut content = String::new();
+        // Built before the header for the same reason `generate_services` builds
+        // its body first: a service whose every operation is a channel op has no
+        // unary method to encode/decode a request/response through, so nothing in
+        // `body` would call the codec — `client_prelude` (the `ClientError`/
+        // `Transport` trait boilerplate) never references it either.
+        let mut body = String::new();
+        body.push_str(&client_prelude(shape));
+        body.push('\n');
 
+        let rules = self.spec.rules.clone();
+        for rule in &rules {
+            if let CsilRuleType::ServiceDef(service) = &rule.rule_type {
+                let client_code = self.generate_client_struct(&rule.name, service, shape)?;
+                body.push_str(&client_code);
+                body.push_str("\n\n");
+            }
+        }
+
+        let mut content = String::new();
         content.push_str(
             "//! Generated transport-agnostic service clients from CSIL specification\n\n",
         );
@@ -2572,23 +3050,32 @@ fn main() {{
         if !shape.marker.is_empty() {
             content.push_str("use super::client::ClientError;\n");
         }
-        // The client owns (de)serialization through the generated per-type codec.
-        content.push_str("use super::codec::*;\n");
+        // The client owns (de)serialization through the generated per-type codec —
+        // but only import it when a generated method actually calls into it (see
+        // `body_uses_codec`, shared with `generate_services`).
+        if Self::body_uses_codec(&body) {
+            content.push_str("use super::codec::*;\n");
+        }
         content.push_str("use super::types::*;\n");
         content.push('\n');
-
-        content.push_str(&client_prelude(shape));
-        content.push('\n');
-
-        for rule in &self.input.csil_spec.rules {
-            if let CsilRuleType::ServiceDef(service) = &rule.rule_type {
-                let client_code = self.generate_client_struct(&rule.name, service, shape)?;
-                content.push_str(&client_code);
-                content.push_str("\n\n");
-            }
-        }
+        content.push_str(&body);
 
         Ok(content)
+    }
+
+    /// Whether `body` (an already-rendered `services.rs`/`client.rs` body) calls
+    /// into the generated codec module. Every codec symbol it could reference is
+    /// either the internal `csil_enc_*`/`csil_dec_*`/`Csil*` surface (see
+    /// `CODEC_RUNTIME_RUST`) or the public `encode_*`/`decode_*` wrappers
+    /// (`emit_record_codec`/`emit_choice_codec`/`emit_op_codec_pair`) — a router
+    /// stub with no dispatchable op, or a client whose service has no unary op,
+    /// calls neither, and must not import a module it never uses.
+    fn body_uses_codec(body: &str) -> bool {
+        body.contains("csil_")
+            || body.contains("Csil")
+            || body.contains("cbor_")
+            || body.contains("encode_")
+            || body.contains("decode_")
     }
 
     fn generate_client_struct(
@@ -2604,6 +3091,14 @@ fn main() {{
         let mut content = String::new();
         content.push_str(&format!("/// Typed client for the {name} service.\n"));
         content.push_str(&format!("pub struct {client}<T: {transport}> {{\n"));
+        // A service whose every operation is a channel op (`<->`/`<-`) has no
+        // unary method to call `self.transport` from (channel ops ride the
+        // router/encoder surface below, not the client struct) — `transport` is
+        // still stored so `new(transport: T)` and the `T: Transport` bound stay
+        // uniform across every service, but clippy has no way to know a
+        // *different* service in the same spec might use it, so allow rather than
+        // special-case the struct shape per service.
+        content.push_str("    #[allow(dead_code)]\n");
         content.push_str("    transport: T,\n");
         content.push_str("}\n\n");
 
@@ -2614,9 +3109,10 @@ fn main() {{
 
         let records = self.record_names();
         let aliases = self.codec_aliases();
-        // Canonical wire strings (the wire contract): service lowercased, op
-        // PascalCased — so a Rust client reaches the same endpoint as its peers.
-        let wire_service = base.to_lowercase();
+        // The client hands its transport seam the CSIL service and operation names
+        // verbatim, so a Rust client reaches the same endpoint as its peers
+        // (docs/cbor-wire-contract.md "RPC call naming").
+        let wire_service = name;
         for operation in &service.operations {
             // Only unary request/response operations belong on the RPC client;
             // channel (`<->`/`<-`) ops ride the router/encoder surface instead.
@@ -2642,8 +3138,8 @@ fn main() {{
                 ));
                 continue;
             }
-            let method = self.to_snake_case(&operation.name);
-            let wire_method = Self::to_pascal_case(&operation.name);
+            let method = Self::to_snake_case(&operation.name);
+            let wire_method = &operation.name;
             let output_type = self.map_type_to_rust(&success, &None)?;
             let stem = self.op_codec_stem(name, &operation.name);
             // A record success reuses its `decode_<t>` wrapper; any other shape uses the
@@ -2651,7 +3147,7 @@ fn main() {{
             let resp_dec = if Self::is_record_ref(&success, &records) {
                 format!(
                     "decode_{}",
-                    self.to_snake_case(&Self::type_ref_name(&success))
+                    Self::to_snake_case(&Self::type_ref_name(&success))
                 )
             } else {
                 format!("decode_{stem}_response")
@@ -2663,12 +3159,15 @@ fn main() {{
             let async_kw = shape.async_kw();
             let dot_await = shape.dot_await();
             if null_input {
-                content.push_str(&format!(
-                    "    pub {async_kw}fn {method}(&self) -> Result<{output_type}, ClientError> {{\n"
+                content.push_str(&Self::rust_client_method_sig(
+                    async_kw,
+                    &method,
+                    None,
+                    &output_type,
                 ));
                 content.push_str(&Self::rust_client_call(
-                    &wire_service,
-                    &wire_method,
+                    wire_service,
+                    wire_method,
                     "&[]",
                     dot_await,
                 ));
@@ -2679,24 +3178,35 @@ fn main() {{
                 let req_enc = if Self::is_record_ref(&operation.input_type, &records) {
                     format!(
                         "encode_{}",
-                        self.to_snake_case(&Self::type_ref_name(&operation.input_type))
+                        Self::to_snake_case(&Self::type_ref_name(&operation.input_type))
                     )
                 } else {
                     format!("encode_{stem}_request")
                 };
-                content.push_str(&format!(
-                    "    pub {async_kw}fn {method}(&self, req: {input_type}) -> Result<{output_type}, ClientError> {{\n"
+                content.push_str(&Self::rust_client_method_sig(
+                    async_kw,
+                    &method,
+                    Some(&input_type),
+                    &output_type,
                 ));
                 content.push_str(&Self::rust_client_call(
-                    &wire_service,
-                    &wire_method,
+                    wire_service,
+                    wire_method,
                     &format!("&{req_enc}(&req)"),
                     dot_await,
                 ));
             }
-            content.push_str(&format!(
+            let decode_line = format!(
                 "        {resp_dec}(&csil_resp).map_err(|e| ClientError::Transport(e.to_string()))\n"
-            ));
+            );
+            if decode_line.trim_end().len() <= 100 {
+                content.push_str(&decode_line);
+            } else {
+                content.push_str(&format!(
+                    "        {resp_dec}(&csil_resp)\n\
+                     \x20           .map_err(|e| ClientError::Transport(e.to_string()))\n"
+                ));
+            }
             content.push_str("    }\n");
         }
 
@@ -2756,8 +3266,8 @@ fn main() {{
     fn op_codec_stem(&self, service_name: &str, op_name: &str) -> String {
         format!(
             "{}_{}",
-            self.to_snake_case(&Self::service_base(service_name)),
-            self.to_snake_case(op_name)
+            Self::to_snake_case(&Self::service_base(service_name)),
+            Self::to_snake_case(op_name)
         )
     }
 
@@ -2784,8 +3294,7 @@ fn main() {{
     /// non-record reference would yield. The Rust alias is a transparent `pub type`,
     /// so the underlying codec's value is assignable to/from the named field.
     fn codec_aliases(&self) -> HashMap<String, CsilTypeExpression> {
-        self.input
-            .csil_spec
+        self.spec
             .rules
             .iter()
             .filter_map(|rule| match &rule.rule_type {
@@ -2799,8 +3308,7 @@ fn main() {{
     }
 
     fn record_names(&self) -> HashSet<String> {
-        self.input
-            .csil_spec
+        self.spec
             .rules
             .iter()
             .filter_map(|rule| {
@@ -2855,29 +3363,29 @@ fn main() {{
         by_ref: bool,
         records: &HashSet<String>,
         aliases: &HashMap<String, CsilTypeExpression>,
-    ) -> String {
+    ) -> RustExpr {
         // A scalar constructor takes the value by copy; a `&T` binding is deref'd.
         let scalar = |ctor: &str| {
             if by_ref {
-                format!("{ctor}(*{expr})")
+                RustExpr::call(ctor, vec![RustExpr::Atom(format!("*{expr}"))])
             } else {
-                format!("{ctor}({expr})")
+                RustExpr::call(ctor, vec![RustExpr::Atom(expr.to_string())])
             }
         };
         // A reference constructor borrows an owned place but takes a binding as-is.
         let refed = |ctor: &str| {
             if by_ref {
-                format!("{ctor}({expr})")
+                RustExpr::call(ctor, vec![RustExpr::Atom(expr.to_string())])
             } else {
-                format!("{ctor}(&{expr})")
+                RustExpr::call(ctor, vec![RustExpr::Atom(format!("&{expr}"))])
             }
         };
         // The reference passed to a composite helper (already a ref, or borrowed).
         let as_ref = || {
             if by_ref {
-                expr.to_string()
+                RustExpr::Atom(expr.to_string())
             } else {
-                format!("&{expr}")
+                RustExpr::Atom(format!("&{expr}"))
             }
         };
         match Self::value_base(ty) {
@@ -2890,13 +3398,13 @@ fn main() {{
                 "bytes" | "bstr" => refed("cbor_bytes"),
                 "timestamp" => refed("csil_enc_timestamp"),
                 "decimal" => refed("csil_enc_decimal"),
-                "null" | "nil" => "CsilCborValue::Null".to_string(),
+                "null" | "nil" => RustExpr::Atom("CsilCborValue::Null".to_string()),
                 // `any` already is a CBOR value tree; carry it through by clone.
-                "any" => format!("{expr}.clone()"),
-                _ => "CsilCborValue::Null".to_string(),
+                "any" => RustExpr::Atom(format!("{expr}.clone()")),
+                _ => RustExpr::Atom("CsilCborValue::Null".to_string()),
             },
             CsilTypeExpression::Reference(name) if records.contains(name) => {
-                refed(&format!("csil_enc_{}", self.to_snake_case(name)))
+                refed(&format!("csil_enc_{}", Self::to_snake_case(name)))
             }
             // A reference to a transparent alias (`StringInt64Map = {* text => int}`,
             // `Tags = [* text]`, `Uuid = text`) has no codec of its own; encode it as
@@ -2907,34 +3415,35 @@ fn main() {{
             }
             // A named type-choice (enum or union) has its own value-tree codec.
             CsilTypeExpression::Reference(name) if self.type_choice(name).is_some() => {
-                refed(&format!("csil_enc_{}", self.to_snake_case(name)))
+                refed(&format!("csil_enc_{}", Self::to_snake_case(name)))
             }
             CsilTypeExpression::Array { element_type, .. } => {
-                if let Some(func) = self.rust_enc_func(element_type, records, aliases) {
-                    Self::rust_call("cbor_enc_array", &[as_ref(), func])
-                } else {
-                    let inner =
-                        self.rust_enc_value(element_type, "csil_elem", true, records, aliases);
-                    Self::rust_call(
-                        "cbor_enc_array",
-                        &[as_ref(), format!("|csil_elem| {inner}")],
-                    )
-                }
+                let elem = match self.rust_enc_func(element_type, records, aliases) {
+                    Some(func) => RustExpr::Atom(func),
+                    None => {
+                        let inner =
+                            self.rust_enc_value(element_type, "csil_elem", true, records, aliases);
+                        RustExpr::closure("|csil_elem|", inner)
+                    }
+                };
+                RustExpr::call("cbor_enc_array", vec![as_ref(), elem])
             }
             CsilTypeExpression::Map { key, value, .. } => {
-                let kenc = self
-                    .rust_enc_func(key, records, aliases)
-                    .unwrap_or_else(|| {
+                let kenc = match self.rust_enc_func(key, records, aliases) {
+                    Some(func) => RustExpr::Atom(func),
+                    None => {
                         let inner = self.rust_enc_value(key, "csil_mk", true, records, aliases);
-                        format!("|csil_mk| {inner}")
-                    });
-                let venc = self
-                    .rust_enc_func(value, records, aliases)
-                    .unwrap_or_else(|| {
+                        RustExpr::closure("|csil_mk|", inner)
+                    }
+                };
+                let venc = match self.rust_enc_func(value, records, aliases) {
+                    Some(func) => RustExpr::Atom(func),
+                    None => {
                         let inner = self.rust_enc_value(value, "csil_mv", true, records, aliases);
-                        format!("|csil_mv| {inner}")
-                    });
-                Self::rust_call("cbor_enc_map", &[as_ref(), kenc, venc])
+                        RustExpr::closure("|csil_mv|", inner)
+                    }
+                };
+                RustExpr::call("cbor_enc_map", vec![as_ref(), kenc, venc])
             }
             // A fixed-shape tuple maps to a Rust tuple; encode positionally into a CBOR
             // array. An absent optional element is held in place as null so the array
@@ -2951,9 +3460,10 @@ fn main() {{
                             records,
                             aliases,
                         );
-                        parts.push(format!(
-                            "match &{place} {{ Some(csil_t) => {inner}, None => CsilCborValue::Null }}"
-                        ));
+                        parts.push(RustExpr::MatchOpt {
+                            place,
+                            inner: Box::new(inner),
+                        });
                     } else {
                         parts.push(self.rust_enc_value(
                             &entry.value_type,
@@ -2964,12 +3474,14 @@ fn main() {{
                         ));
                     }
                 }
-                format!("CsilCborValue::Array(vec![{}])", parts.join(", "))
+                RustExpr::ArrayVec(parts)
             }
-            CsilTypeExpression::Literal(literal) => Self::rust_literal_cbor_expr(literal),
+            CsilTypeExpression::Literal(literal) => {
+                RustExpr::Atom(Self::rust_literal_cbor_expr(literal))
+            }
             // A shape the codec cannot model precisely (a non-record reference, `any`)
             // is carried as null rather than emitting code that would not compile.
-            _ => "CsilCborValue::Null".to_string(),
+            _ => RustExpr::Atom("CsilCborValue::Null".to_string()),
         }
     }
 
@@ -2985,13 +3497,13 @@ fn main() {{
     ) -> Option<String> {
         match Self::value_base(ty) {
             CsilTypeExpression::Reference(name) if records.contains(name) => {
-                Some(format!("csil_enc_{}", self.to_snake_case(name)))
+                Some(format!("csil_enc_{}", Self::to_snake_case(name)))
             }
             CsilTypeExpression::Reference(name) if aliases.contains_key(name) => {
                 self.rust_enc_func(&aliases[name], records, aliases)
             }
             CsilTypeExpression::Reference(name) if self.type_choice(name).is_some() => {
-                Some(format!("csil_enc_{}", self.to_snake_case(name)))
+                Some(format!("csil_enc_{}", Self::to_snake_case(name)))
             }
             CsilTypeExpression::Builtin(name) => match name.as_str() {
                 "timestamp" => Some("csil_enc_timestamp".to_string()),
@@ -3002,52 +3514,230 @@ fn main() {{
         }
     }
 
-    fn rust_call(name: &str, args: &[String]) -> String {
-        let one_line = format!("{name}({})", args.join(", "));
-        if !one_line.contains('\n') && one_line.len() <= 80 {
-            return one_line;
+    /// Lay out `expr` the way rustfmt would: the returned first line carries no
+    /// indentation (the caller has already written `col` characters on it) and
+    /// continuation lines are indented to `indent`; `tail` characters will follow
+    /// on the final line.
+    fn render_expr(expr: &RustExpr, indent: usize, col: usize, tail: usize) -> String {
+        if let Some(f) = expr.flat()
+            && col + f.len() + tail <= 100
+        {
+            return f;
         }
-
-        let mut out = format!("{name}(\n");
-        for arg in args {
-            let lines: Vec<&str> = arg.lines().collect();
-            for (idx, line) in lines.iter().enumerate() {
-                out.push_str("    ");
-                out.push_str(line);
-                if idx + 1 == lines.len() {
-                    out.push(',');
+        let pad = " ".repeat(indent);
+        let pad4 = " ".repeat(indent + 4);
+        match expr {
+            RustExpr::Atom(s) => s.clone(),
+            RustExpr::Closure { params, body } => {
+                let inner = match body.as_ref() {
+                    RustExpr::TupleDec { arity, elems } => {
+                        Self::render_tuple_dec(indent + 4, *arity, elems)
+                    }
+                    RustExpr::LitDec { expected, value } => {
+                        format!("cbor_expect_value(csil_v, &{expected})?;\n{pad4}Ok({value})")
+                    }
+                    other => Self::render_expr(other, indent + 4, indent + 4, 0),
+                };
+                format!("{params} {{\n{pad4}{inner}\n{pad}}}")
+            }
+            RustExpr::Call { .. } => Self::render_call(expr, indent, col, tail),
+            RustExpr::ArrayVec(elems) => {
+                let mut out = String::from("CsilCborValue::Array(vec![\n");
+                for elem in elems {
+                    out.push_str(&pad4);
+                    out.push_str(&Self::render_expr(elem, indent + 4, indent + 4, 1));
+                    out.push_str(",\n");
                 }
-                out.push('\n');
+                out.push_str(&format!("{pad}])"));
+                out
+            }
+            RustExpr::MatchOpt { place, inner } => {
+                let arm = match inner.flat() {
+                    Some(f) if indent + 4 + 16 + f.len() < 100 => {
+                        format!("Some(csil_t) => {f},")
+                    }
+                    _ => {
+                        let pad8 = " ".repeat(indent + 8);
+                        let rendered = Self::render_expr(inner, indent + 8, indent + 8, 0);
+                        format!("Some(csil_t) => {{\n{pad8}{rendered}\n{pad4}}}")
+                    }
+                };
+                format!(
+                    "match &{place} {{\n{pad4}{arm}\n{pad4}None => CsilCborValue::Null,\n{pad}}}"
+                )
+            }
+            RustExpr::TupleDec { arity, elems } => Self::render_tuple_dec(indent, *arity, elems),
+            RustExpr::LitDec { expected, value } => {
+                format!("cbor_expect_value(csil_v, &{expected})?;\n{pad}Ok({value})")
             }
         }
-        out.push(')');
+    }
+
+    /// A call that did not fit flat: rustfmt flattens a chain of single-argument
+    /// calls into one combined head and stacks the innermost argument list;
+    /// otherwise a lone trailing closure overflows with a block body, and failing
+    /// that every argument stacks on its own line.
+    fn render_call(expr: &RustExpr, indent: usize, col: usize, _tail: usize) -> String {
+        let pad = " ".repeat(indent);
+        let pad4 = " ".repeat(indent + 4);
+        let RustExpr::Call {
+            head,
+            args,
+            macro_like,
+        } = expr
+        else {
+            unreachable!("render_call takes only RustExpr::Call");
+        };
+        let outer_macro = *macro_like;
+
+        // Chain-of-single-argument flattening (`Err(CsilCborError(` ...). A macro
+        // is never folded into the head chain so its own no-trailing-comma
+        // argument stacking stays in charge of the innermost list.
+        let mut heads = String::new();
+        let mut depth = 0usize;
+        let mut cur = expr;
+        while let RustExpr::Call {
+            head,
+            args,
+            macro_like,
+        } = cur
+            && args.len() == 1
+            && !*macro_like
+        {
+            heads.push_str(head);
+            heads.push('(');
+            depth += 1;
+            cur = &args[0];
+        }
+        if depth > 0 {
+            let closing = ")".repeat(depth);
+            match cur {
+                RustExpr::Call {
+                    head: inner_head,
+                    args: inner_args,
+                    macro_like,
+                } => {
+                    let mut out = format!("{heads}{inner_head}(\n");
+                    for (idx, arg) in inner_args.iter().enumerate() {
+                        out.push_str(&pad4);
+                        out.push_str(&Self::render_expr(arg, indent + 4, indent + 4, 1));
+                        if !*macro_like || idx + 1 < inner_args.len() {
+                            out.push(',');
+                        }
+                        out.push('\n');
+                    }
+                    out.push_str(&format!("{pad}){closing}"));
+                    return out;
+                }
+                other => {
+                    let rendered = Self::render_expr(other, indent + 4, indent + 4, 1);
+                    return format!("{heads}\n{pad4}{rendered},\n{pad}{closing}");
+                }
+            }
+        }
+
+        // Lone trailing closure: overflow it with a block body when everything
+        // before it stays flat on the head line.
+        let closure_count = args
+            .iter()
+            .filter(|a| matches!(a, RustExpr::Closure { .. }))
+            .count();
+        if closure_count == 1
+            && let Some(RustExpr::Closure { params, body }) = args.last()
+        {
+            let leading: Option<Vec<String>> =
+                args[..args.len() - 1].iter().map(RustExpr::flat).collect();
+            if let Some(leading) = leading {
+                let head_line = format!("{head}({}, {params} {{", leading.join(", "));
+                if col + head_line.len() <= 100 {
+                    let inner = match body.as_ref() {
+                        RustExpr::TupleDec { arity, elems } => {
+                            Self::render_tuple_dec(indent + 4, *arity, elems)
+                        }
+                        RustExpr::LitDec { expected, value } => {
+                            format!("cbor_expect_value(csil_v, &{expected})?;\n{pad4}Ok({value})")
+                        }
+                        other => Self::render_expr(other, indent + 4, indent + 4, 0),
+                    };
+                    return format!("{head_line}\n{pad4}{inner}\n{pad}}})");
+                }
+            }
+        }
+
+        // Every argument on its own line.
+        let mut out = format!("{head}(\n");
+        for (idx, arg) in args.iter().enumerate() {
+            out.push_str(&pad4);
+            out.push_str(&Self::render_expr(arg, indent + 4, indent + 4, 1));
+            if !outer_macro || idx + 1 < args.len() {
+                out.push(',');
+            }
+            out.push('\n');
+        }
+        out.push_str(&format!("{pad})"));
         out
     }
 
-    fn blockify_array_closure(value: &str) -> String {
-        if !value.starts_with("cbor_enc_array(") || value.contains('\n') || value.contains('{') {
-            return value.to_string();
+    /// The positional tuple decoder's statements, first line unindented per the
+    /// `render_expr` contract.
+    fn render_tuple_dec(indent: usize, arity: usize, elems: &[(RustExpr, bool)]) -> String {
+        let pad = " ".repeat(indent);
+        let pad4 = " ".repeat(indent + 4);
+        let pad8 = " ".repeat(indent + 8);
+        let pad12 = " ".repeat(indent + 12);
+        let mut out = format!(
+            "let csil_arr = match csil_v {{\n\
+             {pad4}CsilCborValue::Array(csil_a) => csil_a,\n\
+             {pad4}_ => {{\n\
+             {pad8}return Err(CsilCborError(\n\
+             {pad12}\"csil cbor: tuple expects an array\".to_string(),\n\
+             {pad8}))\n\
+             {pad4}}}\n\
+             {pad}}};\n\
+             {pad}if csil_arr.len() != {arity} {{\n\
+             {pad4}return Err(CsilCborError(format!(\n\
+             {pad8}\"csil cbor: tuple expects {arity} elements, got {{}}\",\n\
+             {pad8}csil_arr.len()\n\
+             {pad4})));\n\
+             {pad}}}\n\
+             {pad}Ok((\n"
+        );
+        for (i, (dec, optional)) in elems.iter().enumerate() {
+            out.push_str(&format!("{pad4}{{\n"));
+            if *optional {
+                out.push_str(&format!(
+                    "{pad8}if matches!(csil_arr[{i}], CsilCborValue::Null) {{\n\
+                     {pad12}None\n\
+                     {pad8}}} else {{\n"
+                ));
+                out.push_str(&Self::render_let(indent + 12, "csil_d", dec));
+                out.push_str(&format!("{pad12}Some(csil_d(&csil_arr[{i}])?)\n{pad8}}}\n"));
+            } else {
+                out.push_str(&Self::render_let(indent + 8, "csil_d", dec));
+                out.push_str(&format!("{pad8}csil_d(&csil_arr[{i}])?\n"));
+            }
+            out.push_str(&format!("{pad4}}},\n"));
         }
-        let Some(split) = value.find(", |") else {
-            return value.to_string();
-        };
-        let (head, closure) = value.split_at(split + 2);
-        let Some(rest) = closure.strip_prefix('|') else {
-            return value.to_string();
-        };
-        let Some(end) = rest.find('|') else {
-            return value.to_string();
-        };
-        let params = &closure[..end + 2];
-        let body = closure[end + 2..]
-            .trim_start()
-            .strip_suffix(')')
-            .unwrap_or("")
-            .trim();
-        if body.is_empty() {
-            return value.to_string();
+        out.push_str(&format!("{pad}))"));
+        out
+    }
+
+    /// Lay out `let {var} = {expr};` at `indent` down rustfmt's ladder: same line
+    /// when the flat form fits, broken after `=` when the flat form fits four
+    /// deeper, otherwise the expression wraps in place.
+    fn render_let(indent: usize, var: &str, expr: &RustExpr) -> String {
+        let pad = " ".repeat(indent);
+        if let Some(f) = expr.flat() {
+            if indent + 4 + var.len() + 3 + f.len() < 100 {
+                return format!("{pad}let {var} = {f};\n");
+            }
+            if indent + 4 + f.len() < 100 {
+                return format!("{pad}let {var} =\n{pad}    {f};\n");
+            }
         }
-        format!("{head}{params} {{\n    {body}\n}})")
+        let col = indent + 4 + var.len() + 3;
+        let rendered = Self::render_expr(expr, indent, col, 1);
+        format!("{pad}let {var} = {rendered};\n")
     }
 
     /// A Rust expression of type `impl Fn(&CsilCborValue) -> Result<T, CsilCborError>`
@@ -3060,23 +3750,28 @@ fn main() {{
         ty: &CsilTypeExpression,
         records: &HashSet<String>,
         aliases: &HashMap<String, CsilTypeExpression>,
-    ) -> String {
+    ) -> RustExpr {
         match Self::value_base(ty) {
             CsilTypeExpression::Builtin(name) => match name.as_str() {
-                "int" | "nint" => "cbor_as_i64".to_string(),
-                "uint" => "cbor_as_u64".to_string(),
-                "float" | "float16" | "float32" | "float64" => "cbor_as_f64".to_string(),
-                "bool" => "cbor_as_bool".to_string(),
-                "text" | "tstr" => "cbor_as_text".to_string(),
-                "bytes" | "bstr" => "cbor_as_bytes".to_string(),
-                "timestamp" => "csil_as_timestamp".to_string(),
-                "decimal" => "csil_as_decimal".to_string(),
+                "int" | "nint" => RustExpr::Atom("cbor_as_i64".to_string()),
+                "uint" => RustExpr::Atom("cbor_as_u64".to_string()),
+                "float" | "float16" | "float32" | "float64" => {
+                    RustExpr::Atom("cbor_as_f64".to_string())
+                }
+                "bool" => RustExpr::Atom("cbor_as_bool".to_string()),
+                "text" | "tstr" => RustExpr::Atom("cbor_as_text".to_string()),
+                "bytes" | "bstr" => RustExpr::Atom("cbor_as_bytes".to_string()),
+                "timestamp" => RustExpr::Atom("csil_as_timestamp".to_string()),
+                "decimal" => RustExpr::Atom("csil_as_decimal".to_string()),
                 // `any` is the CBOR value tree itself; clone it through.
-                "any" => "|csil_v: &CsilCborValue| Ok(csil_v.clone())".to_string(),
+                "any" => RustExpr::closure(
+                    "|csil_v: &CsilCborValue|",
+                    RustExpr::Atom("Ok(csil_v.clone())".to_string()),
+                ),
                 _ => Self::dec_unsupported(),
             },
             CsilTypeExpression::Reference(name) if records.contains(name) => {
-                format!("csil_dec_{}", self.to_snake_case(name))
+                RustExpr::Atom(format!("csil_dec_{}", Self::to_snake_case(name)))
             }
             // A reference to a transparent alias decodes as its underlying type; the
             // Rust alias is a transparent `pub type`, so the value the underlying
@@ -3086,50 +3781,57 @@ fn main() {{
             }
             // A named type-choice (enum or union) decodes via its own value-tree codec.
             CsilTypeExpression::Reference(name) if self.type_choice(name).is_some() => {
-                format!("csil_dec_{}", self.to_snake_case(name))
+                RustExpr::Atom(format!("csil_dec_{}", Self::to_snake_case(name)))
             }
             CsilTypeExpression::Array { element_type, .. } => {
                 let inner = self.rust_dec_func(element_type, records, aliases);
-                format!("|csil_v| cbor_dec_array(csil_v, {inner})")
+                RustExpr::closure(
+                    "|csil_v|",
+                    RustExpr::call(
+                        "cbor_dec_array",
+                        vec![RustExpr::Atom("csil_v".to_string()), inner],
+                    ),
+                )
             }
             CsilTypeExpression::Map { key, value, .. } => {
                 let kf = self.rust_dec_func(key, records, aliases);
                 let vf = self.rust_dec_func(value, records, aliases);
-                format!("|csil_v| cbor_dec_map(csil_v, {kf}, {vf})")
+                RustExpr::closure(
+                    "|csil_v|",
+                    RustExpr::call(
+                        "cbor_dec_map",
+                        vec![RustExpr::Atom("csil_v".to_string()), kf, vf],
+                    ),
+                )
             }
             // Decode a fixed-shape tuple positionally from a CBOR array; an optional
             // element reads `null` as `None`.
             CsilTypeExpression::Tuple(group) => {
-                let n = group.entries.len();
-                let mut elems = Vec::with_capacity(n);
-                for (i, entry) in group.entries.iter().enumerate() {
-                    let dec = self.rust_dec_func(&entry.value_type, records, aliases);
-                    if matches!(entry.occurrence, Some(CsilOccurrence::Optional)) {
-                        elems.push(format!(
-                            "{{ if matches!(csil_arr[{i}], CsilCborValue::Null) {{ None }} else {{ let csil_d = {dec}; Some(csil_d(&csil_arr[{i}])?) }} }}"
-                        ));
-                    } else {
-                        elems.push(format!("{{ let csil_d = {dec}; csil_d(&csil_arr[{i}])? }}"));
-                    }
-                }
-                // A 1-tuple needs the trailing comma to stay a tuple.
-                let trailing = if n == 1 { "," } else { "" };
-                format!(
-                    "|csil_v: &CsilCborValue| {{ \
-                       let csil_arr = match csil_v {{ CsilCborValue::Array(csil_a) => csil_a, _ => return Err(CsilCborError(\"csil cbor: tuple expects an array\".to_string())) }}; \
-                       if csil_arr.len() != {n} {{ return Err(CsilCborError(format!(\"csil cbor: tuple expects {n} elements, got {{}}\", csil_arr.len()))); }} \
-                       Ok(({}{trailing})) \
-                     }}",
-                    elems.join(", ")
+                let elems: Vec<(RustExpr, bool)> = group
+                    .entries
+                    .iter()
+                    .map(|entry| {
+                        (
+                            self.rust_dec_func(&entry.value_type, records, aliases),
+                            matches!(entry.occurrence, Some(CsilOccurrence::Optional)),
+                        )
+                    })
+                    .collect();
+                RustExpr::closure(
+                    "|csil_v: &CsilCborValue|",
+                    RustExpr::TupleDec {
+                        arity: group.entries.len(),
+                        elems,
+                    },
                 )
             }
-            CsilTypeExpression::Literal(literal) => {
-                let expected = Self::rust_literal_cbor_expr(literal);
-                let value = Self::rust_literal_value_expr(literal);
-                format!(
-                    "|csil_v| {{\n    cbor_expect_value(csil_v, &{expected})?;\n    Ok({value})\n}}"
-                )
-            }
+            CsilTypeExpression::Literal(literal) => RustExpr::closure(
+                "|csil_v|",
+                RustExpr::LitDec {
+                    expected: Self::rust_literal_cbor_expr(literal),
+                    value: Self::rust_literal_value_expr(literal),
+                },
+            ),
             _ => Self::dec_unsupported(),
         }
     }
@@ -3137,41 +3839,38 @@ fn main() {{
     /// The decode fallback for a payload shape the codec cannot reconstruct: a
     /// closure that errors. Its `Ok` type is inferred from the field it fills, so it
     /// compiles against any field type without needing a `Default` to fabricate.
-    fn dec_unsupported() -> String {
-        "|_csil_v| Err(CsilCborError(\"csil cbor: unsupported field type\".to_string()))"
-            .to_string()
+    fn dec_unsupported() -> RustExpr {
+        RustExpr::closure(
+            "|_csil_v|",
+            RustExpr::call(
+                "Err",
+                vec![RustExpr::call(
+                    "CsilCborError",
+                    vec![RustExpr::Atom(
+                        "\"csil cbor: unsupported field type\".to_string()".to_string(),
+                    )],
+                )],
+            ),
+        )
     }
 
-    fn rust_push_entry(wire_lit: &str, value: &str) -> String {
-        let value = if value.len() > 78 {
-            Self::blockify_array_closure(value)
-        } else {
-            value.to_string()
-        };
-        let one_line = format!("    csil_entries.push((cbor_text({wire_lit}), {value}));\n");
-        let tuple_width = format!("cbor_text({wire_lit}), {value}").len();
-        if !value.contains('\n') && tuple_width <= 60 {
-            return one_line;
-        }
-
-        let mut out = format!("    csil_entries.push((\n        cbor_text({wire_lit}),\n");
-        if value.contains('\n') {
-            let lines: Vec<&str> = value.lines().collect();
-            for (idx, line) in lines.iter().enumerate() {
-                out.push_str("        ");
-                out.push_str(line);
-                if idx + 1 == lines.len() {
-                    out.push(',');
-                }
-                out.push('\n');
+    /// One `csil_entries.push((cbor_text(<wire>), <value>));` statement at
+    /// `indent`, laid out on one line only while the tuple stays inside rustfmt's
+    /// width and stacked (with the value wrapping in place) otherwise.
+    fn rust_push_entry(indent: usize, wire_lit: &str, value: &RustExpr) -> String {
+        let pad = " ".repeat(indent);
+        let pad4 = " ".repeat(indent + 4);
+        if let Some(flat) = value.flat() {
+            let tuple = format!("cbor_text({wire_lit}), {flat}");
+            let one_line = format!("{pad}csil_entries.push(({tuple}));\n");
+            if tuple.len() <= 60 && one_line.trim_end().len() <= 100 {
+                return one_line;
             }
-        } else {
-            out.push_str("        ");
-            out.push_str(&value);
-            out.push_str(",\n");
         }
-        out.push_str("    ));\n");
-        out
+        let rendered = Self::render_expr(value, indent + 4, indent + 4, 1);
+        format!(
+            "{pad}csil_entries.push((\n{pad4}cbor_text({wire_lit}),\n{pad4}{rendered},\n{pad}));\n"
+        )
     }
 
     fn rust_literal_cbor_expr(literal: &CsilLiteralValue) -> String {
@@ -3190,6 +3889,26 @@ fn main() {{
                 format!("CsilCborValue::Bytes(vec![{values}])")
             }
             CsilLiteralValue::Array(_) => "CsilCborValue::Null".to_string(),
+        }
+    }
+
+    /// The boolean guard for one arm of a MIXED-kind literal enum's decode match
+    /// (see `emit_choice_codec`'s `else` branch): does `csil_v` hold this literal's
+    /// own value, checked in a CBOR-major-type-appropriate way. Every kind except
+    /// `Integer` compares `csil_v` directly against the literal's own rendering
+    /// (`rust_literal_cbor_expr`) — safe because encode and decode always agree on
+    /// which `CsilCborValue` variant a given CBOR major type produces, for every
+    /// kind except integers. `Integer` is the one exception: `cbor_int` always
+    /// encodes to `CsilCborValue::Int`, but `cbor_dec` decodes a non-negative
+    /// integer (CBOR major type 0) to `CsilCborValue::Uint`, so a direct `csil_v ==
+    /// &cbor_int(n)` would reject a valid non-negative match on the wire —
+    /// `cbor_as_i64` already normalizes that Uint/Int aliasing (see its own
+    /// two-armed match over both variants), so route through it instead of a raw
+    /// equality check.
+    fn rust_enum_decode_guard(lit: &CsilLiteralValue) -> String {
+        match lit {
+            CsilLiteralValue::Integer(n) => format!("matches!(cbor_as_i64(csil_v), Ok({n}))"),
+            other => format!("csil_v == &{}", Self::rust_literal_cbor_expr(other)),
         }
     }
 
@@ -3230,46 +3949,58 @@ fn main() {{
         out
     }
 
-    fn rust_fn_header(name: &str, arg: &str, ret: &str) -> String {
-        let one_line =
-            format!("fn {name}({arg}: &CsilCborValue) -> Result<{ret}, CsilCborError> {{\n");
+    /// One `pat => value,` match arm at codec indent. rustfmt keeps the arm on one
+    /// line up to the width limit and otherwise braces the body on its own line (a
+    /// braced arm carries no trailing comma).
+    fn rust_match_arm(pat: &str, value: &str) -> String {
+        let one_line = format!("        {pat} => {value},\n");
         if one_line.trim_end().len() <= 100 {
             return one_line;
         }
-        format!("fn {name}(\n    {arg}: &CsilCborValue,\n) -> Result<{ret}, CsilCborError> {{\n")
+        format!("        {pat} => {{\n            {value}\n        }}\n")
+    }
+
+    /// The `cbor_encode(&<enc>(<arg>))` wrapper body. Past rustfmt's call width the
+    /// nested single-argument calls flatten into one combined head and only the
+    /// innermost argument drops to its own line.
+    fn rust_encode_wrapper_body(call_head: &str, call_arg: &str) -> String {
+        let one_line = format!("    cbor_encode(&{call_head}({call_arg}))\n");
+        if format!("&{call_head}({call_arg})").len() <= 60 && one_line.trim_end().len() <= 100 {
+            return one_line;
+        }
+        format!("    cbor_encode(&{call_head}(\n        {call_arg},\n    ))\n")
+    }
+
+    /// A single-parameter fn signature, wrapped param-on-its-own-line once the
+    /// one-line form passes rustfmt's width.
+    fn rust_sig(prefix: &str, name: &str, param: &str, ret: &str) -> String {
+        let one_line = format!("{prefix}fn {name}({param}) -> {ret} {{\n");
+        if one_line.trim_end().len() <= 100 {
+            return one_line;
+        }
+        format!("{prefix}fn {name}(\n    {param},\n) -> {ret} {{\n")
+    }
+
+    fn rust_fn_header(name: &str, arg: &str, ret: &str) -> String {
+        Self::rust_sig(
+            "",
+            name,
+            &format!("{arg}: &CsilCborValue"),
+            &format!("Result<{ret}, CsilCborError>"),
+        )
     }
 
     fn rust_pub_decode_header(name: &str, ret: &str) -> String {
-        let one_line =
-            format!("pub fn {name}(csil_data: &[u8]) -> Result<{ret}, CsilCborError> {{\n");
-        if one_line.trim_end().len() <= 100 {
-            return one_line;
-        }
-        format!("pub fn {name}(\n    csil_data: &[u8],\n) -> Result<{ret}, CsilCborError> {{\n")
+        Self::rust_sig(
+            "pub ",
+            name,
+            "csil_data: &[u8]",
+            &format!("Result<{ret}, CsilCborError>"),
+        )
     }
 
-    fn rust_decode_binding(indent: &str, dec: &str) -> String {
-        if dec.contains('\n') {
-            let mut lines = dec.lines();
-            let first = lines.next().unwrap_or_default();
-            let mut out = format!("{indent}let csil_decode = {first}\n");
-            let remaining: Vec<&str> = lines.collect();
-            for (idx, line) in remaining.iter().enumerate() {
-                out.push_str(indent);
-                out.push_str(line);
-                if idx + 1 == remaining.len() {
-                    out.push(';');
-                }
-                out.push('\n');
-            }
-            return out;
-        }
-
-        let one_line = format!("{indent}let csil_decode = {dec};\n");
-        if one_line.trim_end().len() <= 100 {
-            return one_line;
-        }
-        format!("{indent}let csil_decode =\n{indent}    {dec};\n")
+    fn rust_decode_binding(indent: usize, dec: &RustExpr) -> String {
+        Self::render_let(indent, "csil_decode", dec)
     }
 
     fn rust_trait_method(name: &str, args: &[String], ret: &str) -> String {
@@ -3279,8 +4010,14 @@ fn main() {{
             format!("&self, {}", args.join(", "))
         };
         let one_line = format!("    fn {name}({params}) -> Result<{ret}, ServiceError>;\n");
-        if one_line.trim_end().len() <= 100 {
+        // rustfmt's ladder for a bodyless trait fn: one line through 99 columns,
+        // return type alone pushed to the next line at exactly 100 (the reserved
+        // terminator column), params one-per-line beyond that.
+        if one_line.trim_end().len() <= 99 {
             return one_line;
+        }
+        if one_line.trim_end().len() == 100 {
+            return format!("    fn {name}({params})\n        -> Result<{ret}, ServiceError>;\n");
         }
 
         let mut out = format!("    fn {name}(\n        &self,\n");
@@ -3293,29 +4030,64 @@ fn main() {{
         out
     }
 
+    /// A client method signature at impl indent: one line through rustfmt's
+    /// width, params one-per-line past it.
+    fn rust_client_method_sig(
+        async_kw: &str,
+        method: &str,
+        input: Option<&str>,
+        output: &str,
+    ) -> String {
+        let params = match input {
+            Some(t) => format!("&self, req: {t}"),
+            None => "&self".to_string(),
+        };
+        let one_line = format!(
+            "    pub {async_kw}fn {method}({params}) -> Result<{output}, ClientError> {{\n"
+        );
+        if one_line.trim_end().len() <= 100 {
+            return one_line;
+        }
+        let mut out = format!("    pub {async_kw}fn {method}(\n        &self,\n");
+        if let Some(t) = input {
+            out.push_str(&format!("        req: {t},\n"));
+        }
+        out.push_str(&format!("    ) -> Result<{output}, ClientError> {{\n"));
+        out
+    }
+
+    /// The `let csil_resp = self.transport.call(...)` statement, following the
+    /// ladder rustfmt applies to the chain (probed against rustfmt 1.x defaults):
+    /// one line while the whole chain stays inside `chain_width`; then one chain
+    /// element per line while the last element stays inside `chain_width`; then —
+    /// sync only — the visual form that keeps `self.transport` together; and once
+    /// the argument list itself passes `fn_call_width`, stacked arguments.
     fn rust_client_call(
         wire_service: &str,
         wire_method: &str,
         request_expr: &str,
         dot_await: &str,
     ) -> String {
+        let args = format!("\"{wire_service}\", \"{wire_method}\", {request_expr}");
+        let arg_width = args.len();
         if dot_await.is_empty() {
-            let one_line = format!(
-                "        let csil_resp = self.transport.call(\"{wire_service}\", \"{wire_method}\", {request_expr})?;\n"
-            );
-            if one_line.trim_end().len() <= 100 {
-                return one_line;
+            if arg_width + 22 <= 60 {
+                return format!("        let csil_resp = self.transport.call({args})?;\n");
             }
-
-            let chained_call = format!(
-                "                .call(\"{wire_service}\", \"{wire_method}\", {request_expr})?;\n"
-            );
-            if chained_call.trim_end().len() <= 100 {
+            if arg_width + 9 <= 60 {
                 return format!(
-                    "        let csil_resp =\n            self.transport\n{chained_call}"
+                    "        let csil_resp = self\n\
+                     \x20           .transport\n\
+                     \x20           .call({args})?;\n"
                 );
             }
-
+            if arg_width <= 60 {
+                return format!(
+                    "        let csil_resp =\n\
+                     \x20           self.transport\n\
+                     \x20               .call({args})?;\n"
+                );
+            }
             return format!(
                 "        let csil_resp = self.transport.call(\n\
                  \x20           \"{wire_service}\",\n\
@@ -3325,17 +4097,17 @@ fn main() {{
             );
         }
 
-        let chained_call =
-            format!("            .call(\"{wire_service}\", \"{wire_method}\", {request_expr})\n");
-        if chained_call.trim_end().len() <= 100 {
+        if arg_width + 29 <= 60 {
+            return format!("        let csil_resp = self.transport.call({args}).await?;\n");
+        }
+        if arg_width <= 60 {
             return format!(
                 "        let csil_resp = self\n\
                  \x20           .transport\n\
-                 {chained_call}\
+                 \x20           .call({args})\n\
                  \x20           .await?;\n"
             );
         }
-
         format!(
             "        let csil_resp = self\n\
              \x20           .transport\n\
@@ -3366,14 +4138,14 @@ fn main() {{
             .iter()
             .filter_map(|e| {
                 let wire = Self::entry_wire_name(e)?;
-                let member = Self::escape_rust_ident(&self.to_snake_case(&wire));
+                let member = Self::escape_rust_ident(&Self::to_snake_case(&wire));
                 Some((member, wire, e))
             })
             .collect();
         let mut canonical: Vec<&(String, String, &CsilGroupEntry)> = named.iter().collect();
         canonical.sort_by_key(|f| Self::cbor_text_key_bytes(&f.1));
 
-        let snake = self.to_snake_case(name);
+        let snake = Self::to_snake_case(name);
         let mut out = String::new();
         let encoder_reads_value = canonical.iter().any(|(_, _, entry)| {
             matches!(entry.occurrence, Some(CsilOccurrence::Optional))
@@ -3396,8 +4168,11 @@ fn main() {{
         out.push_str(&format!(
             "/// Build the canonical CBOR value tree for a {name}.\n"
         ));
-        out.push_str(&format!(
-            "fn csil_enc_{snake}({value_param}: &{name}) -> CsilCborValue {{\n"
+        out.push_str(&Self::rust_sig(
+            "",
+            &format!("csil_enc_{snake}"),
+            &format!("{value_param}: &{name}"),
+            "CsilCborValue",
         ));
         if named.is_empty() {
             out.push_str("    CsilCborValue::Map(Vec::new())\n}\n\n");
@@ -3420,18 +4195,13 @@ fn main() {{
                     out.push_str(&format!(
                         "    if let Some(csil_inner) = &csil_v.{member} {{\n"
                     ));
-                    let push = Self::rust_push_entry(&wire_lit, &enc);
-                    for line in push.lines() {
-                        out.push_str("    ");
-                        out.push_str(line);
-                        out.push('\n');
-                    }
+                    out.push_str(&Self::rust_push_entry(8, &wire_lit, &enc));
                     out.push_str("    }\n");
                 } else {
                     let place = format!("csil_v.{member}");
                     let enc =
                         self.rust_enc_value(&entry.value_type, &place, false, records, aliases);
-                    out.push_str(&Self::rust_push_entry(&wire_lit, &enc));
+                    out.push_str(&Self::rust_push_entry(4, &wire_lit, &enc));
                 }
             }
             out.push_str("    CsilCborValue::Map(csil_entries)\n}\n\n");
@@ -3454,26 +4224,38 @@ fn main() {{
             let dec = self.rust_dec_func(&entry.value_type, records, aliases);
             if matches!(entry.occurrence, Some(CsilOccurrence::Optional)) {
                 // A missing optional key leaves the field None; a present one decodes.
+                // rustfmt's ladder for an overlong head: first only the brace drops
+                // to its own line (the head itself may then still exceed the width —
+                // rustfmt accepts that); only when even the braceless head overflows
+                // does it break after `=`, shifting the whole match four deeper.
                 let map_get = format!("cbor_map_get(csil_root, {wire_lit})");
-                if format!("    let {member} = match {map_get} {{").len() <= 100 {
-                    out.push_str(&format!("    let {member} = match {map_get} {{\n"));
-                } else {
+                let head = format!("    let {member} = match {map_get} {{");
+                let extra = if head.len() <= 100 {
+                    out.push_str(&head);
+                    out.push('\n');
+                    0
+                } else if head.len() - 2 <= 100 {
                     out.push_str(&format!("    let {member} = match {map_get}\n    {{\n"));
-                }
-                out.push_str("        Some(csil_field) => {\n");
-                out.push_str(&Self::rust_decode_binding("            ", &dec));
-                out.push_str(
-                    "            Some(csil_decode(csil_field)?)\n\
-                     \x20       }\n\
-                     \x20       None => None,\n\
-                     \x20   };\n",
-                );
+                    0
+                } else {
+                    out.push_str(&format!("    let {member} =\n        match {map_get} {{\n"));
+                    4
+                };
+                let pad = " ".repeat(extra);
+                out.push_str(&format!("{pad}        Some(csil_field) => {{\n"));
+                out.push_str(&Self::rust_decode_binding(12 + extra, &dec));
+                out.push_str(&format!(
+                    "{pad}            Some(csil_decode(csil_field)?)\n\
+                     {pad}        }}\n\
+                     {pad}        None => None,\n\
+                     {pad}    }};\n"
+                ));
             } else {
                 out.push_str(&format!(
                     "    let {member} = {{\n\
                      \x20       let csil_field = cbor_require(csil_root, {wire_lit})?;\n"
                 ));
-                out.push_str(&Self::rust_decode_binding("        ", &dec));
+                out.push_str(&Self::rust_decode_binding(8, &dec));
                 out.push_str(
                     "        csil_decode(csil_field)?\n\
                      \x20   };\n",
@@ -3487,9 +4269,17 @@ fn main() {{
         out.push_str(&format!(
             "/// Encode a {name} to canonical CSIL CBOR bytes.\n"
         ));
-        out.push_str(&format!(
-            "pub fn encode_{snake}(csil_v: &{name}) -> Vec<u8> {{\n    cbor_encode(&csil_enc_{snake}(csil_v))\n}}\n\n"
+        out.push_str(&Self::rust_sig(
+            "pub ",
+            &format!("encode_{snake}"),
+            &format!("csil_v: &{name}"),
+            "Vec<u8>",
         ));
+        out.push_str(&Self::rust_encode_wrapper_body(
+            &format!("csil_enc_{snake}"),
+            "csil_v",
+        ));
+        out.push_str("}\n\n");
         out.push_str(&format!(
             "/// Decode canonical CSIL CBOR bytes into a {name}.\n"
         ));
@@ -3520,7 +4310,7 @@ fn main() {{
         // `self.input` immutably, while `map_type_to_rust` needs `&mut self`, so the two
         // must not overlap.
         let mut targets: Vec<(String, CsilTypeExpression)> = Vec::new();
-        for rule in &self.input.csil_spec.rules {
+        for rule in &self.spec.rules {
             let CsilRuleType::ServiceDef(service) = &rule.rule_type else {
                 continue;
             };
@@ -3564,16 +4354,52 @@ fn main() {{
         let rust_type = self.map_type_to_rust(ty, &None)?;
         let enc = self.rust_enc_value(ty, "csil_v", true, records, aliases);
         let dec = self.rust_dec_func(ty, records, aliases);
-        let decode_binding = Self::rust_decode_binding("    ", &dec);
-        Ok(format!(
-            "/// Encode the {helper} payload to canonical CSIL CBOR bytes.\n\
-             pub fn encode_{helper}(csil_v: &{rust_type}) -> Vec<u8> {{\n    cbor_encode(&{enc})\n}}\n\n\
-             /// Decode canonical CSIL CBOR bytes into the {helper} payload.\n\
-             pub fn decode_{helper}(csil_data: &[u8]) -> Result<{rust_type}, CsilCborError> {{\n\
-             \x20   let csil_root = cbor_decode(csil_data)?;\n\
-             {decode_binding}\
-             \x20   csil_decode(&csil_root)\n}}\n\n"
-        ))
+        let decode_binding = Self::rust_decode_binding(4, &dec);
+        let mut out = String::new();
+        out.push_str(&format!(
+            "/// Encode the {helper} payload to canonical CSIL CBOR bytes.\n"
+        ));
+        out.push_str(&Self::rust_sig(
+            "pub ",
+            &format!("encode_{helper}"),
+            &format!("csil_v: &{rust_type}"),
+            "Vec<u8>",
+        ));
+        out.push_str(&Self::rust_op_encode_body(&enc));
+        out.push_str("}\n\n");
+        out.push_str(&format!(
+            "/// Decode canonical CSIL CBOR bytes into the {helper} payload.\n"
+        ));
+        out.push_str(&Self::rust_pub_decode_header(
+            &format!("decode_{helper}"),
+            &rust_type,
+        ));
+        out.push_str("    let csil_root = cbor_decode(csil_data)?;\n");
+        out.push_str(&decode_binding);
+        out.push_str("    csil_decode(&csil_root)\n}\n\n");
+        Ok(out)
+    }
+
+    /// The op-codec `cbor_encode(&<enc>)` body: the borrow rides the encoder's
+    /// head so the nested single-argument flattening sees one chain.
+    fn rust_op_encode_body(enc: &RustExpr) -> String {
+        let borrowed = match enc.clone() {
+            RustExpr::Call {
+                head,
+                args,
+                macro_like,
+            } => RustExpr::Call {
+                head: format!("&{head}"),
+                args,
+                macro_like,
+            },
+            RustExpr::Atom(s) => RustExpr::Atom(format!("&{s}")),
+            // An op-boundary encoder root is always a call or an atom.
+            other => other,
+        };
+        let whole = RustExpr::call("cbor_encode", vec![borrowed]);
+        let rendered = Self::render_expr(&whole, 4, 4, 0);
+        format!("    {rendered}\n")
     }
 
     /// Emit the value-tree codec (`csil_enc_<t>`/`csil_dec_<t>`) for a named
@@ -3588,31 +4414,60 @@ fn main() {{
         records: &HashSet<String>,
         aliases: &HashMap<String, CsilTypeExpression>,
     ) -> String {
-        let snake = self.to_snake_case(name);
+        let snake = Self::to_snake_case(name);
         let mut out = String::new();
 
         if let Some(lits) = Self::enum_literals(choices) {
             let idents = Self::enum_variant_idents(&lits);
-            // Encode: each unit variant to its bare literal CBOR value.
+            // Encode: each unit variant to its bare literal CBOR value, via the
+            // same `rust_literal_cbor_expr` every other literal-rendering call site
+            // in this file uses — it already covers every `CsilLiteralValue` kind
+            // (not just text/int), so a mixed-kind enum's variants each encode to
+            // their own kind-appropriate CBOR value with no extra casing here. The
+            // signature is built through `rust_sig` (not a hardcoded one-liner) so
+            // a long synthesized hoisted-choice name (`<Record>_<field>`, which can
+            // run well past a source-declared rule name) still wraps like rustfmt
+            // instead of leaving a fixed line rustfmt would reformat.
             out.push_str(&format!(
-                "/// Encode a {name} enum as its bare literal value.\n\
-                 fn csil_enc_{snake}(csil_v: &{name}) -> CsilCborValue {{\n    match csil_v {{\n"
+                "/// Encode a {name} enum as its bare literal value.\n"
             ));
+            out.push_str(&Self::rust_sig(
+                "",
+                &format!("csil_enc_{snake}"),
+                &format!("csil_v: &{name}"),
+                "CsilCborValue",
+            ));
+            out.push_str("    match csil_v {\n");
             for (ident, lit) in idents.iter().zip(lits.iter()) {
-                let value = match lit {
-                    CsilLiteralValue::Text(s) => format!("cbor_text({s:?})"),
-                    CsilLiteralValue::Integer(n) => format!("cbor_int({n})"),
-                    _ => "CsilCborValue::Null".to_string(),
-                };
-                out.push_str(&format!("        {name}::{ident} => {value},\n"));
+                let value = Self::rust_literal_cbor_expr(lit);
+                out.push_str(&Self::rust_match_arm(&format!("{name}::{ident}"), &value));
             }
             out.push_str("    }\n}\n\n");
 
-            // Decode: read the bare scalar and match it back to the variant.
-            let all_text = matches!(lits.first(), Some(CsilLiteralValue::Text(_)));
+            // Decode: read the bare scalar and match it back to the variant. A
+            // uniform-kind vocabulary (all-text or all-int — the overwhelming
+            // common case) keeps its historical single-extraction shape
+            // (`cbor_as_text`/`cbor_as_i64` once, then a plain scalar match) so
+            // this stays byte-identical to the pre-fix output for every spec that
+            // has no mixed-kind choice. A genuinely mixed vocabulary (`"a" / 1`, or
+            // any other kind mix per `csilgen_common::classify_choice`'s contract)
+            // has no single extractor that fits every arm, so it matches directly
+            // on `csil_v` with a per-arm, kind-appropriate guard instead — this is
+            // the defect fix: previously `enum_literals` rejected a mixed
+            // vocabulary outright (required a uniform text-only or int-only
+            // choice) and it fell through to the union path below, wrapping each
+            // literal in a per-arm payload type it didn't have.
+            let all_text = lits.iter().all(|l| matches!(l, CsilLiteralValue::Text(_)));
+            let all_int = lits
+                .iter()
+                .all(|l| matches!(l, CsilLiteralValue::Integer(_)));
             out.push_str(&format!(
-                "/// Decode a bare literal value into a {name} enum.\n\
-                 fn csil_dec_{snake}(csil_v: &CsilCborValue) -> Result<{name}, CsilCborError> {{\n"
+                "/// Decode a bare literal value into a {name} enum.\n"
+            ));
+            out.push_str(&Self::rust_fn_header(
+                &format!("csil_dec_{snake}"),
+                "csil_v",
+                name,
             ));
             if all_text {
                 out.push_str(
@@ -3620,70 +4475,177 @@ fn main() {{
                 );
                 for (ident, lit) in idents.iter().zip(lits.iter()) {
                     if let CsilLiteralValue::Text(s) = lit {
-                        out.push_str(&format!("        {s:?} => Ok({name}::{ident}),\n"));
+                        out.push_str(&Self::rust_match_arm(
+                            &format!("{s:?}"),
+                            &format!("Ok({name}::{ident})"),
+                        ));
                     }
                 }
-            } else {
+            } else if all_int {
                 out.push_str("    let csil_val = cbor_as_i64(csil_v)?;\n    match csil_val {\n");
                 for (ident, lit) in idents.iter().zip(lits.iter()) {
                     if let CsilLiteralValue::Integer(n) = lit {
-                        out.push_str(&format!("        {n} => Ok({name}::{ident}),\n"));
+                        out.push_str(&Self::rust_match_arm(
+                            &n.to_string(),
+                            &format!("Ok({name}::{ident})"),
+                        ));
                     }
+                }
+            } else {
+                out.push_str("    match csil_v {\n");
+                for (ident, lit) in idents.iter().zip(lits.iter()) {
+                    let guard = Self::rust_enum_decode_guard(lit);
+                    out.push_str(&Self::rust_match_arm(
+                        &format!("_ if {guard}"),
+                        &format!("Ok({name}::{ident})"),
+                    ));
                 }
             }
             out.push_str(&format!(
-                "        csil_other => Err(CsilCborError(format!(\"csil cbor: unknown {name} value {{csil_other:?}}\"))),\n    }}\n}}\n\n"
+                "        csil_other => Err(CsilCborError(format!(\n\
+                 \x20           \"csil cbor: unknown {name} value {{csil_other:?}}\"\n\
+                 \x20       ))),\n    }}\n}}\n\n"
             ));
             return out;
         }
 
         // Union: tagged sum [index, value].
         out.push_str(&format!(
-            "/// Encode a {name} union as a tagged sum `[variant_index, value]`.\n\
-             fn csil_enc_{snake}(csil_v: &{name}) -> CsilCborValue {{\n    match csil_v {{\n"
+            "/// Encode a {name} union as a tagged sum `[variant_index, value]`.\n"
         ));
+        out.push_str(&Self::rust_sig(
+            "",
+            &format!("csil_enc_{snake}"),
+            &format!("csil_v: &{name}"),
+            "CsilCborValue",
+        ));
+        out.push_str("    match csil_v {\n");
         for (i, choice) in choices.iter().enumerate() {
             let enc = self.rust_enc_value(choice, "csil_x", true, records, aliases);
-            let value = format!("CsilCborValue::Array(vec![CsilCborValue::Uint({i}), {enc}])");
-            let one_line = format!("        {name}::Variant{i}(csil_x) => {value},\n");
-            if !value.contains('\n') && one_line.trim_end().len() <= 100 {
-                out.push_str(&one_line);
+            let value = RustExpr::ArrayVec(vec![
+                RustExpr::Atom(format!("CsilCborValue::Uint({i})")),
+                enc,
+            ]);
+            // A literal arm (bare, or `.default`/other-control-operator-wrapped —
+            // see `choice_arm_literal`) encodes its constant, never the binding —
+            // bind `_` so the generated match arm carries no unused-variable
+            // warning.
+            let binding = if choice_arm_literal(choice).is_some() {
+                "_"
             } else {
-                out.push_str(&format!(
-                    "        {name}::Variant{i}(csil_x) => {{\n            {value}\n        }}\n"
-                ));
+                "csil_x"
+            };
+            let pat = format!("{name}::Variant{i}({binding})");
+            // rustfmt's arm ladder: whole arm on one line when it fits; a flat
+            // value that only overruns with the pattern gets a braced body (whose
+            // budget reserves six columns for the arm scaffolding — probed at
+            // inner line <= 94); a non-flat value hangs its `CsilCborValue::Array(vec![`
+            // opener directly off `=>` as long as THAT line still fits — a long
+            // synthesized hoisted-choice pattern (`<Record>_<field>::VariantN(...)` /
+            // `<Service>_<op>_response::VariantN(...)`) can push even the opener
+            // past rustfmt's width, at which point it braces the body instead
+            // (empirical breakpoint verified against real `rustfmt` output; not
+            // simply `max_width`, since the opener line ending in `[` doesn't
+            // carry a trailing comma the way a flat arm's does).
+            let hang_open = format!("        {pat} => CsilCborValue::Array(vec![");
+            match value.flat() {
+                Some(f) if 8 + pat.len() + 4 + f.len() < 100 => {
+                    out.push_str(&format!("        {pat} => {f},\n"));
+                }
+                Some(f) if 12 + f.len() <= 94 => {
+                    out.push_str(&format!(
+                        "        {pat} => {{\n            {f}\n        }}\n"
+                    ));
+                }
+                _ if hang_open.len() <= 98 => {
+                    let rendered = Self::render_expr(&value, 8, 8 + pat.len() + 4, 1);
+                    out.push_str(&format!("        {pat} => {rendered},\n"));
+                }
+                _ => {
+                    // NOT `render_expr(&value, 12, 12, 0)`: at col 12 an 84-char
+                    // flat array would satisfy render_expr's own `col + f.len() <=
+                    // 100` shortcut and come back flat again — that shortcut uses
+                    // `max_width` (100), but this call arrived here precisely
+                    // because the flat form already failed the narrower
+                    // `fn_call_width`-based budgets above. Force the multi-line
+                    // `vec![...]` layout directly instead of re-asking
+                    // `render_expr`, which has no way to know this element list
+                    // was already rejected.
+                    let RustExpr::ArrayVec(elems) = &value else {
+                        unreachable!("emit_choice_codec's union arm value is always an ArrayVec");
+                    };
+                    let mut body = String::from("CsilCborValue::Array(vec![\n");
+                    for elem in elems {
+                        body.push_str("                ");
+                        body.push_str(&Self::render_expr(elem, 16, 16, 1));
+                        body.push_str(",\n");
+                    }
+                    body.push_str("            ])");
+                    out.push_str(&format!(
+                        "        {pat} => {{\n            {body}\n        }}\n"
+                    ));
+                }
             }
         }
         out.push_str("    }\n}\n\n");
 
         out.push_str(&format!(
-            "/// Decode a tagged sum `[variant_index, value]` into a {name} union.\n\
-             fn csil_dec_{snake}(csil_v: &CsilCborValue) -> Result<{name}, CsilCborError> {{\n\
-             \x20   let csil_arr = match csil_v {{\n\
+            "/// Decode a tagged sum `[variant_index, value]` into a {name} union.\n"
+        ));
+        out.push_str(&Self::rust_fn_header(
+            &format!("csil_dec_{snake}"),
+            "csil_v",
+            name,
+        ));
+        out.push_str(
+            "    let csil_arr = match csil_v {\n\
              \x20       CsilCborValue::Array(csil_a) => csil_a,\n\
-             \x20       _ => {{\n\
+             \x20       _ => {\n\
              \x20           return Err(CsilCborError(\n\
              \x20               \"csil cbor: union expects a 2-element array\".to_string(),\n\
              \x20           ))\n\
-             \x20       }}\n\
-             \x20   }};\n\
-             \x20   if csil_arr.len() != 2 {{\n\
+             \x20       }\n\
+             \x20   };\n\
+             \x20   if csil_arr.len() != 2 {\n\
              \x20       return Err(CsilCborError(format!(\n\
-             \x20           \"csil cbor: union array has {{}} elements, expected 2\",\n\
+             \x20           \"csil cbor: union array has {} elements, expected 2\",\n\
              \x20           csil_arr.len()\n\
              \x20       )));\n\
-             \x20   }}\n\
+             \x20   }\n\
              \x20   let csil_idx = cbor_as_u64(&csil_arr[0])?;\n\
-             \x20   match csil_idx {{\n"
-        ));
+             \x20   match csil_idx {\n",
+        );
         for (i, choice) in choices.iter().enumerate() {
             let dec = self.rust_dec_func(choice, records, aliases);
             out.push_str(&format!("        {i} => {{\n"));
-            out.push_str(&Self::rust_decode_binding("            ", &dec));
-            out.push_str(&format!(
-                "            Ok({name}::Variant{i}(csil_decode(&csil_arr[1])?))\n\
-                 \x20       }}\n"
-            ));
+            out.push_str(&Self::rust_decode_binding(12, &dec));
+            // A long synthesized hoisted-choice name (`<Record>_<field>` or
+            // `<Service>_<op>_response`) can push this call past rustfmt's width.
+            // For this exact fixed shape (`Ok(Name::VariantN(csil_decode(&csil_arr[1])?))`
+            // at a fixed indent of 12), rustfmt's actual choice among flat /
+            // break-the-inner-call's-argument / break-the-outer-call's-argument
+            // was reverse-engineered by trial against real `rustfmt` at varying
+            // name lengths — it is not simply `max_width`(100) or
+            // `fn_call_width`(60), so the two breakpoints below (76, 90) are
+            // empirical for this one shape, not general-purpose constants.
+            let flat = format!("            Ok({name}::Variant{i}(csil_decode(&csil_arr[1])?))\n");
+            let flat_len = flat.trim_end().len();
+            if flat_len <= 76 {
+                out.push_str(&flat);
+            } else if flat_len <= 90 {
+                out.push_str(&format!(
+                    "            Ok({name}::Variant{i}(csil_decode(\n\
+                     \x20               &csil_arr[1],\n\
+                     \x20           )?))\n"
+                ));
+            } else {
+                out.push_str(&format!(
+                    "            Ok({name}::Variant{i}(\n\
+                     \x20               csil_decode(&csil_arr[1])?,\n\
+                     \x20           ))\n"
+                ));
+            }
+            out.push_str("        }\n");
         }
         out.push_str(&format!(
             "        csil_other => Err(CsilCborError(format!(\n\
@@ -3738,7 +4700,7 @@ fn main() {{
             content.push_str("\n\n");
         }
 
-        for rule in &self.input.csil_spec.rules {
+        for rule in &self.spec.rules {
             let group = match &rule.rule_type {
                 CsilRuleType::GroupDef(g) => Some(g),
                 CsilRuleType::TypeDef(CsilTypeExpression::Group(g)) => Some(g),
@@ -3753,7 +4715,7 @@ fn main() {{
 
         // Value-tree codecs for named type-choices (enums + unions) so record fields
         // referencing them encode/decode through `csil_enc_`/`csil_dec_`.
-        for rule in &self.input.csil_spec.rules {
+        for rule in &self.spec.rules {
             let choices = match &rule.rule_type {
                 CsilRuleType::TypeChoice(c) => c,
                 CsilRuleType::TypeDef(CsilTypeExpression::Choice(c)) => c,
@@ -3769,8 +4731,10 @@ fn main() {{
         Ok(Some(content))
     }
 
-    /// Strip a trailing `Service` suffix and PascalCase the remainder, matching
-    /// the wire service base used across the TypeScript/Go/Python clients.
+    /// Strip a trailing `Service` suffix and PascalCase the remainder — a Rust
+    /// identifier stem (client struct name, crate/package name, per-op codec
+    /// stem). The wire carries the CSIL service name verbatim
+    /// (docs/cbor-wire-contract.md "RPC call naming"); this is not that.
     fn service_base(name: &str) -> String {
         let pascal = Self::to_pascal_case(name);
         pascal
@@ -3799,20 +4763,9 @@ fn main() {{
     /// Whether the spec declares its own `ServiceError` type (group/type rule),
     /// in which case the generator must not emit its hardcoded fallback.
     fn spec_defines_service_error(&self) -> bool {
-        self.input.csil_spec.rules.iter().any(|r| {
+        self.spec.rules.iter().any(|r| {
             r.name == "ServiceError" && !matches!(r.rule_type, CsilRuleType::ServiceDef(_))
         })
-    }
-
-    fn spec_has_channel_ops(&self) -> bool {
-        self.input
-            .csil_spec
-            .rules
-            .iter()
-            .any(|r| match &r.rule_type {
-                CsilRuleType::ServiceDef(def) => Self::service_has_channel_ops(def),
-                _ => false,
-            })
     }
 
     fn service_has_channel_ops(def: &CsilServiceDefinition) -> bool {
@@ -3849,7 +4802,7 @@ fn main() {{
         content.push_str("    type Context;\n");
 
         for operation in &service.operations {
-            let op_name = self.to_snake_case(&operation.name);
+            let op_name = Self::to_snake_case(&operation.name);
             match operation.direction {
                 CsilServiceDirection::Unidirectional => {
                     // `Res / ServiceError` rides the `Result` error channel, so the
@@ -3921,7 +4874,7 @@ fn main() {{
     /// every wire-id-free spec.
     fn generate_wire_ids(&self, name: &str, service: &CsilServiceDefinition) -> Option<String> {
         let service_id = service.wire_id?;
-        let mod_name = format!("{}_wire_ids", self.to_snake_case(name));
+        let mod_name = format!("{}_wire_ids", Self::to_snake_case(name));
         let mut content = String::new();
         content.push_str(&format!(
             "/// Wire-id ordinals for the {name} service (transport compact profiles).\n"
@@ -3933,7 +4886,7 @@ fn main() {{
                 // Prefix operation constants with `OP_` so an op literally named
                 // `service` emits `OP_SERVICE` rather than colliding with the
                 // `SERVICE` service ordinal (which would fail to compile).
-                let const_name = self.to_snake_case(&operation.name).to_ascii_uppercase();
+                let const_name = Self::to_snake_case(&operation.name).to_ascii_uppercase();
                 content.push_str(&format!("    pub const OP_{const_name}: u64 = {op_id};\n"));
             }
         }
@@ -3958,7 +4911,7 @@ fn main() {{
     /// unrouted (it falls through to the `unknown channel` arm) rather than emitting an
     /// uncompilable decode. The label is the match scrutinee (`"Wire"` or an ordinal).
     fn channel_route_arm(&self, op: &CsilServiceOperation, label: &str) -> Option<String> {
-        let op_snake = self.to_snake_case(&op.name);
+        let op_snake = Self::to_snake_case(&op.name);
         if is_null_input(&op.input_type) {
             return Some(format!("        {label} => handlers.{op_snake}(ctx),\n"));
         }
@@ -3967,12 +4920,59 @@ fn main() {{
         }
         let decode_fn = format!(
             "decode_{}",
-            self.to_snake_case(&Self::type_ref_name(&op.input_type))
+            Self::to_snake_case(&Self::type_ref_name(&op.input_type))
         );
+        // rustfmt's ladder for this statement, probed against the defaults: hang
+        // the struct literal off `.map_err` while its head line fits; then break
+        // after `=`; then give the closure a block body (which reserves one extra
+        // column); then break after `=` with the block body; then break the chain.
+        let d = decode_fn.len();
+        let msg_stmt = if 58 + d <= 100 {
+            format!(
+                "            let msg = {decode_fn}(bytes).map_err(|err| ServiceError {{\n\
+                 \x20               code: 400,\n\
+                 \x20               message: err.to_string(),\n\
+                 \x20           }})?;\n"
+            )
+        } else if 52 + d <= 100 {
+            format!(
+                "            let msg =\n\
+                 \x20               {decode_fn}(bytes).map_err(|err| ServiceError {{\n\
+                 \x20                   code: 400,\n\
+                 \x20                   message: err.to_string(),\n\
+                 \x20               }})?;\n"
+            )
+        } else if 45 + d <= 99 {
+            format!(
+                "            let msg = {decode_fn}(bytes).map_err(|err| {{\n\
+                 \x20               ServiceError {{\n\
+                 \x20                   code: 400,\n\
+                 \x20                   message: err.to_string(),\n\
+                 \x20               }}\n\
+                 \x20           }})?;\n"
+            )
+        } else if 39 + d <= 99 {
+            format!(
+                "            let msg =\n\
+                 \x20               {decode_fn}(bytes).map_err(|err| {{\n\
+                 \x20                   ServiceError {{\n\
+                 \x20                       code: 400,\n\
+                 \x20                       message: err.to_string(),\n\
+                 \x20                   }}\n\
+                 \x20               }})?;\n"
+            )
+        } else {
+            format!(
+                "            let msg = {decode_fn}(bytes)\n\
+                 \x20               .map_err(|err| ServiceError {{\n\
+                 \x20                   code: 400,\n\
+                 \x20                   message: err.to_string(),\n\
+                 \x20               }})?;\n"
+            )
+        };
         Some(format!(
             "        {label} => {{\n\
-             \x20           let msg = {decode_fn}(bytes)\n\
-             \x20               .map_err(|err| ServiceError {{ code: 400, message: err.to_string() }})?;\n\
+             {msg_stmt}\
              \x20           handlers.{op_snake}(ctx, msg)\n\
              \x20       }}\n"
         ))
@@ -3994,13 +4994,15 @@ fn main() {{
         let arms: Vec<String> = inbound_ops
             .iter()
             .filter_map(|op| {
-                let wire = Self::pascal_case(&op.name);
+                // The router matches the verbose wire's event name, which is the CSIL
+                // operation name verbatim (docs/cbor-wire-contract.md "RPC call naming").
+                let wire = &op.name;
                 self.channel_route_arm(op, &format!("\"{wire}\""))
             })
             .collect();
 
         let mut content = String::new();
-        let fn_name = format!("route_{}_channel", self.to_snake_case(service_name));
+        let fn_name = format!("route_{}_channel", Self::to_snake_case(service_name));
         let (handlers, ctx, bytes) = if arms.is_empty() {
             ("_handlers", "_ctx", "_bytes")
         } else {
@@ -4068,7 +5070,10 @@ fn main() {{
             .collect();
 
         let mut content = String::new();
-        let fn_name = format!("route_{}_channel_compact", self.to_snake_case(service_name));
+        let fn_name = format!(
+            "route_{}_channel_compact",
+            Self::to_snake_case(service_name)
+        );
         let (handlers, ctx, bytes) = if arms.is_empty() {
             ("_handlers", "_ctx", "_bytes")
         } else {
@@ -4089,7 +5094,7 @@ fn main() {{
              where\n\
              \x20   H: {service_name},\n\
              {{\n",
-            self.to_snake_case(service_name)
+            Self::to_snake_case(service_name)
         ));
         if arms.is_empty() {
             content.push_str("    Err(ServiceError {\n");
@@ -4124,7 +5129,7 @@ fn main() {{
         service: &CsilServiceDefinition,
     ) -> Result<String, String> {
         let mut content = String::new();
-        let svc_snake = self.to_snake_case(service_name);
+        let svc_snake = Self::to_snake_case(service_name);
         let records = self.record_names();
         for op in &service.operations {
             if !matches!(
@@ -4133,19 +5138,20 @@ fn main() {{
             ) {
                 continue;
             }
-            let op_snake = self.to_snake_case(&op.name);
-            let wire = Self::pascal_case(&op.name);
+            let op_snake = Self::to_snake_case(&op.name);
+            // Verbatim CSIL operation name: what the encoder returns as the wire
+            // event name (docs/cbor-wire-contract.md "RPC call naming").
+            let wire = &op.name;
             let fn_name = format!("encode_{svc_snake}_{op_snake}");
             let doc = format!(
                 "/// Encode a `{wire}` message pushed from {service_name}'s server\n\
                  /// side; the implementer frames `(method, bytes)` onto its connection.\n"
             );
             if is_null_input(&op.output_type) {
-                content.push_str(&format!(
-                    "{doc}pub fn {fn_name}() -> (String, Vec<u8>) {{\n\
-                     \x20   (\"{wire}\".to_string(), Vec::new())\n\
-                     }}\n"
-                ));
+                content.push_str(&doc);
+                content.push_str(&format!("pub fn {fn_name}() -> (String, Vec<u8>) {{\n"));
+                content.push_str(&Self::rust_wire_tuple(wire, "Vec::new()"));
+                content.push_str("}\n");
                 continue;
             }
             if !Self::is_record_ref(&op.output_type, &records) {
@@ -4154,31 +5160,30 @@ fn main() {{
             let output_type = self.map_type_to_rust(&op.output_type, &None)?;
             let encode_fn = format!(
                 "encode_{}",
-                self.to_snake_case(&Self::type_ref_name(&op.output_type))
+                Self::to_snake_case(&Self::type_ref_name(&op.output_type))
             );
-            content.push_str(&format!(
-                "{doc}pub fn {fn_name}(msg: &{output_type}) -> (String, Vec<u8>) {{\n\
-                 \x20   (\"{wire}\".to_string(), {encode_fn}(msg))\n\
-                 }}\n"
+            content.push_str(&doc);
+            content.push_str(&Self::rust_sig(
+                "pub ",
+                &fn_name,
+                &format!("msg: &{output_type}"),
+                "(String, Vec<u8>)",
             ));
+            content.push_str(&Self::rust_wire_tuple(wire, &format!("{encode_fn}(msg)")));
+            content.push_str("}\n");
         }
         Ok(content)
     }
 
-    fn pascal_case(s: &str) -> String {
-        let mut out = String::new();
-        let mut cap = true;
-        for ch in s.chars() {
-            if ch == '-' || ch == '_' {
-                cap = true;
-            } else if cap {
-                out.push(ch.to_ascii_uppercase());
-                cap = false;
-            } else {
-                out.push(ch);
-            }
+    /// The `("Wire".to_string(), <bytes expr>)` body of a channel encoder; the
+    /// tuple stacks one element per line past rustfmt's width.
+    fn rust_wire_tuple(wire: &str, bytes_expr: &str) -> String {
+        let inner = format!("\"{wire}\".to_string(), {bytes_expr}");
+        let one_line = format!("    ({inner})\n");
+        if inner.len() <= 60 && one_line.trim_end().len() <= 100 {
+            return one_line;
         }
-        out
+        format!("    (\n        \"{wire}\".to_string(),\n        {bytes_expr},\n    )\n")
     }
 
     fn generate_lib_file(&mut self, files: &[GeneratedFile]) -> Result<String, String> {
@@ -4253,10 +5258,10 @@ fn main() {{
     fn extract_field_name(&self, key: &Option<CsilGroupKey>) -> Option<String> {
         match key {
             Some(CsilGroupKey::Bare(name)) => {
-                Some(Self::escape_rust_ident(&self.to_snake_case(name)))
+                Some(Self::escape_rust_ident(&Self::to_snake_case(name)))
             }
             Some(CsilGroupKey::Literal(CsilLiteralValue::Text(name))) => {
-                Some(Self::escape_rust_ident(&self.to_snake_case(name)))
+                Some(Self::escape_rust_ident(&Self::to_snake_case(name)))
             }
             _ => None,
         }
@@ -4539,18 +5544,20 @@ fn main() {{
                 CsilValidationConstraint::MinLength(n) | CsilValidationConstraint::MinItems(n)
                     if len_shape =>
                 {
-                    checks.push(Self::len_check(
-                        field_name,
-                        &format!("v.len() < {n}usize"),
-                        &format!("length is below minimum {n}"),
-                    ));
+                    if let Some(cond) = Self::len_min_cond(*n) {
+                        checks.push(Self::len_check(
+                            field_name,
+                            &cond,
+                            &format!("length is below minimum {n}"),
+                        ));
+                    }
                 }
                 CsilValidationConstraint::MaxLength(n) | CsilValidationConstraint::MaxItems(n)
                     if len_shape =>
                 {
                     checks.push(Self::len_check(
                         field_name,
-                        &format!("v.len() > {n}usize"),
+                        &Self::len_max_cond(*n),
                         &format!("length is above maximum {n}"),
                     ));
                 }
@@ -4571,24 +5578,68 @@ fn main() {{
         match size {
             CsilSizeConstraint::Exact(n) => checks.push(Self::len_check(
                 field,
-                &format!("v.len() != {n}usize"),
+                &Self::len_ne_cond(*n),
                 &format!("length must equal {n}"),
             )),
-            CsilSizeConstraint::Range { min, max } => checks.push(Self::len_check(
-                field,
-                &format!("v.len() < {min}usize || v.len() > {max}usize"),
-                &format!("length must be in {min}..={max}"),
-            )),
-            CsilSizeConstraint::Min(n) => checks.push(Self::len_check(
-                field,
-                &format!("v.len() < {n}usize"),
-                &format!("length is below minimum {n}"),
-            )),
+            CsilSizeConstraint::Range { min, max } => {
+                let max_cond = Self::len_max_cond(*max);
+                let cond = match Self::len_min_cond(*min) {
+                    Some(min_cond) => format!("{min_cond} || {max_cond}"),
+                    None => max_cond,
+                };
+                checks.push(Self::len_check(
+                    field,
+                    &cond,
+                    &format!("length must be in {min}..={max}"),
+                ));
+            }
+            CsilSizeConstraint::Min(n) => {
+                if let Some(cond) = Self::len_min_cond(*n) {
+                    checks.push(Self::len_check(
+                        field,
+                        &cond,
+                        &format!("length is below minimum {n}"),
+                    ));
+                }
+            }
             CsilSizeConstraint::Max(n) => checks.push(Self::len_check(
                 field,
-                &format!("v.len() > {n}usize"),
+                &Self::len_max_cond(*n),
                 &format!("length is above maximum {n}"),
             )),
+        }
+    }
+
+    /// Condition for "length below minimum `n`", built to dodge two clippy lints
+    /// rather than emit a bare comparison: `n == 1` is exactly the `is_empty()`
+    /// case (`len_zero`), and `n == 0` can never hold for a `usize` length, so
+    /// that bound is dropped entirely instead of emitting dead-code clippy would
+    /// flag (`absurd_extreme_comparisons`). `None` means "no check to emit".
+    fn len_min_cond(n: u64) -> Option<String> {
+        match n {
+            0 => None,
+            1 => Some("v.is_empty()".to_string()),
+            _ => Some(format!("v.len() < {n}usize")),
+        }
+    }
+
+    /// Condition for "length above maximum `n`", dodging clippy's `len_zero`:
+    /// `n == 0` is exactly the `!is_empty()` case.
+    fn len_max_cond(n: u64) -> String {
+        if n == 0 {
+            "!v.is_empty()".to_string()
+        } else {
+            format!("v.len() > {n}usize")
+        }
+    }
+
+    /// Condition for "length not exactly `n`", dodging clippy's `len_zero`:
+    /// `n == 0` is exactly the `!is_empty()` case.
+    fn len_ne_cond(n: u64) -> String {
+        if n == 0 {
+            "!v.is_empty()".to_string()
+        } else {
+            format!("v.len() != {n}usize")
         }
     }
 
@@ -4641,12 +5692,48 @@ fn main() {{
             CsilLiteralValue::Integer(i) => i.to_string(),
             _ => return None,
         };
-        let parse = match self.decimal_mapping {
-            DecimalMapping::Csil => format!("CsilDecimal::from_str({text:?})"),
-            DecimalMapping::Library => format!("{text:?}.parse::<rust_decimal::Decimal>()"),
+        // A `from_str(...)` receiver is a plain call, so its lone `.map_err` hangs
+        // off it with the struct literal overflowing; the `library` mapping's
+        // literal-receiver chain (`"0".parse::<..>().map_err(..)`) is two links, which
+        // rustfmt always breaks one per line.
+        let binding = match self.decimal_mapping {
+            DecimalMapping::Csil => format!(
+                "                let bound = CsilDecimal::from_str({text:?}).map_err(|e| ValidationError {{\n\
+                 \x20                   field: {field:?}.to_string(),\n\
+                 \x20                   message: format!(\"invalid decimal bound: {{e}}\"),\n\
+                 \x20               }})?;\n"
+            ),
+            // At this nesting rustfmt drops a short literal receiver (probed: up
+            // to the width of `let bound = `) to its own line after the `=`,
+            // pushing the chain a level deeper; a longer receiver stays inline.
+            DecimalMapping::Library if text.len() + 2 <= 12 => format!(
+                "                let bound =\n\
+                 \x20                   {text:?}\n\
+                 \x20                       .parse::<rust_decimal::Decimal>()\n\
+                 \x20                       .map_err(|e| ValidationError {{\n\
+                 \x20                           field: {field:?}.to_string(),\n\
+                 \x20                           message: format!(\"invalid decimal bound: {{e}}\"),\n\
+                 \x20                       }})?;\n"
+            ),
+            DecimalMapping::Library => format!(
+                "                let bound = {text:?}\n\
+                 \x20                   .parse::<rust_decimal::Decimal>()\n\
+                 \x20                   .map_err(|e| ValidationError {{\n\
+                 \x20                       field: {field:?}.to_string(),\n\
+                 \x20                       message: format!(\"invalid decimal bound: {{e}}\"),\n\
+                 \x20                   }})?;\n"
+            ),
         };
         Some(format!(
-            "            {{\n                let bound = {parse}\n                    .map_err(|e| ValidationError {{ field: {field:?}.to_string(), message: format!(\"invalid decimal bound: {{e}}\") }})?;\n                if *v {fail_op} bound {{\n                    return Err(ValidationError {{ field: {field:?}.to_string(), message: {msg:?}.to_string() }});\n                }}\n            }}\n"
+            "            {{\n\
+             {binding}\
+             \x20               if *v {fail_op} bound {{\n\
+             \x20                   return Err(ValidationError {{\n\
+             \x20                       field: {field:?}.to_string(),\n\
+             \x20                       message: {msg:?}.to_string(),\n\
+             \x20                   }});\n\
+             \x20               }}\n\
+             \x20           }}\n"
         ))
     }
 
@@ -4663,7 +5750,20 @@ fn main() {{
             return None;
         };
         Some(format!(
-            "            {{\n                let bound = chrono::DateTime::parse_from_rfc3339({text:?})\n                    .map_err(|e| ValidationError {{ field: {field:?}.to_string(), message: format!(\"invalid timestamp bound: {{e}}\") }})?\n                    .with_timezone(&chrono::Utc);\n                if *v {fail_op} bound {{\n                    return Err(ValidationError {{ field: {field:?}.to_string(), message: {msg:?}.to_string() }});\n                }}\n            }}\n"
+            "            {{\n\
+             \x20               let bound = chrono::DateTime::parse_from_rfc3339({text:?})\n\
+             \x20                   .map_err(|e| ValidationError {{\n\
+             \x20                       field: {field:?}.to_string(),\n\
+             \x20                       message: format!(\"invalid timestamp bound: {{e}}\"),\n\
+             \x20                   }})?\n\
+             \x20                   .with_timezone(&chrono::Utc);\n\
+             \x20               if *v {fail_op} bound {{\n\
+             \x20                   return Err(ValidationError {{\n\
+             \x20                       field: {field:?}.to_string(),\n\
+             \x20                       message: {msg:?}.to_string(),\n\
+             \x20                   }});\n\
+             \x20               }}\n\
+             \x20           }}\n"
         ))
     }
 
@@ -4691,12 +5791,30 @@ fn main() {{
         let Some(rendered) = Self::literal_as_f64(bound) else {
             return;
         };
-        let cond = format!("(*v as f64) {fail_op} {rendered}");
+        // Every `float*` builtin already maps to Rust `f64` (see
+        // `map_builtin_type`), so `*v` is already an `f64` there — casting it to
+        // `f64` again is a clippy `unnecessary_cast`. Only an integer field
+        // reaching this branch (an integer field with a *float* bound, since an
+        // integer bound already returned above) genuinely needs the widening cast.
+        let lhs = if Self::is_float_shape(base) {
+            "*v".to_string()
+        } else {
+            "(*v as f64)".to_string()
+        };
+        let cond = format!("{lhs} {fail_op} {rendered}");
         checks.push(Self::len_check(field, &cond, msg));
     }
 
     fn is_integer_shape(base: &CsilTypeExpression) -> bool {
         matches!(base, CsilTypeExpression::Builtin(n) if matches!(n.as_str(), "int" | "uint"))
+    }
+
+    fn is_float_shape(base: &CsilTypeExpression) -> bool {
+        matches!(
+            base,
+            CsilTypeExpression::Builtin(n)
+                if matches!(n.as_str(), "float" | "float16" | "float32" | "float64")
+        )
     }
 
     /// Render a literal as an `f64` literal token usable on the right side of a
@@ -4711,7 +5829,12 @@ fn main() {{
 
     fn len_check(field: &str, cond: &str, msg: &str) -> String {
         format!(
-            "            if {cond} {{\n                return Err(ValidationError {{ field: \"{field}\".to_string(), message: \"{msg}\".to_string() }});\n            }}\n"
+            "            if {cond} {{\n\
+             \x20               return Err(ValidationError {{\n\
+             \x20                   field: \"{field}\".to_string(),\n\
+             \x20                   message: \"{msg}\".to_string(),\n\
+             \x20               }});\n\
+             \x20           }}\n"
         )
     }
 
@@ -4721,8 +5844,60 @@ fn main() {{
     /// panic) by caching the `Result` and re-borrowing it on each call.
     fn regex_check(field: &str, pattern: &str, idx: usize) -> String {
         let static_name = format!("RE_{}_{idx}", field.to_ascii_uppercase());
+        // The `get_or_init` line follows rustfmt's own fallback ladder for an
+        // overlong `let`: break after `=`, then break the method chain, then give
+        // the closure a block body, then stack the call's argument — and when even
+        // that cannot fit (the pattern literal itself is too wide) rustfmt keeps
+        // the original line untouched, so the one-liner is the give-up form too.
+        let pat = format!("{pattern:?}");
+        let init_stmt = {
+            let one_line = format!(
+                "                let re = {static_name}.get_or_init(|| regex::Regex::new({pat}));\n"
+            );
+            let after_eq = format!(
+                "                    {static_name}.get_or_init(|| regex::Regex::new({pat}));"
+            );
+            let chain_elem =
+                format!("                    .get_or_init(|| regex::Regex::new({pat}));");
+            let block_call = format!("                    regex::Regex::new({pat})");
+            let stacked_arg = format!("                        {pat},");
+            if one_line.trim_end().len() <= 100 {
+                one_line
+            } else if after_eq.len() <= 100 {
+                format!("                let re =\n{after_eq}\n")
+            } else if chain_elem.len() <= 100 {
+                format!("                let re = {static_name}\n{chain_elem}\n")
+            } else if block_call.len() <= 100 {
+                format!(
+                    "                let re = {static_name}.get_or_init(|| {{\n{block_call}\n                }});\n"
+                )
+            } else if stacked_arg.len() <= 100 {
+                format!(
+                    "                let re = {static_name}.get_or_init(|| {{\n\
+                     \x20                   regex::Regex::new(\n{stacked_arg}\n\
+                     \x20                   )\n\
+                     \x20               }});\n"
+                )
+            } else {
+                one_line
+            }
+        };
         format!(
-            "            {{\n                static {static_name}: std::sync::OnceLock<Result<regex::Regex, regex::Error>> = std::sync::OnceLock::new();\n                let re = {static_name}.get_or_init(|| regex::Regex::new({pattern:?}));\n                let re = re.as_ref().map_err(|e| ValidationError {{ field: \"{field}\".to_string(), message: format!(\"invalid regex: {{e}}\") }})?;\n                if !re.is_match(v) {{\n                    return Err(ValidationError {{ field: \"{field}\".to_string(), message: \"value does not match required pattern\".to_string() }});\n                }}\n            }}\n"
+            "            {{\n\
+             \x20               static {static_name}: std::sync::OnceLock<Result<regex::Regex, regex::Error>> =\n\
+             \x20                   std::sync::OnceLock::new();\n\
+             {init_stmt}\
+             \x20               let re = re.as_ref().map_err(|e| ValidationError {{\n\
+             \x20                   field: \"{field}\".to_string(),\n\
+             \x20                   message: format!(\"invalid regex: {{e}}\"),\n\
+             \x20               }})?;\n\
+             \x20               if !re.is_match(v) {{\n\
+             \x20                   return Err(ValidationError {{\n\
+             \x20                       field: \"{field}\".to_string(),\n\
+             \x20                       message: \"value does not match required pattern\".to_string(),\n\
+             \x20                   }});\n\
+             \x20               }}\n\
+             \x20           }}\n"
         )
     }
 
@@ -4772,30 +5947,25 @@ fn main() {{
     /// type tree (group fields, arrays, maps, choices, constrained bases, service
     /// operation signatures). Drives both helper injection and the dep note.
     fn spec_uses_builtin(&self, target: &str) -> bool {
-        self.input
-            .csil_spec
-            .rules
-            .iter()
-            .any(|rule| match &rule.rule_type {
-                CsilRuleType::GroupDef(g) | CsilRuleType::TypeDef(CsilTypeExpression::Group(g)) => {
-                    g.entries
-                        .iter()
-                        .any(|e| Self::type_mentions_builtin(&e.value_type, target))
-                }
-                CsilRuleType::TypeDef(t) => Self::type_mentions_builtin(t, target),
-                CsilRuleType::TypeChoice(choices) => choices
+        self.spec.rules.iter().any(|rule| match &rule.rule_type {
+            CsilRuleType::GroupDef(g) | CsilRuleType::TypeDef(CsilTypeExpression::Group(g)) => g
+                .entries
+                .iter()
+                .any(|e| Self::type_mentions_builtin(&e.value_type, target)),
+            CsilRuleType::TypeDef(t) => Self::type_mentions_builtin(t, target),
+            CsilRuleType::TypeChoice(choices) => choices
+                .iter()
+                .any(|c| Self::type_mentions_builtin(c, target)),
+            CsilRuleType::GroupChoice(groups) => groups.iter().any(|g| {
+                g.entries
                     .iter()
-                    .any(|c| Self::type_mentions_builtin(c, target)),
-                CsilRuleType::GroupChoice(groups) => groups.iter().any(|g| {
-                    g.entries
-                        .iter()
-                        .any(|e| Self::type_mentions_builtin(&e.value_type, target))
-                }),
-                CsilRuleType::ServiceDef(def) => def.operations.iter().any(|op| {
-                    Self::type_mentions_builtin(&op.input_type, target)
-                        || Self::type_mentions_builtin(&op.output_type, target)
-                }),
-            })
+                    .any(|e| Self::type_mentions_builtin(&e.value_type, target))
+            }),
+            CsilRuleType::ServiceDef(def) => def.operations.iter().any(|op| {
+                Self::type_mentions_builtin(&op.input_type, target)
+                    || Self::type_mentions_builtin(&op.output_type, target)
+            }),
+        })
     }
 
     fn type_mentions_builtin(expr: &CsilTypeExpression, target: &str) -> bool {
@@ -4827,7 +5997,9 @@ fn main() {{
         true
     }
 
-    fn to_snake_case(&self, s: &str) -> String {
+    /// A pure function of `s` (no generator state), so it is callable from
+    /// `hoist_inline` inside `new()` before `self` exists.
+    fn to_snake_case(s: &str) -> String {
         let chars: Vec<char> = s.chars().collect();
         let mut result = String::new();
 
@@ -5026,23 +6198,26 @@ mod tests {
 
     #[test]
     fn test_snake_case_conversion() {
-        let input = create_test_input();
-        let generator = RustCodeGenerator::new(&input);
-
-        assert_eq!(generator.to_snake_case("CamelCase"), "camel_case");
+        assert_eq!(RustCodeGenerator::to_snake_case("CamelCase"), "camel_case");
         // Acronym runs stay intact: the boundary lands where a new word starts.
-        assert_eq!(generator.to_snake_case("HTTPResponse"), "http_response");
         assert_eq!(
-            generator.to_snake_case("GetTaskStateByID"),
+            RustCodeGenerator::to_snake_case("HTTPResponse"),
+            "http_response"
+        );
+        assert_eq!(
+            RustCodeGenerator::to_snake_case("GetTaskStateByID"),
             "get_task_state_by_id"
         );
-        assert_eq!(generator.to_snake_case("simple"), "simple");
-        assert_eq!(generator.to_snake_case("create-entry"), "create_entry");
+        assert_eq!(RustCodeGenerator::to_snake_case("simple"), "simple");
         assert_eq!(
-            generator.to_snake_case("MyService-operation"),
+            RustCodeGenerator::to_snake_case("create-entry"),
+            "create_entry"
+        );
+        assert_eq!(
+            RustCodeGenerator::to_snake_case("MyService-operation"),
             "my_service_operation"
         );
-        assert_eq!(generator.to_snake_case("a--b"), "a__b");
+        assert_eq!(RustCodeGenerator::to_snake_case("a--b"), "a__b");
     }
 
     #[test]
@@ -5198,8 +6373,12 @@ mod tests {
             "pub fn submit_task(&self, req: SubmitTaskRequest) -> Result<SubmitTaskResponse, ClientError>"
         ));
         // The client encodes the request, calls over the byte seam, then decodes.
+        // service/op are the verbatim CSIL names (docs/cbor-wire-contract.md
+        // "RPC call naming") — no suffix stripping, no case change. The longer
+        // "CorndogsService" pushes past the flat-arg width, so rustfmt's ladder
+        // stacks each argument on its own line.
         assert!(client.content.contains(
-            "let csil_resp =\n            self.transport\n                .call(\"corndogs\", \"SubmitTask\", &encode_submit_task_request(&req))?;"
+            "let csil_resp = self.transport.call(\n            \"CorndogsService\",\n            \"SubmitTask\",\n            &encode_submit_task_request(&req),\n        )?;"
         ));
         assert!(
             client
@@ -5336,8 +6515,9 @@ mod tests {
                 .content
                 .contains("pub fn delete_task(&self, req: TaskID) -> Result<bool, ClientError>")
         );
+        // Too wide for one line, so it is emitted pre-wrapped the rustfmt way.
         assert!(client.content.contains(
-            "pub fn member_names(&self, req: ListMembersRequest) -> Result<std::collections::HashMap<String, String>, ClientError>"
+            "pub fn member_names(\n        &self,\n        req: ListMembersRequest,\n    ) -> Result<std::collections::HashMap<String, String>, ClientError> {"
         ));
         // No op is dropped with a note anymore.
         assert!(!client.content.contains("handle it manually"));
@@ -5380,7 +6560,7 @@ mod tests {
                 .contains("pub fn encode_member_delete_task_response(csil_v: &bool) -> Vec<u8>")
         );
         assert!(codec.content.contains(
-            "pub fn encode_member_member_names_response(csil_v: &std::collections::HashMap<String, String>) -> Vec<u8>"
+            "pub fn encode_member_member_names_response(\n    csil_v: &std::collections::HashMap<String, String>,\n) -> Vec<u8> {"
         ));
         // The record op needs no per-op helper (its record codec already covers it).
         assert!(
@@ -5426,12 +6606,16 @@ mod tests {
             twin.content
                 .contains("pub struct CorndogsAsyncClient<T: AsyncTransport>")
         );
+        // The one-line signature would be 101 columns, so it is emitted the way
+        // rustfmt would wrap it: params one per line.
         assert!(twin.content.contains(
-            "pub async fn submit_task(&self, req: SubmitTaskRequest) -> Result<SubmitTaskResponse, ClientError>"
+            "pub async fn submit_task(\n        &self,\n        req: SubmitTaskRequest,\n    ) -> Result<SubmitTaskResponse, ClientError> {"
         ));
-        // The seam is awaited before its `?`.
+        // The seam is awaited before its `?`. service/op are verbatim CSIL names;
+        // the longer "CorndogsService" pushes past the flat-arg width so
+        // rustfmt's ladder stacks each argument on its own line.
         assert!(twin.content.contains(
-            ".call(\"corndogs\", \"SubmitTask\", &encode_submit_task_request(&req))\n            .await?;"
+            ".call(\n                \"CorndogsService\",\n                \"SubmitTask\",\n                &encode_submit_task_request(&req),\n            )\n            .await?;"
         ));
         // The twin must not redefine the shared error type.
         assert!(!twin.content.contains("pub enum ClientError"));
@@ -5473,7 +6657,7 @@ mod tests {
                 .contains("pub struct CorndogsClient<T: Transport>")
         );
         assert!(client.content.contains(
-            "pub async fn submit_task(&self, req: SubmitTaskRequest) -> Result<SubmitTaskResponse, ClientError>"
+            "pub async fn submit_task(\n        &self,\n        req: SubmitTaskRequest,\n    ) -> Result<SubmitTaskResponse, ClientError> {"
         ));
         assert!(client.content.contains(".await?;"));
         // No `Async`-marked symbols in the drop-in shape.
@@ -5616,6 +6800,114 @@ mod tests {
         assert!(matches!(success_type(&plain), CsilTypeExpression::Reference(n) if n == "Res"));
     }
 
+    /// Regression for the `examples/build-integration/npm-project/api.csil` shape:
+    /// a hoisted op-boundary union (`delete-notification: NotificationID ->
+    /// DeleteResponse / NotificationError`, neither arm named `ServiceError`)
+    /// whose synthesized name (`NotificationAPI_delete_notification_response`) is
+    /// long enough that the union encoder's per-arm value no longer fits
+    /// rustfmt's single-line-in-braces budget and must render as a fully
+    /// multi-line `CsilCborValue::Array(vec![...])`. This previously came out
+    /// flat-in-braces because the fallback called `render_expr` at a reset column
+    /// that let its own `max_width`-based shortcut re-flatten an element list the
+    /// caller had already rejected on the narrower `fn_call_width` budget.
+    #[test]
+    fn union_arm_with_long_hoisted_name_forces_multiline_array() {
+        let mut input = create_test_input();
+        input.csil_spec.rules.clear();
+        input.csil_spec.rules.push(CsilRule {
+            name: "DeleteResponse".to_string(),
+            rule_type: CsilRuleType::GroupDef(CsilGroupExpression {
+                entries: vec![CsilGroupEntry {
+                    key: Some(CsilGroupKey::Bare("success".to_string())),
+                    value_type: CsilTypeExpression::Builtin("bool".to_string()),
+                    occurrence: None,
+                    metadata: vec![],
+                    doc_comments: Vec::new(),
+                }],
+            }),
+            position: CsilPosition {
+                line: 1,
+                column: 1,
+                offset: 0,
+            },
+            doc_comments: Vec::new(),
+        });
+        input.csil_spec.rules.push(CsilRule {
+            name: "NotificationError".to_string(),
+            rule_type: CsilRuleType::GroupDef(CsilGroupExpression {
+                entries: vec![
+                    CsilGroupEntry {
+                        key: Some(CsilGroupKey::Bare("code".to_string())),
+                        value_type: CsilTypeExpression::Builtin("int".to_string()),
+                        occurrence: None,
+                        metadata: vec![],
+                        doc_comments: Vec::new(),
+                    },
+                    CsilGroupEntry {
+                        key: Some(CsilGroupKey::Bare("message".to_string())),
+                        value_type: CsilTypeExpression::Builtin("text".to_string()),
+                        occurrence: None,
+                        metadata: vec![],
+                        doc_comments: Vec::new(),
+                    },
+                ],
+            }),
+            position: CsilPosition {
+                line: 1,
+                column: 1,
+                offset: 0,
+            },
+            doc_comments: Vec::new(),
+        });
+        input.csil_spec.rules.push(CsilRule {
+            name: "NotificationAPI".to_string(),
+            rule_type: CsilRuleType::ServiceDef(CsilServiceDefinition {
+                operations: vec![CsilServiceOperation {
+                    name: "delete-notification".to_string(),
+                    input_type: CsilTypeExpression::Builtin("text".to_string()),
+                    output_type: CsilTypeExpression::Choice(vec![
+                        CsilTypeExpression::Reference("DeleteResponse".to_string()),
+                        CsilTypeExpression::Reference("NotificationError".to_string()),
+                    ]),
+                    direction: CsilServiceDirection::Unidirectional,
+                    position: CsilPosition {
+                        line: 1,
+                        column: 1,
+                        offset: 0,
+                    },
+                    doc_comments: Vec::new(),
+                    wire_id: None,
+                }],
+                wire_id: None,
+            }),
+            position: CsilPosition {
+                line: 1,
+                column: 1,
+                offset: 0,
+            },
+            doc_comments: Vec::new(),
+        });
+        input.csil_spec.service_count = 1;
+
+        let mut generator = RustCodeGenerator::new(&input);
+        let _ = generator.generate_types().unwrap();
+        let codec = generator.generate_codec().unwrap().unwrap();
+        assert!(
+            codec.contains(
+                "NotificationAPI_delete_notification_response::Variant0(csil_x) => {\n            \
+                 CsilCborValue::Array(vec![\n                CsilCborValue::Uint(0),\n                \
+                 csil_enc_delete_response(csil_x),\n            ])\n        }\n"
+            ),
+            "long hoisted-choice union arm should render the array fully multi-line:\n{codec}"
+        );
+        assert!(
+            !codec.contains(
+                "CsilCborValue::Array(vec![CsilCborValue::Uint(0), csil_enc_delete_response(csil_x)])"
+            ),
+            "must not fall back to the flat single-line array inside the braces"
+        );
+    }
+
     #[test]
     fn test_service_with_hyphenated_operations() {
         let mut input = create_test_input();
@@ -5756,13 +7048,14 @@ mod tests {
         // Router decodes the inbound bytes with the per-type codec and dispatches by
         // wire method name.
         assert!(services.contains("pub fn route_match_channel<H>"));
-        assert!(services.contains("\"Play\" => {"));
+        assert!(services.contains("\"play\" => {"));
         assert!(services.contains("let msg = decode_user(bytes)"));
         assert!(services.contains("handlers.play(ctx, msg)"));
 
-        // Outbound encoder for the bidirectional op, over the per-type codec.
+        // Outbound encoder for the bidirectional op, over the per-type codec. The
+        // wire event name is the CSIL operation name verbatim, not PascalCased.
         assert!(services.contains("pub fn encode_match_play(msg: &User) -> (String, Vec<u8>)"));
-        assert!(services.contains("(\"Play\".to_string(), encode_user(msg))"));
+        assert!(services.contains("(\"play\".to_string(), encode_user(msg))"));
     }
 
     #[test]
@@ -5787,7 +7080,7 @@ mod tests {
         assert!(services.contains("pub fn route_callbacks_channel"));
         let router_start = services.find("pub fn route_callbacks_channel").unwrap();
         let router_block = &services[router_start..];
-        assert!(!router_block.contains("\"Notify\" =>"));
+        assert!(!router_block.contains("\"notify\" =>"));
 
         // The encoder for the reverse op (server pushes Output to the client).
         assert!(
@@ -5966,6 +7259,347 @@ mod tests {
             !types_content.contains("pub type CheckResult = serde_json::Value"),
             "Should not fall back to serde_json::Value"
         );
+    }
+
+    /// A `Widget` record exercising every inline-choice position the contract
+    /// covers: a plain field, an array element, a map value, and a tuple element —
+    /// plus a `.default`-suffixed trailing literal arm (the parser's
+    /// last-arm-gets-the-control-operator quirk). `OtherThing` gives the mixed
+    /// choices a non-literal arm that is a genuine `Reference`, not the `text`/
+    /// `tstr` open-base idiom — Rust has no special-cased "open enum" shape (a
+    /// named choice with a `text` base already lowers to a tagged-sum union; see
+    /// `OrderStatus` in `examples/real-world-api/e-commerce-api.csil`), so an
+    /// inline choice must land on the same union/enum split a same-shaped named
+    /// choice would, not on some inline-only third shape.
+    fn widget_hoisting_input() -> WasmGeneratorInput {
+        let mut input = create_test_input();
+        let synth_position = CsilPosition {
+            line: 1,
+            column: 1,
+            offset: 0,
+        };
+        input.csil_spec.rules.push(CsilRule {
+            name: "OtherThing".to_string(),
+            rule_type: CsilRuleType::GroupDef(CsilGroupExpression {
+                entries: vec![CsilGroupEntry {
+                    key: Some(CsilGroupKey::Bare("note".to_string())),
+                    value_type: CsilTypeExpression::Builtin("text".to_string()),
+                    occurrence: None,
+                    metadata: vec![],
+                    doc_comments: Vec::new(),
+                }],
+            }),
+            position: synth_position.clone(),
+            doc_comments: Vec::new(),
+        });
+        input.csil_spec.rules.push(CsilRule {
+            name: "Widget".to_string(),
+            rule_type: CsilRuleType::GroupDef(CsilGroupExpression {
+                entries: vec![
+                    // Plain field, inline mixed choice, optional: `Reference / literal`.
+                    CsilGroupEntry {
+                        key: Some(CsilGroupKey::Bare("tag".to_string())),
+                        value_type: CsilTypeExpression::Choice(vec![
+                            CsilTypeExpression::Reference("OtherThing".to_string()),
+                            CsilTypeExpression::Literal(CsilLiteralValue::Text(
+                                "unset".to_string(),
+                            )),
+                        ]),
+                        occurrence: Some(CsilOccurrence::Optional),
+                        metadata: vec![],
+                        doc_comments: Vec::new(),
+                    },
+                    // Plain field, inline all-literal choice, last arm `.default`-wrapped:
+                    // `"low" / "high" .default "normal"`.
+                    CsilGroupEntry {
+                        key: Some(CsilGroupKey::Bare("mode".to_string())),
+                        value_type: CsilTypeExpression::Choice(vec![
+                            CsilTypeExpression::Literal(CsilLiteralValue::Text("low".to_string())),
+                            CsilTypeExpression::Constrained {
+                                base_type: Box::new(CsilTypeExpression::Literal(
+                                    CsilLiteralValue::Text("high".to_string()),
+                                )),
+                                constraints: vec![CsilControlOperator::Default(
+                                    CsilLiteralValue::Text("normal".to_string()),
+                                )],
+                            },
+                        ]),
+                        occurrence: None,
+                        metadata: vec![],
+                        doc_comments: Vec::new(),
+                    },
+                    // Array element, inline mixed choice: `[* (int / "auto")]`.
+                    CsilGroupEntry {
+                        key: Some(CsilGroupKey::Bare("codes".to_string())),
+                        value_type: CsilTypeExpression::Array {
+                            element_type: Box::new(CsilTypeExpression::Choice(vec![
+                                CsilTypeExpression::Builtin("int".to_string()),
+                                CsilTypeExpression::Literal(CsilLiteralValue::Text(
+                                    "auto".to_string(),
+                                )),
+                            ])),
+                            occurrence: None,
+                        },
+                        occurrence: None,
+                        metadata: vec![],
+                        doc_comments: Vec::new(),
+                    },
+                    // Map value, inline all-literal choice: `{* text => ("a" / "b")}`.
+                    CsilGroupEntry {
+                        key: Some(CsilGroupKey::Bare("labels".to_string())),
+                        value_type: CsilTypeExpression::Map {
+                            key: Box::new(CsilTypeExpression::Builtin("text".to_string())),
+                            value: Box::new(CsilTypeExpression::Choice(vec![
+                                CsilTypeExpression::Literal(CsilLiteralValue::Text(
+                                    "a".to_string(),
+                                )),
+                                CsilTypeExpression::Literal(CsilLiteralValue::Text(
+                                    "b".to_string(),
+                                )),
+                            ])),
+                            occurrence: None,
+                        },
+                        occurrence: None,
+                        metadata: vec![],
+                        doc_comments: Vec::new(),
+                    },
+                    // Tuple element, inline mixed choice: `[(text / "x"), int]`.
+                    CsilGroupEntry {
+                        key: Some(CsilGroupKey::Bare("pair".to_string())),
+                        value_type: CsilTypeExpression::Tuple(CsilGroupExpression {
+                            entries: vec![
+                                CsilGroupEntry {
+                                    key: None,
+                                    value_type: CsilTypeExpression::Choice(vec![
+                                        CsilTypeExpression::Builtin("text".to_string()),
+                                        CsilTypeExpression::Literal(CsilLiteralValue::Text(
+                                            "x".to_string(),
+                                        )),
+                                    ]),
+                                    occurrence: None,
+                                    metadata: vec![],
+                                    doc_comments: Vec::new(),
+                                },
+                                CsilGroupEntry {
+                                    key: None,
+                                    value_type: CsilTypeExpression::Builtin("int".to_string()),
+                                    occurrence: None,
+                                    metadata: vec![],
+                                    doc_comments: Vec::new(),
+                                },
+                            ],
+                        }),
+                        occurrence: None,
+                        metadata: vec![],
+                        doc_comments: Vec::new(),
+                    },
+                ],
+            }),
+            position: synth_position,
+            doc_comments: Vec::new(),
+        });
+        input
+    }
+
+    #[test]
+    fn test_inline_choice_field_hoisted_to_named_union() {
+        let input = widget_hoisting_input();
+        let mut generator = RustCodeGenerator::new(&input);
+        let types_content = generator.generate_types().unwrap();
+
+        // The field's type is the synthesized `<Record>_<field>` name, exactly as
+        // if `Widget_tag` had been declared as its own named choice rule.
+        assert!(
+            types_content.contains("pub tag: Option<Widget_tag>"),
+            "inline choice field should be hoisted to a synthesized named type:\n{types_content}"
+        );
+        assert!(types_content.contains("pub enum Widget_tag"));
+        assert!(types_content.contains("Variant0(OtherThing)"));
+        assert!(types_content.contains("Variant1(String)"));
+        // No inline choice should ever fall back to the untyped escape hatch.
+        assert!(!types_content.contains("serde_json::Value"));
+    }
+
+    #[test]
+    fn test_inline_all_literal_choice_hoisted_to_named_enum() {
+        let input = widget_hoisting_input();
+        let mut generator = RustCodeGenerator::new(&input);
+        let types_content = generator.generate_types().unwrap();
+
+        assert!(types_content.contains("pub mode: Widget_mode"));
+        assert!(types_content.contains("pub enum Widget_mode"));
+        // A `.default`-wrapped literal arm still contributes a unit variant, not a
+        // payload-carrying one — it stayed classified as a literal despite the
+        // `Constrained` wrapper the parser attached to it.
+        assert!(types_content.contains("Low,"));
+        assert!(types_content.contains("High,"));
+        assert!(!types_content.contains("Widget_mode::Variant"));
+    }
+
+    #[test]
+    fn test_inline_choice_hoisted_in_array_map_tuple_positions() {
+        let input = widget_hoisting_input();
+        let mut generator = RustCodeGenerator::new(&input);
+        let types_content = generator.generate_types().unwrap();
+
+        assert!(
+            types_content.contains("pub codes: Vec<Widget_codes_item>"),
+            "array element inline choice should hoist:\n{types_content}"
+        );
+        assert!(types_content.contains("pub enum Widget_codes_item"));
+
+        assert!(
+            types_content
+                .contains("pub labels: std::collections::HashMap<String, Widget_labels_value>"),
+            "map value inline choice should hoist:\n{types_content}"
+        );
+        assert!(types_content.contains("pub enum Widget_labels_value"));
+        assert!(types_content.contains("A,"));
+        assert!(types_content.contains("B,"));
+
+        assert!(
+            types_content.contains("pub pair: (Widget_pair_0, i64)"),
+            "tuple element inline choice should hoist:\n{types_content}"
+        );
+        assert!(types_content.contains("pub enum Widget_pair_0"));
+    }
+
+    #[test]
+    fn test_inline_choice_codec_matches_named_choice_shape() {
+        let input = widget_hoisting_input();
+        let mut generator = RustCodeGenerator::new(&input);
+        // `generate_types` must run first: it is what sets `type_definitions`, and
+        // `generate_codec` is what actually needs to see the hoisted rules (it
+        // reads `self.spec` independently, so the ordering only matters for
+        // `type_definitions`-driven behavior elsewhere, not for correctness here).
+        let _ = generator.generate_types().unwrap();
+        let codec = generator.generate_codec().unwrap().unwrap();
+
+        // The union field: encoding routes through the hoisted type's own codec
+        // function, with the optional-field binding actually used (not the
+        // `CsilCborValue::Null` stub the pre-fix fallback emitted).
+        assert!(codec.contains("fn csil_enc_widget_tag(csil_v: &Widget_tag)"));
+        assert!(codec.contains("fn csil_dec_widget_tag(csil_v: &CsilCborValue)"));
+        assert!(codec.contains("if let Some(csil_inner) = &csil_v.tag {"));
+        assert!(codec.contains("csil_enc_widget_tag(csil_inner)"));
+
+        // The all-literal field: bare-literal wire (no `[variant_index, value]`
+        // tagged-sum wrapper), decode dispatches by string match, and the
+        // `.default`-wrapped "high" arm encodes its constant with no unused
+        // binding.
+        assert!(codec.contains("fn csil_enc_widget_mode(csil_v: &Widget_mode)"));
+        assert!(codec.contains("Widget_mode::Low => cbor_text(\"low\"),"));
+        assert!(codec.contains("Widget_mode::High => cbor_text(\"high\"),"));
+        assert!(codec.contains("\"low\" => Ok(Widget_mode::Low)"));
+        assert!(codec.contains("\"high\" => Ok(Widget_mode::High)"));
+        assert!(codec.contains("unknown Widget_mode value"));
+
+        // Nested positions: element/value/tuple-slot codecs exist under their
+        // synthesized names.
+        assert!(codec.contains("fn csil_enc_widget_codes_item(csil_v: &Widget_codes_item)"));
+        assert!(codec.contains("fn csil_enc_widget_labels_value(csil_v: &Widget_labels_value)"));
+        assert!(codec.contains("fn csil_enc_widget_pair_0(csil_v: &Widget_pair_0)"));
+    }
+
+    /// `Order.status: "pending" / "shipped" / 0 / 1` — a mixed text+int literal
+    /// choice as a record field. Pins the shared `classify_choice` contract now
+    /// flowing through this generator: `csilgen_common::classify_choice` classifies
+    /// ANY all-literal vocabulary as an `Enum`, mixed kind or not, so this must
+    /// hoist to a named unit-variant enum exactly like an all-text or all-int
+    /// choice does — not fall through to the union path (the pre-fix
+    /// `enum_literals` required a uniform text-only or int-only vocabulary and
+    /// this mixed one failed both checks).
+    fn mixed_kind_choice_input() -> WasmGeneratorInput {
+        let mut input = create_test_input();
+        input.csil_spec.rules = vec![CsilRule {
+            name: "Order".to_string(),
+            rule_type: CsilRuleType::GroupDef(CsilGroupExpression {
+                entries: vec![CsilGroupEntry {
+                    key: Some(CsilGroupKey::Bare("status".to_string())),
+                    value_type: CsilTypeExpression::Choice(vec![
+                        CsilTypeExpression::Literal(CsilLiteralValue::Text("pending".to_string())),
+                        CsilTypeExpression::Literal(CsilLiteralValue::Text("shipped".to_string())),
+                        CsilTypeExpression::Literal(CsilLiteralValue::Integer(0)),
+                        CsilTypeExpression::Literal(CsilLiteralValue::Integer(1)),
+                    ]),
+                    occurrence: None,
+                    metadata: vec![],
+                    doc_comments: Vec::new(),
+                }],
+            }),
+            position: CsilPosition {
+                line: 1,
+                column: 1,
+                offset: 0,
+            },
+            doc_comments: Vec::new(),
+        }];
+        input.csil_spec.service_count = 0;
+        input
+    }
+
+    #[test]
+    fn mixed_kind_literal_choice_hoists_to_unit_variant_enum() {
+        let input = mixed_kind_choice_input();
+        let mut generator = RustCodeGenerator::new(&input);
+        let types_content = generator.generate_types().unwrap();
+
+        assert!(types_content.contains("pub status: Order_status"));
+        assert!(
+            types_content.contains("pub enum Order_status"),
+            "mixed-kind literal choice must hoist to a named enum:\n{types_content}"
+        );
+        // Unit variants — one per literal, regardless of kind — never a payload
+        // (`Variant0(String)`-shaped) arm, which is what the pre-fix union
+        // fallback produced.
+        assert!(types_content.contains("Pending,"));
+        assert!(types_content.contains("Shipped,"));
+        assert!(types_content.contains("V0,"));
+        assert!(types_content.contains("V1,"));
+        assert!(!types_content.contains("Order_status::Variant"));
+        assert!(!types_content.contains("Variant0(String)"));
+    }
+
+    #[test]
+    fn mixed_kind_literal_choice_codec_is_bare_wire_enum_not_tagged_union() {
+        let input = mixed_kind_choice_input();
+        let mut generator = RustCodeGenerator::new(&input);
+        let _ = generator.generate_types().unwrap();
+        let codec = generator.generate_codec().unwrap().unwrap();
+
+        // Encode: bare literal per variant (via `rust_literal_cbor_expr`, kind-
+        // appropriate per arm), never a `[variant_index, value]` tagged sum.
+        assert!(codec.contains("fn csil_enc_order_status(csil_v: &Order_status)"));
+        assert!(codec.contains("Order_status::Pending => cbor_text(\"pending\"),"));
+        assert!(codec.contains("Order_status::Shipped => cbor_text(\"shipped\"),"));
+        assert!(codec.contains("Order_status::V0 => cbor_int(0),"));
+        assert!(codec.contains("Order_status::V1 => cbor_int(1),"));
+
+        // Decode: neither the all-text (`cbor_as_text` + `.as_str()` match) nor the
+        // all-int (`cbor_as_i64` + scalar match) shape applies to a mixed
+        // vocabulary, so it matches directly on `csil_v` with a per-arm,
+        // kind-appropriate guard — text arms compare the decoded CBOR value
+        // directly, int arms route through `cbor_as_i64` so a non-negative literal
+        // (decoded as `CsilCborValue::Uint`, not the `Int` an `Integer` literal's
+        // own rendering would produce) still matches.
+        assert!(codec.contains("fn csil_dec_order_status(csil_v: &CsilCborValue)"));
+        assert!(
+            codec.contains("_ if csil_v == &cbor_text(\"pending\") => Ok(Order_status::Pending),")
+        );
+        assert!(
+            codec.contains("_ if csil_v == &cbor_text(\"shipped\") => Ok(Order_status::Shipped),")
+        );
+        assert!(
+            codec.contains("_ if matches!(cbor_as_i64(csil_v), Ok(0)) => Ok(Order_status::V0),")
+        );
+        assert!(
+            codec.contains("_ if matches!(cbor_as_i64(csil_v), Ok(1)) => Ok(Order_status::V1),")
+        );
+        // Out-of-vocabulary membership check: an unrecognized value of a declared
+        // kind is rejected, not silently coerced.
+        assert!(codec.contains("unknown Order_status value"));
+        // No tagged-sum union shape leaked through for this field.
+        assert!(!codec.contains("union expects a 2-element array"));
     }
 
     #[test]
@@ -6253,6 +7887,172 @@ mod tests {
             doc_comments: Vec::new(),
         }];
         input
+    }
+
+    #[test]
+    fn overlong_codec_signatures_wrap_like_rustfmt() {
+        // The linkkeys regression: `SignedLocalRpCallbackPayload` pushes the
+        // one-line `csil_enc_...` signature to 103 columns, which rustfmt wraps
+        // one param per line — so the generator emits exactly that wrapped form
+        // and a fresh `rustfmt --check` after `csilgen generate` stays diff-free.
+        let input = single_field_spec(
+            "SignedLocalRpCallbackPayload",
+            CsilTypeExpression::Builtin("bytes".to_string()),
+            vec![],
+            None,
+        );
+        let files = RustCodeGenerator::new(&input).generate().unwrap();
+        let codec = files
+            .iter()
+            .find(|f| f.path == "codec.gen.rs")
+            .expect("codec.gen.rs emitted");
+        assert!(codec.content.contains(
+            "fn csil_enc_signed_local_rp_callback_payload(\n\
+             \x20   csil_v: &SignedLocalRpCallbackPayload,\n\
+             ) -> CsilCborValue {"
+        ));
+
+        // A short record name keeps the one-line signature rustfmt would keep.
+        let input = single_field_spec(
+            "User",
+            CsilTypeExpression::Builtin("bytes".to_string()),
+            vec![],
+            None,
+        );
+        let files = RustCodeGenerator::new(&input).generate().unwrap();
+        let codec = files
+            .iter()
+            .find(|f| f.path == "codec.gen.rs")
+            .expect("codec.gen.rs emitted");
+        assert!(
+            codec
+                .content
+                .contains("fn csil_enc_user(csil_v: &User) -> CsilCborValue {")
+        );
+    }
+
+    #[test]
+    fn unsupported_field_decoder_wraps_like_rustfmt() {
+        // The erroring fallback closure exceeds rustfmt's call width, so rustfmt
+        // gives it a block body with the nested single-argument calls flattened;
+        // the generator must emit that exact shape.
+        let input = single_field_spec(
+            "Wrapper",
+            CsilTypeExpression::Reference("NotModeled".to_string()),
+            vec![],
+            None,
+        );
+        let files = RustCodeGenerator::new(&input).generate().unwrap();
+        let codec = files
+            .iter()
+            .find(|f| f.path == "codec.gen.rs")
+            .expect("codec.gen.rs emitted");
+        assert!(codec.content.contains(
+            "        let csil_decode = |_csil_v| {\n\
+             \x20           Err(CsilCborError(\n\
+             \x20               \"csil cbor: unsupported field type\".to_string(),\n\
+             \x20           ))\n\
+             \x20       };"
+        ));
+    }
+
+    #[test]
+    fn wide_map_decoder_overflows_its_trailing_closure_like_rustfmt() {
+        // map<text, any>: the decode call's argument list passes fn_call_width,
+        // so rustfmt block-bodies the binding closure and overflows the trailing
+        // `any` closure inside the call.
+        let input = single_field_spec(
+            "Wrapper",
+            CsilTypeExpression::Map {
+                key: Box::new(CsilTypeExpression::Builtin("text".to_string())),
+                value: Box::new(CsilTypeExpression::Builtin("any".to_string())),
+                occurrence: None,
+            },
+            vec![],
+            None,
+        );
+        let files = RustCodeGenerator::new(&input).generate().unwrap();
+        let codec = files
+            .iter()
+            .find(|f| f.path == "codec.gen.rs")
+            .expect("codec.gen.rs emitted");
+        assert!(codec.content.contains(
+            "        let csil_decode = |csil_v| {\n\
+             \x20           cbor_dec_map(csil_v, cbor_as_text, |csil_v: &CsilCborValue| {\n\
+             \x20               Ok(csil_v.clone())\n\
+             \x20           })\n\
+             \x20       };"
+        ));
+    }
+
+    #[test]
+    fn validation_error_returns_are_emitted_vertically() {
+        // Even the shortest `ValidationError` literal passes rustfmt's
+        // struct_lit_width, so every guard return is emitted in the vertical
+        // form rustfmt would produce.
+        let input = single_field_spec(
+            "Doc",
+            CsilTypeExpression::Builtin("text".to_string()),
+            vec![CsilFieldMetadata::Constraint(
+                CsilValidationConstraint::MaxLength(10),
+            )],
+            None,
+        );
+        let mut generator = RustCodeGenerator::new(&input);
+        let types = generator.generate_types().unwrap();
+        assert!(types.contains(
+            "                return Err(ValidationError {\n\
+             \x20                   field: \"field\".to_string(),\n\
+             \x20                   message: \"length is above maximum 10\".to_string(),\n\
+             \x20               });"
+        ));
+    }
+
+    #[test]
+    fn trait_method_signature_follows_rustfmt_ladder() {
+        // One line through 99 columns; at exactly 100 rustfmt drops only the
+        // return type to the next line; past that, params go one per line.
+        let short = RustCodeGenerator::rust_trait_method(
+            "get",
+            &["input: serde_json::Value".to_string()],
+            "Cart",
+        );
+        assert_eq!(
+            short,
+            "    fn get(&self, input: serde_json::Value) -> Result<Cart, ServiceError>;\n"
+        );
+
+        // 4 + len("fn get_cart(&self, ctx: &Self::Context, input: serde_json::Value) -> Result<Cart, ServiceError>;") == 100.
+        let exactly_100 = RustCodeGenerator::rust_trait_method(
+            "get_cart",
+            &[
+                "ctx: &Self::Context".to_string(),
+                "input: serde_json::Value".to_string(),
+            ],
+            "Cart",
+        );
+        assert_eq!(
+            exactly_100,
+            "    fn get_cart(&self, ctx: &Self::Context, input: serde_json::Value)\n\
+             \x20       -> Result<Cart, ServiceError>;\n"
+        );
+
+        let long = RustCodeGenerator::rust_trait_method(
+            "get_cart_x",
+            &[
+                "ctx: &Self::Context".to_string(),
+                "input: serde_json::Value".to_string(),
+            ],
+            "Cart",
+        );
+        assert_eq!(
+            long,
+            "    fn get_cart_x(\n\
+             \x20       &self,\n\
+             \x20       ctx: &Self::Context,\n\
+             \x20       input: serde_json::Value,\n\
+             \x20   ) -> Result<Cart, ServiceError>;\n"
+        );
     }
 
     #[test]
@@ -6545,12 +8345,35 @@ mod tests {
     }
 
     #[test]
-    fn float_field_bounds_still_compare_as_f64() {
-        // A genuinely floating field keeps the f64 comparison path.
+    fn float_field_bounds_compare_natively_with_no_cast() {
+        // A genuinely floating field's Rust type is already `f64` (see
+        // `map_builtin_type`), so the comparison must not cast it to its own type —
+        // `(*v as f64) > 1.5` on an already-`f64` `v` is clippy's
+        // `unnecessary_cast`, not just a style nit: it fails `-D warnings`.
         let input = single_field_spec(
             "Ratio",
             CsilTypeExpression::Constrained {
                 base_type: Box::new(CsilTypeExpression::Builtin("float64".to_string())),
+                constraints: vec![CsilControlOperator::LessEqual(CsilLiteralValue::Float(1.5))],
+            },
+            vec![],
+            None,
+        );
+        let mut generator = RustCodeGenerator::new(&input);
+        let types = generator.generate_types().unwrap();
+        assert!(types.contains("*v > 1.5"));
+        assert!(!types.contains("as f64"));
+    }
+
+    #[test]
+    fn integer_field_with_float_bound_still_widens_to_f64() {
+        // An integer field constrained by a *float* bound (`int .le 1.5`) has no
+        // native integer/float comparison, so it genuinely needs the widening cast
+        // — only a field whose own Rust type is already `f64` skips it.
+        let input = single_field_spec(
+            "Score",
+            CsilTypeExpression::Constrained {
+                base_type: Box::new(CsilTypeExpression::Builtin("int".to_string())),
                 constraints: vec![CsilControlOperator::LessEqual(CsilLiteralValue::Float(1.5))],
             },
             vec![],
@@ -7361,7 +9184,7 @@ mod tests {
         assert!(
             client
                 .content
-                .contains("self.transport.call(\"events\", \"Heartbeat\", &[])?;"),
+                .contains("self.transport.call(\"EventsService\", \"heartbeat\", &[])?;"),
             "null-input client must send empty request bytes, got:\n{}",
             client.content
         );
@@ -7927,6 +9750,201 @@ mod tests {
             },
             doc_comments: Vec::new(),
         });
+        // The linkkeys regression shape: a record name long enough that the
+        // one-line `csil_enc_...` signature would pass rustfmt's width, plus a
+        // tuple with optional elements to exercise the positional codec's
+        // wrapped closures.
+        input.csil_spec.rules.push(CsilRule {
+            name: "SignedLocalRpTicketRedemptionRequest".to_string(),
+            rule_type: CsilRuleType::GroupDef(CsilGroupExpression {
+                entries: vec![
+                    CsilGroupEntry {
+                        key: Some(CsilGroupKey::Bare("request".to_string())),
+                        value_type: CsilTypeExpression::Builtin("bytes".to_string()),
+                        occurrence: None,
+                        metadata: vec![],
+                        doc_comments: Vec::new(),
+                    },
+                    CsilGroupEntry {
+                        key: Some(CsilGroupKey::Bare("triple".to_string())),
+                        value_type: CsilTypeExpression::Tuple(CsilGroupExpression {
+                            entries: vec![
+                                CsilGroupEntry {
+                                    key: None,
+                                    value_type: CsilTypeExpression::Builtin("text".to_string()),
+                                    occurrence: None,
+                                    metadata: vec![],
+                                    doc_comments: Vec::new(),
+                                },
+                                CsilGroupEntry {
+                                    key: None,
+                                    value_type: CsilTypeExpression::Builtin("int".to_string()),
+                                    occurrence: Some(CsilOccurrence::Optional),
+                                    metadata: vec![],
+                                    doc_comments: Vec::new(),
+                                },
+                            ],
+                        }),
+                        occurrence: None,
+                        metadata: vec![],
+                        doc_comments: Vec::new(),
+                    },
+                ],
+            }),
+            position: CsilPosition {
+                line: 1,
+                column: 1,
+                offset: 0,
+            },
+            doc_comments: Vec::new(),
+        });
+        // Constraint-heavy shape (mirrors examples/tagged-types/orders.csil): a
+        // `decimal` field with a `.ge` bound pulls in the self-contained
+        // `CsilDecimal` helper (whose `Ord` impl strips trailing zeros via `% 10 ==
+        // 0`), and the length constraints below cover every zero/one boundary the
+        // two length-check emitters (`field_checks`'s metadata loop and
+        // `push_size_check`'s control-operator match) can produce — regressing
+        // either `clippy::manual_is_multiple_of` or `clippy::len_zero` fails this
+        // gate.
+        input.csil_spec.rules.push(CsilRule {
+            name: "ConstraintProbe".to_string(),
+            rule_type: CsilRuleType::GroupDef(CsilGroupExpression {
+                entries: vec![
+                    CsilGroupEntry {
+                        key: Some(CsilGroupKey::Bare("unit_price".to_string())),
+                        value_type: CsilTypeExpression::Constrained {
+                            base_type: Box::new(CsilTypeExpression::Builtin("decimal".to_string())),
+                            constraints: vec![CsilControlOperator::GreaterEqual(
+                                CsilLiteralValue::Text("0.00".to_string()),
+                            )],
+                        },
+                        occurrence: None,
+                        metadata: vec![],
+                        doc_comments: Vec::new(),
+                    },
+                    // `.size (1*)` control operator: min-items-of-one, `push_size_check`'s
+                    // `Min` branch.
+                    CsilGroupEntry {
+                        key: Some(CsilGroupKey::Bare("items".to_string())),
+                        value_type: CsilTypeExpression::Constrained {
+                            base_type: Box::new(CsilTypeExpression::Array {
+                                element_type: Box::new(CsilTypeExpression::Builtin(
+                                    "text".to_string(),
+                                )),
+                                occurrence: None,
+                            }),
+                            constraints: vec![CsilControlOperator::Size(CsilSizeConstraint::Min(
+                                1,
+                            ))],
+                        },
+                        occurrence: None,
+                        metadata: vec![],
+                        doc_comments: Vec::new(),
+                    },
+                    // `@min-items(1)` annotation: the metadata-driven MinItems branch in
+                    // `field_checks` rather than the control-operator one above.
+                    CsilGroupEntry {
+                        key: Some(CsilGroupKey::Bare("tags".to_string())),
+                        value_type: CsilTypeExpression::Array {
+                            element_type: Box::new(CsilTypeExpression::Builtin("text".to_string())),
+                            occurrence: None,
+                        },
+                        occurrence: None,
+                        metadata: vec![CsilFieldMetadata::Constraint(
+                            CsilValidationConstraint::MinItems(1),
+                        )],
+                        doc_comments: Vec::new(),
+                    },
+                    // `.size (..0)` (must be empty): the zero-boundary of `push_size_check`'s
+                    // `Max` branch.
+                    CsilGroupEntry {
+                        key: Some(CsilGroupKey::Bare("reserved".to_string())),
+                        value_type: CsilTypeExpression::Constrained {
+                            base_type: Box::new(CsilTypeExpression::Array {
+                                element_type: Box::new(CsilTypeExpression::Builtin(
+                                    "text".to_string(),
+                                )),
+                                occurrence: None,
+                            }),
+                            constraints: vec![CsilControlOperator::Size(CsilSizeConstraint::Max(
+                                0,
+                            ))],
+                        },
+                        occurrence: None,
+                        metadata: vec![],
+                        doc_comments: Vec::new(),
+                    },
+                    // Inline mixed choice (a `Reference` arm plus a literal arm):
+                    // must hoist to `ConstraintProbe_tag` and route through that
+                    // synthesized union's own codec — regressing the hoist drops
+                    // this field to the untyped `serde_json::Value` fallback
+                    // (`E0433: cannot find crate serde_json`), and regressing the
+                    // optional-field binding fix reintroduces an unused
+                    // `csil_inner`.
+                    CsilGroupEntry {
+                        key: Some(CsilGroupKey::Bare("tag".to_string())),
+                        value_type: CsilTypeExpression::Choice(vec![
+                            CsilTypeExpression::Reference("Task".to_string()),
+                            CsilTypeExpression::Literal(CsilLiteralValue::Text(
+                                "untagged".to_string(),
+                            )),
+                        ]),
+                        occurrence: Some(CsilOccurrence::Optional),
+                        metadata: vec![],
+                        doc_comments: Vec::new(),
+                    },
+                    // Inline all-literal choice whose LAST arm carries a trailing
+                    // `.default` control operator (`"low" / "high" .default
+                    // "normal"`) — the parser attaches `.default` to that one arm,
+                    // not the choice as a whole, so it parses as `Constrained {
+                    // base_type: Literal("high"), .. }`. Both the hoisted-name
+                    // (`ConstraintProbe_mode`, tripping `non_camel_case_types`
+                    // without the crate-wide allow) and the arm-classification fix
+                    // (an unstripped `Constrained` wrapper would misclassify this
+                    // as a union and bind-but-never-read the payload) are pinned
+                    // by this fixture actually compiling and staying clippy-clean.
+                    CsilGroupEntry {
+                        key: Some(CsilGroupKey::Bare("mode".to_string())),
+                        value_type: CsilTypeExpression::Choice(vec![
+                            CsilTypeExpression::Literal(CsilLiteralValue::Text("low".to_string())),
+                            CsilTypeExpression::Constrained {
+                                base_type: Box::new(CsilTypeExpression::Literal(
+                                    CsilLiteralValue::Text("high".to_string()),
+                                )),
+                                constraints: vec![CsilControlOperator::Default(
+                                    CsilLiteralValue::Text("normal".to_string()),
+                                )],
+                            },
+                        ]),
+                        occurrence: None,
+                        metadata: vec![],
+                        doc_comments: Vec::new(),
+                    },
+                    // A genuinely floating field with a float bound: the
+                    // comparison must stay `*v > 1.5`, not `(*v as f64) > 1.5` —
+                    // the latter is clippy's `unnecessary_cast` since `float64`
+                    // already maps to Rust `f64`.
+                    CsilGroupEntry {
+                        key: Some(CsilGroupKey::Bare("ratio".to_string())),
+                        value_type: CsilTypeExpression::Constrained {
+                            base_type: Box::new(CsilTypeExpression::Builtin("float64".to_string())),
+                            constraints: vec![CsilControlOperator::LessEqual(
+                                CsilLiteralValue::Float(1.5),
+                            )],
+                        },
+                        occurrence: None,
+                        metadata: vec![],
+                        doc_comments: Vec::new(),
+                    },
+                ],
+            }),
+            position: CsilPosition {
+                line: 1,
+                column: 1,
+                offset: 0,
+            },
+            doc_comments: Vec::new(),
+        });
         if let Some(rule) = input
             .csil_spec
             .rules
@@ -7934,6 +9952,28 @@ mod tests {
             .find(|rule| rule.name == "CorndogsService")
             && let CsilRuleType::ServiceDef(service) = &mut rule.rule_type
         {
+            // An op boundary union whose second arm is NOT literally
+            // `ServiceError` (`Task` vs. the larger `ConstraintProbe`): must hoist
+            // to `CorndogsService_peek_response` rather than falling to
+            // `serde_json::Value` (undeclared dependency), and the size gap
+            // between the two record arms exercises clippy's
+            // `large_enum_variant`, which the crate-wide allow must suppress.
+            service.operations.push(CsilServiceOperation {
+                name: "peek".to_string(),
+                input_type: CsilTypeExpression::Reference("SubmitTaskRequest".to_string()),
+                output_type: CsilTypeExpression::Choice(vec![
+                    CsilTypeExpression::Reference("Task".to_string()),
+                    CsilTypeExpression::Reference("ConstraintProbe".to_string()),
+                ]),
+                direction: CsilServiceDirection::Unidirectional,
+                position: CsilPosition {
+                    line: 1,
+                    column: 1,
+                    offset: 0,
+                },
+                doc_comments: Vec::new(),
+                wire_id: None,
+            });
             service.operations.push(CsilServiceOperation {
                 name: "control".to_string(),
                 input_type: CsilTypeExpression::Reference("Control".to_string()),
@@ -7950,9 +9990,61 @@ mod tests {
                 doc_comments: Vec::new(),
                 wire_id: None,
             });
+            // A unary op whose overlong boundary type forces the client method
+            // signature, transport call, and decode chain onto rustfmt's wrapped
+            // forms.
+            service.operations.push(CsilServiceOperation {
+                name: "redeem-claim-ticket".to_string(),
+                input_type: CsilTypeExpression::Reference(
+                    "SignedLocalRpTicketRedemptionRequest".to_string(),
+                ),
+                output_type: CsilTypeExpression::Reference(
+                    "SignedLocalRpTicketRedemptionRequest".to_string(),
+                ),
+                direction: CsilServiceDirection::Unidirectional,
+                position: CsilPosition {
+                    line: 1,
+                    column: 1,
+                    offset: 0,
+                },
+                doc_comments: Vec::new(),
+                wire_id: None,
+            });
         }
 
         let files = RustCodeGenerator::new(&input).generate().unwrap();
+
+        // Pin the exact shapes the two fixed lints used to fire on, so a regression
+        // in either emitter is caught here even if some other rustfmt-neutral
+        // rewrite kept the fixture superficially "clean".
+        let types = files.iter().find(|f| f.path == "types.rs").unwrap();
+        assert!(
+            types.content.contains("while ma.is_multiple_of(10)")
+                && types.content.contains("while mb.is_multiple_of(10)"),
+            "CsilDecimal::cmp_magnitude should use is_multiple_of, not `% 10 == 0`"
+        );
+        assert!(
+            types.content.contains("if v.is_empty() {"),
+            "a `.size (1*)`/`@min-items(1)` bound of exactly one should render as \
+             `is_empty()`, not `v.len() < 1usize`"
+        );
+        assert!(
+            types.content.contains("if !v.is_empty() {"),
+            "a `.size (..0)` bound of exactly zero should render as `!is_empty()`, \
+             not `v.len() > 0usize`"
+        );
+        assert!(
+            !types.content.contains("% 10 == 0"),
+            "no raw modulo-by-ten equality should remain in the decimal helper"
+        );
+        assert!(
+            !types.content.contains(".len() < 1usize")
+                && !types.content.contains(".len() > 0usize")
+                && !types.content.contains(".len() == 0usize")
+                && !types.content.contains(".len() != 0usize"),
+            "no zero/one length comparison should remain in generated validation"
+        );
+
         let dir = std::env::temp_dir().join(format!("csilgen-rust-tooling-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let src = dir.join("src");
@@ -8142,6 +10234,71 @@ mod tests {
             .current_dir(&dir)
             // Keep the build hermetic and out of the parent's target dir: the
             // generated crate has no deps, so an isolated offline build suffices.
+            .env("CARGO_TARGET_DIR", dir.join("target"))
+            .env("CARGO_NET_OFFLINE", "true")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&run.stdout);
+        let stderr = String::from_utf8_lossy(&run.stderr);
+        assert!(
+            run.status.success(),
+            "cargo run failed:\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        assert_eq!(
+            stdout.trim(),
+            "ok",
+            "unexpected output:\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Compile the mixed-kind literal enum (`Order.status: "pending" / "shipped" /
+    /// 0 / 1`) and, through a real `cargo run`, (a) prove it compiles cleanly, (b)
+    /// round-trip encode -> CBOR bytes -> decode for every declared literal of
+    /// both kinds, and (c) prove an out-of-vocabulary value of a declared kind
+    /// (an unrecognized text, an unrecognized int) is rejected on decode rather
+    /// than silently coerced. This is the live proof behind
+    /// `mixed_kind_literal_choice_codec_is_bare_wire_enum_not_tagged_union`'s
+    /// source-text assertions. Skips cleanly when no cargo toolchain is on PATH.
+    #[test]
+    fn mixed_kind_enum_round_trips_through_cargo() {
+        let probe = std::process::Command::new("cargo")
+            .arg("--version")
+            .output();
+        if probe.map(|o| !o.status.success()).unwrap_or(true) {
+            eprintln!("skipping: no cargo toolchain on PATH");
+            return;
+        }
+
+        let mut input = mixed_kind_choice_input();
+        input.config.target = "rust-typesonly".to_string();
+        input.config.options.insert(
+            "module_root_filename".to_string(),
+            serde_json::Value::String("lib.rs".to_string()),
+        );
+        let files = RustCodeGenerator::new(&input)
+            .generate()
+            .expect("generation ok");
+
+        let dir =
+            std::env::temp_dir().join(format!("csilgen-rust-mixed-enum-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let src = dir.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        for file in &files {
+            std::fs::write(src.join(&file.path), &file.content).unwrap();
+        }
+        std::fs::write(
+            dir.join("Cargo.toml"),
+            "[package]\nname = \"csilroundtrip\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\n[workspace]\n\n[dependencies]\n",
+        )
+        .unwrap();
+        std::fs::write(src.join("main.rs"), RUST_MIXED_ENUM_DRIVER).unwrap();
+
+        let run = std::process::Command::new("cargo")
+            .arg("run")
+            .arg("--quiet")
+            .current_dir(&dir)
             .env("CARGO_TARGET_DIR", dir.join("target"))
             .env("CARGO_NET_OFFLINE", "true")
             .output()
@@ -8826,7 +10983,7 @@ struct Loopback;
 
 impl Transport for Loopback {
     fn call(&self, service: &str, op: &str, req: &[u8]) -> Result<Vec<u8>, ClientError> {
-        if service != "corndogs" || op != "SubmitTask" {
+        if service != "CorndogsService" || op != "submit-task" {
             return Err(ClientError::Transport(format!("unexpected route {service}/{op}")));
         }
         let in_req = decode_submit_task_request(req)
@@ -8909,6 +11066,62 @@ fn main() {
 }
 "#;
 
+    /// Driver `main` for the mixed-kind-literal-enum round-trip crate: round-trips
+    /// every declared literal of both kinds through the public per-record
+    /// `encode_order`/`decode_order`, then proves an out-of-vocabulary value of a
+    /// declared kind is rejected on decode. `csil_enc_order_status`/
+    /// `csil_dec_order_status` are module-private (not `pub`), so this drives them
+    /// indirectly through the one-field `Order` record's own public codec instead
+    /// of calling them directly.
+    const RUST_MIXED_ENUM_DRIVER: &str = r#"use csilroundtrip::*;
+
+fn check(cond: bool, msg: &str) {
+    if !cond {
+        eprintln!("FAIL: {msg}");
+        std::process::exit(1);
+    }
+}
+
+fn main() {
+    // Round-trip every declared literal of both kinds.
+    for (status, label) in [
+        (Order_status::Pending, "pending"),
+        (Order_status::Shipped, "shipped"),
+        (Order_status::V0, "v0"),
+        (Order_status::V1, "v1"),
+    ] {
+        let order = Order { status: status.clone() };
+        let bytes = encode_order(&order);
+        let back = decode_order(&bytes).unwrap_or_else(|e| panic!("decode {label}: {e}"));
+        check(back.status == status, &format!("round-trip {label}"));
+    }
+
+    // Out-of-vocabulary membership check: an unrecognized value of a DECLARED
+    // kind (a text that is not "pending"/"shipped", an int that is not 0/1) must
+    // be rejected on decode, not silently coerced. `Order` has exactly one
+    // field, so its CBOR map is `{status: <literal>}`; reuse the real
+    // map-header + key-header + key-bytes prefix from a valid encode (map(1) +
+    // text key "status", 8 bytes) rather than hand-deriving that prefix's byte
+    // layout independently, and swap in a hand-written CBOR value after it.
+    let good = encode_order(&Order { status: Order_status::Pending });
+    let prefix = &good[..8];
+
+    let mut bad_text = prefix.to_vec();
+    // CBOR text (major type 3), length 9: "cancelled" — not a declared literal.
+    bad_text.push(0x69);
+    bad_text.extend_from_slice(b"cancelled");
+    check(decode_order(&bad_text).is_err(), "out-of-vocab text rejected");
+
+    let mut bad_int = prefix.to_vec();
+    // CBOR unsigned int (major type 0), value 2, inline in the header byte — not
+    // a declared literal.
+    bad_int.push(0x02);
+    check(decode_order(&bad_int).is_err(), "out-of-vocab int rejected");
+
+    println!("ok");
+}
+"#;
+
     /// Async driver `main` for the round-trip crate: it drives the generated
     /// `CorndogsAsyncClient` over an async loopback transport using a from-scratch,
     /// dependency-free `block_on`. The async seam completes without real I/O, so a
@@ -8949,7 +11162,7 @@ struct Loopback;
 
 impl AsyncTransport for Loopback {
     async fn call(&self, service: &str, op: &str, req: &[u8]) -> Result<Vec<u8>, ClientError> {
-        if service != "corndogs" || op != "SubmitTask" {
+        if service != "CorndogsService" || op != "submit-task" {
             return Err(ClientError::Transport(format!("unexpected route {service}/{op}")));
         }
         let in_req = decode_submit_task_request(req)

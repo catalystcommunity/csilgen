@@ -36,7 +36,7 @@ enum Commands {
     TestTransports,
     /// Run the cross-language interop matrix: generate the interop package per
     /// language, build each harness, and exercise every client x server x
-    /// transport pair over Unix sockets. See tests/interop/README.md.
+    /// transport pair over TCP/UDP loopback sockets. See tests/interop/README.md.
     Interop {
         /// Restrict to these languages (default: all registered).
         #[arg(long, value_delimiter = ',')]

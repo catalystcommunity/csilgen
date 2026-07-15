@@ -15,3 +15,14 @@ function assert_true($cond, $message)
         exit(1);
     }
 }
+
+function assert_throws($class, $fn, $message)
+{
+    try {
+        $fn();
+    } catch (\Exception $e) {
+        assert_true($e instanceof $class, $message . ' (threw ' . get_class($e) . ')');
+        return $e;
+    }
+    assert_true(false, $message . ' (nothing thrown)');
+}

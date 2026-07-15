@@ -12,9 +12,10 @@
 ;;   - every operation payload is a NAMED top-level record, so each
 ;;     generated typed client emits a real method for it;
 ;;   - field names are snake_case; operation names are kebab-case;
-;;   - the RPC service id is the lowercased service base name and the
-;;     op id is the PascalCase of the kebab op (e.g. echo-scalars ->
-;;     "EchoScalars"); all generators agree on this.
+;;   - the RPC/Events wire ids are the VERBATIM CSIL names per
+;;     csil-rpc-transport.md §1.1: service as written ("Interop") and
+;;     op as written (kebab-case, e.g. "echo-scalars"); all generators
+;;     agree on this.
 ;;
 ;; This file GROWS as generator codec gaps are closed. Constructs not
 ;; yet byte-clean across every language live in the DEFERRED block at
@@ -30,6 +31,40 @@ Priority = 1 / 2 / 3
 ;; ---- named union (tagged sum [variant_index, value] on the wire) ----
 IdOrName = uint / text
 
+;; ---- mixed union (literal arms + a same-base-type general arm; tagged sum
+;; [variant_index, value] on the wire, 0-based declaration order: general text
+;; is index 0, "pending"/"confirmed"/"cancelled" are indices 1/2/3). On encode,
+;; a literal arm wins over the general arm by value equality; on decode, index
+;; dispatch validates the literal-payload equality.
+MixedStatus = text / "pending" / "confirmed" / "cancelled"
+
+;; ---- all-literal enum whose LAST arm carries a trailing `.default` control
+;; op. CSIL's grammar attaches a control operator to the immediately preceding
+;; primary type, so the parser wraps only that last arm as
+;; `Constrained { base_type: Literal("high"), constraints: [.default "medium"] }`
+;; rather than leaving it a bare `Literal` — classification must see through
+;; that wrapper everywhere a choice arm's literal-ness is checked, or this
+;; misclassifies as a mixed union (one "general" non-literal arm) instead of
+;; the bare-literal enum it is.
+Level = "low" / "medium" / "high" .default "medium"
+
+;; ---- named enum assembled from a base rule plus a `/=` extension (RFC 8610
+;; socket/plug "extend a group/choice" semantics applied to a type choice):
+;; csilgen-core normalizes the two lines into a single 4-arm Choice before any
+;; generator sees the spec, so `Season` here is byte-identical to writing
+;; `Season = "spring" / "summer" / "autumn" / "winter"` on one line.
+Season = "spring" / "summer"
+Season /= "autumn" / "winter"
+
+;; ---- named all-literal enum with MIXED literal kinds (text + int arms). Per
+;; crates/csilgen-common/src/choice.rs `classify_choice`, EVERY arm being a
+;; literal (regardless of kind) classifies this as an `Enum`, not a `Union`:
+;; it wires as the BARE literal value itself (no discriminator tag), and
+;; decode validates membership in the declared vocabulary by kind+value, not
+;; a runtime-type match. `ShipMode` pins that a NAMED reference (not just an
+;; inline field) gets this treatment identically across all generators.
+ShipMode = "ground" / 2 / "air"
+
 ;; ---- full scalar coverage (codec-clean across rust/go/python) ----
 Scalars = {
   i: int,
@@ -41,6 +76,34 @@ Scalars = {
   flag: bool,
   when: timestamp,
   amount: decimal,
+  ;; mixed-union coverage: a value equal to a literal arm must wire as
+  ;; [1,"pending"]; a value with no literal match must wire as [0,...].
+  status_literal: MixedStatus,
+  status_free: MixedStatus,
+  ;; inline anonymous MIXED choice: every generator hoists this to a
+  ;; synthesized named type (`Scalars_note` per-language-cased) since the
+  ;; codec's named-rule machinery can't reach an anonymous mixed choice; wire
+  ;; shape is the same tagged sum [variant_index, value] as MixedStatus above
+  ;; (declaration order: general text is index 0, "info"/"warn" are 1/2).
+  note: text / "info" / "warn",
+  ;; inline anonymous ALL-LITERAL choice: unlike `note`, this is NOT hoisted —
+  ;; an all-literal choice already renders as a correct bare-literal enum
+  ;; inline, so it wires bare (no tag).
+  size: "small" / "medium" / "large",
+  ;; all-literal named enum with a trailing `.default`-constrained last arm
+  ;; (see `Level` above); the value used here ("high") deliberately differs
+  ;; from the declared default ("medium") to prove the field carries the
+  ;; explicit value, not a silently-substituted default.
+  level: Level,
+  ;; named enum built via a base rule + `/=` extension (see `Season` above);
+  ;; the value used here ("autumn") comes from the EXTENSION arms, proving
+  ;; they are reachable, not dropped.
+  season: Season,
+  ;; named all-literal enum with MIXED literal kinds (see `ShipMode` above).
+  ;; Two fields of the same named type pin both a text-kind member wiring as
+  ;; a bare text value and an int-kind member wiring as a bare int value.
+  ship_text: ShipMode,
+  ship_int: ShipMode,
 }
 
 ;; ---- constraints (drives failure cases via validation) ----

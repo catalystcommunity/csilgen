@@ -41,11 +41,11 @@ CsilRpcRequest = {
 }
 ```
 
-- **`service` / `op`** are the verbatim CSIL names. They are derived identically
-  to the generated client's `(service, method)` pair in
-  `docs/cbor-wire-contract.md` ("RPC call naming"): `service` is the CSIL service
-  name; `op` is the CSIL operation name as written (kebab-case). A receiver maps
-  `(service, op)` onto its generated router.
+- **`service` / `op`** are the verbatim CSIL names. They are exactly the
+  `(service, op)` pair the generated clients hand their transport seam
+  (`docs/cbor-wire-contract.md`, "RPC call naming"): `service` is the CSIL
+  service name as written; `op` is the CSIL operation name as written
+  (kebab-case). A receiver maps `(service, op)` onto its generated router.
 - **`id`** is a per-connection monotonically increasing unsigned integer. It is
   **REQUIRED** on carriers that allow more than one call in flight on one
   connection (WebSocket, a pipelined byte stream) and **OPTIONAL** on strictly
@@ -236,7 +236,7 @@ handler/router. CSIL-RPC pins what `call` and the server put on the wire:
 
 The existing generated client transport seam is defined to produce exactly the
 above. Per `docs/cbor-wire-contract.md` and `csil-spec.md`, generators emit a
-`Transport`/`call(service, method, req)` shape per language; CSIL-RPC pins its
+`Transport`/`call(service, op, req)` shape per language; CSIL-RPC pins its
 behavior:
 
 - `call(service, op, req)` MUST encode a `CsilRpcRequest` per §1.1, deliver it via

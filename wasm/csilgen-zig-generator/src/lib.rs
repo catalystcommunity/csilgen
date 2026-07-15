@@ -9,11 +9,11 @@
 //! `process_generation` and its helpers are Zig-specific.
 
 use csilgen_common::{
-    CsilControlOperator, CsilFieldMetadata, CsilGroupEntry, CsilGroupExpression, CsilGroupKey,
-    CsilLiteralValue, CsilOccurrence, CsilRuleType, CsilServiceDefinition, CsilServiceDirection,
-    CsilSizeConstraint, CsilTypeExpression, CsilValidationConstraint, GeneratedFile,
-    GenerationStats, GeneratorCapability, GeneratorMetadata, GeneratorWarning, WarningLevel,
-    WasmGeneratorInput, WasmGeneratorOutput, wasm_interface::*,
+    ChoiceClass, CsilControlOperator, CsilFieldMetadata, CsilGroupEntry, CsilGroupExpression,
+    CsilGroupKey, CsilLiteralValue, CsilOccurrence, CsilRuleType, CsilServiceDefinition,
+    CsilServiceDirection, CsilSizeConstraint, CsilTypeExpression, CsilValidationConstraint,
+    GeneratedFile, GenerationStats, GeneratorCapability, GeneratorMetadata, GeneratorWarning,
+    WarningLevel, WasmGeneratorInput, WasmGeneratorOutput, wasm_interface::*,
 };
 use std::collections::HashMap;
 
@@ -149,9 +149,32 @@ enum Surface {
     TypesOnly,
 }
 
-fn process_generation(input: WasmGeneratorInput) -> Result<WasmGeneratorOutput, i32> {
+fn process_generation(mut input: WasmGeneratorInput) -> Result<WasmGeneratorOutput, i32> {
     let config = ZigConfig::from_options(&input.config.options)?;
     let _ = &config;
+    // A record field (or array element / map value / tuple element) whose type is
+    // an inline, unnamed choice or group has no codec route of its own — rewrite it
+    // to reference a synthesized named rule before any other generation phase runs,
+    // so every downstream emitter (types/validation/codec/client/server) only ever
+    // sees named types in field position, exactly as if the CSIL source had spelled
+    // out `FieldType = ...` and referenced it. `hoist_all_literal_choices: true`
+    // (OCaml's setting, not TypeScript's): unlike TypeScript's native string-
+    // literal union type, Zig has no inline representation for a closed literal
+    // vocabulary that keeps its wire_name/closed-set-validation semantics —
+    // `map_zig_type`'s only inline fallback for an all-text choice collapses it to
+    // a bare `[]const u8`, which is *weaker* than the field's declared type (it
+    // silently accepts any string, not just the declared set). So even a
+    // pure-literal inline choice needs a synthesized name to become the real
+    // `enum`/`enum(i64)`/mixed-enum type `generate_types` can otherwise only
+    // build for a *named* rule. Matches this generator's pre-existing behavior
+    // (its own former hand-rolled hoister hoisted every inline `Choice`
+    // unconditionally, with no all-literal exemption).
+    input.csil_spec = csilgen_common::hoist_inline_composites(
+        &input.csil_spec,
+        csilgen_common::HoistOptions {
+            hoist_all_literal_choices: true,
+        },
+    );
     let surface = match input.config.target.as_str() {
         "zig" | "zig-server" => Surface::Server,
         "zig-client" => Surface::Client,
@@ -299,6 +322,14 @@ enum TypeKind<'a> {
     /// An all-int-literal choice (`Priority = 1 / 2 / 3`): a closed `enum(i64)`
     /// whose wire form is the bare integer (its own discriminant), not a tagged sum.
     IntEnum(Vec<i64>),
+    /// An all-literal choice whose kinds are NOT uniform (`"a" / 1`) — per the
+    /// shared classifier's normative contract (`csilgen_common::choice`) this is
+    /// STILL an `Enum`, just one with no single Zig type able to back a uniform
+    /// `wire_name`/`wire_value` accessor. Represented as a plain nullary `enum`,
+    /// the same shape as `Enum`/`IntEnum` (not a `union(enum)` — no arm carries
+    /// any payload beyond its own compile-time-known literal, so there's nothing
+    /// for a union payload to hold); see `emit_mixed_enum`/`emit_mixed_enum_codec`.
+    MixedEnum(Vec<CsilLiteralValue>),
     Union(&'a [CsilTypeExpression]),
     GroupUnion(&'a [CsilGroupExpression]),
 }
@@ -309,84 +340,65 @@ fn classify_rule(rule_type: &CsilRuleType) -> Option<TypeKind<'_>> {
         CsilRuleType::TypeDef(CsilTypeExpression::Group(g)) => Some(TypeKind::Struct(g)),
         // The parser routes a named choice (`X = A / B`) to a `TypeDef(Choice)`, so
         // this is where real specs land; classify it into the same closed-enum /
-        // open-string / tagged-union shapes a hand-built `TypeChoice` would.
-        CsilRuleType::TypeDef(t @ CsilTypeExpression::Choice(arms)) => {
-            Some(classify_choice(arms, t))
-        }
+        // tagged-union shapes a hand-built `TypeChoice` would.
+        CsilRuleType::TypeDef(CsilTypeExpression::Choice(arms)) => Some(classify_choice(arms)),
         CsilRuleType::TypeDef(t) => Some(TypeKind::Alias(t)),
-        CsilRuleType::TypeChoice(arms) => {
-            let text_literals: Option<Vec<String>> = arms
-                .iter()
-                .map(|a| match unwrap_constrained(a) {
-                    CsilTypeExpression::Literal(CsilLiteralValue::Text(t)) => Some(t.clone()),
-                    _ => None,
-                })
-                .collect();
-            if let Some(names) = text_literals
-                && !names.is_empty()
-            {
-                return Some(TypeKind::Enum(names));
-            }
-            let int_literals: Option<Vec<i64>> = arms
-                .iter()
-                .map(|a| match unwrap_constrained(a) {
-                    CsilTypeExpression::Literal(CsilLiteralValue::Integer(n)) => Some(*n),
-                    _ => None,
-                })
-                .collect();
-            if let Some(ints) = int_literals
-                && !ints.is_empty()
-            {
-                return Some(TypeKind::IntEnum(ints));
-            }
-            Some(TypeKind::Union(arms))
-        }
+        // `TypeChoice` never reaches a generator from real CSIL source once imports
+        // are resolved (every `=`/`/=` choice rule collapses to `TypeDef(Choice(...))`
+        // before the WASM boundary — see csilgen-core's `ast.rs` doc comment on the
+        // variant). Kept only so a hand-built synthetic AST (a unit test) still
+        // classifies correctly, routed through the same shared classifier rather
+        // than duplicating its text/int/mixed logic a second time.
+        CsilRuleType::TypeChoice(arms) => Some(classify_choice(arms)),
         CsilRuleType::GroupChoice(arms) => Some(TypeKind::GroupUnion(arms)),
         CsilRuleType::ServiceDef(_) => None,
     }
 }
 
-/// Classify the arms of a choice rule. A choice of only text literals is a closed
-/// `enum`; a choice that mixes the `text` builtin with literals is an open string
-/// (`[]const u8` — any text is allowed, the literals are merely suggested values);
-/// anything else (referenced types) is a tagged `union(enum)`. The `whole`
-/// expression is carried so the open-string case can alias the choice straight to
-/// its `map_zig_type` result.
-fn classify_choice<'a>(
-    arms: &'a [CsilTypeExpression],
-    whole: &'a CsilTypeExpression,
-) -> TypeKind<'a> {
-    let text_literals: Option<Vec<String>> = arms
+/// Classify the arms of a choice rule per the shared, normative contract
+/// (`csilgen_common::classify_choice`): every arm a literal (any kind, possibly
+/// mixed) is an `Enum`; at least one non-literal arm is a tagged `union(enum)`
+/// (`[variant_index, value]` on the wire). This only layers Zig's own enum
+/// sub-shapes on top — uniform text (`Enum`), uniform int (`IntEnum`), or any
+/// other kind mix (`MixedEnum`) — via `classify_enum`.
+fn classify_choice(arms: &[CsilTypeExpression]) -> TypeKind<'_> {
+    match csilgen_common::classify_choice(arms) {
+        ChoiceClass::Enum(literals) => classify_enum(literals),
+        ChoiceClass::Union(_) => TypeKind::Union(arms),
+    }
+}
+
+/// Sub-classify an ALL-literal choice (`ChoiceClass::Enum`) into the shape Zig
+/// renders: a uniform text vocabulary keeps the historical `Enum` (bare string on
+/// the wire), a uniform int vocabulary keeps `IntEnum` (bare integer), and any
+/// other kind mix — including one mixing text/int/float/bool/bytes — becomes
+/// `MixedEnum`. Previously a mixed-kind literal choice fell through to `Union`
+/// (a `[index, value]` tagged sum) because Zig's classifier required a uniform
+/// text-only or int-only vocabulary before recognizing an enum at all — the same
+/// bug this module's shared classifier documents as a real regression in the
+/// TypeScript and OCaml generators before their own fixes.
+fn classify_enum<'a>(literals: Vec<&CsilLiteralValue>) -> TypeKind<'a> {
+    if let Some(names) = literals
         .iter()
-        .map(|a| match unwrap_constrained(a) {
-            CsilTypeExpression::Literal(CsilLiteralValue::Text(t)) => Some(t.clone()),
+        .map(|l| match l {
+            CsilLiteralValue::Text(t) => Some(t.clone()),
             _ => None,
         })
-        .collect();
-    if let Some(names) = text_literals
-        && !names.is_empty()
+        .collect::<Option<Vec<String>>>()
     {
         return TypeKind::Enum(names);
     }
-    // An all-int-literal choice is a closed integer enum whose wire form is the bare
-    // integer (matching the Go/Rust references); only a heterogeneous set of real
-    // types becomes a tagged-sum union.
-    let int_literals: Option<Vec<i64>> = arms
+    if let Some(ints) = literals
         .iter()
-        .map(|a| match unwrap_constrained(a) {
-            CsilTypeExpression::Literal(CsilLiteralValue::Integer(n)) => Some(*n),
+        .map(|l| match l {
+            CsilLiteralValue::Integer(n) => Some(*n),
             _ => None,
         })
-        .collect();
-    if let Some(ints) = int_literals
-        && !ints.is_empty()
+        .collect::<Option<Vec<i64>>>()
     {
         return TypeKind::IntEnum(ints);
     }
-    if arms.iter().all(is_text_like) {
-        return TypeKind::Alias(whole);
-    }
-    TypeKind::Union(arms)
+    TypeKind::MixedEnum(literals.into_iter().cloned().collect())
 }
 
 /// The names this entry embeds *by value* (so its definition is ordered after
@@ -426,6 +438,7 @@ fn generate_types(input: &WasmGeneratorInput, config: &ZigConfig) -> Option<Stri
         match kind {
             TypeKind::Enum(variants) => emit_enum(&mut enums, name, variants),
             TypeKind::IntEnum(values) => emit_int_enum(&mut enums, name, values),
+            TypeKind::MixedEnum(literals) => emit_mixed_enum(&mut enums, name, literals),
             TypeKind::Alias(t) => {
                 aliases.push_str(&format!("/// {name} is a type alias.\n"));
                 aliases.push_str(&format!("pub const {name} = {};\n\n", map_zig_type(t, "")));
@@ -559,7 +572,7 @@ fn emit_enum(content: &mut String, name: &str, variants: &[String]) {
     content.push_str(&format!("/// {name} is an enumeration.\n"));
     content.push_str(&format!("pub const {name} = enum {{\n"));
     for variant in variants {
-        content.push_str(&format!("    {},\n", zig_ident(&to_snake(variant))));
+        content.push_str(&format!("    {},\n", zig_field_ident(&to_snake(variant))));
     }
     // The wire form of a closed CSIL enum is the original literal text, which may
     // differ from the snake_case Zig tag; wire_name maps each tag back verbatim.
@@ -570,7 +583,7 @@ fn emit_enum(content: &mut String, name: &str, variants: &[String]) {
     for variant in variants {
         content.push_str(&format!(
             "            .{} => \"{}\",\n",
-            zig_ident(&to_snake(variant)),
+            zig_field_ident(&to_snake(variant)),
             zig_escape(variant)
         ));
     }
@@ -604,16 +617,79 @@ fn int_enum_member(v: i64) -> String {
     }
 }
 
+/// A stable Zig identifier for one member of a MIXED-kind literal enum
+/// (`TypeKind::MixedEnum`). A text literal keeps the readable wire-verbatim
+/// snake_case name `emit_enum` uses for a pure-text enum; an integer reuses
+/// `int_enum_member`'s naming so `1` names the same identifier in a `MixedEnum`
+/// as it would in a pure `IntEnum`; bool/float get their own derived-from-the-
+/// literal spelling; bytes/null/array literals have no compact textual form
+/// worth naming after, so they fall back to the positional form every other
+/// kind also uses as its last resort (see `mixed_enum_member_names`'s de-dup).
+fn mixed_enum_member_name(lit: &CsilLiteralValue, index: usize) -> String {
+    match lit {
+        CsilLiteralValue::Text(s) => zig_field_ident(&to_snake(s)),
+        CsilLiteralValue::Integer(n) => int_enum_member(*n),
+        CsilLiteralValue::Bool(b) => format!("v_{}", if *b { "true" } else { "false" }),
+        CsilLiteralValue::Float(f) => {
+            let text = f.to_string();
+            match text.strip_prefix('-') {
+                Some(rest) => format!("v_neg{}", rest.replace('.', "_")),
+                None => format!("v{}", text.replace('.', "_")),
+            }
+        }
+        _ => format!("v{index}"),
+    }
+}
+
+/// The unique member identifiers for a `MixedEnum`'s literals, de-duplicating a
+/// name collision (e.g. two text literals that snake_case to the same spelling)
+/// by falling back to the positional form, which is always unique since it's the
+/// loop index.
+fn mixed_enum_member_names(literals: &[CsilLiteralValue]) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    literals
+        .iter()
+        .enumerate()
+        .map(|(index, lit)| {
+            let name = mixed_enum_member_name(lit, index);
+            if seen.insert(name.clone()) {
+                name
+            } else {
+                format!("v{index}")
+            }
+        })
+        .collect()
+}
+
+/// A closed set of literals whose kinds are NOT uniform (`"a" / 1`) — the third
+/// bare-literal enum shape alongside `emit_enum` (uniform text) and
+/// `emit_int_enum` (uniform int). Same plain nullary `enum` shape as those two,
+/// not a `union(enum)`: no member carries any payload beyond its own
+/// compile-time-known literal, and a mixed vocabulary has no single Zig type a
+/// uniform `wire_name`/`wire_value` accessor could return across every member,
+/// so the literal is instead recovered directly in the codec's switch
+/// (`emit_mixed_enum_codec`) rather than through an accessor method here.
+fn emit_mixed_enum(content: &mut String, name: &str, literals: &[CsilLiteralValue]) {
+    content.push_str(&format!(
+        "/// {name} is an enumeration of mixed-kind literal wire values.\n"
+    ));
+    content.push_str(&format!("pub const {name} = enum {{\n"));
+    for member in mixed_enum_member_names(literals) {
+        content.push_str(&format!("    {member},\n"));
+    }
+    content.push_str("};\n\n");
+}
+
 fn emit_struct(content: &mut String, name: &str, group: &CsilGroupExpression, type_prefix: &str) {
     content.push_str(&format!("/// {name} is a structured data type.\n"));
-    content.push_str(&format!("pub const {name} = struct {{\n"));
+    let mut body = String::new();
     for entry in &group.entries {
         if let Some(field) = entry_field_name(&entry.key) {
             if let Some(description) = field_description(entry) {
-                content.push_str(&format!("    /// {description}\n"));
+                body.push_str(&format!("    /// {description}\n"));
             }
             emit_field(
-                content,
+                &mut body,
                 &field,
                 &entry.value_type,
                 &entry.occurrence,
@@ -621,7 +697,13 @@ fn emit_struct(content: &mut String, name: &str, group: &CsilGroupExpression, ty
             );
         }
     }
-    content.push_str("};\n\n");
+    // zig fmt collapses a fieldless struct onto one line, so emit that form
+    // directly instead of an empty braced block it would rewrite.
+    if body.is_empty() {
+        content.push_str(&format!("pub const {name} = struct {{}};\n\n"));
+    } else {
+        content.push_str(&format!("pub const {name} = struct {{\n{body}}};\n\n"));
+    }
 }
 
 /// Emit one struct field. Snake_case CSIL field names map verbatim to Zig field
@@ -634,7 +716,7 @@ fn emit_field(
     occurrence: &Option<CsilOccurrence>,
     type_prefix: &str,
 ) {
-    let ident = zig_ident(field);
+    let ident = zig_field_ident(field);
     let zt = map_zig_type(value_type, type_prefix);
     if matches!(occurrence, Some(CsilOccurrence::Optional)) {
         // A type that is already nullable (the `?*anyopaque` dynamic fallback) is not
@@ -656,7 +738,7 @@ fn emit_choice(content: &mut String, name: &str, arms: &[CsilTypeExpression], ty
     content.push_str(&format!("/// {name} is a tagged union.\n"));
     content.push_str(&format!("pub const {name} = union(enum) {{\n"));
     for (i, arm) in arms.iter().enumerate() {
-        let tag = zig_ident(&to_snake(&arm_name(arm, i)));
+        let tag = zig_field_ident(&to_snake(&arm_name(arm, i)));
         content.push_str(&format!("    {tag}: {},\n", map_zig_type(arm, type_prefix)));
     }
     content.push_str(&format!(
@@ -664,7 +746,7 @@ fn emit_choice(content: &mut String, name: &str, arms: &[CsilTypeExpression], ty
     ));
     content.push_str("        return switch (self) {\n");
     for (i, arm) in arms.iter().enumerate() {
-        let tag = zig_ident(&to_snake(&arm_name(arm, i)));
+        let tag = zig_field_ident(&to_snake(&arm_name(arm, i)));
         content.push_str(&format!(
             "            .{tag} => \"{}\",\n",
             zig_escape(&arm_name(arm, i))
@@ -727,7 +809,7 @@ fn emit_validate_fn(content: &mut String, name: &str, group: &CsilGroupExpressio
     for entry in &group.entries {
         if let Some(field) = entry_field_name(&entry.key) {
             let optional = matches!(entry.occurrence, Some(CsilOccurrence::Optional));
-            let ident = zig_ident(&field);
+            let ident = zig_field_ident(&field);
             for metadata in &entry.metadata {
                 if let CsilFieldMetadata::Constraint(constraint) = metadata {
                     emit_metadata_check(&mut checks, &ident, optional, constraint);
@@ -926,6 +1008,17 @@ fn resolve_alias<'a>(
         }
     }
     cur
+}
+
+/// Whether a union arm's encoder actually reads its captured switch value. A literal
+/// arm encodes its own declared constant unconditionally (`emit_enc_literal` never
+/// looks at the payload), so `emit_union_codec` must not bind an unread capture for
+/// it — Zig's compiler rejects an unused switch-capture as a hard error.
+fn enc_arm_uses_capture(
+    ty: &CsilTypeExpression,
+    aliases: &HashMap<String, CsilTypeExpression>,
+) -> bool {
+    !matches!(resolve_alias(ty, aliases), CsilTypeExpression::Literal(_))
 }
 
 /// Emit a statement that encodes the scalar/reference value `expr` of type `ty`.
@@ -1222,18 +1315,37 @@ fn emit_dec_literal(
     dst: &str,
     warnings: &mut Vec<GeneratorWarning>,
 ) {
+    // Each arm below is >1 statement; zig fmt always expands a multi-statement block
+    // onto its own lines (regardless of how short it is), so the emitter builds that
+    // shape directly rather than emitting a packed one-liner zig fmt would rewrite.
     match value {
         CsilLiteralValue::Integer(i) if *i >= 0 => out.push_str(&format!(
-            "{indent}{{ const csil_lit = try as_u64({src}); if (csil_lit != @as(u64, {i})) return error.WrongType; {dst} = @as(i64, {i}); }}\n"
+            "{indent}{{\n\
+             {indent}    const csil_lit = try as_u64({src});\n\
+             {indent}    if (csil_lit != @as(u64, {i})) return error.WrongType;\n\
+             {indent}    {dst} = @as(i64, {i});\n\
+             {indent}}}\n"
         )),
         CsilLiteralValue::Integer(i) => out.push_str(&format!(
-            "{indent}{{ const csil_lit = try as_i64({src}); if (csil_lit != @as(i64, {i})) return error.WrongType; {dst} = @as(i64, {i}); }}\n"
+            "{indent}{{\n\
+             {indent}    const csil_lit = try as_i64({src});\n\
+             {indent}    if (csil_lit != @as(i64, {i})) return error.WrongType;\n\
+             {indent}    {dst} = @as(i64, {i});\n\
+             {indent}}}\n"
         )),
         CsilLiteralValue::Float(f) => out.push_str(&format!(
-            "{indent}{{ const csil_lit = try as_f64({src}); if (csil_lit != @as(f64, {f})) return error.WrongType; {dst} = @as(f64, {f}); }}\n"
+            "{indent}{{\n\
+             {indent}    const csil_lit = try as_f64({src});\n\
+             {indent}    if (csil_lit != @as(f64, {f})) return error.WrongType;\n\
+             {indent}    {dst} = @as(f64, {f});\n\
+             {indent}}}\n"
         )),
         CsilLiteralValue::Text(s) => out.push_str(&format!(
-            "{indent}{{ const csil_lit = try as_text({src}); if (!std.mem.eql(u8, csil_lit, \"{}\")) return error.WrongType; {dst} = csil_lit; }}\n",
+            "{indent}{{\n\
+             {indent}    const csil_lit = try as_text({src});\n\
+             {indent}    if (!std.mem.eql(u8, csil_lit, \"{}\")) return error.WrongType;\n\
+             {indent}    {dst} = csil_lit;\n\
+             {indent}}}\n",
             zig_escape(s)
         )),
         CsilLiteralValue::Bytes(bytes) => {
@@ -1243,14 +1355,24 @@ fn emit_dec_literal(
                 .collect::<Vec<_>>()
                 .join(", ");
             out.push_str(&format!(
-                "{indent}{{ const csil_lit = try as_bytes({src}); if (!std.mem.eql(u8, csil_lit, &[_]u8{{ {values} }})) return error.WrongType; {dst} = csil_lit; }}\n"
+                "{indent}{{\n\
+                 {indent}    const csil_lit = try as_bytes({src});\n\
+                 {indent}    if (!std.mem.eql(u8, csil_lit, &[_]u8{{ {values} }})) return error.WrongType;\n\
+                 {indent}    {dst} = csil_lit;\n\
+                 {indent}}}\n"
             ));
         }
         CsilLiteralValue::Bool(b) => out.push_str(&format!(
-            "{indent}{{ const csil_lit = try as_bool({src}); if (csil_lit != {b}) return error.WrongType; {dst} = {b}; }}\n"
+            "{indent}{{\n\
+             {indent}    const csil_lit = try as_bool({src});\n\
+             {indent}    if (csil_lit != {b}) return error.WrongType;\n\
+             {indent}    {dst} = {b};\n\
+             {indent}}}\n"
         )),
         CsilLiteralValue::Null => {
-            out.push_str(&format!("{indent}if ({src} != .null) return error.WrongType; {dst} = null;\n"));
+            out.push_str(&format!(
+                "{indent}if ({src} != .null) return error.WrongType;\n{indent}{dst} = null;\n"
+            ));
         }
         CsilLiteralValue::Array(_) => {
             warnings.push(codec_warning(
@@ -1280,7 +1402,7 @@ fn emit_enc_field(
     aliases: &HashMap<String, CsilTypeExpression>,
     warnings: &mut Vec<GeneratorWarning>,
 ) {
-    let member = zig_ident(&field.name);
+    let member = zig_field_ident(&field.name);
     let key = zig_escape(&field.name);
     // Resolve transparent aliases so a field typed as a named map/array/scalar alias
     // is encoded through the same branch its inline form would take, not the stub.
@@ -1451,7 +1573,7 @@ fn emit_dec_field(
     aliases: &HashMap<String, CsilTypeExpression>,
     warnings: &mut Vec<GeneratorWarning>,
 ) {
-    let member = zig_ident(&field.name);
+    let member = zig_field_ident(&field.name);
     let key = zig_escape(&field.name);
     // Resolve transparent aliases so a field typed as a named map/array/scalar alias
     // is decoded through the same branch its inline form would take, not the stub.
@@ -1624,7 +1746,7 @@ fn emit_record_codec(
         for field in &optionals {
             out.push_str(&format!(
                 "    if (v.{} != null) csil_n += 1;\n",
-                zig_ident(&field.name)
+                zig_field_ident(&field.name)
             ));
         }
         out.push_str("    try w_map_head(out, csil_n);\n");
@@ -1669,7 +1791,7 @@ fn emit_enum_codec(out: &mut String, name: &str, variants: &[String]) {
         out.push_str(&format!(
             "    if (std.mem.eql(u8, csil_s, \"{}\")) {{\n        out.* = .{};\n        return;\n    }}\n",
             zig_escape(variant),
-            zig_ident(&to_snake(variant))
+            zig_field_ident(&to_snake(variant))
         ));
     }
     out.push_str("    return error.WrongType;\n}\n\n");
@@ -1691,6 +1813,87 @@ fn emit_int_enum_codec(out: &mut String, name: &str) {
     ));
 }
 
+/// A boolean expression (referencing a local `src: Value`), true when the decoded
+/// wire value equals `lit`'s own canonical CBOR form — matched directly against
+/// the `Value` union's tag and payload rather than through the fallible `as_*`
+/// accessors (`as_text`/`as_i64`/...), which hard-error on a type mismatch
+/// instead of reporting "not this arm" so the next literal in the vocabulary can
+/// still be tried. `None` for a literal kind this codec cannot represent (an
+/// array literal never reaches a real CSIL choice arm, but `CsilLiteralValue` is
+/// exhaustively matched here for compiler-enforced completeness); the caller
+/// warns and treats it as never-matching.
+fn mixed_literal_match_expr(lit: &CsilLiteralValue) -> Option<String> {
+    Some(match lit {
+        CsilLiteralValue::Integer(i) if *i >= 0 => {
+            format!("src == .uint and src.uint == @as(u64, {i})")
+        }
+        CsilLiteralValue::Integer(i) => format!("src == .int and src.int == @as(i64, {i})"),
+        CsilLiteralValue::Float(f) => format!("src == .float and src.float == @as(f64, {f})"),
+        CsilLiteralValue::Text(s) => format!(
+            "src == .text and std.mem.eql(u8, src.text, \"{}\")",
+            zig_escape(s)
+        ),
+        CsilLiteralValue::Bool(b) => format!("src == .boolean and src.boolean == {b}"),
+        CsilLiteralValue::Bytes(bytes) => {
+            let values = bytes
+                .iter()
+                .map(|b| format!("0x{b:02x}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("src == .bytes and std.mem.eql(u8, src.bytes, &[_]u8{{ {values} }})")
+        }
+        CsilLiteralValue::Null => "src == .null".to_string(),
+        CsilLiteralValue::Array(_) => return None,
+    })
+}
+
+/// Emit the encode + decode for a `MixedEnum`: no `[index, value]` wrapper — every
+/// member IS a literal, so the bare literal is already self-discriminating on the
+/// wire, exactly like `emit_enum_codec`/`emit_int_enum_codec` — but unlike those
+/// two, no single uniform accessor spans every member's kind. Encode switches on
+/// the enum tag straight to `emit_enc_literal` for that member's own literal (the
+/// same per-arm literal dispatch `emit_union_codec` uses for a literal arm, just
+/// with no discriminant prefix or captured payload — a `MixedEnum` member carries
+/// neither). Decode reads the wire value once and membership-matches it, in
+/// declaration order, against every literal via `mixed_literal_match_expr`,
+/// rejecting anything outside the declared vocabulary on the way out — the "not
+/// merely a same-kind runtime check" half of the shared Enum contract
+/// (`csilgen_common::choice`) that a naive uniform-type decoder would miss.
+fn emit_mixed_enum_codec(
+    out: &mut String,
+    name: &str,
+    literals: &[CsilLiteralValue],
+    warnings: &mut Vec<GeneratorWarning>,
+) {
+    let names = mixed_enum_member_names(literals);
+    out.push_str(&format!(
+        "fn enc_{name}(out: *std.ArrayList(u8), v: *const types.{name}) CodecError!void {{\n"
+    ));
+    out.push_str("    switch (v.*) {\n");
+    for (member, lit) in names.iter().zip(literals) {
+        out.push_str(&format!("        .{member} => {{\n"));
+        emit_enc_literal(out, "            ", lit, warnings);
+        out.push_str("        },\n");
+    }
+    out.push_str("    }\n}\n\n");
+
+    out.push_str(&format!(
+        "fn dec_{name}(alloc: std.mem.Allocator, src: Value, out: *types.{name}) CodecError!void {{\n"
+    ));
+    out.push_str("    _ = alloc;\n");
+    for (member, lit) in names.iter().zip(literals) {
+        match mixed_literal_match_expr(lit) {
+            Some(cond) => out.push_str(&format!(
+                "    if ({cond}) {{\n        out.* = .{member};\n        return;\n    }}\n"
+            )),
+            None => warnings.push(codec_warning(
+                "zig codec: array literal in mixed enum never matches on decode".to_string(),
+            )),
+        }
+    }
+    out.push_str("    return error.WrongType;\n}\n\n");
+}
+
 /// Emit the encode + decode for a tagged-sum union. The wire form is a 2-element CBOR
 /// array `[variant_index, value]`: the 0-based declaration ordinal then that arm's own
 /// CBOR. Decode reads the index and dispatches to that arm's decoder.
@@ -1708,8 +1911,15 @@ fn emit_union_codec(
     out.push_str("    try w_array_head(out, 2);\n");
     out.push_str("    switch (v.*) {\n");
     for (i, arm) in arms.iter().enumerate() {
-        let tag = zig_ident(&to_snake(&arm_name(arm, i)));
-        out.push_str(&format!("        .{tag} => |csil_x| {{\n"));
+        let tag = zig_field_ident(&to_snake(&arm_name(arm, i)));
+        // A literal arm's encoder writes its declared constant regardless of the
+        // captured payload (see `emit_enc_literal`), so the capture would go unread;
+        // Zig rejects an unused switch-capture, so discard it (`|_|`) for that arm.
+        if enc_arm_uses_capture(arm, aliases) {
+            out.push_str(&format!("        .{tag} => |csil_x| {{\n"));
+        } else {
+            out.push_str(&format!("        .{tag} => {{\n"));
+        }
         out.push_str(&format!("            try w_uint(out, {i});\n"));
         emit_enc_value(
             out,
@@ -1737,7 +1947,7 @@ fn emit_union_codec(
     out.push_str("    const csil_idx = try as_u64(src.array[0]);\n");
     out.push_str("    switch (csil_idx) {\n");
     for (i, arm) in arms.iter().enumerate() {
-        let tag = zig_ident(&to_snake(&arm_name(arm, i)));
+        let tag = zig_field_ident(&to_snake(&arm_name(arm, i)));
         out.push_str(&format!("        {i} => {{\n"));
         out.push_str(&format!(
             "            var csil_tmp: {} = undefined;\n",
@@ -1795,7 +2005,11 @@ fn generate_codec(
         .filter(|(_, k)| {
             matches!(
                 k,
-                TypeKind::Struct(_) | TypeKind::Enum(_) | TypeKind::IntEnum(_) | TypeKind::Union(_)
+                TypeKind::Struct(_)
+                    | TypeKind::Enum(_)
+                    | TypeKind::IntEnum(_)
+                    | TypeKind::MixedEnum(_)
+                    | TypeKind::Union(_)
             )
         })
         .map(|(n, _)| n.to_string())
@@ -1814,6 +2028,9 @@ fn generate_codec(
             }
             TypeKind::Enum(variants) => emit_enum_codec(&mut bodies, name, variants),
             TypeKind::IntEnum(_) => emit_int_enum_codec(&mut bodies, name),
+            TypeKind::MixedEnum(literals) => {
+                emit_mixed_enum_codec(&mut bodies, name, literals, warnings)
+            }
             TypeKind::Union(arms) => {
                 emit_union_codec(&mut bodies, name, arms, &codec_names, &aliases, warnings)
             }
@@ -1903,7 +2120,6 @@ fn generate_client(input: &WasmGeneratorInput) -> Option<String> {
 fn emit_client_struct(content: &mut String, name: &str, service: &CsilServiceDefinition) {
     let base = service_base(name);
     let client = format!("{base}Client");
-    let wire_service = base.to_lowercase();
     content.push_str(&format!(
         "/// {client} is a typed client for the {name} service over a CsilgenTransport.\n"
     ));
@@ -1925,7 +2141,7 @@ fn emit_client_struct(content: &mut String, name: &str, service: &CsilServiceDef
             continue;
         }
         let method = zig_ident(&to_snake(&op.name));
-        let wire_op = simple_pascal(&op.name);
+        let wire_op = &op.name;
         let resp_type = map_zig_type(&success_type(&op.output_type), "types.");
         let resp_codec = type_codec_name(&success_type(&op.output_type));
         let has_input = !op_input_is_null(&op.input_type);
@@ -1933,7 +2149,7 @@ fn emit_client_struct(content: &mut String, name: &str, service: &CsilServiceDef
         let req_codec = type_codec_name(&op.input_type);
 
         content.push_str(&format!(
-            "\n    /// Invoke {wire_service}/{wire_op} with a typed request, returning the decoded\n\
+            "\n    /// Invoke {name}/{wire_op} with a typed request, returning the decoded\n\
              \x20   /// typed response. Everything in `out` is allocated from `alloc`; pass an arena\n\
              \x20   /// and free it once when done.\n"
         ));
@@ -1952,7 +2168,7 @@ fn emit_client_struct(content: &mut String, name: &str, service: &CsilServiceDef
             content.push_str("        const csil_reqb: []const u8 = &.{};\n");
         }
         content.push_str(&format!(
-            "        const csil_respb = try self.transport.call(self.transport.ptr, alloc, \"{wire_service}\", \"{wire_op}\", csil_reqb);\n"
+            "        const csil_respb = try self.transport.call(self.transport.ptr, alloc, \"{name}\", \"{wire_op}\", csil_reqb);\n"
         ));
         content.push_str("        defer alloc.free(csil_respb);\n");
         content.push_str(&format!(
@@ -2024,7 +2240,7 @@ fn emit_handlers_struct(content: &mut String, name: &str, service: &CsilServiceD
     ));
     content.push_str(&format!("pub const {base}Handlers = struct {{\n"));
     for op in &service.operations {
-        let method = zig_ident(&to_snake(&op.name));
+        let method = zig_field_ident(&to_snake(&op.name));
         match op.direction {
             CsilServiceDirection::Unidirectional => {
                 let out_type = map_zig_type(&success_type(&op.output_type), "types.");
@@ -2094,8 +2310,8 @@ fn emit_channel_router(content: &mut String, name: &str, service: &CsilServiceDe
         if !matches!(op.direction, CsilServiceDirection::Bidirectional) {
             continue;
         }
-        let method = zig_ident(&to_snake(&op.name));
-        let wire_op = simple_pascal(&op.name);
+        let method = zig_field_ident(&to_snake(&op.name));
+        let wire_op = &op.name;
         let in_type = map_zig_type(&op.input_type, "types.");
         content.push_str(&format!(
             "    if (std.mem.eql(u8, method, \"{wire_op}\")) {{\n"
@@ -2133,7 +2349,7 @@ fn emit_channel_router_compact(content: &mut String, name: &str, service: &CsilS
         let Some(op_id) = operation.wire_id else {
             continue;
         };
-        let method = zig_ident(&to_snake(&operation.name));
+        let method = zig_field_ident(&to_snake(&operation.name));
         let in_type = map_zig_type(&operation.input_type, "types.");
         content.push_str(&format!("        {op_id} => {{\n"));
         content.push_str(&format!("            var msg: {in_type} = undefined;\n"));
@@ -2156,7 +2372,7 @@ fn emit_push_encoders(content: &mut String, name: &str, service: &CsilServiceDef
             continue;
         }
         let method = to_snake(&op.name);
-        let wire_op = simple_pascal(&op.name);
+        let wire_op = &op.name;
         content.push_str(&format!(
             "/// encode_{prefix}_{method} encodes a {wire_op} message the server pushes to a\n\
              /// peer; the implementer frames (\"{wire_op}\", bytes) onto its connection.\n"
@@ -2399,9 +2615,9 @@ fn first_unary_example(input: &WasmGeneratorInput) -> Option<ZigUnaryExample> {
             let has_request = !null_input;
             return Some(ZigUnaryExample {
                 client_type: format!("{base}Client"),
-                method: zig_ident(&to_snake(&op.name)),
-                wire_service: base.to_lowercase(),
-                wire_op: simple_pascal(&op.name),
+                method: zig_field_ident(&to_snake(&op.name)),
+                wire_service: rule.name.clone(),
+                wire_op: op.name.clone(),
                 resp_type: map_zig_type(&success, "types."),
                 has_request,
                 req_literal: if has_request {
@@ -2461,12 +2677,12 @@ fn first_channel_example(input: &WasmGeneratorInput) -> Option<ZigChannelExample
             let prefix = to_snake(&base);
             let method = to_snake(&op.name);
             return Some(ZigChannelExample {
-                service_wire: base.to_lowercase(),
+                service_wire: rule.name.clone(),
                 handlers_type: format!("{base}Handlers"),
                 route_fn: format!("route_{prefix}_channel"),
                 encode_fn: format!("encode_{prefix}_{method}"),
-                method: zig_ident(&method),
-                wire_op: simple_pascal(&op.name),
+                method: zig_field_ident(&method),
+                wire_op: op.name.clone(),
                 in_type: map_zig_type(&op.input_type, "types."),
                 in_codec,
                 out_type: map_zig_type(&success, "types."),
@@ -2508,7 +2724,7 @@ fn zig_request_literal(input: &WasmGeneratorInput, ty: &CsilTypeExpression) -> S
             entry_field_name(&e.key).map(|field| {
                 format!(
                     ".{} = {}",
-                    zig_ident(&field),
+                    zig_field_ident(&field),
                     zig_sample_value(&e.value_type)
                 )
             })
@@ -2545,7 +2761,7 @@ fn first_text_field(input: &WasmGeneratorInput, ty: &CsilTypeExpression) -> Opti
     group.entries.iter().find_map(|e| {
         let is_text = matches!(unwrap_constrained(&e.value_type), CsilTypeExpression::Builtin(n) if n == "text" || n == "tstr");
         if is_text && !matches!(e.occurrence, Some(CsilOccurrence::Optional)) {
-            entry_field_name(&e.key).map(|f| zig_ident(&f))
+            entry_field_name(&e.key).map(|f| zig_field_ident(&f))
         } else {
             None
         }
@@ -3269,9 +3485,9 @@ fn arm_name(arm: &CsilTypeExpression, index: usize) -> String {
 
 // ---- naming (wire names verbatim; Zig symbols cased) ----------------------
 
-/// PascalCase by the same simple rule the other generators use for *wire* method
-/// names, so a Zig client and a Go/Rust/Python/TS server agree byte-for-byte:
-/// break on `_`/`-`, uppercase the letter after each break, keep the rest.
+/// PascalCase by a simple rule — break on `_`/`-`, uppercase the letter after
+/// each break, keep the rest — used only to shape Zig identifiers (via
+/// `service_base`). Wire strings carry the verbatim CSIL names instead.
 fn simple_pascal(s: &str) -> String {
     let mut out = String::new();
     for word in s.split(['_', '-']) {
@@ -3323,8 +3539,10 @@ fn to_snake(s: &str) -> String {
     out
 }
 
-/// Strip a trailing `Service` suffix and PascalCase the remainder, matching the
-/// wire service base used across the other clients.
+/// Strip a trailing `Service` suffix and PascalCase the remainder, used only for
+/// Zig identifiers (client/handlers type names, function prefixes, wire-id
+/// constants). Wire strings carry the verbatim CSIL service name instead
+/// (csil-rpc-transport.md §1.1).
 fn service_base(name: &str) -> String {
     let pascal = simple_pascal(name);
     pascal
@@ -3387,9 +3605,20 @@ const ZIG_KEYWORDS: &[&str] = &[
     "var",
     "volatile",
     "while",
-    // Primitive type / value names are not keywords, but used as a bare field or
-    // tag identifier they shadow or collide with the primitive, so they are quoted
-    // too (the brief calls out `type` specifically).
+];
+
+/// Primitive type/value names are not reserved keywords — they only shadow a
+/// built-in when used as a bare *declaration* or *expression* identifier (a local,
+/// param, const, or `pub fn` name). Empirically (zig 0.14, `zig fmt`/`zig ast-check`)
+/// a name like `type` is REQUIRED to be `@"type"` in those positions (`zig ast-check`
+/// rejects a bare `pub fn type(...)` with "name shadows primitive 'type'"), but in a
+/// *field-name* position — struct field declaration, struct-literal init field,
+/// dotted field access, enum/union member declaration, or a switch arm tag — it is
+/// unambiguous, so `zig fmt` canonicalizes an `@"type"` written there down to bare
+/// `type` and `zig fmt --check` fails against the still-quoted form. `zig_ident`
+/// quotes both lists (declaration/expression positions); `zig_field_ident` quotes
+/// only `ZIG_KEYWORDS` (field-name positions), matching what `zig fmt` emits.
+const ZIG_PRIMITIVE_NAMES: &[&str] = &[
     "type",
     "void",
     "bool",
@@ -3404,13 +3633,32 @@ const ZIG_KEYWORDS: &[&str] = &[
     "false",
 ];
 
-/// Render an identifier safe for Zig: a reserved word (or a name that is not a
-/// valid bare identifier) is wrapped in the `@"..."` quoted form.
-fn zig_ident(name: &str) -> String {
-    let valid_bare = !name.is_empty()
+fn zig_valid_bare(name: &str) -> bool {
+    !name.is_empty()
         && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-        && !name.chars().next().unwrap().is_ascii_digit();
-    if ZIG_KEYWORDS.contains(&name) || !valid_bare {
+        && !name.chars().next().unwrap().is_ascii_digit()
+}
+
+/// Render an identifier safe for Zig in a declaration/expression position (a local,
+/// parameter, const, or `pub fn` name): a reserved word, a primitive type/value name,
+/// or a name that is not a valid bare identifier is wrapped in the `@"..."` quoted
+/// form. See `ZIG_PRIMITIVE_NAMES` for why this differs from `zig_field_ident`.
+fn zig_ident(name: &str) -> String {
+    if ZIG_KEYWORDS.contains(&name) || ZIG_PRIMITIVE_NAMES.contains(&name) || !zig_valid_bare(name)
+    {
+        format!("@\"{}\"", zig_escape(name))
+    } else {
+        name.to_string()
+    }
+}
+
+/// Render an identifier safe for Zig in a field-name position: a struct field
+/// declaration, a struct-literal init field, a dotted field access, an enum/union
+/// member declaration, or a switch arm tag. Only a true reserved word needs quoting
+/// here — `zig fmt` strips `@"..."` off a primitive type/value name like `type` in
+/// this position, so quoting it would fail `zig fmt --check`. See `ZIG_PRIMITIVE_NAMES`.
+fn zig_field_ident(name: &str) -> String {
+    if ZIG_KEYWORDS.contains(&name) || !zig_valid_bare(name) {
         format!("@\"{}\"", zig_escape(name))
     } else {
         name.to_string()

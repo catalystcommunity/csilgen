@@ -153,6 +153,26 @@ pub fn generate_files(input: &WasmGeneratorInput) -> Result<Vec<GeneratedFile>, 
     let _mode = common::bidi_transport(input)?;
     let _decimal = common::decimal_mapping(input)?;
     let style = common::client_style(input)?;
+    let _import_extension = common::import_extension(input)?;
+
+    // Rewrite inline (anonymous) composite field types to synthesized named rules so
+    // every emitter sees them as ordinary references and routes them through the
+    // named-rule machinery; a spec without inline composites is reproduced unchanged.
+    // Every emitter below reads from this single hoisted view so types, codec, client,
+    // and server agree on the synthesized declarations. An all-literal choice is left
+    // inline (`hoist_all_literal_choices: false`) — the codec already renders a
+    // correct bare-literal enum for it in the field position itself.
+    let hoisted = {
+        let mut cloned = input.clone();
+        cloned.csil_spec = csilgen_common::hoist_inline_composites(
+            &input.csil_spec,
+            csilgen_common::HoistOptions {
+                hoist_all_literal_choices: false,
+            },
+        );
+        cloned
+    };
+    let input = &hoisted;
 
     let (want_client, want_server) = match input.config.target.as_str() {
         "typescript-typesonly" => (false, false),
@@ -161,6 +181,20 @@ pub fn generate_files(input: &WasmGeneratorInput) -> Result<Vec<GeneratedFile>, 
         // "typescript" and any alias emit everything
         _ => (true, true),
     };
+    // A service-less spec has nothing for `client.gen.ts`/`server.gen.ts` to route
+    // to. Both files still unconditionally reference the synthetic `ServiceError`
+    // (thrown by the router's default case / used in JSDoc), but `types.gen.ts`
+    // only exports it when the spec declares services, so a service-less "full"
+    // build previously emitted a `server.gen.ts` (and would emit `client.gen.ts`
+    // for any channel-carrying spec) that imported a name the types module never
+    // exported. Go and Python already skip client/server emission entirely for
+    // service-less specs (see `wasm/csilgen-go-generator/src/lib.rs` and
+    // `wasm/csilgen-python-generator/src/lib.rs`); mirror that instead of forcing
+    // `types.gen.ts` to export an unused `ServiceError` just to patch the import.
+    let (want_client, want_server) = (
+        want_client && common::has_services(&input.csil_spec),
+        want_server && common::has_services(&input.csil_spec),
+    );
 
     let mut files = vec![GeneratedFile {
         path: "types.gen.ts".to_string(),

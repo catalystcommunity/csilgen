@@ -30,10 +30,10 @@ fn client_method_is_snake_case_and_wire_strings_are_verbatim() {
     assert!(client.contains("def initialize(transport)"));
     // snake_case Ruby method name...
     assert!(client.contains("def submit_task(req)"));
-    // ...but verbatim wire service (lowercased base) + PascalCase wire method, over
-    // the dumb byte seam: the request self-encodes, the reply self-decodes.
+    // ...but the verbatim CSIL service/op names on the wire (csil-rpc-transport.md
+    // §1.1), over the dumb byte seam: the request self-encodes, the reply self-decodes.
     assert!(client.contains(
-        "SubmitTaskResponse.from_cbor(@transport.call(\"corndogs\", \"SubmitTask\", req.to_cbor))"
+        "SubmitTaskResponse.from_cbor(@transport.call(\"corndogs_service\", \"submit-task\", req.to_cbor))"
     ));
     // The ServiceError arm is stripped from the documented success type.
     assert!(client.contains("-> SubmitTaskResponse"));
@@ -54,7 +54,7 @@ fn null_input_op_takes_no_request_param() {
     let client = file(&s, "ruby-client", "client.rb");
     assert!(client.contains("def ping\n"));
     // A null-input op sends an empty byte payload (no request body).
-    assert!(client.contains("@transport.call(\"events\", \"Ping\", \"\".b)"));
+    assert!(client.contains("@transport.call(\"events_service\", \"ping\", \"\".b)"));
 }
 
 #[test]
@@ -110,10 +110,10 @@ fn channel_service_emits_verbose_router_and_encoders() {
     let server = file(&s, "ruby", "server.rb");
     assert!(server.contains("module MatchRouter"));
     assert!(server.contains("def route_channel(handlers, codec, method, data)"));
-    assert!(server.contains("when \"Play\""));
+    assert!(server.contains("when \"play\""));
     assert!(server.contains("handlers.play(msg)"));
     assert!(server.contains("def encode_play(codec, msg)"));
-    assert!(server.contains("[\"Play\", codec.encode(msg)]"));
+    assert!(server.contains("[\"play\", codec.encode(msg)]"));
     // No wire-ids -> no compact twin.
     assert!(!server.contains("route_channel_compact"));
 }
@@ -156,7 +156,7 @@ fn reverse_op_has_encoder_but_no_inbound_handler() {
     assert!(server.contains("def encode_notify(codec, msg)"));
     // ...but no inbound handler method or router case.
     assert!(!server.contains("def notify("));
-    assert!(!server.contains("when \"Notify\""));
+    assert!(!server.contains("when \"notify\""));
 }
 
 #[test]

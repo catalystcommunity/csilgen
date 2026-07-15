@@ -54,7 +54,9 @@ import {
   validateConstrained,
 } from "./gen/dist/index.js";
 
-const SERVICE = "interop";
+// Wire names are the verbatim CSIL names (cbor-wire-contract.md "RPC call naming"):
+// service as written in interop.csil, ops as written (kebab-case).
+const SERVICE = "Interop";
 const VERBOSE: Profile = "verbose";
 const HOST = "127.0.0.1";
 
@@ -73,6 +75,22 @@ function scalarsOk(): Scalars {
     flag: true,
     when: new Date("2026-06-29T12:34:56Z"),
     amount: CsilDecimal.fromString("123.45"),
+    // mixed-union coverage: a value equal to a literal arm must wire as
+    // [1,"pending"]; a value with no literal match must wire as [0,...].
+    statusLiteral: "pending",
+    statusFree: "unlisted",
+    // inline mixed choice (hoisted; literal arm match).
+    note: "info",
+    // inline all-literal choice (not hoisted).
+    size: "medium",
+    // named enum with a trailing `.default`-constrained last arm.
+    level: "high",
+    // named enum assembled via base rule + `/=` extension.
+    season: "autumn",
+    // named all-literal enum with mixed literal kinds (text + int arms);
+    // renders as a plain union-of-literal-types alias, bare value.
+    shipText: "ground",
+    shipInt: 2,
   };
 }
 
@@ -238,16 +256,16 @@ class StreamFrameCarrier implements FrameCarrier {
 function rpcDispatch(req: RpcRequest): HandlerOutcome {
   try {
     switch (req.op) {
-      case "EchoScalars":
+      case "echo-scalars":
         return okReply("Scalars", toScalarsCbor(fromScalarsCbor(req.payload)));
-      case "EchoCollections":
+      case "echo-collections":
         return okReply("Collections", toCollectionsCbor(fromCollectionsCbor(req.payload)));
-      case "EchoNested":
+      case "echo-nested":
         return okReply(
           "EchoNestedResult",
           toEchoNestedResultCbor({ ok: true, echo: fromNestedCbor(req.payload) }),
         );
-      case "ValidateConstrained": {
+      case "validate-constrained": {
         const v = fromConstrainedCbor(req.payload);
         const errs = validateConstrained(v);
         if (errs.length > 0) {
@@ -359,7 +377,7 @@ async function eventsServer(server: net.Server): Promise<void> {
 
       // Push N ticks (on-tick / server push).
       for (let seq = 0; seq < TICKS; seq++) {
-        await send(Event.verbose(SERVICE, "OnTick", toTickCbor({ seq })));
+        await send(Event.verbose(SERVICE, "on-tick", toTickCbor({ seq })));
       }
 
       // React loop.
@@ -377,14 +395,14 @@ async function eventsServer(server: net.Server): Promise<void> {
           await send(Event.verbose(undefined, control.PONG_NAME, ev.payload));
         } else if (method === control.CLOSE_NAME) {
           break;
-        } else if (method === "Duplex") {
+        } else if (method === "duplex") {
           let s: Scalars;
           try {
             s = fromScalarsCbor(ev.payload);
           } catch {
             continue;
           }
-          await send(Event.verbose(SERVICE, "Duplex", toScalarsCbor(s)));
+          await send(Event.verbose(SERVICE, "duplex", toScalarsCbor(s)));
         } else {
           await send(Event.verbose(undefined, control.ERROR_NAME, new Uint8Array(0)));
         }
@@ -427,9 +445,9 @@ async function eventsClient(sock: net.Socket): Promise<Cases> {
     }
     try {
       const ev = Event.decode(frame, VERBOSE);
-      if (ev.event !== "OnTick") {
+      if (ev.event !== "on-tick") {
         tickOk = false;
-        detail = `expected OnTick got ${ev.event}`;
+        detail = `expected on-tick got ${ev.event}`;
         break;
       }
       const t = fromTickCbor(ev.payload);
@@ -447,14 +465,14 @@ async function eventsClient(sock: net.Socket): Promise<Cases> {
   cases.check("on-tick/success", tickOk, detail);
 
   // duplex: send Scalars, expect echo.
-  await send(Event.verbose(SERVICE, "Duplex", toScalarsCbor(scalarsOk())));
+  await send(Event.verbose(SERVICE, "duplex", toScalarsCbor(scalarsOk())));
   const dupFrame = await carrier.recvFrame();
   if (dupFrame === null) {
     cases.fail("duplex/success", "no echo");
   } else {
     try {
       const ev = Event.decode(dupFrame, VERBOSE);
-      if (ev.event === "Duplex") {
+      if (ev.event === "duplex") {
         const s = fromScalarsCbor(ev.payload);
         cases.check("duplex/success", deepEqual(s, scalarsOk()), "echo mismatch");
       } else {

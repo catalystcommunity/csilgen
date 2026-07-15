@@ -719,7 +719,7 @@ fn first_unary_example(spec: &CsilSpecSerialized) -> Option<UnaryExample> {
         let has_request = !op_input_is_null(&op.input_type);
         let success = success_type(&op.output_type);
         return Some(UnaryExample {
-            client_class: format!("{}Client", wire_service_base(&rule.name)),
+            client_class: format!("{}Client", service_base(&rule.name)),
             method: ruby_method_name(&op.name),
             has_request,
             sample: if has_request {
@@ -787,11 +787,11 @@ fn first_channel_example(spec: &CsilSpecSerialized) -> Option<ChannelExample> {
             ) else {
                 continue;
             };
-            let base = wire_service_base(&rule.name);
+            let base = service_base(&rule.name);
             let method = ruby_method_name(&op.name);
             return Some(ChannelExample {
                 router_module: format!("{base}Router"),
-                wire_service: base.to_lowercase(),
+                wire_service: rule.name.clone(),
                 encode_fn: format!("encode_{method}"),
                 handlers_class: format!("{base}Handlers"),
                 inbound_class: inbound,
@@ -830,7 +830,8 @@ fn ruby_sample(spec: &CsilSpecSerialized, ty: &CsilTypeExpression) -> String {
 }
 
 /// `Type.new(field: <sample>, ...)` over a record's required fields, keyed by the
-/// verbatim CSIL field names the generated `Data.define` value object uses.
+/// `Data.define` member names the generated value object uses (`ruby_member_name`,
+/// escaped when a field collides with a method Ruby already defines on the instance).
 fn record_literal(spec: &CsilSpecSerialized, name: &str, group: &CsilGroupExpression) -> String {
     let class = ruby_class_name(name);
     let fields: Vec<String> = group
@@ -839,8 +840,8 @@ fn record_literal(spec: &CsilSpecSerialized, name: &str, group: &CsilGroupExpres
         .filter(|e| e.key.is_some())
         .filter(|e| !matches!(e.occurrence, Some(CsilOccurrence::Optional)))
         .map(|e| {
-            let field = field_name(e.key.as_ref().unwrap());
-            format!("{field}: {}", ruby_sample(spec, &e.value_type))
+            let member = ruby_member_name(&field_name(e.key.as_ref().unwrap()));
+            format!("{member}: {}", ruby_sample(spec, &e.value_type))
         })
         .collect();
     if fields.is_empty() {
@@ -975,11 +976,166 @@ fn ruby_reader_ref(field: &str) -> String {
     }
 }
 
-/// PascalCase a name with the same simple rule the Go/Python/TS clients use for the
-/// wire. convert_case diverges on acronyms, and the wire string must agree
-/// byte-for-byte across every language, so this is hand-rolled rather than
-/// `to_case(Case::Pascal)` — a case transform must never leak onto the wire.
-fn wire_method_name(name: &str) -> String {
+/// Every method Ruby already defines on a `Data.define` instance — Object/Kernel/
+/// BasicObject plus Data's own `with`/`to_h`/`members`/`deconstruct`/`deconstruct_keys`
+/// — computed empirically on Ruby 3.4.8 via
+/// `Data.define(:probe).instance_methods(true) - [:probe]`. Declaring a member of one
+/// of these names doesn't just add a reader: it silently redefines that method on the
+/// instance. Three (`object_id`, `__id__`, `__send__`) are hardcoded into MRI's
+/// "redefining '%s' may cause serious problems" warning. Several more break outright
+/// the moment the shadowed method is used the normal way, since the generated
+/// accessor takes no arguments where the real method requires one:
+/// `Data.define(:initialize)` breaks the constructor itself (`ArgumentError` on
+/// `.new`), `Data.define(:with)`/`:deconstruct_keys` break Data's own copy/pattern-
+/// match affordances, and `:send`/`:method`/etc. break the moment a caller invokes
+/// them with an argument. The rest (`class`, `hash`, `frozen?`, `itself`, ...) neither
+/// warn nor raise — they just silently return the field instead of the real value,
+/// which is the same hazard RuboCop's `Lint/StructNewOverride` flags for `Struct.new`
+/// (this list is the `Data` analogue of that cop's `STRUCT_METHOD_NAMES`).
+const RUBY_RESERVED_MEMBERS: &[&str] = &[
+    "Array",
+    "Complex",
+    "Float",
+    "Hash",
+    "Integer",
+    "Rational",
+    "String",
+    "__callee__",
+    "__dir__",
+    "__id__",
+    "__method__",
+    "__send__",
+    "abort",
+    "at_exit",
+    "autoload",
+    "autoload?",
+    "binding",
+    "block_given?",
+    "caller",
+    "caller_locations",
+    "catch",
+    "class",
+    "clone",
+    "deconstruct",
+    "deconstruct_keys",
+    "define_singleton_method",
+    "display",
+    "dup",
+    "enum_for",
+    "eql?",
+    "equal?",
+    "eval",
+    "exec",
+    "exit",
+    "exit!",
+    "extend",
+    "fail",
+    "fork",
+    "format",
+    "freeze",
+    "frozen?",
+    "gem",
+    "gem_original_require",
+    "gets",
+    "global_variables",
+    "hash",
+    "initialize",
+    "initialize_clone",
+    "initialize_copy",
+    "initialize_dup",
+    "inspect",
+    "instance_eval",
+    "instance_exec",
+    "instance_of?",
+    "instance_variable_defined?",
+    "instance_variable_get",
+    "instance_variable_set",
+    "instance_variables",
+    "is_a?",
+    "iterator?",
+    "itself",
+    "kind_of?",
+    "lambda",
+    "load",
+    "local_variables",
+    "loop",
+    "members",
+    "method",
+    "method_missing",
+    "methods",
+    "nil?",
+    "object_id",
+    "open",
+    "p",
+    "pp",
+    "print",
+    "printf",
+    "private_methods",
+    "proc",
+    "protected_methods",
+    "public_method",
+    "public_methods",
+    "public_send",
+    "putc",
+    "puts",
+    "raise",
+    "rand",
+    "readline",
+    "readlines",
+    "remove_instance_variable",
+    "require",
+    "require_relative",
+    "respond_to?",
+    "respond_to_missing?",
+    "select",
+    "send",
+    "set_trace_func",
+    "singleton_class",
+    "singleton_method",
+    "singleton_method_added",
+    "singleton_method_removed",
+    "singleton_method_undefined",
+    "singleton_methods",
+    "sleep",
+    "spawn",
+    "sprintf",
+    "srand",
+    "syscall",
+    "system",
+    "tap",
+    "test",
+    "then",
+    "throw",
+    "to_enum",
+    "to_h",
+    "to_s",
+    "trace_var",
+    "trap",
+    "untrace_var",
+    "warn",
+    "with",
+    "yield_self",
+];
+
+/// The `Data.define` member identifier for a CSIL field: a name that collides with a
+/// method Ruby already defines on the instance (`RUBY_RESERVED_MEMBERS`) takes a
+/// trailing underscore, exactly as `c_member`/the C# self-named-type escape do for
+/// their own collision classes. The CBOR wire key is never routed through this — it
+/// stays the verbatim CSIL field name (`field_name`), so `object_id` still round-trips
+/// as `"object_id"` on the wire while the Ruby accessor is `object_id_`.
+fn ruby_member_name(field: &str) -> String {
+    if RUBY_RESERVED_MEMBERS.contains(&field) {
+        format!("{field}_")
+    } else {
+        field.to_string()
+    }
+}
+
+/// PascalCase a name with a simple hand-rolled rule (capitalize after `-`/`_`).
+/// convert_case diverges on acronyms, and the class names built from this must stay
+/// stable, so it is not `to_case(Case::Pascal)`. Used only for Ruby identifiers —
+/// wire strings carry the verbatim CSIL names instead (csil-rpc-transport.md §1.1).
+fn pascal_name(name: &str) -> String {
     let mut out = String::new();
     let mut cap = true;
     for ch in name.chars() {
@@ -995,11 +1151,11 @@ fn wire_method_name(name: &str) -> String {
     out
 }
 
-/// The wire service base: strip a trailing `Service`, matching the Go/Python clients
-/// so all languages address the same service string. Built from `wire_method_name`
-/// (not convert_case) so the lowercased result agrees on the wire.
-fn wire_service_base(name: &str) -> String {
-    let pascal = wire_method_name(name);
+/// Strip a trailing `Service` suffix and PascalCase, used only for Ruby identifiers
+/// (the `<Base>Client`/`<Base>Handlers`/`<Base>Router` class and module names). Wire
+/// strings carry the verbatim CSIL service name instead (csil-rpc-transport.md §1.1).
+fn service_base(name: &str) -> String {
+    let pascal = pascal_name(name);
     pascal
         .strip_suffix("Service")
         .filter(|s| !s.is_empty())
@@ -1155,14 +1311,22 @@ fn emit_value_type(name: &str, doc_comments: &[String], group: &CsilGroupExpress
     let fields: Vec<&CsilGroupEntry> = group.entries.iter().filter(|e| e.key.is_some()).collect();
 
     // A per-field summary comment: Ruby can't attach a doc to a `Data.define` member,
-    // so the field/type lines sit above the class as a readable header.
+    // so the field/type lines sit above the class as a readable header. A field whose
+    // name collides with a method Ruby already defines (RUBY_RESERVED_MEMBERS) notes
+    // the escaped Ruby member alongside the verbatim wire field, since the two diverge.
     for entry in &fields {
         let field = field_name(entry.key.as_ref().unwrap());
+        let member = ruby_member_name(&field);
         let ty = map_csil_type_to_ruby(&entry.value_type);
-        if let Some(desc) = field_description(&entry.metadata) {
-            out.push_str(&format!("# {field} [{ty}] {desc}\n"));
+        let suffix = if member == field {
+            String::new()
         } else {
-            out.push_str(&format!("# {field} [{ty}]\n"));
+            format!(" (Ruby member: {member})")
+        };
+        if let Some(desc) = field_description(&entry.metadata) {
+            out.push_str(&format!("# {field} [{ty}]{suffix} {desc}\n"));
+        } else {
+            out.push_str(&format!("# {field} [{ty}]{suffix}\n"));
         }
         if let Some(depends) = depends_comment(&entry.metadata) {
             out.push_str(&format!("#   depends-on: {depends}\n"));
@@ -1171,7 +1335,12 @@ fn emit_value_type(name: &str, doc_comments: &[String], group: &CsilGroupExpress
 
     let members: Vec<String> = fields
         .iter()
-        .map(|e| format!(":{}", field_name(e.key.as_ref().unwrap())))
+        .map(|e| {
+            format!(
+                ":{}",
+                ruby_member_name(&field_name(e.key.as_ref().unwrap()))
+            )
+        })
         .collect();
 
     let needs_initialize = fields.iter().any(|e| {
@@ -1222,14 +1391,14 @@ fn emit_initialize(fields: &[&CsilGroupEntry]) -> String {
     let mut required = Vec::new();
     let mut optional = Vec::new();
     for entry in fields {
-        let field = field_name(entry.key.as_ref().unwrap());
+        let member = ruby_member_name(&field_name(entry.key.as_ref().unwrap()));
         if let Some(default) = entry_default_value(entry) {
             let value = literal_value_to_ruby_value(default, &entry.value_type);
-            optional.push(format!("{field}: {value}"));
+            optional.push(format!("{member}: {value}"));
         } else if matches!(entry.occurrence, Some(CsilOccurrence::Optional)) {
-            optional.push(format!("{field}: nil"));
+            optional.push(format!("{member}: nil"));
         } else {
-            required.push(format!("{field}:"));
+            required.push(format!("{member}:"));
         }
     }
     let mut params = required;
@@ -1257,9 +1426,9 @@ fn emit_validate(fields: &[&CsilGroupEntry]) -> String {
     out.push_str("  # Raises ArgumentError on the first constraint violation.\n");
     out.push_str("  def validate\n");
     for entry in fields {
-        let field = field_name(entry.key.as_ref().unwrap());
+        let member = ruby_member_name(&field_name(entry.key.as_ref().unwrap()));
         let fref = FieldRef {
-            name: &field,
+            name: &member,
             optional: matches!(entry.occurrence, Some(CsilOccurrence::Optional)),
         };
         for metadata in &entry.metadata {
@@ -1658,9 +1827,14 @@ fn codec_record_names(spec: &CsilSpecSerialized) -> std::collections::HashSet<St
 }
 
 /// The transparent type aliases the codec resolves through: a `TypeDef` whose target
-/// is a map / array / scalar / reference / tuple / constrained (NOT a record group or a
-/// choice, which have their own handling). A field referencing one must encode/decode
-/// as the underlying type rather than passing the bare value through the stub.
+/// is a map / array / scalar / reference / tuple / constrained / all-literal choice
+/// (NOT a record group or a *mixed* choice, which have their own handling). A field
+/// referencing one must encode/decode as the underlying type rather than passing the
+/// bare value through the stub. An all-literal named choice (an enum) is included
+/// here rather than excluded outright: `enc_tree`/`dec_tree`'s own `Choice` arm
+/// already gives a bare-literal value the identity encode plus decode membership
+/// validation a reference to it needs, the same treatment an inline enum field
+/// gets, so routing the reference through it here needs no separate mechanism.
 fn codec_aliases(
     spec: &CsilSpecSerialized,
 ) -> std::collections::HashMap<String, CsilTypeExpression> {
@@ -1668,7 +1842,8 @@ fn codec_aliases(
         .iter()
         .filter_map(|rule| match &rule.rule_type {
             CsilRuleType::TypeDef(t) => match t {
-                CsilTypeExpression::Group(_) | CsilTypeExpression::Choice(_) => None,
+                CsilTypeExpression::Group(_) => None,
+                CsilTypeExpression::Choice(choices) if !is_enum_choice(choices) => None,
                 other => Some((rule.name.clone(), other.clone())),
             },
             _ => None,
@@ -1676,13 +1851,34 @@ fn codec_aliases(
         .collect()
 }
 
-/// Is `choices` an all-literal choice (an enum like `"a" / "b"` or `1 / 2 / 3`)? Such a
-/// choice carries its own discriminant — the literal is the value — so it rides the wire
-/// bare. A choice with any non-literal arm is a tagged-sum union (handled separately).
+/// `choice_arm_literal` is the shared `csilgen_common` implementation now (was a local
+/// duplicate here, mirroring the OCaml generator's own copy before its migration): it
+/// sees through a trailing control-operator wrapper (`text / "a" / "b" .default "b"`'s
+/// last arm parses as `Constrained { base_type: Literal("b"), .. }`, not a bare
+/// `Literal`) so a `.default`-suffixed literal arm still counts as literal.
+use csilgen_common::choice_arm_literal;
+
+/// Is `choices` an all-literal choice (an enum like `"a" / "b"` or a MIXED-kind one
+/// like `"a" / 1`)? Such a choice carries its own discriminant — the literal is the
+/// value — so it rides the wire bare. A choice with any non-literal arm is a
+/// tagged-sum union (handled separately). Thin wrapper over the shared
+/// `csilgen_common::all_literal` (which is what actually implements the "any kind, or
+/// a mix of kinds, is still an Enum" contract) kept so the many `is_enum_choice(...)`
+/// call sites below don't all need renaming.
 fn is_enum_choice(choices: &[CsilTypeExpression]) -> bool {
-    choices
-        .iter()
-        .all(|c| matches!(c, CsilTypeExpression::Literal(_)))
+    csilgen_common::all_literal(choices)
+}
+
+/// The representative literal of an all-literal choice (any arm's, since
+/// `enc_tree`'s inline `Choice` arm only needs to know *whether* every arm is a
+/// literal, not which kind), or `None` for a mixed choice. Kept distinct from
+/// `is_enum_choice` (a plain bool) because callers that already have the choices in
+/// hand want the `Option` for an `if let`.
+fn enum_literal_kind(choices: &[CsilTypeExpression]) -> Option<&CsilLiteralValue> {
+    if choices.iter().any(|c| choice_arm_literal(c).is_none()) {
+        return None;
+    }
+    choices.first().and_then(choice_arm_literal)
 }
 
 /// Named tagged-sum unions: a `TypeDef` whose target is a choice with at least one
@@ -1727,6 +1923,18 @@ fn ruby_union_guard(
         CsilTypeExpression::Reference(name) if records.contains(name) => ruby_class_name(name),
         CsilTypeExpression::Array { .. } | CsilTypeExpression::Tuple(_) => "Array".to_string(),
         CsilTypeExpression::Map { .. } => "Hash".to_string(),
+        // A literal arm (e.g. `"pending"`) shares its runtime class with any general
+        // arm of the same base type (`text / "pending"` both guard `String`), so it
+        // groups with that arm here instead of degrading to the catch-all `Object`
+        // guard, which would shadow nothing ahead of it in declaration order.
+        CsilTypeExpression::Literal(lit) => match lit {
+            CsilLiteralValue::Integer(_) => "Integer".to_string(),
+            CsilLiteralValue::Float(_) => "Float".to_string(),
+            CsilLiteralValue::Text(_) | CsilLiteralValue::Bytes(_) => "String".to_string(),
+            CsilLiteralValue::Bool(_) => "TrueClass, FalseClass".to_string(),
+            CsilLiteralValue::Null => "NilClass".to_string(),
+            CsilLiteralValue::Array(_) => "Array".to_string(),
+        },
         _ => "Object".to_string(),
     }
 }
@@ -1789,6 +1997,52 @@ fn enc_tree(
                 "({expr}).each_with_object({{}}) {{ |(csil_k, csil_v), csil_h| csil_h[{ek}] = {ev} }}"
             )
         }
+        // A tuple is a positional CBOR array; its Ruby value is a same-length Array,
+        // each position encoded per its own declared type (an absent optional
+        // position rides as `nil` in place, matching the locked fixed-length wire).
+        CsilTypeExpression::Tuple(group) => {
+            let parts: Vec<String> = group
+                .entries
+                .iter()
+                .enumerate()
+                .map(|(i, e)| {
+                    let elem = format!("({expr})[{i}]");
+                    let enc = enc_tree(&e.value_type, &elem, records, aliases, unions);
+                    if matches!(e.occurrence, Some(CsilOccurrence::Optional)) {
+                        format!("({elem}).nil? ? nil : ({enc})")
+                    } else {
+                        enc
+                    }
+                })
+                .collect();
+            format!("[{}]", parts.join(", "))
+        }
+        // An inline (anonymous) choice at a field / array-element / map-value /
+        // tuple-element position gets exactly the same wire treatment a reference to
+        // a named choice would: an all-literal choice rides bare (Ruby's value
+        // already IS the literal, so encoding it is the identity), a mixed choice
+        // encodes to the locked `[variant_index, value]` tagged sum via
+        // `union_encode_body` (the same arm-grouping/precedence logic
+        // `emit_union_codec` uses for a named union, inlined rather than routed
+        // through a top-level `enc_union_<name>` helper since an anonymous choice has
+        // no rule name to hang one on).
+        CsilTypeExpression::Choice(choices) => {
+            if enum_literal_kind(choices).is_some() {
+                format!("({expr})")
+            } else {
+                format!(
+                    "({})",
+                    union_encode_body(
+                        choices,
+                        &format!("({expr})"),
+                        "inline",
+                        records,
+                        aliases,
+                        unions
+                    )
+                )
+            }
+        }
         _ => format!("({expr})"),
     }
 }
@@ -1838,8 +2092,237 @@ fn dec_tree(
                 "({expr}).each_with_object({{}}) {{ |(csil_k, csil_v), csil_h| csil_h[{dk}] = {dv} }}"
             )
         }
+        // Positional tuple decode: rebuild the Array from each position's own
+        // declared type; an absent optional position decodes back to `nil`.
+        CsilTypeExpression::Tuple(group) => {
+            let parts: Vec<String> = group
+                .entries
+                .iter()
+                .enumerate()
+                .map(|(i, e)| {
+                    let elem = format!("({expr})[{i}]");
+                    let dec = dec_tree(&e.value_type, &elem, records, aliases, unions);
+                    if matches!(e.occurrence, Some(CsilOccurrence::Optional)) {
+                        format!("({elem}).nil? ? nil : ({dec})")
+                    } else {
+                        dec
+                    }
+                })
+                .collect();
+            format!("[{}]", parts.join(", "))
+        }
+        // An inline choice decodes with the same validation a named choice reference
+        // gets: an all-literal choice validates wire-membership (`enum_literal_kind`
+        // is `Some`), a mixed choice reads the `[variant_index, value]` tagged sum via
+        // `union_decode_body`, both inlined for the same reason `enc_tree`'s `Choice`
+        // arm is.
+        CsilTypeExpression::Choice(choices) => {
+            if enum_literal_kind(choices).is_some() {
+                let mut whens = String::new();
+                for c in choices {
+                    if let Some(lit) = choice_arm_literal(c) {
+                        let repr = literal_value_to_ruby(lit);
+                        whens.push_str(&format!("when {repr} then {repr}\n"));
+                    }
+                }
+                format!(
+                    "(case ({expr})\n{whens}else\n  raise ArgumentError, \"csilgen: unknown inline literal #{{({expr}).inspect}}\"\nend)"
+                )
+            } else {
+                let node = format!("({expr})");
+                let idx_expr = format!("({node})[0]");
+                let inner_expr = format!("({node})[1]");
+                let body = union_decode_body(
+                    choices,
+                    &idx_expr,
+                    &inner_expr,
+                    "inline",
+                    records,
+                    aliases,
+                    unions,
+                );
+                format!(
+                    "(raise(ArgumentError, \"csilgen: inline union is not a 2-element array\") unless ({node}).is_a?(::Array) && ({node}).length == 2\n{body})"
+                )
+            }
+        }
         _ => expr.to_string(),
     }
+}
+
+/// Choice arms grouped by their Ruby runtime-class guard (`ruby_union_guard`), in
+/// first-declaration order, each guard's member arm indices in declaration order.
+/// Shared by named-union codec emission (`emit_union_codec`) and the inline-choice
+/// codec (`enc_tree`/`dec_tree`'s own `Choice` arm) so a value routes through
+/// identical index/precedence logic whether the choice came from a named rule
+/// reference or sits directly at a field/array-element/map-value/tuple-element
+/// position.
+fn guard_groups(
+    choices: &[CsilTypeExpression],
+    records: &std::collections::HashSet<String>,
+) -> (Vec<String>, std::collections::HashMap<String, Vec<usize>>) {
+    let mut guard_order: Vec<String> = Vec::new();
+    let mut groups: std::collections::HashMap<String, Vec<usize>> =
+        std::collections::HashMap::new();
+    for (idx, arm) in choices.iter().enumerate() {
+        let guard = ruby_union_guard(arm, records);
+        let entry = groups.entry(guard.clone()).or_default();
+        if entry.is_empty() {
+            guard_order.push(guard);
+        }
+        entry.push(idx);
+    }
+    (guard_order, groups)
+}
+
+/// The `case #{value_expr} ... end` body (without the enclosing `def`) encoding a
+/// union value to the locked `[variant_index, value]` CBOR-array wire form.
+/// `value_expr` is any side-effect-free Ruby expression naming the candidate value
+/// (a bare parameter for a named union, or a parenthesized field/element accessor
+/// for an inline choice) -- it is referenced multiple times, so it must be cheap
+/// and idempotent to evaluate. `ctx` names the choice for the "no arm matched"
+/// error.
+fn union_encode_body(
+    choices: &[CsilTypeExpression],
+    value_expr: &str,
+    ctx: &str,
+    records: &std::collections::HashSet<String>,
+    aliases: &std::collections::HashMap<String, CsilTypeExpression>,
+    unions: &std::collections::HashMap<String, Vec<CsilTypeExpression>>,
+) -> String {
+    let (guard_order, groups) = guard_groups(choices, records);
+    let mut out = String::new();
+    out.push_str(&format!("case {value_expr}\n"));
+    // A mixed union (`text / "pending" / ...`) has a general arm and several literal
+    // arms that all share one Ruby guard class (`String`); grouping by that guard —
+    // mirroring the Go/Python generators' type-switch grouping — lets a literal arm
+    // be checked by value ahead of the general arm within their shared class, instead
+    // of the general arm's `when String` shadowing every literal that would otherwise
+    // be unreachable in declaration order. `choice_arm_literal` sees through a
+    // `.default`-style control-operator wrapper on the arm.
+    for guard in &guard_order {
+        let idxs = &groups[guard];
+        let has_literal = idxs
+            .iter()
+            .any(|&i| choice_arm_literal(&choices[i]).is_some());
+        if !has_literal {
+            // Two non-literal arms CAN share one Ruby guard class (`text / bytes` both
+            // guard `String`; two differently-shaped `Array`/`Hash` arms guard the
+            // same container class) -- `ruby_union_guard` is a runtime-class dispatch,
+            // not a structural one, so it genuinely cannot tell them apart. `idxs` is
+            // already in ascending declaration order (built by iterating `choices` in
+            // order in `guard_groups`), so `idxs[0]` deterministically picks the FIRST
+            // declared arm of the group -- the only signal the spec author actually
+            // controls -- rather than an arbitrary one.
+            let i = idxs[0];
+            let enc = enc_tree(&choices[i], value_expr, records, aliases, unions);
+            out.push_str(&format!("when {guard}\n  [{i}, {enc}]\n"));
+            continue;
+        }
+        // At least one literal shares this guard class: it is more specific than a
+        // general arm of the same class and wins on value collision, so literals are
+        // checked first by equality and keep their own declared index, and the
+        // general arm — if present — is the fallback for every other value of that
+        // class.
+        let mut literal_idxs = Vec::new();
+        let mut general_idx = None;
+        for &i in idxs {
+            if choice_arm_literal(&choices[i]).is_some() {
+                literal_idxs.push(i);
+            } else if general_idx.is_none() {
+                // A guard group can hold TWO OR MORE general (non-literal) arms
+                // alongside a literal (e.g. `text / "pending" / bytes`: `text` and
+                // `bytes` both guard `String`, same as the literal "pending"). This
+                // used to unconditionally overwrite `general_idx` on every non-literal
+                // arm, so the LAST general arm silently won the runtime-type fallback
+                // instead of the first -- for `text / "pending" / bytes` a plain text
+                // value would wire-encode as variant 2 (`bytes`) rather than variant 0
+                // (`text`), corrupting cross-language round-trips. Declaration order is
+                // the only signal the spec author actually controls, so the FIRST
+                // general arm wins (same fix shape as PHP's `union_encode_body`).
+                general_idx = Some(i);
+            }
+        }
+        out.push_str(&format!("when {guard}\n  case {value_expr}\n"));
+        for i in literal_idxs {
+            let lit = choice_arm_literal(&choices[i])
+                .expect("literal_idxs filtered to literal-carrying arms above");
+            let lit_value = literal_value_to_ruby(lit);
+            let enc = enc_tree(&choices[i], value_expr, records, aliases, unions);
+            out.push_str(&format!("  when {lit_value}\n    [{i}, {enc}]\n"));
+        }
+        out.push_str("  else\n");
+        match general_idx {
+            Some(gi) => {
+                let enc = enc_tree(&choices[gi], value_expr, records, aliases, unions);
+                out.push_str(&format!("    [{gi}, {enc}]\n"));
+            }
+            // No general arm to fall back to (every literal in this class is covered
+            // but the value matched none of them): raise the same "no variant
+            // matched" error the outer `case`'s own `else` would, rather than
+            // inventing a new failure mode.
+            None => out.push_str(&format!(
+                "    raise ArgumentError, \"csilgen: value does not match any {ctx} variant\"\n"
+            )),
+        }
+        out.push_str("  end\n");
+    }
+    out.push_str(&format!(
+        "else\n  raise ArgumentError, \"csilgen: value does not match any {ctx} variant\"\nend\n"
+    ));
+    out
+}
+
+/// The `case #{idx_expr} ... end` body decoding a union's declared-index arm.
+/// `inner_expr` (also referenced multiple times, so must be cheap/idempotent) names
+/// the arm's payload; a literal arm validates it against the declared literal
+/// rather than trusting the wire.
+fn union_decode_body(
+    choices: &[CsilTypeExpression],
+    idx_expr: &str,
+    inner_expr: &str,
+    ctx: &str,
+    records: &std::collections::HashSet<String>,
+    aliases: &std::collections::HashMap<String, CsilTypeExpression>,
+    unions: &std::collections::HashMap<String, Vec<CsilTypeExpression>>,
+) -> String {
+    let mut out = String::new();
+    out.push_str(&format!("case {idx_expr}\n"));
+    for (idx, arm) in choices.iter().enumerate() {
+        if let Some(lit) = choice_arm_literal(arm) {
+            let lit_value = literal_value_to_ruby(lit);
+            out.push_str(&format!(
+                "when {idx}\n  raise ArgumentError, \"csilgen: {ctx} variant {idx} expects #{{{lit_value}.inspect}}\" unless {inner_expr} == {lit_value}\n  {inner_expr}\n"
+            ));
+        } else {
+            let dec = dec_tree(arm, inner_expr, records, aliases, unions);
+            out.push_str(&format!("when {idx}\n  {dec}\n"));
+        }
+    }
+    out.push_str(&format!(
+        "else\n  raise ArgumentError, \"csilgen: unknown {ctx} variant index #{{{idx_expr}}}\"\nend\n"
+    ));
+    out
+}
+
+/// Re-indent a `union_encode_body`/`union_decode_body` block (each line at column 0)
+/// under a method body, prefixing every line with `indent`.
+fn reindent(block: &str, indent: &str) -> String {
+    // `split` (not `lines`, which drops a trailing empty segment) so a block ending
+    // in `\n` (every `union_encode_body`/`union_decode_body` does) keeps that
+    // trailing newline -- otherwise the next `push_str` lands on the same source
+    // line as this block's closing `end`.
+    block
+        .split('\n')
+        .map(|line| {
+            if line.is_empty() {
+                String::new()
+            } else {
+                format!("{indent}{line}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Emit the tagged-sum encode/decode helpers for one named union, reopening `CsilCbor`.
@@ -1861,31 +2344,26 @@ fn emit_union_codec(
     out.push_str("module CsilCbor\n  module_function\n\n");
 
     out.push_str(&format!("  def enc_union_{name}(value)\n"));
-    out.push_str("    case value\n");
-    for (idx, arm) in choices.iter().enumerate() {
-        let guard = ruby_union_guard(arm, records);
-        let enc = enc_tree(arm, "value", records, aliases, unions);
-        out.push_str(&format!("    when {guard}\n      [{idx}, {enc}]\n"));
-    }
-    out.push_str(&format!(
-        "    else\n      raise ArgumentError, \"csilgen: value does not match any {name} variant\"\n"
-    ));
-    out.push_str("    end\n  end\n\n");
+    let enc_body = union_encode_body(choices, "value", name, records, aliases, unions);
+    out.push_str(&reindent(&enc_body, "    "));
+    out.push_str("  end\n\n");
 
     out.push_str(&format!("  def dec_union_{name}(node)\n"));
     out.push_str(&format!(
         "    raise ArgumentError, \"csilgen: {name} is not a 2-element union array\" unless node.is_a?(::Array) && node.length == 2\n"
     ));
     out.push_str("    csil_idx, csil_inner = node\n");
-    out.push_str("    case csil_idx\n");
-    for (idx, arm) in choices.iter().enumerate() {
-        let dec = dec_tree(arm, "csil_inner", records, aliases, unions);
-        out.push_str(&format!("    when {idx}\n      {dec}\n"));
-    }
-    out.push_str(&format!(
-        "    else\n      raise ArgumentError, \"csilgen: unknown {name} variant index #{{csil_idx}}\"\n"
-    ));
-    out.push_str("    end\n  end\nend\n\n");
+    let dec_body = union_decode_body(
+        choices,
+        "csil_idx",
+        "csil_inner",
+        name,
+        records,
+        aliases,
+        unions,
+    );
+    out.push_str(&reindent(&dec_body, "    "));
+    out.push_str("  end\nend\n\n");
     out
 }
 
@@ -1924,8 +2402,12 @@ fn emit_record_codec(
         ka.cmp(&kb)
     });
     for entry in &canonical {
+        // `field` is the verbatim CBOR map key (wire); `member` is the Ruby accessor,
+        // escaped when the field collides with a method Ruby already defines on the
+        // Data instance (RUBY_RESERVED_MEMBERS) — the two diverge only for those.
         let field = field_name(entry.key.as_ref().unwrap());
-        let reader = ruby_reader_ref(&field);
+        let member = ruby_member_name(&field);
+        let reader = ruby_reader_ref(&member);
         let node = enc_tree(&entry.value_type, &reader, records, aliases, unions);
         if matches!(entry.occurrence, Some(CsilOccurrence::Optional)) {
             out.push_str(&format!(
@@ -1950,13 +2432,16 @@ fn emit_record_codec(
         let parts: Vec<String> = in_order
             .iter()
             .map(|entry| {
+                // `field` stays the verbatim wire key for the `node[...]` lookup;
+                // `member` (escaped when reserved) labels the constructor keyword arg.
                 let field = field_name(entry.key.as_ref().unwrap());
+                let member = ruby_member_name(&field);
                 let access = format!("node[\"{field}\"]");
                 let dec = dec_tree(&entry.value_type, &access, records, aliases, unions);
                 if matches!(entry.occurrence, Some(CsilOccurrence::Optional)) {
-                    format!("      {field}: (node.key?(\"{field}\") ? {dec} : nil)")
+                    format!("      {member}: (node.key?(\"{field}\") ? {dec} : nil)")
                 } else {
-                    format!("      {field}: {dec}")
+                    format!("      {member}: {dec}")
                 }
             })
             .collect();
@@ -2417,9 +2902,11 @@ fn generate_client_file(spec: &CsilSpecSerialized) -> Option<String> {
 }
 
 fn emit_client_class(name: &str, service: &CsilServiceDefinition) -> String {
-    let base = wire_service_base(name);
+    let base = service_base(name);
     let client = format!("{base}Client");
-    let wire_service = base.to_lowercase();
+    // The wire service string is the CSIL service name verbatim
+    // (docs/csil-rpc-transport.md §1.1) — no case transform may leak onto the wire.
+    let wire_service = name;
 
     let mut out = String::new();
     out.push_str(&format!("# Typed client for the {name} service.\n"));
@@ -2439,7 +2926,7 @@ fn emit_client_class(name: &str, service: &CsilServiceDefinition) -> String {
             continue;
         }
         let method = ruby_method_name(&op.name);
-        let wire_method = wire_method_name(&op.name);
+        let wire_method = &op.name;
         let has_input = !op_input_is_null(&op.input_type);
         let success = success_type(&op.output_type);
         let out_ty = map_csil_type_to_ruby(&success);
@@ -2525,7 +3012,7 @@ fn generate_server_file(spec: &CsilSpecSerialized) -> Option<String> {
 }
 
 fn emit_handlers_class(name: &str, service: &CsilServiceDefinition) -> String {
-    let base = wire_service_base(name);
+    let base = service_base(name);
     let handler_class = format!("{base}Handlers");
     let mut out = String::new();
 
@@ -2585,7 +3072,7 @@ fn emit_handlers_class(name: &str, service: &CsilServiceDefinition) -> String {
 /// the `@wire-id` ordinal, only when wire-ids are present so wire-id-free output stays
 /// byte-identical), and the per-op outbound encoders.
 fn emit_router_module(name: &str, service: &CsilServiceDefinition) -> String {
-    let base = wire_service_base(name);
+    let base = service_base(name);
     let router = format!("{base}Router");
     let mut out = String::new();
 
@@ -2614,7 +3101,7 @@ fn emit_router_module(name: &str, service: &CsilServiceDefinition) -> String {
     out.push_str("  def route_channel(handlers, codec, method, data)\n");
     out.push_str("    case method\n");
     for op in &bidi {
-        let wire = wire_method_name(&op.name);
+        let wire = &op.name;
         let method = ruby_method_name(&op.name);
         out.push_str(&format!("    when \"{wire}\"\n"));
         if op_input_is_null(&op.input_type) {
@@ -2663,7 +3150,7 @@ fn emit_router_module(name: &str, service: &CsilServiceDefinition) -> String {
         ) {
             continue;
         }
-        let wire = wire_method_name(&op.name);
+        let wire = &op.name;
         let method = ruby_method_name(&op.name);
         out.push_str(&format!(
             "  # Encode a `{wire}` message the server pushes to a peer; returns\n"
@@ -2703,7 +3190,7 @@ fn emit_wire_id_consts(service: &CsilServiceDefinition) -> Option<String> {
 /// reference ordinals without a router). Additive: None when the service is wire-id-free.
 fn emit_wire_ids(name: &str, service: &CsilServiceDefinition) -> Option<String> {
     let service_id = service.wire_id?;
-    let base = wire_service_base(name);
+    let base = service_base(name);
     let module = format!("{base}WireIds");
     let mut out = String::new();
     out.push_str(&format!(
@@ -2730,8 +3217,8 @@ mod tests {
     fn class_and_method_naming() {
         assert_eq!(ruby_class_name("user_profile"), "UserProfile");
         assert_eq!(ruby_method_name("deposit-claim"), "deposit_claim");
-        assert_eq!(wire_method_name("deposit-claim"), "DepositClaim");
-        assert_eq!(wire_service_base("CorndogsService"), "Corndogs");
+        assert_eq!(pascal_name("deposit-claim"), "DepositClaim");
+        assert_eq!(service_base("CorndogsService"), "Corndogs");
     }
 
     #[test]
@@ -2838,6 +3325,69 @@ mod tests {
         );
         // The keyword is legal as a constructor keyword label, so decode stays bare.
         assert!(out.contains("when: Time.iso8601((node[\"when\"]).value)"));
+    }
+
+    #[test]
+    fn reserved_member_field_escapes_to_trailing_underscore() {
+        // A field named `object_id` (RUBY_RESERVED_MEMBERS) would otherwise become a
+        // `Data.define(:object_id)` member, redefining `Object#object_id` and tripping
+        // Ruby's "redefining 'object_id' may cause serious problems" warning. The Ruby
+        // member is escaped to `object_id_`; the CBOR wire key stays the verbatim
+        // "object_id" field name at every reference site.
+        let group = CsilGroupExpression {
+            entries: vec![bare("object_id", builtin("text"))],
+        };
+        let records = std::collections::HashSet::new();
+        let aliases = std::collections::HashMap::new();
+        let unions = std::collections::HashMap::new();
+
+        let value_type = emit_value_type("Relation", &[], &group);
+        assert!(
+            value_type.contains("Relation = Data.define(:object_id_)"),
+            "expected escaped Data.define member, got:\n{value_type}"
+        );
+        assert!(
+            !value_type.contains(":object_id)"),
+            "the raw `object_id` member must never be declared, got:\n{value_type}"
+        );
+
+        let out = emit_record_codec("Relation", &group, &records, &aliases, &unions);
+        // Encode reads the escaped Ruby accessor but writes the verbatim wire key.
+        assert!(
+            out.contains("csil_map[\"object_id\"] = object_id_"),
+            "encode must read `object_id_` and write wire key \"object_id\", got:\n{out}"
+        );
+        // Decode's constructor keyword label is the escaped member; the map lookup
+        // keys off the verbatim wire field.
+        assert!(
+            out.contains("object_id_: node[\"object_id\"]"),
+            "decode must key the constructor arg `object_id_:` off wire \"object_id\", got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn reserved_member_record_literal_uses_escaped_keyword() {
+        // `record_literal` builds the `Type.new(field: sample)` genquickstart/sample
+        // call; a reserved-member field must key the constructor by its escaped Ruby
+        // member, not the raw wire name.
+        let spec = CsilSpecSerialized {
+            rules: vec![CsilRule {
+                name: "Relation".to_string(),
+                rule_type: CsilRuleType::GroupDef(CsilGroupExpression {
+                    entries: vec![bare("object_id", builtin("text"))],
+                }),
+                position: pos(),
+                doc_comments: vec![],
+            }],
+            source_content: None,
+            service_count: 0,
+            fields_with_metadata_count: 0,
+        };
+        let group = CsilGroupExpression {
+            entries: vec![bare("object_id", builtin("text"))],
+        };
+        let literal = record_literal(&spec, "Relation", &group);
+        assert_eq!(literal, "Relation.new(object_id_: \"example\")");
     }
 
     #[test]
@@ -2981,9 +3531,10 @@ mod tests {
         };
         let out = emit_client_class("CorndogsService", &service);
         // The request self-encodes, the reply self-decodes; the transport only moves
-        // bytes. The ServiceError arm is dropped from the success type.
+        // bytes over the verbatim CSIL service/op wire strings. The ServiceError arm
+        // is dropped from the success type.
         assert!(out.contains(
-            "Task.from_cbor(@transport.call(\"corndogs\", \"SubmitTask\", req.to_cbor))"
+            "Task.from_cbor(@transport.call(\"CorndogsService\", \"submit-task\", req.to_cbor))"
         ));
     }
 
@@ -3151,7 +3702,7 @@ mod tests {
         assert!(body.contains("Csilgen::Transport::StreamCarrier.new(ssl)"));
         // The $hello handshake + the $ping/$pong heartbeat from the lib.
         assert!(body.contains(
-            "Events::Hello.new(versions: [1], profiles: [\"verbose\"], service: \"user\").encode"
+            "Events::Hello.new(versions: [1], profiles: [\"verbose\"], service: \"user_service\").encode"
         ));
         assert!(body.contains("Events::HelloAck.decode(ack).profile"));
         assert!(body.contains("if ev.event == Events::Control::PING_NAME"));

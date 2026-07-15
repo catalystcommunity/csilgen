@@ -107,6 +107,73 @@ pub fn client_style(input: &WasmGeneratorInput) -> Result<ClientStyle, String> {
     }
 }
 
+/// How the generator writes relative specifiers between its own generated
+/// modules (`./types.gen`, `./codec.gen`, ...). The wire format never depends on
+/// this — it only changes what a consumer's module resolver sees.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImportExtension {
+    /// `./types.gen.ts` — resolvable by Node's ESM loader running the `.ts`
+    /// sources directly (type stripping) and by `nodenext`/`node16`
+    /// typechecking, which model that same runtime. Requires TypeScript 5.7's
+    /// `allowImportingTsExtensions` (or `rewriteRelativeImportExtensions` for a
+    /// build) on the consumer's side. Default — preserves the behavior
+    /// requested in
+    /// docs/csilgen-requests/typescript-codec-import-missing-extension.md.
+    Ts,
+    /// `./types.gen.js` — the specifier a `tsc`/bundler build actually emits on
+    /// disk. Resolves under plain `nodenext`/`node16` on any TypeScript version
+    /// without extension-rewriting flags — the pre-diff-compatible path for a
+    /// bare (non-package) consumer — at the cost of pointing at a file that does
+    /// not exist until the consumer's own build produces it, so running the
+    /// `.ts` sources directly under type stripping does not work in this mode.
+    Js,
+    /// `./types.gen` — no extension. Only resolvable under `moduleResolution`
+    /// modes that do not enforce Node ESM extension rules (`bundler`,
+    /// `classic`, or plain `node`/CommonJS `require`); the generator's
+    /// pre-existing behavior before extensioned specifiers were added.
+    None,
+}
+
+impl ImportExtension {
+    /// Build the relative specifier for a generated module from its
+    /// extension-less stem (e.g. `"types.gen"`), so every emitter that imports
+    /// another generated module (types/codec/client/server/index barrel) picks
+    /// the same suffix. An explicit `*_module` option (`client_types_module`,
+    /// `codec_types_module`, ...) is used verbatim and never passes through
+    /// here — this only supplies the *default* specifier.
+    pub fn specifier(&self, stem: &str) -> String {
+        match self {
+            ImportExtension::Ts => format!("./{stem}.ts"),
+            ImportExtension::Js => format!("./{stem}.js"),
+            ImportExtension::None => format!("./{stem}"),
+        }
+    }
+}
+
+/// Read & validate `import_extension` from the CSIL options block. Mirrors
+/// `bidi_transport`/`decimal_mapping`/`client_style`: any value other than
+/// `ts`/`js`/`none` is rejected at generation time instead of silently
+/// degrading. Absent -> `Ts`, preserving the consumer-requested default (Node
+/// ESM + `nodenext`, no workaround flags needed for `noEmit` typechecking). A
+/// bare `csilgen generate` drop-in on an older TypeScript (or one without
+/// `allowImportingTsExtensions`/`rewriteRelativeImportExtensions`), or a
+/// consumer who only ever `tsc`-builds the raw sources, can opt down to `js` or
+/// `none` to match a pre-existing project's module resolution instead.
+pub fn import_extension(input: &WasmGeneratorInput) -> Result<ImportExtension, String> {
+    match input.config.options.get("import_extension") {
+        None => Ok(ImportExtension::Ts),
+        Some(v) => match v.as_str() {
+            Some("ts") => Ok(ImportExtension::Ts),
+            Some("js") => Ok(ImportExtension::Js),
+            Some("none") => Ok(ImportExtension::None),
+            Some(other) => Err(format!(
+                "import_extension must be \"ts\", \"js\", or \"none\", got {other:?}"
+            )),
+            None => Err(format!("import_extension must be a string, got {v:?}")),
+        },
+    }
+}
+
 /// The shape of one emitted client file: whether its methods are async and the
 /// symbol marker that keeps an async twin distinct from the sync client when both
 /// are emitted into the same package. `marker` is empty for a stand-alone client
@@ -260,6 +327,12 @@ pub fn ts_literal_type(value: &CsilLiteralValue) -> String {
         CsilLiteralValue::Array(_) => "unknown[]".to_string(),
     }
 }
+
+// `choice_arm_literal` / `all_literal` / `classify_choice` are shared machinery
+// now (see `csilgen_common::choice`, THE normative classification contract) —
+// re-exported here so every existing `common::choice_arm_literal(...)` /
+// `common::all_literal(...)` call site in this crate keeps working unchanged.
+pub use csilgen_common::{all_literal, choice_arm_literal};
 
 /// A TypeScript string-literal expression: the string wrapped in double quotes with
 /// the JSON control characters escaped. Shared by type rendering and the codec so a
@@ -532,14 +605,18 @@ pub fn service_base(name: &str) -> String {
         .unwrap_or(pascal)
 }
 
-/// The string passed to the transport for a service: lowercase of the base name.
+/// The string passed to the transport for a service: the CSIL service rule name
+/// verbatim, so a transport can place it on the wire unmodified (see
+/// docs/cbor-wire-contract.md "RPC call naming"). Any lossy derivation (the old
+/// lowercase-and-strip-Service) could not be reversed at the transport seam.
 pub fn service_wire(name: &str) -> String {
-    service_base(name).to_lowercase()
+    name.to_string()
 }
 
-/// The string passed to the transport for a method: PascalCase of the op name.
+/// The string passed to the transport for a method: the CSIL operation name
+/// verbatim (kebab-case), matching the `op` field of the CSIL-RPC v1 envelope.
 pub fn method_wire(op: &CsilServiceOperation) -> String {
-    to_pascal(&op.name)
+    op.name.clone()
 }
 
 /// Render a JSDoc block from doc comments plus any extra trailing lines.

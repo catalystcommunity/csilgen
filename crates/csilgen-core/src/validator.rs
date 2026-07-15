@@ -262,28 +262,25 @@ pub fn validate_spec_optimized(spec: &CsilSpec) -> Result<()> {
 
     let lookup_context = ValidationContext { type_names };
 
+    let mut errors = Vec::new();
+
+    // Rule-name uniqueness is a single O(n) HashMap pass over the whole spec, not one
+    // of the per-reference O(n) scans (multiplied by rule count) that the BTreeSet
+    // lookup table and chunked/parallel dispatch below exist to avoid — so it runs
+    // unconditionally here rather than being folded into either optimization.
+    if let Err(duplicate_errors) = validate_unique_rule_names(spec) {
+        errors.extend(duplicate_errors);
+    }
+
     // For large specs (>1000 rules), use parallel validation
-    if spec.rules.len() > 1000 {
+    let rule_validation_result = if spec.rules.len() > 1000 {
         validate_spec_parallel(spec, lookup_context)
     } else {
         validate_spec_sequential(spec, lookup_context)
-    }
-}
+    };
 
-#[derive(Clone)]
-struct ValidationContext {
-    type_names: std::collections::BTreeSet<String>,
-}
-
-fn validate_spec_sequential(spec: &CsilSpec, context: ValidationContext) -> Result<()> {
-    let mut errors = Vec::new();
-
-    errors.extend(validate_wire_ids(spec));
-
-    for rule in &spec.rules {
-        if let Err(validation_errors) = validate_rule_optimized(rule, spec, &context) {
-            errors.extend(validation_errors);
-        }
+    if let Err(rule_errors) = rule_validation_result {
+        errors.extend(rule_errors);
     }
 
     if !errors.is_empty() {
@@ -294,7 +291,36 @@ fn validate_spec_sequential(spec: &CsilSpec, context: ValidationContext) -> Resu
     Ok(())
 }
 
-fn validate_spec_parallel(spec: &CsilSpec, context: ValidationContext) -> Result<()> {
+#[derive(Clone)]
+struct ValidationContext {
+    type_names: std::collections::BTreeSet<String>,
+}
+
+fn validate_spec_sequential(
+    spec: &CsilSpec,
+    context: ValidationContext,
+) -> Result<(), Vec<ValidationError>> {
+    let mut errors = Vec::new();
+
+    errors.extend(validate_wire_ids(spec));
+
+    for rule in &spec.rules {
+        if let Err(validation_errors) = validate_rule_optimized(rule, spec, &context) {
+            errors.extend(validation_errors);
+        }
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors)
+    }
+}
+
+fn validate_spec_parallel(
+    spec: &CsilSpec,
+    context: ValidationContext,
+) -> Result<(), Vec<ValidationError>> {
     let spec = Arc::new(spec);
     let context = Arc::new(context);
     let errors = Arc::new(Mutex::new(validate_wire_ids(&spec)));
@@ -327,12 +353,11 @@ fn validate_spec_parallel(spec: &CsilSpec, context: ValidationContext) -> Result
     });
 
     let final_errors = errors.lock().unwrap();
-    if !final_errors.is_empty() {
-        let error_messages: Vec<String> = final_errors.iter().map(|e| e.to_string()).collect();
-        bail!("Validation errors:\n{}", error_messages.join("\n"));
+    if final_errors.is_empty() {
+        Ok(())
+    } else {
+        Err(final_errors.clone())
     }
-
-    Ok(())
 }
 
 fn validate_rule_optimized(
@@ -1669,6 +1694,39 @@ mod tests {
             crate::parser::parse_csil("@wire-id(7)\nservice A {\n@wire-id(0)\nfoo: X -> Y\n}\n")
                 .unwrap();
         assert!(validate_spec(&spec).is_ok());
+    }
+
+    #[test]
+    fn test_optimized_path_rejects_duplicate_rule_name() {
+        // Two rules named `Widget` in one file: validate_spec_optimized is what the CLI's
+        // `generate`/`validate` commands actually call, so it must catch this too, not just
+        // validate_spec.
+        let spec =
+            crate::parser::parse_csil("Widget = { id: int }\nWidget = { name: text }\n").unwrap();
+
+        let err = validate_spec_optimized(&spec).unwrap_err().to_string();
+        assert!(err.contains("Duplicate rule name 'Widget'"), "got: {err}");
+    }
+
+    #[test]
+    fn test_optimized_path_accepts_unique_rule_names() {
+        let spec = crate::parser::parse_csil("Widget = { id: int }\nGadget = { widget: Widget }\n")
+            .unwrap();
+
+        assert!(validate_spec_optimized(&spec).is_ok());
+    }
+
+    #[test]
+    fn test_optimized_and_standard_paths_agree_on_duplicates() {
+        // Both entry points should report the same collision so the CLI's fast path never
+        // silently diverges from the exhaustive one.
+        let spec =
+            crate::parser::parse_csil("Widget = { id: int }\nWidget = { name: text }\n").unwrap();
+
+        let standard_err = validate_spec(&spec).unwrap_err().to_string();
+        let optimized_err = validate_spec_optimized(&spec).unwrap_err().to_string();
+        assert!(standard_err.contains("Duplicate rule name 'Widget'"));
+        assert!(optimized_err.contains("Duplicate rule name 'Widget'"));
     }
 
     #[test]

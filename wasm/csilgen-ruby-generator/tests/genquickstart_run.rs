@@ -253,9 +253,10 @@ puts \"DATAGRAMS OK\"\n",
         ev_block.contains("def open_tls_carrier(host, port)\n  $carrier\nend"),
         "TLS carrier swap did not match the emitted open_tls_carrier:\n{ev_block}"
     );
-    // The recv loop reads the `$hello-ack` first, then one typed `StreamTick` event, then
-    // `nil` to end. `route_channel` must decode that event to a `Tick` and dispatch it into
-    // the handler — which is what proves the generated router resolves from this package.
+    // The recv loop reads the `$hello-ack` first, then one typed `stream-tick` event
+    // (the verbatim CSIL op name is the wire string), then `nil` to end. `route_channel`
+    // must decode that event to a `Tick` and dispatch it into the handler — which is
+    // what proves the generated router resolves from this package.
     let ev_harness = format!(
         "{preamble}{ev_block}\n\
 # An in-process stream carrier: send_frame collects, recv_frame replays a scripted inbound\n\
@@ -267,7 +268,7 @@ class InProcCarrier\n\
 end\n\n\
 inbound = [\n\
   Events::HelloAck.new(v: 1, profile: \"verbose\").encode,\n\
-  Events::Event.verbose(\"echo\", \"StreamTick\", Tick.new(seq: 5).to_cbor).encode(Events::Profile::VERBOSE),\n\
+  Events::Event.verbose(\"echo_service\", \"stream-tick\", Tick.new(seq: 5).to_cbor).encode(Events::Profile::VERBOSE),\n\
 ]\n\
 $carrier = InProcCarrier.new(inbound)\n\n\
 # Override the one channel op so the dispatched, codec-decoded value is observable.\n\
@@ -275,7 +276,7 @@ class CaptureHandlers < EchoHandlers\n\
   def stream_tick(msg) = ($captured = msg)\n\
 end\n\n\
 session(CaptureHandlers.new, channel_codec)\n\
-raise \"router did not dispatch StreamTick into the handler: #{{$captured.inspect}}\" unless $captured == Tick.new(seq: 5)\n\
+raise \"router did not dispatch stream-tick into the handler: #{{$captured.inspect}}\" unless $captured == Tick.new(seq: 5)\n\
 puts \"EVENTS OK\"\n",
     );
     let ev_path = root.join("events_harness.rb");

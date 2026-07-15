@@ -7,11 +7,11 @@
 //! server interface + verbose/compact channel routers — never the wire bytes.
 
 use csilgen_common::{
-    CsilControlOperator, CsilGroupEntry, CsilGroupExpression, CsilGroupKey, CsilLiteralValue,
-    CsilOccurrence, CsilRuleType, CsilServiceDefinition, CsilServiceDirection, CsilSizeConstraint,
-    CsilTypeExpression, CsilValidationConstraint, GeneratedFile, GenerationStats,
-    GeneratorCapability, GeneratorMetadata, WasmGeneratorInput, WasmGeneratorOutput,
-    wasm_interface::*,
+    ChoiceClass, CsilControlOperator, CsilGroupEntry, CsilGroupExpression, CsilGroupKey,
+    CsilLiteralValue, CsilOccurrence, CsilRuleType, CsilServiceDefinition, CsilServiceDirection,
+    CsilSizeConstraint, CsilTypeExpression, CsilValidationConstraint, GeneratedFile,
+    GenerationStats, GeneratorCapability, GeneratorMetadata, WasmGeneratorInput,
+    WasmGeneratorOutput, choice_arm_literal, classify_choice, wasm_interface::*,
 };
 use csilgen_common::{CsilFieldMetadata, GeneratorWarning};
 use std::collections::HashMap;
@@ -238,7 +238,31 @@ impl ClientShape {
 /// The single typed entry point used by both the WASM `generate` export and the
 /// integration tests. Kept `pub` so the `rlib` crate-type lets tests drive real
 /// generation (a `cdylib`-only crate cannot be linked by integration tests).
-pub fn render(input: WasmGeneratorInput) -> Result<WasmGeneratorOutput, i32> {
+pub fn render(mut input: WasmGeneratorInput) -> Result<WasmGeneratorOutput, i32> {
+    // A field/element/value/tuple-slot whose type is an inline (anonymous) choice or group
+    // has no named rule behind it, so `map_csil_type`/`csharp_enc_value`/`csharp_dec_value`
+    // have no codec route and used to collapse it to `object` + CBOR null (value dropped).
+    // Hoisting each such shape to a synthesized named rule up front makes every downstream
+    // pass treat it exactly like a hand-written named choice/group — one code path, no
+    // bespoke inline handling anywhere. Shared machinery (`csilgen_common::hoist`) replaces
+    // this crate's former local hoist pass verbatim.
+    //
+    // `hoist_all_literal_choices: true` — UNLIKE TypeScript/Java/OCaml's `false`, C#'s field
+    // codec (`map_csil_type_inner`/`csharp_enc_value`/`csharp_dec_value`) has NO case at all
+    // for an un-hoisted `CsilTypeExpression::Choice`, literal or not: it falls through to the
+    // `object`/`new CborValue.Null()` blind-passthrough fallback (the exact bug this module
+    // exists to fix). So C# has always relied on hoisting EVERY inline choice, closed-literal
+    // ones included, to a named rule with its own codec — confirmed by the pre-migration
+    // output for `tests/interop/interop.csil`'s all-literal `Scalars.size` field, which
+    // hoists to a synthesized `ScalarsSize` enum today. Passing `false` here would silently
+    // regress that field (and every field like it) back to an untyped `object` with a
+    // null-emitting codec.
+    input.csil_spec = csilgen_common::hoist_inline_composites(
+        &input.csil_spec,
+        csilgen_common::HoistOptions {
+            hoist_all_literal_choices: true,
+        },
+    );
     let config = CsharpConfig::from_options(&input.config.options)?;
     // Validate client_style up front (before emitting any file) so a bad value fails the
     // whole run regardless of which target is requested.
@@ -987,7 +1011,7 @@ fn first_channel_example(
         };
         let base = service_base(&rule.name);
         return Some(ChannelExample {
-            service_wire: base.to_lowercase(),
+            service_wire: rule.name.clone(),
             router: format!("{base}Router"),
             iface: service_interface_name(&rule.name),
             encode_method: format!("Encode{}", pascal_ident(&chan.name)),
@@ -1116,7 +1140,7 @@ fn record_literal(
             e.key.as_ref().map(|key| {
                 format!(
                     "{} = {}",
-                    pascal_ident(&wire_key(key)),
+                    member_ident(pascal, &wire_key(key)),
                     csharp_sample(input, &e.value_type, records, config, visited)
                 )
             })
@@ -1224,7 +1248,7 @@ fn emit_record(body: &mut String, name: &str, group: &CsilGroupExpression, confi
     for entry in &group.entries {
         if let Some(key) = &entry.key {
             let wire = wire_key(key);
-            let prop = pascal_ident(&wire);
+            let prop = member_ident(&record, &wire);
             let base = map_csil_type(&entry.value_type, config);
             let optional = matches!(entry.occurrence, Some(CsilOccurrence::Optional));
 
@@ -1248,14 +1272,19 @@ fn emit_record(body: &mut String, name: &str, group: &CsilGroupExpression, confi
         body.push_str("    public void Validate()\n    {\n");
         for entry in &group.entries {
             if let Some(key) = &entry.key {
-                let field = FieldRef {
-                    prop: pascal_ident(&wire_key(key)),
-                    optional: matches!(entry.occurrence, Some(CsilOccurrence::Optional)),
-                };
+                let field = FieldRef::new(
+                    member_ident(&record, &wire_key(key)),
+                    matches!(entry.occurrence, Some(CsilOccurrence::Optional)),
+                );
+                // Every check on this field is collected unguarded first, then — for
+                // an optional field — nested inside one shared null-narrowing `if` so
+                // the guard variable is declared exactly once per field (see
+                // `FieldRef` doc comment for why per-check guards collide as CS0128).
+                let mut checks = String::new();
                 for metadata in &entry.metadata {
                     if let CsilFieldMetadata::Constraint(constraint) = metadata {
                         emit_metadata_constraint(
-                            body,
+                            &mut checks,
                             &field,
                             &entry.value_type,
                             constraint,
@@ -1265,8 +1294,21 @@ fn emit_record(body: &mut String, name: &str, group: &CsilGroupExpression, confi
                 }
                 if let CsilTypeExpression::Constrained { constraints, .. } = &entry.value_type {
                     for op in constraints {
-                        emit_control_op_check(body, &field, &entry.value_type, op, config);
+                        emit_control_op_check(&mut checks, &field, &entry.value_type, op, config);
                     }
+                }
+                if checks.is_empty() {
+                    continue;
+                }
+                if field.optional {
+                    body.push_str(&format!(
+                        "        if ({} is {{ }} {})\n        {{\n",
+                        field.prop, field.local
+                    ));
+                    body.push_str(&indent_block(&checks));
+                    body.push_str("        }\n");
+                } else {
+                    body.push_str(&checks);
                 }
             }
         }
@@ -1285,7 +1327,10 @@ fn emit_type_choice(
     choices: &[CsilTypeExpression],
     config: &CsharpConfig,
 ) {
-    if !choices.is_empty() && choices.iter().all(is_literal_choice) {
+    // `classify_choice` is THE normative enum/union split (csilgen_common::choice): every
+    // arm a literal, of any kind or a mix of kinds, is an enum; this call site must agree
+    // with `emit_choice_codec`'s or the declaration and the codec disagree on the shape.
+    if matches!(classify_choice(choices), ChoiceClass::Enum(_)) {
         emit_enum(body, name, choices);
         return;
     }
@@ -1343,7 +1388,7 @@ fn emit_group_choice(
         for entry in &choice.entries {
             if let Some(key) = &entry.key {
                 let wire = wire_key(key);
-                let prop = pascal_ident(&wire);
+                let prop = member_ident(&arm, &wire);
                 let base_type = map_csil_type(&entry.value_type, config);
                 let optional = matches!(entry.occurrence, Some(CsilOccurrence::Optional));
                 body.push_str(&format!("    // CBOR key: {wire}\n"));
@@ -1361,34 +1406,54 @@ fn emit_group_choice(
     }
 }
 
+/// The C# enum member identifier for one literal-choice arm. `Text`/`Integer` keep their
+/// original spelling (the text verbatim, or `Value{n}` for an int) so an all-`Text`- or
+/// all-`Integer`-arm enum — the only kinds `classify_choice` recognized before this
+/// migration — generates a byte-identical member list. The other literal kinds are only
+/// reachable now that `classify_choice` folds every literal kind (not just Text/Integer)
+/// into `Enum`; `index` disambiguates a kind with no natural short textual form
+/// (`Bytes`/`Array`) since two distinct values of that kind would otherwise collide on the
+/// same generic member name.
+fn enum_member_ident(enum_name: &str, literal: &CsilLiteralValue, index: usize) -> String {
+    match literal {
+        CsilLiteralValue::Text(text) => member_ident(enum_name, text),
+        CsilLiteralValue::Integer(value) => member_ident(enum_name, &format!("Value{value}")),
+        CsilLiteralValue::Bool(b) => member_ident(enum_name, if *b { "True" } else { "False" }),
+        CsilLiteralValue::Null => member_ident(enum_name, "Null"),
+        CsilLiteralValue::Float(_) => member_ident(enum_name, &format!("Value{index}")),
+        CsilLiteralValue::Bytes(_) => member_ident(enum_name, &format!("Bytes{index}")),
+        CsilLiteralValue::Array(_) => member_ident(enum_name, &format!("Array{index}")),
+    }
+}
+
 fn emit_enum(body: &mut String, name: &str, choices: &[CsilTypeExpression]) {
     let enum_name = pascal_ident(name);
     body.push_str(&format!("public enum {enum_name}\n{{\n"));
-    for choice in choices {
-        if let CsilTypeExpression::Literal(literal) = choice {
-            match literal {
-                CsilLiteralValue::Text(text) => {
-                    // The literal text is the wire value verbatim; the member name is a
-                    // generator-side PascalCase mapping of it.
-                    body.push_str(&format!("    // wire value: {text}\n"));
-                    body.push_str(&format!("    {},\n", pascal_ident(text)));
-                }
-                CsilLiteralValue::Integer(value) => {
-                    body.push_str(&format!("    Value{value} = {value},\n"));
-                }
-                _ => {}
+    for (index, choice) in choices.iter().enumerate() {
+        // `choice_arm_literal` sees through a `.default`-style control-operator wrapper so a
+        // trailing-`.default` literal arm still contributes its enum member. `classify_choice`
+        // guarantees every arm here carries a literal (that is what makes this an `Enum` in
+        // the first place), so `None` cannot occur.
+        let Some(literal) = choice_arm_literal(choice) else {
+            continue;
+        };
+        let member = enum_member_ident(&enum_name, literal, index);
+        match literal {
+            CsilLiteralValue::Text(text) => {
+                // The literal text is the wire value verbatim; the member name is a
+                // generator-side PascalCase mapping of it.
+                body.push_str(&format!("    // wire value: {text}\n"));
+                body.push_str(&format!("    {member},\n"));
+            }
+            CsilLiteralValue::Integer(value) => {
+                body.push_str(&format!("    {member} = {value},\n"));
+            }
+            _ => {
+                body.push_str(&format!("    {member},\n"));
             }
         }
     }
     body.push_str("}\n\n");
-}
-
-fn is_literal_choice(choice: &CsilTypeExpression) -> bool {
-    matches!(
-        choice,
-        CsilTypeExpression::Literal(CsilLiteralValue::Text(_))
-            | CsilTypeExpression::Literal(CsilLiteralValue::Integer(_))
-    )
 }
 
 // ---------------------------------------------------------------------------
@@ -1499,9 +1564,32 @@ fn emit_client_class(
     let base = service_base(name);
     let client = shape.class_name(&base);
     let transport = shape.transport_name();
-    // Canonical wire strings (the wire contract): service lowercased, op PascalCased.
-    // These never change with the client shape — the async twin rides the same wire.
-    let wire_service = base.to_lowercase();
+
+    // A primary-constructor parameter C# never reads inside the class body is a
+    // compile warning (CS9113 "parameter is unread"): a channel-only service (every
+    // op `<->`/`->>`, none `Unidirectional`), or one whose every unary op has a
+    // payload `op_boundary_expressible` can't model, would emit a `transport` param
+    // no method ever calls. Rather than suppress the warning, skip the class outright
+    // — mirroring the typescript generator's `has_services` gating and go/python,
+    // which likewise never emit a client with no callable method.
+    let has_usable_op = service.operations.iter().any(|operation| {
+        if !matches!(operation.direction, CsilServiceDirection::Unidirectional) {
+            return false;
+        }
+        let success = success_type(&operation.output_type);
+        let null_input = op_input_is_null(&operation.input_type);
+        let req_ok =
+            null_input || op_boundary_expressible(&operation.input_type, records, aliases, choices);
+        req_ok && op_boundary_expressible(&success, records, aliases, choices)
+    });
+    if !has_usable_op {
+        body.push_str(&format!(
+            "// {name} has no unary operation csilgen can put on an RPC client (channel-only,\n\
+             // or every payload is inexpressible); no {client} is emitted so `transport`\n\
+             // is never left an unread constructor parameter.\n\n"
+        ));
+        return;
+    }
 
     body.push_str(&format!(
         "/// <summary>Typed RPC client for the {name} service. The client owns\n/// (de)serialization via the generated codec; the transport only moves bytes.</summary>\n"
@@ -1537,7 +1625,6 @@ fn emit_client_class(
         // The `Async` suffix rides the marker so the twin's `SubmitTaskAsync` coexists with
         // the sync `SubmitTask`, while the drop-in keeps the canonical name.
         let method = format!("{}{}", pascal_ident(&operation.name), shape.marker);
-        let wire_op = wire_op_string(&operation.name);
         let output = map_csil_type(&success, config);
         let stem = op_codec_stem(name, &operation.name);
         // Only the seam round-trip and the return type turn async; `System.Threading.Tasks`
@@ -1565,8 +1652,13 @@ fn emit_client_class(
                 (format!("{input} {param}"), enc)
             }
         };
-        let call =
-            format!("{await_kw}transport.Call(\"{wire_service}\", \"{wire_op}\", {req_bytes})");
+        // Wire strings are the verbatim CSIL service and operation names
+        // (csil-rpc-transport.md §1.1/§1.3), distinct from the C# identifiers. They
+        // never change with the client shape — the async twin rides the same wire.
+        let call = format!(
+            "{await_kw}transport.Call(\"{name}\", \"{wire_op}\", {req_bytes})",
+            wire_op = operation.name
+        );
         // A record success reuses the generic `Codec.Decode<T>`; any other shape uses the
         // op's per-op response decoder.
         let decode = if is_record_ref(&success, records) {
@@ -1580,14 +1672,6 @@ fn emit_client_class(
     }
 
     body.push_str("}\n\n");
-}
-
-/// The wire `op` string: the operation name PascalCased with the simple rule
-/// (capitalize after `_`/`-`), matching the other generators (`submit-task` →
-/// `"SubmitTask"`). Never keyword-escaped — the wire string is raw, unlike the C#
-/// method identifier.
-fn wire_op_string(name: &str) -> String {
-    pascal_case(name)
 }
 
 /// Whether a type is a reference to a record the codec can (de)serialize, so a typed
@@ -2020,7 +2104,7 @@ fn emit_record_codec(
         .filter_map(|e| {
             let key = e.key.as_ref()?;
             let wire = wire_key(key);
-            Some((pascal_ident(&wire), wire, e))
+            Some((member_ident(&type_name, &wire), wire, e))
         })
         .collect();
     let mut canonical: Vec<&(String, String, &CsilGroupEntry)> = named.iter().collect();
@@ -2100,10 +2184,13 @@ fn emit_record_codec(
     out
 }
 
-/// Emit the codec pair for a named type-choice. An all-literal choice is a closed enum
-/// whose wire form is the bare literal (text or integer); any other choice is a tagged
-/// union encoded as the locked `[variant_index, value]` 2-element array (0-based index in
-/// declaration order, recursive value codec per arm).
+/// Emit the codec pair for a named type-choice. `classify_choice` (THE normative
+/// enum/union split, `csilgen_common::choice`) decides the shape: an all-literal choice —
+/// of any kind, even a mix of kinds — is a closed enum whose wire form is the bare literal;
+/// any other choice is a tagged union encoded as the locked `[variant_index, value]`
+/// 2-element array (0-based index in declaration order, recursive value codec per arm).
+/// This call site must classify identically to `emit_type_choice`'s (the declaration side)
+/// or the declared C# shape and its codec disagree.
 fn emit_choice_codec(
     name: &str,
     cases: &[CsilTypeExpression],
@@ -2112,40 +2199,131 @@ fn emit_choice_codec(
     choices: &std::collections::HashSet<String>,
 ) -> String {
     let type_name = pascal_ident(name);
-    if !cases.is_empty() && cases.iter().all(is_literal_choice) {
-        emit_enum_codec(&type_name, cases)
-    } else {
-        emit_union_codec(&type_name, cases, records, aliases, choices)
+    match classify_choice(cases) {
+        ChoiceClass::Enum(_) => emit_enum_codec(&type_name, cases),
+        ChoiceClass::Union(_) => emit_union_codec(&type_name, cases, records, aliases, choices),
     }
 }
 
-/// Bare-literal enum codec: each member maps to its verbatim wire literal (text or the
-/// signed integer it stands for), mirroring `emit_enum`'s member spelling exactly.
+/// A boolean C# expression asserting the `CborValue` bound to `expr` structurally equals
+/// literal `lit`, via a nested type + property pattern (`is Type { Value: X }`) so the
+/// check composes recursively for `Array` without a bespoke runtime helper — the generated
+/// `Codec` class cannot reach `Cbor.ValueEquals` (private, used only by `Cbor`'s own
+/// `ExpectLiteral`). The `Integer` split mirrors `csharp_literal_cbor_expr`/`Cbor.Enc`:
+/// canonical CBOR always encodes a non-negative integer as major type 0, so `Cbor.Decode`
+/// hands back `CborValue.Uint` for one, never `CborValue.Int`, regardless of which C#
+/// record built it.
+fn csharp_literal_equals_expr(expr: &str, lit: &CsilLiteralValue) -> String {
+    match lit {
+        // A non-negative literal must match either wire representation: a value that came
+        // straight from `ToCborValue` (this same codec's mixed-enum encode arm always emits
+        // `CborValue.Int`, even for a non-negative member — see emit_enum_codec's comment on
+        // why encode keeps the pre-migration rendering) as well as a value that came back
+        // through actual CBOR byte encode/decode (canonical CBOR has one wire form for a
+        // non-negative integer, major type 0, which this codec's byte-level decoder always
+        // reconstructs as `CborValue.Uint`). Guarding on `Uint` alone made `FromCborValue`
+        // reject the exact value `ToCborValue` had just produced for any in-memory (no byte
+        // round-trip) caller — the defect this comment exists to prevent regressing.
+        CsilLiteralValue::Integer(i) if *i >= 0 => {
+            format!(
+                "{expr} is CborValue.Uint {{ Value: {i}UL }} or CborValue.Int {{ Value: {i}L }}"
+            )
+        }
+        CsilLiteralValue::Integer(i) => format!("{expr} is CborValue.Int {{ Value: {i}L }}"),
+        CsilLiteralValue::Float(f) => format!("{expr} is CborValue.Float {{ Value: {f} }}"),
+        CsilLiteralValue::Text(s) => {
+            format!(
+                "{expr} is CborValue.Text {{ Value: \"{}\" }}",
+                csharp_escape(s)
+            )
+        }
+        CsilLiteralValue::Bool(b) => format!(
+            "{expr} is CborValue.Bool {{ Value: {} }}",
+            if *b { "true" } else { "false" }
+        ),
+        CsilLiteralValue::Null => format!("{expr} is CborValue.Null"),
+        CsilLiteralValue::Bytes(bytes) => {
+            let values = bytes
+                .iter()
+                .map(|b| b.to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(
+                "({expr} is CborValue.Bytes csilLitBytes{expr_id} && csilLitBytes{expr_id}.Value.SequenceEqual(new byte[] {{ {values} }}))",
+                expr_id = ident_suffix(expr)
+            )
+        }
+        CsilLiteralValue::Array(items) => {
+            let binding = format!("csilLitArr{}", ident_suffix(expr));
+            let checks: Vec<String> = items
+                .iter()
+                .enumerate()
+                .map(|(index, item)| {
+                    csharp_literal_equals_expr(&format!("{binding}.Items[{index}]"), item)
+                })
+                .collect();
+            let joined = if checks.is_empty() {
+                "true".to_string()
+            } else {
+                checks.join(" && ")
+            };
+            format!(
+                "({expr} is CborValue.Array {binding} && {binding}.Items.Count == {} && {joined})",
+                items.len()
+            )
+        }
+    }
+}
+
+/// A short, unique-enough identifier fragment derived from `expr` so a nested
+/// `csharp_literal_equals_expr` binding (`csilLitArr...`/`csilLitBytes...`) doesn't shadow
+/// an outer one when `Array` literals nest.
+fn ident_suffix(expr: &str) -> String {
+    expr.chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect()
+}
+
+/// Bare-literal enum codec: each member maps to its verbatim wire literal, mirroring
+/// `emit_enum`'s member spelling exactly (`enum_member_ident`, shared by both).
 fn emit_enum_codec(type_name: &str, cases: &[CsilTypeExpression]) -> String {
-    let int_based = cases
+    // `choice_arm_literal` strips a `.default`-style wrapper so a trailing-`.default`
+    // literal arm is still classified and encoded as its own literal value.
+    let int_only = cases
         .iter()
-        .all(|c| matches!(c, CsilTypeExpression::Literal(CsilLiteralValue::Integer(_))));
+        .all(|c| matches!(choice_arm_literal(c), Some(CsilLiteralValue::Integer(_))));
+    let text_only = cases
+        .iter()
+        .all(|c| matches!(choice_arm_literal(c), Some(CsilLiteralValue::Text(_))));
+
     let mut to_arms = String::new();
-    let mut from_arms = String::new();
-    for case in cases {
-        match case {
-            CsilTypeExpression::Literal(CsilLiteralValue::Text(text)) => {
-                let member = pascal_ident(text);
+    for (index, case) in cases.iter().enumerate() {
+        let Some(literal) = choice_arm_literal(case) else {
+            continue;
+        };
+        let member = enum_member_ident(type_name, literal, index);
+        match literal {
+            // Encode is unaffected by the mixed-kind decode bug below: each arm's `value
+            // switch` produces its own `CborValue` per enum MEMBER, not per wire kind — kept
+            // byte-identical to the pre-migration rendering for these two kinds.
+            CsilLiteralValue::Text(text) => {
                 let lit = csharp_escape(text);
                 to_arms.push_str(&format!(
                     "        {type_name}.{member} => new CborValue.Text(\"{lit}\"),\n"
                 ));
-                from_arms.push_str(&format!("        \"{lit}\" => {type_name}.{member},\n"));
             }
-            CsilTypeExpression::Literal(CsilLiteralValue::Integer(value)) => {
+            CsilLiteralValue::Integer(value) => {
                 to_arms.push_str(&format!(
-                    "        {type_name}.Value{value} => new CborValue.Int({value}),\n"
+                    "        {type_name}.{member} => new CborValue.Int({value}),\n"
                 ));
-                from_arms.push_str(&format!("        {value} => {type_name}.Value{value},\n"));
             }
-            _ => {}
+            other => {
+                let cbor_expr = csharp_literal_cbor_expr(other);
+                to_arms.push_str(&format!("        {type_name}.{member} => {cbor_expr},\n"));
+            }
         }
     }
+
     let mut out = String::new();
     out.push_str(&format!(
         "    /// <summary>The bare-literal CBOR value for a {type_name}.</summary>\n"
@@ -2156,13 +2334,54 @@ fn emit_enum_codec(type_name: &str, cases: &[CsilTypeExpression]) -> String {
     out.push_str(&format!(
         "    /// <summary>Reconstruct a {type_name} from its bare-literal CBOR value.</summary>\n"
     ));
-    if int_based {
+
+    // A uniform (all-Text or all-Integer) vocabulary keeps its pre-migration decode
+    // rendering byte-for-byte: a single `Cbor.AsI64`/`Cbor.AsText` extraction, then a switch
+    // over the bare scalar. This is every enum any pinned interop/example spec declares
+    // today. Only a choice this shortcut cannot honestly serve — a genuinely mixed-kind
+    // vocabulary (the confirmed defect: `Cbor.AsText` can't hand back an `int` for a bare
+    // integer pattern, CS8121), or a uniform vocabulary of some OTHER single literal kind
+    // (Bool/Null/Float/Bytes/Array-only, reachable now that `classify_choice` folds every
+    // literal kind into `Enum`, not just Text/Integer) — takes the general path: each arm
+    // matched by ITS OWN kind-appropriate pattern against the raw `CborValue`, so no single
+    // scalar extractor has to assume every member shares one wire kind.
+    if int_only {
+        let mut from_arms = String::new();
+        for (index, case) in cases.iter().enumerate() {
+            if let Some(literal @ CsilLiteralValue::Integer(value)) = choice_arm_literal(case) {
+                let member = enum_member_ident(type_name, literal, index);
+                from_arms.push_str(&format!("        {value} => {type_name}.{member},\n"));
+            }
+        }
         out.push_str(&format!(
             "    public static {type_name} {type_name}FromCborValue(CborValue value) => Cbor.AsI64(value) switch\n    {{\n{from_arms}        _ => throw new CborException(\"invalid {type_name} value\"),\n    }};\n\n"
         ));
-    } else {
+    } else if text_only {
+        let mut from_arms = String::new();
+        for (index, case) in cases.iter().enumerate() {
+            if let Some(literal @ CsilLiteralValue::Text(text)) = choice_arm_literal(case) {
+                let member = enum_member_ident(type_name, literal, index);
+                let lit = csharp_escape(text);
+                from_arms.push_str(&format!("        \"{lit}\" => {type_name}.{member},\n"));
+            }
+        }
         out.push_str(&format!(
             "    public static {type_name} {type_name}FromCborValue(CborValue value) => Cbor.AsText(value) switch\n    {{\n{from_arms}        _ => throw new CborException(\"invalid {type_name} value\"),\n    }};\n\n"
+        ));
+    } else {
+        let mut from_arms = String::new();
+        for (index, case) in cases.iter().enumerate() {
+            let Some(literal) = choice_arm_literal(case) else {
+                continue;
+            };
+            let member = enum_member_ident(type_name, literal, index);
+            let guard = csharp_literal_equals_expr("csilLitValue", literal);
+            from_arms.push_str(&format!(
+                "        CborValue csilLitValue when {guard} => {type_name}.{member},\n"
+            ));
+        }
+        out.push_str(&format!(
+            "    public static {type_name} {type_name}FromCborValue(CborValue value) => value switch\n    {{\n{from_arms}        _ => throw new CborException(\"invalid {type_name} value\"),\n    }};\n\n"
         ));
     }
     out
@@ -2460,7 +2679,12 @@ fn emit_channel_router(
         }
         let method = pascal_ident(&operation.name);
         let input = map_csil_type(&operation.input_type, config);
-        body.push_str(&format!("            case \"{method}\":\n            {{\n"));
+        // The case key is the verbatim CSIL operation name (csil-rpc-transport.md
+        // §1.3), matching what the peer's op encoder frames.
+        body.push_str(&format!(
+            "            case \"{}\":\n            {{\n",
+            operation.name
+        ));
         body.push_str(&format!(
             "                var message = ({input})codec.Decode(data, typeof({input}));\n"
         ));
@@ -2514,7 +2738,9 @@ fn emit_channel_router(
             "    public static (string Method, byte[] Data) Encode{method}(ICsilCodec codec, {output} message)\n    {{\n"
         ));
         body.push_str("        var data = codec.Encode(message);\n");
-        body.push_str(&format!("        return (\"{method}\", data);\n"));
+        // The framed wire string is the verbatim CSIL operation name; only the
+        // `Encode<Op>` method identifier is PascalCased.
+        body.push_str(&format!("        return (\"{}\", data);\n", operation.name));
         body.push_str("    }\n\n");
     }
 
@@ -2531,32 +2757,71 @@ fn emit_channel_router(
 // ---------------------------------------------------------------------------
 
 /// A property's C# name plus whether it is optional (nullable). Threaded through the
-/// check emitters so each can guard a null optional with `if (X is { } value)`.
+/// check emitters so each can guard a null optional with `if (X is { } localGuard)`.
+///
+/// `local` is the pattern-variable name a null-narrowing guard binds to. C# scopes an
+/// `is` pattern variable to the whole enclosing block, not just its `if` statement, so
+/// two guards sharing a name collide as CS0128 even when they sit in separate sibling
+/// `if`s (e.g. one per constraint on the same field, or one per optional field in the
+/// same `Validate()`). A fixed name like `value` reused across every guard in a method
+/// is exactly that collision; deriving `local` from `prop` keeps it unique, since C#
+/// already requires `prop` to be unique among a record's members.
 struct FieldRef {
     prop: String,
     optional: bool,
+    local: String,
 }
 
 impl FieldRef {
-    /// The expression a check reads. An optional field is unwrapped to the bound
-    /// non-null `value` inside its guard; a required field reads the property directly.
-    fn access(&self) -> &str {
-        if self.optional { "value" } else { &self.prop }
-    }
-
-    /// Wrap a check, guarding it behind a null test when the field is optional.
-    fn wrap(&self, cond: &str, message: &str) -> String {
-        if self.optional {
-            format!(
-                "        if ({prop} is {{ }} value)\n        {{\n            if ({cond})\n            {{\n                throw new System.ArgumentException(\"{message}\");\n            }}\n        }}\n",
-                prop = self.prop
-            )
-        } else {
-            format!(
-                "        if ({cond})\n        {{\n            throw new System.ArgumentException(\"{message}\");\n        }}\n"
-            )
+    fn new(prop: String, optional: bool) -> Self {
+        let local = guard_local_name(&prop);
+        Self {
+            prop,
+            optional,
+            local,
         }
     }
+
+    /// The expression a check reads. An optional field is unwrapped to its bound
+    /// non-null guard variable inside the narrowing block; a required field reads the
+    /// property directly.
+    fn access(&self) -> &str {
+        if self.optional {
+            &self.local
+        } else {
+            &self.prop
+        }
+    }
+
+    /// One unguarded check: `if (cond) { throw ...; }` at the method's base indent.
+    /// All of a field's checks are collected at this same indent, then — for an
+    /// optional field — wrapped together in a *single* null-narrowing `if` by the
+    /// caller, so one guard variable covers every check on that field instead of one
+    /// guard per check.
+    fn check(&self, cond: &str, message: &str) -> String {
+        format!(
+            "        if ({cond})\n        {{\n            throw new System.ArgumentException(\"{message}\");\n        }}\n"
+        )
+    }
+}
+
+/// Derive an optional field's null-narrowing guard-variable name from its (unique)
+/// property name: lowercase the leading letter (stripping a keyword-escape `@` first,
+/// since `@` may only prefix a whole identifier) and suffix `Value`. Kept distinct from
+/// `access()`'s non-optional branch (the bare property name) so a guard can never
+/// shadow the property it narrows.
+fn guard_local_name(prop: &str) -> String {
+    let mut chars = prop.trim_start_matches('@').chars();
+    match chars.next() {
+        None => "value".to_string(),
+        Some(first) => format!("{}{}Value", first.to_lowercase(), chars.as_str()),
+    }
+}
+
+/// Indent every line of a block of already-emitted checks by one more level, for
+/// nesting inside a field's null-narrowing guard `if`.
+fn indent_block(checks: &str) -> String {
+    checks.lines().map(|line| format!("    {line}\n")).collect()
 }
 
 fn entry_has_check(entry: &CsilGroupEntry) -> bool {
@@ -2710,7 +2975,7 @@ fn emit_len_check(
     let accessor = len_accessor(value_type);
     let cond = format!("{}.{accessor} {op} {n}", field.access());
     let message = csharp_escape(&format!("field '{}' must have {tail}", field.prop));
-    body.push_str(&field.wrap(&cond, &message));
+    body.push_str(&field.check(&cond, &message));
 }
 
 fn emit_size_check(
@@ -2775,7 +3040,7 @@ fn emit_regex_check(body: &mut String, field: &FieldRef, pattern: &str) {
         "field '{}' must match pattern '{}'",
         field.prop, pattern
     ));
-    body.push_str(&field.wrap(&cond, &message));
+    body.push_str(&field.check(&cond, &message));
 }
 
 /// One ordered comparison honoring the field's type. `vop` is the C# operator whose
@@ -2799,7 +3064,7 @@ fn emit_ordered_check(
             let cond = format!("{access} {vop} {rendered}");
             let message =
                 csharp_escape(&format!("field '{}' must be {desc} {rendered}", field.prop));
-            body.push_str(&field.wrap(&cond, &message));
+            body.push_str(&field.check(&cond, &message));
         }
         OrderedKind::LibraryDecimal => {
             let Some(text) = literal_as_decimal_text(value) else {
@@ -2811,7 +3076,7 @@ fn emit_ordered_check(
             );
             let cond = format!("{access} {vop} {bound}");
             let message = csharp_escape(&format!("field '{}' must be {desc} {text}", field.prop));
-            body.push_str(&field.wrap(&cond, &message));
+            body.push_str(&field.check(&cond, &message));
         }
         OrderedKind::CsilDecimal => {
             let Some(text) = literal_as_decimal_text(value) else {
@@ -2822,7 +3087,7 @@ fn emit_ordered_check(
                 csharp_escape(&text)
             );
             let message = csharp_escape(&format!("field '{}' must be {desc} {text}", field.prop));
-            body.push_str(&field.wrap(&cond, &message));
+            body.push_str(&field.check(&cond, &message));
         }
         OrderedKind::Timestamp => {
             let Some(text) = literal_as_timestamp_text(value) else {
@@ -2831,7 +3096,7 @@ fn emit_ordered_check(
             let bound = format!("System.DateTimeOffset.Parse(\"{}\")", csharp_escape(&text));
             let cond = format!("{access} {vop} {bound}");
             let message = csharp_escape(&format!("field '{}' must be {desc} {text}", field.prop));
-            body.push_str(&field.wrap(&cond, &message));
+            body.push_str(&field.check(&cond, &message));
         }
     }
 }
@@ -3127,7 +3392,8 @@ fn service_interface_name(name: &str) -> String {
 }
 
 /// The service base used for the client class and wire-id prefix: the PascalCased
-/// name with any trailing `Service` removed.
+/// name with any trailing `Service` removed. C# identifiers only — wire strings
+/// carry the verbatim CSIL service name instead (csil-rpc-transport.md §1.1).
 fn service_base(name: &str) -> String {
     let pascal = pascal_case(name);
     pascal
@@ -3151,6 +3417,21 @@ fn pascal_ident(s: &str) -> String {
 /// C# keywords are lowercase and only surface a collision in camelCase contexts.
 fn camel_ident(s: &str) -> String {
     escape_keyword(&camel_case(s))
+}
+
+/// `pascal_ident` for a member (property or enum case) of the type named `enclosing`
+/// (already PascalCased). C# forbids a member spelled like its containing type (CS0542),
+/// so a CSIL field such as `relation` inside record `Relation` gains a trailing
+/// underscore. That escape is collision-free because `pascal_case` strips underscores,
+/// so no other field's mapping can produce the escaped spelling. Only the C# member
+/// name changes — the CBOR wire key stays the verbatim CSIL name.
+fn member_ident(enclosing: &str, s: &str) -> String {
+    let ident = pascal_ident(s);
+    if ident == enclosing {
+        format!("{ident}_")
+    } else {
+        ident
+    }
 }
 
 fn pascal_case(s: &str) -> String {
@@ -3694,7 +3975,7 @@ public static partial class Cbor
         (CborValue.Float a, CborValue.Float b) => a.Value == b.Value,
         (CborValue.Null, CborValue.Null) => true,
         (CborValue.Text a, CborValue.Text b) => a.Value == b.Value,
-        (CborValue.Bytes a, CborValue.Bytes b) => a.Value.AsSpan().SequenceEqual(b.Value),
+        (CborValue.Bytes a, CborValue.Bytes b) => a.Value.SequenceEqual(b.Value),
         (CborValue.Array a, CborValue.Array b) => a.Items.Count == b.Items.Count && a.Items.Zip(b.Items).All(p => ValueEquals(p.First, p.Second)),
         _ => false,
     };
@@ -4185,6 +4466,456 @@ mod tests {
         }
     }
 
+    /// A service with ONLY a `<->` (bidirectional/channel) operation — no `Unidirectional`
+    /// op at all, so the RPC client would have no method to put on it. Regression fixture for
+    /// the CS9113 ("parameter is unread") client-skip fix: `emit_client_class` used to emit
+    /// `public sealed class FooClient(ICsilTransport transport)` unconditionally, with a body
+    /// of nothing but a `// channel operation ... is not part of the RPC client` comment, so
+    /// `transport` was a primary-constructor parameter no method ever read.
+    fn channel_only_input(target: &str) -> WasmGeneratorInput {
+        let text = || CsilTypeExpression::Builtin("text".to_string());
+        let pos = || CsilPosition {
+            line: 1,
+            column: 1,
+            offset: 0,
+        };
+        let msg = CsilRule {
+            name: "ChatMessage".to_string(),
+            rule_type: CsilRuleType::GroupDef(CsilGroupExpression {
+                entries: vec![bare_entry("body", text())],
+            }),
+            position: pos(),
+            doc_comments: Vec::new(),
+        };
+        let svc = CsilRule {
+            name: "ChatService".to_string(),
+            rule_type: CsilRuleType::ServiceDef(CsilServiceDefinition {
+                operations: vec![CsilServiceOperation {
+                    name: "chat".to_string(),
+                    input_type: CsilTypeExpression::Reference("ChatMessage".to_string()),
+                    output_type: CsilTypeExpression::Reference("ChatMessage".to_string()),
+                    direction: CsilServiceDirection::Bidirectional,
+                    position: pos(),
+                    doc_comments: Vec::new(),
+                    wire_id: None,
+                }],
+                wire_id: None,
+            }),
+            position: pos(),
+            doc_comments: Vec::new(),
+        };
+        WasmGeneratorInput {
+            csil_spec: CsilSpecSerialized {
+                rules: vec![msg, svc],
+                source_content: None,
+                service_count: 1,
+                fields_with_metadata_count: 0,
+            },
+            config: GeneratorConfig {
+                target: target.to_string(),
+                output_dir: "/tmp".to_string(),
+                options: HashMap::new(),
+            },
+            generator_metadata: GeneratorMetadata {
+                name: "csharp".to_string(),
+                version: "1.0.0".to_string(),
+                description: String::new(),
+                target: "csharp".to_string(),
+                capabilities: vec![],
+                author: None,
+                homepage: None,
+            },
+        }
+    }
+
+    #[test]
+    fn channel_only_service_emits_no_client_class() {
+        let output = render(channel_only_input("csharp-client")).expect("generation ok");
+        let client = file_content(&output, "Client.gen.cs");
+        assert!(
+            !client.contains("class ChatClient"),
+            "a channel-only service must not emit a client class with an unread \
+             `transport` primary-constructor parameter: {client}"
+        );
+        assert!(
+            client.contains("no ChatClient is emitted"),
+            "the skip must still leave an explanatory note: {client}"
+        );
+    }
+
+    /// The real CS9113 proof: a channel-only service's client (still emitted as an empty
+    /// file with just an explanatory comment) must build with zero warnings. Skips cleanly
+    /// when no dotnet toolchain is on PATH.
+    #[test]
+    fn channel_only_service_client_builds_without_unread_parameter_warning() {
+        if !have_dotnet() {
+            eprintln!("skipping: no dotnet toolchain on PATH");
+            return;
+        }
+        let mut input = channel_only_input("csharp-client");
+        input
+            .config
+            .options
+            .insert("emit_packages".to_string(), serde_json::json!(["csharp"]));
+        input.config.options.insert(
+            "package_name".to_string(),
+            serde_json::json!("Csilgen.ChannelOnlyTest"),
+        );
+        let output = render(input).expect("generation ok");
+        assert!(csproj(&output).is_some(), "package mode emits a .csproj");
+
+        let dir =
+            std::env::temp_dir().join(format!("csilgen-cs-channelonly-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for file in &output.files {
+            std::fs::write(dir.join(&file.path), &file.content).unwrap();
+        }
+        let run = run_dotnet(&dir, "build");
+        let stdout = String::from_utf8_lossy(&run.stdout);
+        let stderr = String::from_utf8_lossy(&run.stderr);
+        assert!(
+            run.status.success(),
+            "dotnet build failed:\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        assert!(
+            !stdout.contains("CS9113") && !stdout.contains("is unread"),
+            "no unread-parameter warning should be possible once the useless client is \
+             skipped:\nstdout:\n{stdout}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A record referencing two named all-literal choices — `Color = "red" / "green" /
+    /// "blue"` and `Level = 1 / 2 / 3` — for the enum-decode membership audit: unlike
+    /// dart (whose closed choice is a transparent `String`/`int` alias with no codec of
+    /// its own) csharp lowers a bare-literal choice to a real `enum` with its own
+    /// `<Type>FromCborValue`, generated by `emit_enum_codec`.
+    fn enum_audit_input(target: &str) -> WasmGeneratorInput {
+        let pos = || CsilPosition {
+            line: 1,
+            column: 1,
+            offset: 0,
+        };
+        let lit_text = |s: &str| CsilTypeExpression::Literal(CsilLiteralValue::Text(s.to_string()));
+        let lit_int = |n: i64| CsilTypeExpression::Literal(CsilLiteralValue::Integer(n));
+        let color = CsilRule {
+            name: "Color".to_string(),
+            rule_type: CsilRuleType::TypeChoice(vec![
+                lit_text("red"),
+                lit_text("green"),
+                lit_text("blue"),
+            ]),
+            position: pos(),
+            doc_comments: Vec::new(),
+        };
+        let level = CsilRule {
+            name: "Level".to_string(),
+            rule_type: CsilRuleType::TypeChoice(vec![lit_int(1), lit_int(2), lit_int(3)]),
+            position: pos(),
+            doc_comments: Vec::new(),
+        };
+        let item = CsilRule {
+            name: "Item".to_string(),
+            rule_type: CsilRuleType::GroupDef(CsilGroupExpression {
+                entries: vec![
+                    bare_entry("color", CsilTypeExpression::Reference("Color".to_string())),
+                    bare_entry("level", CsilTypeExpression::Reference("Level".to_string())),
+                ],
+            }),
+            position: pos(),
+            doc_comments: Vec::new(),
+        };
+        WasmGeneratorInput {
+            csil_spec: CsilSpecSerialized {
+                rules: vec![color, level, item],
+                source_content: None,
+                service_count: 0,
+                fields_with_metadata_count: 0,
+            },
+            config: GeneratorConfig {
+                target: target.to_string(),
+                output_dir: "/tmp".to_string(),
+                options: HashMap::new(),
+            },
+            generator_metadata: GeneratorMetadata {
+                name: "csharp".to_string(),
+                version: "1.0.0".to_string(),
+                description: String::new(),
+                target: "csharp".to_string(),
+                capabilities: vec![],
+                author: None,
+                homepage: None,
+            },
+        }
+    }
+
+    /// Empirical enum-decode membership audit (csharp): decode an out-of-set string
+    /// (`"purple"` against `Color`) and an out-of-set int (`99` against `Level`) and
+    /// confirm both raise the codec's standard `CborException`, while a valid member
+    /// still round-trips byte-identical — the same contract python/ocaml/php/ruby/elixir
+    /// already enforce. `emit_enum_codec`'s generated `switch` already has a `_ => throw
+    /// new CborException(...)` fallback arm for both the text- and int-based enum decode,
+    /// so this is confirmation, not a fix. Skips cleanly when no dotnet toolchain is on PATH.
+    #[test]
+    fn enum_decode_rejects_out_of_set_value_through_dotnet() {
+        if !have_dotnet() {
+            eprintln!("skipping: no dotnet toolchain on PATH");
+            return;
+        }
+        let output = render(enum_audit_input("csharp")).expect("generation ok");
+
+        let dir =
+            std::env::temp_dir().join(format!("csilgen-cs-enum-decode-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for file in &output.files {
+            std::fs::write(dir.join(&file.path), &file.content).unwrap();
+        }
+        std::fs::write(dir.join("Program.cs"), CSHARP_ENUM_DECODE_DRIVER).unwrap();
+        std::fs::write(dir.join("roundtrip.csproj"), CSHARP_CSPROJ).unwrap();
+
+        let mut cmd = std::process::Command::new("dotnet");
+        cmd.arg("run")
+            .arg("--project")
+            .arg(&dir)
+            .current_dir(&dir)
+            .env("DOTNET_NOLOGO", "1")
+            .env("DOTNET_CLI_TELEMETRY_OPTOUT", "1")
+            .env("DOTNET_SKIP_FIRST_TIME_EXPERIENCE", "1")
+            .env("NUGET_PACKAGES", dir.join(".nuget"));
+        if let Ok(home) = std::env::var("DOTNET_CLI_HOME") {
+            cmd.env("DOTNET_CLI_HOME", home);
+        }
+        let run = cmd.output().unwrap();
+        let stdout = String::from_utf8_lossy(&run.stdout);
+        let stderr = String::from_utf8_lossy(&run.stderr);
+        assert!(
+            run.status.success(),
+            "dotnet run failed:\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        assert_eq!(
+            stdout.trim(),
+            "ok",
+            "unexpected output:\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    const CSHARP_ENUM_DECODE_DRIVER: &str = r#"using Csilgen.Transport;
+using System.Collections.Generic;
+
+var valid = new CborValue.Map(new List<(CborValue, CborValue)>
+{
+    (new CborValue.Text("color"), new CborValue.Text("red")),
+    (new CborValue.Text("level"), new CborValue.Int(2)),
+});
+var back = Codec.ItemFromCborValue(valid);
+if (back.Color != Color.Red || back.Level != Level.Value2)
+{
+    throw new System.Exception("valid round-trip mismatch");
+}
+
+var purple = new CborValue.Map(new List<(CborValue, CborValue)>
+{
+    (new CborValue.Text("color"), new CborValue.Text("purple")),
+    (new CborValue.Text("level"), new CborValue.Int(2)),
+});
+try
+{
+    Codec.ItemFromCborValue(purple);
+    throw new System.Exception("out-of-set color was accepted");
+}
+catch (CborException e)
+{
+    if (!e.Message.Contains("invalid Color"))
+    {
+        throw new System.Exception($"wrong error for out-of-set color: {e.Message}");
+    }
+}
+
+var ninetynine = new CborValue.Map(new List<(CborValue, CborValue)>
+{
+    (new CborValue.Text("color"), new CborValue.Text("red")),
+    (new CborValue.Text("level"), new CborValue.Int(99)),
+});
+try
+{
+    Codec.ItemFromCborValue(ninetynine);
+    throw new System.Exception("out-of-set level was accepted");
+}
+catch (CborException e)
+{
+    if (!e.Message.Contains("invalid Level"))
+    {
+        throw new System.Exception($"wrong error for out-of-set level: {e.Message}");
+    }
+}
+
+System.Console.WriteLine("ok");
+"#;
+
+    /// Regression spec for the confirmed mixed-kind-literal-choice decode defect: `Status`
+    /// mixes a text literal, an integer literal, and a second text literal in one choice
+    /// (`"pending" / 1 / "shipped"`). `classify_choice` (`csilgen_common::choice`) says this
+    /// is ALL literal — an `Enum` — regardless of the kind mix. Before the fix,
+    /// `emit_enum_codec`'s `int_based` gate required EVERY arm to be an `Integer`, so a
+    /// mixed vocabulary fell to the `Cbor.AsText(value) switch` branch — and its bare
+    /// `1 => Value1` arm (an `int` pattern matched against a `switch` typed `string`) is
+    /// CS8121, a hard C# compile failure, not just a wrong-answer bug.
+    fn mixed_literal_choice_input(target: &str) -> WasmGeneratorInput {
+        let pos = || CsilPosition {
+            line: 1,
+            column: 1,
+            offset: 0,
+        };
+        let lit_text = |s: &str| CsilTypeExpression::Literal(CsilLiteralValue::Text(s.to_string()));
+        let lit_int = |n: i64| CsilTypeExpression::Literal(CsilLiteralValue::Integer(n));
+        let status = CsilRule {
+            name: "Status".to_string(),
+            rule_type: CsilRuleType::TypeChoice(vec![
+                lit_text("pending"),
+                lit_int(1),
+                lit_text("shipped"),
+            ]),
+            position: pos(),
+            doc_comments: Vec::new(),
+        };
+        let item = CsilRule {
+            name: "Item".to_string(),
+            rule_type: CsilRuleType::GroupDef(CsilGroupExpression {
+                entries: vec![bare_entry(
+                    "status",
+                    CsilTypeExpression::Reference("Status".to_string()),
+                )],
+            }),
+            position: pos(),
+            doc_comments: Vec::new(),
+        };
+        WasmGeneratorInput {
+            csil_spec: CsilSpecSerialized {
+                rules: vec![status, item],
+                source_content: None,
+                service_count: 0,
+                fields_with_metadata_count: 0,
+            },
+            config: GeneratorConfig {
+                target: target.to_string(),
+                output_dir: "/tmp".to_string(),
+                options: HashMap::new(),
+            },
+            generator_metadata: GeneratorMetadata {
+                name: "csharp".to_string(),
+                version: "1.0.0".to_string(),
+                description: String::new(),
+                target: "csharp".to_string(),
+                capabilities: vec![],
+                author: None,
+                homepage: None,
+            },
+        }
+    }
+
+    /// Drives the mixed-kind `Status` codec: every declared member (of either literal kind)
+    /// round-trips through its own kind-appropriate wire form, and an out-of-set value of
+    /// EITHER kind is rejected — not just one, since a wrong fix could easily satisfy one
+    /// kind's membership check while silently accepting anything of the other kind's type.
+    const CSHARP_MIXED_ENUM_DRIVER: &str = r#"using Csilgen.Transport;
+
+if (Codec.StatusFromCborValue(Codec.StatusToCborValue(Status.Pending)) != Status.Pending)
+{
+    throw new System.Exception("Pending round-trip mismatch");
+}
+if (Codec.StatusFromCborValue(Codec.StatusToCborValue(Status.Value1)) != Status.Value1)
+{
+    throw new System.Exception("Value1 round-trip mismatch");
+}
+if (Codec.StatusFromCborValue(Codec.StatusToCborValue(Status.Shipped)) != Status.Shipped)
+{
+    throw new System.Exception("Shipped round-trip mismatch");
+}
+
+// An out-of-set TEXT value is rejected even though the vocabulary also contains an int.
+try
+{
+    Codec.StatusFromCborValue(new CborValue.Text("unknown"));
+    throw new System.Exception("out-of-set text value was accepted");
+}
+catch (CborException e)
+{
+    if (!e.Message.Contains("invalid Status"))
+    {
+        throw new System.Exception($"wrong error for out-of-set text: {e.Message}");
+    }
+}
+
+// An out-of-set INTEGER value is rejected even though the vocabulary also contains text.
+try
+{
+    Codec.StatusFromCborValue(new CborValue.Uint(42));
+    throw new System.Exception("out-of-set integer value was accepted");
+}
+catch (CborException e)
+{
+    if (!e.Message.Contains("invalid Status"))
+    {
+        throw new System.Exception($"wrong error for out-of-set integer: {e.Message}");
+    }
+}
+
+System.Console.WriteLine("ok");
+"#;
+
+    /// Proves the `is_literal_choice` -> `classify_choice` migration's headline fix: a
+    /// mixed-kind all-literal choice generates C# that actually COMPILES (the pre-fix
+    /// output was CS8121, so this test would fail to build, not just fail an assertion) and
+    /// round-trips/rejects correctly for both literal kinds. Skips cleanly when no dotnet
+    /// toolchain is on PATH.
+    #[test]
+    fn mixed_kind_literal_choice_round_trips_and_rejects_out_of_set_through_dotnet() {
+        if !have_dotnet() {
+            eprintln!("skipping: no dotnet toolchain on PATH");
+            return;
+        }
+        let output = render(mixed_literal_choice_input("csharp")).expect("generation ok");
+
+        let dir =
+            std::env::temp_dir().join(format!("csilgen-cs-mixed-enum-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for file in &output.files {
+            std::fs::write(dir.join(&file.path), &file.content).unwrap();
+        }
+        std::fs::write(dir.join("Program.cs"), CSHARP_MIXED_ENUM_DRIVER).unwrap();
+        std::fs::write(dir.join("roundtrip.csproj"), CSHARP_CSPROJ).unwrap();
+
+        let mut cmd = std::process::Command::new("dotnet");
+        cmd.arg("run")
+            .arg("--project")
+            .arg(&dir)
+            .current_dir(&dir)
+            .env("DOTNET_NOLOGO", "1")
+            .env("DOTNET_CLI_TELEMETRY_OPTOUT", "1")
+            .env("DOTNET_SKIP_FIRST_TIME_EXPERIENCE", "1")
+            .env("NUGET_PACKAGES", dir.join(".nuget"));
+        if let Ok(home) = std::env::var("DOTNET_CLI_HOME") {
+            cmd.env("DOTNET_CLI_HOME", home);
+        }
+        let run = cmd.output().unwrap();
+        let stdout = String::from_utf8_lossy(&run.stdout);
+        let stderr = String::from_utf8_lossy(&run.stderr);
+        assert!(
+            run.status.success(),
+            "dotnet run failed:\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        assert_eq!(
+            stdout.trim(),
+            "ok",
+            "unexpected output:\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// The 3-transport verification spec: an `Echo` service with a `->` op (`ping`) and a
     /// record-typed `<->` op (`pulse`), both over `Ping`/`Pong` records, generated under a
     /// distinct namespace so the codec types don't collide with the transport library.
@@ -4303,6 +5034,9 @@ mod tests {
         // Events: the lib's handshake/framing/heartbeat surface + the generated router.
         assert!(events.contains("new StreamCarrier(tls)"));
         assert!(events.contains("new Hello("));
+        // The handshake and the outbound send name the service by its verbatim CSIL name.
+        assert!(events.contains("{ Service = \"Echo\" }.Encode()"));
+        assert!(events.contains("Event.Verbose(\"Echo\", method, body).Encode(profile)"));
         assert!(events.contains("HelloAck.Decode(ack)"));
         assert!(events.contains("ChannelHandlers : IEchoService"));
         assert!(events.contains("EchoRouter.EncodePulse(codec, new Pong { Msg = \"example\" })"));
@@ -4447,11 +5181,26 @@ mod tests {
         assert!(!prelude_or_client.contains("Call<TRequest, TResponse>"));
 
         let client = file_content(&output, "Client.gen.cs");
-        // Canonical wire strings: service lowercased, op PascalCased; round-trip through
+        // Wire strings are the verbatim CSIL service and op names; round-trip through
         // the generated codec rather than a host-supplied serializer.
         assert!(client.contains(
-            "public Task SubmitTask(SubmitTaskRequest submitTaskRequest) =>\n        Codec.Decode<Task>(transport.Call(\"corndogs\", \"SubmitTask\", Codec.Encode(submitTaskRequest)));"
+            "public Task SubmitTask(SubmitTaskRequest submitTaskRequest) =>\n        Codec.Decode<Task>(transport.Call(\"CorndogsService\", \"submit-task\", Codec.Encode(submitTaskRequest)));"
         ));
+    }
+
+    #[test]
+    fn channel_router_and_encoder_use_verbatim_wire_op() {
+        let output = render(transports_input("csharp")).expect("generation ok");
+        let services = file_content(&output, "Services.gen.cs");
+        // The verbose router keys on the verbatim (kebab-case-as-written) CSIL op name;
+        // the C# method identifier stays PascalCased.
+        assert!(services.contains("case \"pulse\":"));
+        assert!(services.contains("handlers.Pulse(message);"));
+        // The outbound encoder keeps its PascalCased name but frames the verbatim op.
+        assert!(services.contains("EncodePulse(ICsilCodec codec"));
+        assert!(services.contains("return (\"pulse\", data);"));
+        assert!(!services.contains("case \"Pulse\":"));
+        assert!(!services.contains("return (\"Pulse\", data);"));
     }
 
     /// A spec whose ops exercise the boundary shapes the old record-only filter dropped:
@@ -4591,7 +5340,7 @@ mod tests {
         // The record boundary keeps the generic codec; non-record boundaries ride per-op
         // helpers, so the client and a consumer share one byte seam for every op.
         assert!(client.contains(
-            "public Member CreateMember(Member member) =>\n        Codec.Decode<Member>(transport.Call(\"member\", \"CreateMember\", Codec.Encode(member)));"
+            "public Member CreateMember(Member member) =>\n        Codec.Decode<Member>(transport.Call(\"MemberService\", \"create-member\", Codec.Encode(member)));"
         ));
         assert!(client.contains("Codec.EncodeMemberGetMemberRequest(memberID)"));
         assert!(client.contains("Codec.DecodeMemberListMembersResponse(transport.Call("));
@@ -4626,7 +5375,7 @@ mod tests {
             twin.contains("public sealed class CorndogsAsyncClient(ICsilAsyncTransport transport)")
         );
         assert!(twin.contains(
-            "public async System.Threading.Tasks.Task<Task> SubmitTaskAsync(SubmitTaskRequest submitTaskRequest) =>\n        Codec.Decode<Task>(await transport.Call(\"corndogs\", \"SubmitTask\", Codec.Encode(submitTaskRequest)));"
+            "public async System.Threading.Tasks.Task<Task> SubmitTaskAsync(SubmitTaskRequest submitTaskRequest) =>\n        Codec.Decode<Task>(await transport.Call(\"CorndogsService\", \"submit-task\", Codec.Encode(submitTaskRequest)));"
         ));
         // The shared exception is NOT redefined in the twin (the sync file owns it).
         assert!(!twin.contains("class CsilClientException"));
@@ -4664,7 +5413,7 @@ mod tests {
         ));
         assert!(client.contains("public sealed class CorndogsClient(ICsilTransport transport)"));
         assert!(client.contains(
-            "public async System.Threading.Tasks.Task<Task> SubmitTask(SubmitTaskRequest submitTaskRequest) =>\n        Codec.Decode<Task>(await transport.Call(\"corndogs\", \"SubmitTask\", Codec.Encode(submitTaskRequest)));"
+            "public async System.Threading.Tasks.Task<Task> SubmitTask(SubmitTaskRequest submitTaskRequest) =>\n        Codec.Decode<Task>(await transport.Call(\"CorndogsService\", \"submit-task\", Codec.Encode(submitTaskRequest)));"
         ));
         // A standalone drop-in still defines the shared exception.
         assert!(client.contains("class CsilClientException"));
@@ -4765,6 +5514,334 @@ mod tests {
             codec.contains("new CborValue.Bytes(csilV1)"),
             "the bytes optional must encode its own typed binding"
         );
+    }
+
+    /// A spec whose members PascalCase to their enclosing type's name: record
+    /// `Relation` with field `relation` (constrained, so `Validate()` also references
+    /// it) and enum `Status` with wire value `"status"`. C# rejects a member spelled
+    /// like its containing type (CS0542), so both must escape.
+    fn self_named_input(target: &str) -> WasmGeneratorInput {
+        let text = || CsilTypeExpression::Builtin("text".to_string());
+        let pos = || CsilPosition {
+            line: 1,
+            column: 1,
+            offset: 0,
+        };
+        let relation_field = CsilGroupEntry {
+            key: Some(CsilGroupKey::Bare("relation".to_string())),
+            value_type: text(),
+            occurrence: None,
+            metadata: vec![CsilFieldMetadata::Constraint(
+                CsilValidationConstraint::MinLength(1),
+            )],
+            doc_comments: Vec::new(),
+        };
+        let relation = CsilRule {
+            name: "Relation".to_string(),
+            rule_type: CsilRuleType::GroupDef(CsilGroupExpression {
+                entries: vec![
+                    relation_field,
+                    bare_entry(
+                        "status",
+                        CsilTypeExpression::Reference("Status".to_string()),
+                    ),
+                ],
+            }),
+            position: pos(),
+            doc_comments: Vec::new(),
+        };
+        let status = CsilRule {
+            name: "Status".to_string(),
+            rule_type: CsilRuleType::TypeDef(CsilTypeExpression::Choice(vec![
+                CsilTypeExpression::Literal(CsilLiteralValue::Text("status".to_string())),
+                CsilTypeExpression::Literal(CsilLiteralValue::Text("inactive".to_string())),
+            ])),
+            position: pos(),
+            doc_comments: Vec::new(),
+        };
+        let err = CsilRule {
+            name: "ServiceError".to_string(),
+            rule_type: CsilRuleType::GroupDef(CsilGroupExpression {
+                entries: vec![
+                    bare_entry("code", CsilTypeExpression::Builtin("int".to_string())),
+                    bare_entry("message", text()),
+                ],
+            }),
+            position: pos(),
+            doc_comments: Vec::new(),
+        };
+        let svc = CsilRule {
+            name: "RelationService".to_string(),
+            rule_type: CsilRuleType::ServiceDef(CsilServiceDefinition {
+                operations: vec![CsilServiceOperation {
+                    name: "get-relation".to_string(),
+                    input_type: CsilTypeExpression::Reference("Relation".to_string()),
+                    output_type: CsilTypeExpression::Choice(vec![
+                        CsilTypeExpression::Reference("Relation".to_string()),
+                        CsilTypeExpression::Reference("ServiceError".to_string()),
+                    ]),
+                    direction: CsilServiceDirection::Unidirectional,
+                    position: pos(),
+                    doc_comments: Vec::new(),
+                    wire_id: None,
+                }],
+                wire_id: None,
+            }),
+            position: pos(),
+            doc_comments: Vec::new(),
+        };
+        WasmGeneratorInput {
+            csil_spec: CsilSpecSerialized {
+                rules: vec![relation, status, err, svc],
+                source_content: None,
+                service_count: 1,
+                fields_with_metadata_count: 1,
+            },
+            config: GeneratorConfig {
+                target: target.to_string(),
+                output_dir: "/tmp".to_string(),
+                options: HashMap::new(),
+            },
+            generator_metadata: GeneratorMetadata {
+                name: "csharp".to_string(),
+                version: "1.0.0".to_string(),
+                description: String::new(),
+                target: "csharp".to_string(),
+                capabilities: vec![],
+                author: None,
+                homepage: None,
+            },
+        }
+    }
+
+    /// A member spelled like its enclosing type is CS0542 in C#: `Relation.relation`
+    /// must surface as the `Relation_` property (a spelling `pascal_case` can never
+    /// produce for another field, since it strips underscores) at every reference
+    /// site, while the CBOR wire key stays the verbatim CSIL name.
+    #[test]
+    fn self_named_members_escape_ident_but_not_wire_key() {
+        let output = render(self_named_input("csharp-client")).expect("generation ok");
+
+        let types = file_content(&output, "Types.gen.cs");
+        assert!(types.contains("public sealed record Relation\n"));
+        assert!(types.contains("public required string Relation_ { get; init; }"));
+        assert!(
+            !types.contains("string Relation {"),
+            "property must not shadow its enclosing record"
+        );
+        assert!(types.contains("// CBOR key: relation"));
+        // Validate() must reach the field through the escaped property.
+        assert!(types.contains("Relation_.Length < 1"));
+        // The enum member escapes the same way, keeping the wire literal verbatim.
+        assert!(types.contains("public enum Status"));
+        assert!(types.contains("// wire value: status\n    Status_,"));
+
+        let codec = file_content(&output, "Codec.gen.cs");
+        assert!(codec.contains("new CborValue.Text(\"relation\")"));
+        assert!(codec.contains("value.Relation_"));
+        assert!(codec.contains("Relation_ = csilField"));
+        assert!(codec.contains("Status.Status_ => new CborValue.Text(\"status\")"));
+        assert!(codec.contains("\"status\" => Status.Status_,"));
+    }
+
+    /// The real CS0542 proof: a package generated from the self-named spec must
+    /// compile under `dotnet build`. Skips cleanly when no dotnet toolchain is on PATH.
+    #[test]
+    fn self_named_package_builds_with_dotnet() {
+        if !have_dotnet() {
+            eprintln!("skipping: no dotnet toolchain on PATH");
+            return;
+        }
+
+        let mut input = self_named_input("csharp-client");
+        input
+            .config
+            .options
+            .insert("emit_packages".to_string(), serde_json::json!(["csharp"]));
+        input.config.options.insert(
+            "package_name".to_string(),
+            serde_json::json!("Csilgen.SelfNamedTest"),
+        );
+        let output = render(input).expect("generation ok");
+        assert!(csproj(&output).is_some(), "package mode emits a .csproj");
+
+        let dir =
+            std::env::temp_dir().join(format!("csilgen-csharp-selfnamed-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for file in &output.files {
+            std::fs::write(dir.join(&file.path), &file.content).unwrap();
+        }
+        let run = run_dotnet(&dir, "build");
+        let stdout = String::from_utf8_lossy(&run.stdout);
+        let stderr = String::from_utf8_lossy(&run.stderr);
+        assert!(
+            run.status.success(),
+            "dotnet build failed:\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A record whose `Validate()` must emit more than one null-narrowing guard: `label`
+    /// carries two checks on the *same* optional field (min + max length), and `tags` /
+    /// `score` are two *different* optional fields each with their own check(s). Before the
+    /// fix, every guard bound to the literal pattern-variable name `value`, so the second
+    /// `if (X is { } value)` in the method — same field or not — was CS0128 (and reading
+    /// `value` afterward, typed from whichever declaration the compiler kept, produced
+    /// downstream CS0165/CS0019/CS1061 on cascading specs). Modeled directly on the
+    /// generated shape that failed in `examples/breaking-changes/api-v2.csil` et al.
+    fn constrained_optionals_input(target: &str) -> WasmGeneratorInput {
+        let pos = || CsilPosition {
+            line: 1,
+            column: 1,
+            offset: 0,
+        };
+        let optional_entry = |name: &str, ty: CsilTypeExpression, metadata| CsilGroupEntry {
+            key: Some(CsilGroupKey::Bare(name.to_string())),
+            value_type: ty,
+            occurrence: Some(CsilOccurrence::Optional),
+            metadata,
+            doc_comments: Vec::new(),
+        };
+        let widget = CsilRule {
+            name: "Widget".to_string(),
+            rule_type: CsilRuleType::GroupDef(CsilGroupExpression {
+                entries: vec![
+                    optional_entry(
+                        "label",
+                        CsilTypeExpression::Builtin("text".to_string()),
+                        vec![
+                            CsilFieldMetadata::Constraint(CsilValidationConstraint::MinLength(1)),
+                            CsilFieldMetadata::Constraint(CsilValidationConstraint::MaxLength(50)),
+                        ],
+                    ),
+                    optional_entry(
+                        "tags",
+                        CsilTypeExpression::Array {
+                            element_type: Box::new(CsilTypeExpression::Builtin("text".to_string())),
+                            occurrence: None,
+                        },
+                        vec![CsilFieldMetadata::Constraint(
+                            CsilValidationConstraint::MaxItems(20),
+                        )],
+                    ),
+                    optional_entry(
+                        "score",
+                        CsilTypeExpression::Builtin("int".to_string()),
+                        vec![
+                            CsilFieldMetadata::Constraint(CsilValidationConstraint::MinValue(
+                                CsilLiteralValue::Integer(0),
+                            )),
+                            CsilFieldMetadata::Constraint(CsilValidationConstraint::MaxValue(
+                                CsilLiteralValue::Integer(100),
+                            )),
+                        ],
+                    ),
+                ],
+            }),
+            position: pos(),
+            doc_comments: Vec::new(),
+        };
+        WasmGeneratorInput {
+            csil_spec: CsilSpecSerialized {
+                rules: vec![widget],
+                source_content: None,
+                service_count: 0,
+                fields_with_metadata_count: 3,
+            },
+            config: GeneratorConfig {
+                target: target.to_string(),
+                output_dir: "/tmp".to_string(),
+                options: HashMap::new(),
+            },
+            generator_metadata: GeneratorMetadata {
+                name: "csharp".to_string(),
+                version: "1.0.0".to_string(),
+                description: String::new(),
+                target: "csharp".to_string(),
+                capabilities: vec![],
+                author: None,
+                homepage: None,
+            },
+        }
+    }
+
+    /// Pins the fixed `Validate()` shape: one null-narrowing guard per optional field
+    /// (never one per check), each guard's pattern-variable name unique across the
+    /// method, and both of `label`'s checks nested inside its single guard.
+    #[test]
+    fn multi_constraint_optionals_emit_one_guard_per_field() {
+        let output = render(constrained_optionals_input("csharp")).expect("generation ok");
+        let types = file_content(&output, "Types.gen.cs");
+
+        let guards: Vec<&str> = types
+            .lines()
+            .filter_map(|line| line.trim().strip_prefix("if ("))
+            .filter_map(|line| line.split(" is { } ").nth(1))
+            .filter_map(|line| line.strip_suffix(')'))
+            .collect();
+        assert_eq!(
+            guards.len(),
+            3,
+            "one guard per optional field (label, tags, score), not one per check: {guards:?}"
+        );
+        let unique: std::collections::HashSet<&&str> = guards.iter().collect();
+        assert_eq!(
+            unique.len(),
+            guards.len(),
+            "every guard's pattern-variable name must be unique in Validate(): {guards:?}"
+        );
+
+        // `label` has two checks (min + max length); both must live inside its one guard.
+        let label_guard_open = format!("if (Label is {{ }} {})", guards[0]);
+        assert_eq!(
+            types.matches(&label_guard_open).count(),
+            1,
+            "label's guard must open exactly once even though it has two checks"
+        );
+        assert!(types.contains(&format!("{}.Length < 1", guards[0])));
+        assert!(types.contains(&format!("{}.Length > 50", guards[0])));
+    }
+
+    /// The real CS0128/CS0165/CS0019/CS1061 proof: a package with several
+    /// multiply-constrained optional fields must compile under `dotnet build`. Skips
+    /// cleanly when no dotnet toolchain is on PATH.
+    #[test]
+    fn multi_constraint_optionals_package_builds_with_dotnet() {
+        if !have_dotnet() {
+            eprintln!("skipping: no dotnet toolchain on PATH");
+            return;
+        }
+
+        let mut input = constrained_optionals_input("csharp-client");
+        input
+            .config
+            .options
+            .insert("emit_packages".to_string(), serde_json::json!(["csharp"]));
+        input.config.options.insert(
+            "package_name".to_string(),
+            serde_json::json!("Csilgen.ConstrainedOptionalsTest"),
+        );
+        let output = render(input).expect("generation ok");
+        assert!(csproj(&output).is_some(), "package mode emits a .csproj");
+
+        let dir = std::env::temp_dir().join(format!(
+            "csilgen-csharp-constrained-optionals-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for file in &output.files {
+            std::fs::write(dir.join(&file.path), &file.content).unwrap();
+        }
+        let run = run_dotnet(&dir, "build");
+        let stdout = String::from_utf8_lossy(&run.stdout);
+        let stderr = String::from_utf8_lossy(&run.stderr);
+        assert!(
+            run.status.success(),
+            "dotnet build failed:\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A spec exercising every construct the interop wire locks: a text enum, an int enum,
@@ -5432,7 +6509,7 @@ internal sealed class Loopback : ICsilTransport
 {
     public byte[] Call(string service, string op, byte[] request)
     {
-        if (service != "corndogs" || op != "SubmitTask")
+        if (service != "CorndogsService" || op != "submit-task")
         {
             throw new System.Exception($"unexpected route {service}/{op}");
         }
@@ -5507,7 +6584,7 @@ internal sealed class AsyncLoopback : ICsilAsyncTransport
 {
     public System.Threading.Tasks.Task<byte[]> Call(string service, string op, byte[] request)
     {
-        if (service != "corndogs" || op != "SubmitTask")
+        if (service != "CorndogsService" || op != "submit-task")
         {
             throw new System.Exception($"unexpected route {service}/{op}");
         }
@@ -5565,6 +6642,499 @@ internal sealed class SyncLoopback : ICsilTransport
     {
         var req = Codec.Decode<SubmitTaskRequest>(request);
         return Codec.Encode(req.Task);
+    }
+}
+"#;
+
+    // -----------------------------------------------------------------------
+    // Inline (anonymous) choice/group hoisting
+    // -----------------------------------------------------------------------
+
+    /// The inline-choice torture spec built as AST: an `InlineChoicePayload` record and an
+    /// `InlineChoiceRecord` exercising an inline choice in every hoistable position — a
+    /// direct field (open union), a `.default`-wrapped literal field (still an enum), a
+    /// mixed union with a reference arm, an array element, a map value, a tuple slot, and a
+    /// field inside an inline group (recursion). Mirrors inline-choice-torture.csil.
+    fn inline_choice_input(target: &str) -> WasmGeneratorInput {
+        let text = || CsilTypeExpression::Builtin("text".to_string());
+        let int = || CsilTypeExpression::Builtin("int".to_string());
+        let boolean = || CsilTypeExpression::Builtin("bool".to_string());
+        let lit_text = |s: &str| CsilTypeExpression::Literal(CsilLiteralValue::Text(s.to_string()));
+        let lit_int = |n: i64| CsilTypeExpression::Literal(CsilLiteralValue::Integer(n));
+        // A literal arm carrying a trailing `.default` control operator — the parser binds
+        // it to this one arm, so it arrives as `Constrained { Literal, .. }`.
+        let defaulted = |s: &str, default: &str| CsilTypeExpression::Constrained {
+            base_type: Box::new(lit_text(s)),
+            constraints: vec![CsilControlOperator::Default(CsilLiteralValue::Text(
+                default.to_string(),
+            ))],
+        };
+        let pos = || CsilPosition {
+            line: 1,
+            column: 1,
+            offset: 0,
+        };
+        let opt_entry = |name: &str, ty: CsilTypeExpression| CsilGroupEntry {
+            key: Some(CsilGroupKey::Bare(name.to_string())),
+            value_type: ty,
+            occurrence: Some(CsilOccurrence::Optional),
+            metadata: vec![],
+            doc_comments: Vec::new(),
+        };
+        let tuple_slot = |ty: CsilTypeExpression| CsilGroupEntry {
+            key: None,
+            value_type: ty,
+            occurrence: None,
+            metadata: vec![],
+            doc_comments: Vec::new(),
+        };
+        let group_rule = |name: &str, entries: Vec<CsilGroupEntry>| CsilRule {
+            name: name.to_string(),
+            rule_type: CsilRuleType::GroupDef(CsilGroupExpression { entries }),
+            position: pos(),
+            doc_comments: Vec::new(),
+        };
+
+        let payload = group_rule("InlineChoicePayload", vec![bare_entry("detail", text())]);
+        let record = group_rule(
+            "InlineChoiceRecord",
+            vec![
+                bare_entry(
+                    "status",
+                    CsilTypeExpression::Choice(vec![
+                        text(),
+                        lit_text("pending"),
+                        lit_text("active"),
+                        lit_text("closed"),
+                    ]),
+                ),
+                opt_entry(
+                    "priority",
+                    CsilTypeExpression::Choice(vec![
+                        text(),
+                        lit_text("low"),
+                        lit_text("normal"),
+                        defaulted("high", "normal"),
+                    ]),
+                ),
+                opt_entry(
+                    "size",
+                    CsilTypeExpression::Choice(vec![
+                        lit_text("small"),
+                        lit_text("medium"),
+                        defaulted("large", "medium"),
+                    ]),
+                ),
+                bare_entry(
+                    "payload",
+                    CsilTypeExpression::Choice(vec![
+                        lit_text("none"),
+                        lit_int(42),
+                        CsilTypeExpression::Reference("InlineChoicePayload".to_string()),
+                    ]),
+                ),
+                bare_entry(
+                    "tags",
+                    CsilTypeExpression::Array {
+                        element_type: Box::new(CsilTypeExpression::Choice(vec![
+                            text(),
+                            lit_text("red"),
+                            lit_text("green"),
+                            lit_text("blue"),
+                            int(),
+                        ])),
+                        occurrence: Some(CsilOccurrence::ZeroOrMore),
+                    },
+                ),
+                bare_entry(
+                    "labels",
+                    CsilTypeExpression::Map {
+                        key: Box::new(text()),
+                        value: Box::new(CsilTypeExpression::Choice(vec![
+                            text(),
+                            lit_text("yes"),
+                            lit_text("no"),
+                            boolean(),
+                        ])),
+                        occurrence: Some(CsilOccurrence::ZeroOrMore),
+                    },
+                ),
+                bare_entry(
+                    "coord",
+                    CsilTypeExpression::Tuple(CsilGroupExpression {
+                        entries: vec![
+                            tuple_slot(int()),
+                            tuple_slot(CsilTypeExpression::Choice(vec![
+                                text(),
+                                lit_text("x"),
+                                lit_text("y"),
+                                lit_text("z"),
+                            ])),
+                        ],
+                    }),
+                ),
+                bare_entry(
+                    "nested",
+                    CsilTypeExpression::Group(CsilGroupExpression {
+                        entries: vec![bare_entry(
+                            "kind",
+                            CsilTypeExpression::Choice(vec![
+                                text(),
+                                lit_text("a"),
+                                lit_text("b"),
+                                int(),
+                            ]),
+                        )],
+                    }),
+                ),
+            ],
+        );
+        let svc = CsilRule {
+            name: "InlineChoiceService".to_string(),
+            rule_type: CsilRuleType::ServiceDef(CsilServiceDefinition {
+                operations: vec![CsilServiceOperation {
+                    name: "round-trip".to_string(),
+                    input_type: CsilTypeExpression::Reference("InlineChoiceRecord".to_string()),
+                    output_type: CsilTypeExpression::Reference("InlineChoiceRecord".to_string()),
+                    direction: CsilServiceDirection::Unidirectional,
+                    position: pos(),
+                    doc_comments: Vec::new(),
+                    wire_id: None,
+                }],
+                wire_id: None,
+            }),
+            position: pos(),
+            doc_comments: Vec::new(),
+        };
+        WasmGeneratorInput {
+            csil_spec: CsilSpecSerialized {
+                rules: vec![payload, record, svc],
+                source_content: None,
+                service_count: 1,
+                fields_with_metadata_count: 0,
+            },
+            config: GeneratorConfig {
+                target: target.to_string(),
+                output_dir: "/tmp".to_string(),
+                options: HashMap::new(),
+            },
+            generator_metadata: GeneratorMetadata {
+                name: "csharp".to_string(),
+                version: "1.0.0".to_string(),
+                description: String::new(),
+                target: "csharp".to_string(),
+                capabilities: vec![],
+                author: None,
+                homepage: None,
+            },
+        }
+    }
+
+    #[test]
+    fn inline_choice_fields_hoisted_to_named_unions() {
+        let output = render(inline_choice_input("csharp")).expect("generation ok");
+        let types = file_content(&output, "Types.gen.cs");
+        // A direct inline open union is hoisted to a named discriminated union and the field
+        // is typed as it — no `object` collapse.
+        assert!(types.contains("public abstract record InlineChoiceRecordStatus;"));
+        assert!(types.contains("public required InlineChoiceRecordStatus Status { get; init; }"));
+        // The mixed union with a reference arm carries a variant named after the reference.
+        assert!(types.contains(
+            "public sealed record InlineChoiceRecordPayloadInlineChoicePayload(InlineChoicePayload Value) : InlineChoiceRecordPayload;"
+        ));
+        // No inline-choice field falls back to the opaque `object` mapping any more.
+        assert!(!types.contains("public required object Status"));
+        assert!(!types.contains("List<object>"));
+        assert!(!types.contains("Dictionary<string, object>"));
+    }
+
+    #[test]
+    fn inline_default_literal_choice_stays_a_closed_enum() {
+        // Regression for the Constrained-arm bug: `.default "medium"` binds to the last
+        // literal arm (`Constrained { Literal("large"), .. }`), which must still classify as
+        // a literal enum member rather than pushing the whole choice into the union path.
+        let output = render(inline_choice_input("csharp")).expect("generation ok");
+        let types = file_content(&output, "Types.gen.cs");
+        assert!(types.contains("public enum InlineChoiceRecordSize"));
+        assert!(!types.contains("abstract record InlineChoiceRecordSize"));
+        // The wrapped final arm still appears as an enum member.
+        assert!(types.contains("Large,"));
+        let codec = file_content(&output, "Codec.gen.cs");
+        // Bare-literal wire (not a tagged sum) for the closed enum.
+        assert!(codec.contains("InlineChoiceRecordSize.Large => new CborValue.Text(\"large\"),"));
+    }
+
+    #[test]
+    fn inline_choice_in_array_map_tuple_and_nested_group_hoisted() {
+        let output = render(inline_choice_input("csharp")).expect("generation ok");
+        let types = file_content(&output, "Types.gen.cs");
+        assert!(types.contains("System.Collections.Generic.List<InlineChoiceRecordTagsItem> Tags"));
+        assert!(types.contains(
+            "System.Collections.Generic.Dictionary<string, InlineChoiceRecordLabelsValue> Labels"
+        ));
+        assert!(types.contains("(long Field0, InlineChoiceRecordCoord1 Field1) Coord"));
+        // The inline group field is hoisted, and its own inline choice field is hoisted too
+        // (recursion into a hoisted composite).
+        assert!(types.contains("public sealed record InlineChoiceRecordNested"));
+        assert!(types.contains("public required InlineChoiceRecordNestedKind Kind"));
+        let codec = file_content(&output, "Codec.gen.cs");
+        // The nested array/map/tuple codecs route each element through the hoisted union
+        // codec rather than emitting a CBOR null placeholder.
+        assert!(codec.contains("InlineChoiceRecordTagsItemToCborValue(csilElem)"));
+        assert!(codec.contains("InlineChoiceRecordLabelsValueToCborValue(csilKv.Value)"));
+        assert!(codec.contains("InlineChoiceRecordCoord1ToCborValue(value.Coord.Field1)"));
+        // Regression: none of the hoisted positions collapse to a null placeholder.
+        assert!(!codec.contains("csilElem => (CborValue)new CborValue.Null()"));
+    }
+
+    /// Mirrors `csilgen_common::hoist`'s
+    /// `case_insensitive_collision_between_existing_and_synthesized_rule_is_disambiguated`:
+    /// an existing rule `UserData` plus a `User` rule whose `data` field is an inline mixed
+    /// choice (a text-literal arm and a `UserData` reference arm — a `Union`, so it hoists
+    /// regardless of `hoist_all_literal_choices`) hoist-names to `User_data` (owner `User`,
+    /// field `data`), which pascal-collides with `UserData` (both canonicalize to
+    /// `"userdata"`). The shared hoist pass (now wired into this generator) disambiguates
+    /// the synthesized rule name; this test additionally proves the C# generator doesn't go
+    /// on to declare two colliding C# types for the two different rules — a duplicate,
+    /// non-compiling `record`/`enum` declaration, the actual failure mode a name collision
+    /// causes here.
+    #[test]
+    fn case_insensitive_collision_between_existing_and_synthesized_rule_does_not_duplicate_a_csharp_type()
+     {
+        let pos = || CsilPosition {
+            line: 1,
+            column: 1,
+            offset: 0,
+        };
+        let user_data = CsilRule {
+            name: "UserData".to_string(),
+            rule_type: CsilRuleType::GroupDef(CsilGroupExpression {
+                entries: vec![bare_entry(
+                    "value",
+                    CsilTypeExpression::Builtin("text".to_string()),
+                )],
+            }),
+            position: pos(),
+            doc_comments: Vec::new(),
+        };
+        let user = CsilRule {
+            name: "User".to_string(),
+            rule_type: CsilRuleType::GroupDef(CsilGroupExpression {
+                entries: vec![bare_entry(
+                    "data",
+                    CsilTypeExpression::Choice(vec![
+                        CsilTypeExpression::Literal(CsilLiteralValue::Text("x".to_string())),
+                        CsilTypeExpression::Reference("UserData".to_string()),
+                    ]),
+                )],
+            }),
+            position: pos(),
+            doc_comments: Vec::new(),
+        };
+        let input = WasmGeneratorInput {
+            csil_spec: CsilSpecSerialized {
+                rules: vec![user_data, user],
+                source_content: None,
+                service_count: 0,
+                fields_with_metadata_count: 0,
+            },
+            config: GeneratorConfig {
+                target: "csharp".to_string(),
+                output_dir: "/tmp".to_string(),
+                options: HashMap::new(),
+            },
+            generator_metadata: GeneratorMetadata {
+                name: "csharp".to_string(),
+                version: "1.0.0".to_string(),
+                description: String::new(),
+                target: "csharp".to_string(),
+                capabilities: vec![],
+                author: None,
+                homepage: None,
+            },
+        };
+        let output = render(input).expect("generation ok");
+        let types = file_content(&output, "Types.gen.cs");
+
+        // The existing UserData group survives, and the synthesized choice's base type is
+        // NOT literally also named UserData (that would be a duplicate `record UserData`
+        // declaration, non-compiling C#).
+        assert!(types.contains("public sealed record UserData\n"));
+        assert!(
+            !types.contains("public abstract record UserData;"),
+            "synthesized choice collided with UserData's record name:\n{types}"
+        );
+
+        // Every `record`/`enum` header in the file introduces a unique C# identifier.
+        let mut declared: Vec<&str> = Vec::new();
+        for raw in types.lines() {
+            let line = raw.trim();
+            let rest = line
+                .strip_prefix("public sealed record ")
+                .or_else(|| line.strip_prefix("public abstract record "))
+                .or_else(|| line.strip_prefix("public enum "));
+            if let Some(rest) = rest {
+                let name = rest
+                    .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                    .next()
+                    .unwrap_or("");
+                if !name.is_empty() {
+                    declared.push(name);
+                }
+            }
+        }
+        let mut sorted = declared.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(
+            sorted.len(),
+            declared.len(),
+            "a C# type name is declared more than once: {declared:?}"
+        );
+    }
+
+    /// Compile the generated inline-choice torture output and assert the exact canonical CBOR
+    /// bytes for every record-field position match the OCaml oracle, then prove the
+    /// array/map/tuple positions (which OCaml has no codec for) round-trip stably. Skips
+    /// cleanly when no dotnet toolchain is on PATH.
+    #[test]
+    fn inline_choice_bytes_match_oracle_through_dotnet() {
+        let probe = std::process::Command::new("dotnet")
+            .arg("--version")
+            .output();
+        if probe.map(|o| !o.status.success()).unwrap_or(true) {
+            eprintln!("skipping: no dotnet toolchain on PATH");
+            return;
+        }
+
+        let output = render(inline_choice_input("csharp-client")).expect("generation ok");
+        let dir =
+            std::env::temp_dir().join(format!("csilgen-csharp-inline-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for file in &output.files {
+            std::fs::write(dir.join(&file.path), &file.content).unwrap();
+        }
+        std::fs::write(dir.join("Program.cs"), CSHARP_INLINE_DRIVER).unwrap();
+        std::fs::write(dir.join("roundtrip.csproj"), CSHARP_CSPROJ).unwrap();
+
+        let mut cmd = std::process::Command::new("dotnet");
+        cmd.arg("run")
+            .arg("--project")
+            .arg(&dir)
+            .current_dir(&dir)
+            .env("DOTNET_NOLOGO", "1")
+            .env("DOTNET_CLI_TELEMETRY_OPTOUT", "1")
+            .env("DOTNET_SKIP_FIRST_TIME_EXPERIENCE", "1")
+            .env("NUGET_PACKAGES", dir.join(".nuget"));
+        if let Ok(home) = std::env::var("DOTNET_CLI_HOME") {
+            cmd.env("DOTNET_CLI_HOME", home);
+        }
+        let run = cmd.output().unwrap();
+        let stdout = String::from_utf8_lossy(&run.stdout);
+        let stderr = String::from_utf8_lossy(&run.stderr);
+        assert!(
+            run.status.success(),
+            "dotnet run failed:\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        assert_eq!(
+            stdout.trim(),
+            "ok",
+            "unexpected output:\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Driver for the inline-choice byte oracle: encodes each record-field inline choice via
+    /// the generated codec and asserts the exact hex against the OCaml-confirmed table, then
+    /// round-trips a full record (covering the array/map/tuple positions) for stability.
+    const CSHARP_INLINE_DRIVER: &str = r#"using Csilgen.Transport;
+
+internal static class Program
+{
+    private static string Hex(CborValue v) =>
+        System.Convert.ToHexString(Cbor.Encode(v)).ToLowerInvariant();
+
+    private static void Check(string label, CborValue v, string expect)
+    {
+        var got = Hex(v);
+        if (got != expect)
+        {
+            System.Console.WriteLine($"FAIL {label}: got={got} expect={expect}");
+            System.Environment.Exit(1);
+        }
+    }
+
+    private static void Main()
+    {
+        Check("status(Pending)",
+            Codec.InlineChoiceRecordStatusToCborValue(new InlineChoiceRecordStatusVariant2("pending")),
+            "82016770656e64696e67");
+        Check("status(Other free)",
+            Codec.InlineChoiceRecordStatusToCborValue(new InlineChoiceRecordStatusVariant1("free")),
+            "82006466726565");
+        Check("priority(High)",
+            Codec.InlineChoiceRecordPriorityToCborValue(new InlineChoiceRecordPriorityVariant4("high")),
+            "82036468696768");
+        Check("size(Medium)",
+            Codec.InlineChoiceRecordSizeToCborValue(InlineChoiceRecordSize.Medium),
+            "666d656469756d");
+        Check("payload(None)",
+            Codec.InlineChoiceRecordPayloadToCborValue(new InlineChoiceRecordPayloadVariant1("none")),
+            "8200646e6f6e65");
+        Check("payload(Inline)",
+            Codec.InlineChoiceRecordPayloadToCborValue(
+                new InlineChoiceRecordPayloadInlineChoicePayload(new InlineChoicePayload { Detail = "hi" })),
+            "8202a16664657461696c626869");
+        Check("nested.kind(A)",
+            Codec.InlineChoiceRecordNestedKindToCborValue(new InlineChoiceRecordNestedKindVariant2("a")),
+            "82016161");
+        Check("nested.kind(Text free)",
+            Codec.InlineChoiceRecordNestedKindToCborValue(new InlineChoiceRecordNestedKindVariant1("free")),
+            "82006466726565");
+        Check("nested.kind(Int 7)",
+            Codec.InlineChoiceRecordNestedKindToCborValue(new InlineChoiceRecordNestedKindVariant4(7)),
+            "820307");
+
+        // Full-record round-trip covers tags/labels/coord (array/map/tuple inline choices),
+        // which the OCaml oracle has no codec for; the bytes must be stable and decode-equal.
+        var rec = new InlineChoiceRecord
+        {
+            Status = new InlineChoiceRecordStatusVariant2("pending"),
+            Priority = new InlineChoiceRecordPriorityVariant4("high"),
+            Size = InlineChoiceRecordSize.Medium,
+            Payload = new InlineChoiceRecordPayloadInlineChoicePayload(new InlineChoicePayload { Detail = "hi" }),
+            Tags = new System.Collections.Generic.List<InlineChoiceRecordTagsItem>
+            {
+                new InlineChoiceRecordTagsItemVariant2("red"),
+                new InlineChoiceRecordTagsItemVariant1("adhoc"),
+                new InlineChoiceRecordTagsItemVariant5(99),
+            },
+            Labels = new System.Collections.Generic.Dictionary<string, InlineChoiceRecordLabelsValue>
+            {
+                ["k"] = new InlineChoiceRecordLabelsValueVariant2("yes"),
+                ["b"] = new InlineChoiceRecordLabelsValueVariant4(true),
+            },
+            Coord = (5L, new InlineChoiceRecordCoord1Variant2("x")),
+            Nested = new InlineChoiceRecordNested { Kind = new InlineChoiceRecordNestedKindVariant4(7) },
+        };
+        var bytes = Codec.Encode(rec);
+        var back = Codec.Decode<InlineChoiceRecord>(bytes);
+        var bytes2 = Codec.Encode(back);
+        if (System.Convert.ToHexString(bytes) != System.Convert.ToHexString(bytes2))
+        {
+            System.Console.WriteLine("FAIL round-trip not stable");
+            System.Environment.Exit(1);
+        }
+        var tag0 = (InlineChoiceRecordTagsItemVariant2)back.Tags[0];
+        var coordArm = (InlineChoiceRecordCoord1Variant2)back.Coord.Field1;
+        if (tag0.Value != "red" || back.Coord.Field0 != 5 || coordArm.Value != "x")
+        {
+            System.Console.WriteLine("FAIL decoded inline positions");
+            System.Environment.Exit(1);
+        }
+
+        System.Console.WriteLine("ok");
     }
 }
 "#;

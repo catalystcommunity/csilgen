@@ -109,14 +109,22 @@ service UserAPI {
 
 ## Usage
 
+Configuration options come only from the CSIL source file's `options { … }`
+block — the CLI has no `--option` flag:
+
+```csil
+options {
+  package_name: "myapi",
+  use_json_tags: true,
+}
+```
+
 ```bash
 # Build the generator
 cargo build --target wasm32-unknown-unknown --release
 
 # Use with csilgen CLI
-csilgen generate --input api.csil --target go-generator --output ./generated/ \
-  --option package_name=myapi \
-  --option use_json_tags=true
+csilgen generate --input api.csil --target go-generator --output ./generated/
 ```
 
 ## Key Implementation Features

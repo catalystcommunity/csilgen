@@ -249,9 +249,9 @@ fn client_emits_types_and_client() {
     let client = file(&files, "client.gen.ts");
     // type-only import from the companion types module
     assert!(client.contains("import type {"));
-    assert!(client.contains("} from \"./types.gen\";"));
+    assert!(client.contains("} from \"./types.gen.ts\";"));
     // the typed methods pull their codec helpers from the codec module
-    assert!(client.contains("} from \"./codec.gen\";"));
+    assert!(client.contains("} from \"./codec.gen.ts\";"));
     assert!(client.contains("fromLoginResponseCbor"));
     assert!(client.contains("toLoginRequestCbor"));
     // byte-seam transport interface present
@@ -262,16 +262,14 @@ fn client_emits_types_and_client() {
     assert!(client.contains("export class MemberClient {"));
     // camelCase method (sync byte seam): encode -> call -> decode
     assert!(client.contains("login(req: LoginRequest): LoginResponse {"));
-    assert!(
-        client.contains(
-            "const csilResp = this.t.call(\"auth\", \"Login\", toLoginRequestCbor(req));"
-        )
-    );
+    assert!(client.contains(
+        "const csilResp = this.t.call(\"AuthService\", \"Login\", toLoginRequestCbor(req));"
+    ));
     assert!(client.contains("return fromLoginResponseCbor(csilResp);"));
-    // wire strings: lowercase service, PascalCase method
-    assert!(
-        client.contains("this.t.call(\"member\", \"ListMembers\", toListMembersRequestCbor(req));")
-    );
+    // wire strings: verbatim CSIL service and operation names
+    assert!(client.contains(
+        "this.t.call(\"MemberService\", \"list-members\", toListMembersRequestCbor(req));"
+    ));
     // aggregate class with default name
     assert!(client.contains("export class ApiClient {"));
     assert!(client.contains("this.auth = new AuthClient(t);"));
@@ -303,7 +301,7 @@ fn async_twin_emitted_by_default_with_marked_symbols() {
     // Methods are async and Promise-returning, awaiting the byte seam.
     assert!(twin.contains("async login(req: LoginRequest): Promise<LoginResponse> {"));
     assert!(twin.contains(
-        "const csilResp = await this.t.call(\"auth\", \"Login\", toLoginRequestCbor(req));"
+        "const csilResp = await this.t.call(\"AuthService\", \"Login\", toLoginRequestCbor(req));"
     ));
     assert!(twin.contains("return fromLoginResponseCbor(csilResp);"));
     // The aggregate wires the marked per-service clients.
@@ -391,8 +389,8 @@ fn server_emits_types_and_server() {
     );
     assert!(server.contains("export interface ServerHandlers {"));
     assert!(server.contains("export async function dispatch("));
-    // dispatch routing keys
-    assert!(server.contains("case \"auth\": {"));
+    // dispatch routing keys: verbatim CSIL service and operation names
+    assert!(server.contains("case \"AuthService\": {"));
     assert!(server.contains("case \"Login\": {"));
     assert!(server.contains("const res = await handlers.auth.login(req, ctx);"));
 }
@@ -411,6 +409,50 @@ fn aggregate_target_emits_all_three() {
             "server.gen.ts"
         ]
     );
+}
+
+// A service-less spec (records/types only, no `ServiceDef`) has nothing for
+// `client.gen.ts`/`server.gen.ts` to route to: both files unconditionally
+// reference the synthetic `ServiceError`, which `types.gen.ts` only exports when
+// the spec declares services. Emitting either file for a service-less spec would
+// therefore always fail to typecheck (`ServiceError` imported but never
+// exported). Go and Python already skip client/server emission for service-less
+// specs; the aggregate/client/server TypeScript targets do the same.
+#[test]
+fn serviceless_aggregate_target_omits_client_and_server() {
+    let files = generate_files(&input_with_spec("typescript", money_spec())).expect("generate");
+    let paths: Vec<&str> = files.iter().map(|f| f.path.as_str()).collect();
+    assert_eq!(paths, vec!["types.gen.ts", "codec.gen.ts"]);
+    // The synthetic error type is only ever emitted for service-bearing specs, so
+    // a service-less types module never declares it either.
+    assert!(!file(&files, "types.gen.ts").contains("ServiceError"));
+}
+
+#[test]
+fn serviceless_client_target_omits_client_file() {
+    let files =
+        generate_files(&input_with_spec("typescript-client", money_spec())).expect("generate");
+    let paths: Vec<&str> = files.iter().map(|f| f.path.as_str()).collect();
+    assert_eq!(paths, vec!["types.gen.ts", "codec.gen.ts"]);
+}
+
+#[test]
+fn serviceless_server_target_omits_server_file() {
+    let files =
+        generate_files(&input_with_spec("typescript-server", money_spec())).expect("generate");
+    let paths: Vec<&str> = files.iter().map(|f| f.path.as_str()).collect();
+    assert_eq!(paths, vec!["types.gen.ts", "codec.gen.ts"]);
+}
+
+// A spec that *does* declare services must keep emitting a working server (and
+// client) — the service-less gate above must not regress the common case.
+#[test]
+fn spec_with_services_still_emits_a_working_server() {
+    let files = generate_files(&input_for("typescript-server")).expect("generate");
+    let paths: Vec<&str> = files.iter().map(|f| f.path.as_str()).collect();
+    assert_eq!(paths, vec!["types.gen.ts", "codec.gen.ts", "server.gen.ts"]);
+    assert!(file(&files, "types.gen.ts").contains("export interface ServiceError {"));
+    assert!(file(&files, "server.gen.ts").contains("ServiceError"));
 }
 
 #[test]
@@ -1105,6 +1147,7 @@ const TRANSPORTS_TSCONFIG: &str = r#"{
     "strict": true,
     "esModuleInterop": true,
     "skipLibCheck": true,
+    "rewriteRelativeImportExtensions": true,
     "lib": ["es2020", "dom"],
     "outDir": "out"
   },
@@ -1121,6 +1164,7 @@ const TRANSPORTS_TSCONFIG_NOEMIT: &str = r#"{
     "strict": true,
     "esModuleInterop": true,
     "skipLibCheck": true,
+    "rewriteRelativeImportExtensions": true,
     "lib": ["es2020", "dom"],
     "noEmit": true
   },
@@ -1160,11 +1204,11 @@ fn connection_mode_client_emits_channel_handler_router_and_encoder() {
     assert!(client.contains("play(msg: GameState): void;"));
     assert!(client.contains("notify(msg: Acknowledgment): void;"));
 
-    // Router decodes by method name (PascalCase wire keys).
+    // Router decodes by method name (verbatim CSIL op names as wire keys).
     assert!(client.contains("export function routeMatchChannel("));
-    assert!(client.contains("case \"Play\":"));
+    assert!(client.contains("case \"play\":"));
     assert!(client.contains("handlers.play(codec.decode<GameState>(bytes));"));
-    assert!(client.contains("case \"Notify\":"));
+    assert!(client.contains("case \"notify\":"));
 
     // Outbound encoder exists for <-> (client sends PlayerInput) but not for
     // reverse (server-pushed only).
@@ -1191,7 +1235,7 @@ fn connection_mode_server_emits_channel_handler_router_and_encoders() {
 
     // Unary op stays on the handlers interface + dispatched.
     assert!(server.contains("listEvents(req: ListRequest, ctx: RequestContext)"));
-    assert!(server.contains("case \"ListEvents\":"));
+    assert!(server.contains("case \"list-events\":"));
 
     // Channel handler interface: server inbound is <-> input_type only.
     // Reverse contributes no inbound handler (server pushes, doesn't receive).
@@ -1204,9 +1248,9 @@ fn connection_mode_server_emits_channel_handler_router_and_encoders() {
 
     // Router has the <-> case but not reverse.
     assert!(server.contains("export function routeMatchChannel("));
-    assert!(server.contains("case \"Play\":"));
+    assert!(server.contains("case \"play\":"));
     assert!(
-        !server.contains("case \"Notify\":"),
+        !server.contains("case \"notify\":"),
         "no reverse inbound on server side"
     );
 
@@ -1225,17 +1269,17 @@ fn connection_mode_dispatch_does_not_route_channel_ops() {
         "server.gen.ts",
     )
     .to_string();
-    // ListEvents -> Unidirectional, routed via dispatch.
-    assert!(server.contains("case \"ListEvents\":"));
+    // list-events -> Unidirectional, routed via dispatch.
+    assert!(server.contains("case \"list-events\":"));
     // <-> and <- ops live in routeMatchChannel, NOT in dispatch.
     let dispatch_block_start = server.find("export async function dispatch").unwrap();
     let dispatch_block = &server[dispatch_block_start..];
     assert!(
-        !dispatch_block.contains("case \"Play\":"),
+        !dispatch_block.contains("case \"play\":"),
         "bidi <-> must not be dispatched in connection mode"
     );
     assert!(
-        !dispatch_block.contains("case \"Notify\":"),
+        !dispatch_block.contains("case \"notify\":"),
         "reverse <- must not be dispatched in connection mode"
     );
 }
@@ -1256,16 +1300,18 @@ fn rpc_mode_emits_check_and_send_on_client() {
 
     // <-> gets both check + send over the byte seam (sync, codec-encoded).
     assert!(client.contains("sendPlay(req: PlayerInput): void {"));
-    assert!(client.contains("this.t.call(\"match\", \"PlaySend\", toPlayerInputCbor(req));"));
+    assert!(
+        client.contains("this.t.call(\"MatchService\", \"playSend\", toPlayerInputCbor(req));")
+    );
     assert!(client.contains("checkPlay(): GameState[] {"));
-    assert!(client.contains("this.t.call(\"match\", \"PlayCheck\", new Uint8Array());"));
+    assert!(client.contains("this.t.call(\"MatchService\", \"playCheck\", new Uint8Array());"));
     assert!(client.contains(
         "return asArray(decode(csilResp)).map((csilE) => fromGameStateCborValue(csilE));"
     ));
 
     // <- gets check only (no send — server pushes).
     assert!(client.contains("checkNotify(): Acknowledgment[] {"));
-    assert!(client.contains("\"NotifyCheck\""));
+    assert!(client.contains("\"notifyCheck\""));
     assert!(!client.contains("sendNotify"));
 }
 
@@ -1286,11 +1332,11 @@ fn rpc_mode_server_dispatches_check_and_send_methods() {
     assert!(!server.contains("sendNotify"));
 
     // dispatch routes the synthetic Send/Check methods through call().
-    assert!(server.contains("case \"PlaySend\":"));
+    assert!(server.contains("case \"playSend\":"));
     assert!(server.contains("await handlers.match.sendPlay(req, ctx);"));
-    assert!(server.contains("case \"PlayCheck\":"));
+    assert!(server.contains("case \"playCheck\":"));
     assert!(server.contains("await handlers.match.checkPlay(ctx)"));
-    assert!(server.contains("case \"NotifyCheck\":"));
+    assert!(server.contains("case \"notifyCheck\":"));
 }
 
 #[test]
@@ -1786,7 +1832,7 @@ fn inline_decimal_in_op_signature_injects_import_in_server() {
     )
     .to_string();
     assert!(
-        server.contains("import { CsilDecimal } from \"./types.gen\";"),
+        server.contains("import { CsilDecimal } from \"./types.gen.ts\";"),
         "server must import CsilDecimal, got:\n{server}"
     );
     let client = file(
@@ -2200,7 +2246,7 @@ fn unidirectional_op_with_null_input_omits_request_param() {
         "null input must not surface as a request param, got: {client}"
     );
     assert!(
-        client.contains("this.t.call(\"feed\", \"PollEvent\", new Uint8Array());"),
+        client.contains("this.t.call(\"FeedService\", \"poll-event\", new Uint8Array());"),
         "call must send an empty payload for the null request, got: {client}"
     );
     assert!(
@@ -2849,6 +2895,173 @@ fn codec_round_trips_named_map_aliases() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// The mixed-union regression: `OrderStatus = text / "pending" / ... / "refunded"`
+/// (examples/real-world-api/e-commerce-api.csil) has a general `text` arm alongside
+/// several literal arms of the same base type. Before the literal-first ordering
+/// fix, the general arm's `typeof v === "string"` predicate — checked first because
+/// it was declared first — matched every string, making every literal's own declared
+/// index unreachable on encode.
+fn mixed_union_spec() -> CsilSpecSerialized {
+    let literal = |s: &str| CsilTypeExpression::Literal(CsilLiteralValue::Text(s.to_string()));
+    let order_status = CsilTypeExpression::Choice(vec![
+        builtin("text"),
+        literal("pending"),
+        literal("confirmed"),
+        literal("processing"),
+        literal("shipped"),
+        literal("delivered"),
+        literal("cancelled"),
+        literal("refunded"),
+    ]);
+    spec_of(vec![
+        alias_rule("OrderStatus", order_status),
+        group_rule(
+            "Order",
+            vec![
+                field("id", builtin("text"), false),
+                field("status", reference("OrderStatus"), false),
+            ],
+            vec![],
+        ),
+    ])
+}
+
+/// The `OrderStatus`-shaped literal arms, in declaration order, alongside their
+/// 0-based declared index (`text` is index 0; see `mixed_union_spec`).
+fn mixed_union_literals() -> [(&'static str, usize); 7] {
+    [
+        ("pending", 1),
+        ("confirmed", 2),
+        ("processing", 3),
+        ("shipped", 4),
+        ("delivered", 5),
+        ("cancelled", 6),
+        ("refunded", 7),
+    ]
+}
+
+#[test]
+fn mixed_union_encode_checks_every_literal_before_the_general_arm() {
+    let files = generate_files(&input_with_spec("typescript-client", mixed_union_spec())).unwrap();
+    let codec = file(&files, "codec.gen.ts");
+    let encoder = codec
+        .split("export function toOrderStatusCborValue")
+        .nth(1)
+        .expect("encoder emitted");
+
+    // Every literal arm keeps its own declared index...
+    for (lit, idx) in mixed_union_literals() {
+        assert!(
+            encoder.contains(&format!(
+                "if (v === \"{lit}\") {{ const csilV = v as \"{lit}\"; return [{idx}, csilV]; }}"
+            )),
+            "literal arm for {lit} not emitted with its declared index {idx}:\n{codec}"
+        );
+    }
+    // ...and every literal arm is checked before the general `text` arm, so the
+    // general arm's broader predicate never shadows a literal's declared index.
+    let general_pos = encoder
+        .find("typeof v === \"string\"")
+        .expect("general arm present");
+    let last_literal_pos = encoder
+        .find("if (v === \"refunded\")")
+        .expect("last-declared literal arm present");
+    assert!(
+        last_literal_pos < general_pos,
+        "the general arm's predicate is checked before a literal arm, which shadows it on encode:\n{codec}"
+    );
+    // The general arm still returns its own declared index 0, as the fallback for
+    // any string that is none of the declared literals.
+    assert!(
+        encoder.contains(
+            "if (typeof v === \"string\") { const csilV = v as string; return [0, csilV]; }"
+        ),
+        "general arm should return its own declared index 0 as the fallback:\n{codec}"
+    );
+}
+
+#[test]
+fn mixed_union_decode_dispatches_every_index_and_validates_literals() {
+    let files = generate_files(&input_with_spec("typescript-client", mixed_union_spec())).unwrap();
+    let codec = file(&files, "codec.gen.ts");
+    let decoder = codec
+        .split("export function fromOrderStatusCborValue")
+        .nth(1)
+        .expect("decoder emitted");
+
+    // Index 0 (the general arm) decodes permissively, like any other `text` field.
+    assert!(
+        decoder.contains("case 0: return asString(csilArr[1]);"),
+        "general-arm index 0 not dispatched:\n{codec}"
+    );
+    // Every literal index validates the payload equals the declared literal via the
+    // shared `asLiteral` runtime helper, rather than merely casting it.
+    for (lit, idx) in mixed_union_literals() {
+        assert!(
+            decoder.contains(&format!(
+                "case {idx}: return asLiteral<\"{lit}\">(csilArr[1], \"{lit}\");"
+            )),
+            "literal index {idx} ({lit}) does not validate via asLiteral:\n{codec}"
+        );
+    }
+}
+
+/// End-to-end proof under node: encode dispatches literal-over-general, every
+/// declared index round-trips, and a literal-index payload that does not equal the
+/// declared literal is rejected rather than silently accepted. Skips when node/npx
+/// is unavailable so the suite stays portable.
+#[test]
+fn mixed_union_round_trips_and_rejects_literal_mismatch_under_node() {
+    let have_node = std::process::Command::new("node")
+        .arg("--version")
+        .output()
+        .is_ok();
+    let have_npx = std::process::Command::new("npx")
+        .arg("--version")
+        .output()
+        .is_ok();
+    if !have_node || !have_npx {
+        eprintln!("skipping: node/npx not on PATH");
+        return;
+    }
+
+    let files = generate_files(&input_with_spec("typescript-client", mixed_union_spec())).unwrap();
+    let dir = std::env::temp_dir().join(format!("csilgen-ts-mixedunion-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    for f in &files {
+        std::fs::write(dir.join(&f.path), &f.content).unwrap();
+    }
+    std::fs::write(dir.join("driver.ts"), MIXED_UNION_DRIVER_TS).unwrap();
+    std::fs::write(dir.join("tsconfig.json"), CODEC_TSCONFIG).unwrap();
+
+    let build = std::process::Command::new("npx")
+        .args(["-y", "-p", "typescript@5", "tsc", "-p", "tsconfig.json"])
+        .current_dir(&dir)
+        .output()
+        .unwrap();
+    assert!(
+        build.status.success(),
+        "tsc type-check/compile failed:\n{}{}",
+        String::from_utf8_lossy(&build.stdout),
+        String::from_utf8_lossy(&build.stderr)
+    );
+
+    let run = std::process::Command::new("node")
+        .arg(dir.join("out").join("driver.js"))
+        .current_dir(&dir)
+        .output()
+        .unwrap();
+    assert!(
+        run.status.success(),
+        "node round-trip failed:\n{}{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&run.stdout).trim(), "ok");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// The tagged core types (`timestamp` -> tag 0 `Date`, `decimal` -> tag 4
 /// `CsilDecimal`) are not exercised by the corndogs round-trip, so type-check a
 /// money record's emitted codec to confirm those paths compile. Compile-only (csil
@@ -2988,12 +3201,18 @@ fn package_json_has_derived_name_and_defaults() {
     assert_eq!(tsconfig["compilerOptions"]["strict"], true);
     assert_eq!(tsconfig["compilerOptions"]["declaration"], true);
     assert_eq!(tsconfig["compilerOptions"]["outDir"], "dist");
+    // The package build depends on this to compile the `.ts`-extensioned
+    // relative specifiers the modules use.
+    assert_eq!(
+        tsconfig["compilerOptions"]["rewriteRelativeImportExtensions"],
+        true
+    );
 
     // The barrel re-exports the generated modules and is the package `main` source.
     let index = file(&files, "index.ts");
-    assert!(index.contains("from \"./types.gen\""));
-    assert!(index.contains("from \"./codec.gen\""));
-    assert!(index.contains("from \"./client.gen\""));
+    assert!(index.contains("from \"./types.gen.ts\""));
+    assert!(index.contains("from \"./codec.gen.ts\""));
+    assert!(index.contains("from \"./client.gen.ts\""));
 }
 
 #[test]
@@ -3040,15 +3259,376 @@ fn barrel_dedupes_codec_collision_for_aggregate_target() {
     let files =
         generate_files(&package_input_with_spec("typescript", channel_spec())).expect("generate");
     let index = file(&files, "index.ts");
-    assert!(index.contains("export * from \"./client.gen\";"));
+    assert!(index.contains("export * from \"./client.gen.ts\";"));
     assert!(
-        !index.contains("export * from \"./server.gen\";"),
+        !index.contains("export * from \"./server.gen.ts\";"),
         "server must not be star-exported alongside client, got:\n{index}"
     );
     // Server still contributes its unique surface explicitly.
-    assert!(index.contains("from \"./server.gen\";"));
+    assert!(index.contains("from \"./server.gen.ts\";"));
     assert!(index.contains("dispatch"));
     assert!(index.contains("ServerHandlers"));
+}
+
+/// The fixture set every `import_extension` coverage test below runs over: every
+/// sub-target (typesonly/client/server/aggregate), a spec that exercises
+/// bidirectional channel ops (`channel_spec`), a spec that exercises every
+/// transport section (`transports_spec`), and the package barrel — the one
+/// emitter of relative *re-exports* rather than plain imports.
+fn specifier_coverage_inputs() -> Vec<WasmGeneratorInput> {
+    vec![
+        input_with_spec("typescript-typesonly", channel_spec()),
+        input_with_spec("typescript-client", channel_spec()),
+        input_with_spec("typescript-server", channel_spec()),
+        input_with_spec("typescript", channel_spec()),
+        input_with_spec("typescript", transports_spec()),
+        package_input_with_spec("typescript", channel_spec()),
+    ]
+}
+
+/// Every relative (`./`/`../`) specifier appearing in a `from "..."` position
+/// across the emitted `.ts` files, paired with the file that carries it.
+fn collect_relative_specifiers(files: &[GeneratedFile]) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for f in files {
+        if !f.path.ends_with(".ts") {
+            continue;
+        }
+        for line in f.content.lines() {
+            let Some(idx) = line.find("from \"") else {
+                continue;
+            };
+            let spec = &line[idx + "from \"".len()..];
+            let Some(end) = spec.find('"') else { continue };
+            let spec = &spec[..end];
+            if spec.starts_with("./") || spec.starts_with("../") {
+                out.push((f.path.clone(), spec.to_string()));
+            }
+        }
+    }
+    out
+}
+
+/// Default `import_extension` (absent option) must reproduce the behavior
+/// requested in docs/csilgen-requests/typescript-codec-import-missing-extension.md:
+/// every relative specifier the generator emits carries the `.ts` extension, so
+/// Node's ESM loader (and `nodenext` typechecking) resolve it without a workaround.
+#[test]
+fn import_extension_default_ts_matches_previous_behavior() {
+    for input in specifier_coverage_inputs() {
+        let files = generate_files(&input).expect("generate");
+        let specs = collect_relative_specifiers(&files);
+        assert!(
+            !specs.is_empty(),
+            "fixture produced no relative specifiers to check"
+        );
+        for (path, spec) in specs {
+            assert!(
+                spec.ends_with(".ts"),
+                "{path} ({}) emits a relative specifier without .ts: {spec}",
+                input.config.target,
+            );
+        }
+    }
+}
+
+/// `import_extension: "js"` — the specifier a `tsc` build actually emits on disk —
+/// must rewrite every relative specifier consistently (types/codec/client/server/
+/// index barrel), matching plain `nodenext` resolution on any TypeScript version
+/// with no 5.7 extension-rewriting flag required. This is the pre-diff-compatible
+/// path for a bare (non-package) consumer: see
+/// `import_extension_js_compiles_clean_under_plain_nodenext_without_57_flags`
+/// below for the real `tsc` proof that TS5097 is gone.
+#[test]
+fn import_extension_js_rewrites_every_relative_specifier() {
+    for mut input in specifier_coverage_inputs() {
+        input
+            .config
+            .options
+            .insert("import_extension".to_string(), serde_json::json!("js"));
+        let files = generate_files(&input).expect("generate");
+        let specs = collect_relative_specifiers(&files);
+        assert!(
+            !specs.is_empty(),
+            "fixture produced no relative specifiers to check"
+        );
+        for (path, spec) in specs {
+            assert!(
+                spec.ends_with(".js"),
+                "{path} ({}) import_extension=js did not rewrite: {spec}",
+                input.config.target,
+            );
+        }
+    }
+}
+
+/// `import_extension: "none"` — the generator's pre-existing (extension-less)
+/// behavior — must rewrite every relative specifier consistently, with no
+/// trailing `.ts`/`.js` anywhere.
+#[test]
+fn import_extension_none_rewrites_every_relative_specifier() {
+    for mut input in specifier_coverage_inputs() {
+        input
+            .config
+            .options
+            .insert("import_extension".to_string(), serde_json::json!("none"));
+        let files = generate_files(&input).expect("generate");
+        let specs = collect_relative_specifiers(&files);
+        assert!(
+            !specs.is_empty(),
+            "fixture produced no relative specifiers to check"
+        );
+        for (path, spec) in specs {
+            assert!(
+                !spec.ends_with(".ts") && !spec.ends_with(".js"),
+                "{path} ({}) import_extension=none left an extension: {spec}",
+                input.config.target,
+            );
+        }
+    }
+}
+
+/// Mirrors `invalid_bidirectional_transport_value_fails_generation` /
+/// `invalid_decimal_mapping_fails_generation`: an unrecognized `import_extension`
+/// value is a hard generation error, not a silent fallback.
+#[test]
+fn import_extension_invalid_value_is_rejected() {
+    let mut input = input_with_spec("typescript-client", channel_spec());
+    input.config.options.insert(
+        "import_extension".to_string(),
+        serde_json::Value::String("mjs".to_string()),
+    );
+    let err = generate_files(&input).expect_err("invalid import_extension must fail generation");
+    assert!(
+        err.contains("import_extension") && err.contains("mjs"),
+        "error must name the option and bad value, got {err:?}"
+    );
+}
+
+/// An explicit `*_module` option (`client_types_module`, `client_codec_module`,
+/// `codec_types_module`) is used verbatim regardless of `import_extension` — only
+/// the *default* specifier follows the option.
+#[test]
+fn import_extension_does_not_override_explicit_module_option() {
+    let mut input = input_for("typescript-client");
+    input
+        .config
+        .options
+        .insert("import_extension".to_string(), serde_json::json!("js"));
+    input.config.options.insert(
+        "client_types_module".to_string(),
+        serde_json::Value::String("../generated/types".to_string()),
+    );
+    let client = file(&generate_files(&input).expect("generate"), "client.gen.ts").to_string();
+    assert!(client.contains("} from \"../generated/types\";"));
+}
+
+// ---------------------------------------------------------------------------
+// `import_extension` real-compile proofs — bare (non-package) output, the
+// consumer this option exists for: `csilgen generate --target typescript`
+// dropped into an existing project with no emitted tsconfig/package.json.
+// ---------------------------------------------------------------------------
+
+/// A driver exercising the typed client + codec against the generated modules,
+/// importing them with the given specifier suffix (`.ts`, `.js`, or empty).
+fn corndogs_driver_ts(specifier_suffix: &str) -> String {
+    format!(
+        r#"import {{ CorndogsClient, type ServiceTransport }} from "./client.gen{specifier_suffix}";
+import {{
+  toSubmitTaskRequestCbor,
+  fromSubmitTaskRequestCbor,
+  toTaskCbor,
+}} from "./codec.gen{specifier_suffix}";
+import type {{ Task, SubmitTaskRequest }} from "./types.gen{specifier_suffix}";
+
+class Loopback implements ServiceTransport {{
+  call(_service: string, _op: string, req: Uint8Array): Uint8Array {{
+    const reqObj = fromSubmitTaskRequestCbor(req);
+    return toTaskCbor(reqObj.task);
+  }}
+}}
+
+function check(ok: boolean, what: string): void {{
+  if (!ok) throw new Error("check failed: " + what);
+}}
+
+const task: Task = {{
+  uuid: "u-123",
+  currentState: "PENDING",
+  payload: new Uint8Array([1, 2, 3]),
+  priority: 7,
+  labels: {{ a: 1 }},
+  tags: ["x"],
+}};
+const req: SubmitTaskRequest = {{ task, queue: "default" }};
+
+// Direct codec round-trip, independent of the client.
+const reqBytes = toSubmitTaskRequestCbor(req);
+check(reqBytes.length > 0, "encoded request has bytes");
+
+const client = new CorndogsClient(new Loopback());
+const resp = client.submitTask(req);
+check(resp.uuid === "u-123", "resp uuid");
+
+console.log("ok");
+"#
+    )
+}
+
+/// Stage `generate_files(input)` plus `driver.ts` and `tsconfig`, in a fresh temp
+/// dir named `label`. Returns the dir for the caller to run `tsc`/`node` against.
+fn stage_import_extension_fixture(
+    label: &str,
+    input: &WasmGeneratorInput,
+    driver_suffix: &str,
+    tsconfig: &str,
+) -> std::path::PathBuf {
+    let files = generate_files(input).expect("generate");
+    let dir = std::env::temp_dir().join(format!(
+        "csilgen-ts-import-ext-{label}-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    for f in &files {
+        std::fs::write(dir.join(&f.path), &f.content).unwrap();
+    }
+    std::fs::write(dir.join("driver.ts"), corndogs_driver_ts(driver_suffix)).unwrap();
+    std::fs::write(dir.join("tsconfig.json"), tsconfig).unwrap();
+    dir
+}
+
+/// `import_extension: "ts"` (default) under `nodenext` with `allowImportingTsExtensions`
+/// and `noEmit` set — the consumer-requested behavior from
+/// docs/csilgen-requests/typescript-codec-import-missing-extension.md must still
+/// typecheck clean with no workaround flags beyond the ones that request already
+/// required.
+const IMPORT_EXTENSION_TS_TSCONFIG: &str = r#"{
+  "compilerOptions": {
+    "target": "es2020",
+    "module": "nodenext",
+    "moduleResolution": "nodenext",
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "allowImportingTsExtensions": true,
+    "noEmit": true
+  },
+  "include": ["*.ts"]
+}
+"#;
+
+#[test]
+fn import_extension_ts_compiles_clean_under_nodenext_with_allow_ts_extensions() {
+    if !have_node_npx() {
+        eprintln!("skipping: node/npx not on PATH");
+        return;
+    }
+    let input = input_with_spec("typescript-client", corndogs_spec());
+    let dir =
+        stage_import_extension_fixture("ts-nodenext", &input, ".ts", IMPORT_EXTENSION_TS_TSCONFIG);
+    let build = run_tsc(&dir, &["--noEmit"]);
+    assert!(
+        build.status.success(),
+        "default import_extension=ts must typecheck clean under nodenext+allowImportingTsExtensions:\n{}{}",
+        String::from_utf8_lossy(&build.stdout),
+        String::from_utf8_lossy(&build.stderr),
+    );
+}
+
+/// `import_extension: "js"` under plain `nodenext` with NO TypeScript 5.7 flags —
+/// the pre-diff-compatible path for a bare consumer stuck on an older TypeScript
+/// (or one that hasn't opted into `allowImportingTsExtensions`/
+/// `rewriteRelativeImportExtensions`). Proves TS5097 ("An import path can only end
+/// with a '.ts' extension when 'allowImportingTsExtensions' is enabled") is gone:
+/// the generator now emits `.js`-suffixed specifiers pointing at the sibling `.ts`
+/// sources, which `nodenext` resolves without any extra flag. Also runs the
+/// compiled output under node to prove it is not just syntactically clean but
+/// actually executes.
+const IMPORT_EXTENSION_JS_TSCONFIG: &str = r#"{
+  "compilerOptions": {
+    "target": "es2020",
+    "module": "nodenext",
+    "moduleResolution": "nodenext",
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "outDir": "dist"
+  },
+  "include": ["*.ts"]
+}
+"#;
+
+#[test]
+fn import_extension_js_compiles_clean_under_plain_nodenext_without_57_flags() {
+    if !have_node_npx() {
+        eprintln!("skipping: node/npx not on PATH");
+        return;
+    }
+    let mut input = input_with_spec("typescript-client", corndogs_spec());
+    input
+        .config
+        .options
+        .insert("import_extension".to_string(), serde_json::json!("js"));
+    let dir =
+        stage_import_extension_fixture("js-nodenext", &input, ".js", IMPORT_EXTENSION_JS_TSCONFIG);
+    let build = run_tsc(&dir, &[]);
+    assert!(
+        build.status.success(),
+        "import_extension=js must compile clean under plain nodenext (no 5.7 flags) — TS5097 must be gone:\n{}{}",
+        String::from_utf8_lossy(&build.stdout),
+        String::from_utf8_lossy(&build.stderr),
+    );
+    let run = std::process::Command::new("node")
+        .arg(dir.join("dist").join("driver.js"))
+        .output()
+        .unwrap();
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "compiled driver.js must run clean:\n{}{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr),
+    );
+}
+
+/// `import_extension: "none"` under `moduleResolution: "bundler"` — the shape a
+/// consumer feeding the raw `.ts` sources to a bundler (esbuild/webpack/Vite) or a
+/// tsc-only-for-types setup expects: bundler resolution does not require an
+/// extension on a relative specifier at all.
+const IMPORT_EXTENSION_NONE_TSCONFIG: &str = r#"{
+  "compilerOptions": {
+    "target": "es2020",
+    "module": "esnext",
+    "moduleResolution": "bundler",
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "noEmit": true
+  },
+  "include": ["*.ts"]
+}
+"#;
+
+#[test]
+fn import_extension_none_compiles_clean_under_bundler_resolution() {
+    if !have_node_npx() {
+        eprintln!("skipping: node/npx not on PATH");
+        return;
+    }
+    let mut input = input_with_spec("typescript-client", corndogs_spec());
+    input
+        .config
+        .options
+        .insert("import_extension".to_string(), serde_json::json!("none"));
+    let dir =
+        stage_import_extension_fixture("none-bundler", &input, "", IMPORT_EXTENSION_NONE_TSCONFIG);
+    let build = run_tsc(&dir, &["--noEmit"]);
+    assert!(
+        build.status.success(),
+        "import_extension=none must typecheck clean under moduleResolution bundler:\n{}{}",
+        String::from_utf8_lossy(&build.stdout),
+        String::from_utf8_lossy(&build.stderr),
+    );
 }
 
 /// Generate a package from `input`, write it to a temp dir, and type-check it with
@@ -3125,6 +3705,25 @@ fn emitted_aggregate_package_type_checks() {
     );
 }
 
+#[test]
+fn serviceless_package_type_checks_without_client_or_server() {
+    // Regression coverage for the service-less `server.gen.ts` importing a
+    // `ServiceError` that a service-less `types.gen.ts` never exports: this used
+    // to fail `tsc --noEmit` (TS2305, no exported member `ServiceError`) for any
+    // service-less spec built under the aggregate target. `money_spec` declares
+    // records but no `ServiceDef`, so client/server must be absent and the
+    // resulting package (types + codec + barrel) must still type-check clean.
+    let input = package_input_with_spec("typescript", money_spec());
+    let files = generate_files(&input).expect("generate");
+    for path in ["client.gen.ts", "client.async.gen.ts", "server.gen.ts"] {
+        assert!(
+            !files.iter().any(|f| f.path == path),
+            "{path} must not be emitted for a service-less spec"
+        );
+    }
+    typecheck_emitted_package("serviceless", &input);
+}
+
 const CODEC_TSCONFIG_NOEMIT: &str = r#"{
   "compilerOptions": {
     "target": "es2020",
@@ -3133,6 +3732,7 @@ const CODEC_TSCONFIG_NOEMIT: &str = r#"{
     "strict": true,
     "esModuleInterop": true,
     "skipLibCheck": true,
+    "rewriteRelativeImportExtensions": true,
     "lib": ["es2020", "dom"],
     "noEmit": true
   },
@@ -3148,6 +3748,7 @@ const CODEC_TSCONFIG: &str = r#"{
     "strict": true,
     "esModuleInterop": true,
     "skipLibCheck": true,
+    "rewriteRelativeImportExtensions": true,
     "lib": ["es2020", "dom"],
     "outDir": "out"
   },
@@ -3183,6 +3784,58 @@ check(back.queueCounts.q1 === 3 && back.queueCounts.q2 === 1, "queue_counts entr
 check(Object.keys(back.queueAndStateCounts).length === 2, "nested size");
 check(back.queueAndStateCounts.q1.active === 2, "nested q1 active");
 check(back.queueAndStateCounts.q2.paused === 5, "nested q2 paused");
+
+console.log("ok");
+"#;
+
+const MIXED_UNION_DRIVER_TS: &str = r#"import {
+  toOrderStatusCbor,
+  fromOrderStatusCbor,
+  toOrderStatusCborValue,
+  fromOrderStatusCborValue,
+} from "./codec.gen";
+import type { OrderStatus } from "./types.gen";
+
+function check(ok: boolean, what: string): void {
+  if (!ok) throw new Error("check failed: " + what);
+}
+
+function sameArray(a: unknown, b: unknown): boolean {
+  return JSON.stringify(a) === JSON.stringify(b);
+}
+
+// Literal-over-general precedence on encode: a value equal to a declared literal
+// takes that literal's own declared index, not the general `text` arm's index 0.
+check(sameArray(toOrderStatusCborValue("pending"), [1, "pending"]), "encode(pending) -> index 1");
+check(sameArray(toOrderStatusCborValue("refunded"), [7, "refunded"]), "encode(refunded) -> index 7");
+// A string that is not one of the declared literals falls through to the general
+// arm and keeps ITS declared index 0.
+check(sameArray(toOrderStatusCborValue("on-hold"), [0, "on-hold"]), "encode(on-hold) -> index 0");
+
+// Every declared index round-trips through the byte-level codec.
+const statuses: OrderStatus[] = [
+  "on-hold",
+  "pending",
+  "confirmed",
+  "processing",
+  "shipped",
+  "delivered",
+  "cancelled",
+  "refunded",
+];
+for (const s of statuses) {
+  check(fromOrderStatusCbor(toOrderStatusCbor(s)) === s, `round-trip(${s})`);
+}
+
+// A literal-index payload that does not equal the declared literal is rejected
+// rather than silently returned.
+let threw = false;
+try {
+  fromOrderStatusCborValue([1, "confirmed"]);
+} catch {
+  threw = true;
+}
+check(threw, "decode([1, \"confirmed\"]) must reject a literal mismatch");
 
 console.log("ok");
 "#;
@@ -3303,6 +3956,663 @@ const resp = client.submitTask(req);
 check(resp.uuid === "u-123", "resp uuid");
 check(bytesEq(resp.payload, payload), "resp payload");
 check(resp.priority === 7, "resp priority");
+
+console.log("ok");
+"#;
+
+// ---------------------------------------------------------------------------
+// Inline (anonymous) composite field hoisting
+//
+// A mixed choice or inline group written directly in a field / array element /
+// map value / tuple element must behave exactly like a reference to a named
+// choice/group with the same arms: mixed choices ride the wire as tagged sums,
+// inline groups as CBOR maps, and a closed all-literal choice (even one whose
+// last arm carries a trailing `.default`, which the parser attaches as a
+// `Constrained` wrapper) as its bare literal with decode-side membership
+// validation. These mirror the torture spec shared with the java/csharp/kotlin
+// agents and the OCaml byte oracle.
+// ---------------------------------------------------------------------------
+
+fn choice(arms: Vec<CsilTypeExpression>) -> CsilTypeExpression {
+    CsilTypeExpression::Choice(arms)
+}
+
+fn lit_text(s: &str) -> CsilTypeExpression {
+    CsilTypeExpression::Literal(CsilLiteralValue::Text(s.to_string()))
+}
+
+fn lit_int(i: i64) -> CsilTypeExpression {
+    CsilTypeExpression::Literal(CsilLiteralValue::Integer(i))
+}
+
+fn array_of(element: CsilTypeExpression) -> CsilTypeExpression {
+    CsilTypeExpression::Array {
+        element_type: Box::new(element),
+        occurrence: Some(CsilOccurrence::ZeroOrMore),
+    }
+}
+
+fn map_of(value: CsilTypeExpression) -> CsilTypeExpression {
+    CsilTypeExpression::Map {
+        key: Box::new(builtin("text")),
+        value: Box::new(value),
+        occurrence: Some(CsilOccurrence::ZeroOrMore),
+    }
+}
+
+fn tuple_of(elements: Vec<CsilTypeExpression>) -> CsilTypeExpression {
+    CsilTypeExpression::Tuple(CsilGroupExpression {
+        entries: elements
+            .into_iter()
+            .map(|t| CsilGroupEntry {
+                key: None,
+                value_type: t,
+                occurrence: None,
+                metadata: vec![],
+                doc_comments: vec![],
+            })
+            .collect(),
+    })
+}
+
+fn inline_group_ty(entries: Vec<CsilGroupEntry>) -> CsilTypeExpression {
+    CsilTypeExpression::Group(CsilGroupExpression { entries })
+}
+
+/// A trailing `.default` on the last choice arm, exactly as the parser attaches
+/// it: a `Constrained { base_type: Literal, .. }` wrapping that one arm.
+fn default_arm(s: &str, default: &str) -> CsilTypeExpression {
+    constrained(
+        lit_text(s),
+        vec![CsilControlOperator::Default(CsilLiteralValue::Text(
+            default.to_string(),
+        ))],
+    )
+}
+
+fn inline_choice_spec() -> CsilSpecSerialized {
+    let mut spec = spec_of(vec![
+        record_typedef(
+            "InlineChoicePayload",
+            vec![field("detail", builtin("text"), false)],
+        ),
+        record_typedef(
+            "InlineChoiceRecord",
+            vec![
+                field(
+                    "status",
+                    choice(vec![
+                        builtin("text"),
+                        lit_text("pending"),
+                        lit_text("active"),
+                        lit_text("closed"),
+                    ]),
+                    false,
+                ),
+                field(
+                    "priority",
+                    choice(vec![
+                        builtin("text"),
+                        lit_text("low"),
+                        lit_text("normal"),
+                        default_arm("high", "normal"),
+                    ]),
+                    true,
+                ),
+                field(
+                    "size",
+                    choice(vec![
+                        lit_text("small"),
+                        lit_text("medium"),
+                        default_arm("large", "medium"),
+                    ]),
+                    true,
+                ),
+                field(
+                    "payload",
+                    choice(vec![
+                        lit_text("none"),
+                        lit_int(42),
+                        reference("InlineChoicePayload"),
+                    ]),
+                    false,
+                ),
+                field(
+                    "tags",
+                    array_of(choice(vec![
+                        builtin("text"),
+                        lit_text("red"),
+                        lit_text("green"),
+                        lit_text("blue"),
+                        builtin("int"),
+                    ])),
+                    false,
+                ),
+                field(
+                    "labels",
+                    map_of(choice(vec![
+                        builtin("text"),
+                        lit_text("yes"),
+                        lit_text("no"),
+                        builtin("bool"),
+                    ])),
+                    false,
+                ),
+                field(
+                    "coord",
+                    tuple_of(vec![
+                        builtin("int"),
+                        choice(vec![
+                            builtin("text"),
+                            lit_text("x"),
+                            lit_text("y"),
+                            lit_text("z"),
+                        ]),
+                    ]),
+                    false,
+                ),
+                field(
+                    "nested",
+                    inline_group_ty(vec![field(
+                        "kind",
+                        choice(vec![
+                            builtin("text"),
+                            lit_text("a"),
+                            lit_text("b"),
+                            builtin("int"),
+                        ]),
+                        false,
+                    )]),
+                    false,
+                ),
+            ],
+        ),
+        CsilRule {
+            name: "InlineChoiceService".to_string(),
+            rule_type: CsilRuleType::ServiceDef(CsilServiceDefinition {
+                operations: vec![op(
+                    "round-trip",
+                    "InlineChoiceRecord",
+                    "InlineChoiceRecord",
+                    vec![],
+                )],
+                wire_id: None,
+            }),
+            position: pos(),
+            doc_comments: vec![],
+        },
+    ]);
+    spec.service_count = 1;
+    spec
+}
+
+#[test]
+fn inline_choice_hoists_mixed_positions_and_leaves_literal_enums_inline() {
+    let files = generate_files(&input_with_spec("typescript", inline_choice_spec())).unwrap();
+    let types = file(&files, "types.gen.ts");
+    let codec = file(&files, "codec.gen.ts");
+
+    // Every mixed inline position is hoisted to a synthesized named type, so the
+    // owning field references it (a direct field, an array element, a map value, a
+    // tuple element, and an inline group's own field all get names).
+    for decl in [
+        "export type InlineChoiceRecordStatus = string | \"pending\" | \"active\" | \"closed\";",
+        "export type InlineChoiceRecordPayload = \"none\" | 42 | InlineChoicePayload;",
+        "export type InlineChoiceRecordTagsItem = string | \"red\" | \"green\" | \"blue\" | number;",
+        "export type InlineChoiceRecordLabelsValue = string | \"yes\" | \"no\" | boolean;",
+        "export type InlineChoiceRecordCoord1 = string | \"x\" | \"y\" | \"z\";",
+        "export interface InlineChoiceRecordNested {",
+        "export type InlineChoiceRecordNestedKind = string | \"a\" | \"b\" | number;",
+    ] {
+        assert!(
+            types.contains(decl),
+            "missing synthesized type `{decl}`:\n{types}"
+        );
+    }
+    // The array element type is `Item[]` (the whole element is the choice), not the
+    // precedence-broken `... | number[]` an un-hoisted inline choice produced.
+    assert!(
+        types.contains("tags: InlineChoiceRecordTagsItem[];"),
+        "array element not hoisted to a named item type:\n{types}"
+    );
+
+    // A closed all-literal choice keeps its inline form (no synthesized union codec);
+    // the field type is the bare union.
+    assert!(
+        types.contains("size?: \"small\" | \"medium\" | \"large\";"),
+        "closed literal enum should stay an inline union type:\n{types}"
+    );
+    assert!(
+        !codec.contains("toInlineChoiceRecordSizeCborValue"),
+        "closed literal enum must NOT get a tagged-sum union codec:\n{codec}"
+    );
+
+    // Each hoisted mixed choice routes through the reused union codec machinery.
+    for f in [
+        "export function toInlineChoiceRecordStatusCborValue",
+        "export function toInlineChoiceRecordPayloadCborValue",
+        "export function toInlineChoiceRecordTagsItemCborValue",
+        "export function toInlineChoiceRecordLabelsValueCborValue",
+        "export function toInlineChoiceRecordCoord1CborValue",
+        "export function toInlineChoiceRecordNestedCborValue",
+        "export function toInlineChoiceRecordNestedKindCborValue",
+    ] {
+        assert!(codec.contains(f), "missing hoisted codec `{f}`:\n{codec}");
+    }
+
+    // The owning record routes each position through the synthesized codec rather
+    // than passing the raw value through.
+    assert!(
+        codec.contains("csilMap.set(\"nested\", toInlineChoiceRecordNestedCborValue(v.nested));"),
+        "inline group field not routed through its record codec:\n{codec}"
+    );
+    assert!(
+        codec.contains(
+            "v.tags.map((csilE): CborValue => toInlineChoiceRecordTagsItemCborValue(csilE))"
+        ),
+        "array element not routed through its item codec:\n{codec}"
+    );
+
+    // The payload union's record arm routes through the record codec at its declared
+    // index 2, and the literal arms keep indices 0/1.
+    assert!(
+        codec.contains("case 2: return fromInlineChoicePayloadCborValue(csilArr[1]);"),
+        "record union arm not dispatched at its declared index:\n{codec}"
+    );
+}
+
+#[test]
+fn inline_closed_enum_default_arm_validates_membership_and_stays_bare() {
+    let codec = file(
+        &generate_files(&input_with_spec("typescript", inline_choice_spec())).unwrap(),
+        "codec.gen.ts",
+    )
+    .to_string();
+
+    // The closed enum's decode validates the value is one of the declared literals —
+    // and crucially the `.default`-wrapped final arm ("large") is included, proving the
+    // `Constrained` wrapper is seen through rather than dropping that arm.
+    assert!(
+        codec.contains(
+            "asEnumMember(asString(csilV), [\"small\", \"medium\", \"large\"]) as \"small\" | \"medium\" | \"large\""
+        ),
+        "closed enum decode must validate membership against all three literals:\n{codec}"
+    );
+    // It stays a bare literal on the wire (the record sets the value directly).
+    assert!(
+        codec.contains("if (v.size !== undefined) csilMap.set(\"size\", v.size);"),
+        "closed enum must encode as the bare literal value:\n{codec}"
+    );
+}
+
+#[test]
+fn inline_mixed_choice_default_arm_keeps_its_declared_index_before_general() {
+    let codec = file(
+        &generate_files(&input_with_spec("typescript", inline_choice_spec())).unwrap(),
+        "codec.gen.ts",
+    )
+    .to_string();
+    // `priority`'s final arm ("high") carries the trailing `.default`, so the parser
+    // wraps it in `Constrained`. It must still be recognized as a literal: it keeps
+    // its declared index 3 and is checked BEFORE the general `text` arm, or the general
+    // arm's `typeof v === "string"` predicate would shadow it and miswrite [0, "high"].
+    let encoder = codec
+        .split("export function toInlineChoiceRecordPriorityCborValue")
+        .nth(1)
+        .expect("priority union encoder emitted");
+    assert!(
+        encoder.contains("if (v === \"high\") { const csilV = v as \"high\"; return [3, csilV]; }"),
+        "the `.default`-wrapped literal arm lost its declared index:\n{codec}"
+    );
+    let high_pos = encoder.find("v === \"high\"").expect("high arm present");
+    let general_pos = encoder
+        .find("typeof v === \"string\"")
+        .expect("general arm present");
+    assert!(
+        high_pos < general_pos,
+        "the general arm is checked before the `.default` literal arm, shadowing it:\n{codec}"
+    );
+}
+
+/// End-to-end proof under node: the hoisted inline choices/groups produce bytes
+/// identical to the OCaml oracle for the record-field-level positions, a full record
+/// round-trips through every position (array/map/tuple included — positions OCaml has
+/// no oracle for), and the closed enum rejects an unknown value. Skips when node/npx
+/// is unavailable so the suite stays portable.
+#[test]
+fn inline_choice_matches_cross_language_bytes_and_round_trips_under_node() {
+    let have_node = std::process::Command::new("node")
+        .arg("--version")
+        .output()
+        .is_ok();
+    let have_npx = std::process::Command::new("npx")
+        .arg("--version")
+        .output()
+        .is_ok();
+    if !have_node || !have_npx {
+        eprintln!("skipping: node/npx not on PATH");
+        return;
+    }
+
+    let files = generate_files(&input_with_spec("typescript", inline_choice_spec())).unwrap();
+    let dir = std::env::temp_dir().join(format!("csilgen-ts-inlinechoice-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    for f in &files {
+        std::fs::write(dir.join(&f.path), &f.content).unwrap();
+    }
+    std::fs::write(dir.join("driver.ts"), INLINE_CHOICE_DRIVER_TS).unwrap();
+    std::fs::write(dir.join("tsconfig.json"), CODEC_TSCONFIG).unwrap();
+
+    let build = std::process::Command::new("npx")
+        .args(["-y", "-p", "typescript@5", "tsc", "-p", "tsconfig.json"])
+        .current_dir(&dir)
+        .output()
+        .unwrap();
+    assert!(
+        build.status.success(),
+        "tsc type-check/compile failed:\n{}{}",
+        String::from_utf8_lossy(&build.stdout),
+        String::from_utf8_lossy(&build.stderr)
+    );
+
+    let run = std::process::Command::new("node")
+        .arg(dir.join("out").join("driver.js"))
+        .current_dir(&dir)
+        .output()
+        .unwrap();
+    assert!(
+        run.status.success(),
+        "node round-trip failed:\n{}{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&run.stdout).trim(), "ok");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+const INLINE_CHOICE_DRIVER_TS: &str = r#"import {
+  toInlineChoiceRecordStatusCbor,
+  toInlineChoiceRecordPriorityCbor,
+  toInlineChoiceRecordPayloadCbor,
+  toInlineChoiceRecordNestedKindCbor,
+  toInlineChoiceRecordCbor,
+  fromInlineChoiceRecordCbor,
+  fromInlineChoiceRecordCborValue,
+} from "./codec.gen";
+import type { InlineChoiceRecord } from "./types.gen";
+
+function check(ok: boolean, what: string): void {
+  if (!ok) throw new Error("check failed: " + what);
+}
+const hex = (b: Uint8Array): string =>
+  Array.from(b, (x) => x.toString(16).padStart(2, "0")).join("");
+
+// Byte cross-check against the OCaml oracle (record-field-level inline choices).
+check(hex(toInlineChoiceRecordStatusCbor("pending")) === "82016770656e64696e67", "status(pending) = [1,\"pending\"]");
+check(hex(toInlineChoiceRecordStatusCbor("free")) === "82006466726565", "status(free) = [0,\"free\"]");
+check(hex(toInlineChoiceRecordPriorityCbor("high")) === "82036468696768", "priority(high) = [3,\"high\"]");
+check(hex(toInlineChoiceRecordPayloadCbor("none")) === "8200646e6f6e65", "payload(none) = [0,\"none\"]");
+check(hex(toInlineChoiceRecordPayloadCbor({ detail: "hi" })) === "8202a16664657461696c626869", "payload(inline) = [2,{detail:\"hi\"}]");
+check(hex(toInlineChoiceRecordNestedKindCbor("a")) === "82016161", "kind(a) = [1,\"a\"]");
+check(hex(toInlineChoiceRecordNestedKindCbor("free")) === "82006466726565", "kind(free) = [0,\"free\"]");
+check(hex(toInlineChoiceRecordNestedKindCbor(7)) === "820307", "kind(7) = [3,7]");
+
+// A closed all-literal enum rides the wire as its bare literal, and a full record
+// round-trips through every hoisted position (array, map, tuple, nested group).
+const rec: InlineChoiceRecord = {
+  status: "pending",
+  size: "medium",
+  payload: { detail: "x" },
+  tags: ["red", 5],
+  labels: { a: "yes", b: true },
+  coord: [1, "x"],
+  nested: { kind: 7 },
+};
+const bytes = toInlineChoiceRecordCbor(rec);
+check(hex(bytes).includes("6473697a65666d656469756d"), "size rides wire as bare text \"medium\"");
+const back = fromInlineChoiceRecordCbor(bytes);
+check(JSON.stringify(back) === JSON.stringify(rec), "record round-trip: " + JSON.stringify(back));
+
+// Decode validates the closed enum's membership: an unknown value is rejected.
+let threw = false;
+try {
+  fromInlineChoiceRecordCborValue(new Map<unknown, unknown>([
+    ["status", [0, "x"]],
+    ["payload", [0, "none"]],
+    ["tags", []],
+    ["labels", new Map()],
+    ["coord", [1, [0, "x"]]],
+    ["nested", new Map([["kind", [1, "a"]]])],
+    ["size", "huge"],
+  ]) as never);
+} catch {
+  threw = true;
+}
+check(threw, "decode rejects an unknown closed-enum value");
+
+console.log("ok");
+"#;
+
+// `Color`/`Priority` are named (`Name = "a" / "b"`) enums, referenced from a
+// record field rather than declared inline — the parity gap fixed in
+// `codec::aliases`: a `Reference` to a literal-only choice used to fall through
+// to a blind, unvalidated cast (`aliases()` excluded ALL choices, not just
+// non-literal unions), while the identical inline spelling already validated
+// membership via `asEnumMember`.
+fn named_enum_spec() -> CsilSpecSerialized {
+    spec_of(vec![
+        CsilRule {
+            name: "Color".to_string(),
+            rule_type: CsilRuleType::TypeDef(choice(vec![
+                lit_text("red"),
+                lit_text("green"),
+                lit_text("blue"),
+            ])),
+            position: pos(),
+            doc_comments: vec![],
+        },
+        CsilRule {
+            name: "Priority".to_string(),
+            rule_type: CsilRuleType::TypeDef(choice(vec![lit_int(1), lit_int(2), lit_int(3)])),
+            position: pos(),
+            doc_comments: vec![],
+        },
+        record_typedef(
+            "NamedEnumRecord",
+            vec![
+                field("color", reference("Color"), false),
+                field("priority", reference("Priority"), false),
+            ],
+        ),
+    ])
+}
+
+/// Empirical proof (via `node`) that a NAMED enum reference validates wire-value
+/// membership on decode exactly like an inline enum does: a well-typed value
+/// outside the declared literal set ("purple", 99) must raise, and every declared
+/// member must still round-trip.
+#[test]
+fn named_enum_reference_validates_membership_under_node() {
+    let have_node = std::process::Command::new("node")
+        .arg("--version")
+        .output()
+        .is_ok();
+    if !have_node {
+        eprintln!("skipping: node not on PATH");
+        return;
+    }
+
+    let files = generate_files(&input_with_spec("typescript", named_enum_spec())).unwrap();
+    let dir = std::env::temp_dir().join(format!("csilgen-ts-namedenum-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    for f in &files {
+        std::fs::write(dir.join(&f.path), &f.content).unwrap();
+    }
+    std::fs::write(dir.join("probe.mjs"), NAMED_ENUM_DRIVER_JS).unwrap();
+
+    let run = std::process::Command::new("node")
+        .arg("probe.mjs")
+        .current_dir(&dir)
+        .output()
+        .unwrap();
+    assert!(
+        run.status.success(),
+        "node probe failed:\n{}{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&run.stdout).trim(), "ok");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+const NAMED_ENUM_DRIVER_JS: &str = r#"import { toNamedEnumRecordCbor, fromNamedEnumRecordCbor } from "./codec.gen.ts";
+
+function check(ok, what) {
+  if (!ok) throw new Error("check failed: " + what);
+}
+
+// Every declared member round-trips.
+const good = { color: "green", priority: 2 };
+const back = fromNamedEnumRecordCbor(toNamedEnumRecordCbor(good));
+check(back.color === "green" && back.priority === 2, "valid named-enum members round-trip");
+
+// A well-typed value outside the declared set must fail decode — the named-enum
+// analog of the inline-choice membership check above.
+let threwColor = false;
+try {
+  fromNamedEnumRecordCbor(toNamedEnumRecordCbor({ color: "purple", priority: 1 }));
+} catch {
+  threwColor = true;
+}
+check(threwColor, "decode rejects an out-of-set named text enum (Color) value");
+
+let threwPriority = false;
+try {
+  fromNamedEnumRecordCbor(toNamedEnumRecordCbor({ color: "red", priority: 99 }));
+} catch {
+  threwPriority = true;
+}
+check(threwPriority, "decode rejects an out-of-set named int enum (Priority) value");
+
+console.log("ok");
+"#;
+
+/// A record with an inline MIXED-kind literal choice field (`"a" / 1`, a text
+/// literal and an integer literal in the same choice) — the shape the shared
+/// `csilgen_common::classify_choice` contract fixed: ALL-literal (any kind mix)
+/// classifies as an `Enum`, so this must stay inline (not hoisted) exactly like a
+/// uniform-kind literal choice, and decode must validate membership.
+fn mixed_kind_literal_choice_spec() -> CsilSpecSerialized {
+    spec_of(vec![record_typedef(
+        "MixedEnumRecord",
+        vec![field(
+            "code",
+            choice(vec![lit_text("a"), lit_int(1)]),
+            false,
+        )],
+    )])
+}
+
+/// Regression test for the pre-fix bug: TS's decode picked a single scalar
+/// reader (`asNumber`/`asBool`/`asString`) by requiring a UNIFORM literal kind
+/// across every arm, defaulting to `asString` for anything else — which threw at
+/// runtime decoding the integer member of a mixed-kind choice like `"a" / 1`
+/// (`asString` rejects a non-string CBOR item). Confirms the generated source
+/// routes a mixed-kind choice through the new `asEnumScalar` generic reader.
+#[test]
+fn mixed_kind_literal_choice_decode_uses_generic_enum_scalar_reader() {
+    let files = generate_files(&input_with_spec(
+        "typescript",
+        mixed_kind_literal_choice_spec(),
+    ))
+    .unwrap();
+    let codec = &files
+        .iter()
+        .find(|f| f.path == "codec.gen.ts")
+        .unwrap()
+        .content;
+    assert!(
+        codec.contains("asEnumScalar"),
+        "mixed-kind choice decode must route through the generic asEnumScalar reader:\n{codec}"
+    );
+}
+
+/// Empirical proof (via `node`) that a mixed-kind literal choice (`"a" / 1`)
+/// rides the wire as a bare literal (not a tagged-sum union — it is still an
+/// ALL-literal `Enum` per the classification contract), every declared member of
+/// EITHER kind round-trips, and an out-of-vocabulary value is rejected on decode.
+#[test]
+fn mixed_kind_literal_choice_round_trips_and_validates_membership_under_node() {
+    let have_node = std::process::Command::new("node")
+        .arg("--version")
+        .output()
+        .is_ok();
+    if !have_node {
+        eprintln!("skipping: node not on PATH");
+        return;
+    }
+
+    let files = generate_files(&input_with_spec(
+        "typescript",
+        mixed_kind_literal_choice_spec(),
+    ))
+    .unwrap();
+    let dir = std::env::temp_dir().join(format!("csilgen-ts-mixedenum-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    for f in &files {
+        std::fs::write(dir.join(&f.path), &f.content).unwrap();
+    }
+    std::fs::write(dir.join("probe.mjs"), MIXED_ENUM_DRIVER_JS).unwrap();
+
+    let run = std::process::Command::new("node")
+        .arg("probe.mjs")
+        .current_dir(&dir)
+        .output()
+        .unwrap();
+    assert!(
+        run.status.success(),
+        "node probe failed:\n{}{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&run.stdout).trim(), "ok");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+const MIXED_ENUM_DRIVER_JS: &str = r#"import { toMixedEnumRecordCbor, fromMixedEnumRecordCbor } from "./codec.gen.ts";
+
+function check(ok, what) {
+  if (!ok) throw new Error("check failed: " + what);
+}
+
+// Both declared members — a text literal AND an integer literal in the same
+// choice — round-trip.
+const textBack = fromMixedEnumRecordCbor(toMixedEnumRecordCbor({ code: "a" }));
+check(textBack.code === "a", "text member of mixed-kind enum round-trips");
+const intBack = fromMixedEnumRecordCbor(toMixedEnumRecordCbor({ code: 1 }));
+check(intBack.code === 1, "int member of mixed-kind enum round-trips");
+
+// A well-typed value (a string, matching the "a" arm's runtime type) outside the
+// declared vocabulary must still be rejected — a membership check, not merely a
+// type check.
+let threwString = false;
+try {
+  fromMixedEnumRecordCbor(toMixedEnumRecordCbor({ code: "z" }));
+} catch {
+  threwString = true;
+}
+check(threwString, "decode rejects an out-of-set text value for a mixed-kind enum");
+
+let threwInt = false;
+try {
+  fromMixedEnumRecordCbor(toMixedEnumRecordCbor({ code: 99 }));
+} catch {
+  threwInt = true;
+}
+check(threwInt, "decode rejects an out-of-set int value for a mixed-kind enum");
 
 console.log("ok");
 "#;

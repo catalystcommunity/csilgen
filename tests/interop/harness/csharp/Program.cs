@@ -21,7 +21,7 @@ using GenCbor = interop_api.CborValue;
 
 internal static class Harness
 {
-    private const string Service = "interop";
+    private const string Service = "Interop";
 
     // -----------------------------------------------------------------------
     // Fixed language-neutral test vectors (see README "Fixed test vectors").
@@ -40,6 +40,22 @@ internal static class Harness
         Flag = true,
         When = Ts(),
         Amount = CsilDecimal.Parse("123.45"),
+        // mixed-union coverage: a value equal to a literal arm must wire as
+        // [1,"pending"]; a value with no literal match must wire as [0,...].
+        StatusLiteral = new MixedStatusVariant2("pending"),
+        StatusFree = new MixedStatusVariant1("unlisted"),
+        // inline mixed choice (hoisted; literal arm match, ScalarsNoteVariant2 == "info").
+        Note = new ScalarsNoteVariant2("info"),
+        // inline all-literal choice (hoisted to an enum).
+        Size = ScalarsSize.Medium,
+        // named enum with a trailing `.default`-constrained last arm.
+        Level = Level.High,
+        // named enum assembled via base rule + `/=` extension.
+        Season = Season.Autumn,
+        // named all-literal enum with mixed literal kinds (text + int arms);
+        // renders as a real C# enum.
+        ShipText = ShipMode.Ground,
+        ShipInt = ShipMode.Value2,
     };
 
     private static Collections CollectionsOk() => new()
@@ -91,7 +107,10 @@ internal static class Harness
     private static bool ScalarsEq(Scalars a, Scalars b) =>
         a.I == b.I && a.U == b.U && a.N == b.N && a.F.Equals(b.F) && a.T == b.T
         && a.Raw.SequenceEqual(b.Raw) && a.Flag == b.Flag && a.When == b.When
-        && a.Amount.CompareTo(b.Amount) == 0;
+        && a.Amount.CompareTo(b.Amount) == 0
+        && a.StatusLiteral.Equals(b.StatusLiteral) && a.StatusFree.Equals(b.StatusFree)
+        && a.Note.Equals(b.Note) && a.Size == b.Size && a.Level == b.Level && a.Season == b.Season
+        && a.ShipText == b.ShipText && a.ShipInt == b.ShipInt;
 
     private static bool ConstrainedEq(Constrained a, Constrained b) =>
         a.Code == b.Code && a.Qty == b.Qty && a.Rate.CompareTo(b.Rate) == 0
@@ -292,7 +311,7 @@ internal static class Harness
             {
                 switch (req.Op)
                 {
-                    case "EchoScalars":
+                    case "echo-scalars":
                         try
                         {
                             var v = Codec.Decode<Scalars>(req.Payload);
@@ -303,7 +322,7 @@ internal static class Harness
                             return HandlerOutcome.Transport(Status.MalformedEnvelope, e.Message);
                         }
 
-                    case "EchoCollections":
+                    case "echo-collections":
                         try
                         {
                             var v = Codec.Decode<Collections>(req.Payload);
@@ -314,7 +333,7 @@ internal static class Harness
                             return HandlerOutcome.Transport(Status.MalformedEnvelope, e.Message);
                         }
 
-                    case "EchoNested":
+                    case "echo-nested":
                         try
                         {
                             var v = Codec.Decode<Nested>(req.Payload);
@@ -325,7 +344,7 @@ internal static class Harness
                             return HandlerOutcome.Transport(Status.MalformedEnvelope, e.Message);
                         }
 
-                    case "ValidateConstrained":
+                    case "validate-constrained":
                         Constrained input;
                         try
                         {
@@ -510,7 +529,7 @@ internal static class Harness
                 {
                     break;
                 }
-                else if (method == "Duplex")
+                else if (method == "duplex")
                 {
                     try
                     {
@@ -571,10 +590,10 @@ internal static class Harness
             }
 
             Event ev = Event.Decode(frame, Profile.Verbose);
-            if (ev.EventName != "OnTick")
+            if (ev.EventName != "on-tick")
             {
                 tickOk = false;
-                detail = $"expected OnTick got {ev.EventName}";
+                detail = $"expected on-tick got {ev.EventName}";
                 break;
             }
 
@@ -600,7 +619,7 @@ internal static class Harness
         else
         {
             Event ev = Event.Decode(duplexFrame, Profile.Verbose);
-            if (ev.EventName == "Duplex")
+            if (ev.EventName == "duplex")
             {
                 var s = Codec.Decode<Scalars>(ev.Payload);
                 cases.Check("duplex/success", ScalarsEq(s, ScalarsOk()), "echo mismatch");

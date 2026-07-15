@@ -56,16 +56,6 @@ fn module_is_capitalized() {
     );
 }
 
-#[test]
-fn wire_service_and_op_match_the_contract() {
-    // The wire service strips `Service` and lowercases; the op is PascalCased (the
-    // wire contract), so an OCaml client routes to the same endpoint as its peers.
-    assert_eq!(wire_service_name("CorndogsService"), "corndogs");
-    assert_eq!(wire_service_name("Attestation"), "attestation");
-    assert_eq!(wire_op_name("deposit-claim"), "DepositClaim");
-    assert_eq!(wire_op_name("submit_task"), "SubmitTask");
-}
-
 // --- type mapping -----------------------------------------------------------
 
 #[test]
@@ -270,7 +260,7 @@ fn server_module_emits_handler_and_routers() {
     assert!(out.contains("deposit_claim : bytes -> outcome;"));
     // Verbose router dispatches by the verbatim wire op name (kebab preserved).
     assert!(out.contains("let route (h : handler) ~(op : string) ~(payload : bytes) ="));
-    assert!(out.contains("| \"DepositClaim\" -> h.deposit_claim payload"));
+    assert!(out.contains("| \"deposit-claim\" -> h.deposit_claim payload"));
     // Compact router dispatches by ordinal, emitted because the service has a wire id.
     assert!(out.contains("let route_compact (h : handler) ~(op_ord : int64)"));
     assert!(out.contains("| 1L -> h.deposit_claim payload"));
@@ -303,7 +293,7 @@ fn push_op_handler_takes_unit_payload() {
         wire_id: None,
     };
     let out = emit_service_module("Feed", &svc);
-    assert!(out.contains("| \"Subscribe\" -> ignore payload; h.subscribe Bytes.empty"));
+    assert!(out.contains("| \"subscribe\" -> ignore payload; h.subscribe Bytes.empty"));
 }
 
 // --- services: client -------------------------------------------------------
@@ -326,10 +316,11 @@ fn client_module_emits_typed_calls() {
     assert!(out.contains("module Attestation = struct"));
     // The success type drops the ServiceError arm.
     assert!(out.contains("decode_response : bytes -> deposit_claim_response"));
-    // The wire op string is verbatim; the OCaml fn name is snake_case.
+    // The wire service/op strings are the CSIL names verbatim; the OCaml fn name is
+    // snake_case.
     assert!(out.contains("let deposit_claim (c : client)"));
-    assert!(out.contains("~op:\"DepositClaim\""));
-    assert!(out.contains("~service:\"attestation\""));
+    assert!(out.contains("~op:\"deposit-claim\""));
+    assert!(out.contains("~service:\"Attestation\""));
 }
 
 // --- surfaces ---------------------------------------------------------------
@@ -718,6 +709,780 @@ const CODEC_DRIVER_OCAML: &str = r#"let () =
   print_string "ok\n"
 "#;
 
+/// A spec with a mixed-union type-choice (`OrderStatus = text / "pending" /
+/// "confirmed" / "cancelled"`), matching `OrderStatus` in
+/// examples/real-world-api/e-commerce-api.csil, referenced by a minimal `Order`
+/// record so `generate_codec` emits the choice's own codec pair.
+fn mixed_union_spec() -> CsilSpecSerialized {
+    let status = CsilRule {
+        name: "OrderStatus".to_string(),
+        rule_type: CsilRuleType::TypeDef(CsilTypeExpression::Choice(vec![
+            builtin("text"),
+            text_literal("pending"),
+            text_literal("confirmed"),
+            text_literal("cancelled"),
+        ])),
+        position: pos(),
+        doc_comments: vec![],
+    };
+    let order = group_rule(
+        "Order",
+        vec![bare_entry(
+            "status",
+            CsilTypeExpression::Reference("OrderStatus".to_string()),
+        )],
+    );
+    CsilSpecSerialized {
+        rules: vec![status, order],
+        source_content: None,
+        service_count: 0,
+        fields_with_metadata_count: 0,
+    }
+}
+
+/// Regression test for the bare-text wire-incompatibility bug: `OrderStatus` is
+/// modeled internally as a proper ADT (`Pending | Confirmed | Cancelled | Other of
+/// string`, an *open* string enum — see `classify_choice`), but the generated codec
+/// used to ENCODE the bare CBOR text for every arm, never the tagged sum, which is
+/// wire-incompatible with go/python/rust/c/csharp/kotlin for this shape (any choice
+/// with a non-literal arm). Compiles and runs the generated codec with dune to prove
+/// the actual wire bytes, not just the generated source text. Skips cleanly when
+/// dune is not on PATH.
+#[test]
+fn mixed_union_encodes_tagged_sum_not_bare_text() {
+    let have = std::process::Command::new("dune")
+        .arg("--version")
+        .output()
+        .is_ok();
+    if !have {
+        eprintln!("skipping: no dune on PATH");
+        return;
+    }
+    let spec = mixed_union_spec();
+    let cfg = GeneratorConfig {
+        target: "ocaml-client".into(),
+        output_dir: "/tmp".into(),
+        options: HashMap::new(),
+    };
+    let files = generate_ocaml(&spec, &cfg).unwrap();
+
+    let dir = std::env::temp_dir().join(format!("csilgen-ocaml-mixedunion-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    for f in &files {
+        std::fs::write(dir.join(&f.path), &f.content).unwrap();
+    }
+    std::fs::write(dir.join("dune-project"), "(lang dune 3.0)\n").unwrap();
+    std::fs::write(
+        dir.join("dune"),
+        "(executable (name test) (modules types csil_cbor codec test))\n",
+    )
+    .unwrap();
+    std::fs::write(dir.join("test.ml"), MIXED_UNION_DRIVER_OCAML).unwrap();
+
+    let run = std::process::Command::new("dune")
+        .arg("exec")
+        .arg("--profile")
+        .arg("release")
+        .arg("--root")
+        .arg(&dir)
+        .arg("./test.exe")
+        .output()
+        .unwrap();
+    assert!(
+        run.status.success(),
+        "ocaml mixed-union check failed:\n{}{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&run.stdout).trim(), "ok");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+const MIXED_UNION_DRIVER_OCAML: &str = r#"let () =
+  (* A declared literal must win its own index over the general `text` arm, even
+     though both live in the same `order_status` type. *)
+  (match Codec.encode_order_status Types.Pending with
+   | Csil_cbor.Array [ Csil_cbor.Uint 1L; Csil_cbor.Text "pending" ] -> ()
+   | _ -> failwith "pending: expected [1; \"pending\"]");
+  (match Codec.encode_order_status Types.Confirmed with
+   | Csil_cbor.Array [ Csil_cbor.Uint 2L; Csil_cbor.Text "confirmed" ] -> ()
+   | _ -> failwith "confirmed: expected [2; \"confirmed\"]");
+  (match Codec.encode_order_status Types.Cancelled with
+   | Csil_cbor.Array [ Csil_cbor.Uint 3L; Csil_cbor.Text "cancelled" ] -> ()
+   | _ -> failwith "cancelled: expected [3; \"cancelled\"]");
+  (* A string matching no literal falls back to the general arm, index 0. *)
+  (match Codec.encode_order_status (Types.Other "on-hold") with
+   | Csil_cbor.Array [ Csil_cbor.Uint 0L; Csil_cbor.Text "on-hold" ] -> ()
+   | _ -> failwith "on-hold: expected [0; \"on-hold\"]");
+  (* Every declared index decodes back to its value, literal arms included. *)
+  assert (
+    Codec.decode_order_status (Codec.encode_order_status (Types.Other "on-hold"))
+    = Types.Other "on-hold");
+  assert (
+    Codec.decode_order_status (Codec.encode_order_status Types.Pending) = Types.Pending);
+  assert (
+    Codec.decode_order_status (Codec.encode_order_status Types.Confirmed) = Types.Confirmed);
+  assert (
+    Codec.decode_order_status (Codec.encode_order_status Types.Cancelled) = Types.Cancelled);
+  (* A full round-trip through a record field. *)
+  let order : Types.order = { Types.status = Types.Pending } in
+  let order_back = Codec.decode_order_bytes (Codec.encode_order_bytes order) in
+  assert (order_back.status = Types.Pending);
+  (* A literal arm still validates its payload rather than trusting the index: an
+     index that claims "pending" but carries a different string must be rejected. *)
+  (try
+     let (_ : Types.order_status) =
+       Codec.decode_order_status
+         (Csil_cbor.Array [ Csil_cbor.Uint 1L; Csil_cbor.Text "confirmed" ])
+     in
+     failwith "expected failure for literal/value mismatch"
+   with Failure _ -> ());
+  (* An out-of-range index is rejected too. *)
+  (try
+     let (_ : Types.order_status) =
+       Codec.decode_order_status
+         (Csil_cbor.Array [ Csil_cbor.Uint 99L; Csil_cbor.Text "pending" ])
+     in
+     failwith "expected failure for unknown variant index"
+   with Failure _ -> ());
+  print_string "ok\n"
+"#;
+
+// --- inline (anonymous) group/choice fields ----------------------------------
+
+/// A field whose type is directly an inline choice (no named rule behind it) used
+/// to collapse to the opaque `Csil_cbor.t` and its codec fell to a `failwith`
+/// field-shape stub — found verifying
+/// examples/real-world-api/e-commerce-api.csil's `APIError.error_type`. It is now
+/// hoisted to its own `<Record>_<field>` type (`csilgen_common::hoist_inline_composites`),
+/// exactly like the corresponding shape already was for a *named* choice. The
+/// hoist pass runs once in `generate_ocaml` (see that function), so a test
+/// exercising `generate_types`/`generate_codec` directly must hoist first, same as
+/// every real caller.
+#[test]
+fn inline_choice_field_hoists_to_synthesized_type() {
+    let spec = CsilSpecSerialized {
+        rules: vec![group_rule(
+            "APIError",
+            vec![bare_entry(
+                "error_type",
+                CsilTypeExpression::Choice(vec![
+                    builtin("text"),
+                    text_literal("not_found"),
+                    text_literal("invalid_input"),
+                ]),
+            )],
+        )],
+        source_content: None,
+        service_count: 0,
+        fields_with_metadata_count: 0,
+    };
+    let spec = csilgen_common::hoist_inline_composites(
+        &spec,
+        csilgen_common::HoistOptions {
+            hoist_all_literal_choices: true,
+        },
+    );
+    let (types_ml, mli) = generate_types(&spec);
+    assert!(types_ml.contains("api_error_error_type"));
+    assert!(!types_ml.contains("Csil_cbor.t"));
+    assert!(mli.contains("api_error_error_type"));
+
+    let codec = generate_codec(&spec).expect("codec emitted");
+    assert!(codec.contains("encode_api_error_error_type"));
+    assert!(codec.contains("decode_api_error_error_type"));
+    assert!(!codec.contains("no codec for"));
+}
+
+/// The same nominal-type problem, but for an inline `{ ... }` group rather than a
+/// choice (found sweeping examples/multi-file/mixed/standalone.csil's
+/// `StandaloneType.metadata` while verifying this fix) — `csilgen_common::hoist_inline_composites`
+/// covers both shapes with the same mechanism.
+#[test]
+fn inline_group_field_hoists_to_synthesized_record() {
+    let spec = CsilSpecSerialized {
+        rules: vec![group_rule(
+            "StandaloneType",
+            vec![bare_entry(
+                "metadata",
+                CsilTypeExpression::Group(CsilGroupExpression {
+                    entries: vec![bare_entry("created", builtin("int"))],
+                }),
+            )],
+        )],
+        source_content: None,
+        service_count: 0,
+        fields_with_metadata_count: 0,
+    };
+    let spec = csilgen_common::hoist_inline_composites(
+        &spec,
+        csilgen_common::HoistOptions {
+            hoist_all_literal_choices: true,
+        },
+    );
+    let (types_ml, _) = generate_types(&spec);
+    assert!(types_ml.contains("standalone_type_metadata"));
+    assert!(!types_ml.contains("Csil_cbor.t"));
+
+    let codec = generate_codec(&spec).expect("codec emitted");
+    assert!(codec.contains("encode_standalone_type_metadata"));
+    assert!(codec.contains("decode_standalone_type_metadata"));
+    assert!(!codec.contains("no codec for"));
+}
+
+/// Regression test for the `.default`-suffixed literal choice arm bug found while
+/// sweeping examples/build-integration/npm-project/api.csil: CSIL's grammar
+/// attaches a trailing control operator to the immediately preceding primary
+/// type, so the last arm of `text / "low" / "normal" / "high" .default "normal"`
+/// parses as `Constrained { base_type: Literal("high"), .. }`, not a bare
+/// `Literal`. Before `choice_arm_literal`, that arm fell out of the literal-enum
+/// classification entirely (dropping it into the general union path with no
+/// codec for its still-constrained payload) instead of becoming its own
+/// `High` constructor alongside the other literals.
+#[test]
+fn choice_literal_arm_survives_trailing_default() {
+    let choices = vec![
+        builtin("text"),
+        text_literal("low"),
+        text_literal("normal"),
+        CsilTypeExpression::Constrained {
+            base_type: Box::new(text_literal("high")),
+            constraints: vec![csilgen_common::CsilControlOperator::Default(
+                CsilLiteralValue::Text("normal".to_string()),
+            )],
+        },
+    ];
+    let decl = generate_type_choice("Priority", &choices);
+    assert_eq!(
+        decl,
+        "type priority = Low | Normal | High | Other of string"
+    );
+
+    let records = std::collections::HashSet::new();
+    let choice_set = std::collections::HashSet::new();
+    let aliases = std::collections::HashMap::new();
+    let (enc, dec) = emit_choice_codec("Priority", &choices, &records, &choice_set, &aliases);
+    assert!(!enc.contains("no codec for"));
+    assert!(!dec.contains("no codec for"));
+    assert!(enc.contains("High -> Cbor.Array [Cbor.int64 3L; Cbor.Text \"high\"]"));
+}
+
+/// A spec with an inline (unnamed) *mixed* choice field — a named-record arm plus
+/// a literal arm, so it has a non-literal member and must code as the tagged sum
+/// `[variant_index, value]`, matching the contract already proven for named
+/// choices by `mixed_union_encodes_tagged_sum_not_bare_text`.
+fn inline_mixed_choice_spec() -> CsilSpecSerialized {
+    let person = group_rule("Person", vec![bare_entry("name", builtin("text"))]);
+    let ticket = group_rule(
+        "Ticket",
+        vec![
+            bare_entry("id", builtin("text")),
+            optional_entry(
+                "assignee",
+                CsilTypeExpression::Choice(vec![
+                    CsilTypeExpression::Reference("Person".to_string()),
+                    text_literal("unassigned"),
+                ]),
+            ),
+        ],
+    );
+    CsilSpecSerialized {
+        rules: vec![person, ticket],
+        source_content: None,
+        service_count: 0,
+        fields_with_metadata_count: 0,
+    }
+}
+
+/// Compiles and round-trips an inline mixed-choice field's synthesized codec with
+/// dune, proving the actual wire bytes (tagged sum) rather than just the
+/// generated source text. Skips cleanly when dune is not on PATH.
+#[test]
+fn inline_choice_mixed_field_round_trips_through_dune() {
+    let have = std::process::Command::new("dune")
+        .arg("--version")
+        .output()
+        .is_ok();
+    if !have {
+        eprintln!("skipping: no dune on PATH");
+        return;
+    }
+    let spec = inline_mixed_choice_spec();
+    let cfg = GeneratorConfig {
+        target: "ocaml-client".into(),
+        output_dir: "/tmp".into(),
+        options: HashMap::new(),
+    };
+    let files = generate_ocaml(&spec, &cfg).unwrap();
+
+    let dir =
+        std::env::temp_dir().join(format!("csilgen-ocaml-inline-mixed-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    for f in &files {
+        std::fs::write(dir.join(&f.path), &f.content).unwrap();
+    }
+    std::fs::write(dir.join("dune-project"), "(lang dune 3.0)\n").unwrap();
+    std::fs::write(
+        dir.join("dune"),
+        "(executable (name test) (modules types csil_cbor codec test))\n",
+    )
+    .unwrap();
+    std::fs::write(dir.join("test.ml"), INLINE_MIXED_CHOICE_DRIVER_OCAML).unwrap();
+
+    let run = std::process::Command::new("dune")
+        .arg("exec")
+        .arg("--profile")
+        .arg("release")
+        .arg("--root")
+        .arg(&dir)
+        .arg("./test.exe")
+        .output()
+        .unwrap();
+    assert!(
+        run.status.success(),
+        "ocaml inline mixed-choice check failed:\n{}{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&run.stdout).trim(), "ok");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+const INLINE_MIXED_CHOICE_DRIVER_OCAML: &str = r#"let () =
+  let alice : Types.person = { name = "Alice" } in
+  let t1 : Types.ticket = { id = "T-1"; assignee = Some (Types.Person alice) } in
+  let t1_back = Codec.decode_ticket_bytes (Codec.encode_ticket_bytes t1) in
+  (match t1_back.assignee with
+   | Some (Types.Person p) -> assert (p.name = "Alice")
+   | _ -> failwith "expected Some (Person alice)");
+  let t2 : Types.ticket = { id = "T-2"; assignee = Some Types.Unassigned } in
+  let t2_back = Codec.decode_ticket_bytes (Codec.encode_ticket_bytes t2) in
+  assert (t2_back.assignee = Some Types.Unassigned);
+  let t3 : Types.ticket = { id = "T-3"; assignee = None } in
+  let t3_back = Codec.decode_ticket_bytes (Codec.encode_ticket_bytes t3) in
+  assert (t3_back.assignee = None);
+  (* wire proof: the tagged sum, not a bare literal or an opaque blob, since the
+     choice has a non-literal (Person) arm. *)
+  (match Codec.encode_ticket_assignee Types.Unassigned with
+   | Csil_cbor.Array [ Csil_cbor.Uint 1L; Csil_cbor.Text "unassigned" ] -> ()
+   | _ -> failwith "expected [1; \"unassigned\"]");
+  (match Codec.encode_ticket_assignee (Types.Person alice) with
+   | Csil_cbor.Array [ Csil_cbor.Uint 0L; Csil_cbor.Map _ ] -> ()
+   | _ -> failwith "expected [0; <person map>]");
+  print_string "ok\n"
+"#;
+
+/// A spec with an inline (unnamed) *all-literal* choice field — the closed
+/// literal-enum shape, so it must code as the bare CBOR literal (its own
+/// discriminant), never the tagged sum.
+fn inline_all_literal_choice_spec() -> CsilSpecSerialized {
+    let order = group_rule(
+        "Order",
+        vec![
+            bare_entry("id", builtin("text")),
+            bare_entry(
+                "status",
+                CsilTypeExpression::Choice(vec![
+                    text_literal("pending"),
+                    text_literal("shipped"),
+                    text_literal("delivered"),
+                ]),
+            ),
+        ],
+    );
+    CsilSpecSerialized {
+        rules: vec![order],
+        source_content: None,
+        service_count: 0,
+        fields_with_metadata_count: 0,
+    }
+}
+
+/// Compiles and round-trips an inline all-literal-choice field's synthesized
+/// codec with dune, proving the actual wire bytes (bare literal, not a tagged
+/// sum) rather than just the generated source text. Skips cleanly when dune is
+/// not on PATH.
+#[test]
+fn inline_choice_all_literal_field_round_trips_through_dune() {
+    let have = std::process::Command::new("dune")
+        .arg("--version")
+        .output()
+        .is_ok();
+    if !have {
+        eprintln!("skipping: no dune on PATH");
+        return;
+    }
+    let spec = inline_all_literal_choice_spec();
+    let cfg = GeneratorConfig {
+        target: "ocaml-client".into(),
+        output_dir: "/tmp".into(),
+        options: HashMap::new(),
+    };
+    let files = generate_ocaml(&spec, &cfg).unwrap();
+
+    let dir = std::env::temp_dir().join(format!(
+        "csilgen-ocaml-inline-literal-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    for f in &files {
+        std::fs::write(dir.join(&f.path), &f.content).unwrap();
+    }
+    std::fs::write(dir.join("dune-project"), "(lang dune 3.0)\n").unwrap();
+    std::fs::write(
+        dir.join("dune"),
+        "(executable (name test) (modules types csil_cbor codec test))\n",
+    )
+    .unwrap();
+    std::fs::write(dir.join("test.ml"), INLINE_ALL_LITERAL_CHOICE_DRIVER_OCAML).unwrap();
+
+    let run = std::process::Command::new("dune")
+        .arg("exec")
+        .arg("--profile")
+        .arg("release")
+        .arg("--root")
+        .arg(&dir)
+        .arg("./test.exe")
+        .output()
+        .unwrap();
+    assert!(
+        run.status.success(),
+        "ocaml inline all-literal-choice check failed:\n{}{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&run.stdout).trim(), "ok");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+const INLINE_ALL_LITERAL_CHOICE_DRIVER_OCAML: &str = r#"let () =
+  let o1 : Types.order = { id = "O-1"; status = Types.Pending } in
+  let o1_back = Codec.decode_order_bytes (Codec.encode_order_bytes o1) in
+  assert (o1_back.status = Types.Pending);
+  (* wire proof: an ALL-literal choice is the bare CBOR text, never a tagged
+     sum. *)
+  (match Codec.encode_order_status Types.Shipped with
+   | Csil_cbor.Text "shipped" -> ()
+   | _ -> failwith "expected bare CBOR text \"shipped\"");
+  assert (Codec.decode_order_status (Csil_cbor.Text "delivered") = Types.Delivered);
+  (* An unknown literal must be rejected, not silently accepted. *)
+  (try
+     let (_ : Types.order_status) = Codec.decode_order_status (Csil_cbor.Text "bogus") in
+     failwith "expected failure for unknown literal"
+   with Failure _ -> ());
+  print_string "ok\n"
+"#;
+
+// --- generalized hoisting: array/map/tuple positions, nested -----------------
+
+/// A "torture" spec exercising an inline choice (mixed, and OCaml's own
+/// all-literal-must-still-be-named case) in every container position — an array
+/// element, a map key, a map value, and a tuple slot — plus two shapes nested at
+/// least two levels deep: an array of arrays, and a group nested inside an array
+/// nested inside a field's own inline group. `csilgen_common::hoist_inline_composites`
+/// must reach every one of these, not just a direct record field.
+fn torture_spec() -> CsilSpecSerialized {
+    let widget = group_rule("Widget", vec![bare_entry("name", builtin("text"))]);
+    let mixed_choice = |literal: &str| {
+        CsilTypeExpression::Choice(vec![
+            CsilTypeExpression::Reference("Widget".to_string()),
+            text_literal(literal),
+        ])
+    };
+    let tuple_entry = |value_type: CsilTypeExpression| CsilGroupEntry {
+        key: None,
+        value_type,
+        occurrence: None,
+        metadata: vec![],
+        doc_comments: vec![],
+    };
+    let torture = group_rule(
+        "Torture",
+        vec![
+            // Array element: a mixed inline choice (tagged-sum shape).
+            bare_entry(
+                "tags",
+                CsilTypeExpression::Array {
+                    element_type: Box::new(mixed_choice("unassigned")),
+                    occurrence: None,
+                },
+            ),
+            // Array element: an all-literal inline choice — OCaml still hoists this
+            // (unlike TS/Java/C#/Kotlin) because a field/element type must be named;
+            // see hoist.rs's module doc.
+            bare_entry(
+                "codes",
+                CsilTypeExpression::Array {
+                    element_type: Box::new(CsilTypeExpression::Choice(vec![
+                        text_literal("red"),
+                        text_literal("green"),
+                        text_literal("blue"),
+                    ])),
+                    occurrence: None,
+                },
+            ),
+            // Map value: a mixed inline choice.
+            bare_entry(
+                "labels",
+                CsilTypeExpression::Map {
+                    key: Box::new(builtin("text")),
+                    value: Box::new(mixed_choice("missing")),
+                    occurrence: None,
+                },
+            ),
+            // Map key: an all-literal inline choice.
+            bare_entry(
+                "flags",
+                CsilTypeExpression::Map {
+                    key: Box::new(CsilTypeExpression::Choice(vec![
+                        text_literal("on"),
+                        text_literal("off"),
+                    ])),
+                    value: Box::new(builtin("bool")),
+                    occurrence: None,
+                },
+            ),
+            // Tuple slot: a mixed inline choice at index 1 (index 0 stays a plain int).
+            bare_entry(
+                "coord",
+                CsilTypeExpression::Tuple(CsilGroupExpression {
+                    entries: vec![
+                        tuple_entry(builtin("int")),
+                        tuple_entry(mixed_choice("origin")),
+                    ],
+                }),
+            ),
+            // Nested two levels: an array of arrays of a mixed inline choice.
+            bare_entry(
+                "matrix",
+                CsilTypeExpression::Array {
+                    element_type: Box::new(CsilTypeExpression::Array {
+                        element_type: Box::new(mixed_choice("empty_cell")),
+                        occurrence: None,
+                    }),
+                    occurrence: None,
+                },
+            ),
+            // Nested three levels: the field's own inline group, containing an array
+            // of an inline group, containing a mixed inline choice.
+            bare_entry(
+                "nested",
+                CsilTypeExpression::Group(CsilGroupExpression {
+                    entries: vec![bare_entry(
+                        "inner",
+                        CsilTypeExpression::Array {
+                            element_type: Box::new(CsilTypeExpression::Group(
+                                CsilGroupExpression {
+                                    entries: vec![bare_entry("deep", mixed_choice("leaf"))],
+                                },
+                            )),
+                            occurrence: None,
+                        },
+                    )],
+                }),
+            ),
+        ],
+    );
+    CsilSpecSerialized {
+        rules: vec![widget, torture],
+        source_content: None,
+        service_count: 0,
+        fields_with_metadata_count: 0,
+    }
+}
+
+/// Every container position (array element, map key, map value, tuple slot) — and
+/// every nesting depth among them, up to three levels for the field's own inline
+/// group — resolves to its own named rule with a full codec, matching the
+/// `<Owner>_<field>`/`_item`/`_key`/`_value`/`_<index>` naming
+/// `wasm/csilgen-typescript-generator/src/hoist.rs` establishes. No position falls
+/// through to the opaque `Csil_cbor.t` escape hatch or its `no codec for` stub.
+#[test]
+fn torture_spec_hoists_every_container_position_recursively() {
+    let spec = csilgen_common::hoist_inline_composites(
+        &torture_spec(),
+        csilgen_common::HoistOptions {
+            hoist_all_literal_choices: true,
+        },
+    );
+    let (types_ml, mli) = generate_types(&spec);
+    for name in [
+        "torture_tags_item",              // array element (mixed choice)
+        "torture_codes_item",             // array element (all-literal choice)
+        "torture_labels_value",           // map value (mixed choice)
+        "torture_flags_key",              // map key (all-literal choice)
+        "torture_coord_1",                // tuple slot (mixed choice)
+        "torture_matrix_item_item",       // array-of-array, 2 levels deep
+        "torture_nested",                 // the field's own inline group
+        "torture_nested_inner_item",      // array-of-group inside it, 2 levels deep
+        "torture_nested_inner_item_deep", // choice inside that group, 3 levels deep
+    ] {
+        assert!(
+            types_ml.contains(name),
+            "missing synthesized type `{name}`:\n{types_ml}"
+        );
+        assert!(mli.contains(name), "missing from .mli `{name}`:\n{mli}");
+    }
+    assert!(
+        !types_ml.contains("Csil_cbor.t"),
+        "an inline composite fell through to the opaque escape hatch:\n{types_ml}"
+    );
+
+    let codec = generate_codec(&spec).expect("codec emitted");
+    for f in [
+        "encode_torture_tags_item",
+        "decode_torture_tags_item",
+        "encode_torture_codes_item",
+        "decode_torture_codes_item",
+        "encode_torture_labels_value",
+        "decode_torture_labels_value",
+        "encode_torture_flags_key",
+        "decode_torture_flags_key",
+        "encode_torture_coord_1",
+        "decode_torture_coord_1",
+        "encode_torture_matrix_item_item",
+        "decode_torture_matrix_item_item",
+        "encode_torture_nested",
+        "decode_torture_nested",
+        "encode_torture_nested_inner_item",
+        "decode_torture_nested_inner_item",
+        "encode_torture_nested_inner_item_deep",
+        "decode_torture_nested_inner_item_deep",
+    ] {
+        assert!(codec.contains(f), "missing hoisted codec `{f}`:\n{codec}");
+    }
+    assert!(
+        !codec.contains("no codec for"),
+        "unsupported field shape:\n{codec}"
+    );
+
+    // The mixed choices code as the tagged sum (a record arm plus a literal arm);
+    // the all-literal ones (codes/flags) stay the closed bare-literal enum, exactly
+    // like a named choice — hoisting doesn't change which shape a choice gets.
+    assert!(codec.contains(
+        "match v with Widget csil_x -> Cbor.Array [Cbor.int64 0L; (encode_widget csil_x)] | Unassigned -> Cbor.Array [Cbor.int64 1L; Cbor.Text \"unassigned\"]"
+    ));
+    assert!(codec.contains("match v with Red -> Cbor.Text \"red\" | Green -> Cbor.Text \"green\" | Blue -> Cbor.Text \"blue\""));
+}
+
+/// Compiles and round-trips the torture spec's codec with dune, proving actual wire
+/// bytes for two of the generalized positions: an array-of-inline-choice element
+/// (`tags`) and a map-value inline choice (`labels`). Both assert the tagged-sum
+/// `[variant_index, value]` shape at the correct 0-based index, and that decode
+/// validates a literal arm's payload against its expected text rather than trusting
+/// the index alone (a corrupted payload at a literal arm's index must fail, not
+/// silently decode as that literal). Skips cleanly when dune is not on PATH.
+#[test]
+fn torture_array_and_map_positions_round_trip_through_dune() {
+    let have = std::process::Command::new("dune")
+        .arg("--version")
+        .output()
+        .is_ok();
+    if !have {
+        eprintln!("skipping: no dune on PATH");
+        return;
+    }
+    let spec = torture_spec();
+    let cfg = GeneratorConfig {
+        target: "ocaml-client".into(),
+        output_dir: "/tmp".into(),
+        options: HashMap::new(),
+    };
+    let files = generate_ocaml(&spec, &cfg).unwrap();
+
+    let dir = std::env::temp_dir().join(format!("csilgen-ocaml-torture-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    for f in &files {
+        std::fs::write(dir.join(&f.path), &f.content).unwrap();
+    }
+    std::fs::write(dir.join("dune-project"), "(lang dune 3.0)\n").unwrap();
+    std::fs::write(
+        dir.join("dune"),
+        "(executable (name test) (modules types csil_cbor codec test))\n",
+    )
+    .unwrap();
+    std::fs::write(dir.join("test.ml"), TORTURE_DRIVER_OCAML).unwrap();
+
+    let run = std::process::Command::new("dune")
+        .arg("exec")
+        .arg("--profile")
+        .arg("release")
+        .arg("--root")
+        .arg(&dir)
+        .arg("./test.exe")
+        .output()
+        .unwrap();
+    assert!(
+        run.status.success(),
+        "ocaml torture-spec check failed:\n{}{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&run.stdout).trim(), "ok");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+const TORTURE_DRIVER_OCAML: &str = r#"let () =
+  let widget : Types.widget = { name = "spinner" } in
+  let t : Types.torture = {
+    tags = [ Types.Widget widget; Types.Unassigned ];
+    codes = [ Types.Red; Types.Green; Types.Blue ];
+    labels = [ ("k1", Types.Widget widget); ("k2", Types.Missing) ];
+    flags = [ (Types.On, true); (Types.Off, false) ];
+    coord = (7L, Types.Widget widget);
+    matrix = [ [ Types.Widget widget; Types.Empty_cell ] ];
+    nested = { inner = [ { deep = Types.Widget widget }; { deep = Types.Leaf } ] };
+  } in
+  let t_back = Codec.decode_torture_bytes (Codec.encode_torture_bytes t) in
+  assert (t_back.tags = t.tags);
+  assert (t_back.codes = t.codes);
+  assert (t_back.labels = t.labels);
+  assert (t_back.flags = t.flags);
+  assert (t_back.coord = t.coord);
+  assert (t_back.matrix = t.matrix);
+  assert (t_back.nested = t.nested);
+
+  (* Array-of-inline-choice element (`tags`): wire proof of the tagged sum at its
+     declared 0-based index, for both the record arm and the literal arm. *)
+  (match Codec.encode_torture_tags_item Types.Unassigned with
+   | Csil_cbor.Array [ Csil_cbor.Uint 1L; Csil_cbor.Text "unassigned" ] -> ()
+   | _ -> failwith "expected [1; \"unassigned\"]");
+  (match Codec.encode_torture_tags_item (Types.Widget widget) with
+   | Csil_cbor.Array [ Csil_cbor.Uint 0L; Csil_cbor.Map _ ] -> ()
+   | _ -> failwith "expected [0; <widget map>]");
+  (* Literal validation: a payload that doesn't match the literal arm's own text at
+     its own index must be rejected, not silently accepted as that arm. *)
+  (try
+     let (_ : Types.torture_tags_item) =
+       Codec.decode_torture_tags_item
+         (Csil_cbor.Array [ Csil_cbor.Uint 1L; Csil_cbor.Text "wrong" ])
+     in
+     failwith "expected failure for a mismatched literal payload"
+   with Failure _ -> ());
+
+  (* Map-value inline choice (`labels`): the same tagged-sum + literal-validation
+     proof, one container position over. *)
+  (match Codec.encode_torture_labels_value Types.Missing with
+   | Csil_cbor.Array [ Csil_cbor.Uint 1L; Csil_cbor.Text "missing" ] -> ()
+   | _ -> failwith "expected [1; \"missing\"]");
+  (match Codec.encode_torture_labels_value (Types.Widget widget) with
+   | Csil_cbor.Array [ Csil_cbor.Uint 0L; Csil_cbor.Map _ ] -> ()
+   | _ -> failwith "expected [0; <widget map>]");
+  (try
+     let (_ : Types.torture_labels_value) =
+       Codec.decode_torture_labels_value
+         (Csil_cbor.Array [ Csil_cbor.Uint 1L; Csil_cbor.Text "wrong" ])
+     in
+     failwith "expected failure for a mismatched literal payload"
+   with Failure _ -> ());
+
+  print_string "ok\n"
+"#;
+
 // --- self-contained package mode --------------------------------------------
 
 /// A `GeneratorConfig` for `target` whose `emit_packages` option is the given JSON
@@ -904,7 +1669,7 @@ fn genquickstart_events_section_handshake_and_router_dispatch() {
     assert!(c.contains("Events.ping_name"));
     assert!(c.contains("Events.encode_heartbeat hb"));
     // Dispatch into the generated server router + one outbound event via the codec.
-    assert!(c.contains("Events.new_verbose_event (Some \"echo\") \"Watch\""));
+    assert!(c.contains("Events.new_verbose_event (Some \"Echo\") \"watch\""));
     assert!(c.contains("Codec.encode_pong_bytes value"));
     assert!(c.contains("Services.Echo.route handler ~op:name ~payload:ev.payload"));
     // The handler record decodes the inbound channel payload with the generated codec.
@@ -1251,3 +2016,143 @@ fn genquickstart_carriers_compile_against_lib() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// --- mixed-kind literal enum (the shared classify_choice migration fix) -----
+
+fn int_literal(value: i64) -> CsilTypeExpression {
+    CsilTypeExpression::Literal(CsilLiteralValue::Integer(value))
+}
+
+/// A spec with an inline choice mixing a text literal and an integer literal
+/// (`"a" / 1`). Per the shared `csilgen_common::classify_choice` contract this is
+/// STILL an all-literal `Enum` (ANY kind mix), not a `Union` — before this
+/// generator's migration to the shared classifier it required a uniform
+/// text-only or int-only vocabulary to recognize an enum at all, so a choice
+/// like this misclassified as a `Union` (a `[variant_index, value]` tagged sum)
+/// instead of the bare-literal wire every other all-literal choice gets.
+fn mixed_kind_literal_choice_spec() -> CsilSpecSerialized {
+    let record = group_rule(
+        "MixedEnumRecord",
+        vec![bare_entry(
+            "code",
+            CsilTypeExpression::Choice(vec![text_literal("a"), int_literal(1)]),
+        )],
+    );
+    CsilSpecSerialized {
+        rules: vec![record],
+        source_content: None,
+        service_count: 0,
+        fields_with_metadata_count: 0,
+    }
+}
+
+/// The generated `types.ml` declares a real OCaml variant (one nullary
+/// constructor per literal) for a mixed-kind enum, not a fallback to the opaque
+/// `Csil_cbor.t` a generic `Union` arm without a payload type would otherwise
+/// need.
+#[test]
+fn mixed_kind_literal_choice_emits_nullary_variant() {
+    let cfg = GeneratorConfig {
+        target: "ocaml-typesonly".into(),
+        output_dir: "/tmp".into(),
+        options: HashMap::new(),
+    };
+    let files = generate_ocaml(&mixed_kind_literal_choice_spec(), &cfg).unwrap();
+    let types_ml = &files.iter().find(|f| f.path == "types.ml").unwrap().content;
+    assert!(
+        types_ml.contains("mixed_enum_record_code = A | V_1"),
+        "expected a nullary-constructor variant for the mixed-kind choice:\n{types_ml}"
+    );
+    assert!(
+        !types_ml.contains("Csil_cbor.t"),
+        "a mixed-kind literal enum must be a real variant, not an opaque payload:\n{types_ml}"
+    );
+}
+
+/// Compiles and round-trips the mixed-kind enum's generated codec with dune,
+/// proving the actual wire bytes: a bare CBOR literal (never a tagged-sum array)
+/// for BOTH the text member and the integer member, and that decode rejects an
+/// unknown literal. Skips cleanly when dune is not on PATH.
+#[test]
+fn mixed_kind_literal_choice_round_trips_through_dune() {
+    let have = std::process::Command::new("dune")
+        .arg("--version")
+        .output()
+        .is_ok();
+    if !have {
+        eprintln!("skipping: no dune on PATH");
+        return;
+    }
+    let spec = mixed_kind_literal_choice_spec();
+    let cfg = GeneratorConfig {
+        target: "ocaml-client".into(),
+        output_dir: "/tmp".into(),
+        options: HashMap::new(),
+    };
+    let files = generate_ocaml(&spec, &cfg).unwrap();
+
+    let dir = std::env::temp_dir().join(format!("csilgen-ocaml-mixedenum-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    for f in &files {
+        std::fs::write(dir.join(&f.path), &f.content).unwrap();
+    }
+    std::fs::write(dir.join("dune-project"), "(lang dune 3.0)\n").unwrap();
+    std::fs::write(
+        dir.join("dune"),
+        "(executable (name test) (modules types csil_cbor codec test))\n",
+    )
+    .unwrap();
+    std::fs::write(dir.join("test.ml"), MIXED_KIND_LITERAL_CHOICE_DRIVER_OCAML).unwrap();
+
+    let run = std::process::Command::new("dune")
+        .arg("exec")
+        .arg("--profile")
+        .arg("release")
+        .arg("--root")
+        .arg(&dir)
+        .arg("./test.exe")
+        .output()
+        .unwrap();
+    assert!(
+        run.status.success(),
+        "ocaml mixed-kind literal choice check failed:\n{}{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&run.stdout).trim(), "ok");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+const MIXED_KIND_LITERAL_CHOICE_DRIVER_OCAML: &str = r#"let () =
+  (* Both kinds round-trip through the full record codec. *)
+  let text_rec : Types.mixed_enum_record = { code = Types.A } in
+  let text_back = Codec.decode_mixed_enum_record_bytes (Codec.encode_mixed_enum_record_bytes text_rec) in
+  assert (text_back.code = Types.A);
+  let int_rec : Types.mixed_enum_record = { code = Types.V_1 } in
+  let int_back = Codec.decode_mixed_enum_record_bytes (Codec.encode_mixed_enum_record_bytes int_rec) in
+  assert (int_back.code = Types.V_1);
+  (* Wire proof: a mixed-kind ALL-literal choice is still the bare CBOR literal,
+     never a tagged-sum array — the same enum contract every all-literal choice
+     gets, regardless of the mix of literal kinds. *)
+  (match Codec.encode_mixed_enum_record_code Types.A with
+   | Csil_cbor.Text "a" -> ()
+   | _ -> failwith "expected bare CBOR text \"a\"");
+  (match Codec.encode_mixed_enum_record_code Types.V_1 with
+   | Csil_cbor.Uint 1L -> ()
+   | _ -> failwith "expected bare CBOR uint 1");
+  (* An unknown literal (right general CBOR shape, wrong value) must be rejected. *)
+  (try
+     let (_ : Types.mixed_enum_record_code) =
+       Codec.decode_mixed_enum_record_code (Csil_cbor.Text "z")
+     in
+     failwith "expected failure for unknown text literal"
+   with Failure _ -> ());
+  (try
+     let (_ : Types.mixed_enum_record_code) =
+       Codec.decode_mixed_enum_record_code (Csil_cbor.Uint 99L)
+     in
+     failwith "expected failure for unknown int literal"
+   with Failure _ -> ());
+  print_string "ok\n"
+"#;

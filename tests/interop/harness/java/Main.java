@@ -44,15 +44,20 @@ import csilgen.generated.IdOrName;
 import csilgen.generated.Interop;
 import csilgen.generated.InteropClient;
 import csilgen.generated.InteropRouter;
+import csilgen.generated.Level;
+import csilgen.generated.MixedStatus;
 import csilgen.generated.Nested;
 import csilgen.generated.Priority;
 import csilgen.generated.Scalars;
+import csilgen.generated.ScalarsNote;
+import csilgen.generated.Season;
 import csilgen.generated.ServiceError;
+import csilgen.generated.ShipMode;
 import csilgen.generated.Tick;
 import csilgen.generated.Transport;
 
 public final class Main {
-    private static final String SERVICE = "interop";
+    private static final String SERVICE = "Interop";
     private static final long TICKS = 3;
 
     private static final long OP_ECHO_SCALARS = 0;
@@ -68,10 +73,26 @@ public final class Main {
     }
 
     private static Scalars scalarsOk() {
+        // mixed-union coverage: a value equal to a literal arm must wire as
+        // [1,"pending"]; a value with no literal match must wire as [0,...].
         return new Scalars(
             -42L, 42L, -7L, 3.5, "héllo 世界",
             new byte[] {0x01, 0x02, (byte) 0xf0, (byte) 0xff},
-            true, ts(), new BigDecimal("123.45"));
+            true, ts(), new BigDecimal("123.45"),
+            new MixedStatus("pending"), new MixedStatus("unlisted"),
+            // inline mixed choice (hoisted; literal arm match).
+            new ScalarsNote("info"),
+            // inline all-literal choice (not hoisted).
+            "medium",
+            // named enum with a trailing `.default`-constrained last arm.
+            new Level("high"),
+            // named enum assembled via base rule + `/=` extension.
+            new Season("autumn"),
+            // named all-literal enum with mixed literal kinds (text + int arms);
+            // still gets a wrapper record for a NAMED reference (unlike Java's
+            // un-hoisted inline choices, which render bare with no wrapper).
+            new ShipMode("ground"),
+            new ShipMode(2L));
     }
 
     private static Collections collectionsOk() {
@@ -299,23 +320,23 @@ public final class Main {
         return req -> {
             try {
                 switch (req.op()) {
-                    case "EchoScalars" -> {
+                    case "echo-scalars" -> {
                         Scalars v = CsilCbor.decodeScalars(req.payload());
                         return Rpc.HandlerOutcome.reply(
                             "Scalars", CsilCbor.encodeScalars(handlers.echoScalars(v)));
                     }
-                    case "EchoCollections" -> {
+                    case "echo-collections" -> {
                         Collections v = CsilCbor.decodeCollections(req.payload());
                         return Rpc.HandlerOutcome.reply(
                             "Collections", CsilCbor.encodeCollections(handlers.echoCollections(v)));
                     }
-                    case "EchoNested" -> {
+                    case "echo-nested" -> {
                         Nested v = CsilCbor.decodeNested(req.payload());
                         return Rpc.HandlerOutcome.reply(
                             "EchoNestedResult",
                             CsilCbor.encodeEchoNestedResult(handlers.echoNested(v)));
                     }
-                    case "ValidateConstrained" -> {
+                    case "validate-constrained" -> {
                         try {
                             // decodeConstrained runs the canonical constructor's validation.
                             Constrained v = CsilCbor.decodeConstrained(req.payload());
@@ -391,7 +412,7 @@ public final class Main {
         }
         // The invalid input must surface as a service error, not a transport error.
         try {
-            transport.call(SERVICE, "ValidateConstrained", constrainedBadBytes());
+            transport.call(SERVICE, "validate-constrained", constrainedBadBytes());
             cases.fail("validate-constrained/failure", "server accepted invalid input");
         } catch (ServiceErrorException e) {
             cases.pass("validate-constrained/failure");
@@ -456,7 +477,7 @@ public final class Main {
                 sendEvent(carrier, Events.Event.verbose(null, Events.PONG_NAME, ev.payload()));
             } else if (method.equals(Events.CLOSE_NAME)) {
                 break;
-            } else if (method.equals("Duplex")) {
+            } else if (method.equals("duplex")) {
                 Scalars s = CsilCbor.decodeScalars(ev.payload());
                 handlers.duplex(s);
                 var em = InteropRouter.encodeInteropDuplex(codec, s);
@@ -497,9 +518,9 @@ public final class Main {
                 break;
             }
             Events.Event ev = Events.Event.decode(f, Events.Profile.VERBOSE);
-            if (!"OnTick".equals(ev.event())) {
+            if (!"on-tick".equals(ev.event())) {
                 tickOk = false;
-                detail = "expected OnTick got " + ev.event();
+                detail = "expected on-tick got " + ev.event();
                 break;
             }
             Tick t = CsilCbor.decodeTick(ev.payload());
@@ -519,7 +540,7 @@ public final class Main {
             cases.fail("duplex/success", "no echo");
         } else {
             Events.Event ev = Events.Event.decode(df, Events.Profile.VERBOSE);
-            if ("Duplex".equals(ev.event())) {
+            if ("duplex".equals(ev.event())) {
                 Scalars s = CsilCbor.decodeScalars(ev.payload());
                 cases.check("duplex/success", s.equals(scalarsOk()), "echo mismatch");
             } else {

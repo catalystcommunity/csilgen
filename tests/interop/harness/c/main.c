@@ -28,7 +28,7 @@
 #include "gen/codec.gen.h"
 #include "gen/validation.gen.h"
 
-#define SERVICE "interop"
+#define SERVICE "Interop"
 
 /* --------------------------------------------------------------------------
  * Fixed language-neutral test vectors (see tests/interop/README.md).
@@ -51,6 +51,27 @@ static Scalars scalars_ok(void) {
     s.when.epoch_seconds = 0;
     s.amount.exponent = -2; /* 123.45 = 12345 * 10^-2 */
     s.amount.mantissa = 12345;
+    /* mixed-union coverage: a value equal to a literal arm must wire as
+     * [1,"pending"]; a value with no literal match must wire as [0,...]. */
+    s.status_literal.tag = MIXED_STATUS_CHOICE1;
+    s.status_literal.u.choice1 = "pending";
+    s.status_free.tag = MIXED_STATUS_TEXT;
+    s.status_free.u.text = "unlisted";
+    /* inline mixed choice (hoisted; literal arm match). */
+    s.note.tag = SCALARS_NOTE_CHOICE1;
+    s.note.u.choice1 = "info";
+    /* inline all-literal choice (hoisted to a plain enum). */
+    s.size = SCALARS_SIZE_MEDIUM;
+    /* named enum with a trailing `.default`-constrained last arm. */
+    s.level = LEVEL_HIGH;
+    /* named enum assembled via base rule + `/=` extension. */
+    s.season = SEASON_AUTUMN;
+    /* named all-literal enum with mixed literal kinds (text + int arms);
+     * renders as a tagged struct (no single C type spans both kinds). */
+    s.ship_text.tag = SHIP_MODE_GROUND;
+    s.ship_text.u.ground = "ground";
+    s.ship_int.tag = SHIP_MODE_2;
+    s.ship_int.u.v2 = 2;
     return s;
 }
 
@@ -142,6 +163,37 @@ static bool streq(const char *a, const char *b) {
     return strcmp(a, b) == 0;
 }
 
+static bool mixed_status_eq(const MixedStatus *a, const MixedStatus *b) {
+    if (a->tag != b->tag) return false;
+    switch (a->tag) {
+        case MIXED_STATUS_TEXT: return streq(a->u.text, b->u.text);
+        case MIXED_STATUS_CHOICE1: return streq(a->u.choice1, b->u.choice1);
+        case MIXED_STATUS_CHOICE2: return streq(a->u.choice2, b->u.choice2);
+        case MIXED_STATUS_CHOICE3: return streq(a->u.choice3, b->u.choice3);
+    }
+    return false;
+}
+
+static bool scalars_note_eq(const Scalars_note *a, const Scalars_note *b) {
+    if (a->tag != b->tag) return false;
+    switch (a->tag) {
+        case SCALARS_NOTE_TEXT: return streq(a->u.text, b->u.text);
+        case SCALARS_NOTE_CHOICE1: return streq(a->u.choice1, b->u.choice1);
+        case SCALARS_NOTE_CHOICE2: return streq(a->u.choice2, b->u.choice2);
+    }
+    return false;
+}
+
+static bool ship_mode_eq(const ShipMode *a, const ShipMode *b) {
+    if (a->tag != b->tag) return false;
+    switch (a->tag) {
+        case SHIP_MODE_GROUND: return streq(a->u.ground, b->u.ground);
+        case SHIP_MODE_2: return a->u.v2 == b->u.v2;
+        case SHIP_MODE_AIR: return streq(a->u.air, b->u.air);
+    }
+    return false;
+}
+
 static bool scalars_eq(const Scalars *a, const Scalars *b) {
     if (a->i != b->i || a->u != b->u || a->n != b->n) return false;
     if (a->f != b->f) return false;
@@ -152,6 +204,14 @@ static bool scalars_eq(const Scalars *a, const Scalars *b) {
     if (!streq(a->when.rfc3339, b->when.rfc3339)) return false;
     if (a->amount.exponent != b->amount.exponent || a->amount.mantissa != b->amount.mantissa)
         return false;
+    if (!mixed_status_eq(&a->status_literal, &b->status_literal)) return false;
+    if (!mixed_status_eq(&a->status_free, &b->status_free)) return false;
+    if (!scalars_note_eq(&a->note, &b->note)) return false;
+    if (a->size != b->size) return false;
+    if (a->level != b->level) return false;
+    if (a->season != b->season) return false;
+    if (!ship_mode_eq(&a->ship_text, &b->ship_text)) return false;
+    if (!ship_mode_eq(&a->ship_int, &b->ship_int)) return false;
     return true;
 }
 
@@ -337,7 +397,7 @@ static void rpc_handler(void *vctx, const csil_rpc_request *req, csil_rpc_outcom
     size_t pn = 0;
     CsilCodecArena *own = NULL;
 
-    if (strcmp(req->op, "EchoScalars") == 0) {
+    if (strcmp(req->op, "echo-scalars") == 0) {
         Scalars s;
         if (csil_decode_Scalars(req->payload, req->payload_len, &s, &own)) {
             csil_rpc_outcome_transport(
@@ -353,7 +413,7 @@ static void rpc_handler(void *vctx, const csil_rpc_request *req, csil_rpc_outcom
         }
         ctx->pending = pb;
         csil_rpc_outcome_reply(out, "Scalars", pb, pn);
-    } else if (strcmp(req->op, "EchoCollections") == 0) {
+    } else if (strcmp(req->op, "echo-collections") == 0) {
         Collections v;
         if (csil_decode_Collections(req->payload, req->payload_len, &v, &own)) {
             csil_rpc_outcome_transport(
@@ -369,7 +429,7 @@ static void rpc_handler(void *vctx, const csil_rpc_request *req, csil_rpc_outcom
         }
         ctx->pending = pb;
         csil_rpc_outcome_reply(out, "Collections", pb, pn);
-    } else if (strcmp(req->op, "EchoNested") == 0) {
+    } else if (strcmp(req->op, "echo-nested") == 0) {
         Nested v;
         if (csil_decode_Nested(req->payload, req->payload_len, &v, &own)) {
             csil_rpc_outcome_transport(
@@ -388,7 +448,7 @@ static void rpc_handler(void *vctx, const csil_rpc_request *req, csil_rpc_outcom
         }
         ctx->pending = pb;
         csil_rpc_outcome_reply(out, "EchoNestedResult", pb, pn);
-    } else if (strcmp(req->op, "ValidateConstrained") == 0) {
+    } else if (strcmp(req->op, "validate-constrained") == 0) {
         Constrained v;
         if (csil_decode_Constrained(req->payload, req->payload_len, &v, &own)) {
             csil_rpc_outcome_transport(
@@ -461,7 +521,7 @@ static void rpc_client_run(int fd, Cases *cases) {
         csil_rpc_response resp;
         if (csil_encode_Scalars(&want, &rb, &rn)) {
             cases_add(cases, "echo-scalars/success", false, "encode");
-        } else if (rpc_call(cl, "EchoScalars", rb, rn, &resp)) {
+        } else if (rpc_call(cl, "echo-scalars", rb, rn, &resp)) {
             free(rb);
             cases_add(cases, "echo-scalars/success", false, "carrier");
         } else {
@@ -488,7 +548,7 @@ static void rpc_client_run(int fd, Cases *cases) {
         csil_rpc_response resp;
         if (csil_encode_Collections(&want, &rb, &rn)) {
             cases_add(cases, "echo-collections/success", false, "encode");
-        } else if (rpc_call(cl, "EchoCollections", rb, rn, &resp)) {
+        } else if (rpc_call(cl, "echo-collections", rb, rn, &resp)) {
             free(rb);
             cases_add(cases, "echo-collections/success", false, "carrier");
         } else {
@@ -516,7 +576,7 @@ static void rpc_client_run(int fd, Cases *cases) {
         csil_rpc_response resp;
         if (csil_encode_Nested(&want, &rb, &rn)) {
             cases_add(cases, "echo-nested/success", false, "encode");
-        } else if (rpc_call(cl, "EchoNested", rb, rn, &resp)) {
+        } else if (rpc_call(cl, "echo-nested", rb, rn, &resp)) {
             free(rb);
             cases_add(cases, "echo-nested/success", false, "carrier");
         } else {
@@ -544,7 +604,7 @@ static void rpc_client_run(int fd, Cases *cases) {
         csil_rpc_response resp;
         if (csil_encode_Constrained(&want, &rb, &rn)) {
             cases_add(cases, "validate-constrained/success", false, "encode");
-        } else if (rpc_call(cl, "ValidateConstrained", rb, rn, &resp)) {
+        } else if (rpc_call(cl, "validate-constrained", rb, rn, &resp)) {
             free(rb);
             cases_add(cases, "validate-constrained/success", false, "carrier");
         } else {
@@ -577,7 +637,7 @@ static void rpc_client_run(int fd, Cases *cases) {
         csil_rpc_response resp;
         if (csil_encode_Constrained(&bad, &rb, &rn)) {
             cases_add(cases, "validate-constrained/failure", false, "encode");
-        } else if (rpc_call(cl, "ValidateConstrained", rb, rn, &resp)) {
+        } else if (rpc_call(cl, "validate-constrained", rb, rn, &resp)) {
             free(rb);
             cases_add(cases, "validate-constrained/failure", false, "carrier");
         } else {
@@ -660,7 +720,7 @@ static void events_serve_conn(int fd) {
         uint8_t *tb = NULL;
         size_t tn = 0;
         if (csil_encode_Tick(&t, &tb, &tn) == 0) {
-            send_event(&car, SERVICE, "OnTick", tb, tn);
+            send_event(&car, SERVICE, "on-tick", tb, tn);
             free(tb);
         }
     }
@@ -674,14 +734,14 @@ static void events_serve_conn(int fd) {
         } else if (strcmp(method, CSIL_CLOSE_NAME) == 0) {
             csil_event_free(&ev);
             break;
-        } else if (strcmp(method, "Duplex") == 0) {
+        } else if (strcmp(method, "duplex") == 0) {
             Scalars s;
             CsilCodecArena *own = NULL;
             if (csil_decode_Scalars(ev.payload, ev.payload_len, &s, &own) == 0) {
                 uint8_t *eb = NULL;
                 size_t en = 0;
                 if (csil_encode_Scalars(&s, &eb, &en) == 0) {
-                    send_event(&car, SERVICE, "Duplex", eb, en);
+                    send_event(&car, SERVICE, "duplex", eb, en);
                     free(eb);
                 }
                 csil_codec_arena_free(own);
@@ -723,9 +783,9 @@ static void events_client_run(int fd, Cases *cases) {
             snprintf(detail, sizeof(detail), "stream closed during ticks");
             break;
         }
-        if (!ev.event || strcmp(ev.event, "OnTick") != 0) {
+        if (!ev.event || strcmp(ev.event, "on-tick") != 0) {
             tick_ok = false;
-            snprintf(detail, sizeof(detail), "expected OnTick");
+            snprintf(detail, sizeof(detail), "expected on-tick");
             csil_event_free(&ev);
             break;
         }
@@ -753,11 +813,11 @@ static void events_client_run(int fd, Cases *cases) {
         uint8_t *eb = NULL;
         size_t en = 0;
         if (csil_encode_Scalars(&want, &eb, &en) == 0) {
-            send_event(&car, SERVICE, "Duplex", eb, en);
+            send_event(&car, SERVICE, "duplex", eb, en);
             free(eb);
         }
         if (recv_event(&car, &ev)) {
-            if (ev.event && strcmp(ev.event, "Duplex") == 0) {
+            if (ev.event && strcmp(ev.event, "duplex") == 0) {
                 Scalars got;
                 CsilCodecArena *own = NULL;
                 if (csil_decode_Scalars(ev.payload, ev.payload_len, &got, &own)) {

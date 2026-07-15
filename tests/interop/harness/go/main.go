@@ -21,7 +21,7 @@ import (
 	"interopapi"
 )
 
-const service = "interop"
+const service = "Interop"
 
 // ---------------------------------------------------------------------------
 // Codec adapter — bridges the generated per-type Encode/Decode functions onto
@@ -111,6 +111,23 @@ func scalarsOK() interopapi.Scalars {
 		Flag:   true,
 		When:   ts(),
 		Amount: mustDecimal("123.45"),
+		// mixed-union coverage: a value equal to a literal arm must wire as
+		// [1,"pending"]; a value with no literal match must wire as [0,...].
+		StatusLiteral: "pending",
+		StatusFree:    "unlisted",
+		// inline mixed choice (hoisted; Note is interface{} like MixedStatus above).
+		Note: "info",
+		// inline all-literal choice (not hoisted; plain string).
+		Size: "medium",
+		// named enum with a trailing `.default`-constrained last arm.
+		Level: "high",
+		// named enum assembled via base rule + `/=` extension.
+		Season: "autumn",
+		// named all-literal enum with mixed literal kinds (text + int arms);
+		// ShipMode has no uniform Go type so it's `interface{}`, holding the
+		// bare literal directly.
+		ShipText: "ground",
+		ShipInt:  int64(2),
 	}
 }
 
@@ -310,7 +327,7 @@ func rpcServer(ln net.Listener) {
 		dispatch := func(req *transport.RpcRequest) transport.HandlerOutcome {
 			ctx := context.Background()
 			switch req.Op {
-			case "EchoScalars":
+			case "echo-scalars":
 				v, derr := interopapi.DecodeScalars(req.Payload)
 				if derr != nil {
 					return transport.Transport(transport.StatusMalformedEnvelope, derr.Error())
@@ -320,7 +337,7 @@ func rpcServer(ln net.Listener) {
 					return transport.Transport(transport.StatusInternal, herr.Error())
 				}
 				return transport.Reply("Scalars", interopapi.EncodeScalars(r))
-			case "EchoCollections":
+			case "echo-collections":
 				v, derr := interopapi.DecodeCollections(req.Payload)
 				if derr != nil {
 					return transport.Transport(transport.StatusMalformedEnvelope, derr.Error())
@@ -330,7 +347,7 @@ func rpcServer(ln net.Listener) {
 					return transport.Transport(transport.StatusInternal, herr.Error())
 				}
 				return transport.Reply("Collections", interopapi.EncodeCollections(r))
-			case "EchoNested":
+			case "echo-nested":
 				v, derr := interopapi.DecodeNested(req.Payload)
 				if derr != nil {
 					return transport.Transport(transport.StatusMalformedEnvelope, derr.Error())
@@ -340,7 +357,7 @@ func rpcServer(ln net.Listener) {
 					return transport.Transport(transport.StatusInternal, herr.Error())
 				}
 				return transport.Reply("EchoNestedResult", interopapi.EncodeEchoNestedResult(r))
-			case "ValidateConstrained":
+			case "validate-constrained":
 				v, derr := interopapi.DecodeConstrained(req.Payload)
 				if derr != nil {
 					return transport.Transport(transport.StatusMalformedEnvelope, derr.Error())
@@ -476,7 +493,7 @@ func eventsServer(ln net.Listener) {
 				sendEvent(carrier, verboseEvent(nil, transport.PongName, ev.Payload))
 			case transport.CloseName:
 				goto nextConn
-			case "Duplex":
+			case "duplex":
 				if s, derr := interopapi.DecodeScalars(ev.Payload); derr == nil {
 					_ = h.Duplex(ctx, s)
 					m, b, eerr := interopapi.EncodeInteropDuplex(codec, s)
@@ -533,9 +550,9 @@ func eventsClient(conn net.Conn) *cases {
 			detail = "decode: " + derr.Error()
 			break
 		}
-		if ev.Event == nil || *ev.Event != "OnTick" {
+		if ev.Event == nil || *ev.Event != "on-tick" {
 			tickOK = false
-			detail = fmt.Sprintf("expected OnTick got %v", ev.Event)
+			detail = fmt.Sprintf("expected on-tick got %v", ev.Event)
 			break
 		}
 		t, terr := interopapi.DecodeTick(ev.Payload)
@@ -556,7 +573,7 @@ func eventsClient(conn net.Conn) *cases {
 	m, b, _ := interopapi.EncodeInteropDuplex(codec, scalarsOK())
 	sendEvent(carrier, verboseEvent(&svc, m, b))
 	if f, err := carrier.RecvFrame(); err == nil && f != nil {
-		if ev, derr := transport.DecodeEvent(f, transport.ProfileVerbose); derr == nil && ev.Event != nil && *ev.Event == "Duplex" {
+		if ev, derr := transport.DecodeEvent(f, transport.ProfileVerbose); derr == nil && ev.Event != nil && *ev.Event == "duplex" {
 			if s, serr := interopapi.DecodeScalars(ev.Payload); serr != nil {
 				c.fail("duplex/success", serr.Error())
 			} else {

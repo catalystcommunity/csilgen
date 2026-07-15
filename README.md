@@ -11,7 +11,7 @@ Flow is similar to protocgen for protobufs.
 
 ## Current Status
 
-The core architecture is in place and the CLI is functional end-to-end: parsing, validation, formatting, linting, breaking-change detection, and code generation for Rust, Go, TypeScript, Python, JSON Schema, and OpenAPI all work today. See the [detailed Implementation Status](#implementation-status) below for what's polished vs. what's still on the roadmap.
+The core architecture is in place and the CLI is functional end-to-end: parsing, validation, formatting, linting, breaking-change detection, and code generation all work today for 18 targets — `c`, `csharp`, `dart`, `elixir`, `go`, `java`, `json`, `kotlin`, `noop`, `ocaml`, `openapi`, `php`, `python`, `ruby`, `rust`, `swift`, `typescript`, `zig` (run `csilgen generate --target <bogus>` for this list straight from the CLI). See the [detailed Implementation Status](#implementation-status) below for what's polished vs. what's still on the roadmap.
 
 ## Current Usage
 
@@ -36,6 +36,9 @@ cargo run -p csilgen -- generate --input your-file.csil --target typescript-clie
 cargo run -p csilgen -- generate --input your-file.csil --target python --output ./generated/
 cargo run -p csilgen -- generate --input your-file.csil --target openapi --output ./generated/
 cargo run -p csilgen -- generate --input your-file.csil --target php --output ./generated/
+# java, csharp, c, swift, kotlin, zig, ocaml, elixir, ruby, and dart are also
+# available targets — see the full list in "Current Status" above
+cargo run -p csilgen -- generate --input your-file.csil --target java --output ./generated/
 
 # Or install and use the CLI directly
 cargo install --path crates/csilgen-cli
@@ -109,9 +112,9 @@ composes with the control operators above; both are honored by every generator.
 - **Validator**: Constraint checking, dependency analysis, breaking-change detection.
 - **CLI tools**: `validate`, `generate`, `format`, `lint`, `breaking`.
 - **Plugin runtime**: Dynamic generator discovery from `~/.csilgen/generators/`, `./.generators/`, and `target/wasm32-unknown-unknown/release/` — first-write-wins precedence. Generators are conforming `csilgen_<target>_generator.wasm` cdylibs; no CLI map to edit.
-- **Generators**: Rust, Go, TypeScript, Python, PHP (each with `-typesonly` / `-client` / `-server` sub-targets, e.g. `rust-client`, `go-typesonly`, `php-client`), plus JSON Schema and OpenAPI. Service directions `->`, `<->`, `<-` all emit consistently (handler + router + outbound encoders).
-- **Constraints & tagged types**: the full RFC 8610 control-operator set and the `@`-annotation constraints are honored across all six generators; the `timestamp` (tag 0) and `decimal` (tag 4) core types emit per the CBOR wire contract.
-- **Testing**: 605 tests across the workspace.
+- **Generators**: Rust, Go, TypeScript, Python, PHP (each with `-typesonly` / `-client` / `-server` sub-targets, e.g. `rust-client`, `go-typesonly`, `php-client`), Java, C#, C, Swift, Kotlin, Zig, OCaml, Elixir, Ruby, Dart, plus JSON Schema and OpenAPI — 18 targets total (`noop` included, a test fixture). Service directions `->`, `<->`, `<-` all emit consistently (handler + router + outbound encoders).
+- **Constraints & tagged types**: the full RFC 8610 control-operator set and the `@`-annotation constraints are honored across every generator; the `timestamp` (tag 0) and `decimal` (tag 4) core types emit per the CBOR wire contract.
+- **Testing**: 1,481 tests across the workspace.
 
 ### 🔄 Deferred / partial
 - **Base-encoding and text-processing operators** (`.b64u`, `.hex`, `.printf`, `.join`, …) — not yet parsed; everything else in RFC 8610's control-operator set is supported.
@@ -133,7 +136,7 @@ This is a Rust workspace containing multiple crates:
 - **Runtime (`wasm/`)**:
   - **csilgen-wasm-core**: Core types/helpers compiled to wasm
   - **csilgen-wasm-generators**: Discovery + execution runtime
-- **Generators (`wasm/csilgen-<target>-generator/`)**: each is a single `cdylib` crate that produces `csilgen_<target>_generator.wasm`. Targets: `rust`, `go`, `typescript`, `python`, `php` (each also accepting `-typesonly` / `-client` / `-server` sub-targets, e.g. `php-client`), `json`, `openapi`, plus the `noop` test fixture. There is no parallel library copy — the wasm crate is the single source of truth for each generator.
+- **Generators (`wasm/csilgen-<target>-generator/`)**: each is a single `cdylib` crate that produces `csilgen_<target>_generator.wasm`. Targets: `rust`, `go`, `typescript`, `python`, `php` (each also accepting `-typesonly` / `-client` / `-server` sub-targets, e.g. `php-client`), `java`, `csharp`, `c`, `swift`, `kotlin`, `zig`, `ocaml`, `elixir`, `ruby`, `dart`, `json`, `openapi`, plus the `noop` test fixture. There is no parallel library copy — the wasm crate is the single source of truth for each generator.
 - **Development tools**: `tools/xtask` build automation.
 
 Generators are discovered dynamically, **first-write-wins**, scanning in this priority order: `target/wasm32-unknown-unknown/release` (local dev builds) → `./.generators` (project-local pin/override) → `~/.csilgen/generators/` (user-installed baseline). Files matching `csilgen_<target>_generator.wasm` are registered; everything else is ignored. A project can drop a wasm into `.generators/` to override the user's installed copy without touching the homedir. To ship a third-party generator, build a `cdylib` of the same shape and place it in any of those directories — `--target <yourname>` resolves automatically.
@@ -290,7 +293,7 @@ See `examples/multi-file/` for concrete examples of these patterns.
 
 ## Custom Generator Development
 
-csilgen supports custom code generators via WASM modules. Every generator — including the built-in ones — is a `cdylib` crate that follows exactly one naming convention; nothing in the CLI is hardcoded.
+csilgen supports custom code generators via WASM modules. Every generator — including the built-in ones — is a `cdylib` crate that follows exactly one naming convention; nothing in the CLI is hardcoded. See [`docs/generator-plugin-contract.md`](docs/generator-plugin-contract.md) for the normative plugin interface (WASM ABI, JSON boundary shapes, discovery, and conformance tiers).
 
 ### How discovery works
 
@@ -342,4 +345,4 @@ Files that match **`csilgen_<target>_generator.wasm`** are registered as generat
 
 ### Existing generators
 
-See any of `wasm/csilgen-{rust,go,typescript,json,python,php,openapi}-generator/` for working examples.
+See any of `wasm/csilgen-*-generator/` for working examples — every real target (`rust`, `go`, `typescript`, `python`, `php`, `java`, `csharp`, `c`, `swift`, `kotlin`, `zig`, `ocaml`, `elixir`, `ruby`, `dart`, `json`, `openapi`) follows the same shape.
