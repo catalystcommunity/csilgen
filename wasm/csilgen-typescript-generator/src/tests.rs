@@ -210,6 +210,49 @@ fn file<'a>(files: &'a [GeneratedFile], path: &str) -> &'a str {
         .unwrap_or_else(|| panic!("missing file {path}"))
 }
 
+/// An optional `bytes` field carries three distinct states — absent, present-and-empty,
+/// present-and-non-empty — and the codec must decide presence by whether the value is
+/// set, never by whether it is non-empty (cbor-wire-contract.md "Optional fields"). A
+/// truthy `if (v.payload)` would treat a zero-length `Uint8Array` as absent and silently
+/// lose a caller's "replace this with nothing".
+#[test]
+fn optional_bytes_encodes_on_presence_not_emptiness() {
+    let mut input = input_for("typescript-typesonly");
+    input.csil_spec = spec_of(vec![group_rule(
+        "UpdateRequest",
+        vec![
+            field("id", builtin("text"), false),
+            field("payload", builtin("bytes"), true),
+        ],
+        vec![],
+    )]);
+    let files = generate_files(&input).expect("generate");
+    let types = file(&files, "types.gen.ts");
+    let codec = file(&files, "codec.gen.ts");
+
+    // The `?` marker distinguishes undefined (absent) from an empty Uint8Array
+    // (present-and-empty).
+    assert!(
+        types.contains("payload?: Uint8Array;"),
+        "optional bytes needs a presence-carrying type:\n{types}"
+    );
+    // Encode gates on `!== undefined`, never on truthiness.
+    assert!(
+        codec.contains("if (v.payload !== undefined) csilMap.set(\"payload\", v.payload);"),
+        "encode must gate on presence, not emptiness:\n{codec}"
+    );
+    assert!(
+        !codec.contains("if (v.payload) csilMap.set"),
+        "encode must not gate on truthiness -- an empty Uint8Array is present:\n{codec}"
+    );
+    // Decode maps a missing key to undefined but keeps a present zero-length byte
+    // string, so the three states stay distinct.
+    assert!(
+        codec.contains("csilV === undefined ? undefined : asBytes(csilV)"),
+        "decode must gate on key presence:\n{codec}"
+    );
+}
+
 #[test]
 fn typesonly_emits_only_types_with_service_error() {
     let files = generate_files(&input_for("typescript-typesonly")).expect("generate");

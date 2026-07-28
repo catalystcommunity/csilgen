@@ -532,11 +532,18 @@ const EVENTS_CARRIER_RUBY: &str = r#"# One example carrier: a TLS byte stream fr
 # library's StreamCarrier owns the framing; we own only the socket.
 Events = Csilgen::Transport::Events
 
+# The max-frame guard is a carrier setting, not a generated constant: raise it when a peer
+# accepts payloads larger than the 16 MiB default (the envelope adds framing and request
+# metadata around the payload, so the limit must exceed the largest payload), or lower it
+# to harden an exposed listener. Valid limits are 1..MAX_FRAME_LIMIT and are checked at
+# construction.
+MAX_FRAME = Csilgen::Transport::Conventions::MAX_FRAME_DEFAULT
+
 def open_tls_carrier(host, port)
   socket = TCPSocket.new(host, port)
   ssl = OpenSSL::SSL::SSLSocket.new(socket)
   ssl.connect
-  Csilgen::Transport::StreamCarrier.new(ssl)
+  Csilgen::Transport::StreamCarrier.new(ssl, max_frame: MAX_FRAME)
 end
 "#;
 
@@ -3282,6 +3289,48 @@ mod tests {
         }
     }
 
+    /// An optional `bytes` field carries three distinct states — absent,
+    /// present-and-empty, present-and-non-empty — and the codec must decide presence by
+    /// whether the value is set, never by whether it is non-empty
+    /// (cbor-wire-contract.md "Optional fields"). `unless payload.nil?` is the presence
+    /// test; a bare `if payload` would treat an empty String as absent in Ruby only if
+    /// the value were nil, but the emitted guard must stay explicitly nil-based so the
+    /// three states survive.
+    #[test]
+    fn optional_bytes_encodes_on_presence_not_emptiness() {
+        let group = CsilGroupExpression {
+            entries: vec![
+                bare("id", builtin("text")),
+                opt("payload", builtin("bytes")),
+            ],
+        };
+        let mut records = std::collections::HashSet::new();
+        records.insert("UpdateRequest".to_string());
+        let out = emit_record_codec(
+            "UpdateRequest",
+            &group,
+            &records,
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+        );
+
+        // Encode gates on nil (presence), not on emptiness.
+        assert!(
+            out.contains("csil_map[\"payload\"] = (payload).b unless payload.nil?"),
+            "encode must gate on presence, not emptiness:\n{out}"
+        );
+        assert!(
+            !out.contains("unless payload.empty?"),
+            "encode must not gate on emptiness:\n{out}"
+        );
+        // Decode gates on the key being present, so a present empty binary stays
+        // present rather than collapsing to nil.
+        assert!(
+            out.contains("payload: (node.key?(\"payload\") ? node[\"payload\"] : nil)"),
+            "decode must gate on key presence:\n{out}"
+        );
+    }
+
     #[test]
     fn codec_keys_in_canonical_order() {
         let mut records = std::collections::HashSet::new();
@@ -3699,7 +3748,10 @@ mod tests {
         assert!(body.contains("## CSIL-Events (TLS)"));
         assert!(body.contains("Events = Csilgen::Transport::Events"));
         assert!(body.contains("def open_tls_carrier(host, port)"));
-        assert!(body.contains("Csilgen::Transport::StreamCarrier.new(ssl)"));
+        // The carrier is built with an explicit max-frame limit so an operator can see
+        // and change the guard without editing generated source (conventions doc §5).
+        assert!(body.contains("Csilgen::Transport::StreamCarrier.new(ssl, max_frame: MAX_FRAME)"));
+        assert!(body.contains("MAX_FRAME = Csilgen::Transport::Conventions::MAX_FRAME_DEFAULT"));
         // The $hello handshake + the $ping/$pong heartbeat from the lib.
         assert!(body.contains(
             "Events::Hello.new(versions: [1], profiles: [\"verbose\"], service: \"user_service\").encode"

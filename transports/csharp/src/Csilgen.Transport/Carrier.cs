@@ -125,8 +125,14 @@ public sealed class StreamCarrier : IFrameCarrier
     private readonly Stream _stream;
     private readonly int _maxFrame;
 
+    /// <summary>
+    /// Builds a carrier with a host-chosen max-frame limit. The limit is validated here rather
+    /// than at the first frame, so a misconfigured carrier is a construction-time error the host
+    /// can surface at startup.
+    /// </summary>
     public StreamCarrier(Stream stream, int maxFrame = Conventions.MaxFrameDefault)
     {
+        Conventions.ValidateMaxFrame(maxFrame);
         _stream = stream;
         _maxFrame = maxFrame;
     }
@@ -135,6 +141,9 @@ public sealed class StreamCarrier : IFrameCarrier
         Framing.WriteLengthPrefixed(_stream, frame, _maxFrame);
 
     public byte[]? RecvFrame() => Framing.ReadLengthPrefixed(_stream, _maxFrame);
+
+    /// <summary>The limit this carrier enforces in both directions.</summary>
+    public int MaxFrame => _maxFrame;
 
     public void Dispose() => _stream.Dispose();
 }

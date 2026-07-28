@@ -10,6 +10,28 @@ final class Conventions
     /** CBOR semantic tag wrapping an embedded, opaque CBOR data item (RFC 8949 3.4.5.1). */
     const TAG_ENCODED_CBOR = 24;
 
+    /** Default max encoded envelope size for stream/message carriers (16 MiB). A
+     * carrier rejects anything larger before allocating for it. */
+    const MAX_FRAME_DEFAULT = 16777216;
+
+    /** Largest max-frame limit a host may configure (2 GiB - 1). The 4-byte length
+     * prefix can express more, but the limit lives in a signed 32-bit integer in
+     * several supported languages, so this is the portable ceiling every CSIL
+     * transport agrees on. Anything above it would also disable the receive guard
+     * outright, since no wire length could exceed it. */
+    const MAX_FRAME_LIMIT = 2147483647;
+
+    /** Check a host-supplied max-frame limit against the conventions doc range
+     * (1..MAX_FRAME_LIMIT), so an unusable carrier fails at construction rather
+     * than on its first frame. */
+    public static function validateMaxFrame($maxFrame)
+    {
+        if (!is_int($maxFrame) || $maxFrame < 1 || $maxFrame > self::MAX_FRAME_LIMIT) {
+            throw new InvalidMaxFrameException($maxFrame, self::MAX_FRAME_LIMIT);
+        }
+        return $maxFrame;
+    }
+
     // Transport status registry -- see csil-transport-conventions.md section 4.
     const STATUS_OK = 0;
     const STATUS_MALFORMED_ENVELOPE = 1;

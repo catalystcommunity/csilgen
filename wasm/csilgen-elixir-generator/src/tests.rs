@@ -171,6 +171,48 @@ fn test_struct_emission() {
     assert!(types.contains("@wire_keys [subject: \"subject\", claim: \"claim\", note: \"note\"]"));
 }
 
+/// An optional `bytes` field carries three distinct states — absent, present-and-empty,
+/// present-and-non-empty — and the codec must decide presence by whether the value is
+/// set, never by whether it is non-empty (cbor-wire-contract.md "Optional fields"). A
+/// `byte_size(v.payload) > 0` guard would collapse present-empty into absent and silently
+/// lose a caller's "replace this with nothing".
+#[test]
+fn optional_bytes_encodes_on_presence_not_emptiness() {
+    let input = group_input(
+        "UpdateRequest",
+        vec![
+            bare_entry("id", CsilTypeExpression::Builtin("text".to_string())),
+            optional_entry("payload", CsilTypeExpression::Builtin("bytes".to_string())),
+        ],
+        HashMap::new(),
+    );
+    let out = process_generation(input).unwrap();
+    let types = file(&out, "types.gen.ex");
+
+    // `binary() | nil` distinguishes nil (absent) from `<<>>` (present-and-empty).
+    assert!(
+        types.contains("payload: binary() | nil"),
+        "optional bytes needs a presence-carrying type:\n{types}"
+    );
+    // Encode gates on `is_nil/1`, never on the byte size.
+    assert!(
+        types.contains(
+            "if(is_nil(v.payload), do: nil, else: {{:text, \"payload\"}, {:bytes, v.payload}})"
+        ),
+        "encode must gate on presence, not emptiness:\n{types}"
+    );
+    assert!(
+        !types.contains("byte_size(v.payload) > 0"),
+        "encode must not gate on emptiness:\n{types}"
+    );
+    // Decode reads the key out of the map, so a present zero-length binary stays `<<>>`
+    // rather than collapsing to nil.
+    assert!(
+        types.contains("case Map.get(csil_fields, {:text, \"payload\"}) do"),
+        "decode must gate on key presence:\n{types}"
+    );
+}
+
 #[test]
 fn test_wire_keys_stay_verbatim_snake_case() {
     let input = group_input(
@@ -2252,8 +2294,11 @@ fn genquickstart_events_section_handshake_and_router_dispatch() {
     // A TLS frame carrier built on the library's length-prefix framing.
     assert!(body.contains("defmodule TlsFrameCarrier do"));
     assert!(body.contains("@behaviour Csilgen.Transport.Carrier"));
-    assert!(body.contains("Carrier.frame_length_prefixed(frame)"));
-    assert!(body.contains("Carrier.read_length_prefixed(c.buffer)"));
+    // Framing carries an explicit max-frame limit so an operator can see and change the
+    // guard without editing generated source (conventions doc §5).
+    assert!(body.contains("Carrier.frame_length_prefixed(frame, @max_frame)"));
+    assert!(body.contains("Carrier.read_length_prefixed(c.buffer, @max_frame)"));
+    assert!(body.contains("@max_frame Csilgen.Transport.Conventions.max_frame_default()"));
     assert!(body.contains(":ssl.connect("));
 
     // The $hello / $hello-ack handshake via the library control plane.

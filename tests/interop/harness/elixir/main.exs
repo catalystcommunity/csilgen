@@ -148,6 +148,8 @@ defmodule Handlers do
   @impl true
   def echo_nested(req, _ctx), do: {:ok, %G.EchoNestedResult{ok: true, echo: req}}
   @impl true
+  def echo_opt_bytes(req, _ctx), do: {:ok, req}
+  @impl true
   def validate_constrained(req, _ctx) do
     case G.Validation.validate_constrained(req) do
       :ok -> {:ok, req}
@@ -256,6 +258,10 @@ defmodule Rpc do
         {:ok, r} = Handlers.echo_nested(G.Nested.from_cbor(req.payload), %{})
         RPC.new_response_ok("EchoNestedResult", G.EchoNestedResult.to_cbor(r))
 
+      "echo-opt-bytes" ->
+        {:ok, r} = Handlers.echo_opt_bytes(G.OptBytes.from_cbor(req.payload), %{})
+        RPC.new_response_ok("OptBytes", G.OptBytes.to_cbor(r))
+
       "validate-constrained" ->
         # The typed error arm rides as a status-0 `ServiceError` variant.
         case Handlers.validate_constrained(G.Constrained.from_cbor(req.payload), %{}) do
@@ -361,6 +367,53 @@ defmodule Rpc do
       rescue
         # The typed error arm surfaces as a raised error -- the failure-case path.
         _ -> Cases.pass(cases, "validate-constrained/failure")
+      end
+
+    # Optional-bytes presence: absent, present-empty, and present-non-empty are three
+    # distinct states that must each survive the round trip unchanged. `nil` is the absent
+    # marker -- an empty binary is present, and `is_nil/1` (not a truthiness test) is what
+    # keeps them apart.
+    cases =
+      try do
+        r = G.InteropClient.echo_opt_bytes(client, %G.OptBytes{tag: "absent", payload: nil})
+
+        Cases.check(
+          cases,
+          "opt-bytes/absent",
+          is_nil(r.payload),
+          "expected absent, got #{inspect(r.payload)}"
+        )
+      rescue
+        e -> Cases.fail(cases, "opt-bytes/absent", Exception.message(e))
+      end
+
+    cases =
+      try do
+        r = G.InteropClient.echo_opt_bytes(client, %G.OptBytes{tag: "empty", payload: <<>>})
+
+        Cases.check(
+          cases,
+          "opt-bytes/present-empty",
+          r.payload == <<>>,
+          "expected present-and-empty, got #{inspect(r.payload)}"
+        )
+      rescue
+        e -> Cases.fail(cases, "opt-bytes/present-empty", Exception.message(e))
+      end
+
+    cases =
+      try do
+        sent = <<0x01, 0x02, 0xF0, 0xFF>>
+        r = G.InteropClient.echo_opt_bytes(client, %G.OptBytes{tag: "full", payload: sent})
+
+        Cases.check(
+          cases,
+          "opt-bytes/present-non-empty",
+          r.payload == sent,
+          "expected 0102f0ff, got #{inspect(r.payload)}"
+        )
+      rescue
+        e -> Cases.fail(cases, "opt-bytes/present-non-empty", Exception.message(e))
       end
 
     cases

@@ -24,6 +24,24 @@ pub const CONTROL_SERVICE_ORD: u64 = 0;
 /// carrier rejects anything larger before allocating for it.
 pub const MAX_FRAME_DEFAULT: usize = 16 * 1024 * 1024;
 
+/// The largest max-frame limit a host may configure (2 GiB - 1). The 4-byte length
+/// prefix can express more, but the limit lives in a signed 32-bit integer in
+/// several supported languages, so this is the portable ceiling every CSIL
+/// transport agrees on. Anything above it would also disable the receive guard
+/// outright, since no wire length could exceed it.
+pub const MAX_FRAME_LIMIT: usize = 2147483647;
+
+/// Raised when a host configures a max-frame limit outside the valid range.
+pub const InvalidMaxFrameError = error{InvalidMaxFrame};
+
+/// Check a host-supplied max-frame limit against the conventions doc range
+/// (1..=MAX_FRAME_LIMIT), so an unusable carrier fails at construction rather than
+/// on its first frame.
+pub fn validate_max_frame(max_frame: usize) InvalidMaxFrameError!usize {
+    if (max_frame < 1 or max_frame > MAX_FRAME_LIMIT) return error.InvalidMaxFrame;
+    return max_frame;
+}
+
 /// Errors raised across the envelope layer. Joins the codec errors with the
 /// transport-level distinctions a host needs to handle.
 pub const Error = cbor.Error || error{

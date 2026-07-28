@@ -246,7 +246,7 @@ puts \"DATAGRAMS OK\"\n",
     // carrier for an in-process one and actually run `session`, so a missing router surface
     // (the NameError this whole pass exists to prevent) fails the test for real.
     let ev_block = ruby_block(&md, "## CSIL-Events (TLS)").replace(
-        "def open_tls_carrier(host, port)\n  socket = TCPSocket.new(host, port)\n  ssl = OpenSSL::SSL::SSLSocket.new(socket)\n  ssl.connect\n  Csilgen::Transport::StreamCarrier.new(ssl)\nend",
+        "def open_tls_carrier(host, port)\n  socket = TCPSocket.new(host, port)\n  ssl = OpenSSL::SSL::SSLSocket.new(socket)\n  ssl.connect\n  Csilgen::Transport::StreamCarrier.new(ssl, max_frame: MAX_FRAME)\nend",
         "def open_tls_carrier(host, port)\n  $carrier\nend",
     );
     assert!(

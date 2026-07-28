@@ -97,6 +97,21 @@ public sealed class FrameTooLargeException : TransportException
     public int Maximum { get; }
 }
 
+/// <summary>Raised when a host configures a max-frame limit outside the valid range.</summary>
+public sealed class InvalidMaxFrameException : TransportException
+{
+    public InvalidMaxFrameException(int got, int limit)
+        : base($"max-frame limit of {got} is outside the valid range 1..={limit}")
+    {
+        Got = got;
+        Limit = limit;
+    }
+
+    public int Got { get; }
+
+    public int Limit { get; }
+}
+
 public sealed class UnsupportedVersionException : TransportException
 {
     public UnsupportedVersionException(ulong version)
@@ -151,6 +166,27 @@ public static class Conventions
     // MaxFrameDefault is the default max encoded envelope size for stream/message carriers (16 MiB).
     // A carrier rejects anything larger before allocating for it.
     public const int MaxFrameDefault = 16 * 1024 * 1024;
+
+    // MaxFrameLimit is the largest max-frame limit a host may configure (2 GiB - 1). The 4-byte
+    // length prefix can express more, but the limit lives in a signed 32-bit integer in several
+    // supported languages, so this is the portable ceiling every CSIL transport agrees on.
+    // Anything above it would also disable the receive guard outright, since no wire length
+    // could exceed it.
+    public const int MaxFrameLimit = 2147483647;
+
+    // ValidateMaxFrame checks a host-supplied max-frame limit against the conventions doc range
+    // (1..=MaxFrameLimit), so an unusable carrier fails at construction rather than on its first
+    // frame. Only the lower bound is checkable here: MaxFrameLimit is int.MaxValue, so no int
+    // argument can exceed it. Languages with wider integers check both ends.
+    public static int ValidateMaxFrame(int maxFrame)
+    {
+        if (maxFrame < 1)
+        {
+            throw new InvalidMaxFrameException(maxFrame, MaxFrameLimit);
+        }
+
+        return maxFrame;
+    }
 
     // Tag24 wraps opaque payload bytes (themselves a CBOR item) in tag 24.
     public static CborValue Tag24(byte[] payload) =>

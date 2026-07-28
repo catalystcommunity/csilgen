@@ -228,6 +228,8 @@ internal static class Harness
 
         public EchoNestedResult EchoNested(Nested nested) => new() { Ok = true, Echo = nested };
 
+        public OptBytes EchoOptBytes(OptBytes optBytes) => optBytes;
+
         // Throws System.ArgumentException on invalid input; the RPC dispatch maps that to the
         // typed `ServiceError` arm (the failure-case path).
         public Constrained ValidateConstrained(Constrained constrained)
@@ -344,6 +346,17 @@ internal static class Harness
                             return HandlerOutcome.Transport(Status.MalformedEnvelope, e.Message);
                         }
 
+                    case "echo-opt-bytes":
+                        try
+                        {
+                            var v = Codec.Decode<OptBytes>(req.Payload);
+                            return HandlerOutcome.Reply("OptBytes", Codec.Encode(handlers.EchoOptBytes(v)));
+                        }
+                        catch (Exception e)
+                        {
+                            return HandlerOutcome.Transport(Status.MalformedEnvelope, e.Message);
+                        }
+
                     case "validate-constrained":
                         Constrained input;
                         try
@@ -444,6 +457,46 @@ internal static class Harness
         catch (Exception e)
         {
             cases.Fail("validate-constrained/failure", $"expected service error, got {e.Message}");
+        }
+
+        // Optional-bytes presence: absent, present-empty, and present-non-empty are three
+        // distinct states that must each survive the round trip unchanged. `null` is the
+        // absent marker -- a zero-length byte[] is present and must not decode to null.
+        try
+        {
+            var r = client.EchoOptBytes(new OptBytes { Tag = "absent", Payload = null });
+            cases.Check("opt-bytes/absent", r.Payload is null, $"expected absent, got {r.Payload?.Length}");
+        }
+        catch (Exception e)
+        {
+            cases.Fail("opt-bytes/absent", e.Message);
+        }
+
+        try
+        {
+            var r = client.EchoOptBytes(new OptBytes { Tag = "empty", Payload = Array.Empty<byte>() });
+            cases.Check(
+                "opt-bytes/present-empty",
+                r.Payload is not null && r.Payload.Length == 0,
+                $"expected present-and-empty, got {(r.Payload is null ? "null" : r.Payload.Length.ToString())}");
+        }
+        catch (Exception e)
+        {
+            cases.Fail("opt-bytes/present-empty", e.Message);
+        }
+
+        try
+        {
+            byte[] sent = { 0x01, 0x02, 0xf0, 0xff };
+            var r = client.EchoOptBytes(new OptBytes { Tag = "full", Payload = sent });
+            cases.Check(
+                "opt-bytes/present-non-empty",
+                r.Payload is not null && r.Payload.AsSpan().SequenceEqual(sent),
+                "expected 0102f0ff");
+        }
+        catch (Exception e)
+        {
+            cases.Fail("opt-bytes/present-non-empty", e.Message);
         }
 
         return cases;

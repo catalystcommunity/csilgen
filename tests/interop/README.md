@@ -88,6 +88,7 @@ RFC3339 UTC; decimals are exact strings.
 - **Nested (`NESTED_OK`)**: `inner=SCALARS_OK, maybe=CONSTRAINED_OK, many=[SCALARS_OK]`
 - **Constrained valid (`CONSTRAINED_OK`)**: `code="PRD-AB12CD", qty=10, rate="0.25", password="hunter2hunter2", tags=["one","two"]`
 - **Constrained invalid (`CONSTRAINED_BAD`)**: `code="bad", qty=0, rate="9.9", password="x", tags=[]` (violates size/regex/range/length/min-items)
+- **OptBytes, three states**: `{tag:"absent"}` (no `payload` key at all), `{tag:"empty", payload=0x}` (present, zero-length), `{tag:"full", payload=0x0102f0ff}` (present, four bytes). The echo must come back in the same state — absent stays absent, and present-empty must NOT arrive as absent.
 
 ## Case battery
 
@@ -101,6 +102,9 @@ gaps are being closed.
 | rpc        | echo-collections/success      | 2    | arrays (all cardinalities), maps, any-map, tuples, enum, int-enum, union |
 | rpc        | validate-constrained/success  | 2    | valid Constrained echoes (error-variant op) |
 | rpc        | validate-constrained/failure  | 2    | invalid Constrained → server returns ApiError variant |
+| rpc        | opt-bytes/absent              | 1    | optional `bytes` unset → key omitted, echo still unset |
+| rpc        | opt-bytes/present-empty       | 1    | optional `bytes` set to empty → key present as 0x40, echo still present-and-empty |
+| rpc        | opt-bytes/present-non-empty   | 1    | optional `bytes` set → key present with the bytes, echo byte-identical |
 | events     | on-tick/success               | 1    | server pushes N Ticks; client verifies sequence+enum field |
 | events     | duplex/success                | 1    | client sends Scalars frames; server echoes via channel router |
 | events     | unknown-method/failure        | 1    | client sends an unknown channel method → server router returns error/404 |

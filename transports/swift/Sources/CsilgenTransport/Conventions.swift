@@ -20,6 +20,23 @@ public let controlServiceOrd: UInt64 = 0
 /// carrier rejects anything larger before allocating for it.
 public let maxFrameDefault: Int = 16 * 1024 * 1024
 
+/// The largest max-frame limit a host may configure (2 GiB - 1). The 4-byte length
+/// prefix can express more, but the limit lives in a signed 32-bit integer in several
+/// supported languages, so this is the portable ceiling every CSIL transport agrees
+/// on. Anything above it would also disable the receive guard outright, since no wire
+/// length could exceed it.
+public let maxFrameLimit: Int = 2_147_483_647
+
+/// Check a host-supplied max-frame limit against the conventions doc range
+/// (1...`maxFrameLimit`), so an unusable carrier fails at construction rather than on
+/// its first frame.
+public func validateMaxFrame(_ maxFrame: Int) throws -> Int {
+    guard maxFrame >= 1, maxFrame <= maxFrameLimit else {
+        throw TransportError.invalidMaxFrame(got: maxFrame, limit: maxFrameLimit)
+    }
+    return maxFrame
+}
+
 /// The conservative max datagram size (envelope + payload) safe across UDP/WebRTC/QUIC.
 public let maxDatagramDefault: Int = 1200
 
@@ -30,6 +47,7 @@ public enum TransportError: Error, Equatable {
     case decode(String)
     case malformed(String)
     case frameTooLarge(got: Int, maximum: Int)
+    case invalidMaxFrame(got: Int, limit: Int)
     case unsupportedVersion(UInt64)
     /// A non-zero transport status returned by a peer (distinct from an application
     /// error, which rides inside the payload as a declared `/ ErrorType` arm).

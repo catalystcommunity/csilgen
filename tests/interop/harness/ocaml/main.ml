@@ -217,6 +217,10 @@ let rpc_server listener =
         let r : T.echo_nested_result = { ok = true; echo = v } in
         Rpc.reply "EchoNestedResult" (C.encode_echo_nested_result_bytes r)
       | exception Failure m -> malformed m)
+    | "echo-opt-bytes" -> (
+      match C.decode_opt_bytes_bytes req.Rpc.payload with
+      | v -> Rpc.reply "OptBytes" (C.encode_opt_bytes_bytes v)
+      | exception Failure m -> malformed m)
     | "validate-constrained" -> (
       match C.decode_constrained_bytes req.Rpc.payload with
       | v ->
@@ -278,6 +282,31 @@ let rpc_client fd =
    | Ok _ -> fail cs "validate-constrained/failure" "server accepted invalid input"
    | Error "ServiceError" -> pass cs "validate-constrained/failure"
    | Error e -> fail cs "validate-constrained/failure" ("expected service error, got " ^ e));
+  (* Optional-bytes presence: absent, present-empty, and present-non-empty are three
+     distinct states that must each survive the round trip unchanged. [None] is absent;
+     [Some Bytes.empty] is present-and-empty and must not come back as [None]. *)
+  (match
+     Interop_api.Client.Interop.echo_opt_bytes client
+       ({ tag = "absent"; payload = None } : T.opt_bytes)
+   with
+   | Ok r -> check cs "opt-bytes/absent" (r.payload = None) "expected absent"
+   | Error e -> fail cs "opt-bytes/absent" e);
+  (match
+     Interop_api.Client.Interop.echo_opt_bytes client
+       ({ tag = "empty"; payload = Some Bytes.empty } : T.opt_bytes)
+   with
+   | Ok r ->
+     check cs "opt-bytes/present-empty"
+       (match r.payload with Some b -> Bytes.length b = 0 | None -> false)
+       "expected present-and-empty"
+   | Error e -> fail cs "opt-bytes/present-empty" e);
+  (let sent = Bytes.of_string "\x01\x02\xF0\xFF" in
+   match
+     Interop_api.Client.Interop.echo_opt_bytes client
+       ({ tag = "full"; payload = Some sent } : T.opt_bytes)
+   with
+   | Ok r -> check cs "opt-bytes/present-non-empty" (r.payload = Some sent) "expected 0102f0ff"
+   | Error e -> fail cs "opt-bytes/present-non-empty" e);
   cs
 
 (* --------------------------------------------------------------------------- *)

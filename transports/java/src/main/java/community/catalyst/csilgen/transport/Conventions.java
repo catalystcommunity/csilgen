@@ -8,7 +8,7 @@ package community.catalyst.csilgen.transport;
 
 import java.util.List;
 
-final class Conventions {
+public final class Conventions {
     private Conventions() {}
 
     /** The current transport version; a new value is minted only for a breaking change. */
@@ -21,7 +21,30 @@ final class Conventions {
     static final long CONTROL_SERVICE_ORD = 0;
 
     /** The default max encoded envelope size for stream/message carriers (16 MiB). */
-    static final int MAX_FRAME_DEFAULT = 16 * 1024 * 1024;
+    public static final int MAX_FRAME_DEFAULT = 16 * 1024 * 1024;
+
+    /**
+     * The largest max-frame limit a host may configure (2 GiB - 1). The 4-byte length prefix
+     * can express more, but the limit lives in a signed 32-bit integer in several supported
+     * languages, so this is the portable ceiling every CSIL transport agrees on. Anything
+     * above it would also disable the receive guard outright, since no wire length could
+     * exceed it.
+     */
+    public static final int MAX_FRAME_LIMIT = 2147483647;
+
+    /**
+     * Checks a host-supplied max-frame limit against the conventions doc range
+     * (1..=MAX_FRAME_LIMIT), so an unusable carrier fails at construction rather than on its
+     * first frame.
+     */
+    public static int validateMaxFrame(int maxFrame) {
+        // Only the lower bound is checkable here: MAX_FRAME_LIMIT is Integer.MAX_VALUE, so
+        // no int argument can exceed it. Languages with wider integers check both ends.
+        if (maxFrame < 1) {
+            throw new InvalidMaxFrameException(maxFrame, MAX_FRAME_LIMIT);
+        }
+        return maxFrame;
+    }
 
     /** Wraps opaque payload bytes (themselves a CBOR item) in tag 24. */
     static CborValue tag24(byte[] payload) {

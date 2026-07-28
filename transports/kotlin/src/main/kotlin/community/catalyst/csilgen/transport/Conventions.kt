@@ -20,6 +20,21 @@ const val CONTROL_SERVICE_ORD: ULong = 0uL
  *  rejects anything larger before allocating for it. */
 const val MAX_FRAME_DEFAULT: Int = 16 * 1024 * 1024
 
+/** Largest max-frame limit a host may configure (2 GiB - 1). The 4-byte length prefix can
+ *  express more, but the limit lives in a signed 32-bit integer in several supported
+ *  languages, so this is the portable ceiling every CSIL transport agrees on. Anything above
+ *  it would also disable the receive guard outright, since no wire length could exceed it. */
+const val MAX_FRAME_LIMIT: Int = 2147483647
+
+/** Check a host-supplied max-frame limit against the conventions doc range
+ *  (1..MAX_FRAME_LIMIT), so an unusable carrier fails at construction rather than on its
+ *  first frame. Only the lower bound is checkable here: MAX_FRAME_LIMIT is `Int.MAX_VALUE`,
+ *  so no Int argument can exceed it. Languages with wider integers check both ends. */
+fun validateMaxFrame(maxFrame: Int): Int {
+    if (maxFrame < 1) throw InvalidMaxFrameException(maxFrame.toLong(), MAX_FRAME_LIMIT)
+    return maxFrame
+}
+
 /** Base of the transport exception hierarchy. Kotlin has no checked exceptions, so the
  *  references raise rather than thread a `Result` through every call. */
 open class TransportException(message: String, cause: Throwable? = null) :
@@ -28,6 +43,10 @@ open class TransportException(message: String, cause: Throwable? = null) :
 /** A frame exceeded the max-frame guard; the receiver rejects it before allocating. */
 class FrameTooLargeException(val got: Long, val max: Int) :
     TransportException("frame of $got bytes exceeds max-frame guard of $max bytes")
+
+/** A host configured a max-frame limit outside the valid range. */
+class InvalidMaxFrameException(val got: Long, val limit: Int) :
+    TransportException("max-frame limit of $got is outside the valid range 1..=$limit")
 
 /** An envelope's version is not supported. */
 class UnsupportedVersionException(val v: ULong) :

@@ -16,16 +16,19 @@ from __future__ import annotations
 from . import carrier, cbor, conventions, datagrams, events, rpc
 from .conventions import (
     MAX_FRAME_DEFAULT,
+    MAX_FRAME_LIMIT,
     VERSION,
     CarrierError,
     DecodeError,
     EncodeError,
     FrameTooLargeError,
+    InvalidMaxFrameError,
     MalformedError,
     Status,
     StatusError,
     TransportError,
     UnsupportedVersionError,
+    validate_max_frame,
 )
 
 __all__ = [
@@ -37,6 +40,9 @@ __all__ = [
     "rpc",
     "VERSION",
     "MAX_FRAME_DEFAULT",
+    "MAX_FRAME_LIMIT",
+    "validate_max_frame",
+    "InvalidMaxFrameError",
     "Status",
     "TransportError",
     "EncodeError",

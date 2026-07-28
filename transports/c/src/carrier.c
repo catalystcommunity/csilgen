@@ -98,12 +98,18 @@ csil_frame_carrier csil_stream_carrier(const csil_stream *stream,
                                        size_t max_frame) {
     csil_frame_carrier c;
     memset(&c, 0, sizeof(c));
+    size_t limit = max_frame ? max_frame : CSIL_MAX_FRAME_DEFAULT;
+    /* Validated at construction rather than at the first frame, so a misconfigured
+     * carrier is detectable at startup by the same NULL-vtable check as OOM. */
+    if (!csil_validate_max_frame(limit)) {
+        return c;
+    }
     stream_state *st = calloc(1, sizeof(*st));
     if (!st) {
         return c; /* function pointers NULL: an unusable carrier the host detects */
     }
     st->stream = *stream;
-    st->max_frame = max_frame ? max_frame : CSIL_MAX_FRAME_DEFAULT;
+    st->max_frame = limit;
     c.send_frame = stream_send;
     c.recv_frame = stream_recv;
     c.userdata = st;

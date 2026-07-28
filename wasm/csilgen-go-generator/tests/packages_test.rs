@@ -410,7 +410,10 @@ fn each_section_names_its_library_imports_and_seam() {
     // router. Inbound (the router decodes the op input, Ping) rides a codec adapter
     // over the per-type codec; outbound (the op success output, Pong) rides the
     // generated encoder; dispatch goes through Route<Service>Channel — not codec-direct.
-    assert!(events.contains("transport.NewStreamCarrier(conn)"));
+    // The carrier is built with an explicit max-frame limit so an operator can see and
+    // change the guard without editing generated source (conventions doc §5).
+    assert!(events.contains("transport.NewStreamCarrierWithMaxFrame(conn, maxFrame)"));
+    assert!(events.contains("const maxFrame = transport.MaxFrameDefault"));
     assert!(events.contains("transport.Hello{"));
     assert!(events.contains("$hello"));
     assert!(events.contains("transport.DecodeHelloAck(ackFrame)"));

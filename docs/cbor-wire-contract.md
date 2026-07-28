@@ -134,6 +134,18 @@ language's empty/none value. (Rust additionally requires `#[serde(default)]` on
 optional `bytes` fields because the custom `serde_bytes` codec otherwise turns a
 missing field into a hard error; the generator emits this automatically.)
 
+**Absent is not the same as present-and-empty.** A field whose value is an empty
+byte string, empty text, empty array, or empty map is *present*: encode MUST emit
+its key with the empty value (a `bytes` field becomes a zero-length CBOR byte
+string, `0x40`), and decode MUST NOT normalize it back to absent. Presence is
+decided by whether the value is set, never by whether it is empty — so a generator
+that emits a truthiness test (`if (field)`, `if len(field) > 0`) instead of a
+presence test (`if field is not None`, `if v.payload != nil`) is wrong. This
+distinction is load-bearing: a caller uses it to mean "leave the stored value
+alone" (absent) versus "replace the stored value with nothing" (present-empty),
+and the three states — absent, present-empty, present-non-empty — must survive an
+encode/decode round trip in every generated language.
+
 ## Choices: enum vs. union on the wire
 
 A CSIL choice (`A / B / ...`, whether declared inline or via `Name = A / B` /

@@ -97,6 +97,46 @@ fn services_file(files: &[GeneratedFile]) -> &str {
         .content
 }
 
+/// An optional `bytes` field carries three distinct states — absent, present-and-empty,
+/// present-and-non-empty — and the codec must decide presence by whether the value is
+/// set, never by whether it is non-empty (cbor-wire-contract.md "Optional fields"). An
+/// `isNotEmpty` guard would collapse present-empty into absent and silently lose a
+/// caller's "replace this with nothing".
+#[test]
+fn optional_bytes_encodes_on_presence_not_emptiness() {
+    let rules = vec![record_rule(
+        "UpdateRequest",
+        vec![
+            entry("id", builtin("text"), false),
+            entry("payload", builtin("bytes"), true),
+        ],
+    )];
+    let files = generate_dart_code(&spec(rules, 0), &config("dart")).unwrap();
+    let code = types_file(&files);
+
+    // A nullable Uint8List distinguishes null (absent) from an empty list
+    // (present-and-empty).
+    assert!(
+        code.contains("final Uint8List? payload;"),
+        "optional bytes needs a presence-carrying type: {code}"
+    );
+    // Encode gates on `!= null` (presence), not on emptiness.
+    assert!(
+        code.contains("if (payload != null) map['payload'] = payload"),
+        "encode must gate on presence, not emptiness: {code}"
+    );
+    assert!(
+        !code.contains("payload!.isNotEmpty"),
+        "encode must not gate on emptiness: {code}"
+    );
+    // Decode maps a missing key to null but keeps a present zero-length byte string,
+    // so the three states stay distinct.
+    assert!(
+        code.contains("payload: map['payload'] == null ? null : map['payload'] as Uint8List"),
+        "decode must gate on key presence: {code}"
+    );
+}
+
 #[test]
 fn record_emits_final_class_with_const_named_constructor() {
     let rules = vec![record_rule(

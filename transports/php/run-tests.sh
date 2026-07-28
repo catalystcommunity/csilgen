@@ -8,3 +8,4 @@ fi
 
 php tests/conformance_test.php
 php tests/roundtrip_test.php
+php tests/max_frame_test.php

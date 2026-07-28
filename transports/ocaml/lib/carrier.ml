@@ -87,8 +87,19 @@ let read_length_prefixed ic ~max =
             | exception End_of_file ->
                 Error (Conventions.Carrier "truncated frame body")))
 
-let stream_carrier ?(max_frame = Conventions.max_frame_default) ic out =
+let carrier_with_max_frame ic out max_frame =
   {
     send_frame = (fun b -> write_length_prefixed out b ~max:max_frame);
     recv_frame = (fun () -> read_length_prefixed ic ~max:max_frame);
   }
+
+let stream_carrier ic out =
+  carrier_with_max_frame ic out Conventions.max_frame_default
+
+(* Split from [stream_carrier] rather than taking an optional argument so the
+   default path stays total: only the configured path can fail validation, and it
+   fails at construction rather than on its first frame. *)
+let stream_carrier_with_max_frame ~max_frame ic out =
+  match Conventions.validate_max_frame max_frame with
+  | Error e -> Error e
+  | Ok max_frame -> Ok (carrier_with_max_frame ic out max_frame)

@@ -20,7 +20,8 @@ use interop_api::{
     decode_collections, decode_constrained, decode_nested, decode_scalars, decode_service_error,
     decode_tick, encode_collections, encode_constrained, encode_interop_on_tick, encode_scalars,
     encode_service_error, route_interop_channel, ClientError, Collections, Color, Constrained,
-    CsilCborValue, EchoNestedResult, IdOrName, Interop, Level, MixedStatus, Nested, Priority,
+    CsilCborValue, EchoNestedResult, IdOrName, Interop, Level, MixedStatus, Nested, OptBytes,
+    Priority,
     Scalars, Scalars_note, Scalars_size, Season, ServiceError, ShipMode, Tick, Transport,
 };
 
@@ -210,6 +211,9 @@ impl Interop for Handlers {
             echo: input,
         })
     }
+    fn echo_opt_bytes(&self, _: &(), input: OptBytes) -> Result<OptBytes, ServiceError> {
+        Ok(input)
+    }
     fn validate_constrained(
         &self,
         _: &(),
@@ -299,6 +303,13 @@ fn rpc_server(listener: TcpListener) {
                     },
                     Err(e) => HandlerOutcome::Transport(Status::MalformedEnvelope, e.to_string()),
                 },
+                "echo-opt-bytes" => match interop_api::decode_opt_bytes(&req.payload) {
+                    Ok(v) => match handlers.echo_opt_bytes(&(), v) {
+                        Ok(r) => reply("OptBytes", interop_api::encode_opt_bytes(&r)),
+                        Err(e) => HandlerOutcome::Transport(Status::Internal, e.message),
+                    },
+                    Err(e) => HandlerOutcome::Transport(Status::MalformedEnvelope, e.to_string()),
+                },
                 "validate-constrained" => match decode_constrained(&req.payload) {
                     Ok(v) => match handlers.validate_constrained(&(), v) {
                         Ok(r) => reply("Constrained", encode_constrained(&r)),
@@ -371,6 +382,43 @@ fn rpc_client(stream: TcpStream) -> Cases {
             "validate-constrained/failure",
             format!("expected service error, got {e}"),
         ),
+    }
+
+    // Optional-bytes presence: absent, present-empty, and present-non-empty are three
+    // distinct states that must each survive the round trip unchanged. `Option` is the
+    // presence carrier -- `Some(vec![])` must never come back as `None`.
+    match client.echo_opt_bytes(OptBytes {
+        tag: "absent".into(),
+        payload: None,
+    }) {
+        Ok(r) => cases.check(
+            "opt-bytes/absent",
+            r.payload.is_none(),
+            format!("expected absent, got {:?}", r.payload),
+        ),
+        Err(e) => cases.fail("opt-bytes/absent", e.to_string()),
+    }
+    match client.echo_opt_bytes(OptBytes {
+        tag: "empty".into(),
+        payload: Some(Vec::new()),
+    }) {
+        Ok(r) => cases.check(
+            "opt-bytes/present-empty",
+            r.payload.as_deref() == Some(&[][..]),
+            format!("expected present-and-empty, got {:?}", r.payload),
+        ),
+        Err(e) => cases.fail("opt-bytes/present-empty", e.to_string()),
+    }
+    match client.echo_opt_bytes(OptBytes {
+        tag: "full".into(),
+        payload: Some(vec![0x01, 0x02, 0xf0, 0xff]),
+    }) {
+        Ok(r) => cases.check(
+            "opt-bytes/present-non-empty",
+            r.payload.as_deref() == Some(&[0x01, 0x02, 0xf0, 0xff][..]),
+            format!("expected 0102f0ff, got {:?}", r.payload),
+        ),
+        Err(e) => cases.fail("opt-bytes/present-non-empty", e.to_string()),
     }
     cases
 }

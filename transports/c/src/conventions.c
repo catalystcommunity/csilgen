@@ -2,6 +2,10 @@
 
 #include <stdlib.h>
 
+int csil_validate_max_frame(size_t max_frame) {
+    return max_frame >= 1 && max_frame <= CSIL_MAX_FRAME_LIMIT;
+}
+
 const char *csil_status_name(csil_status s) {
     switch (s.code) {
     case 0:

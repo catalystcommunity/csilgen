@@ -181,7 +181,8 @@ following CBOR envelope, then that many bytes.
 
 - The length counts only the envelope bytes, not the 4-byte prefix.
 - A receiver MUST reject a length exceeding the max-frame guard (conventions doc;
-  default 16 MiB) **before** allocating, and close the connection.
+  default 16 MiB, configurable per carrier) **before** allocating, and close the
+  connection.
 - The stream MAY pipeline (multiple requests before their responses); when it
   does, `id` is REQUIRED. A strictly synchronous one-in-flight stream MAY omit
   `id`.

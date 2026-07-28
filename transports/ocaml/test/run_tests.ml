@@ -5,4 +5,5 @@
 let () =
   Conformance.run ();
   Roundtrip.run ();
+  Max_frame.run ();
   print_endline "all OCaml transport tests passed"

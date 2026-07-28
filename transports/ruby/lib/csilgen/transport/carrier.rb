@@ -62,11 +62,13 @@ module Csilgen
     # A FrameCarrier over any read/write/flush byte stream (a socket, a TLS-wrapped IO,
     # a StringIO pair), using the canonical 4-byte length-prefix framing.
     class StreamCarrier
-      attr_reader :stream
+      attr_reader :stream, :max_frame
 
       def initialize(stream, max_frame: Conventions::MAX_FRAME_DEFAULT)
         @stream = stream
-        @max_frame = max_frame
+        # Validated here rather than at the first frame, so a misconfigured carrier
+        # is a construction-time error the host can surface at startup.
+        @max_frame = Conventions.validate_max_frame(max_frame)
       end
 
       def send_frame(frame)

@@ -750,7 +750,13 @@ struct Handler: {handler} {{
 
 func session() throws {{
     // StreamCarrier wraps any ByteStream with the library's 4-byte length-prefix framing.
-    let carrier = StreamCarrier(stream: TlsByteStream(host: "localhost", port: 7443))
+    // The max-frame guard is a carrier setting, not a generated constant: raise maxFrame
+    // when a peer accepts payloads larger than the 16 MiB default (the envelope adds
+    // framing and request metadata around the payload, so the limit must exceed the
+    // largest payload), or lower it to harden an exposed listener. Valid limits are
+    // 1...maxFrameLimit and are checked at construction.
+    let carrier = try StreamCarrier(
+        stream: TlsByteStream(host: "localhost", port: 7443), maxFrame: maxFrameDefault)
     let codec = ChannelCodec()
     let handler = Handler()
 
@@ -806,7 +812,13 @@ try session()
 const SWIFT_EVENTS_NO_CHANNEL_SESSION: &str = r#"
 func session() throws {
     // StreamCarrier wraps any ByteStream with the library's 4-byte length-prefix framing.
-    let carrier = StreamCarrier(stream: TlsByteStream(host: "localhost", port: 7443))
+    // The max-frame guard is a carrier setting, not a generated constant: raise maxFrame
+    // when a peer accepts payloads larger than the 16 MiB default (the envelope adds
+    // framing and request metadata around the payload, so the limit must exceed the
+    // largest payload), or lower it to harden an exposed listener. Valid limits are
+    // 1...maxFrameLimit and are checked at construction.
+    let carrier = try StreamCarrier(
+        stream: TlsByteStream(host: "localhost", port: 7443), maxFrame: maxFrameDefault)
 
     // $hello / $hello-ack handshake (control plane).
     try carrier.sendFrame(Hello(versions: [csilVersion], profiles: ["verbose"]).encode())

@@ -82,10 +82,20 @@ public final class Carriers {
             this(in, out, Conventions.MAX_FRAME_DEFAULT);
         }
 
+        /**
+         * Builds a carrier with a host-chosen max-frame limit. The limit is validated here
+         * rather than at the first frame, so a misconfigured carrier is a construction-time
+         * error the host can surface at startup.
+         */
         public StreamCarrier(InputStream in, OutputStream out, int maxFrame) {
             this.in = in;
             this.out = out;
-            this.maxFrame = maxFrame;
+            this.maxFrame = Conventions.validateMaxFrame(maxFrame);
+        }
+
+        /** The limit this carrier enforces in both directions. */
+        public int maxFrame() {
+            return maxFrame;
         }
 
         @Override

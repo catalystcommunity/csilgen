@@ -20,6 +20,13 @@ module Csilgen
       # carrier rejects anything larger before allocating for it.
       MAX_FRAME_DEFAULT = 16 * 1024 * 1024
 
+      # Largest max-frame limit a host may configure (2 GiB - 1). The 4-byte length
+      # prefix can express more, but the limit lives in a signed 32-bit integer in
+      # several supported languages, so this is the portable ceiling every CSIL
+      # transport agrees on. Anything above it would also disable the receive guard
+      # outright, since no wire length could exceed it.
+      MAX_FRAME_LIMIT = 2_147_483_647
+
       STATUS_NAMES = {
         0 => "ok",
         1 => "malformed-envelope",
@@ -33,6 +40,17 @@ module Csilgen
       }.freeze
 
       module_function
+
+      # Check a host-supplied max-frame limit against the conventions doc range
+      # (1..MAX_FRAME_LIMIT), so an unusable carrier fails at construction rather
+      # than on its first frame.
+      def validate_max_frame(max_frame)
+        unless max_frame.is_a?(Integer) && max_frame >= 1 && max_frame <= MAX_FRAME_LIMIT
+          raise InvalidMaxFrameError.new(max_frame, MAX_FRAME_LIMIT)
+        end
+
+        max_frame
+      end
 
       # Wrap opaque payload bytes (themselves a CBOR item) in tag 24. The bytes are
       # forced binary so the codec treats them as a byte string, never re-encoded text.
@@ -159,6 +177,16 @@ module Csilgen
         @got = got
         @maximum = maximum
         super("frame of #{got} bytes exceeds max-frame guard of #{maximum} bytes")
+      end
+    end
+
+    class InvalidMaxFrameError < Error
+      attr_reader :got, :limit
+
+      def initialize(got, limit)
+        @got = got
+        @limit = limit
+        super("max-frame limit of #{got} is outside the valid range 1..=#{limit}")
       end
     end
 

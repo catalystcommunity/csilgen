@@ -29,6 +29,13 @@ CONTROL_SERVICE_ORD: int = 0
 # rejects anything larger before allocating for it.
 MAX_FRAME_DEFAULT: int = 16 * 1024 * 1024
 
+# Largest max-frame limit a host may configure (2 GiB - 1). The 4-byte length prefix
+# can express more, but the limit lives in a signed 32-bit integer in several
+# supported languages, so this is the portable ceiling every CSIL transport agrees
+# on. Anything above it would also disable the receive guard outright, since no wire
+# length could exceed it.
+MAX_FRAME_LIMIT: int = 2147483647
+
 _STATUS_NAMES = {
     0: "ok",
     1: "malformed-envelope",
@@ -100,6 +107,26 @@ class FrameTooLargeError(TransportError):
         )
         self.got = got
         self.maximum = maximum
+
+
+class InvalidMaxFrameError(TransportError):
+    def __init__(self, got: int, limit: int) -> None:
+        super().__init__(
+            f"max-frame limit of {got} is outside the valid range 1..={limit}"
+        )
+        self.got = got
+        self.limit = limit
+
+
+def validate_max_frame(max_frame: int) -> int:
+    """Check a host-supplied max-frame limit against the conventions doc range
+    (1..=``MAX_FRAME_LIMIT``), so an unusable carrier fails at construction rather
+    than on its first frame."""
+    if not isinstance(max_frame, int) or isinstance(max_frame, bool):
+        raise InvalidMaxFrameError(max_frame, MAX_FRAME_LIMIT)
+    if max_frame < 1 or max_frame > MAX_FRAME_LIMIT:
+        raise InvalidMaxFrameError(max_frame, MAX_FRAME_LIMIT)
+    return max_frame
 
 
 class UnsupportedVersionError(TransportError):

@@ -1089,12 +1089,20 @@ func (t *HTTPRpcCarrier) Call(ctx context.Context, service, op string, req []byt
 /// the session logic transport-agnostic.
 const EVENTS_CARRIER_GO: &str = r#"// One example carrier: a TLS byte stream framed with CSIL's 4-byte length prefix
 // via the library's StreamCarrier. Swap tls.Dial for a WebSocket/QUIC stream.
+
+// The max-frame guard is a carrier setting, not a generated constant: raise it when a
+// peer accepts payloads larger than the 16 MiB default (the envelope adds framing and
+// request metadata around the payload, so the limit must exceed the largest payload),
+// or lower it to harden an exposed listener. Valid limits are 1..=transport.MaxFrameLimit
+// and are checked at construction.
+const maxFrame = transport.MaxFrameDefault
+
 func openTLSCarrier(addr string) (transport.FrameCarrier, error) {
 	conn, err := tls.Dial("tcp", addr, &tls.Config{})
 	if err != nil {
 		return nil, err
 	}
-	return transport.NewStreamCarrier(conn), nil
+	return transport.NewStreamCarrierWithMaxFrame(conn, maxFrame)
 }
 "#;
 
@@ -6783,6 +6791,72 @@ mod tests {
                 constraints,
             },
         )
+    }
+
+    fn optional_entry(name: &str, value_type: CsilTypeExpression) -> CsilGroupEntry {
+        CsilGroupEntry {
+            key: Some(CsilGroupKey::Bare(name.to_string())),
+            value_type,
+            occurrence: Some(csilgen_common::CsilOccurrence::Optional),
+            metadata: vec![],
+            doc_comments: Vec::new(),
+        }
+    }
+
+    /// An optional `bytes` field carries three distinct states — absent,
+    /// present-and-empty, present-and-non-empty — and the codec must decide presence by
+    /// whether the value is set, never by whether it is non-empty (cbor-wire-contract.md
+    /// "Optional fields"). A `len(...) > 0` or truthiness guard would collapse
+    /// present-empty into absent and silently lose a caller's "replace this with nothing".
+    #[test]
+    fn optional_bytes_encodes_on_presence_not_emptiness() {
+        let input = group_input(
+            "UpdateRequest",
+            vec![
+                bare_entry("id", CsilTypeExpression::Builtin("text".to_string())),
+                optional_entry("payload", CsilTypeExpression::Builtin("bytes".to_string())),
+            ],
+            HashMap::new(),
+        );
+        let output = super::process_generation(input).expect("generation ok");
+        let types = &output
+            .files
+            .iter()
+            .find(|f| f.path == "types.gen.go")
+            .expect("types emitted")
+            .content;
+        let codec = &output
+            .files
+            .iter()
+            .find(|f| f.path == "codec.gen.go")
+            .expect("codec emitted")
+            .content;
+
+        // The field type must be able to hold all three states: a pointer distinguishes
+        // nil (absent) from a pointer to an empty slice (present-and-empty).
+        assert!(
+            types.contains("Payload *[]byte"),
+            "optional bytes needs a presence-carrying type:\n{types}"
+        );
+        // Encode gates on presence.
+        assert!(
+            codec.contains("if csilV.Payload != nil {"),
+            "encode must gate on presence, not emptiness:\n{codec}"
+        );
+        assert!(
+            !codec.contains("len(*csilV.Payload) > 0"),
+            "encode must not gate on emptiness:\n{codec}"
+        );
+        // Decode gates on the key being present in the map, and keeps a present-empty
+        // value present by taking the address of the decoded slice.
+        assert!(
+            codec.contains("if csilField, csilOk := cborMapGet(csilRoot, \"payload\"); csilOk {"),
+            "decode must gate on key presence:\n{codec}"
+        );
+        assert!(
+            codec.contains("csilOut.Payload = &csilVal"),
+            "a present value must stay present after decode:\n{codec}"
+        );
     }
 
     #[test]

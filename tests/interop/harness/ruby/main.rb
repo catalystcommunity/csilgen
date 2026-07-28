@@ -166,6 +166,10 @@ class Handlers < InteropHandlers
     EchoNestedResult.new(ok: true, echo: req)
   end
 
+  def echo_opt_bytes(req)
+    req
+  end
+
   def validate_constrained(req)
     req.validate
     req
@@ -210,6 +214,9 @@ def rpc_dispatch(handlers, req)
   when "echo-nested"
     v = Nested.from_cbor(req.payload)
     T::RPC::Reply.new("EchoNestedResult", handlers.echo_nested(v).to_cbor)
+  when "echo-opt-bytes"
+    v = OptBytes.from_cbor(req.payload)
+    T::RPC::Reply.new("OptBytes", handlers.echo_opt_bytes(v).to_cbor)
   when "validate-constrained"
     v = Constrained.from_cbor(req.payload)
     begin
@@ -280,6 +287,34 @@ def rpc_client(conn)
   rescue StandardError
     # The typed error arm surfaces as a raised error -- the failure-case path.
     cases.pass("validate-constrained/failure")
+  end
+
+  # Optional-bytes presence: absent, present-empty, and present-non-empty are three
+  # distinct states that must each survive the round trip unchanged. `nil` is the absent
+  # marker -- an empty String is present, and `unless payload.nil?` (not `if payload`)
+  # is what keeps them apart.
+  begin
+    r = client.echo_opt_bytes(OptBytes.new(tag: "absent"))
+    cases.check("opt-bytes/absent", r.payload.nil?, "expected absent, got #{r.payload.inspect}")
+  rescue StandardError => e
+    cases.fail("opt-bytes/absent", e.message)
+  end
+
+  begin
+    r = client.echo_opt_bytes(OptBytes.new(tag: "empty", payload: "".b))
+    cases.check("opt-bytes/present-empty", !r.payload.nil? && r.payload.empty?,
+                "expected present-and-empty, got #{r.payload.inspect}")
+  rescue StandardError => e
+    cases.fail("opt-bytes/present-empty", e.message)
+  end
+
+  begin
+    sent = "\x01\x02\xF0\xFF".b
+    r = client.echo_opt_bytes(OptBytes.new(tag: "full", payload: sent))
+    cases.check("opt-bytes/present-non-empty", r.payload == sent,
+                "expected 0102f0ff, got #{r.payload.inspect}")
+  rescue StandardError => e
+    cases.fail("opt-bytes/present-non-empty", e.message)
   end
 
   cases

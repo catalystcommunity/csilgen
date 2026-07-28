@@ -23,6 +23,23 @@ const int controlServiceOrd = 0;
 /// carrier rejects anything larger before allocating for it.
 const int maxFrameDefault = 16 * 1024 * 1024;
 
+/// Largest max-frame limit a host may configure (2 GiB - 1). The 4-byte length
+/// prefix can express more, but the limit lives in a signed 32-bit integer in
+/// several supported languages, so this is the portable ceiling every CSIL
+/// transport agrees on. Anything above it would also disable the receive guard
+/// outright, since no wire length could exceed it.
+const int maxFrameLimit = 2147483647;
+
+/// Check a host-supplied max-frame limit against the conventions doc range
+/// (1..=[maxFrameLimit]), so an unusable framer fails where the host configures it
+/// rather than on its first frame.
+int validateMaxFrame(int maxFrame) {
+  if (maxFrame < 1 || maxFrame > maxFrameLimit) {
+    throw InvalidMaxFrameException(maxFrame, maxFrameLimit);
+  }
+  return maxFrame;
+}
+
 /// Transport-level status. Distinct from application errors, which ride inside the
 /// payload as a declared `/ ErrorType` arm.
 ///
@@ -109,6 +126,13 @@ class FrameTooLargeException extends TransportException {
   final int maximum;
   FrameTooLargeException(this.got, this.maximum)
       : super('frame of $got bytes exceeds max-frame guard of $maximum bytes');
+}
+
+class InvalidMaxFrameException extends TransportException {
+  final int got;
+  final int limit;
+  InvalidMaxFrameException(this.got, this.limit)
+      : super('max-frame limit of $got is outside the valid range 1..=$limit');
 }
 
 class UnsupportedVersionException extends TransportException {

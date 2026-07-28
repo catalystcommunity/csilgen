@@ -3025,7 +3025,7 @@ pub fn main() !void {{
     defer _ = gpa.deinit();
     const alloc = gpa.allocator();
 
-    var tls_carrier = try openTlsCarrier(alloc, "localhost", 7443);
+    var tls_carrier = try openTlsCarrier(alloc, "localhost", 7443, csil.conventions.MAX_FRAME_DEFAULT);
     const carrier = tls_carrier.carrier();
     defer carrier.close();
 
@@ -3126,6 +3126,11 @@ const TlsFrameCarrier = struct {
     stream: std.net.Stream,
     tls_client: std.crypto.tls.Client,
     ca: std.crypto.Certificate.Bundle,
+    // The max-frame guard is a carrier setting, not a generated constant: raise it when a
+    // peer accepts payloads larger than the 16 MiB default (the envelope adds framing and
+    // request metadata around the payload, so the limit must exceed the largest payload),
+    // or lower it to harden an exposed listener. Valid limits are
+    // 1..=csil.conventions.MAX_FRAME_LIMIT; openTlsCarrier validates the one it is given.
     max_frame: usize = csil.conventions.MAX_FRAME_DEFAULT,
 
     fn carrier(self: *TlsFrameCarrier) carrier_seam.FrameCarrier {
@@ -3172,7 +3177,9 @@ const TlsFrameCarrier = struct {
     }
 };
 
-fn openTlsCarrier(alloc: std.mem.Allocator, host: []const u8, port: u16) !TlsFrameCarrier {
+fn openTlsCarrier(alloc: std.mem.Allocator, host: []const u8, port: u16, max_frame: usize) !TlsFrameCarrier {
+    // Validated up front so a misconfigured guard fails at connect rather than mid-session.
+    const limit = try csil.conventions.validate_max_frame(max_frame);
     const stream = try std.net.tcpConnectToHost(alloc, host, port);
     var ca = std.crypto.Certificate.Bundle{};
     try ca.rescan(alloc);
@@ -3180,7 +3187,7 @@ fn openTlsCarrier(alloc: std.mem.Allocator, host: []const u8, port: u16) !TlsFra
         .host = .{ .explicit = host },
         .ca = .{ .bundle = ca },
     });
-    return .{ .stream = stream, .tls_client = tls_client, .ca = ca };
+    return .{ .stream = stream, .tls_client = tls_client, .ca = ca, .max_frame = limit };
 }
 "#;
 
@@ -3191,7 +3198,7 @@ const EVENTS_NOCHANNEL_SESSION_ZIG: &str = r#"pub fn main() !void {
     defer _ = gpa.deinit();
     const alloc = gpa.allocator();
 
-    var tls_carrier = try openTlsCarrier(alloc, "localhost", 7443);
+    var tls_carrier = try openTlsCarrier(alloc, "localhost", 7443, csil.conventions.MAX_FRAME_DEFAULT);
     const carrier = tls_carrier.carrier();
     defer carrier.close();
 

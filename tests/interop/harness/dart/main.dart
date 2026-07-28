@@ -140,6 +140,13 @@ bool constrainedEq(Constrained a, Constrained b) =>
     treeEqual(a.toCborValue(), b.toCborValue());
 bool nestedEq(Nested a, Nested b) =>
     treeEqual(a.toCborValue(), b.toCborValue());
+bool bytesEq(Uint8List a, Uint8List b) {
+  if (a.length != b.length) return false;
+  for (var i = 0; i < a.length; i++) {
+    if (a[i] != b[i]) return false;
+  }
+  return true;
+}
 
 // ---------------------------------------------------------------------------
 // Result accumulation + JSON output.
@@ -209,6 +216,8 @@ final class Handlers implements InteropHandler {
   @override
   EchoNestedResult echoNested(Nested request) =>
       EchoNestedResult(ok: true, echo: request);
+  @override
+  OptBytes echoOptBytes(OptBytes request) => request;
   @override
   Constrained validateConstrained(Constrained request) {
     request.validate();
@@ -366,6 +375,9 @@ HandlerOutcome rpcDispatch(Handlers handlers, RpcRequest req) {
       case 'echo-nested':
         return Reply('EchoNestedResult',
             handlers.echoNested(Nested.fromCbor(req.payload)).toCbor());
+      case 'echo-opt-bytes':
+        return Reply('OptBytes',
+            handlers.echoOptBytes(OptBytes.fromCbor(req.payload)).toCbor());
       case 'validate-constrained':
         final input = Constrained.fromCbor(req.payload);
         try {
@@ -439,6 +451,35 @@ Cases rpcClient(SyncStreamFrameCarrier carrier) {
   } catch (e) {
     cases.fail(
         'validate-constrained/failure', 'expected service error, got $e');
+  }
+  // Optional-bytes presence: absent, present-empty, and present-non-empty are three
+  // distinct states that must each survive the round trip unchanged. `null` is the absent
+  // marker -- a zero-length Uint8List is present and must not decode to null.
+  try {
+    final r = client.echoOptBytes(OptBytes(tag: 'absent'));
+    cases.check('opt-bytes/absent', r.payload == null,
+        'expected absent, got ${r.payload}');
+  } catch (e) {
+    cases.fail('opt-bytes/absent', '$e');
+  }
+  try {
+    final r = client
+        .echoOptBytes(OptBytes(tag: 'empty', payload: Uint8List(0)));
+    cases.check('opt-bytes/present-empty',
+        r.payload != null && r.payload!.isEmpty,
+        'expected present-and-empty, got ${r.payload}');
+  } catch (e) {
+    cases.fail('opt-bytes/present-empty', '$e');
+  }
+  try {
+    final sent = Uint8List.fromList([0x01, 0x02, 0xf0, 0xff]);
+    final r = client.echoOptBytes(OptBytes(tag: 'full', payload: sent));
+    cases.check(
+        'opt-bytes/present-non-empty',
+        r.payload != null && bytesEq(r.payload!, sent),
+        'expected 0102f0ff, got ${r.payload}');
+  } catch (e) {
+    cases.fail('opt-bytes/present-non-empty', '$e');
   }
   return cases;
 }

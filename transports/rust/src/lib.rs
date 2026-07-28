@@ -16,7 +16,9 @@ pub mod datagrams;
 pub mod events;
 pub mod rpc;
 
-pub use conventions::{Result, Status, TransportError, VERSION};
+pub use conventions::{
+    MAX_FRAME_DEFAULT, MAX_FRAME_LIMIT, Result, Status, TransportError, VERSION, validate_max_frame,
+};
 
 /// A UDP-backed `DatagramCarrier`. Built-in convenience for the native datagram
 /// path; the browser path (WebRTC unreliable / WebTransport) implements the same
