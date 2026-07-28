@@ -16,6 +16,10 @@ val control_service_ord : int64
 (* Default max encoded envelope size for stream/message carriers (16 MiB). *)
 val max_frame_default : int
 
+(* Largest max-frame guard a host may configure (2 GiB - 1) — the portable ceiling
+   shared by every CSIL transport. *)
+val max_frame_limit : int
+
 (* A transport-level status, distinct from application errors (which ride inside
    the payload as a declared [/ ErrorType] arm). Carried as the raw wire code so
    host-defined extension codes (>= 64) and unknown codes compare correctly. *)
@@ -40,11 +44,15 @@ val status_name : status -> string
 type error =
   | Malformed of string
   | Frame_too_large of { got : int; maximum : int }
+  | Invalid_max_frame of { got : int; limit : int }
   | Unsupported_version of int64
   | Carrier of string
   | Status_error of { status : string; code : int64; message : string }
 
 val error_message : error -> string
+
+(* Check a host-supplied max-frame limit against 1..[max_frame_limit]. *)
+val validate_max_frame : int -> (int, error) result
 
 (* Build a [Malformed] error from a format string (the "malformed envelope:" prefix
    is added by [error_message]). Shared by the per-transport envelope decoders. *)

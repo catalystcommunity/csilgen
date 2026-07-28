@@ -52,8 +52,13 @@ if(PROJECT_IS_TOP_LEVEL AND BUILD_TESTING)
     target_link_libraries(test_roundtrip PRIVATE csil_transport)
     add_test(NAME roundtrip COMMAND test_roundtrip)
 
+    add_executable(test_max_frame tests/test_max_frame.c)
+    target_link_libraries(test_max_frame PRIVATE csil_transport)
+    add_test(NAME max_frame COMMAND test_max_frame)
+
     if(NOT MSVC)
         target_compile_options(test_conformance PRIVATE -Wall -Wextra -Wpedantic)
         target_compile_options(test_roundtrip PRIVATE -Wall -Wextra -Wpedantic)
+        target_compile_options(test_max_frame PRIVATE -Wall -Wextra -Wpedantic)
     endif()
 endif()

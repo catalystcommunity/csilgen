@@ -577,6 +577,51 @@ fn corndogs_spec() -> CsilSpecSerialized {
     }
 }
 
+/// An optional `bytes` field carries three distinct states — absent, present-and-empty,
+/// present-and-non-empty — and the codec must decide presence by whether the value is
+/// set, never by whether it is non-empty (cbor-wire-contract.md "Optional fields"). A
+/// `Bytes.length > 0` guard would collapse present-empty into absent and silently lose a
+/// caller's "replace this with nothing".
+#[test]
+fn optional_bytes_encodes_on_presence_not_emptiness() {
+    let spec = CsilSpecSerialized {
+        rules: vec![group_rule(
+            "UpdateRequest",
+            vec![
+                bare_entry("id", builtin("text")),
+                optional_entry("payload", builtin("bytes")),
+            ],
+        )],
+        source_content: None,
+        service_count: 0,
+        fields_with_metadata_count: 0,
+    };
+    let (types, _mli) = generate_types(&spec);
+    let codec = generate_codec(&spec).expect("codec emitted");
+
+    // `bytes option` distinguishes None (absent) from `Some Bytes.empty`
+    // (present-and-empty).
+    assert!(
+        types.contains("payload : bytes option"),
+        "optional bytes needs a presence-carrying type:\n{types}"
+    );
+    // Encode matches on the option, never on the length.
+    assert!(
+        codec.contains("(match v.payload with Some csil_x -> Some (Cbor.Text \"payload\""),
+        "encode must gate on presence, not emptiness:\n{codec}"
+    );
+    assert!(
+        !codec.contains("Bytes.length v.payload"),
+        "encode must not gate on emptiness:\n{codec}"
+    );
+    // Decode maps a missing key to None but keeps a present zero-length byte string as
+    // `Some`, so the three states stay distinct.
+    assert!(
+        codec.contains("match csil_field \"payload\" with Some csil_v -> Some (Cbor.to_bytes csil_v) | None -> None"),
+        "decode must gate on key presence:\n{codec}"
+    );
+}
+
 #[test]
 fn codec_emitted_with_typed_client() {
     let spec = corndogs_spec();
@@ -1659,7 +1704,10 @@ fn genquickstart_events_section_handshake_and_router_dispatch() {
 
     assert!(c.contains("## CSIL-Events (TLS)"));
     // A frame carrier built on the library's length-prefix framing over a stream.
-    assert!(c.contains("Carrier.stream_carrier ic oc"));
+    // The carrier is built with an explicit max-frame limit so an operator can see and
+    // change the guard without editing generated source (conventions doc §5).
+    assert!(c.contains("Carrier.stream_carrier_with_max_frame ~max_frame ic oc"));
+    assert!(c.contains("let max_frame = Conventions.max_frame_default"));
     assert!(c.contains("TLS swap point"));
     // The $hello / $hello-ack handshake via the library control plane.
     assert!(c.contains("Events.encode_hello hello"));

@@ -42,12 +42,14 @@ import {
   fromCollectionsCbor,
   fromConstrainedCbor,
   fromNestedCbor,
+  fromOptBytesCbor,
   fromScalarsCbor,
   fromServiceErrorCbor,
   fromTickCbor,
   toCollectionsCbor,
   toConstrainedCbor,
   toEchoNestedResultCbor,
+  toOptBytesCbor,
   toScalarsCbor,
   toServiceErrorCbor,
   toTickCbor,
@@ -265,6 +267,8 @@ function rpcDispatch(req: RpcRequest): HandlerOutcome {
           "EchoNestedResult",
           toEchoNestedResultCbor({ ok: true, echo: fromNestedCbor(req.payload) }),
         );
+      case "echo-opt-bytes":
+        return okReply("OptBytes", toOptBytesCbor(fromOptBytesCbor(req.payload)));
       case "validate-constrained": {
         const v = fromConstrainedCbor(req.payload);
         const errs = validateConstrained(v);
@@ -352,6 +356,37 @@ async function rpcClient(sock: net.Socket): Promise<Cases> {
   } catch {
     // The typed error arm surfaces as a thrown service error.
     cases.pass("validate-constrained/failure");
+  }
+
+  // Optional-bytes presence: absent, present-empty, and present-non-empty are three
+  // distinct states that must each survive the round trip unchanged. `undefined` is the
+  // absent marker -- a zero-length Uint8Array is present, and must not decode to undefined.
+  try {
+    const r = await client.echoOptBytes({ tag: "absent" });
+    cases.check("opt-bytes/absent", r.payload === undefined, `expected absent, got ${r.payload}`);
+  } catch (e) {
+    cases.fail("opt-bytes/absent", String(e));
+  }
+  try {
+    const r = await client.echoOptBytes({ tag: "empty", payload: new Uint8Array(0) });
+    cases.check(
+      "opt-bytes/present-empty",
+      r.payload !== undefined && r.payload.length === 0,
+      `expected present-and-empty, got ${r.payload}`,
+    );
+  } catch (e) {
+    cases.fail("opt-bytes/present-empty", String(e));
+  }
+  try {
+    const sent = new Uint8Array([0x01, 0x02, 0xf0, 0xff]);
+    const r = await client.echoOptBytes({ tag: "full", payload: sent });
+    cases.check(
+      "opt-bytes/present-non-empty",
+      r.payload !== undefined && Buffer.compare(Buffer.from(r.payload), Buffer.from(sent)) === 0,
+      `expected 0102f0ff, got ${r.payload}`,
+    );
+  } catch (e) {
+    cases.fail("opt-bytes/present-non-empty", String(e));
   }
   return cases;
 }

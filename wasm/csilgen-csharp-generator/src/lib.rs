@@ -729,13 +729,20 @@ using __NAMESPACE__;
 
 public static class CsilEventsExample
 {
+    // The max-frame guard is a carrier setting, not a generated constant: raise it when a
+    // peer accepts payloads larger than the 16 MiB default (the envelope adds framing and
+    // request metadata around the payload, so the limit must exceed the largest payload),
+    // or lower it to harden an exposed listener. Valid limits are 1..=Conventions.MaxFrameLimit
+    // and are checked at construction.
+    const int MaxFrame = Conventions.MaxFrameDefault;
+
     static IFrameCarrier OpenTlsCarrier(string host, int port)
     {
         var tcp = new TcpClient(host, port);
         var tls = new SslStream(tcp.GetStream());
         tls.AuthenticateAsClient(host);
         // StreamCarrier owns the length-prefix framing over any duplex stream.
-        return new StreamCarrier(tls);
+        return new StreamCarrier(tls, MaxFrame);
     }
 
     // Bridges the library's byte seam to the generated static Codec. Codec.Decode is
@@ -801,12 +808,16 @@ using Csilgen.Transport;
 
 public static class CsilEventsExample
 {
+    // The max-frame guard is a carrier setting an operator can raise or lower; valid limits
+    // are 1..=Conventions.MaxFrameLimit and are checked at construction.
+    const int MaxFrame = Conventions.MaxFrameDefault;
+
     static IFrameCarrier OpenTlsCarrier(string host, int port)
     {
         var tcp = new TcpClient(host, port);
         var tls = new SslStream(tcp.GetStream());
         tls.AuthenticateAsClient(host);
-        return new StreamCarrier(tls);
+        return new StreamCarrier(tls, MaxFrame);
     }
 
     public static void Run()
@@ -5032,7 +5043,10 @@ System.Console.WriteLine("ok");
 
         let events = section(readme, "## CSIL-Events (TLS)");
         // Events: the lib's handshake/framing/heartbeat surface + the generated router.
-        assert!(events.contains("new StreamCarrier(tls)"));
+        // The carrier is built with an explicit max-frame limit so an operator can see and
+        // change the guard without editing generated source (conventions doc §5).
+        assert!(events.contains("new StreamCarrier(tls, MaxFrame)"));
+        assert!(events.contains("const int MaxFrame = Conventions.MaxFrameDefault;"));
         assert!(events.contains("new Hello("));
         // The handshake and the outbound send name the service by its verbatim CSIL name.
         assert!(events.contains("{ Service = \"Echo\" }.Encode()"));
@@ -5612,6 +5626,71 @@ System.Console.WriteLine("ok");
                 homepage: None,
             },
         }
+    }
+
+    /// An optional `bytes` field carries three distinct states — absent,
+    /// present-and-empty, present-and-non-empty — and the codec must decide presence by
+    /// whether the value is set, never by whether it is non-empty (cbor-wire-contract.md
+    /// "Optional fields"). A `.Length > 0` guard would collapse present-empty into absent
+    /// and silently lose a caller's "replace this with nothing".
+    #[test]
+    fn optional_bytes_encodes_on_presence_not_emptiness() {
+        let pos = || CsilPosition {
+            line: 1,
+            column: 1,
+            offset: 0,
+        };
+        let payload = CsilGroupEntry {
+            key: Some(CsilGroupKey::Bare("payload".to_string())),
+            value_type: CsilTypeExpression::Builtin("bytes".to_string()),
+            occurrence: Some(CsilOccurrence::Optional),
+            metadata: vec![],
+            doc_comments: Vec::new(),
+        };
+        let rule = CsilRule {
+            name: "UpdateRequest".to_string(),
+            rule_type: CsilRuleType::GroupDef(CsilGroupExpression {
+                entries: vec![
+                    bare_entry("id", CsilTypeExpression::Builtin("text".to_string())),
+                    payload,
+                ],
+            }),
+            position: pos(),
+            doc_comments: Vec::new(),
+        };
+        let mut input = self_named_input("csharp-client");
+        input.csil_spec = CsilSpecSerialized {
+            rules: vec![rule],
+            source_content: None,
+            service_count: 0,
+            fields_with_metadata_count: 0,
+        };
+
+        let output = render(input).expect("generation ok");
+        let types = file_content(&output, "Types.gen.cs");
+        let codec = file_content(&output, "Codec.gen.cs");
+
+        // A nullable byte[] distinguishes null (absent) from an empty array
+        // (present-and-empty).
+        assert!(
+            types.contains("public byte[]? Payload { get; init; }"),
+            "optional bytes needs a presence-carrying type:\n{types}"
+        );
+        // Encode gates on the value being set (`is { }`), not on its length.
+        assert!(
+            codec.contains("if (value.Payload is { } csilV1)"),
+            "encode must gate on presence, not emptiness:\n{codec}"
+        );
+        assert!(
+            !codec.contains("value.Payload.Length > 0"),
+            "encode must not gate on emptiness:\n{codec}"
+        );
+        // Decode maps a missing key to null but keeps a present zero-length byte string,
+        // so the three states stay distinct.
+        assert!(
+            codec.contains("Cbor.MapGet(value, \"payload\") is { } csilRaw1"),
+            "decode must gate on key presence:\n{codec}"
+        );
     }
 
     /// A member spelled like its enclosing type is CS0542 in C#: `Relation.relation`

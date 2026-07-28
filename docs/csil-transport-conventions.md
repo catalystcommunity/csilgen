@@ -203,8 +203,22 @@ UDP/WebRTC/QUIC datagram, one body per HTTP message). Two rules are shared:
 - **Max frame guard.** Every stream/message carrier MUST enforce a configurable
   maximum encoded envelope size and reject anything larger before allocating for
   it, so a hostile or corrupt length prefix cannot exhaust memory. The default is
-  **16 MiB**; hosts may lower it. Datagrams have their own, much smaller, MTU
-  limit (see that spec).
+  **16 MiB**. Datagrams have their own, much smaller, MTU limit (see that spec).
+- **Configuring the guard.** A host MUST be able to set the limit — up or down —
+  through the carrier's public API, without editing generated code. The guard
+  applies in both directions: a carrier rejects an outbound frame larger than the
+  limit, and rejects an inbound length prefix larger than the limit *before* it
+  allocates the frame buffer. Because an envelope carries CSIL-RPC framing and
+  request metadata around the payload, the limit must exceed the largest payload
+  a peer accepts, not equal it.
+- **Valid limits.** A limit is valid when it is at least 1 byte and at most
+  **2147483647** (2 GiB − 1). An implementation MUST reject an invalid limit
+  where the host supplies it, rather than clamping it or deferring the failure to
+  the first frame. The 4-byte length prefix can express a larger value, but a
+  limit is held in a signed 32-bit integer in several supported languages, so
+  2147483647 is the portable ceiling every implementation agrees on. A limit
+  above that ceiling would also silently disable the receive guard, since no wire
+  length could ever exceed it.
 - **Self-delimited payloads.** Because the payload is a tag-24 byte string, its
   length is known from the envelope; a receiver never needs to guess where the
   payload ends.

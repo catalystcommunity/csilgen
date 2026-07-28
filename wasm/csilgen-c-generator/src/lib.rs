@@ -3966,9 +3966,17 @@ static int on_{handler_method}(void *ctx, const {inbound_type} *msg) {{
     return 0;
 }}
 
+/* The max-frame guard is a carrier setting, not a generated constant: raise it when a
+   peer accepts payloads larger than the 16 MiB default (the envelope adds framing and
+   request metadata around the payload, so the limit must exceed the largest payload), or
+   lower it to harden an exposed listener. Valid limits are 1..CSIL_MAX_FRAME_LIMIT; an
+   invalid one yields a carrier with NULL send_frame/recv_frame, checked below. */
+#define MAX_FRAME CSIL_MAX_FRAME_DEFAULT
+
 static int session(SSL *ssl) {{
     csil_stream stream = {{ .read = tls_read, .write = tls_write, .userdata = ssl }};
-    csil_frame_carrier carrier = csil_stream_carrier(&stream, 0);
+    csil_frame_carrier carrier = csil_stream_carrier(&stream, MAX_FRAME);
+    if (!carrier.send_frame) {{ return -1; }} /* invalid max-frame limit */
     CsilgenCodec codec = {{ .decode = channel_decode, .encode = channel_encode, .self = NULL }};
     {handlers_struct} handlers = {{ .{handler_method} = on_{handler_method} }};
 
@@ -4301,9 +4309,15 @@ static int tls_write(void *self, const uint8_t *buf, size_t len) {
 
 /// The Events session body when the spec declares no `<->` op: the handshake and heartbeat
 /// still apply, so they are shown, with a note where the dispatch would go.
-const EVENTS_NO_CHANNEL_SESSION_C: &str = r##"static int session(SSL *ssl) {
+const EVENTS_NO_CHANNEL_SESSION_C: &str = r##"/* The max-frame guard is a carrier setting an
+   operator can raise or lower; valid limits are 1..CSIL_MAX_FRAME_LIMIT, and an invalid one
+   yields a carrier with NULL send_frame/recv_frame, checked below. */
+#define MAX_FRAME CSIL_MAX_FRAME_DEFAULT
+
+static int session(SSL *ssl) {
     csil_stream stream = { .read = tls_read, .write = tls_write, .userdata = ssl };
-    csil_frame_carrier carrier = csil_stream_carrier(&stream, 0);
+    csil_frame_carrier carrier = csil_stream_carrier(&stream, MAX_FRAME);
+    if (!carrier.send_frame) { return -1; } /* invalid max-frame limit */
 
     // $hello / $hello-ack handshake (control plane).
     const uint64_t versions[] = { CSIL_VERSION };

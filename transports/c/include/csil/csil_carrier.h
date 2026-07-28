@@ -56,7 +56,11 @@ typedef struct csil_stream {
  * big-endian length-prefix framing, enforcing max_frame (0 selects
  * CSIL_MAX_FRAME_DEFAULT) before allocating or sending. The returned carrier's
  * userdata points at a heap copy of *stream; release it with
- * csil_stream_carrier_dispose. */
+ * csil_stream_carrier_dispose.
+ *
+ * A max_frame outside 1..CSIL_MAX_FRAME_LIMIT yields a carrier with NULL
+ * send_frame/recv_frame — the same unusable-carrier signal as an allocation
+ * failure, so the host detects a misconfigured limit at construction. */
 csil_frame_carrier csil_stream_carrier(const csil_stream *stream, size_t max_frame);
 void csil_stream_carrier_dispose(csil_frame_carrier *carrier);
 

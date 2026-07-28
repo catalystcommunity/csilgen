@@ -694,7 +694,7 @@ fn events_section(import: &str, ch: Option<&ChannelExample>) -> String {
     );
     out.push_str("```python\n");
     out.push_str("import socket\nimport ssl\n\n");
-    out.push_str("from csilgen_transport import VERSION\n");
+    out.push_str("from csilgen_transport import MAX_FRAME_DEFAULT, VERSION\n");
     out.push_str(
         "from csilgen_transport.carrier import StreamCarrier\n\
          from csilgen_transport.events import Event, Hello, HelloAck, Heartbeat, Profile, control\n",
@@ -727,12 +727,21 @@ fn events_section(import: &str, ch: Option<&ChannelExample>) -> String {
 /// 4-byte length-prefix framing; the codec bridges the library's byte seam to this
 /// package's generated per-type `to_cbor`/`from_cbor`.
 const EVENTS_CARRIER_PYTHON: &str = r#"# One example carrier: a TLS byte stream framed with CSIL's 4-byte length prefix.
+
+# The max-frame guard is a carrier setting, not a generated constant: raise it when a
+# peer accepts payloads larger than the 16 MiB default (the envelope adds framing and
+# request metadata around the payload, so the limit must exceed the largest payload),
+# or lower it to harden an exposed listener. Valid limits are 1..=MAX_FRAME_LIMIT and
+# are checked at construction.
+MAX_FRAME = MAX_FRAME_DEFAULT
+
+
 def open_tls_carrier(host: str, port: int) -> StreamCarrier:
     raw = socket.create_connection((host, port))
     ctx = ssl.create_default_context()
     tls = ctx.wrap_socket(raw, server_hostname=host)
     # StreamCarrier owns the length-prefix framing over any read/write/flush stream.
-    return StreamCarrier(tls.makefile("rwb"))
+    return StreamCarrier(tls.makefile("rwb"), max_frame=MAX_FRAME)
 
 
 class GenCodec:
@@ -4555,6 +4564,79 @@ mod tests {
         ] {
             assert_eq!(generator.map_builtin_type(builtin).unwrap(), expected);
         }
+    }
+
+    /// An optional `bytes` field carries three distinct states — absent,
+    /// present-and-empty, present-and-non-empty — and the codec must decide presence by
+    /// whether the value is set, never by whether it is non-empty (cbor-wire-contract.md
+    /// "Optional fields"). `if csil_x:` would treat `b""` as absent; the emitted guard
+    /// must be `is not None` so a caller's "replace this with nothing" survives.
+    #[test]
+    fn optional_bytes_encodes_on_presence_not_emptiness() {
+        let spec = CsilSpecSerialized {
+            rules: vec![CsilRule {
+                name: "UpdateRequest".to_string(),
+                rule_type: CsilRuleType::GroupDef(CsilGroupExpression {
+                    entries: vec![
+                        CsilGroupEntry {
+                            key: Some(CsilGroupKey::Bare("id".to_string())),
+                            value_type: CsilTypeExpression::Builtin("text".to_string()),
+                            occurrence: None,
+                            metadata: vec![],
+                            doc_comments: Vec::new(),
+                        },
+                        CsilGroupEntry {
+                            key: Some(CsilGroupKey::Bare("payload".to_string())),
+                            value_type: CsilTypeExpression::Builtin("bytes".to_string()),
+                            occurrence: Some(CsilOccurrence::Optional),
+                            metadata: vec![],
+                            doc_comments: Vec::new(),
+                        },
+                    ],
+                }),
+                position: create_test_position(),
+                doc_comments: Vec::new(),
+            }],
+            source_content: None,
+            service_count: 0,
+            fields_with_metadata_count: 0,
+        };
+
+        let result =
+            generate_python_code_from_serialized(&spec, &create_test_config(false)).unwrap();
+        let types = &result
+            .iter()
+            .find(|f| f.path == "types.py")
+            .unwrap()
+            .content;
+        let codec = &result
+            .iter()
+            .find(|f| f.path == "codec.py")
+            .unwrap()
+            .content;
+
+        // `Optional` distinguishes None (absent) from `b""` (present-and-empty).
+        assert!(
+            types.contains("payload: Optional[bytes] = None"),
+            "optional bytes needs a presence-carrying type:\n{types}"
+        );
+        // Encode gates on `is not None`, never on truthiness.
+        assert!(
+            codec.contains("if csil_x is not None:"),
+            "encode must gate on presence, not emptiness:\n{codec}"
+        );
+        assert!(
+            !codec.contains("if csil_x:"),
+            "encode must not gate on truthiness -- b\"\" is present:\n{codec}"
+        );
+        // Decode maps a missing key to None but keeps a present zero-length byte string
+        // as `b""`, so the three states stay distinct.
+        assert!(
+            codec.contains(
+                "payload=(None if tree.get(\"payload\") is None else _csil_expect_bytes(tree[\"payload\"]))"
+            ),
+            "decode must gate on key presence:\n{codec}"
+        );
     }
 
     #[test]

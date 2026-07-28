@@ -24,6 +24,23 @@ const ControlServiceOrd uint64 = 0
 // carriers (16 MiB). A carrier rejects anything larger before allocating for it.
 const MaxFrameDefault = 16 * 1024 * 1024
 
+// MaxFrameLimit is the largest max-frame limit a host may configure (2 GiB - 1).
+// The 4-byte length prefix can express more, but the limit lives in a signed
+// 32-bit integer in several supported languages, so this is the portable ceiling
+// every CSIL transport agrees on. Anything above it would also disable the receive
+// guard outright, since no wire length could exceed it.
+const MaxFrameLimit = 2147483647
+
+// ValidateMaxFrame checks a host-supplied max-frame limit against the conventions
+// doc range (1..=MaxFrameLimit), so an unusable carrier fails at construction
+// rather than on its first frame.
+func ValidateMaxFrame(maxFrame int) error {
+	if maxFrame < 1 || maxFrame > MaxFrameLimit {
+		return ErrInvalidMaxFrame{Got: maxFrame, Limit: MaxFrameLimit}
+	}
+	return nil
+}
+
 // Status is a transport-level status. It is distinct from application errors,
 // which ride inside the payload as a declared `/ ErrorType` arm. See the
 // conventions doc registry. Equality is by the underlying code, so host-defined
@@ -88,6 +105,17 @@ type ErrFrameTooLarge struct {
 
 func (e ErrFrameTooLarge) Error() string {
 	return fmt.Sprintf("frame of %d bytes exceeds max-frame guard of %d bytes", e.Got, e.Max)
+}
+
+// ErrInvalidMaxFrame is returned when a host configures a max-frame limit outside
+// the valid range.
+type ErrInvalidMaxFrame struct {
+	Got   int
+	Limit int
+}
+
+func (e ErrInvalidMaxFrame) Error() string {
+	return fmt.Sprintf("max-frame limit of %d is outside the valid range 1..=%d", e.Got, e.Limit)
 }
 
 // ErrUnsupportedVersion is returned when an envelope's version is not supported.

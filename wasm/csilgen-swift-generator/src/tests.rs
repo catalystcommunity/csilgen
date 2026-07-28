@@ -153,6 +153,56 @@ fn array_and_map_mapping() {
     assert_eq!(map_type(&map, false), "[String: [UInt8]]");
 }
 
+/// An optional `bytes` field carries three distinct states — absent, present-and-empty,
+/// present-and-non-empty — and the codec must decide presence by whether the value is
+/// set, never by whether it is non-empty (cbor-wire-contract.md "Optional fields"). An
+/// `isEmpty` guard would collapse present-empty into absent and silently lose a caller's
+/// "replace this with nothing".
+///
+/// Swift is asserted at the source level rather than executed: there is no `swiftc` in
+/// the toolchain set, and unlike the other 13 languages Swift has no `tests/interop`
+/// harness to run it end to end.
+#[test]
+fn optional_bytes_encodes_on_presence_not_emptiness() {
+    let input = input_from_rules(
+        "swift",
+        vec![group_rule(
+            "UpdateRequest",
+            vec![
+                bare_entry("id", builtin("text")),
+                opt_entry("payload", builtin("bytes")),
+            ],
+        )],
+        0,
+    );
+    let types = generate_types(&input).expect("types emitted");
+    let codec = generate_codec(&input).expect("codec emitted");
+
+    // The field type must be able to hold all three states: `Optional` distinguishes
+    // nil (absent) from `.some([])` (present-and-empty).
+    assert!(
+        types.contains("public let payload: [UInt8]?"),
+        "optional bytes needs a presence-carrying type:\n{types}"
+    );
+    // Encode gates on presence (`if let`), not on emptiness.
+    assert!(
+        codec.contains(
+            "if let csilV = self.payload { csilEntries.append((\"payload\", .bytes(csilV))) }"
+        ),
+        "encode must gate on presence, not emptiness:\n{codec}"
+    );
+    assert!(
+        !codec.contains("payload.isEmpty"),
+        "encode must not gate on emptiness:\n{codec}"
+    );
+    // Decode gates on the key being present in the map; a present empty byte string
+    // therefore stays `.some([])` rather than collapsing to nil.
+    assert!(
+        codec.contains("if let csilV = CsilCbor.mapGet(cborValue, \"payload\")"),
+        "decode must gate on key presence:\n{codec}"
+    );
+}
+
 #[test]
 fn snake_case_field_becomes_camel_with_verbatim_wire_key() {
     let rule = group_rule(
@@ -1975,8 +2025,13 @@ fn readme_rpc_section_uses_lib_envelope_and_example_call() {
 fn readme_events_section_handshake_heartbeat_and_router_dispatch() {
     let c = render_transports_readme(vec![]);
     assert!(c.contains("## CSIL-Events (TLS)"));
-    // A frame carrier over a TLS byte stream via the lib's StreamCarrier framing.
-    assert!(c.contains("StreamCarrier(stream: TlsByteStream(host: \"localhost\", port: 7443))"));
+    // A frame carrier over a TLS byte stream via the lib's StreamCarrier framing, built
+    // with an explicit max-frame limit so an operator can see and change the guard
+    // without editing generated source (conventions doc §5).
+    assert!(c.contains(
+        "stream: TlsByteStream(host: \"localhost\", port: 7443), maxFrame: maxFrameDefault"
+    ));
+    assert!(c.contains("let carrier = try StreamCarrier("));
     assert!(c.contains("final class TlsByteStream: ByteStream"));
     // The $hello / $hello-ack handshake with the lib Hello/HelloAck.
     assert!(

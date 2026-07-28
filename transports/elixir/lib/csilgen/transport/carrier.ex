@@ -29,9 +29,15 @@ defmodule Csilgen.Transport.Carrier do
   """
   @callback recv_frame(carrier()) :: {:ok, binary(), carrier()} | :closed | {:error, term()}
 
+  import Csilgen.Transport.Conventions, only: [is_valid_max_frame: 1]
+
   @doc "The default 16 MiB max-frame guard, shared with the conventions layer."
   @spec max_frame_default() :: pos_integer()
   def max_frame_default, do: Csilgen.Transport.Conventions.max_frame_default()
+
+  @doc "The largest max-frame guard a host may configure, shared with the conventions layer."
+  @spec max_frame_limit() :: pos_integer()
+  def max_frame_limit, do: Csilgen.Transport.Conventions.max_frame_limit()
 
   @doc """
   Wraps a frame in CSIL stream framing: a 4-byte big-endian length prefix. The
@@ -39,10 +45,18 @@ defmodule Csilgen.Transport.Carrier do
   rather than emitted.
   """
   @spec frame_length_prefixed(binary(), pos_integer()) ::
-          {:ok, binary()} | {:error, {:frame_too_large, non_neg_integer(), pos_integer()}}
+          {:ok, binary()}
+          | {:error, {:frame_too_large, non_neg_integer(), pos_integer()}}
+          | {:error, {:invalid_max_frame, term(), pos_integer()}}
   def frame_length_prefixed(frame, max \\ nil)
 
   def frame_length_prefixed(frame, nil), do: frame_length_prefixed(frame, max_frame_default())
+
+  # A limit outside the valid range is rejected here rather than silently framing
+  # against an unusable guard.
+  def frame_length_prefixed(_frame, max) when not is_valid_max_frame(max) do
+    {:error, {:invalid_max_frame, max, max_frame_limit()}}
+  end
 
   def frame_length_prefixed(frame, max) when is_binary(frame) and byte_size(frame) > max do
     {:error, {:frame_too_large, byte_size(frame), max}}
@@ -62,9 +76,16 @@ defmodule Csilgen.Transport.Carrier do
           {:ok, binary(), binary()}
           | :incomplete
           | {:error, {:frame_too_large, non_neg_integer(), pos_integer()}}
+          | {:error, {:invalid_max_frame, term(), pos_integer()}}
   def read_length_prefixed(buffer, max \\ nil)
 
   def read_length_prefixed(buffer, nil), do: read_length_prefixed(buffer, max_frame_default())
+
+  # A limit outside the valid range is rejected before any length is even read, so
+  # a misconfigured guard can never admit an oversized allocation.
+  def read_length_prefixed(_buffer, max) when not is_valid_max_frame(max) do
+    {:error, {:invalid_max_frame, max, max_frame_limit()}}
+  end
 
   # The length is read as an unsigned 32-bit value and checked against the guard
   # before the body slice is even attempted.

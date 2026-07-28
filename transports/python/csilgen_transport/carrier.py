@@ -17,6 +17,7 @@ from .conventions import (
     MAX_FRAME_DEFAULT,
     CarrierError,
     FrameTooLargeError,
+    validate_max_frame,
 )
 
 
@@ -106,13 +107,20 @@ class StreamCarrier(FrameCarrier):
 
     def __init__(self, stream, max_frame: int = MAX_FRAME_DEFAULT) -> None:
         self._stream = stream
-        self._max_frame = max_frame
+        # Validated here rather than at the first frame, so a misconfigured carrier
+        # is a construction-time error the host can surface at startup.
+        self._max_frame = validate_max_frame(max_frame)
 
     def send_frame(self, frame: bytes) -> None:
         write_length_prefixed(self._stream, frame, self._max_frame)
 
     def recv_frame(self) -> Optional[bytes]:
         return read_length_prefixed(self._stream, self._max_frame)
+
+    @property
+    def max_frame(self) -> int:
+        """The limit this carrier enforces in both directions."""
+        return self._max_frame
 
     @property
     def stream(self):

@@ -633,6 +633,7 @@ fn events_section(config: &KotlinConfig, ch: Option<&ChannelExample>) -> String 
          import community.catalyst.csilgen.transport.Hello\n\
          import community.catalyst.csilgen.transport.HelloAck\n\
          import community.catalyst.csilgen.transport.Profile\n\
+         import community.catalyst.csilgen.transport.MAX_FRAME_DEFAULT\n\
          import community.catalyst.csilgen.transport.StreamCarrier\n\
          import javax.net.ssl.SSLSocketFactory\n\n",
     );
@@ -651,9 +652,17 @@ fn events_section(config: &KotlinConfig, ch: Option<&ChannelExample>) -> String 
 /// transport-agnostic.
 const EVENTS_CARRIER_KT: &str = r#"// One example carrier: a TLS byte stream framed with CSIL's 4-byte length prefix. The
 // library's StreamCarrier owns the framing; we own only the socket.
+
+// The max-frame guard is a carrier setting, not a generated constant: raise it when a peer
+// accepts payloads larger than the 16 MiB default (the envelope adds framing and request
+// metadata around the payload, so the limit must exceed the largest payload), or lower it
+// to harden an exposed listener. Valid limits are 1..MAX_FRAME_LIMIT and are checked at
+// construction.
+const val MAX_FRAME: Int = MAX_FRAME_DEFAULT
+
 fun openTlsCarrier(host: String, port: Int): FrameCarrier {
     val socket = SSLSocketFactory.getDefault().createSocket(host, port)
-    return StreamCarrier(socket.getInputStream(), socket.getOutputStream())
+    return StreamCarrier(socket.getInputStream(), socket.getOutputStream(), MAX_FRAME)
 }
 "#;
 
@@ -3764,6 +3773,54 @@ mod tests {
             .find(|f| f.path.ends_with(suffix))
             .map(|f| f.content.clone())
             .unwrap_or_else(|| panic!("no file ending in {suffix}"))
+    }
+
+    /// An optional `bytes` field carries three distinct states — absent,
+    /// present-and-empty, present-and-non-empty — and the codec must decide presence by
+    /// whether the value is set, never by whether it is non-empty (cbor-wire-contract.md
+    /// "Optional fields"). An `isNotEmpty()` guard would collapse present-empty into
+    /// absent and silently lose a caller's "replace this with nothing".
+    #[test]
+    fn optional_bytes_encodes_on_presence_not_emptiness() {
+        let record = CsilGroupExpression {
+            entries: vec![
+                entry("id", CsilTypeExpression::Builtin("text".to_string()), None),
+                entry(
+                    "payload",
+                    CsilTypeExpression::Builtin("bytes".to_string()),
+                    Some(CsilOccurrence::Optional),
+                ),
+            ],
+        };
+        let out = process_generation(spec(
+            "kotlin",
+            vec![rule("UpdateRequest", CsilRuleType::GroupDef(record))],
+        ))
+        .unwrap();
+        let types = content(&out, "Types.kt");
+        let codec = content(&out, "Codec.kt");
+
+        // A nullable ByteArray distinguishes null (absent) from an empty array
+        // (present-and-empty).
+        assert!(
+            types.contains("val payload: ByteArray? = null"),
+            "optional bytes needs a presence-carrying type:\n{types}"
+        );
+        // Encode gates on presence (`?.let`), not on emptiness.
+        assert!(
+            codec.contains("this.payload?.let { csilV ->"),
+            "encode must gate on presence, not emptiness:\n{codec}"
+        );
+        assert!(
+            !codec.contains("payload.isNotEmpty()"),
+            "encode must not gate on emptiness:\n{codec}"
+        );
+        // Decode gates on the key being present in the map, so a present empty byte
+        // string stays non-null rather than collapsing to absent.
+        assert!(
+            codec.contains("CsilCbor.mapGet(cbor, \"payload\")?.let"),
+            "decode must gate on key presence:\n{codec}"
+        );
     }
 
     #[test]

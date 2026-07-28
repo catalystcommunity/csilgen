@@ -30,6 +30,7 @@ from interop_api import (
     InteropClient,
     InteropHandlers,
     Nested,
+    OptBytes,
     Scalars,
     ServiceError,
     Tick,
@@ -191,6 +192,9 @@ class Handlers(InteropHandlers):
     def echo_nested(self, req: Nested, ctx: dict) -> EchoNestedResult:
         return EchoNestedResult(ok=True, echo=req)
 
+    def echo_opt_bytes(self, req: OptBytes, ctx: dict) -> OptBytes:
+        return req
+
     def validate_constrained(self, req: Constrained, ctx: dict) -> Constrained:
         # Decode already ran validation (__post_init__); reaching here means valid.
         return req
@@ -241,6 +245,9 @@ def rpc_server(listener: socket.socket) -> None:
                 return Reply(
                     "EchoNestedResult", handlers.echo_nested(v, {}).to_cbor()
                 )
+            if op == "echo-opt-bytes":
+                v = OptBytes.from_cbor(req.payload)
+                return Reply("OptBytes", handlers.echo_opt_bytes(v, {}).to_cbor())
             if op == "validate-constrained":
                 # Decode validates; an invalid payload raises and is returned as the
                 # typed ServiceError arm (status-0 variant), the failure-case path.
@@ -312,6 +319,37 @@ def rpc_client(stream) -> Cases:
         cases.fail("validate-constrained/failure", "server accepted invalid input")
     except Exception:
         cases.pass_("validate-constrained/failure")
+
+    # Optional-bytes presence: absent, present-empty, and present-non-empty are three
+    # distinct states that must each survive the round trip unchanged. `is None` is the
+    # presence test -- `if payload:` would collapse present-empty into absent.
+    try:
+        r = client.echo_opt_bytes(OptBytes(tag="absent"))
+        cases.check(
+            "opt-bytes/absent", r.payload is None, f"expected absent, got {r.payload!r}"
+        )
+    except Exception as exc:
+        cases.fail("opt-bytes/absent", str(exc))
+
+    try:
+        r = client.echo_opt_bytes(OptBytes(tag="empty", payload=b""))
+        cases.check(
+            "opt-bytes/present-empty",
+            r.payload == b"" and r.payload is not None,
+            f"expected present-and-empty, got {r.payload!r}",
+        )
+    except Exception as exc:
+        cases.fail("opt-bytes/present-empty", str(exc))
+
+    try:
+        r = client.echo_opt_bytes(OptBytes(tag="full", payload=b"\x01\x02\xf0\xff"))
+        cases.check(
+            "opt-bytes/present-non-empty",
+            r.payload == b"\x01\x02\xf0\xff",
+            f"expected 0102f0ff, got {r.payload!r}",
+        )
+    except Exception as exc:
+        cases.fail("opt-bytes/present-non-empty", str(exc))
 
     return cases
 

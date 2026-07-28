@@ -1419,7 +1419,12 @@ fn readme_events_section_handshake_heartbeat_and_router_dispatch() {
     assert!(readme.contains("## CSIL-Events (TLS)"));
     // A frame carrier over a TLS byte stream via the lib's stream-carrier framing.
     assert!(readme.contains("csil_stream stream = { .read = tls_read, .write = tls_write"));
-    assert!(readme.contains("csil_frame_carrier carrier = csil_stream_carrier(&stream, 0)"));
+    // The carrier is built with an explicit max-frame limit so an operator can see and
+    // change the guard without editing generated source (conventions doc §5).
+    assert!(
+        readme.contains("csil_frame_carrier carrier = csil_stream_carrier(&stream, MAX_FRAME)")
+    );
+    assert!(readme.contains("#define MAX_FRAME CSIL_MAX_FRAME_DEFAULT"));
     // The $hello / $hello-ack handshake with the lib's Hello/HelloAck.
     assert!(readme.contains("csil_hello hello = {"));
     assert!(readme.contains("csil_hello_encode(&hello, &hb, &hbn)"));
@@ -2451,3 +2456,52 @@ int main(void) {
     return 0;
 }
 "#;
+
+/// An optional `bytes` field carries three distinct states — absent, present-and-empty,
+/// present-and-non-empty — and the codec must decide presence by whether the value is
+/// set, never by whether it is non-empty (cbor-wire-contract.md "Optional fields"). A
+/// `->len > 0` guard would collapse present-empty into absent and silently lose a
+/// caller's "replace this with nothing".
+#[test]
+fn optional_bytes_encodes_on_presence_not_emptiness() {
+    let mut payload = bare_entry("payload", builtin("bytes"));
+    payload.occurrence = Some(CsilOccurrence::Optional);
+    let input = input_with_rules(
+        vec![group_rule(
+            "UpdateRequest",
+            vec![bare_entry("id", builtin("text")), payload],
+        )],
+        "c",
+        HashMap::new(),
+    );
+    let config = CConfig::from_options(&input.config.options).unwrap();
+    let types = generate_types(&input, &config).expect("types emitted");
+    let mut warnings = Vec::new();
+    let codec = generate_codec(&input, &config, &mut warnings).expect("codec emitted");
+
+    // A pointer distinguishes NULL (absent) from a CsilBytes with len 0
+    // (present-and-empty).
+    assert!(
+        types.contains("CsilBytes *payload;"),
+        "optional bytes needs a presence-carrying type:\n{types}"
+    );
+    // Both the map-size count and the emit gate on the pointer, not the length.
+    assert!(
+        codec.contains("if (v->payload) csilc_n++;"),
+        "the map-size count must gate on presence:\n{codec}"
+    );
+    assert!(
+        codec.contains("if (v->payload) {"),
+        "encode must gate on presence, not emptiness:\n{codec}"
+    );
+    assert!(
+        !codec.contains("v->payload->len > 0"),
+        "encode must not gate on emptiness:\n{codec}"
+    );
+    // Decode allocates a CsilBytes whenever the key is present, so a zero-length byte
+    // string comes back as a non-NULL pointer with len 0 rather than as absent.
+    assert!(
+        codec.contains("out->payload = csilc_p;"),
+        "a present value must stay present after decode:\n{codec}"
+    );
+}

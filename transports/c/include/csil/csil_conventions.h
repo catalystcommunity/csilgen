@@ -49,6 +49,18 @@ typedef enum csil_err {
  * allocating for it. */
 #define CSIL_MAX_FRAME_DEFAULT ((size_t)(16 * 1024 * 1024))
 
+/* CSIL_MAX_FRAME_LIMIT is the largest max-frame limit a host may configure
+ * (2 GiB - 1). The 4-byte length prefix can express more, but the limit lives in
+ * a signed 32-bit integer in several supported languages, so this is the portable
+ * ceiling every CSIL transport agrees on. Anything above it would also disable the
+ * receive guard outright, since no wire length could exceed it. */
+#define CSIL_MAX_FRAME_LIMIT ((size_t)2147483647)
+
+/* csil_validate_max_frame reports whether max_frame is inside the conventions doc
+ * range (1..CSIL_MAX_FRAME_LIMIT). 0 is not valid here: the carrier constructor
+ * treats 0 as "use the default" before it validates. */
+int csil_validate_max_frame(size_t max_frame);
+
 /* CSIL_MAX_DATAGRAM_DEFAULT is the conservative max datagram size safe across
  * UDP/WebRTC/QUIC. */
 #define CSIL_MAX_DATAGRAM_DEFAULT ((size_t)1200)

@@ -18,6 +18,12 @@ defmodule Csilgen.Transport.Conventions do
   # Default max encoded envelope size (16 MiB). A carrier rejects anything larger
   # before allocating for it.
   @max_frame_default 16 * 1024 * 1024
+  # Largest limit a host may configure (2 GiB - 1). The 4-byte length prefix can
+  # express more, but the limit lives in a signed 32-bit integer in several
+  # supported languages, so this is the portable ceiling every CSIL transport
+  # agrees on. Anything above it would also disable the receive guard outright,
+  # since no wire length could exceed it.
+  @max_frame_limit 2_147_483_647
 
   @doc "The current transport version."
   @spec version() :: non_neg_integer()
@@ -34,6 +40,18 @@ defmodule Csilgen.Transport.Conventions do
   @doc "The default 16 MiB max-frame guard."
   @spec max_frame_default() :: pos_integer()
   def max_frame_default, do: @max_frame_default
+
+  @doc "The largest max-frame guard a host may configure."
+  @spec max_frame_limit() :: pos_integer()
+  def max_frame_limit, do: @max_frame_limit
+
+  @doc """
+  True when `max` is a max-frame limit inside the conventions doc range
+  (1..#{@max_frame_limit}). Usable in guards so a framing function can reject a
+  misconfigured limit in its head rather than on the frame itself.
+  """
+  defguard is_valid_max_frame(max)
+           when is_integer(max) and max >= 1 and max <= @max_frame_limit
 
   @doc "Wraps opaque payload bytes (themselves a CBOR item) in tag 24."
   @spec tag24(binary()) :: {:tag, non_neg_integer(), {:bytes, binary()}}

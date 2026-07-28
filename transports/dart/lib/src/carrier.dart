@@ -41,6 +41,7 @@ abstract interface class DatagramCarrier {
 /// `ByteData.setUint32` (safe on every backend); only the 64-bit `ByteData`
 /// methods are avoided (they throw on dart2js).
 Uint8List frameLengthPrefixed(Uint8List bytes, {int max = maxFrameDefault}) {
+  validateMaxFrame(max);
   if (bytes.length > max) throw FrameTooLargeException(bytes.length, max);
   final out = Uint8List(4 + bytes.length);
   ByteData.sublistView(out).setUint32(0, bytes.length, Endian.big);
@@ -56,7 +57,11 @@ class LengthPrefixedDeframer {
   Uint8List _buf = Uint8List(0);
   final int max;
 
-  LengthPrefixedDeframer({this.max = maxFrameDefault});
+  /// The limit is validated here rather than at the first frame, so a
+  /// misconfigured deframer is a construction-time error the host can surface at
+  /// startup.
+  LengthPrefixedDeframer({int max = maxFrameDefault})
+      : max = validateMaxFrame(max);
 
   void push(Uint8List chunk) {
     final merged = Uint8List(_buf.length + chunk.length);

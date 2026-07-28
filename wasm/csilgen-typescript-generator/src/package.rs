@@ -241,7 +241,7 @@ fn events_section(pkg: &str, ch: Option<&ChannelExample>) -> String {
     out.push_str("```ts\n");
     out.push_str(
         "import {\n  Event,\n  Hello,\n  HelloAck,\n  Heartbeat,\n  control,\n  \
-         frameLengthPrefixed,\n  LengthPrefixedDeframer,\n  \
+         frameLengthPrefixed,\n  LengthPrefixedDeframer,\n  MAX_FRAME_DEFAULT,\n  \
          type FrameCarrier,\n  type Profile,\n} from \"csilgen-transport\";\n",
     );
     out.push_str("import * as tls from \"node:tls\";\n");
@@ -281,9 +281,17 @@ fn events_section(pkg: &str, ch: Option<&ChannelExample>) -> String {
 /// exposing the library's `sendFrame`/`recvFrame` seam so the session logic is
 /// transport-agnostic.
 const EVENTS_CARRIER_TS: &str = r#"// One example carrier: a TLS byte stream framed with CSIL's 4-byte length prefix.
+
+// The max-frame guard is a carrier setting, not a generated constant: raise it when a peer
+// accepts payloads larger than the 16 MiB default (the envelope adds framing and request
+// metadata around the payload, so the limit must exceed the largest payload), or lower it
+// to harden an exposed listener. Valid limits are 1..=MAX_FRAME_LIMIT and are checked where
+// the deframer is built.
+const MAX_FRAME = MAX_FRAME_DEFAULT;
+
 function openTlsCarrier(host: string, port: number): FrameCarrier {
   const socket = tls.connect({ host, port });
-  const deframer = new LengthPrefixedDeframer();
+  const deframer = new LengthPrefixedDeframer(MAX_FRAME);
   const inbox: Uint8Array[] = [];
   const waiters: ((f: Uint8Array | null) => void)[] = [];
   const deliver = (f: Uint8Array | null) => {
@@ -298,7 +306,7 @@ function openTlsCarrier(host: string, port: number): FrameCarrier {
   socket.on("close", () => deliver(null));
   return {
     sendFrame(bytes: Uint8Array) {
-      socket.write(frameLengthPrefixed(bytes));
+      socket.write(frameLengthPrefixed(bytes, MAX_FRAME));
     },
     recvFrame(): Promise<Uint8Array | null> {
       const f = inbox.shift();

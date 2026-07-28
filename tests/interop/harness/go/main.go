@@ -7,6 +7,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"net"
@@ -184,6 +185,23 @@ func nestedOK() interopapi.Nested {
 	}
 }
 
+// The three optional-bytes states. A nil Payload is *absent* (the key is omitted);
+// a non-nil pointer to an empty slice is *present and empty* (the key carries 0x40).
+// The pointer is what keeps those two distinguishable.
+func optBytesAbsent() interopapi.OptBytes {
+	return interopapi.OptBytes{Tag: "absent"}
+}
+
+func optBytesEmpty() interopapi.OptBytes {
+	empty := []byte{}
+	return interopapi.OptBytes{Tag: "empty", Payload: &empty}
+}
+
+func optBytesFull() interopapi.OptBytes {
+	full := []byte{0x01, 0x02, 0xf0, 0xff}
+	return interopapi.OptBytes{Tag: "full", Payload: &full}
+}
+
 // ---------------------------------------------------------------------------
 // Result accumulation + JSON output (no third-party deps).
 // ---------------------------------------------------------------------------
@@ -278,6 +296,10 @@ func (handlers) EchoNested(_ context.Context, req interopapi.Nested) (interopapi
 	return interopapi.EchoNestedResult{Ok: true, Echo: req}, nil
 }
 
+func (handlers) EchoOptBytes(_ context.Context, req interopapi.OptBytes) (interopapi.OptBytes, error) {
+	return req, nil
+}
+
 func (handlers) ValidateConstrained(_ context.Context, req interopapi.Constrained) (interopapi.Constrained, error) {
 	if err := req.Validate(); err != nil {
 		return interopapi.Constrained{}, err
@@ -357,6 +379,16 @@ func rpcServer(ln net.Listener) {
 					return transport.Transport(transport.StatusInternal, herr.Error())
 				}
 				return transport.Reply("EchoNestedResult", interopapi.EncodeEchoNestedResult(r))
+			case "echo-opt-bytes":
+				v, derr := interopapi.DecodeOptBytes(req.Payload)
+				if derr != nil {
+					return transport.Transport(transport.StatusMalformedEnvelope, derr.Error())
+				}
+				r, herr := h.EchoOptBytes(ctx, v)
+				if herr != nil {
+					return transport.Transport(transport.StatusInternal, herr.Error())
+				}
+				return transport.Reply("OptBytes", interopapi.EncodeOptBytes(r))
 			case "validate-constrained":
 				v, derr := interopapi.DecodeConstrained(req.Payload)
 				if derr != nil {
@@ -416,6 +448,29 @@ func rpcClient(conn net.Conn) *cases {
 		c.pass("validate-constrained/failure")
 	} else {
 		c.fail("validate-constrained/failure", "server accepted invalid input")
+	}
+
+	// Optional-bytes presence: absent, present-empty, and present-non-empty are three
+	// distinct states that must each survive the round trip unchanged.
+	if r, err := client.EchoOptBytes(ctx, optBytesAbsent()); err != nil {
+		c.fail("opt-bytes/absent", err.Error())
+	} else {
+		c.check("opt-bytes/absent", r.Payload == nil, fmt.Sprintf("expected absent, got %+v", r.Payload))
+	}
+
+	if r, err := client.EchoOptBytes(ctx, optBytesEmpty()); err != nil {
+		c.fail("opt-bytes/present-empty", err.Error())
+	} else {
+		c.check("opt-bytes/present-empty", r.Payload != nil && len(*r.Payload) == 0,
+			fmt.Sprintf("expected present-and-empty, got %+v", r.Payload))
+	}
+
+	if r, err := client.EchoOptBytes(ctx, optBytesFull()); err != nil {
+		c.fail("opt-bytes/present-non-empty", err.Error())
+	} else {
+		c.check("opt-bytes/present-non-empty",
+			r.Payload != nil && bytes.Equal(*r.Payload, []byte{0x01, 0x02, 0xf0, 0xff}),
+			fmt.Sprintf("expected 0102f0ff, got %+v", r.Payload))
 	}
 
 	return c

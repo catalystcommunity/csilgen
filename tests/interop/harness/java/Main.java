@@ -47,6 +47,7 @@ import csilgen.generated.InteropRouter;
 import csilgen.generated.Level;
 import csilgen.generated.MixedStatus;
 import csilgen.generated.Nested;
+import csilgen.generated.OptBytes;
 import csilgen.generated.Priority;
 import csilgen.generated.Scalars;
 import csilgen.generated.ScalarsNote;
@@ -228,6 +229,11 @@ public final class Main {
         }
 
         @Override
+        public OptBytes echoOptBytes(OptBytes req) {
+            return req;
+        }
+
+        @Override
         public Constrained validateConstrained(Constrained req) {
             // Decoding already ran the canonical constructor's validation; a value that
             // reaches here is valid, so echo it.
@@ -336,6 +342,11 @@ public final class Main {
                             "EchoNestedResult",
                             CsilCbor.encodeEchoNestedResult(handlers.echoNested(v)));
                     }
+                    case "echo-opt-bytes" -> {
+                        OptBytes v = CsilCbor.decodeOptBytes(req.payload());
+                        return Rpc.HandlerOutcome.reply(
+                            "OptBytes", CsilCbor.encodeOptBytes(handlers.echoOptBytes(v)));
+                    }
                     case "validate-constrained" -> {
                         try {
                             // decodeConstrained runs the canonical constructor's validation.
@@ -418,6 +429,32 @@ public final class Main {
             cases.pass("validate-constrained/failure");
         } catch (RuntimeException e) {
             cases.fail("validate-constrained/failure", "expected service error, got " + e);
+        }
+        // Optional-bytes presence: absent, present-empty, and present-non-empty are three
+        // distinct states that must each survive the round trip unchanged. `null` is the
+        // absent marker -- a zero-length byte[] is present and must not decode to null.
+        try {
+            OptBytes r = client.echoOptBytes(new OptBytes("absent", null));
+            cases.check("opt-bytes/absent", r.payload() == null,
+                "expected absent, got " + Arrays.toString(r.payload()));
+        } catch (RuntimeException e) {
+            cases.fail("opt-bytes/absent", e.toString());
+        }
+        try {
+            OptBytes r = client.echoOptBytes(new OptBytes("empty", new byte[0]));
+            cases.check("opt-bytes/present-empty",
+                r.payload() != null && r.payload().length == 0,
+                "expected present-and-empty, got " + Arrays.toString(r.payload()));
+        } catch (RuntimeException e) {
+            cases.fail("opt-bytes/present-empty", e.toString());
+        }
+        try {
+            byte[] sent = new byte[] {0x01, 0x02, (byte) 0xf0, (byte) 0xff};
+            OptBytes r = client.echoOptBytes(new OptBytes("full", sent));
+            cases.check("opt-bytes/present-non-empty", Arrays.equals(r.payload(), sent),
+                "expected 0102f0ff, got " + Arrays.toString(r.payload()));
+        } catch (RuntimeException e) {
+            cases.fail("opt-bytes/present-non-empty", e.toString());
         }
         return cases;
     }

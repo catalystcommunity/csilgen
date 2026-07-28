@@ -29,6 +29,7 @@ const Scalars = gen_types.Scalars;
 const Collections = gen_types.Collections;
 const Constrained = gen_types.Constrained;
 const Nested = gen_types.Nested;
+const OptBytes = gen_types.OptBytes;
 const EchoNestedResult = gen_types.EchoNestedResult;
 const MixedStatus = gen_types.MixedStatus;
 const CsilValue = gen_codec.CsilValue;
@@ -340,6 +341,13 @@ fn rpcHandle(ptr: *anyopaque, req: *const rpc.RpcRequest) rpc.HandlerOutcome {
         const b = gen_codec.encode_EchoNestedResult(a, &r) catch
             return rpc.HandlerOutcome.make_transport(Status.internal, "encode");
         return rpc.HandlerOutcome.make_reply("EchoNestedResult", b);
+    } else if (streq(req.op, "echo-opt-bytes")) {
+        var v: OptBytes = undefined;
+        gen_codec.decode_OptBytes(a, req.payload, &v) catch
+            return rpc.HandlerOutcome.make_transport(Status.malformed_envelope, "decode");
+        const b = gen_codec.encode_OptBytes(a, &v) catch
+            return rpc.HandlerOutcome.make_transport(Status.internal, "encode");
+        return rpc.HandlerOutcome.make_reply("OptBytes", b);
     } else if (streq(req.op, "validate-constrained")) {
         var v: Constrained = undefined;
         gen_codec.decode_Constrained(a, req.payload, &v) catch
@@ -450,6 +458,45 @@ fn rpcClient(a: std.mem.Allocator, stream: std.net.Stream) Cases {
             cases.check("validate-constrained/failure", err == error.ServiceError, @errorName(err));
         }
     }
+    // Optional-bytes presence: absent, present-empty, and present-non-empty are three
+    // distinct states that must each survive the round trip unchanged. `null` is absent;
+    // an empty (zero-length) slice is present and must not come back as null.
+    {
+        var got: OptBytes = undefined;
+        const sent = OptBytes{ .tag = "absent", .payload = null };
+        if (c.echo_opt_bytes(a, &sent, &got)) {
+            cases.check("opt-bytes/absent", got.payload == null, "expected absent");
+        } else |err| {
+            cases.fail("opt-bytes/absent", @errorName(err));
+        }
+    }
+    {
+        var got: OptBytes = undefined;
+        const sent = OptBytes{ .tag = "empty", .payload = &[_]u8{} };
+        if (c.echo_opt_bytes(a, &sent, &got)) {
+            cases.check(
+                "opt-bytes/present-empty",
+                got.payload != null and got.payload.?.len == 0,
+                "expected present-and-empty",
+            );
+        } else |err| {
+            cases.fail("opt-bytes/present-empty", @errorName(err));
+        }
+    }
+    {
+        var got: OptBytes = undefined;
+        const bytes = [_]u8{ 0x01, 0x02, 0xf0, 0xff };
+        const sent = OptBytes{ .tag = "full", .payload = &bytes };
+        if (c.echo_opt_bytes(a, &sent, &got)) {
+            cases.check(
+                "opt-bytes/present-non-empty",
+                got.payload != null and std.mem.eql(u8, got.payload.?, &bytes),
+                "expected 0102f0ff",
+            );
+        } else |err| {
+            cases.fail("opt-bytes/present-non-empty", @errorName(err));
+        }
+    }
     sc.carrier().close();
     return cases;
 }
@@ -483,6 +530,7 @@ fn chEchoCollections(_: *anyopaque, _: *const Collections, _: *Collections) anye
 fn chEchoNested(_: *anyopaque, _: *const Nested, _: *EchoNestedResult) anyerror!void {}
 fn chValidateConstrained(_: *anyopaque, _: *const Constrained, _: *Constrained) anyerror!void {}
 fn chDuplex(_: *anyopaque, _: *const Scalars) anyerror!void {}
+fn chEchoOptBytes(_: *anyopaque, _: *const OptBytes, _: *OptBytes) anyerror!void {}
 
 fn eventsServeConn(base: std.mem.Allocator, stream: std.net.Stream) void {
     var sc = carrier.StreamCarrier.init(stream);
@@ -516,6 +564,7 @@ fn eventsServeConn(base: std.mem.Allocator, stream: std.net.Stream) void {
         .echo_nested = chEchoNested,
         .validate_constrained = chValidateConstrained,
         .duplex = chDuplex,
+        .echo_opt_bytes = chEchoOptBytes,
     };
     var codec_alloc = a;
     const codec = gen_server.CsilgenCodec{ .ptr = &codec_alloc, .decode = chDecodeScalars, .encode = chEncodeScalars };

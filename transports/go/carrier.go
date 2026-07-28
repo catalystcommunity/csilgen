@@ -91,9 +91,19 @@ func NewStreamCarrier(stream io.ReadWriter) *StreamCarrier {
 	return &StreamCarrier{stream: stream, maxFrame: MaxFrameDefault}
 }
 
-func NewStreamCarrierWithMaxFrame(stream io.ReadWriter, maxFrame int) *StreamCarrier {
-	return &StreamCarrier{stream: stream, maxFrame: maxFrame}
+// NewStreamCarrierWithMaxFrame builds a carrier with a host-chosen max-frame
+// limit. The limit is validated here rather than at the first frame, so a
+// misconfigured carrier is a construction-time error the host can surface at
+// startup.
+func NewStreamCarrierWithMaxFrame(stream io.ReadWriter, maxFrame int) (*StreamCarrier, error) {
+	if err := ValidateMaxFrame(maxFrame); err != nil {
+		return nil, err
+	}
+	return &StreamCarrier{stream: stream, maxFrame: maxFrame}, nil
 }
+
+// MaxFrame reports the limit this carrier enforces in both directions.
+func (c *StreamCarrier) MaxFrame() int { return c.maxFrame }
 
 func (c *StreamCarrier) SendFrame(b []byte) error {
 	return WriteLengthPrefixed(c.stream, b, c.maxFrame)

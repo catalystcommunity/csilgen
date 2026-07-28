@@ -5,6 +5,12 @@ let tag_encoded_cbor = 24L
 let control_service_ord = 0L
 let max_frame_default = 16 * 1024 * 1024
 
+(* The 4-byte length prefix can express more, but the limit lives in a signed
+   32-bit integer in several supported languages, so this is the portable ceiling
+   every CSIL transport agrees on. Anything above it would also disable the receive
+   guard outright, since no wire length could exceed it. *)
+let max_frame_limit = 2_147_483_647
+
 type status = int64
 
 let status_ok = 0L
@@ -36,6 +42,7 @@ let status_name s =
 type error =
   | Malformed of string
   | Frame_too_large of { got : int; maximum : int }
+  | Invalid_max_frame of { got : int; limit : int }
   | Unsupported_version of int64
   | Carrier of string
   | Status_error of { status : string; code : int64; message : string }
@@ -45,6 +52,9 @@ let error_message = function
   | Frame_too_large { got; maximum } ->
       Printf.sprintf "frame of %d bytes exceeds max-frame guard of %d bytes" got
         maximum
+  | Invalid_max_frame { got; limit } ->
+      Printf.sprintf "max-frame limit of %d is outside the valid range 1..=%d" got
+        limit
   | Unsupported_version v ->
       Printf.sprintf "unsupported transport version %Ld" v
   | Carrier m -> "carrier error: " ^ m
@@ -54,6 +64,13 @@ let error_message = function
       else Printf.sprintf "transport status %s (%Ld)" status code
 
 let malformed fmt = Printf.ksprintf (fun s -> Malformed s) fmt
+
+(* Check a host-supplied max-frame limit against the conventions doc range, so an
+   unusable carrier fails at construction rather than on its first frame. *)
+let validate_max_frame max_frame =
+  if max_frame < 1 || max_frame > max_frame_limit then
+    Error (Invalid_max_frame { got = max_frame; limit = max_frame_limit })
+  else Ok max_frame
 
 let tag24 payload =
   (* Copy so a later mutation of the caller's buffer can't change the envelope. *)

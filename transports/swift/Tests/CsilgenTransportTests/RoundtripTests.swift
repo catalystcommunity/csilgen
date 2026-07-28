@@ -57,7 +57,7 @@ final class RoundtripTests: XCTestCase {
 
     func testStreamCarrierFramesMultipleMessages() throws {
         let stream = InMemoryByteStream()
-        let carrier = StreamCarrier(stream: stream)
+        let carrier = try StreamCarrier(stream: stream)
         try carrier.sendFrame([1, 2, 3])
         try carrier.sendFrame([])
         try carrier.sendFrame([9])

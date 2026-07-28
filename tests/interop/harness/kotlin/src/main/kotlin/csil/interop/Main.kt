@@ -168,6 +168,7 @@ private fun rpcDispatch(req: RpcRequest): HandlerOutcome = when (req.op) {
     "echo-nested" -> reqReply(req.payload, { nestedFromCbor(it) }) {
         Reply("EchoNestedResult", EchoNestedResult(ok = true, echo = it).toCbor())
     }
+    "echo-opt-bytes" -> reqReply(req.payload, { optBytesFromCbor(it) }) { Reply("OptBytes", it.toCbor()) }
     "validate-constrained" -> reqReply(req.payload, { constrainedFromCbor(it) }) { input ->
         try {
             input.validate()
@@ -248,6 +249,36 @@ private fun rpcClient(ch: Socket): Cases {
         cases.pass("validate-constrained/failure")
     } catch (e: Exception) {
         cases.fail("validate-constrained/failure", "expected service error, got $e")
+    }
+    // Optional-bytes presence: absent, present-empty, and present-non-empty are three
+    // distinct states that must each survive the round trip unchanged. `null` is the absent
+    // marker -- a zero-length ByteArray is present and must not decode to null.
+    try {
+        val r = client.echoOptBytes(OptBytes(tag = "absent", payload = null))
+        cases.check("opt-bytes/absent", r.payload == null, "expected absent, got ${r.payload?.size}")
+    } catch (e: Exception) {
+        cases.fail("opt-bytes/absent", e.message ?: e.toString())
+    }
+    try {
+        val r = client.echoOptBytes(OptBytes(tag = "empty", payload = ByteArray(0)))
+        cases.check(
+            "opt-bytes/present-empty",
+            r.payload != null && r.payload!!.isEmpty(),
+            "expected present-and-empty, got ${r.payload?.size}",
+        )
+    } catch (e: Exception) {
+        cases.fail("opt-bytes/present-empty", e.message ?: e.toString())
+    }
+    try {
+        val sent = byteArrayOf(0x01, 0x02, 0xf0.toByte(), 0xff.toByte())
+        val r = client.echoOptBytes(OptBytes(tag = "full", payload = sent))
+        cases.check(
+            "opt-bytes/present-non-empty",
+            r.payload != null && r.payload!!.contentEquals(sent),
+            "expected 0102f0ff, got ${r.payload?.size}",
+        )
+    } catch (e: Exception) {
+        cases.fail("opt-bytes/present-non-empty", e.message ?: e.toString())
     }
     return cases
 }

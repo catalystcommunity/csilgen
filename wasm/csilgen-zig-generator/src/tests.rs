@@ -2254,3 +2254,52 @@ pub fn main() !void {
     try stdout.print("ok\n", .{});
 }
 "#;
+
+/// An optional `bytes` field carries three distinct states — absent, present-and-empty,
+/// present-and-non-empty — and the codec must decide presence by whether the value is
+/// set, never by whether it is non-empty (cbor-wire-contract.md "Optional fields"). A
+/// `.len > 0` guard would collapse present-empty into absent and silently lose a
+/// caller's "replace this with nothing".
+#[test]
+fn optional_bytes_encodes_on_presence_not_emptiness() {
+    let mut payload = bare_entry("payload", builtin("bytes"));
+    payload.occurrence = Some(CsilOccurrence::Optional);
+    let input = input_with_rules(
+        vec![group_rule(
+            "UpdateRequest",
+            vec![bare_entry("id", builtin("text")), payload],
+        )],
+        "zig",
+        HashMap::new(),
+    );
+    let config = ZigConfig::from_options(&input.config.options).unwrap();
+    let types = generate_types(&input, &config).unwrap();
+    let mut warnings = Vec::new();
+    let codec = generate_codec(&input, &config, &mut warnings).expect("codec emitted");
+
+    // An optional slice distinguishes null (absent) from a zero-length slice
+    // (present-and-empty).
+    assert!(
+        types.contains("payload: ?[]const u8 = null,"),
+        "optional bytes needs a presence-carrying type:\n{types}"
+    );
+    // Both the map-size count and the emit gate on presence, not emptiness.
+    assert!(
+        codec.contains("if (v.payload != null) csil_n += 1;"),
+        "the map-size count must gate on presence:\n{codec}"
+    );
+    assert!(
+        codec.contains("if (v.payload) |csil_x| {"),
+        "encode must gate on presence, not emptiness:\n{codec}"
+    );
+    assert!(
+        !codec.contains("v.payload.?.len > 0"),
+        "encode must not gate on emptiness:\n{codec}"
+    );
+    // Decode gates on the key being present; a present empty byte string therefore
+    // stays non-null rather than collapsing to absent.
+    assert!(
+        codec.contains("if (mget(m, \"payload\")) |csil_fv| {"),
+        "decode must gate on key presence:\n{codec}"
+    );
+}

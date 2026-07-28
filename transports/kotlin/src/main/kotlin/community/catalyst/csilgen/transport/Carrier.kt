@@ -106,8 +106,12 @@ private fun readFully(input: InputStream, buf: ByteArray, offset: Int, len: Int)
 class StreamCarrier(
     private val input: InputStream,
     private val output: OutputStream,
-    private val maxFrame: Int = MAX_FRAME_DEFAULT,
+    maxFrame: Int = MAX_FRAME_DEFAULT,
 ) : FrameCarrier {
+    /** The limit this carrier enforces in both directions. Validated at construction rather
+     *  than at the first frame, so a misconfigured carrier surfaces at startup. */
+    val maxFrame: Int = validateMaxFrame(maxFrame)
+
     override fun sendFrame(bytes: ByteArray) = writeLengthPrefixed(output, bytes, maxFrame)
     override fun recvFrame(): ByteArray? = readLengthPrefixed(input, maxFrame)
 }

@@ -119,6 +119,13 @@ pub const StreamCarrier = struct {
         return .{ .stream = stream };
     }
 
+    /// Build a carrier with a host-chosen max-frame limit. The limit is validated
+    /// here rather than at the first frame, so a misconfigured carrier is a
+    /// construction-time error the host can surface at startup.
+    pub fn init_with_max_frame(stream: std.net.Stream, max_frame: usize) conv.InvalidMaxFrameError!StreamCarrier {
+        return .{ .stream = stream, .max_frame = try conv.validate_max_frame(max_frame) };
+    }
+
     pub fn carrier(self: *StreamCarrier) FrameCarrier {
         return .{ .ptr = self, .vtable = &vtable };
     }
@@ -263,4 +270,137 @@ test "loopback frame carrier moves bytes through the seam" {
     defer a.free(got);
     try std.testing.expectEqualSlices(u8, &.{ 4, 5 }, got);
     try std.testing.expect((try c.recv(a)) == null);
+}
+
+
+// ---- the configurable max-frame guard (conventions doc §5) -------------------
+//
+// A host sets the limit up or down through StreamCarrier, the limit applies to
+// reads and writes alike, an oversized inbound length is rejected before
+// allocation, and an invalid limit fails at construction rather than on the first
+// frame. The tests drive a real file handle wrapped in std.net.Stream rather than a
+// mock, so the guard is exercised over the same I/O path a socket carrier uses (and
+// stays portable — a socketpair syscall is not in the 0.14 std surface).
+
+/// A scratch file exposed as both ends of a std.net.Stream: frames written through
+/// `writer` are read back through `reader` after a rewind.
+const StreamFixture = struct {
+    tmp: std.testing.TmpDir,
+    file: std.fs.File,
+
+    fn open() !StreamFixture {
+        var tmp = std.testing.tmpDir(.{});
+        const file = try tmp.dir.createFile("frames.bin", .{ .read = true });
+        return .{ .tmp = tmp, .file = file };
+    }
+
+    fn writer(self: *StreamFixture) std.net.Stream {
+        return .{ .handle = self.file.handle };
+    }
+
+    /// Rewind to the start so the frames just written are what a reader sees.
+    fn rewind(self: *StreamFixture) !void {
+        try self.file.seekTo(0);
+    }
+
+    fn close(self: *StreamFixture) void {
+        self.file.close();
+        self.tmp.cleanup();
+    }
+};
+
+test "default limit accepts a frame below it" {
+    const alloc = std.testing.allocator;
+    var fx = try StreamFixture.open();
+    defer fx.close();
+
+    var carrier_state = StreamCarrier.init(fx.writer());
+    const body = [_]u8{0xAB} ** 1024;
+    try carrier_state.carrier().send(&body);
+
+    try fx.rewind();
+    const got = (try carrier_state.carrier().recv(alloc)).?;
+    defer alloc.free(got);
+    try std.testing.expectEqualSlices(u8, &body, got);
+}
+
+test "default limit rejects a frame above it" {
+    const alloc = std.testing.allocator;
+    var fx = try StreamFixture.open();
+    defer fx.close();
+
+    var carrier_state = StreamCarrier.init(fx.writer());
+    const big = try alloc.alloc(u8, conv.MAX_FRAME_DEFAULT + 1);
+    defer alloc.free(big);
+    @memset(big, 0);
+
+    try std.testing.expectError(error.FrameTooLarge, carrier_state.carrier().send(big));
+    // A rejected frame must not put bytes on the wire.
+    try std.testing.expectEqual(@as(u64, 0), try fx.file.getEndPos());
+}
+
+test "a smaller custom limit rejects what the default accepts" {
+    var fx = try StreamFixture.open();
+    defer fx.close();
+
+    var carrier_state = try StreamCarrier.init_with_max_frame(fx.writer(), 64);
+    const body = [_]u8{0xCD} ** 1024;
+    try std.testing.expectError(error.FrameTooLarge, carrier_state.carrier().send(&body));
+}
+
+test "a larger custom limit accepts what the default rejects" {
+    const alloc = std.testing.allocator;
+    var fx = try StreamFixture.open();
+    defer fx.close();
+
+    const raised = conv.MAX_FRAME_DEFAULT + 4096;
+    var carrier_state = try StreamCarrier.init_with_max_frame(fx.writer(), raised);
+
+    const big = try alloc.alloc(u8, conv.MAX_FRAME_DEFAULT + 1);
+    defer alloc.free(big);
+    @memset(big, 0);
+
+    try carrier_state.carrier().send(big);
+    try fx.rewind();
+    const got = (try carrier_state.carrier().recv(alloc)).?;
+    defer alloc.free(got);
+    try std.testing.expectEqual(big.len, got.len);
+}
+
+test "an oversized incoming length is rejected before allocation" {
+    const alloc = std.testing.allocator;
+    var fx = try StreamFixture.open();
+    defer fx.close();
+
+    // Only the 4-byte prefix, claiming ~4 GiB, with no body behind it. If the guard
+    // ran after the read this would allocate 4 GiB; it must fail on the prefix.
+    try fx.file.writeAll(&[_]u8{ 0xFF, 0xFF, 0xFF, 0xFF });
+    try fx.rewind();
+
+    var carrier_state = try StreamCarrier.init_with_max_frame(fx.writer(), 4096);
+    try std.testing.expectError(error.FrameTooLarge, carrier_state.carrier().recv(alloc));
+    // The guard consumed the prefix and stopped: nothing past it was read.
+    try std.testing.expectEqual(@as(u64, 4), try fx.file.getPos());
+}
+
+test "invalid limits are rejected at construction" {
+    var fx = try StreamFixture.open();
+    defer fx.close();
+
+    for ([_]usize{ 0, conv.MAX_FRAME_LIMIT + 1, std.math.maxInt(usize) }) |limit| {
+        try std.testing.expectError(
+            error.InvalidMaxFrame,
+            StreamCarrier.init_with_max_frame(fx.writer(), limit),
+        );
+    }
+}
+
+test "boundary limits are accepted" {
+    var fx = try StreamFixture.open();
+    defer fx.close();
+
+    for ([_]usize{ 1, conv.MAX_FRAME_DEFAULT, conv.MAX_FRAME_LIMIT }) |limit| {
+        const c = try StreamCarrier.init_with_max_frame(fx.writer(), limit);
+        try std.testing.expectEqual(limit, c.max_frame);
+    }
 }

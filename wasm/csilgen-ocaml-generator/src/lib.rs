@@ -765,12 +765,21 @@ const EVENTS_CARRIER_OCAML: &str = r#"(* One example carrier: a byte stream fram
    library's [stream_carrier] owns framing; this only opens the socket. For real TLS,
    wrap [ic]/[oc] with the [tls] (or [ssl]) opam library at the marked point — the
    carrier and the session logic below ride any channel pair unchanged. *)
+(* The max-frame guard is a carrier setting, not a generated constant: raise it when a
+   peer accepts payloads larger than the 16 MiB default (the envelope adds framing and
+   request metadata around the payload, so the limit must exceed the largest payload), or
+   lower it to harden an exposed listener. Valid limits are 1..[max_frame_limit] and are
+   checked at construction, so a misconfigured guard fails here rather than mid-session. *)
+let max_frame = Conventions.max_frame_default
+
 let connect_frame_carrier host port : Carrier.frame_carrier =
   let he = Unix.gethostbyname host in
   let addr = Unix.ADDR_INET (he.Unix.h_addr_list.(0), port) in
   let ic, oc = Unix.open_connection addr in
   (* TLS swap point: [let ic, oc = Tls_unix.wrap ic oc in] (or the [ssl] equivalent). *)
-  Carrier.stream_carrier ic oc
+  match Carrier.stream_carrier_with_max_frame ~max_frame ic oc with
+  | Ok carrier -> carrier
+  | Error e -> failwith (Conventions.error_message e)
 "#;
 
 /// The channel session body for an Events connection that has a record `<->` op: the

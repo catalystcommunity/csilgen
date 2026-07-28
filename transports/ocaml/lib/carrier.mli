@@ -43,6 +43,13 @@ val read_length_prefixed :
   in_channel -> max:int -> (bytes option, Conventions.error) result
 
 (* A frame carrier over any byte stream (TCP, TLS, Unix socket) using the
-   canonical length-prefix framing. [max_frame] defaults to [max_frame_default]. *)
-val stream_carrier :
-  ?max_frame:int -> in_channel -> out_channel -> frame_carrier
+   canonical length-prefix framing and the default [max_frame_default] guard. *)
+val stream_carrier : in_channel -> out_channel -> frame_carrier
+
+(* The same carrier with a host-chosen guard, validated at construction against
+   1..[max_frame_limit] rather than on the first frame. *)
+val stream_carrier_with_max_frame :
+  max_frame:int ->
+  in_channel ->
+  out_channel ->
+  (frame_carrier, Conventions.error) result

@@ -448,6 +448,22 @@ static void rpc_handler(void *vctx, const csil_rpc_request *req, csil_rpc_outcom
         }
         ctx->pending = pb;
         csil_rpc_outcome_reply(out, "EchoNestedResult", pb, pn);
+    } else if (strcmp(req->op, "echo-opt-bytes") == 0) {
+        OptBytes v;
+        if (csil_decode_OptBytes(req->payload, req->payload_len, &v, &own)) {
+            csil_rpc_outcome_transport(
+                out, csil_status_from_code(CSIL_STATUS_MALFORMED_ENVELOPE_CODE), "decode");
+            return;
+        }
+        int rc = csil_encode_OptBytes(&v, &pb, &pn);
+        csil_codec_arena_free(own);
+        if (rc) {
+            csil_rpc_outcome_transport(out, csil_status_from_code(CSIL_STATUS_INTERNAL_CODE),
+                                       "encode");
+            return;
+        }
+        ctx->pending = pb;
+        csil_rpc_outcome_reply(out, "OptBytes", pb, pn);
     } else if (strcmp(req->op, "validate-constrained") == 0) {
         Constrained v;
         if (csil_decode_Constrained(req->payload, req->payload_len, &v, &own)) {
@@ -647,6 +663,61 @@ static void rpc_client_run(int fd, Cases *cases) {
                 strcmp(resp.variant, "ServiceError") == 0;
             cases_add(cases, "validate-constrained/failure", is_service_err,
                       "expected service error");
+            csil_rpc_response_free(&resp);
+        }
+    }
+
+    /* Optional-bytes presence: absent, present-empty, and present-non-empty are three
+     * distinct states that must each survive the round trip unchanged. A NULL payload
+     * pointer is absent; a non-NULL CsilBytes with len 0 is present-and-empty, and must
+     * not come back as NULL. */
+    {
+        CsilBytes empty = {NULL, 0};
+        static const uint8_t full_bytes[] = {0x01, 0x02, 0xf0, 0xff};
+        CsilBytes full = {(uint8_t *)full_bytes, sizeof full_bytes};
+
+        struct {
+            const char *name;
+            OptBytes sent;
+        } states[] = {
+            {"opt-bytes/absent", {(char *)"absent", NULL}},
+            {"opt-bytes/present-empty", {(char *)"empty", &empty}},
+            {"opt-bytes/present-non-empty", {(char *)"full", &full}},
+        };
+
+        for (size_t i = 0; i < sizeof states / sizeof states[0]; i++) {
+            uint8_t *rb = NULL;
+            size_t rn = 0;
+            csil_rpc_response resp;
+            if (csil_encode_OptBytes(&states[i].sent, &rb, &rn)) {
+                cases_add(cases, states[i].name, false, "encode");
+                continue;
+            }
+            if (rpc_call(cl, "echo-opt-bytes", rb, rn, &resp)) {
+                free(rb);
+                cases_add(cases, states[i].name, false, "carrier");
+                continue;
+            }
+            free(rb);
+            OptBytes got;
+            CsilCodecArena *own = NULL;
+            if (!csil_status_is_ok(resp.status)) {
+                cases_add(cases, states[i].name, false, "transport error");
+            } else if (csil_decode_OptBytes(resp.payload, resp.payload_len, &got, &own)) {
+                cases_add(cases, states[i].name, false, "decode");
+            } else {
+                bool ok;
+                if (states[i].sent.payload == NULL) {
+                    ok = got.payload == NULL;
+                } else {
+                    ok = got.payload != NULL && got.payload->len == states[i].sent.payload->len &&
+                         (got.payload->len == 0 ||
+                          memcmp(got.payload->data, states[i].sent.payload->data,
+                                 got.payload->len) == 0);
+                }
+                cases_add(cases, states[i].name, ok, "presence or bytes mismatch");
+                csil_codec_arena_free(own);
+            }
             csil_rpc_response_free(&resp);
         }
     }

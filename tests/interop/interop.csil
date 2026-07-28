@@ -145,6 +145,20 @@ Nested = {
 
 EchoNestedResult = { ok: bool, echo: Nested }
 
+;; ---- optional-bytes presence: absent vs present-empty vs present-non-empty ----
+;; Per docs/cbor-wire-contract.md, an optional field is present when it is set,
+;; not when it is non-empty, so these are three distinct states on the wire:
+;; absent omits the `payload` key entirely, present-empty carries the key with a
+;; zero-length byte string (0x40), and present-non-empty carries the bytes. A
+;; consumer uses the distinction to mean "leave the stored value alone" (absent)
+;; versus "replace it with nothing" (present-empty). A codec that encodes on a
+;; truthiness test, or a decode that normalizes present-empty back to absent,
+;; collapses two of the three states and fails the echo below.
+OptBytes = {
+  tag: text,
+  ? payload: bytes
+}
+
 ;; ---- error arm for the typed error-variant operation. The transport convention
 ;; is that a declared error arm is named `ServiceError`; the carrier maps a
 ;; status-0 reply whose variant is `ServiceError` to the language's error path.
@@ -172,5 +186,9 @@ service Interop {
   ;; bidirectional (client sends, server echoes via the channel router)
   @wire-id(5)
   duplex: Scalars <-> Scalars,
+  ;; CSIL-RPC optional-bytes presence: the client sends each of the three states
+  ;; and asserts the echo preserves it (see OptBytes above).
+  @wire-id(6)
+  echo-opt-bytes: OptBytes -> OptBytes,
 }
 

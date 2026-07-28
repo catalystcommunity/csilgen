@@ -523,6 +523,13 @@ const EVENTS_CARRIER_ELIXIR: &str = r#"defmodule TlsFrameCarrier do
 
   alias Csilgen.Transport.Carrier
 
+  # The max-frame guard is a carrier setting, not a generated constant: raise it when a
+  # peer accepts payloads larger than the 16 MiB default (the envelope adds framing and
+  # request metadata around the payload, so the limit must exceed the largest payload), or
+  # lower it to harden an exposed listener. Valid limits are 1..max_frame_limit; the
+  # framing functions reject anything outside that range.
+  @max_frame Csilgen.Transport.Conventions.max_frame_default()
+
   defstruct [:socket, buffer: <<>>]
 
   def connect(host, port) do
@@ -537,7 +544,7 @@ const EVENTS_CARRIER_ELIXIR: &str = r#"defmodule TlsFrameCarrier do
 
   @impl true
   def send_frame(%__MODULE__{socket: socket} = c, frame) do
-    with {:ok, wire} <- Carrier.frame_length_prefixed(frame),
+    with {:ok, wire} <- Carrier.frame_length_prefixed(frame, @max_frame),
          :ok <- :ssl.send(socket, wire) do
       {:ok, c}
     end
@@ -545,7 +552,7 @@ const EVENTS_CARRIER_ELIXIR: &str = r#"defmodule TlsFrameCarrier do
 
   @impl true
   def recv_frame(%__MODULE__{} = c) do
-    case Carrier.read_length_prefixed(c.buffer) do
+    case Carrier.read_length_prefixed(c.buffer, @max_frame) do
       {:ok, frame, rest} ->
         {:ok, frame, %{c | buffer: rest}}
 

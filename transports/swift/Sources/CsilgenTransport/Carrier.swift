@@ -86,11 +86,15 @@ public func readLengthPrefixed(_ stream: ByteStream, maxFrame: Int) throws -> [U
 /// the host, so it is intentionally not `Sendable`.
 public final class StreamCarrier: FrameCarrier {
     private let stream: ByteStream
-    private let maxFrame: Int
 
-    public init(stream: ByteStream, maxFrame: Int = maxFrameDefault) {
+    /// The limit this carrier enforces in both directions.
+    public let maxFrame: Int
+
+    /// The limit is validated at construction rather than at the first frame, so a
+    /// misconfigured carrier is an error the host can surface at startup.
+    public init(stream: ByteStream, maxFrame: Int = maxFrameDefault) throws {
         self.stream = stream
-        self.maxFrame = maxFrame
+        self.maxFrame = try validateMaxFrame(maxFrame)
     }
 
     public func sendFrame(_ frame: [UInt8]) throws {

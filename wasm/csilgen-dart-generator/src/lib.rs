@@ -1628,8 +1628,15 @@ class TlsFrameCarrier implements FrameCarrier {
     });
   }
 
+  // The max-frame guard is a carrier setting, not a generated constant: raise it when a
+  // peer accepts payloads larger than the 16 MiB default (the envelope adds framing and
+  // request metadata around the payload, so the limit must exceed the largest payload), or
+  // lower it to harden an exposed listener. Valid limits are 1..maxFrameLimit and are
+  // checked where the deframer is built.
+  static const int maxFrame = maxFrameDefault;
+
   final io.Socket _socket;
-  final LengthPrefixedDeframer _deframer = LengthPrefixedDeframer();
+  final LengthPrefixedDeframer _deframer = LengthPrefixedDeframer(max: maxFrame);
   final List<Uint8List> _inbox = [];
 
   static Future<TlsFrameCarrier> connect(String host, int port) async {
@@ -1638,7 +1645,7 @@ class TlsFrameCarrier implements FrameCarrier {
   }
 
   @override
-  void sendFrame(Uint8List frame) => _socket.add(frameLengthPrefixed(frame));
+  void sendFrame(Uint8List frame) => _socket.add(frameLengthPrefixed(frame, max: maxFrame));
 
   @override
   Uint8List? recvFrame() => _inbox.isEmpty ? null : _inbox.removeAt(0);

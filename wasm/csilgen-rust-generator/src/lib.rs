@@ -480,9 +480,17 @@ impl Transport for HttpRpcCarrier {
 const EVENTS_CARRIER_RUST: &str = r#"// One example carrier: a TLS byte stream framed by the library's StreamCarrier (CSIL
 // 4-byte length prefix). std has no TLS, so wrap a TcpStream in a rustls (or native-tls)
 // TlsStream for production — the framing is identical over any Read + Write.
-fn open_tls_carrier(addr: &str) -> std::io::Result<StreamCarrier<TcpStream>> {
+
+// The max-frame guard is a carrier setting, not a generated constant: raise it when a
+// peer accepts payloads larger than the 16 MiB default (the envelope adds framing and
+// request metadata around the payload, so the limit must exceed the largest payload),
+// or lower it to harden an exposed listener. Valid limits are 1..=MAX_FRAME_LIMIT and
+// are checked at construction.
+const MAX_FRAME: usize = MAX_FRAME_DEFAULT;
+
+fn open_tls_carrier(addr: &str) -> Result<StreamCarrier<TcpStream>, Box<dyn std::error::Error>> {
     let stream = TcpStream::connect(addr)?;
-    Ok(StreamCarrier::new(stream))
+    Ok(StreamCarrier::with_max_frame(stream, MAX_FRAME)?)
 }
 "#;
 
@@ -2111,7 +2119,7 @@ impl<'a> RustCodeGenerator<'a> {
         out.push_str(
             "use csilgen_transport::carrier::{FrameCarrier, StreamCarrier};\n\
              use csilgen_transport::events::{control, Event, Heartbeat, Hello, HelloAck, Profile};\n\
-             use csilgen_transport::VERSION;\n\
+             use csilgen_transport::{MAX_FRAME_DEFAULT, VERSION};\n\
              use std::net::TcpStream;\n\n",
         );
         out.push_str(EVENTS_CARRIER_RUST);
@@ -6265,6 +6273,78 @@ mod tests {
         assert!(services_content.contains(
             "fn create_user(&self, ctx: &Self::Context, input: User) -> Result<User, ServiceError>;"
         ));
+    }
+
+    /// An optional `bytes` field carries three distinct states — absent,
+    /// present-and-empty, present-and-non-empty — and the codec must decide presence by
+    /// whether the value is set, never by whether it is non-empty (cbor-wire-contract.md
+    /// "Optional fields"). An `is_empty()` guard would collapse present-empty into absent
+    /// and silently lose a caller's "replace this with nothing".
+    #[test]
+    fn optional_bytes_encodes_on_presence_not_emptiness() {
+        let mut input = create_test_input();
+        input.csil_spec.rules = vec![CsilRule {
+            name: "UpdateRequest".to_string(),
+            rule_type: CsilRuleType::GroupDef(CsilGroupExpression {
+                entries: vec![
+                    CsilGroupEntry {
+                        key: Some(CsilGroupKey::Bare("id".to_string())),
+                        value_type: CsilTypeExpression::Builtin("text".to_string()),
+                        occurrence: None,
+                        metadata: vec![],
+                        doc_comments: Vec::new(),
+                    },
+                    CsilGroupEntry {
+                        key: Some(CsilGroupKey::Bare("payload".to_string())),
+                        value_type: CsilTypeExpression::Builtin("bytes".to_string()),
+                        occurrence: Some(CsilOccurrence::Optional),
+                        metadata: vec![],
+                        doc_comments: Vec::new(),
+                    },
+                ],
+            }),
+            position: CsilPosition {
+                line: 1,
+                column: 1,
+                offset: 0,
+            },
+            doc_comments: Vec::new(),
+        }];
+        input.csil_spec.service_count = 0;
+
+        let mut generator = RustCodeGenerator::new(&input);
+        let files = generator.generate().expect("generation ok");
+        let file = |suffix: &str| {
+            files
+                .iter()
+                .find(|f| f.path.ends_with(suffix))
+                .unwrap_or_else(|| panic!("no file ending in {suffix}"))
+                .content
+                .clone()
+        };
+        let types = file("types.rs");
+        let codec = file("codec.gen.rs");
+
+        // `Option` distinguishes None (absent) from `Some(vec![])` (present-and-empty).
+        assert!(
+            types.contains("pub payload: Option<Vec<u8>>"),
+            "optional bytes needs a presence-carrying type:\n{types}"
+        );
+        // Encode gates on presence (`if let Some`), not on emptiness.
+        assert!(
+            codec.contains("if let Some(csil_inner) = &csil_v.payload {"),
+            "encode must gate on presence, not emptiness:\n{codec}"
+        );
+        assert!(
+            !codec.contains("!csil_v.payload.as_ref().is_some_and(|p| p.is_empty())"),
+            "encode must not gate on emptiness:\n{codec}"
+        );
+        // Decode gates on the key being present in the map, so a present empty byte
+        // string stays `Some` rather than collapsing to `None`.
+        assert!(
+            codec.contains("let payload = match cbor_map_get(csil_root, \"payload\")"),
+            "decode must gate on key presence:\n{codec}"
+        );
     }
 
     /// A single-field group record rule, for fixtures that need the request/response
@@ -10717,7 +10797,10 @@ mod tests {
         // router. Outbound (the op success output, Pong) rides the generated encoder;
         // inbound dispatch goes through route_<service>_channel into a handler that
         // implements the generated service trait — not codec-direct.
-        assert!(events.contains("StreamCarrier::new(stream)"));
+        // The carrier is built with an explicit max-frame limit so an operator can see
+        // and change the guard without editing generated source (conventions doc §5).
+        assert!(events.contains("StreamCarrier::with_max_frame(stream, MAX_FRAME)?"));
+        assert!(events.contains("const MAX_FRAME: usize = MAX_FRAME_DEFAULT;"));
         assert!(events.contains("Hello {"));
         assert!(events.contains("$hello"));
         assert!(events.contains("HelloAck::decode(&ack_frame)"));

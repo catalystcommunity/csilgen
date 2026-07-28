@@ -474,6 +474,7 @@ fn java_events_section(
     out.push_str(&format!("package {};\n\n", config.package));
     out.push_str(
         "import community.catalyst.csilgen.transport.Carriers;\n\
+         import community.catalyst.csilgen.transport.Conventions;\n\
          import community.catalyst.csilgen.transport.Events;\n\
          import community.catalyst.csilgen.transport.FrameCarrier;\n\
          import java.io.IOException;\n\
@@ -496,6 +497,9 @@ fn java_events_section(
 fn java_events_session(ch: &ChannelExample) -> String {
     format!(
         r#"public final class EventsExample {{
+    // The carrier's max-frame guard; see the comment at the carrier construction below.
+    static final int MAX_FRAME = Conventions.MAX_FRAME_DEFAULT;
+
     // A handler for the {service} channel; the generated router dispatches decoded events
     // to it. The interface bundles every service op, so the unary ops are stubbed.
     static final class Handlers implements {iface} {{
@@ -516,9 +520,14 @@ fn java_events_session(ch: &ChannelExample) -> String {
 
     public static void main(String[] args) throws IOException {{
         // One example carrier: a TLS byte stream framed with CSIL's 4-byte length prefix.
+        // The max-frame guard is a carrier setting, not a generated constant: raise MAX_FRAME
+        // when a peer accepts payloads larger than the 16 MiB default (the envelope adds
+        // framing and request metadata around the payload, so the limit must exceed the
+        // largest payload), or lower it to harden an exposed listener. Valid limits are
+        // 1..=Conventions.MAX_FRAME_LIMIT and are checked at construction.
         SSLSocket socket = (SSLSocket) SSLSocketFactory.getDefault().createSocket("localhost", 7443);
         FrameCarrier carrier =
-            new Carriers.StreamCarrier(socket.getInputStream(), socket.getOutputStream());
+            new Carriers.StreamCarrier(socket.getInputStream(), socket.getOutputStream(), MAX_FRAME);
         Handlers handlers = new Handlers();
         Codec codec = new ExampleCodec();
 
@@ -581,11 +590,19 @@ fn java_events_no_channel(server_surface: bool) -> String {
     };
     format!(
         r#"public final class EventsExample {{
+    // The carrier's max-frame guard; see the comment at the carrier construction below.
+    static final int MAX_FRAME = Conventions.MAX_FRAME_DEFAULT;
+
     public static void main(String[] args) throws IOException {{
 {note}        // One example carrier: a TLS byte stream framed with CSIL's 4-byte length prefix.
+        // The max-frame guard is a carrier setting, not a generated constant: raise MAX_FRAME
+        // when a peer accepts payloads larger than the 16 MiB default (the envelope adds
+        // framing and request metadata around the payload, so the limit must exceed the
+        // largest payload), or lower it to harden an exposed listener. Valid limits are
+        // 1..=Conventions.MAX_FRAME_LIMIT and are checked at construction.
         SSLSocket socket = (SSLSocket) SSLSocketFactory.getDefault().createSocket("localhost", 7443);
         FrameCarrier carrier =
-            new Carriers.StreamCarrier(socket.getInputStream(), socket.getOutputStream());
+            new Carriers.StreamCarrier(socket.getInputStream(), socket.getOutputStream(), MAX_FRAME);
 
         // $hello / $hello-ack handshake (control plane).
         carrier.sendFrame(new Events.Hello(List.of(1L), List.of("verbose"), null, null).encode());
@@ -4022,6 +4039,43 @@ mod tests {
 
     fn paths(files: &[GeneratedFile]) -> Vec<String> {
         files.iter().map(|f| f.path.clone()).collect()
+    }
+
+    /// An optional `bytes` field carries three distinct states — absent,
+    /// present-and-empty, present-and-non-empty — and the codec must decide presence by
+    /// whether the value is set, never by whether it is non-empty (cbor-wire-contract.md
+    /// "Optional fields"). A `length > 0` guard would collapse present-empty into absent
+    /// and silently lose a caller's "replace this with nothing".
+    #[test]
+    fn optional_bytes_encodes_on_presence_not_emptiness() {
+        let group = CsilGroupExpression {
+            entries: vec![
+                bare("id", builtin("text"), None),
+                bare("payload", builtin("bytes"), Some(CsilOccurrence::Optional)),
+            ],
+        };
+        let files = generate_java(&input_for(
+            vec![rule("UpdateRequest", CsilRuleType::GroupDef(group))],
+            "java",
+        ))
+        .unwrap();
+        let codec = &file(&files, "csilgen/generated/CsilCbor.java").content;
+
+        // Encode gates on `!= null` (presence), not on the array length.
+        assert!(
+            codec.contains("if (v.payload() != null) {"),
+            "encode must gate on presence, not emptiness:\n{codec}"
+        );
+        assert!(
+            !codec.contains("v.payload().length > 0"),
+            "encode must not gate on emptiness:\n{codec}"
+        );
+        // Decode maps a missing key to null but keeps a present zero-length byte string
+        // as a zero-length array, so the three states stay distinct.
+        assert!(
+            codec.contains("payload = csilField != null ? asBytes(csilField) : null;"),
+            "decode must gate on key presence:\n{codec}"
+        );
     }
 
     #[test]
