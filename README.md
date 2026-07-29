@@ -47,6 +47,49 @@ csilgen generate --input your-file.csil --target rust --output ./generated/
 
 See the examples directory for sample CSIL files to experiment with.
 
+### Use a released CLI
+
+Download the CLI archive for your operating system and architecture from the
+GitHub Release. Extract the archive. Put `csilgen` or `csilgen.exe` in a
+directory on your `PATH`.
+
+The CLI archives do not contain generators. Download the generator archives
+that you need from the same GitHub Release. Extract each WASM file to one of
+these directories:
+
+- `~/.csilgen/generators/` for a user installation
+- `./.generators/` for a project installation
+
+For example, the Rust generator archive contains
+`csilgen_rust_generator.wasm`.
+
+## Continuous Integration
+
+This repository uses reactorcide for continuous integration and releases. Each
+job starts runnerlib. The repository plugin runs the job in the runnerlib
+`POST_SOURCE_PREP` phase.
+
+The pull request workflow runs these jobs in parallel after the commit check:
+
+- Rust workspace checks and tests
+- WASM generator builds
+- Transport library tests
+- Cross-language interoperability tests
+- Release archive builds
+
+You can run each job on your computer. See
+[`.reactorcide/README.md`](.reactorcide/README.md) for the commands and the
+required tools.
+
+Releases use Conventional Commits and one repository version. A release tag has
+the form `vX.Y.Z`. The GitHub Release contains these files:
+
+- A CLI archive for each supported operating system and architecture
+- One WASM archive for each production generator
+- One source archive for each transport library
+
+The specifications and tests do not have separate versions.
+
 ## CDDL Syntax Support
 
 ### ✅ Supported CBOR Constraint Types

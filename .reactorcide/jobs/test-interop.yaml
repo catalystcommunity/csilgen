@@ -1,0 +1,15 @@
+name: csilgen-test-interop
+description: "Run the cross-language interoperability matrix."
+job:
+  image: containers.catalystsquad.com/public/reactorcide/runnerbase:dev
+  command: runnerlib run --plugin-dir /job/src/.reactorcide/plugins --job-command true
+  timeout: 1800
+  priority: 10
+  capabilities:
+    - docker
+  run_as:
+    user: root
+environment:
+  CSILGEN_JOB: interop
+run_local:
+  user: root

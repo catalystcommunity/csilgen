@@ -1,0 +1,13 @@
+name: csilgen-test-core
+description: "Check and test the Rust workspace."
+job:
+  image: containers.catalystsquad.com/public/reactorcide/runnerbase:dev
+  command: runnerlib run --plugin-dir /job/src/.reactorcide/plugins --job-command true
+  timeout: 2400
+  priority: 10
+  run_as:
+    user: root
+environment:
+  CSILGEN_JOB: core
+run_local:
+  user: root
