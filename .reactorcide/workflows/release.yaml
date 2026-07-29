@@ -1,0 +1,10 @@
+name: CSILgen Release
+description: "Tag and publish one umbrella release after a merge to main."
+on:
+  events:
+    - pull_request_merged
+  branches:
+    - main
+jobs:
+  release:
+    job_file: release.yaml

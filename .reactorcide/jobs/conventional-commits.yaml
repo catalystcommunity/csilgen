@@ -1,0 +1,11 @@
+name: csilgen-conventional-commits
+description: "Validate pull request commit subjects."
+job:
+  image: containers.catalystsquad.com/public/reactorcide/runnerbase:dev
+  command: runnerlib run --plugin-dir /job/src/.reactorcide/plugins --job-command true
+  timeout: 300
+  priority: 10
+environment:
+  CSILGEN_JOB: conventional-commits
+run_local:
+  user: host

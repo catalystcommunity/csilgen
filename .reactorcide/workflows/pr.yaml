@@ -1,0 +1,36 @@
+name: CSILgen PR
+description: "Validate commits, tests, interoperability, and release archives."
+on:
+  events:
+    - pull_request_opened
+    - pull_request_updated
+  branches:
+    - main
+jobs:
+  conventional-commits:
+    job_file: conventional-commits.yaml
+
+  test-core:
+    job_file: test-core.yaml
+    depends_on:
+      - conventional-commits
+
+  test-generators:
+    job_file: test-generators.yaml
+    depends_on:
+      - conventional-commits
+
+  test-transports:
+    job_file: test-transports.yaml
+    depends_on:
+      - conventional-commits
+
+  test-interop:
+    job_file: test-interop.yaml
+    depends_on:
+      - conventional-commits
+
+  package:
+    job_file: package.yaml
+    depends_on:
+      - conventional-commits

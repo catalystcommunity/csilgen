@@ -1,0 +1,15 @@
+name: csilgen-test-transports
+description: "Run all transport conformance tests."
+job:
+  image: containers.catalystsquad.com/public/reactorcide/runnerbase:dev
+  command: runnerlib run --plugin-dir /job/src/.reactorcide/plugins --job-command true
+  timeout: 3600
+  priority: 10
+  capabilities:
+    - docker
+  run_as:
+    user: root
+environment:
+  CSILGEN_JOB: transports
+run_local:
+  user: root
