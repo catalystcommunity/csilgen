@@ -1,6 +1,6 @@
 ; The interop harness executable links the generated package (gen/, the
 ; `interop_api` library) and the monorepo's OCaml transport library (vendored into
-; transport/ by build.sh), plus the stdlib `unix` library for the Unix sockets.
+; transport/ by the Python orchestrator), plus the stdlib `unix` library.
 (executable
  (name main)
  (libraries interop_api csilgen_transport unix))

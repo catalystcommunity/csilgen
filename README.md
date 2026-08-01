@@ -53,9 +53,9 @@ Download the CLI archive for your operating system and architecture from the
 GitHub Release. Extract the archive. Put `csilgen` or `csilgen.exe` in a
 directory on your `PATH`.
 
-The CLI archives do not contain generators. Download the generator archives
-that you need from the same GitHub Release. Extract each WASM file to one of
-these directories:
+The CLI archives do not contain generators. Download each generator archive
+from its generator GitHub Release. Extract each WASM file to one of these
+directories:
 
 - `~/.csilgen/generators/` for a user installation
 - `./.generators/` for a project installation
@@ -66,8 +66,9 @@ For example, the Rust generator archive contains
 ## Continuous Integration
 
 This repository uses reactorcide for continuous integration and releases. Each
-job starts runnerlib. The repository plugin runs the job in the runnerlib
-`POST_SOURCE_PREP` phase.
+job starts runnerlib. Remote jobs load the Python plugin from the trusted
+`main` CI checkout. The plugin runs the job in the runnerlib `POST_SOURCE_PREP`
+phase. Pull request source code cannot replace the trusted plugin.
 
 The pull request workflow runs these jobs in parallel after the commit check:
 
@@ -81,14 +82,17 @@ You can run each job on your computer. See
 [`.reactorcide/README.md`](.reactorcide/README.md) for the commands and the
 required tools.
 
-Releases use Conventional Commits and one repository version. A release tag has
-the form `vX.Y.Z`. The GitHub Release contains these files:
+Releases use Conventional Commits. The CLI, each production generator, and
+each transport library have separate versions. Release tags have these forms:
 
-- A CLI archive for each supported operating system and architecture
-- One WASM archive for each production generator
-- One source archive for each transport library
+- `csilgen-core/vX.Y.Z` for the CLI
+- `generator-<language>/vX.Y.Z` for a generator
+- `transport-<language>/vX.Y.Z` for a transport library
 
-The specifications and tests do not have separate versions.
+A CLI release contains one archive for each supported operating system and
+architecture. A generator release contains one WASM archive. A transport
+release contains one source archive. The specifications and tests do not have
+release targets.
 
 ## CDDL Syntax Support
 

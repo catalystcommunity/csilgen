@@ -1,0 +1,68 @@
+skip_short_versions: true
+targets:
+  - name: csilgen-core
+    paths: [crates/csilgen-cli, crates/csilgen-core, crates/csilgen-common, wasm/csilgen-wasm-generators, Cargo.toml, Cargo.lock, README.md]
+  - name: generator-c
+    paths: [wasm/csilgen-c-generator, crates/csilgen-common, Cargo.toml, Cargo.lock]
+  - name: generator-csharp
+    paths: [wasm/csilgen-csharp-generator, crates/csilgen-common, Cargo.toml, Cargo.lock]
+  - name: generator-dart
+    paths: [wasm/csilgen-dart-generator, crates/csilgen-common, Cargo.toml, Cargo.lock]
+  - name: generator-elixir
+    paths: [wasm/csilgen-elixir-generator, crates/csilgen-common, Cargo.toml, Cargo.lock]
+  - name: generator-go
+    paths: [wasm/csilgen-go-generator, crates/csilgen-common, Cargo.toml, Cargo.lock]
+  - name: generator-java
+    paths: [wasm/csilgen-java-generator, crates/csilgen-common, Cargo.toml, Cargo.lock]
+  - name: generator-json
+    paths: [wasm/csilgen-json-generator, crates/csilgen-common, Cargo.toml, Cargo.lock]
+  - name: generator-kotlin
+    paths: [wasm/csilgen-kotlin-generator, crates/csilgen-common, Cargo.toml, Cargo.lock]
+  - name: generator-ocaml
+    paths: [wasm/csilgen-ocaml-generator, crates/csilgen-common, Cargo.toml, Cargo.lock]
+  - name: generator-openapi
+    paths: [wasm/csilgen-openapi-generator, crates/csilgen-common, Cargo.toml, Cargo.lock]
+  - name: generator-php
+    paths: [wasm/csilgen-php-generator, crates/csilgen-common, Cargo.toml, Cargo.lock]
+  - name: generator-python
+    paths: [wasm/csilgen-python-generator, crates/csilgen-common, Cargo.toml, Cargo.lock]
+  - name: generator-ruby
+    paths: [wasm/csilgen-ruby-generator, crates/csilgen-common, Cargo.toml, Cargo.lock]
+  - name: generator-rust
+    paths: [wasm/csilgen-rust-generator, crates/csilgen-common, Cargo.toml, Cargo.lock]
+  - name: generator-swift
+    paths: [wasm/csilgen-swift-generator, crates/csilgen-common, Cargo.toml, Cargo.lock]
+  - name: generator-typescript
+    paths: [wasm/csilgen-typescript-generator, crates/csilgen-common, Cargo.toml, Cargo.lock]
+  - name: generator-zig
+    paths: [wasm/csilgen-zig-generator, crates/csilgen-common, Cargo.toml, Cargo.lock]
+  - name: transport-c
+    paths: [transports/c]
+  - name: transport-csharp
+    paths: [transports/csharp]
+  - name: transport-dart
+    paths: [transports/dart]
+  - name: transport-elixir
+    paths: [transports/elixir]
+  - name: transport-go
+    paths: [transports/go]
+  - name: transport-java
+    paths: [transports/java]
+  - name: transport-kotlin
+    paths: [transports/kotlin]
+  - name: transport-ocaml
+    paths: [transports/ocaml]
+  - name: transport-php
+    paths: [transports/php]
+  - name: transport-python
+    paths: [transports/python]
+  - name: transport-ruby
+    paths: [transports/ruby]
+  - name: transport-rust
+    paths: [transports/rust]
+  - name: transport-swift
+    paths: [transports/swift]
+  - name: transport-typescript
+    paths: [transports/typescript]
+  - name: transport-zig
+    paths: [transports/zig]

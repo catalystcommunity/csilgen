@@ -25,31 +25,54 @@ The transport and interoperability jobs build a CI image before they run the
 tests. This build can take several minutes. The package job can pull
 cross-build images.
 
-All job logic is in
-[`plugins/plugin_csilgen_jobs.py`](plugins/plugin_csilgen_jobs.py). The YAML job
-command starts runnerlib. Runnerlib loads the plugin after it prepares the
-source. The plugin then runs the selected job in the `POST_SOURCE_PREP` phase.
-A plugin error causes the runnerlib job to fail.
+The YAML job command starts runnerlib. Remote jobs load the Python lifecycle
+plugin from the trusted CI checkout of `main`. The tested source stays in a
+separate checkout. Runnerlib does not load a plugin from the tested source when
+the trusted checkout is present.
+
+The lifecycle plugin is
+[`plugins/plugin_csilgen_jobs.py`](plugins/plugin_csilgen_jobs.py). The trusted
+interop implementation is [`scripts/interop.py`](scripts/interop.py). The
+plugin runs the selected job in the `POST_SOURCE_PREP` phase. A Python error
+causes the runnerlib job to fail.
 
 The interoperability job is separate from the other test jobs. Its runtime
 limit is 360 seconds. The job fails if the test command takes more time.
 
 ## Releases
 
-The release workflow runs after a pull request merges to `main`. It uses
-`semver-tags` and Conventional Commits to calculate one repository version. It
-creates a tag with the form `vX.Y.Z`.
+The release-tag workflow runs after a pull request merges to `main`. It uses
+`semver-tags` v0.6.0 and Conventional Commits. It calculates a separate version
+for the CLI, each generator, and each transport.
 
-The release job creates one GitHub Release for the tag. It uploads:
+The `.semver-tags.yaml` file defines named targets and their paths. A commit can
+change more than one target. A change to a shared path can release all targets
+that use that path. The target name defines the tag prefix. The source path
+does not define the public name.
 
-- CLI archives for Linux x86-64, Linux ARM64, macOS ARM64, and Windows x86-64
-- A separate WASM archive for each production generator
-- A separate source archive for each transport library
+The commit type defines the version change. A `feat` commit changes the minor
+version. A breaking commit changes the major version. Other supported commit
+types change the patch version. The commit scope does not select a release
+target. The changed paths select the targets.
 
-All archives use the same repository version. The specifications and tests are
-not release artifacts. Transport archives are not published to package
-registries.
+The release-tag job creates one draft GitHub Release for each changed target.
+It then pushes all new tags in one atomic operation. Tags have these forms:
 
-The remote release job reads the GitHub token from the reactorcide
-`catalystcommunity/ci:githubpat` secret. Do not run `release.yaml` on your
-computer. Use `package.yaml` to test release builds without a publish action.
+- `csilgen-core/vX.Y.Z`
+- `generator-<language>/vX.Y.Z`
+- `transport-<language>/vX.Y.Z`
+
+Each tag starts a separate release workflow. The release job verifies the
+draft and the source commit before it builds an artifact. It then uploads:
+
+- Four CLI archives for a `csilgen-core` tag
+- One WASM archive for a generator tag
+- One source archive for a transport tag
+
+The specifications and tests do not have release targets. The release jobs do
+not publish transport archives to package registries.
+
+The remote release jobs read the GitHub token from the reactorcide
+`catalystcommunity/ci:githubpat` secret. You cannot run these jobs on your
+computer. Use `package.yaml` to test all release builds without a publish
+action.

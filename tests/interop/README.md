@@ -2,9 +2,10 @@
 
 Proves the CSIL wire standard is byte-identical and behaviorally consistent
 across every generated language. One spec (`interop.csil`) is generated for each
-target language; each language builds a single **harness** program that runs as
-either a **server** or a **client**; then the orchestrator
-(`cargo run -p xtask interop`) runs the full matrix:
+target language. Each language builds one **harness** program that runs as a
+**server** or a **client**. The trusted Python orchestrator then runs the full
+matrix. For local development, `cargo run -p xtask interop` calls the same
+Python implementation:
 
 ```
 for transport in {rpc, events, datagrams}:

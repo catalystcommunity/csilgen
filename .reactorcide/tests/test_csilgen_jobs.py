@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
 import sys
 import unittest
 from pathlib import Path
 from unittest import mock
+
+from src.plugins import PluginManager
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -18,6 +21,17 @@ if SPEC is None or SPEC.loader is None:
 PLUGIN = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = PLUGIN
 SPEC.loader.exec_module(PLUGIN)
+
+INTEROP_PATH = ROOT / ".reactorcide" / "scripts" / "interop.py"
+INTEROP_SPEC = importlib.util.spec_from_file_location(
+    "csilgen_interop",
+    INTEROP_PATH,
+)
+if INTEROP_SPEC is None or INTEROP_SPEC.loader is None:
+    raise RuntimeError("The csilgen interop implementation is not available")
+INTEROP = importlib.util.module_from_spec(INTEROP_SPEC)
+sys.modules[INTEROP_SPEC.name] = INTEROP
+INTEROP_SPEC.loader.exec_module(INTEROP)
 
 
 class ConventionalCommitTests(unittest.TestCase):
@@ -38,6 +52,11 @@ class ConventionalCommitTests(unittest.TestCase):
 
 
 class DispatchTests(unittest.TestCase):
+    def test_runnerlib_loader_imports_plugin(self) -> None:
+        manager = PluginManager()
+        manager.load_plugin_from_file(str(PLUGIN_PATH))
+        self.assertIn("csilgen_jobs", manager.list_plugins())
+
     def test_dispatch_uses_post_source_prep(self) -> None:
         plugin = PLUGIN.CsilgenJobsPlugin()
         self.assertEqual(
@@ -50,7 +69,11 @@ class DispatchTests(unittest.TestCase):
         context.config.code_dir = str(ROOT)
         context.metadata = {}
         with (
-            mock.patch.dict(os.environ, {"CSILGEN_JOB": "core"}, clear=False),
+            mock.patch.dict(
+                os.environ,
+                {"REACTORCIDE_CSILGEN_JOB": "core"},
+                clear=False,
+            ),
             mock.patch.object(PLUGIN, "_test_core") as test_core,
         ):
             PLUGIN.CsilgenJobsPlugin().execute(context)
@@ -58,6 +81,17 @@ class DispatchTests(unittest.TestCase):
 
 
 class CommandTests(unittest.TestCase):
+    def test_path_arguments_are_converted_to_strings(self) -> None:
+        completed = mock.Mock()
+        with mock.patch.object(
+            PLUGIN.subprocess,
+            "run",
+            return_value=completed,
+        ) as run:
+            PLUGIN._run(("example", Path("input")), cwd=ROOT)
+
+        self.assertEqual(run.call_args.args[0], ("example", "input"))
+
     def test_sensitive_arguments_are_redacted(self) -> None:
         completed = mock.Mock()
         with (
@@ -75,6 +109,84 @@ class CommandTests(unittest.TestCase):
             )
         self.assertIs(result, completed)
         log_stdout.assert_called_once_with("+ example [REDACTED]")
+
+
+class TrustedImplementationTests(unittest.TestCase):
+    def test_toolchain_image_does_not_copy_tested_source(self) -> None:
+        self.assertNotIn("COPY .", PLUGIN.CI_TOOLCHAIN_DOCKERFILE)
+        self.assertIn("mkdir -p /job/src /job/ci", PLUGIN.CI_TOOLCHAIN_DOCKERFILE)
+
+    def test_interop_launches_programs_without_shell_wrappers(self) -> None:
+        for language in INTEROP.LANGUAGES:
+            with self.subTest(language=language.name):
+                command, _, _ = INTEROP._launch(ROOT, language)
+                self.assertNotIn(command[0], {"bash", "sh"})
+                self.assertFalse(command[0].endswith("/run"))
+                self.assertFalse(command[0].endswith(".sh"))
+
+    def test_named_release_targets_do_not_use_marker_paths(self) -> None:
+        config = (ROOT / ".semver-tags.yaml").read_text(encoding="utf-8")
+        self.assertIn("targets:", config)
+        self.assertNotIn(".release-targets", config)
+        self.assertIn("skip_short_versions: true", config)
+
+
+class ReleaseTests(unittest.TestCase):
+    def test_release_plans_parse_all_targets(self) -> None:
+        packages = list(PLUGIN.RELEASE_PACKAGES)
+        versions = ["0.2.0"] * len(packages)
+        tags = [f"{package}/v0.2.0" for package in packages]
+        metadata = {
+            "Release_package": ",".join(packages),
+            "New_release_published": ",".join(
+                "true" if index == 0 else "false"
+                for index in range(len(packages))
+            ),
+            "New_release_version": ",".join(versions),
+            "New_release_git_tag": ",".join(tags),
+            "New_release_git_head": ",".join(["abc123"] * len(packages)),
+            "New_release_notes_json": json.dumps(
+                {
+                    "new_release_notes_escaped": {
+                        f"package_{package}": ["feat: initial release"]
+                        for package in packages
+                    }
+                }
+            ),
+        }
+
+        plans = PLUGIN._release_plans(metadata)
+
+        self.assertEqual(len(plans), len(packages))
+        self.assertTrue(plans[0].published)
+        self.assertFalse(plans[1].published)
+        self.assertEqual(plans[0].tag, "csilgen-core/v0.2.0")
+
+    def test_release_tag_selects_one_generator(self) -> None:
+        root = ROOT
+        output = root / "target" / "release-artifacts"
+        with (
+            mock.patch.object(PLUGIN, "_release_output", return_value=output),
+            mock.patch.object(PLUGIN, "_build_wasm") as build_wasm,
+            mock.patch.object(PLUGIN, "_archive_generator") as archive,
+        ):
+            result = PLUGIN._build_tag_artifacts(
+                root,
+                "generator-rust/v1.2.3",
+            )
+
+        self.assertEqual(result, output)
+        build_wasm.assert_called_once_with(
+            root,
+            release=True,
+            packages=("csilgen-rust-generator",),
+        )
+        archive.assert_called_once_with(
+            root,
+            "csilgen-rust-generator",
+            "1.2.3",
+            output,
+        )
 
 
 if __name__ == "__main__":

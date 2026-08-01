@@ -16,7 +16,7 @@
     <Compile Remove="gen/**/*.cs" />
   </ItemGroup>
   <ItemGroup>
-    <!-- The generated package (gitignored, produced by the orchestrator / build.sh) and the
+    <!-- The generated package (gitignored and produced by the Python orchestrator) and the
          in-repo transport library. They use distinct namespaces (interop_api vs
          Csilgen.Transport), so their same-named CBOR value trees do not collide. -->
     <ProjectReference Include="gen/interop_api.csproj" />
