@@ -1,11 +1,20 @@
 name: csilgen-test-generators
 description: "Build all production generator WASM modules."
+triggers:
+  events:
+    - pull_request_opened
+    - pull_request_updated
+  branches:
+    - main
 job:
-  image: containers.catalystsquad.com/public/reactorcide/runnerbase:dev
-  command: runnerlib run --plugin-dir /job/src/.reactorcide/plugins --job-command true
+  image: containers.catalystsquad.com/public/reactorcide/runnerbase:latest
+  command: "runnerlib run --job-command true"
   timeout: 2400
   priority: 10
+  working_dir: /job
+  depends_on:
+    - csilgen-conventional-commits
 environment:
-  CSILGEN_JOB: generators
+  REACTORCIDE_CSILGEN_JOB: generators
 run_local:
   user: host

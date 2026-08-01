@@ -1,0 +1,10 @@
+name: CSILgen Release Tag
+description: "Create draft releases and push changed tags after a merge."
+on:
+  events:
+    - pull_request_merged
+  branches:
+    - main
+jobs:
+  tag:
+    job_file: release-tag.yaml

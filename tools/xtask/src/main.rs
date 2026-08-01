@@ -6,8 +6,6 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
-mod interop;
-
 #[derive(Parser)]
 #[command(name = "xtask")]
 #[command(about = "Development automation tasks for csilgen")]
@@ -34,9 +32,8 @@ enum Commands {
     /// each against the shared conformance vectors. Languages whose toolchain is
     /// absent are skipped with a message rather than failing the run.
     TestTransports,
-    /// Run the cross-language interop matrix: generate the interop package per
-    /// language, build each harness, and exercise every client x server x
-    /// transport pair over TCP/UDP loopback sockets. See tests/interop/README.md.
+    /// Call the trusted Python implementation of the cross-language interop
+    /// matrix. See tests/interop/README.md.
     Interop {
         /// Restrict to these languages (default: all registered).
         #[arg(long, value_delimiter = ',')]
@@ -347,6 +344,26 @@ fn install_wasm() -> Result<()> {
     Ok(())
 }
 
+fn run_interop(langs: &[String], transports: &[String]) -> Result<()> {
+    let root = std::env::current_dir()?;
+    let script = root.join(".reactorcide/scripts/interop.py");
+    let mut command = std::process::Command::new("python3");
+    command.arg(&script).arg("--root").arg(&root);
+    if !langs.is_empty() {
+        command.arg("--langs").arg(langs.join(","));
+    }
+    if !transports.is_empty() {
+        command.arg("--transports").arg(transports.join(","));
+    }
+    let status = command
+        .status()
+        .context("Failed to run the trusted Python interop implementation")?;
+    if !status.success() {
+        anyhow::bail!("interoperability tests failed");
+    }
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
@@ -392,7 +409,7 @@ fn main() -> Result<()> {
             test_transports()?;
         }
         Commands::Interop { langs, transports } => {
-            interop::run(langs.clone(), transports.clone())?;
+            run_interop(langs, transports)?;
         }
     }
 

@@ -1,9 +1,0 @@
-#!/usr/bin/env bash
-# Launch the Zig harness: run <server|client> <rpc|events|datagrams> <port>.
-set -euo pipefail
-
-# shellcheck disable=SC1091
-source "${CATALYST_TOOLS:-$HOME/.local/catalyst-tools}/env.sh" 2>/dev/null || true
-
-HERE="$(cd "$(dirname "$0")" && pwd)"
-exec "$HERE/zig-out/bin/csil-interop-zig" "$@"

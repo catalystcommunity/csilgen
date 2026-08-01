@@ -1,22 +1,18 @@
-name: csilgen-release
-description: "Build and publish the release for one csilgen tag."
+name: csilgen-release-tag
+description: "Create draft releases and push changed csilgen tags."
 triggers:
   events:
-    - tag_created
+    - pull_request_merged
   branches:
-    - "*/v*"
+    - main
 job:
   image: containers.catalystsquad.com/public/reactorcide/runnerbase:latest
   command: "runnerlib run --job-command true"
-  timeout: 5400
+  timeout: 900
   priority: 15
   working_dir: /job
   disable_run_local: true
-  capabilities:
-    - builder
-  run_as:
-    user: root
 environment:
-  REACTORCIDE_CSILGEN_JOB: release
+  REACTORCIDE_CSILGEN_JOB: release-tag
   REACTORCIDE_REPO: catalystcommunity/csilgen
   GITHUB_PAT: "${secret:catalystcommunity/ci:githubpat}"

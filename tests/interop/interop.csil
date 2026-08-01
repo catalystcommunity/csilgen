@@ -4,7 +4,7 @@
 ;; The single authoritative spec for the N-language x N-language
 ;; interop test suite. Generated once per target language; each
 ;; language builds a harness that runs as client or server and the
-;; orchestrator (`cargo run -p xtask interop`) exercises every type,
+;; Python orchestrator (`cargo run -p xtask interop` locally) exercises every type,
 ;; constraint, and transport (CSIL-RPC, CSIL-Events, CSIL-Datagrams)
 ;; so the wire standard is proven byte-identical across languages.
 ;;
@@ -191,4 +191,3 @@ service Interop {
   @wire-id(6)
   echo-opt-bytes: OptBytes -> OptBytes,
 }
-

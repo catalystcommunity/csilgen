@@ -1,15 +1,24 @@
 name: csilgen-package
 description: "Build all release archives without publishing them."
+triggers:
+  events:
+    - pull_request_opened
+    - pull_request_updated
+  branches:
+    - main
 job:
-  image: containers.catalystsquad.com/public/reactorcide/runnerbase:dev
-  command: runnerlib run --plugin-dir /job/src/.reactorcide/plugins --job-command true
+  image: containers.catalystsquad.com/public/reactorcide/runnerbase:latest
+  command: "runnerlib run --job-command true"
   timeout: 5400
   priority: 10
+  working_dir: /job
+  depends_on:
+    - csilgen-conventional-commits
   capabilities:
-    - docker
+    - builder
   run_as:
     user: root
 environment:
-  CSILGEN_JOB: package
+  REACTORCIDE_CSILGEN_JOB: package
 run_local:
   user: root
