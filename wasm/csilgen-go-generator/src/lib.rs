@@ -2962,7 +2962,17 @@ fn emit_union_codec(
     let mut groups: std::collections::HashMap<String, Vec<usize>> =
         std::collections::HashMap::new();
     for (i, variant) in variants.iter().enumerate() {
-        let go_type = reflow_go_type(&map_csil_type_to_go(variant, &None, dec), 1);
+        // A nil interface has its own case in a Go type switch. Do not dispatch a
+        // null arm through `interface{}`: that case also matches every non-nil
+        // concrete value and makes all later union arms unreachable.
+        let go_type = if matches!(
+            codec_unwrap_constrained(variant),
+            CsilTypeExpression::Builtin(name) if name == "null" || name == "nil"
+        ) {
+            "nil".to_string()
+        } else {
+            reflow_go_type(&map_csil_type_to_go(variant, &None, dec), 1)
+        };
         let entry = groups.entry(go_type.clone()).or_default();
         if entry.is_empty() {
             type_order.push(go_type.clone());
@@ -7262,12 +7272,38 @@ mod tests {
             .find(|f| f.path == "codec.gen.go")
             .expect("codec emitted");
 
-        // Single shared `case interface{}:` clause, returning the FIRST arm's own
-        // index (0) unconditionally -- the second arm (index 1) never gets its
-        // own reachable branch on encode.
-        assert_eq!(codec.content.matches("case interface{}:").count(), 1);
+        // Both spellings describe the nil runtime value. They share one `case nil:`
+        // clause, and the first declared arm wins.
+        assert_eq!(codec.content.matches("case nil:").count(), 1);
         assert!(codec.content.contains("cborArray{cborUint(0), cborNull{}}"));
         assert!(!codec.content.contains("cborArray{cborUint(1), cborNull{}}"));
+    }
+
+    #[test]
+    fn null_union_arm_only_matches_nil() {
+        let input = choice_record_input(
+            "NullableValue",
+            vec![
+                CsilTypeExpression::Builtin("null".to_string()),
+                CsilTypeExpression::Builtin("bool".to_string()),
+                CsilTypeExpression::Builtin("int".to_string()),
+                CsilTypeExpression::Builtin("text".to_string()),
+                CsilTypeExpression::Builtin("bytes".to_string()),
+            ],
+        );
+        let output = super::process_generation(input).expect("generation ok");
+        let codec = output
+            .files
+            .iter()
+            .find(|f| f.path == "codec.gen.go")
+            .expect("codec emitted");
+
+        assert!(codec.content.contains("case nil:"));
+        assert!(!codec.content.contains("case interface{}:"));
+        assert!(codec.content.contains("case bool:"));
+        assert!(codec.content.contains("case int64:"));
+        assert!(codec.content.contains("case string:"));
+        assert!(codec.content.contains("case []byte:"));
     }
 
     #[test]

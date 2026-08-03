@@ -2983,6 +2983,178 @@ fn mixed_union_literals() -> [(&'static str, usize); 7] {
     ]
 }
 
+fn union_dispatch_spec() -> CsilSpecSerialized {
+    let union_rule = |name: &str, arms: Vec<CsilTypeExpression>| CsilRule {
+        name: name.to_string(),
+        rule_type: CsilRuleType::TypeDef(CsilTypeExpression::Choice(arms)),
+        position: pos(),
+        doc_comments: vec![],
+    };
+
+    spec_of(vec![
+        record_typedef("EventPayload", vec![field("name", builtin("text"), false)]),
+        record_typedef(
+            "PageViewPayload",
+            vec![field("route", builtin("text"), false)],
+        ),
+        record_typedef(
+            "ErrorPayload",
+            vec![
+                field("error_type", builtin("text"), false),
+                field("message", builtin("text"), false),
+                field("handled", builtin("bool"), false),
+            ],
+        ),
+        union_rule(
+            "TypedValue",
+            vec![
+                builtin("null"),
+                builtin("bool"),
+                builtin("int"),
+                builtin("uint"),
+                builtin("float"),
+                builtin("decimal"),
+                builtin("text"),
+                builtin("bytes"),
+            ],
+        ),
+        union_rule(
+            "Payload",
+            vec![
+                reference("EventPayload"),
+                reference("PageViewPayload"),
+                reference("ErrorPayload"),
+            ],
+        ),
+        record_typedef(
+            "TelemetryItem",
+            vec![field("payload", reference("Payload"), false)],
+        ),
+    ])
+}
+
+#[test]
+fn union_decimal_guard_does_not_shadow_text_or_bytes() {
+    let files =
+        generate_files(&input_with_spec("typescript-client", union_dispatch_spec())).unwrap();
+    let codec = file(&files, "codec.gen.ts");
+    let encoder = codec
+        .split("export function toTypedValueCborValue")
+        .nth(1)
+        .expect("encoder emitted");
+
+    assert!(encoder.contains(
+        "if (v instanceof CsilDecimal) { const csilV = v as CsilDecimal; return [5, { tag: 4, value: csilV.toTag4() }]; }"
+    ));
+    assert!(encoder.contains(
+        "if (typeof v === \"string\") { const csilV = v as string; return [6, csilV]; }"
+    ));
+    assert!(encoder.contains(
+        "if (v instanceof Uint8Array) { const csilV = v as Uint8Array; return [7, csilV]; }"
+    ));
+    assert!(!encoder.contains("if (true)"));
+}
+
+#[test]
+fn union_record_guards_check_each_arms_required_properties() {
+    let files =
+        generate_files(&input_with_spec("typescript-client", union_dispatch_spec())).unwrap();
+    let codec = file(&files, "codec.gen.ts");
+    let encoder = codec
+        .split("export function toPayloadCborValue")
+        .nth(1)
+        .expect("encoder emitted");
+
+    for (member, index, ty) in [
+        ("name", 0, "EventPayload"),
+        ("route", 1, "PageViewPayload"),
+        ("errorType", 2, "ErrorPayload"),
+    ] {
+        assert!(
+            encoder.contains(&format!(
+                "Object.prototype.hasOwnProperty.call(v, \"{member}\")"
+            )),
+            "record arm {ty} does not check its required property:\n{codec}"
+        );
+        assert!(
+            encoder.contains(&format!("const csilV = v as {ty}; return [{index},")),
+            "record arm {ty} lost its declared index:\n{codec}"
+        );
+    }
+}
+
+#[test]
+fn union_runtime_dispatch_reaches_decimal_text_bytes_and_each_record_arm() {
+    let have_node = std::process::Command::new("node")
+        .arg("--version")
+        .output()
+        .is_ok();
+    let have_npx = std::process::Command::new("npx")
+        .arg("--version")
+        .output()
+        .is_ok();
+    if !have_node || !have_npx {
+        eprintln!("skipping: node/npx not on PATH");
+        return;
+    }
+
+    let files =
+        generate_files(&input_with_spec("typescript-client", union_dispatch_spec())).unwrap();
+    let dir =
+        std::env::temp_dir().join(format!("csilgen-ts-union-dispatch-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    for file in &files {
+        std::fs::write(dir.join(&file.path), &file.content).unwrap();
+    }
+    std::fs::write(
+        dir.join("driver.ts"),
+        r#"import { toPayloadCborValue, toTypedValueCborValue } from "./codec.gen";
+import { CsilDecimal } from "./types.gen";
+
+function index(value: unknown): number | bigint {
+  return (value as [number | bigint, unknown])[0];
+}
+
+if (index(toTypedValueCborValue(new CsilDecimal(-2, 123n))) !== 5) throw new Error("decimal arm");
+if (index(toTypedValueCborValue("us-west2")) !== 6) throw new Error("text arm");
+if (index(toTypedValueCborValue(new Uint8Array([1]))) !== 7) throw new Error("bytes arm");
+if (index(toPayloadCborValue({ name: "event" })) !== 0) throw new Error("event arm");
+if (index(toPayloadCborValue({ route: "/docs" })) !== 1) throw new Error("page arm");
+if (index(toPayloadCborValue({ errorType: "io", message: "failed", handled: false })) !== 2) throw new Error("error arm");
+console.log("ok");
+"#,
+    )
+    .unwrap();
+    std::fs::write(dir.join("tsconfig.json"), CODEC_TSCONFIG).unwrap();
+
+    let build = std::process::Command::new("npx")
+        .args(["-y", "-p", "typescript@5", "tsc", "-p", "tsconfig.json"])
+        .current_dir(&dir)
+        .output()
+        .unwrap();
+    assert!(
+        build.status.success(),
+        "tsc failed:\n{}{}",
+        String::from_utf8_lossy(&build.stdout),
+        String::from_utf8_lossy(&build.stderr)
+    );
+
+    let run = std::process::Command::new("node")
+        .arg(dir.join("out").join("driver.js"))
+        .current_dir(&dir)
+        .output()
+        .unwrap();
+    assert!(
+        run.status.success(),
+        "node failed:\n{}{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&run.stdout).trim(), "ok");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn mixed_union_encode_checks_every_literal_before_the_general_arm() {
     let files = generate_files(&input_with_spec("typescript-client", mixed_union_spec())).unwrap();

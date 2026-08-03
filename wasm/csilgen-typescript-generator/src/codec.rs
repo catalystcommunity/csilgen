@@ -33,6 +33,17 @@ pub fn record_names(spec: &CsilSpecSerialized) -> HashSet<String> {
         .collect()
 }
 
+/// The field definitions for each record. Union encode guards use these definitions
+/// to distinguish record arms by their required properties.
+fn record_groups(spec: &CsilSpecSerialized) -> HashMap<String, &CsilGroupExpression> {
+    spec.rules
+        .iter()
+        .filter_map(|rule| {
+            rule_group(&rule.rule_type).map(|group| (common::to_pascal(&rule.name), group))
+        })
+        .collect()
+}
+
 /// Whether a type is a reference to a record the codec covers, so the typed
 /// client can call the record's own `to<T>Cbor`/`from<T>Cbor`.
 pub fn is_record_ref(ty: &CsilTypeExpression, records: &HashSet<String>) -> bool {
@@ -118,6 +129,7 @@ fn unions(spec: &CsilSpecSerialized) -> HashMap<String, &[CsilTypeExpression]> {
 
 struct Ctx<'a> {
     records: &'a HashSet<String>,
+    record_groups: &'a HashMap<String, &'a CsilGroupExpression>,
     aliases: &'a HashMap<String, CsilTypeExpression>,
     unions: &'a HashMap<String, &'a [CsilTypeExpression]>,
     mapping: DecimalMapping,
@@ -559,6 +571,10 @@ fn ts_variant_predicate(ty: &CsilTypeExpression, expr: &str, ctx: &Ctx) -> Strin
             "bytes" | "bstr" => format!("{expr} instanceof Uint8Array"),
             "bool" => format!("typeof {expr} === \"boolean\""),
             "null" | "nil" => format!("{expr} === null"),
+            "decimal" => match ctx.mapping {
+                DecimalMapping::Csil => format!("{expr} instanceof CsilDecimal"),
+                DecimalMapping::Library => format!("{expr} instanceof Decimal"),
+            },
             _ => "true".to_string(),
         },
         CsilTypeExpression::Literal(v) => match v {
@@ -572,10 +588,31 @@ fn ts_variant_predicate(ty: &CsilTypeExpression, expr: &str, ctx: &Ctx) -> Strin
         CsilTypeExpression::Array { .. } => format!("Array.isArray({expr})"),
         CsilTypeExpression::Reference(name) => match ctx.aliases.get(&common::to_pascal(name)) {
             Some(underlying) => ts_variant_predicate(underlying, expr, ctx),
-            // A record reference is an object that is none of the other CborValue shapes.
-            None if ctx.records.contains(&common::to_pascal(name)) => format!(
-                "typeof {expr} === \"object\" && {expr} !== null && !Array.isArray({expr}) && !({expr} instanceof Uint8Array) && !({expr} instanceof Map)"
-            ),
+            // A record reference is a plain object with all fields that the record
+            // requires. This distinguishes records with different required keys.
+            None if ctx.records.contains(&common::to_pascal(name)) => {
+                let plain_object = format!(
+                    "typeof {expr} === \"object\" && {expr} !== null && !Array.isArray({expr}) && !({expr} instanceof Uint8Array) && !({expr} instanceof Map)"
+                );
+                let Some(group) = ctx.record_groups.get(&common::to_pascal(name)) else {
+                    return plain_object;
+                };
+                let required_keys = codec_fields(group)
+                    .into_iter()
+                    .filter(|field| !field.optional)
+                    .map(|field| {
+                        format!(
+                            "Object.prototype.hasOwnProperty.call({expr}, {})",
+                            ts_string_literal(&field.member)
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                if required_keys.is_empty() {
+                    plain_object
+                } else {
+                    format!("{plain_object} && {}", required_keys.join(" && "))
+                }
+            }
             // A nested union reaches the wire as a 2-element tagged-sum array.
             None if ctx.unions.contains_key(&common::to_pascal(name)) => {
                 format!("Array.isArray({expr})")
@@ -670,8 +707,10 @@ pub fn op_encode_expr(
 ) -> (String, BTreeSet<String>) {
     let aliases = aliases(spec);
     let unions = unions(spec);
+    let record_groups = record_groups(spec);
     let ctx = Ctx {
         records,
+        record_groups: &record_groups,
         aliases: &aliases,
         unions: &unions,
         mapping,
@@ -694,8 +733,10 @@ pub fn op_decode_expr(
 ) -> (String, BTreeSet<String>) {
     let aliases = aliases(spec);
     let unions = unions(spec);
+    let record_groups = record_groups(spec);
     let ctx = Ctx {
         records,
+        record_groups: &record_groups,
         aliases: &aliases,
         unions: &unions,
         mapping,
@@ -719,8 +760,10 @@ pub fn op_decode_value_expr(
 ) -> (String, BTreeSet<String>) {
     let aliases = aliases(spec);
     let unions = unions(spec);
+    let record_groups = record_groups(spec);
     let ctx = Ctx {
         records,
+        record_groups: &record_groups,
         aliases: &aliases,
         unions: &unions,
         mapping,
@@ -761,8 +804,10 @@ pub fn op_boundary_expressible(
 ) -> bool {
     let aliases = aliases(spec);
     let unions = unions(spec);
+    let record_groups = record_groups(spec);
     let ctx = Ctx {
         records,
+        record_groups: &record_groups,
         aliases: &aliases,
         unions: &unions,
         mapping: DecimalMapping::Csil,
@@ -888,8 +933,10 @@ pub fn generate(input: &WasmGeneratorInput) -> Option<String> {
     let ext = common::import_extension(input).unwrap_or(ImportExtension::Ts);
     let aliases = aliases(spec);
     let unions = unions(spec);
+    let record_groups = record_groups(spec);
     let ctx = Ctx {
         records: &records,
+        record_groups: &record_groups,
         aliases: &aliases,
         unions: &unions,
         mapping,
