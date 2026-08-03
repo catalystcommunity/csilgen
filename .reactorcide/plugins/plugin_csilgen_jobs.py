@@ -491,7 +491,10 @@ def _container_runtime() -> str:
     docker = shutil.which("docker")
     if docker:
         return docker
-    if os.environ.get("DOCKER_HOST"):
+    docker_socket = Path("/var/run/docker.sock")
+    if os.environ.get("DOCKER_HOST") or docker_socket.exists():
+        if not os.environ.get("DOCKER_HOST"):
+            os.environ["DOCKER_HOST"] = f"unix://{docker_socket}"
         return _install_docker_client()
     podman = shutil.which("podman")
     if podman:
