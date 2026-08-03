@@ -110,6 +110,27 @@ class CommandTests(unittest.TestCase):
         self.assertIs(result, completed)
         log_stdout.assert_called_once_with("+ example [REDACTED]")
 
+    def test_container_runtime_uses_the_mounted_docker_socket(self) -> None:
+        with (
+            mock.patch.dict(os.environ, {}, clear=True),
+            mock.patch.object(PLUGIN.shutil, "which", return_value=None),
+            mock.patch.object(PLUGIN.Path, "exists", return_value=True),
+            mock.patch.object(
+                PLUGIN,
+                "_install_docker_client",
+                return_value="/tmp/docker/docker",
+            ) as install_docker,
+        ):
+            runtime = PLUGIN._container_runtime()
+
+            self.assertEqual(
+                os.environ["DOCKER_HOST"],
+                "unix:///var/run/docker.sock",
+            )
+
+        self.assertEqual(runtime, "/tmp/docker/docker")
+        install_docker.assert_called_once_with()
+
 
 class TrustedImplementationTests(unittest.TestCase):
     def test_toolchain_image_does_not_copy_tested_source(self) -> None:
