@@ -176,6 +176,14 @@ arm could structurally match a given value):
 - Among several **general arms that share one runtime dispatch type**, the
   **first declared** wins.
 
+Some dynamic languages cannot distinguish all general arms. For example,
+TypeScript uses one runtime number type for `int`, `uint`, and `float`. The first
+declared arm wins for these values. For record arms, the TypeScript encoder checks
+the required properties of each record. This check distinguishes records that
+have different required properties. It cannot distinguish records that accept the
+same object shape. The first declared arm wins when two record shapes match. Use
+an explicit discriminant field when each arm must have a unique runtime identity.
+
 Decode always dispatches by `variant_index`; a literal arm's payload is then
 validated for equality against that literal (a `[1, "confirmed"]` for an arm
 declared as the literal `"pending"` at index 1 is a decode error, not a coerced
