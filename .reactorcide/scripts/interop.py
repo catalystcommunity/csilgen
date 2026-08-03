@@ -73,6 +73,27 @@ def _generated(root: Path, language: Language) -> Path:
     return _harness(root, language) / "gen"
 
 
+def _build_generators(root: Path, languages: Sequence[Language]) -> None:
+    packages = tuple(
+        dict.fromkeys(
+            f"csilgen-{language.generator}-generator"
+            for language in languages
+        )
+    )
+    print("== building interop WASM generators (release) ==", flush=True)
+    args = [
+        "cargo",
+        "build",
+        "--release",
+        "--quiet",
+        "--target",
+        "wasm32-unknown-unknown",
+    ]
+    for package in packages:
+        args.extend(("--package", package))
+    _run(args, root)
+
+
 def _generate(root: Path, cli: Path, language: Language) -> None:
     specification = root / "tests" / "interop" / "interop.csil"
     options = (
@@ -451,6 +472,7 @@ def run(
     languages = _select_languages(language_names)
     transports = _select_transports(transport_names)
     cli = root / "target" / "release" / "csilgen"
+    _build_generators(root, languages)
     print("== building csilgen CLI (release) ==", flush=True)
     _run(("cargo", "build", "--release", "--quiet", "-p", "csilgen"), root)
     if not cli.is_file():
