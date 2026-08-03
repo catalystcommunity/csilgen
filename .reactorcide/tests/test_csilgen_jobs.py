@@ -124,6 +124,47 @@ class TrustedImplementationTests(unittest.TestCase):
                 self.assertFalse(command[0].endswith("/run"))
                 self.assertFalse(command[0].endswith(".sh"))
 
+    def test_interop_builds_the_selected_wasm_generators(self) -> None:
+        languages = INTEROP._select_languages(("go", "typescript"))
+        completed = mock.Mock()
+        with mock.patch.object(
+            INTEROP.subprocess,
+            "run",
+            return_value=completed,
+        ) as run:
+            INTEROP._build_generators(ROOT, languages)
+
+        commands = [call.args[0] for call in run.call_args_list]
+        self.assertEqual(
+            commands[0],
+            (
+                "cargo",
+                "build",
+                "--release",
+                "--quiet",
+                "--target",
+                "wasm32-unknown-unknown",
+                "--package",
+                "csilgen-go-generator",
+                "--package",
+                "csilgen-typescript-generator",
+            ),
+        )
+
+    def test_interop_run_builds_generators_before_cli_use(self) -> None:
+        with mock.patch.object(
+            INTEROP,
+            "_build_generators",
+            side_effect=RuntimeError("stop after generator build"),
+        ) as build_generators:
+            with self.assertRaisesRegex(RuntimeError, "stop after generator build"):
+                INTEROP.run(ROOT, ("rust",), ("rpc",))
+
+        build_generators.assert_called_once_with(
+            ROOT.resolve(),
+            INTEROP._select_languages(("rust",)),
+        )
+
     def test_named_release_targets_do_not_use_marker_paths(self) -> None:
         config = (ROOT / ".semver-tags.yaml").read_text(encoding="utf-8")
         self.assertIn("targets:", config)
