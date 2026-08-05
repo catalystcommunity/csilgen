@@ -1,4 +1,4 @@
-//! Error reporting and user experience utilities for the CLI
+//! CLI diagnostics and progress output.
 
 use atty::Stream;
 use console::{Term, style};
@@ -53,7 +53,6 @@ impl ErrorReporter {
                 self.report_validation_error(validation_error)?;
             }
             CsilgenError::MultipleErrors(errors) => {
-                // Sort errors by priority before displaying
                 let sorted_errors = CsilgenError::sort_errors_by_priority(errors.to_vec());
 
                 if self.config.use_colors {
@@ -126,7 +125,6 @@ impl ErrorReporter {
 
     /// Report a parse error with context and suggestions
     fn report_parse_error(&self, error: &ParseError) -> anyhow::Result<()> {
-        // Error header with icon and category
         let category = self.parse_error_category(&error.error_kind);
         if self.config.use_colors {
             self.term.write_line(&format!(
@@ -139,7 +137,6 @@ impl ErrorReporter {
             self.term.write_line(&format!("Parse Error ({category})"))?;
         }
 
-        // Location information if available
         if let Some(location) = &error.location {
             if self.config.use_colors {
                 self.term
@@ -149,7 +146,6 @@ impl ErrorReporter {
             }
         }
 
-        // Main error message
         if self.config.use_colors {
             self.term
                 .write_line(&format!("  {}", style(&error.message).bright()))?;
@@ -157,7 +153,6 @@ impl ErrorReporter {
             self.term.write_line(&format!("  {}", error.message))?;
         }
 
-        // Code snippet if available
         if let Some(snippet) = &error.snippet {
             self.term.write_line("")?;
             if self.config.use_colors {
@@ -176,7 +171,6 @@ impl ErrorReporter {
             }
         }
 
-        // Suggestion if available
         if let Some(suggestion) = &error.suggestion {
             self.term.write_line("")?;
             if self.config.use_colors {
@@ -197,9 +191,8 @@ impl ErrorReporter {
         Ok(())
     }
 
-    /// Report a validation error with context and suggestions  
+    /// Report a validation error with context and suggestions.
     fn report_validation_error(&self, error: &ValidationError) -> anyhow::Result<()> {
-        // Error header with icon and category
         let category = self.validation_error_category(&error.error_kind);
         if self.config.use_colors {
             self.term.write_line(&format!(
@@ -213,7 +206,6 @@ impl ErrorReporter {
                 .write_line(&format!("Validation Error ({category})"))?;
         }
 
-        // Location information if available
         if let Some(location) = &error.location {
             if self.config.use_colors {
                 self.term
@@ -223,7 +215,6 @@ impl ErrorReporter {
             }
         }
 
-        // Main error message
         if self.config.use_colors {
             self.term
                 .write_line(&format!("  {}", style(&error.message).bright()))?;
@@ -231,7 +222,6 @@ impl ErrorReporter {
             self.term.write_line(&format!("  {}", error.message))?;
         }
 
-        // Suggestion if available
         if let Some(suggestion) = &error.suggestion {
             self.term.write_line("")?;
             if self.config.use_colors {

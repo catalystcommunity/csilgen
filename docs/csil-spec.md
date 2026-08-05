@@ -750,8 +750,9 @@ Generators can produce:
 
 ### Language Support
 
-Current language targets (18, run `csilgen generate --target <bogus>` for the
-authoritative list straight from the CLI):
+The standard installation provides 17 output generator targets and the `noop`
+test target. The targets that are available to the CLI depend on the installed
+WASM files.
 
 - **Rust**: Structs with serde, a per-type CBOR codec, and a typed client/server (`-typesonly` / `-client` / `-server` sub-targets)
 - **TypeScript**: Interfaces, a transport-agnostic client, and server handlers. Four targets:
@@ -775,9 +776,9 @@ authoritative list straight from the CLI):
 - **OpenAPI**: OpenAPI 3.0 specifications
 - **JSON Schema**: JSON Schema draft 7+
 
-Every one of the 14 non-schema targets emits a self-contained, per-type CBOR
-codec and a typed client/server over a dumb byte-transport seam — see
-`cbor-wire-contract.md`.
+Each of the 15 language targets emits a self-contained CBOR codec for each
+type. It also emits a typed client and server that use a byte transport
+interface. See `cbor-wire-contract.md`.
 
 ### Generation Examples
 
@@ -785,14 +786,15 @@ codec and a typed client/server over a dumb byte-transport seam — see
 # Generate Rust code
 csilgen generate --input api.csil --target rust --output ./src/generated/
 
-# Generate TypeScript with validation
-csilgen generate --input api.csil --target typescript --validation --output ./src/api/
+# Generate TypeScript
+csilgen generate --input api.csil --target typescript --output ./src/api/
 
 # Generate OpenAPI specification
-csilgen generate --input api.csil --target openapi --output ./docs/api.yaml
+csilgen generate --input api.csil --target openapi --output ./docs/
 
-# Generate multiple targets
-csilgen generate --input api.csil --target rust,typescript,python --output ./generated/
+# Generate more than one target
+csilgen generate --input api.csil --target rust --output ./generated/rust/
+csilgen generate --input api.csil --target python --output ./generated/python/
 ```
 
 ### Generator Directives

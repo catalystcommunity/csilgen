@@ -1,7 +1,4 @@
-//! User-friendly dependency reporting for CSIL file analysis
-//!
-//! This module provides functions to report dependency analysis results to users
-//! in a clear and informative way.
+//! Dependency analysis output.
 
 use csilgen_core::FileDependencyGraph;
 use std::path::{Path, PathBuf};
@@ -23,7 +20,7 @@ pub fn report_dependency_strategy(graph: &FileDependencyGraph, entry_points: &[P
 }
 
 /// Print detailed dependency analysis information
-pub fn print_detailed_analysis(graph: &FileDependencyGraph, entry_points: &[PathBuf]) {
+fn print_detailed_analysis(graph: &FileDependencyGraph, entry_points: &[PathBuf]) {
     println!("Entry Points:");
     for entry in entry_points {
         println!("  📄 {}", format_file_name(entry));
@@ -47,7 +44,7 @@ pub fn print_detailed_analysis(graph: &FileDependencyGraph, entry_points: &[Path
         }
     }
 
-    println!(); // Empty line for readability
+    println!();
 }
 
 /// Print a hierarchical dependency tree for a file
@@ -64,9 +61,8 @@ fn print_dependency_tree(graph: &FileDependencyGraph, file: &Path, depth: usize)
             format_file_name(dep)
         );
 
-        // Recursively print dependencies, but avoid infinite loops
+        // This limit also protects callers that pass a graph with a cycle.
         if depth < 10 {
-            // Reasonable recursion limit
             print_dependency_tree(graph, dep, depth + 1);
         }
     }
@@ -114,15 +110,6 @@ pub fn report_no_entry_points_error(all_files: &[PathBuf]) -> String {
         Consider creating a main.csil file that includes the files you want to generate code from.",
         file_names.join(", ")
     )
-}
-
-/// Format cycle paths for error messages
-pub fn format_cycle_paths(cycle: &[PathBuf]) -> String {
-    cycle
-        .iter()
-        .map(|p| format_file_name(p))
-        .collect::<Vec<_>>()
-        .join(" → ")
 }
 
 /// Report generation strategy summary
@@ -177,20 +164,6 @@ mod tests {
 
         let path = PathBuf::from("simple.csil");
         assert_eq!(format_file_name(&path), "simple.csil");
-    }
-
-    #[test]
-    fn test_format_cycle_paths() {
-        let temp_dir = TempDir::new().unwrap();
-
-        let a = create_test_file(temp_dir.path(), "a.csil", "");
-        let b = create_test_file(temp_dir.path(), "b.csil", "");
-        let c = create_test_file(temp_dir.path(), "c.csil", "");
-
-        let cycle = vec![a, b, c];
-        let formatted = format_cycle_paths(&cycle);
-
-        assert_eq!(formatted, "a.csil → b.csil → c.csil");
     }
 
     #[test]

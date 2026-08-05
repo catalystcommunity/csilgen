@@ -1,6 +1,4 @@
-//! Library functions for the csilgen CLI tool
-//!
-//! This module contains testable functions extracted from the main CLI binary.
+//! Code-generation support for the csilgen command-line interface.
 
 pub mod dependency_report;
 
@@ -46,7 +44,6 @@ fn find_csil_files_in_directory(dir: &Path) -> CliResult<Vec<PathBuf>> {
                 let path = entry.path();
 
                 if path.is_dir() {
-                    // Recursively visit subdirectories
                     visit_dir(&path, files)?;
                 } else if path.is_file() && path.extension().is_some_and(|ext| ext == "csil") {
                     files.push(path);
@@ -58,7 +55,7 @@ fn find_csil_files_in_directory(dir: &Path) -> CliResult<Vec<PathBuf>> {
 
     visit_dir(dir, &mut csil_files)?;
 
-    // Sort files for consistent ordering
+    // Stable order makes generated output and diagnostics reproducible.
     csil_files.sort();
 
     Ok(csil_files)
@@ -96,9 +93,7 @@ pub fn generate_code_with_progress(
 ) -> CliResult<GenerationResult> {
     let input_files = discover_input_files(input_pattern)?;
 
-    // Determine processing strategy based on input
     if input_files.len() == 1 {
-        // Single file - process normally
         process_single_file(
             &input_files[0],
             target,
@@ -107,7 +102,6 @@ pub fn generate_code_with_progress(
             readme_transports.as_deref(),
         )
     } else {
-        // Multiple files - use dependency analysis
         process_multiple_files_with_dependencies(
             input_files,
             target,
@@ -138,13 +132,10 @@ fn discover_input_files(input_pattern: &str) -> CliResult<Vec<PathBuf>> {
     let path = PathBuf::from(input_pattern);
 
     if path.exists() && path.is_dir() {
-        // Directory path - find all .csil files recursively
         find_csil_files_in_directory(&path)
     } else if path.exists() && path.is_file() {
-        // Single file path
         Ok(vec![path])
     } else if let Ok(paths) = glob(input_pattern) {
-        // Glob pattern - collect all matching files
         let mut files = Vec::new();
         for path_result in paths {
             match path_result {
@@ -165,12 +156,11 @@ fn discover_input_files(input_pattern: &str) -> CliResult<Vec<PathBuf>> {
             Ok(files)
         }
     } else {
-        // Path doesn't exist
         Err(format!("Input path does not exist: {}", path.display()).into())
     }
 }
 
-/// Process a single file (legacy behavior)
+/// Process one input file.
 fn process_single_file(
     input_file: &Path,
     target: &str,
@@ -178,7 +168,6 @@ fn process_single_file(
     progress_bar: Option<ProgressBar>,
     readme_transports: Option<&[String]>,
 ) -> CliResult<GenerationResult> {
-    // Create output directories as needed
     fs::create_dir_all(output_dir).map_err(|e| {
         format!(
             "Error creating output directory {}: {}",
@@ -187,16 +176,13 @@ fn process_single_file(
         )
     })?;
 
-    // Initialize progress bar if provided
     if let Some(pb) = &progress_bar {
-        pb.set_length(3); // Parse, Generate, Write phases for single file
+        pb.set_length(3);
         pb.set_position(0);
     }
 
-    // Initialize WASM runtime and generator setup
     let (mut runtime, generator_id) = initialize_wasm_runtime(target)?;
 
-    // Update progress: parsing phase
     if let Some(pb) = &progress_bar {
         pb.set_message(format!(
             "Parsing {}",
@@ -205,7 +191,6 @@ fn process_single_file(
         pb.set_position(0);
     }
 
-    // Parse the CSIL file with import resolution
     let spec = parse_csil_with_imports(input_file)?;
 
     // Validate before generating: the generate path consumes contracts (e.g. the
@@ -214,24 +199,20 @@ fn process_single_file(
     validate_spec_optimized(&spec)
         .map_err(|e| format!("Validation failed for {}: {}", input_file.display(), e))?;
 
-    // Update progress: generation phase
     if let Some(pb) = &progress_bar {
         pb.set_message(format!("Generating {target}"));
         pb.set_position(1);
     }
 
-    // Extract options from CSIL file
     let mut options = extract_options_from_spec(&spec);
     apply_readme_transports(&mut options, readme_transports);
 
-    // Create generator configuration
     let config = GeneratorConfig {
         target: target.to_string(),
         output_dir: output_dir.to_string_lossy().to_string(),
         options,
     };
 
-    // Execute the generator
     let generated_files = runtime
         .execute_generator(&generator_id, &spec, &config)
         .map_err(|e| {
@@ -243,17 +224,14 @@ fn process_single_file(
             )
         })?;
 
-    // Update progress: writing phase
     if let Some(pb) = &progress_bar {
         pb.set_message(format!("Writing {} files", generated_files.len()));
         pb.set_position(2);
     }
 
-    // Write generated files
     let (files_written, total_size) =
         write_generated_files(&generator_id, &generated_files, output_dir)?;
 
-    // Finish progress bar
     if let Some(pb) = &progress_bar {
         pb.finish_with_message(format!(
             "Completed: 1 file processed, {files_written} files generated"
@@ -276,7 +254,6 @@ fn process_multiple_files_with_dependencies(
     progress_bar: Option<ProgressBar>,
     readme_transports: Option<&[String]>,
 ) -> CliResult<GenerationResult> {
-    // Create output directories as needed
     fs::create_dir_all(output_dir).map_err(|e| {
         format!(
             "Error creating output directory {}: {}",
@@ -285,28 +262,23 @@ fn process_multiple_files_with_dependencies(
         )
     })?;
 
-    // Build dependency graph
     let dependency_graph = FileDependencyGraph::build_from_files(&input_files)
         .map_err(|e| format!("Failed to build dependency graph: {e}"))?;
 
-    // Detect and report circular dependencies
     if let Some(cycles) = dependency_graph.has_circular_dependencies() {
         return Err(report_circular_dependency_error(&cycles).into());
     }
 
-    // Find entry points
     let entry_points = dependency_graph.find_entry_points();
 
     if entry_points.is_empty() {
         return Err(report_no_entry_points_error(&input_files).into());
     }
 
-    // Report what we're doing
     let dependency_files = dependency_graph.get_dependency_files();
     report_dependency_strategy(&dependency_graph, &entry_points);
     report_generation_summary(input_files.len(), &entry_points, &dependency_files);
 
-    // Process only entry points (each gets fully resolved with imports)
     process_entry_points(
         entry_points,
         target,
@@ -324,16 +296,13 @@ fn process_entry_points(
     progress_bar: Option<ProgressBar>,
     readme_transports: Option<&[String]>,
 ) -> CliResult<GenerationResult> {
-    // Initialize progress bar if provided
     if let Some(pb) = &progress_bar {
-        pb.set_length(entry_points.len() as u64 * 3); // Parse, Generate, Write phases
+        pb.set_length(entry_points.len() as u64 * 3);
         pb.set_position(0);
     }
 
-    // Initialize WASM runtime and generator setup
     let (mut runtime, generator_id) = initialize_wasm_runtime(target)?;
 
-    // Process each entry point file with progress tracking
     let mut total_files_written = 0;
     let mut total_size = 0;
     let mut processed_count = 0;
@@ -342,7 +311,6 @@ fn process_entry_points(
     for (i, input_file) in entry_points.iter().enumerate() {
         processed_count += 1;
 
-        // Update progress: parsing phase
         if let Some(pb) = &progress_bar {
             pb.set_message(format!(
                 "Parsing {}",
@@ -351,7 +319,6 @@ fn process_entry_points(
             pb.set_position((i * 3) as u64);
         }
 
-        // Parse the CSIL file with import resolution
         let spec = match parse_csil_with_imports(input_file) {
             Ok(spec) => spec,
             Err(e) => {
@@ -363,31 +330,26 @@ fn process_entry_points(
             }
         };
 
-        // Validate before generating (see process_single_file).
         if let Err(e) = validate_spec_optimized(&spec) {
             eprintln!("Validation failed for {}: {}", input_file.display(), e);
             error_count += 1;
             continue;
         }
 
-        // Update progress: generation phase
         if let Some(pb) = &progress_bar {
             pb.set_message(format!("Generating {target}"));
             pb.set_position((i * 3 + 1) as u64);
         }
 
-        // Extract options from CSIL file
         let mut options = extract_options_from_spec(&spec);
         apply_readme_transports(&mut options, readme_transports);
 
-        // Create generator configuration for this file
         let config = GeneratorConfig {
             target: target.to_string(),
             output_dir: output_dir.to_string_lossy().to_string(),
             options,
         };
 
-        // Execute the generator for this file
         let generated_files = match runtime.execute_generator(&generator_id, &spec, &config) {
             Ok(files) => files,
             Err(e) => {
@@ -403,13 +365,11 @@ fn process_entry_points(
             }
         };
 
-        // Update progress: writing phase
         if let Some(pb) = &progress_bar {
             pb.set_message(format!("Writing {} files", generated_files.len()));
             pb.set_position((i * 3 + 2) as u64);
         }
 
-        // Write generated files for this input
         match write_generated_files(&generator_id, &generated_files, output_dir) {
             Ok((files_written, size)) => {
                 total_files_written += files_written;
@@ -425,13 +385,11 @@ fn process_entry_points(
             }
         }
 
-        // Update progress: completed file
         if let Some(pb) = &progress_bar {
             pb.set_position((i * 3 + 3) as u64);
         }
     }
 
-    // Finish progress bar
     if let Some(pb) = &progress_bar {
         pb.finish_with_message(format!(
             "Completed: {processed_count} entry points processed, {total_files_written} files generated"
@@ -448,11 +406,9 @@ fn process_entry_points(
 
 /// Initialize WASM runtime and validate generator availability
 fn initialize_wasm_runtime(target: &str) -> CliResult<(WasmGeneratorRuntime, String)> {
-    // Initialize WASM runtime
     let mut runtime =
         WasmGeneratorRuntime::new().map_err(|e| format!("Error initializing WASM runtime: {e}"))?;
 
-    // Discover available generators
     runtime
         .discover_generators()
         .map_err(|e| format!("Error discovering generators: {e}"))?;
@@ -469,7 +425,7 @@ fn initialize_wasm_runtime(target: &str) -> CliResult<(WasmGeneratorRuntime, Str
 /// emits the requested subset based on `config.target`. When several match, the
 /// most specific (longest) generator target wins.
 fn resolve_generator_for_target(runtime: &WasmGeneratorRuntime, target: &str) -> CliResult<String> {
-    let mut best: Option<(&str, &str)> = None; // (generator_target, generator_id)
+    let mut best: Option<(&str, &str)> = None;
     for discovered in runtime.registry().discovered_generators().values() {
         let gt = discovered.metadata.target.as_str();
         let matches = gt == target || target.starts_with(&format!("{gt}-"));
@@ -501,23 +457,11 @@ fn resolve_generator_for_target(runtime: &WasmGeneratorRuntime, target: &str) ->
     .into())
 }
 
-/// Resolve a generator-supplied relative path onto `output_dir`, rejecting
-/// anything that could write outside it.
+/// Resolve a generator output path without permitting writes outside `output_dir`.
 ///
-/// The plugin contract (docs/generator-plugin-contract.md §3) obligates
-/// generators to emit only relative, traversal-safe paths, but that's a MUST on
-/// the generator side, not something the host can trust — a generator is an
-/// arbitrary third-party WASM module, and a buggy or malicious one emitting
-/// `../../.bashrc` or `/etc/passwd` would otherwise write wherever
-/// `output_dir.join(path)` (or plain `Path::join`, which discards the base
-/// entirely when `path` is absolute) lands. We can't `canonicalize` the result
-/// to double check, because the file doesn't exist yet — canonicalize requires
-/// an existing path. Instead we walk `Path::components()` and reject anything
-/// that isn't a plain relative path: a `..` component, a root/prefix component
-/// (covers both leading `/` and Windows drive letters like `C:\`), or a path
-/// with no real components at all (empty, or only `.`). `CurDir` components are
-/// dropped rather than rejected since `./foo` is a harmless, if odd, way to
-/// spell `foo`.
+/// Generators are third-party modules. The host must enforce the plugin path
+/// contract even when a module is faulty or malicious. Component inspection is
+/// necessary because the output file does not yet exist and cannot be canonicalized.
 fn sanitize_output_path(
     generator_id: &str,
     output_dir: &Path,
@@ -567,13 +511,11 @@ fn write_generated_files(
     for generated_file in generated_files {
         let file_path = sanitize_output_path(generator_id, output_dir, &generated_file.path)?;
 
-        // Ensure parent directories exist
         if let Some(parent) = file_path.parent() {
             fs::create_dir_all(parent)
                 .map_err(|e| format!("Failed to create directory {}: {}", parent.display(), e))?;
         }
 
-        // Write file
         fs::write(&file_path, &generated_file.content)
             .map_err(|e| format!("Failed to write file {}: {}", file_path.display(), e))?;
 

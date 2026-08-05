@@ -1131,13 +1131,13 @@ jobs:
     steps:
       - uses: actions/checkout@v3
       
-      - name: Install CSILgen
+      - name: Install csilgen
         run: |
-          cargo install csilgen-cli
+          cargo install --git https://github.com/catalystcommunity/csilgen.git csilgen
           
       - name: Validate CSIL files
         run: |
-          csilgen validate --input api/
+          find api -name '*.csil' -exec csilgen validate --input {} \;
           
       - name: Check breaking changes
         run: |
@@ -1145,15 +1145,15 @@ jobs:
           cp -r api/ api-main/
           git checkout -
           
-          if csilgen breaking --current api-main/ --new api/ | grep "BREAKING"; then
+          if ! csilgen breaking --current api-main/main.csil --new api/main.csil; then
             echo "::error::Breaking changes detected! Bump major version."
             exit 1
           fi
           
       - name: Generate code
         run: |
-          csilgen generate --input api/ --target typescript --output generated/
-          csilgen generate --input api/ --target python --output generated/
+          csilgen generate --input api/ --target typescript --output generated/typescript/
+          csilgen generate --input api/ --target python --output generated/python/
           
       - name: Test generated code
         run: |
@@ -1181,10 +1181,11 @@ if [ -n "$CSIL_FILES" ]; then
             exit 1
         fi
         
-        # Format
-        csilgen format "$file"
-        git add "$file"
     done
+
+    # Format all CSIL files in the repository.
+    csilgen format .
+    git add -- $CSIL_FILES
     
     echo "✅ All CSIL files validated and formatted"
 fi
@@ -1197,8 +1198,8 @@ fi
 {
   "scripts": {
     "generate": "csilgen generate --input api/ --target typescript --output src/generated/",
-    "validate": "csilgen validate --input api/",
-    "check-breaking": "csilgen breaking --current api-stable/ --new api/",
+    "validate": "find api -name '*.csil' -exec csilgen validate --input {} \\;",
+    "check-breaking": "csilgen breaking --current api-stable/main.csil --new api/main.csil",
     "prebuild": "npm run generate",
     "build": "tsc"
   }
