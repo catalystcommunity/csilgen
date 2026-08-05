@@ -213,6 +213,7 @@ csilgen generate --input examples/basic-usage/simple-service.csil --target noop 
 ```
 
 ### Full CLI Commands
+
 ```bash
 csilgen validate --input interface.csil
 csilgen generate --input interface.csil --target rust --output ./generated/
@@ -220,6 +221,20 @@ csilgen generate --input ./schemas/ --target rust --output ./generated/  # Multi
 csilgen breaking --current A.csil --new B.csil
 csilgen format path/to/dir/ --dry-run
 csilgen lint path/to/dir/ --fix
+```
+
+The `validate` and `breaking` commands accept file paths. The `format` command
+processes a directory tree. The `lint` command processes CSIL files directly
+in one directory.
+
+Generators can create a `genquickstart.md` file with transport examples. By
+default, this file contains the CSIL-RPC, CSIL-Events, and CSIL-Datagrams
+examples. Use one or more of these options to select examples:
+
+```bash
+--readme-csil-rpc
+--readme-csil-events
+--readme-csil-datagrams
 ```
 
 ## Multi-File Projects and Dependency Analysis

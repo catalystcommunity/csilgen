@@ -1,4 +1,4 @@
-//! CLI tool for generating code from CBOR Service Interface Language (CSIL) interface definitions
+//! Command-line interface for CSIL validation, generation, comparison, formatting, and linting.
 
 pub mod error_reporting;
 
@@ -14,13 +14,14 @@ use std::path::PathBuf;
 
 #[derive(Parser)]
 #[command(name = "csilgen")]
-#[command(about = "A CLI tool for generating code from CSIL interface definitions")]
+#[command(version)]
+#[command(about = "Validate CSIL files and generate code from them")]
 struct Cli {
-    /// Enable verbose output for debugging
+    /// Show detailed diagnostic output
     #[arg(short, long, global = true)]
     verbose: bool,
 
-    /// Suppress non-essential output for scripting
+    /// Do not show formatted status and error messages
     #[arg(short, long, global = true)]
     quiet: bool,
 
@@ -34,7 +35,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Parse and validate a CSIL file
+    /// Parse imports and validate a CSIL file
     Validate {
         /// Path to the CSIL file
         #[arg(short, long)]
@@ -42,37 +43,29 @@ enum Commands {
     },
     /// Generate code from CSIL file(s)
     Generate {
-        /// Path to CSIL file, directory, or glob pattern (e.g., "user.csil", "./schemas", "*.csil", "schemas/**/*.csil")
+        /// CSIL file, directory, or glob pattern
         ///
-        /// For directories/patterns with multiple files, csilgen performs dependency analysis to:
-        /// - Identify entry point files (not imported by others)
-        /// - Generate code only from entry points to avoid duplicates
-        /// - Include dependencies automatically via import resolution
-        ///   
-        ///   Use CSIL_VERBOSE=1 for detailed dependency analysis output
+        /// For multiple files, csilgen generates code from files that no other
+        /// file imports. It resolves their imports automatically. Set
+        /// CSIL_VERBOSE=1 to show the dependency graph.
         #[arg(short, long)]
         input: String,
-        /// Target generator name, resolved from installed generators in ~/.csilgen/generators/
-        /// (e.g. rust, go, typescript, json, python, openapi). The rust, go, python, and
-        /// typescript generators also accept -server / -client / -typesonly sub-targets
-        /// (e.g. rust-client, go-typesonly). The bare rust/go/python target emits the server
-        /// surface; bare typescript emits client, server, and types together.
+        /// Installed generator target or a sub-target such as rust-client
         #[arg(short, long)]
         target: String,
         /// Output directory
         #[arg(short, long)]
         output: PathBuf,
-        /// Limit the generated `genquickstart.md` to the CSIL-RPC transport example.
+        /// Include the CSIL-RPC example in the generated quickstart
         ///
-        /// `--readme-csil-rpc`, `--readme-csil-events`, and `--readme-csil-datagrams`
-        /// select which transport sections the Quickstart shows; passing none emits
-        /// all three.
+        /// Use one or more readme transport options to select examples. If you
+        /// do not use these options, the quickstart contains all examples.
         #[arg(long)]
         readme_csil_rpc: bool,
-        /// Limit the generated `genquickstart.md` to the CSIL-Events transport example.
+        /// Include the CSIL-Events example in the generated quickstart
         #[arg(long)]
         readme_csil_events: bool,
-        /// Limit the generated `genquickstart.md` to the CSIL-Datagrams transport example.
+        /// Include the CSIL-Datagrams example in the generated quickstart
         #[arg(long)]
         readme_csil_datagrams: bool,
     },
@@ -85,7 +78,7 @@ enum Commands {
         #[arg(long)]
         new: PathBuf,
     },
-    /// Format CSIL files in a directory
+    /// Format all CSIL files in a directory tree
     Format {
         /// Path to directory containing CSIL files
         path: PathBuf,
@@ -93,7 +86,7 @@ enum Commands {
         #[arg(long)]
         dry_run: bool,
     },
-    /// Lint CSIL files in a directory
+    /// Lint CSIL files directly in a directory
     Lint {
         /// Path to directory containing CSIL files
         path: PathBuf,
@@ -106,7 +99,6 @@ enum Commands {
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
-    // Create CLI output configuration
     let output_config = CliOutputConfig {
         use_colors: !cli.no_color && atty::is(atty::Stream::Stderr),
         verbose: cli.verbose,
@@ -138,15 +130,13 @@ fn run_command(cli: &Cli, reporter: &ErrorReporter) -> Result<(), csilgen_common
             })?;
 
             reporter.report_success(&format!("Parsed {} rules successfully", spec.rules.len()))?;
-            // Use optimized validation for large specs
+            validate_spec_optimized(&spec)?;
             if spec.rules.len() > 1000 {
-                validate_spec_optimized(&spec)?;
                 reporter.report_success(&format!(
                     "Large spec validated successfully using parallel validation ({} rules)",
                     spec.rules.len()
                 ))?;
             } else {
-                validate_spec_optimized(&spec)?;
                 reporter.report_success("CSIL file validated successfully")?;
             }
         }
@@ -167,8 +157,7 @@ fn run_command(cli: &Cli, reporter: &ErrorReporter) -> Result<(), csilgen_common
                 None
             };
 
-            // Each `--readme-csil-*` flag opts that transport's Quickstart section in;
-            // with none set we pass `None` so generators emit all three by default.
+            // An absent value tells generators to include all transport examples.
             let mut readme_transports: Vec<String> = Vec::new();
             if *readme_csil_rpc {
                 readme_transports.push("rpc".to_string());
@@ -386,10 +375,8 @@ fn run_command(cli: &Cli, reporter: &ErrorReporter) -> Result<(), csilgen_common
 fn parse_csil_with_imports(path: &std::path::Path) -> anyhow::Result<CsilSpec> {
     let mut resolver = ImportResolver::new();
 
-    // Use streaming parser for large files to optimize memory usage
     let file_size = std::fs::metadata(path)?.len();
     let mut spec = if file_size > 10 * 1024 * 1024 {
-        // >10MB
         parse_csil_file_streaming(path)?
     } else {
         parse_csil_file(path)?
@@ -397,4 +384,32 @@ fn parse_csil_with_imports(path: &std::path::Path) -> anyhow::Result<CsilSpec> {
 
     resolver.resolve_imports(&mut spec, path)?;
     Ok(spec)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    #[test]
+    fn cli_definition_is_valid() {
+        Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn generate_help_lists_all_transport_options() {
+        let command = Cli::command();
+        let generate = command
+            .find_subcommand("generate")
+            .expect("generate subcommand");
+        let help = generate.clone().render_long_help().to_string();
+
+        for option in [
+            "--readme-csil-rpc",
+            "--readme-csil-events",
+            "--readme-csil-datagrams",
+        ] {
+            assert!(help.contains(option), "generate help must contain {option}");
+        }
+    }
 }
