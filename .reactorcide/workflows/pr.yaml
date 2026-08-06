@@ -29,6 +29,12 @@ jobs:
     job_file: test-interop.yaml
     depends_on:
       - conventional-commits
+    for_each:
+      - rust,go,python,typescript
+      - java,csharp,c
+      - ruby,elixir,dart
+      - ocaml,zig,kotlin
+    item_var: CSILGEN_INTEROP_SERVERS
 
   package:
     job_file: package.yaml

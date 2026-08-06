@@ -35,9 +35,12 @@ enum Commands {
     /// Call the trusted Python implementation of the cross-language interop
     /// matrix. See tests/interop/README.md.
     Interop {
-        /// Restrict to these languages (default: all registered).
+        /// Restrict clients to these languages (default: all registered).
         #[arg(long, value_delimiter = ',')]
         langs: Vec<String>,
+        /// Restrict servers to these languages (default: selected clients).
+        #[arg(long, value_delimiter = ',')]
+        servers: Vec<String>,
         /// Restrict to these transports: rpc, events, datagrams (default: all).
         #[arg(long, value_delimiter = ',')]
         transports: Vec<String>,
@@ -344,13 +347,16 @@ fn install_wasm() -> Result<()> {
     Ok(())
 }
 
-fn run_interop(langs: &[String], transports: &[String]) -> Result<()> {
+fn run_interop(langs: &[String], servers: &[String], transports: &[String]) -> Result<()> {
     let root = std::env::current_dir()?;
     let script = root.join(".reactorcide/scripts/interop.py");
     let mut command = std::process::Command::new("python3");
     command.arg(&script).arg("--root").arg(&root);
     if !langs.is_empty() {
         command.arg("--langs").arg(langs.join(","));
+    }
+    if !servers.is_empty() {
+        command.arg("--servers").arg(servers.join(","));
     }
     if !transports.is_empty() {
         command.arg("--transports").arg(transports.join(","));
@@ -408,8 +414,12 @@ fn main() -> Result<()> {
         Commands::TestTransports => {
             test_transports()?;
         }
-        Commands::Interop { langs, transports } => {
-            run_interop(langs, transports)?;
+        Commands::Interop {
+            langs,
+            servers,
+            transports,
+        } => {
+            run_interop(langs, servers, transports)?;
         }
     }
 

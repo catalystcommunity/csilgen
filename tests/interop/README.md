@@ -5,7 +5,11 @@ across every generated language. One spec (`interop.csil`) is generated for each
 target language. Each language builds one **harness** program that runs as a
 **server** or a **client**. The trusted Python orchestrator then runs the full
 matrix. For local development, `cargo run -p xtask interop` calls the same
-Python implementation:
+Python implementation. Use `--servers` to run one server-language shard:
+
+```bash
+cargo run -p xtask interop -- --servers rust,go,python,typescript
+```
 
 ```
 for transport in {rpc, events, datagrams}:
@@ -15,8 +19,10 @@ for transport in {rpc, events, datagrams}:
         run  harness(client_lang) client <transport> <port(server_lang)>  ->  JSON results
 ```
 
-Every client talks to every server (including its own) over a per-server
-**loopback port** on `127.0.0.1`. Swift is excluded (no `swiftc` available).
+Every selected client talks to every selected server, including itself when
+it is in both sets. The tests use one loopback port for each server on
+`127.0.0.1`. Swift is excluded because the test image does not contain
+`swiftc`.
 
 ## Transports & carriers
 

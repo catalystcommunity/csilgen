@@ -18,7 +18,7 @@ Replace `test-core.yaml` with one of these job files:
 - `test-core.yaml` checks and tests the Rust workspace.
 - `test-generators.yaml` builds all production generator WASM modules.
 - `test-transports.yaml` tests all transport libraries.
-- `test-interop.yaml` runs the cross-language interoperability matrix.
+- `test-interop.yaml` runs one cross-language interoperability shard.
 - `package.yaml` builds all release archives. It does not publish a release.
 
 The transport and interoperability jobs build a CI image before they run the
@@ -36,8 +36,10 @@ interop implementation is [`scripts/interop.py`](scripts/interop.py). The
 plugin runs the selected job in the `POST_SOURCE_PREP` phase. A Python error
 causes the runnerlib job to fail.
 
-The interoperability job is separate from the other test jobs. Its runtime
-limit is 360 seconds. The job fails if the test command takes more time.
+The pull request workflow expands the interoperability job into four shards.
+Each shard tests all clients and transports against a group of server
+languages. The workflow succeeds only when all shards succeed. The job timeout
+stops a shard that does not finish.
 
 ## Releases
 

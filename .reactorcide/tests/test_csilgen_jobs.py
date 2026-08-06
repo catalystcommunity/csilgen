@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 import importlib.util
+import io
 import json
 import os
 import sys
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 from unittest import mock
 
+import yaml
 from src.plugins import PluginManager
 
 
@@ -184,6 +187,74 @@ class TrustedImplementationTests(unittest.TestCase):
         build_generators.assert_called_once_with(
             ROOT.resolve(),
             INTEROP._select_languages(("rust",)),
+        )
+
+    def test_interop_prepares_clients_and_sharded_servers(self) -> None:
+        with mock.patch.object(
+            INTEROP,
+            "_build_generators",
+            side_effect=RuntimeError("stop after generator build"),
+        ) as build_generators:
+            with self.assertRaisesRegex(RuntimeError, "stop after generator build"):
+                INTEROP.run(
+                    ROOT,
+                    ("rust",),
+                    ("rpc",),
+                    ("go",),
+                )
+
+        build_generators.assert_called_once_with(
+            ROOT.resolve(),
+            INTEROP._select_languages(("rust", "go")),
+        )
+
+    def test_interop_report_counts_only_the_shard(self) -> None:
+        clients = INTEROP._select_languages(("rust", "go"))
+        servers = INTEROP._select_languages(("python",))
+        results = [
+            ("rpc", "rust", "python", True, []),
+            ("rpc", "go", "python", True, []),
+        ]
+        output = io.StringIO()
+
+        with redirect_stdout(output):
+            INTEROP._report(clients, servers, ("rpc",), results)
+
+        self.assertIn("interop summary: 2/2 cells passed", output.getvalue())
+
+    def test_interop_shard_environment_is_forwarded(self) -> None:
+        with mock.patch.dict(
+            os.environ,
+            {"CSILGEN_INTEROP_SERVERS": "rust,go"},
+            clear=False,
+        ):
+            self.assertEqual(
+                PLUGIN._interop_server_names(),
+                ("rust", "go"),
+            )
+            self.assertEqual(
+                PLUGIN._forwarded_ci_environment(),
+                ("--env", "CSILGEN_INTEROP_SERVERS=rust,go"),
+            )
+
+    def test_pr_workflow_defines_four_interop_shards(self) -> None:
+        workflow = yaml.safe_load(
+            (ROOT / ".reactorcide/workflows/pr.yaml").read_text(
+                encoding="utf-8"
+            )
+        )
+        interop = workflow["jobs"]["test-interop"]
+        shards = [
+            name
+            for shard in interop["for_each"]
+            for name in shard.split(",")
+        ]
+
+        self.assertEqual(len(interop["for_each"]), 4)
+        self.assertEqual(interop["item_var"], "CSILGEN_INTEROP_SERVERS")
+        self.assertEqual(
+            sorted(shards),
+            sorted(language.name for language in INTEROP.LANGUAGES),
         )
 
     def test_named_release_targets_do_not_use_marker_paths(self) -> None:
