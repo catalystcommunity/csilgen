@@ -410,7 +410,8 @@ Result = Tuple[str, str, str, bool, List[str]]
 
 
 def _report(
-    languages: Sequence[Language],
+    clients: Sequence[Language],
+    servers: Sequence[Language],
     transports: Sequence[str],
     results: Sequence[Result],
 ) -> None:
@@ -420,12 +421,12 @@ def _report(
     for transport in transports:
         print(f"\n=== {transport} ===  (rows = client, cols = server)")
         print(f"{'':>10} |", end="")
-        for language in languages:
-            print(f" {language.name:>8}", end="")
+        for server in servers:
+            print(f" {server.name:>8}", end="")
         print()
-        for client in languages:
+        for client in clients:
             print(f"{client.name:>10} |", end="")
-            for server in languages:
+            for server in servers:
                 item = by_cell.get((transport, client.name, server.name))
                 mark = "✓" if item and item[3] else "✗" if item else "·"
                 print(f" {mark:>8}", end="")
@@ -467,10 +468,13 @@ def run(
     root: Path,
     language_names: Sequence[str] = (),
     transport_names: Sequence[str] = (),
+    server_names: Sequence[str] = (),
 ) -> None:
     root = root.resolve()
-    languages = _select_languages(language_names)
+    clients = _select_languages(language_names)
+    servers = _select_languages(server_names) if server_names else clients
     transports = _select_transports(transport_names)
+    languages = tuple(dict.fromkeys((*clients, *servers)))
     cli = root / "target" / "release" / "csilgen"
     _build_generators(root, languages)
     print("== building csilgen CLI (release) ==", flush=True)
@@ -479,7 +483,8 @@ def run(
         raise RuntimeError(f"csilgen binary not found at {cli}")
     print(
         "== interop: langs "
-        f"[{', '.join(language.name for language in languages)}] "
+        f"[{', '.join(language.name for language in clients)}] "
+        f"servers [{', '.join(language.name for language in servers)}] "
         f"transports [{', '.join(transports)}] ==",
         flush=True,
     )
@@ -490,17 +495,21 @@ def run(
 
     results: List[Result] = []
     for transport in transports:
-        for server in languages:
+        for server in servers:
+            print(
+                f"== testing {transport} server {server.name} ==",
+                flush=True,
+            )
             try:
                 process = _spawn_server(root, server, transport)
             except RuntimeError as error:
-                for client in languages:
+                for client in clients:
                     results.append(
                         (transport, client.name, server.name, False, [f"server start: {error}"])
                     )
                 continue
             try:
-                for client in languages:
+                for client in clients:
                     ok, failures = _run_client(
                         root,
                         client,
@@ -511,7 +520,7 @@ def run(
             finally:
                 process.kill()
                 process.wait()
-    _report(languages, transports, results)
+    _report(clients, servers, transports, results)
 
 
 def _split_values(value: str) -> Tuple[str, ...]:
@@ -522,6 +531,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path, default=Path.cwd())
     parser.add_argument("--langs", default="")
+    parser.add_argument("--servers", default="")
     parser.add_argument("--transports", default="")
     args = parser.parse_args(argv)
     try:
@@ -529,6 +539,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             args.root,
             _split_values(args.langs),
             _split_values(args.transports),
+            _split_values(args.servers),
         )
     except (OSError, RuntimeError, subprocess.SubprocessError) as error:
         print(f"interop failed: {error}", file=sys.stderr)

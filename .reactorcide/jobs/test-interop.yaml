@@ -1,5 +1,5 @@
 name: csilgen-test-interop
-description: "Run the cross-language interoperability matrix."
+description: "Run cross-language interoperability tests."
 triggers:
   events:
     - pull_request_opened
