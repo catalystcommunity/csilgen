@@ -25,6 +25,20 @@ from src.logging import log_stdout
 from src.plugins import Plugin, PluginContext, PluginPhase
 
 
+ASSET_CACHE_PATH = (
+    Path(__file__).resolve().parents[1] / "scripts" / "asset_cache.py"
+)
+ASSET_CACHE_SPEC = importlib.util.spec_from_file_location(
+    "csilgen_asset_cache",
+    ASSET_CACHE_PATH,
+)
+if ASSET_CACHE_SPEC is None or ASSET_CACHE_SPEC.loader is None:
+    raise RuntimeError("The CSILgen asset-cache module is not available")
+ASSET_CACHE = importlib.util.module_from_spec(ASSET_CACHE_SPEC)
+sys.modules[ASSET_CACHE_SPEC.name] = ASSET_CACHE
+ASSET_CACHE_SPEC.loader.exec_module(ASSET_CACHE)
+
+
 CI_TOOLCHAIN_DOCKERFILE = """\
 FROM docker.io/library/node:24-bookworm-slim AS node
 FROM mcr.microsoft.com/dotnet/sdk:8.0-bookworm-slim AS dotnet
@@ -134,27 +148,29 @@ TRANSPORTS = (
     "zig",
 )
 
-CORE_RELEASE = "csilgen-core"
-GENERATOR_RELEASES = {
-    f"generator-{package.removeprefix('csilgen-').removesuffix('-generator')}": package
-    for package in GENERATOR_PACKAGES
-}
-TRANSPORT_RELEASES = {
-    f"transport-{language}": language for language in TRANSPORTS
-}
-RELEASE_PACKAGES = (
-    CORE_RELEASE,
-    *GENERATOR_RELEASES,
-    *TRANSPORT_RELEASES,
-)
+RELEASE_PACKAGE = "csilgen"
+RELEASE_PACKAGES = (RELEASE_PACKAGE,)
 RELEASE_TAG = re.compile(
-    r"^(?P<package>[a-z0-9-]+)/v(?P<version>"
+    r"^csilgen/v(?P<version>"
     r"(?:0|[1-9][0-9]*)\."
     r"(?:0|[1-9][0-9]*)\."
     r"(?:0|[1-9][0-9]*)"
     r"(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?)$"
 )
 RELEASE_MARKER_PREFIX = "<!-- csilgen-release-source:"
+CLI_PLATFORMS = (
+    "linux-x86_64",
+    "linux-aarch64",
+    "darwin-aarch64",
+    "windows-x86_64",
+)
+GENERATOR_ASSET = "generators.tar.gz"
+TRANSPORT_ASSETS = tuple(f"transport-{language}.tar.gz" for language in TRANSPORTS)
+EXPECTED_CACHE_ASSETS = (
+    *(f"cli-{platform}.tar.gz" for platform in CLI_PLATFORMS),
+    GENERATOR_ASSET,
+    *TRANSPORT_ASSETS,
+)
 
 
 class ReleasePlan(NamedTuple):
@@ -647,7 +663,7 @@ def _run_in_ci_image(root: Path, job_name: str) -> None:
             "--workdir",
             "/job/src",
             "--env",
-            f"REACTORCIDE_CSILGEN_JOB={job_name}",
+            f"CSILGEN_JOB={job_name}",
             "--env",
             "CSILGEN_TOOLCHAIN_READY=1",
             "--env",
@@ -836,10 +852,11 @@ def _release_output(root: Path) -> Path:
     return output
 
 
-def _build_cli_artifacts(root: Path, version: str, output: Path) -> None:
-
+def _cli_builds() -> Mapping[str, tuple[str, str, tuple[str, ...], str, str]]:
     zig_image = "ghcr.io/rust-cross/cargo-zigbuild:latest"
-    builds = (
+    return {
+        platform: (image, target, command, binary, archive_name)
+        for platform, image, target, command, binary, archive_name in (
         (
             "linux-x86_64",
             zig_image,
@@ -872,23 +889,40 @@ def _build_cli_artifacts(root: Path, version: str, output: Path) -> None:
             "target/x86_64-pc-windows-gnu/release/csilgen.exe",
             "csilgen.exe",
         ),
-    )
-    for platform, image, target, command, binary, archive_name in builds:
-        built_binary = _builder_build(
-            root,
-            image,
-            target,
-            command,
-            binary,
         )
-        archive = output / f"csilgen-{version}-{platform}.tar.gz"
-        _tar_files(
-            archive,
-            (
-                (built_binary, archive_name),
-                (root / "LICENSE", "LICENSE"),
-                (root / "README.md", "README.md"),
-            ),
+    }
+
+
+def _build_cli_asset(
+    root: Path,
+    platform_name: str,
+    output: Path,
+    archive_name: str,
+) -> Path:
+    build = _cli_builds().get(platform_name)
+    if build is None:
+        raise RuntimeError(f"The CLI release platform is invalid: {platform_name}")
+    image, target, command, binary, binary_name = build
+    built_binary = _builder_build(root, image, target, command, binary)
+    archive = output / archive_name
+    _tar_files(
+        archive,
+        (
+            (built_binary, binary_name),
+            (root / "LICENSE", "LICENSE"),
+            (root / "README.md", "README.md"),
+        ),
+    )
+    return archive
+
+
+def _build_cli_artifacts(root: Path, version: str, output: Path) -> None:
+    for platform_name in CLI_PLATFORMS:
+        _build_cli_asset(
+            root,
+            platform_name,
+            output,
+            f"csilgen-{version}-{platform_name}.tar.gz",
         )
 
 
@@ -897,36 +931,60 @@ def _generator_wasm(root: Path, package: str) -> Path:
     return (wasm_dir / package.replace("-", "_")).with_suffix(".wasm")
 
 
-def _archive_generator(
-    root: Path,
-    package: str,
-    version: str,
-    output: Path,
-) -> None:
-    language = package.removeprefix("csilgen-").removesuffix("-generator")
-    wasm = _generator_wasm(root, package)
-    archive = output / f"csilgen-generator-{language}-{version}.tar.gz"
-    _tar_files(
-        archive,
-        (
-            (wasm, wasm.name),
-            (root / "LICENSE", "LICENSE"),
-        ),
-    )
+def _archive_generators(root: Path, output: Path, archive_name: str) -> Path:
+    files = [
+        (_generator_wasm(root, package), _generator_wasm(root, package).name)
+        for package in GENERATOR_PACKAGES
+    ]
+    files.append((root / "LICENSE", "LICENSE"))
+    archive = output / archive_name
+    _tar_files(archive, files)
+    return archive
 
 
 def _archive_transport(
     root: Path,
     language: str,
-    version: str,
     output: Path,
-) -> None:
-    archive = output / f"csilgen-transport-{language}-{version}.tar.gz"
+    archive_name: str,
+) -> Path:
+    archive = output / archive_name
     _tar_tracked(
         archive,
         root,
         (f"transports/{language}", "LICENSE"),
     )
+    return archive
+
+
+def _release_asset_name(asset: str, version: str) -> str:
+    if asset.startswith("cli-"):
+        platform_name = asset.removeprefix("cli-").removesuffix(".tar.gz")
+        return f"csilgen-{version}-{platform_name}.tar.gz"
+    if asset == GENERATOR_ASSET:
+        return f"csilgen-generators-{version}.tar.gz"
+    if asset.startswith("transport-"):
+        language = asset.removeprefix("transport-").removesuffix(".tar.gz")
+        return f"csilgen-transport-{language}-{version}.tar.gz"
+    raise RuntimeError(f"The release asset is invalid: {asset}")
+
+
+def _build_cache_asset(root: Path, asset: str) -> Path:
+    output = _release_output(root)
+    if asset.startswith("cli-"):
+        platform_name = asset.removeprefix("cli-").removesuffix(".tar.gz")
+        return _build_cli_asset(root, platform_name, output, asset)
+    if asset == GENERATOR_ASSET:
+        _build_wasm(root, release=True, packages=GENERATOR_PACKAGES)
+        return _archive_generators(root, output, asset)
+    if asset == "transports.tar.gz":
+        raise RuntimeError("Transport assets must remain separate archives")
+    if asset.startswith("transport-"):
+        language = asset.removeprefix("transport-").removesuffix(".tar.gz")
+        if language not in TRANSPORTS:
+            raise RuntimeError(f"The transport release asset is invalid: {asset}")
+        return _archive_transport(root, language, output, asset)
+    raise RuntimeError(f"The cache asset is invalid: {asset}")
 
 
 def _build_all_release_artifacts(
@@ -934,12 +992,17 @@ def _build_all_release_artifacts(
     versions: Mapping[str, str],
 ) -> Path:
     output = _release_output(root)
-    _build_cli_artifacts(root, versions[CORE_RELEASE], output)
+    version = versions[RELEASE_PACKAGE]
+    _build_cli_artifacts(root, version, output)
     _build_wasm(root, release=True, packages=GENERATOR_PACKAGES)
-    for release, package in GENERATOR_RELEASES.items():
-        _archive_generator(root, package, versions[release], output)
-    for release, language in TRANSPORT_RELEASES.items():
-        _archive_transport(root, language, versions[release], output)
+    _archive_generators(root, output, f"csilgen-generators-{version}.tar.gz")
+    for language in TRANSPORTS:
+        _archive_transport(
+            root,
+            language,
+            output,
+            f"csilgen-transport-{language}-{version}.tar.gz",
+        )
     return output
 
 
@@ -947,20 +1010,239 @@ def _build_tag_artifacts(root: Path, tag: str) -> Path:
     match = RELEASE_TAG.fullmatch(tag)
     if not match:
         raise RuntimeError(f"The release tag is invalid: {tag}")
-    package = match.group("package")
     version = match.group("version")
-    output = _release_output(root)
-    if package == CORE_RELEASE:
-        _build_cli_artifacts(root, version, output)
-    elif package in GENERATOR_RELEASES:
-        generator = GENERATOR_RELEASES[package]
-        _build_wasm(root, release=True, packages=(generator,))
-        _archive_generator(root, generator, version, output)
-    elif package in TRANSPORT_RELEASES:
-        _archive_transport(root, TRANSPORT_RELEASES[package], version, output)
+    return _build_all_release_artifacts(root, {RELEASE_PACKAGE: version})
+
+
+def _workflow_vars() -> Mapping[str, Any]:
+    path = os.environ.get("RC_WF_VARS_FILE", "")
+    if not path:
+        raise RuntimeError("RC_WF_VARS_FILE is required for asset jobs")
+    value = json.loads(Path(path).read_text(encoding="utf-8"))
+    if not isinstance(value, dict):
+        raise RuntimeError("The workflow variables are invalid")
+    return value
+
+
+def _set_workflow_vars(values: Mapping[str, Any]) -> None:
+    path = os.environ.get("RC_WF_OUTPUT_FILE", "")
+    if not path:
+        raise RuntimeError("RC_WF_OUTPUT_FILE is required for asset jobs")
+    output = Path(path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(
+        json.dumps({"vars": dict(values), "outputs": {}}, sort_keys=True),
+        encoding="utf-8",
+    )
+
+
+def _git_tree(root: Path, revision: str = "HEAD") -> str:
+    result = _run(("git", "rev-parse", f"{revision}^{{tree}}"), cwd=root, capture=True)
+    tree = result.stdout.strip()
+    if not re.fullmatch(r"[0-9a-f]{40,64}", tree):
+        raise RuntimeError("Git returned an invalid tree hash")
+    return tree
+
+
+def _asset_for_job() -> str:
+    kind = os.environ.get("CSILGEN_ASSET_KIND", "")
+    item = os.environ.get("CSILGEN_ASSET_ITEM", "")
+    if kind == "cli" and item in CLI_PLATFORMS:
+        return f"cli-{item}.tar.gz"
+    if kind == "generators" and not item:
+        return GENERATOR_ASSET
+    if kind == "transport" and item in TRANSPORTS:
+        return f"transport-{item}.tar.gz"
+    raise RuntimeError("The release asset job selection is invalid")
+
+
+def _prepare_asset_lane(root: Path) -> None:
+    cache = ASSET_CACHE.S3Cache.from_environment()
+    event = os.environ.get("REACTORCIDE_EVENT_TYPE", "")
+    if event in {"pull_request_opened", "pull_request_updated"}:
+        source_sha = os.environ.get("REACTORCIDE_SHA", "")
+        lane = ASSET_CACHE.pr_lane(
+            os.environ.get("REACTORCIDE_PR_NUMBER", ""),
+            source_sha,
+        )
+    elif event == "tag_created":
+        tag = _release_tag_from_environment(root)
+        match = RELEASE_TAG.fullmatch(tag)
+        if match is None:
+            raise RuntimeError("The release tag is invalid")
+        lane = ASSET_CACHE.version_lane(match.group("version"))
+        source_sha = _run(("git", "rev-parse", "HEAD"), cwd=root, capture=True).stdout.strip()
+        token = os.environ.get("GITHUB_PAT", "")
+        if not token:
+            raise RuntimeError("GITHUB_PAT is required to prepare a release")
+        _authorized_release(
+            token,
+            os.environ.get("REACTORCIDE_REPO", "catalystcommunity/csilgen"),
+            tag,
+            source_sha,
+        )
     else:
-        raise RuntimeError(f"The release tag has an unknown package: {tag}")
-    return output
+        raise RuntimeError("Asset preparation requires a PR or tag event")
+
+    cached_assets: set[str] = set()
+    try:
+        manifest = _read_lane_manifest(cache, lane, verify_files=True)
+    except (FileNotFoundError, RuntimeError, ValueError, json.JSONDecodeError):
+        log_stdout(f"The existing lane {lane} is not reusable; rebuild its assets")
+        manifest = None
+    if manifest is not None:
+        if manifest.get("source_sha") == source_sha and manifest.get("source_tree") == _git_tree(root):
+            cached_assets = set(EXPECTED_CACHE_ASSETS)
+
+    uploads: dict[str, dict[str, str]] = {}
+    for asset in EXPECTED_CACHE_ASSETS:
+        if asset in cached_assets:
+            continue
+        staging_asset = "staging-" + asset
+        uploads[asset] = {
+            "asset": cache.presign(
+                "PUT", ASSET_CACHE.object_key(lane, staging_asset)
+            ),
+            "sha256": cache.presign(
+                "PUT",
+                ASSET_CACHE.object_key(lane, staging_asset + ".sha256"),
+            ),
+        }
+    _set_workflow_vars(
+        {
+            "asset_cache_lane": lane,
+            "asset_cache_uploads": uploads,
+            "asset_cache_source_sha": source_sha,
+            "asset_cache_source_tree": _git_tree(root),
+        }
+    )
+    log_stdout(
+        f"Prepared asset lane {lane} with {len(uploads)} build upload set(s)"
+    )
+
+
+def _put_presigned(url: str, content: bytes) -> None:
+    request = urllib.request.Request(url, data=content, method="PUT")
+    for attempt in range(5):
+        try:
+            with urllib.request.urlopen(request, timeout=120) as response:
+                response.read()
+            return
+        except urllib.error.HTTPError as error:
+            if error.code not in {408, 429, 500, 502, 503, 504} or attempt == 4:
+                raise RuntimeError(
+                    f"The exact-object asset upload failed with HTTP {error.code}"
+                ) from None
+        except (urllib.error.URLError, TimeoutError):
+            if attempt == 4:
+                raise RuntimeError("The exact-object asset upload failed") from None
+        time.sleep(2**attempt)
+    raise RuntimeError("The exact-object asset upload failed")
+
+
+def _build_and_upload_asset(root: Path) -> None:
+    asset = _asset_for_job()
+    variables = _workflow_vars()
+    uploads = variables.get("asset_cache_uploads")
+    if not isinstance(uploads, dict):
+        raise RuntimeError("The asset upload map is missing")
+    upload = uploads.get(asset)
+    if upload is None:
+        log_stdout(f"Reuse sealed cache asset {asset}")
+        return
+    if not isinstance(upload, dict):
+        raise RuntimeError("The asset upload entry is invalid")
+    asset_url = upload.get("asset")
+    digest_url = upload.get("sha256")
+    if not isinstance(asset_url, str) or not isinstance(digest_url, str):
+        raise RuntimeError("The asset upload URLs are invalid")
+    archive = _build_cache_asset(root, asset)
+    digest = ASSET_CACHE.file_sha256(archive)
+    _put_presigned(asset_url, archive.read_bytes())
+    _put_presigned(digest_url, (digest + "\n").encode())
+    log_stdout(f"Built and uploaded cache asset {asset}")
+
+
+def _read_lane_manifest(
+    cache: Any,
+    lane: str,
+    *,
+    verify_files: bool,
+) -> dict[str, Any]:
+    content = cache.get_bytes(ASSET_CACHE.object_key(lane, ASSET_CACHE.MANIFEST))
+    manifest = ASSET_CACHE.decode_manifest(content)
+    assets = manifest.get("assets")
+    if not isinstance(assets, list) or len(assets) != len(EXPECTED_CACHE_ASSETS):
+        raise RuntimeError("The asset-cache manifest has the wrong asset count")
+    by_name = {item.get("name"): item for item in assets if isinstance(item, dict)}
+    if set(by_name) != set(EXPECTED_CACHE_ASSETS):
+        raise RuntimeError("The asset-cache manifest has unexpected assets")
+    if verify_files:
+        for name in EXPECTED_CACHE_ASSETS:
+            item = by_name[name]
+            content = cache.get_bytes(ASSET_CACHE.object_key(lane, name))
+            actual = hashlib.sha256(content).hexdigest()
+            if item.get("sha256") != actual or item.get("size") != len(content):
+                raise RuntimeError(f"The cached asset is invalid: {name}")
+    return manifest
+
+
+def _seal_asset_lane(root: Path) -> None:
+    variables = _workflow_vars()
+    lane = variables.get("asset_cache_lane")
+    source_sha = variables.get("asset_cache_source_sha")
+    source_tree = variables.get("asset_cache_source_tree")
+    if not all(isinstance(value, str) for value in (lane, source_sha, source_tree)):
+        raise RuntimeError("The asset lane variables are invalid")
+    cache = ASSET_CACHE.S3Cache.from_environment()
+    uploads = variables.get("asset_cache_uploads")
+    if not isinstance(uploads, dict):
+        raise RuntimeError("The asset upload map is missing")
+    assets = []
+    for asset in EXPECTED_CACHE_ASSETS:
+        if asset in uploads:
+            staging_asset = "staging-" + asset
+            staging_key = ASSET_CACHE.object_key(lane, staging_asset)
+            staging_digest_key = ASSET_CACHE.object_key(
+                lane, staging_asset + ".sha256"
+            )
+            content = cache.get_bytes(staging_key)
+            recorded = cache.get_bytes(staging_digest_key).decode().strip()
+        else:
+            content = cache.get_bytes(ASSET_CACHE.object_key(lane, asset))
+            recorded = cache.get_bytes(
+                ASSET_CACHE.object_key(lane, asset + ".sha256")
+            ).decode().strip()
+        digest = hashlib.sha256(content).hexdigest()
+        if recorded != digest:
+            raise RuntimeError(f"The asset checksum does not match: {asset}")
+        if asset in uploads:
+            final_key = ASSET_CACHE.object_key(lane, asset)
+            cache.copy(staging_key, final_key)
+            copied = cache.get_bytes(final_key)
+            if hashlib.sha256(copied).hexdigest() != digest or len(copied) != len(content):
+                raise RuntimeError(f"The sealed asset copy is invalid: {asset}")
+            cache.put_bytes(
+                ASSET_CACHE.object_key(lane, asset + ".sha256"),
+                (digest + "\n").encode(),
+            )
+            cache.delete(staging_key)
+            cache.delete(staging_digest_key)
+        assets.append({"name": asset, "sha256": digest, "size": len(content)})
+    manifest = {
+        "schema": 1,
+        "project": ASSET_CACHE.PROJECT,
+        "lane": lane,
+        "source_sha": source_sha,
+        "source_tree": source_tree,
+        "created_at": time.time(),
+        "assets": assets,
+    }
+    cache.put_bytes(
+        ASSET_CACHE.object_key(lane, ASSET_CACHE.MANIFEST),
+        ASSET_CACHE.encode_manifest(manifest),
+    )
+    log_stdout(f"Sealed asset lane {lane}")
 
 
 def _go_environment(root: Path) -> Mapping[str, str]:
@@ -1288,6 +1570,10 @@ def _tag_releases(root: Path) -> None:
     for plan in changed:
         _create_or_reuse_draft(token, repository, plan)
 
+    if len(changed) != 1:
+        raise RuntimeError("The unified release must create exactly one tag")
+    _promote_merged_pr_assets(root, token, repository, changed[0])
+
     _configure_git_auth(root, token, repository)
     try:
         result = _release_plans(_semver_tags(root, dry_run=False))
@@ -1298,6 +1584,118 @@ def _tag_releases(root: Path) -> None:
     if actual != expected:
         raise RuntimeError("semver-tags pushed a different release plan")
     log_stdout(f"Pushed {len(actual)} release tag(s) atomically")
+
+
+def _promote_merged_pr_assets(
+    root: Path,
+    token: str,
+    repository: str,
+    plan: ReleasePlan,
+) -> bool:
+    pr_number = os.environ.get("REACTORCIDE_PR_NUMBER", "")
+    if not pr_number.isdigit():
+        log_stdout("No PR number is available; the tag workflow will rebuild assets")
+        return False
+    api = f"https://api.github.com/repos/{repository}"
+    pull = _github_request("GET", f"{api}/pulls/{pr_number}", token)
+    if not isinstance(pull, dict) or pull.get("merged") is not True:
+        raise RuntimeError("GitHub did not return a merged pull request")
+    base = pull.get("base")
+    base_repo = base.get("repo") if isinstance(base, dict) else None
+    if (
+        not isinstance(base, dict)
+        or base.get("ref") != "main"
+        or not isinstance(base_repo, dict)
+        or base_repo.get("full_name") != repository
+    ):
+        raise RuntimeError("The merged pull request has an unexpected base")
+    if pull.get("merge_commit_sha") != plan.source_sha:
+        raise RuntimeError("The merged pull request does not match the release commit")
+    head = pull.get("head") if isinstance(pull, dict) else None
+    head_sha = head.get("sha") if isinstance(head, dict) else None
+    head_repo = head.get("repo") if isinstance(head, dict) else None
+    head_repository = head_repo.get("full_name") if isinstance(head_repo, dict) else None
+    if (
+        not isinstance(head_sha, str)
+        or not re.fullmatch(r"[0-9a-fA-F]{40,64}", head_sha)
+        or not isinstance(head_repository, str)
+        or not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", head_repository)
+    ):
+        log_stdout("The PR head metadata is unavailable; the tag workflow will build assets")
+        return False
+    source_lane = ASSET_CACHE.pr_lane(pr_number, head_sha)
+    cache = ASSET_CACHE.S3Cache.from_environment()
+    try:
+        manifest = _read_lane_manifest(cache, source_lane, verify_files=True)
+    except (FileNotFoundError, RuntimeError, ValueError, json.JSONDecodeError):
+        log_stdout(
+            f"PR lane {source_lane} is not reusable; the tag workflow will build assets"
+        )
+        return False
+    if manifest.get("source_sha") != head_sha:
+        log_stdout("The PR cache commit is stale; the tag workflow will build assets")
+        return False
+    head_api = f"https://api.github.com/repos/{head_repository}"
+    try:
+        head_commit = _github_request(
+            "GET", f"{head_api}/git/commits/{head_sha}", token
+        )
+    except RuntimeError:
+        log_stdout("The PR head tree is unavailable; the tag workflow will build assets")
+        return False
+    tree = head_commit.get("tree") if isinstance(head_commit, dict) else None
+    head_tree = tree.get("sha") if isinstance(tree, dict) else None
+    merge_tree = _git_tree(root)
+    if manifest.get("source_tree") != head_tree:
+        log_stdout("The PR cache tree is stale; the tag workflow will build assets")
+        return False
+    if head_tree != merge_tree:
+        log_stdout(
+            "The merged tree differs from the tested PR tree; "
+            "the tag workflow will rebuild assets"
+        )
+        return False
+
+    version_match = RELEASE_TAG.fullmatch(plan.tag)
+    if version_match is None:
+        raise RuntimeError("The calculated release tag is invalid")
+    destination_lane = ASSET_CACHE.version_lane(version_match.group("version"))
+    merged_lane = ASSET_CACHE.main_lane(plan.source_sha)
+    for lane in (destination_lane, merged_lane):
+        for asset in EXPECTED_CACHE_ASSETS:
+            source_content = cache.get_bytes(ASSET_CACHE.object_key(source_lane, asset))
+            cache.copy(
+                ASSET_CACHE.object_key(source_lane, asset),
+                ASSET_CACHE.object_key(lane, asset),
+            )
+            destination_content = cache.get_bytes(ASSET_CACHE.object_key(lane, asset))
+            if (
+                hashlib.sha256(destination_content).digest()
+                != hashlib.sha256(source_content).digest()
+                or len(destination_content) != len(source_content)
+            ):
+                raise RuntimeError(f"The promoted asset copy is invalid: {asset}")
+            cache.put_bytes(
+                ASSET_CACHE.object_key(lane, asset + ".sha256"),
+                (hashlib.sha256(destination_content).hexdigest() + "\n").encode(),
+            )
+        promoted = dict(manifest)
+        promoted.update(
+            {
+                "lane": lane,
+                "source_sha": plan.source_sha,
+                "source_tree": merge_tree,
+                "created_at": time.time(),
+                "promoted_from": source_lane,
+                "main_lane": merged_lane,
+            }
+        )
+        cache.put_bytes(
+            ASSET_CACHE.object_key(lane, ASSET_CACHE.MANIFEST),
+            ASSET_CACHE.encode_manifest(promoted),
+        )
+    log_stdout(f"Promoted sealed PR assets from {source_lane} to {destination_lane}")
+    return True
 
 
 def _release_tag_from_environment(root: Path) -> str:
@@ -1332,7 +1730,23 @@ def _publish_tag_release(root: Path) -> None:
         tag,
         source_sha.stdout.strip(),
     )
-    artifacts = _build_tag_artifacts(root, tag)
+    match = RELEASE_TAG.fullmatch(tag)
+    if match is None:
+        raise RuntimeError("The release tag is invalid")
+    version = match.group("version")
+    lane = ASSET_CACHE.version_lane(version)
+    cache = ASSET_CACHE.S3Cache.from_environment()
+    manifest = _read_lane_manifest(cache, lane, verify_files=True)
+    if manifest.get("source_sha") != source_sha.stdout.strip():
+        raise RuntimeError("The release cache has the wrong source commit")
+    if manifest.get("source_tree") != _git_tree(root):
+        raise RuntimeError("The release cache has the wrong source tree")
+    artifacts = _release_output(root)
+    for asset in EXPECTED_CACHE_ASSETS:
+        cache.get_file(
+            ASSET_CACHE.object_key(lane, asset),
+            artifacts / _release_asset_name(asset, version),
+        )
     _upload_release_artifacts(token, repository, release, artifacts)
 
     api = f"https://api.github.com/repos/{repository}"
@@ -1361,6 +1775,134 @@ def _publish_tag_release(root: Path) -> None:
     else:
         log_stdout(f"Updated GitHub Release {tag}")
 
+    merged_lane = ASSET_CACHE.main_lane(source_sha.stdout.strip())
+    for asset in EXPECTED_CACHE_ASSETS:
+        source_content = cache.get_bytes(ASSET_CACHE.object_key(lane, asset))
+        cache.copy(
+            ASSET_CACHE.object_key(lane, asset),
+            ASSET_CACHE.object_key(merged_lane, asset),
+        )
+        destination_content = cache.get_bytes(
+            ASSET_CACHE.object_key(merged_lane, asset)
+        )
+        if (
+            hashlib.sha256(destination_content).digest()
+            != hashlib.sha256(source_content).digest()
+            or len(destination_content) != len(source_content)
+        ):
+            raise RuntimeError(f"The main-lane asset copy is invalid: {asset}")
+        cache.put_bytes(
+            ASSET_CACHE.object_key(merged_lane, asset + ".sha256"),
+            (hashlib.sha256(destination_content).hexdigest() + "\n").encode(),
+        )
+    main_manifest = dict(manifest)
+    main_manifest.update(
+        {
+            "lane": merged_lane,
+            "created_at": time.time(),
+            "release_lane": lane,
+            "main_lane": merged_lane,
+        }
+    )
+    cache.put_bytes(
+        ASSET_CACHE.object_key(merged_lane, ASSET_CACHE.MANIFEST),
+        ASSET_CACHE.encode_manifest(main_manifest),
+    )
+    version_manifest = dict(manifest)
+    version_manifest.update({"main_lane": merged_lane})
+    cache.put_bytes(
+        ASSET_CACHE.object_key(lane, ASSET_CACHE.MANIFEST),
+        ASSET_CACHE.encode_manifest(version_manifest),
+    )
+    cache.put_bytes(
+        ASSET_CACHE.object_key("main", "latest.json"),
+        ASSET_CACHE.encode_manifest(
+            {
+                "schema": 1,
+                "project": ASSET_CACHE.PROJECT,
+                "lane": "main",
+                "main_lane": merged_lane,
+                "release_lane": lane,
+                "source_sha": source_sha.stdout.strip(),
+                "source_tree": _git_tree(root),
+                "created_at": time.time(),
+            }
+        ),
+    )
+    log_stdout(f"Updated the main asset pointer to {merged_lane}")
+
+
+def _cleanup_asset_cache() -> None:
+    cache = ASSET_CACHE.S3Cache.from_environment()
+    prefix = ASSET_CACHE.PROJECT + "/"
+    objects = cache.list(prefix)
+    by_lane: dict[str, list[Any]] = {}
+    for item in objects:
+        relative = item.key.removeprefix(prefix)
+        lane, separator, _ = relative.partition("/")
+        if separator and ASSET_CACHE.LANE_RE.fullmatch(lane):
+            by_lane.setdefault(lane, []).append(item)
+    version_lanes = sorted(
+        (lane for lane in by_lane if ASSET_CACHE.VERSION_LANE_RE.fullmatch(lane)),
+        key=ASSET_CACHE.version_sort_key,
+        reverse=True,
+    )
+    completed_versions: list[tuple[str, dict[str, Any], float]] = []
+    for lane in version_lanes:
+        try:
+            manifest = _read_lane_manifest(cache, lane, verify_files=False)
+        except (FileNotFoundError, RuntimeError, ValueError, json.JSONDecodeError):
+            continue
+        created_at = manifest.get("created_at")
+        if isinstance(created_at, (int, float)):
+            completed_versions.append((lane, manifest, float(created_at)))
+        if len(completed_versions) == 6:
+            break
+    if not completed_versions:
+        log_stdout("The asset cache has no complete release lane")
+        return
+    retained_versions = {lane for lane, _, _ in completed_versions}
+    retained_lanes = {"main", *retained_versions}
+    retained_times = [created_at for _, _, created_at in completed_versions]
+    for _, manifest, _ in completed_versions:
+        for field in ("promoted_from", "main_lane"):
+            value = manifest.get(field)
+            if isinstance(value, str) and ASSET_CACHE.LANE_RE.fullmatch(value):
+                retained_lanes.add(value)
+        source_sha = manifest.get("source_sha")
+        if isinstance(source_sha, str):
+            try:
+                retained_lanes.add(ASSET_CACHE.main_lane(source_sha))
+            except RuntimeError:
+                pass
+    cutoff = min(retained_times)
+    deleted_lanes = 0
+    for lane, lane_objects in sorted(by_lane.items()):
+        if lane in retained_lanes:
+            continue
+        try:
+            manifest = _read_lane_manifest(cache, lane, verify_files=False)
+        except (FileNotFoundError, RuntimeError, ValueError, json.JSONDecodeError):
+            lane_time = max(item.last_modified.timestamp() for item in lane_objects)
+        else:
+            created_at = manifest.get("created_at")
+            object_time = max(
+                item.last_modified.timestamp() for item in lane_objects
+            )
+            lane_time = (
+                max(float(created_at), object_time)
+                if isinstance(created_at, (int, float))
+                else object_time
+            )
+        if lane_time >= cutoff:
+            continue
+        for item in lane_objects:
+            if not item.key.startswith(prefix + lane + "/"):
+                raise RuntimeError("The cleanup object escaped its validated lane")
+            cache.delete(item.key)
+        deleted_lanes += 1
+    log_stdout(f"Deleted {deleted_lanes} expired asset-cache lane(s)")
+
 
 class CsilgenJobsPlugin(Plugin):
     """Run the selected csilgen job after runnerlib prepares the source."""
@@ -1377,10 +1919,10 @@ class CsilgenJobsPlugin(Plugin):
         os.environ[f"GIT_CONFIG_KEY_{config_count}"] = "safe.directory"
         os.environ[f"GIT_CONFIG_VALUE_{config_count}"] = str(root)
         os.environ["GIT_CONFIG_COUNT"] = str(config_count + 1)
-        job = os.environ.get("REACTORCIDE_CSILGEN_JOB")
+        job = os.environ.get("CSILGEN_JOB")
         if not job:
             raise RuntimeError(
-                "REACTORCIDE_CSILGEN_JOB must select a runnerlib lifecycle job"
+                "CSILGEN_JOB must select a runnerlib lifecycle job"
             )
 
         if job == "conventional-commits":
@@ -1399,9 +1941,17 @@ class CsilgenJobsPlugin(Plugin):
             _test_interop(root)
         elif job == "package":
             _package(root)
+        elif job == "asset-prepare":
+            _prepare_asset_lane(root)
+        elif job == "asset-build":
+            _build_and_upload_asset(root)
+        elif job == "asset-seal":
+            _seal_asset_lane(root)
+        elif job == "asset-cleanup":
+            _cleanup_asset_cache()
         elif job == "release-tag":
             _tag_releases(root)
         elif job == "release":
             _publish_tag_release(root)
         else:
-            raise RuntimeError(f"Unknown REACTORCIDE_CSILGEN_JOB value: {job}")
+            raise RuntimeError(f"Unknown CSILGEN_JOB value: {job}")

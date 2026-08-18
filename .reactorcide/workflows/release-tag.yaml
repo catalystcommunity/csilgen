@@ -1,3 +1,4 @@
+id: csilgen-release-tag
 name: CSILgen Release Tag
 description: "Create draft releases and push changed tags after a merge."
 on:

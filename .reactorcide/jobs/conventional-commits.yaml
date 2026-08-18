@@ -13,6 +13,6 @@ job:
   priority: 10
   working_dir: /job
 environment:
-  REACTORCIDE_CSILGEN_JOB: conventional-commits
+  CSILGEN_JOB: conventional-commits
 run_local:
   user: host

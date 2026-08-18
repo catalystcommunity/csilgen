@@ -19,6 +19,6 @@ job:
   run_as:
     user: root
 environment:
-  REACTORCIDE_CSILGEN_JOB: transports
+  CSILGEN_JOB: transports
 run_local:
   user: root

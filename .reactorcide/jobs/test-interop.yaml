@@ -19,6 +19,6 @@ job:
   run_as:
     user: root
 environment:
-  REACTORCIDE_CSILGEN_JOB: interop
+  CSILGEN_JOB: interop
 run_local:
   user: root

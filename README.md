@@ -53,15 +53,14 @@ Download the CLI archive for your operating system and architecture from the
 GitHub Release. Extract the archive. Put `csilgen` or `csilgen.exe` in a
 directory on your `PATH`.
 
-The CLI archives do not contain generators. Download each generator archive
-from its generator GitHub Release. Extract each WASM file to one of these
+The CLI archives do not contain generators. Download the generator archive
+from the same GitHub Release. Extract the WASM files to one of these
 directories:
 
 - `~/.csilgen/generators/` for a user installation
 - `./.generators/` for a project installation
 
-For example, the Rust generator archive contains
-`csilgen_rust_generator.wasm`.
+For example, the archive contains `csilgen_rust_generator.wasm`.
 
 ## Continuous Integration
 
@@ -82,17 +81,11 @@ You can run each job on your computer. See
 [`.reactorcide/README.md`](.reactorcide/README.md) for the commands and the
 required tools.
 
-Releases use Conventional Commits. The CLI, each production generator, and
-each transport library have separate versions. Release tags have these forms:
-
-- `csilgen-core/vX.Y.Z` for the CLI
-- `generator-<language>/vX.Y.Z` for a generator
-- `transport-<language>/vX.Y.Z` for a transport library
-
-A CLI release contains one archive for each supported operating system and
-architecture. A generator release contains one WASM archive. A transport
-release contains one source archive. The specifications and tests do not have
-release targets.
+Releases use Conventional Commits. All files in the repository use one version
+and one `csilgen/vX.Y.Z` tag. A release contains one CLI archive for each
+supported operating system and architecture. It also contains one archive with
+all production generator WASM modules and one source archive for each
+transport. The specifications and tests do not have separate release targets.
 
 ## CDDL Syntax Support
 

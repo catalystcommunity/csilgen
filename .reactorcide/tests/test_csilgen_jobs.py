@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import importlib.util
+import hashlib
 import io
 import json
 import os
 import sys
 import unittest
+import datetime as dt
 from contextlib import redirect_stdout
 from pathlib import Path
 from unittest import mock
@@ -74,7 +76,7 @@ class DispatchTests(unittest.TestCase):
         with (
             mock.patch.dict(
                 os.environ,
-                {"REACTORCIDE_CSILGEN_JOB": "core"},
+                {"CSILGEN_JOB": "core"},
                 clear=False,
             ),
             mock.patch.object(PLUGIN, "_test_core") as test_core,
@@ -265,6 +267,28 @@ class TrustedImplementationTests(unittest.TestCase):
 
 
 class ReleaseTests(unittest.TestCase):
+    def test_release_has_twenty_unique_logical_assets(self) -> None:
+        self.assertEqual(len(PLUGIN.EXPECTED_CACHE_ASSETS), 20)
+        self.assertEqual(len(set(PLUGIN.EXPECTED_CACHE_ASSETS)), 20)
+        self.assertEqual(len(PLUGIN.CLI_PLATFORMS), 4)
+        self.assertEqual(len(PLUGIN.TRANSPORT_ASSETS), 15)
+        self.assertIn(PLUGIN.GENERATOR_ASSET, PLUGIN.EXPECTED_CACHE_ASSETS)
+
+    def test_generator_archive_contains_all_production_wasm_files(self) -> None:
+        output = ROOT / "target" / "release-artifacts"
+        with mock.patch.object(PLUGIN, "_tar_files") as tar_files:
+            archive = PLUGIN._archive_generators(
+                ROOT, output, "generators.tar.gz"
+            )
+
+        self.assertEqual(archive, output / "generators.tar.gz")
+        files = tar_files.call_args.args[1]
+        names = [name for _, name in files]
+        self.assertEqual(len(names), 18)
+        self.assertEqual(names[-1], "LICENSE")
+        self.assertEqual(len(set(names[:-1])), 17)
+        self.assertFalse(any("noop" in name for name in names))
+
     def test_release_plans_parse_all_targets(self) -> None:
         packages = list(PLUGIN.RELEASE_PACKAGES)
         versions = ["0.2.0"] * len(packages)
@@ -292,34 +316,222 @@ class ReleaseTests(unittest.TestCase):
 
         self.assertEqual(len(plans), len(packages))
         self.assertTrue(plans[0].published)
-        self.assertFalse(plans[1].published)
-        self.assertEqual(plans[0].tag, "csilgen-core/v0.2.0")
+        self.assertEqual(plans[0].package, "csilgen")
+        self.assertEqual(plans[0].tag, "csilgen/v0.2.0")
 
-    def test_release_tag_selects_one_generator(self) -> None:
+    def test_release_tag_builds_one_unified_release(self) -> None:
         root = ROOT
         output = root / "target" / "release-artifacts"
         with (
-            mock.patch.object(PLUGIN, "_release_output", return_value=output),
-            mock.patch.object(PLUGIN, "_build_wasm") as build_wasm,
-            mock.patch.object(PLUGIN, "_archive_generator") as archive,
+            mock.patch.object(
+                PLUGIN,
+                "_build_all_release_artifacts",
+                return_value=output,
+            ) as build,
         ):
             result = PLUGIN._build_tag_artifacts(
                 root,
-                "generator-rust/v1.2.3",
+                "csilgen/v1.2.3",
             )
 
         self.assertEqual(result, output)
-        build_wasm.assert_called_once_with(
-            root,
-            release=True,
-            packages=("csilgen-rust-generator",),
+        build.assert_called_once_with(
+            root, {"csilgen": "1.2.3"}
         )
-        archive.assert_called_once_with(
-            root,
-            "csilgen-rust-generator",
-            "1.2.3",
-            output,
+
+
+class AssetCacheTests(unittest.TestCase):
+    class MemoryCache:
+        def __init__(self, objects: dict[str, bytes] | None = None) -> None:
+            self.objects = dict(objects or {})
+            self.copies: list[tuple[str, str]] = []
+
+        def get_bytes(self, key: str) -> bytes:
+            if key not in self.objects:
+                raise FileNotFoundError(key)
+            return self.objects[key]
+
+        def put_bytes(self, key: str, content: bytes) -> None:
+            self.objects[key] = content
+
+        def copy(self, source: str, destination: str) -> None:
+            self.objects[destination] = self.get_bytes(source)
+            self.copies.append((source, destination))
+
+        def delete(self, key: str) -> None:
+            self.objects.pop(key, None)
+
+    def test_lane_names_identify_exact_source_states(self) -> None:
+        sha = "a" * 40
+        self.assertEqual(PLUGIN.ASSET_CACHE.pr_lane("12", sha), "pr-12-aaaaaaaaaaaa")
+        self.assertEqual(PLUGIN.ASSET_CACHE.main_lane(sha), "main-aaaaaaaaaaaa")
+        self.assertEqual(PLUGIN.ASSET_CACHE.version_lane("1.2.3"), "v1.2.3")
+
+    def test_presign_does_not_include_the_secret_key(self) -> None:
+        cache = PLUGIN.ASSET_CACHE.S3Cache(
+            "https://cache.example.test",
+            "cache-bucket",
+            "access-key",
+            "secret-key-value",
         )
+        url = cache.presign("PUT", "csilgen/lane/asset.tar.gz", expires=60)
+
+        self.assertNotIn("secret-key-value", url)
+        self.assertIn("X-Amz-Signature=", url)
+        self.assertIn("X-Amz-Expires=60", url)
+
+    def test_seal_copies_staging_objects_before_manifest(self) -> None:
+        lane = "pr-12-aaaaaaaaaaaa"
+        objects: dict[str, bytes] = {}
+        uploads: dict[str, dict[str, str]] = {}
+        for asset in PLUGIN.EXPECTED_CACHE_ASSETS:
+            content = ("content-" + asset).encode()
+            staging = "staging-" + asset
+            objects[PLUGIN.ASSET_CACHE.object_key(lane, staging)] = content
+            objects[PLUGIN.ASSET_CACHE.object_key(lane, staging + ".sha256")] = (
+                hashlib.sha256(content).hexdigest() + "\n"
+            ).encode()
+            uploads[asset] = {"asset": "hidden", "sha256": "hidden"}
+        cache = self.MemoryCache(objects)
+        variables = {
+            "asset_cache_lane": lane,
+            "asset_cache_source_sha": "a" * 40,
+            "asset_cache_source_tree": "b" * 40,
+            "asset_cache_uploads": uploads,
+        }
+
+        with (
+            mock.patch.object(PLUGIN, "_workflow_vars", return_value=variables),
+            mock.patch.object(
+                PLUGIN.ASSET_CACHE.S3Cache,
+                "from_environment",
+                return_value=cache,
+            ),
+        ):
+            PLUGIN._seal_asset_lane(ROOT)
+
+        manifest_key = PLUGIN.ASSET_CACHE.object_key(
+            lane, PLUGIN.ASSET_CACHE.MANIFEST
+        )
+        manifest = PLUGIN.ASSET_CACHE.decode_manifest(cache.objects[manifest_key])
+        self.assertEqual(len(manifest["assets"]), 20)
+        self.assertEqual(len(cache.copies), 20)
+        self.assertFalse(any("/staging-" in key for key in cache.objects))
+
+    def test_missing_pr_lane_uses_tag_build_fallback(self) -> None:
+        pull = {
+            "merged": True,
+            "merge_commit_sha": "b" * 40,
+            "base": {
+                "ref": "main",
+                "repo": {"full_name": "catalystcommunity/csilgen"},
+            },
+            "head": {
+                "sha": "a" * 40,
+                "repo": {"full_name": "example/csilgen"},
+            },
+        }
+        plan = PLUGIN.ReleasePlan(
+            "csilgen", True, "1.2.3", "csilgen/v1.2.3", "b" * 40, "notes"
+        )
+        cache = self.MemoryCache()
+        with (
+            mock.patch.dict(os.environ, {"REACTORCIDE_PR_NUMBER": "12"}),
+            mock.patch.object(PLUGIN, "_github_request", return_value=pull),
+            mock.patch.object(
+                PLUGIN.ASSET_CACHE.S3Cache,
+                "from_environment",
+                return_value=cache,
+            ),
+        ):
+            promoted = PLUGIN._promote_merged_pr_assets(
+                ROOT, "token", "catalystcommunity/csilgen", plan
+            )
+
+        self.assertFalse(promoted)
+
+    def test_release_workflow_has_fanout_seal_and_always_cleanup(self) -> None:
+        workflow = yaml.safe_load(
+            (ROOT / ".reactorcide/workflows/release.yaml").read_text(
+                encoding="utf-8"
+            )
+        )
+        jobs = workflow["jobs"]
+        self.assertEqual(len(jobs["asset-cli"]["for_each"]), 4)
+        self.assertEqual(len(jobs["asset-transports"]["for_each"]), 15)
+        self.assertEqual(
+            set(jobs["asset-seal"]["depends_on"]),
+            {
+                "asset-cli",
+                "asset-generators",
+                "asset-transports",
+                "release-test-core",
+                "release-test-generators",
+                "release-test-transports",
+                "release-test-interop",
+            },
+        )
+        self.assertEqual(jobs["asset-cleanup"]["condition"], "always")
+        self.assertEqual(jobs["asset-cleanup"]["depends_on"], ["release"])
+
+    def test_cleanup_keeps_a_lane_with_recent_staging_objects(self) -> None:
+        now = dt.datetime.now(dt.timezone.utc)
+        objects: dict[str, bytes] = {}
+        infos: list[object] = []
+
+        def manifest(lane: str, created_at: float) -> None:
+            key = PLUGIN.ASSET_CACHE.object_key(
+                lane, PLUGIN.ASSET_CACHE.MANIFEST
+            )
+            value = {
+                "schema": 1,
+                "project": "csilgen",
+                "lane": lane,
+                "source_sha": "a" * 40,
+                "source_tree": "b" * 40,
+                "created_at": created_at,
+                "assets": [
+                    {"name": name, "sha256": "0" * 64, "size": 1}
+                    for name in PLUGIN.EXPECTED_CACHE_ASSETS
+                ],
+            }
+            objects[key] = PLUGIN.ASSET_CACHE.encode_manifest(value)
+            infos.append(
+                PLUGIN.ASSET_CACHE.ObjectInfo(
+                    key, len(objects[key]), dt.datetime.fromtimestamp(created_at, dt.timezone.utc)
+                )
+            )
+
+        for index in range(1, 7):
+            manifest(f"v1.0.{index}", (now - dt.timedelta(days=index)).timestamp())
+        retry_lane = "pr-10-aaaaaaaaaaaa"
+        manifest(retry_lane, (now - dt.timedelta(days=30)).timestamp())
+        staging_key = PLUGIN.ASSET_CACHE.object_key(retry_lane, "staging-generators.tar.gz")
+        objects[staging_key] = b"active"
+        infos.append(PLUGIN.ASSET_CACHE.ObjectInfo(staging_key, 6, now))
+        abandoned_key = PLUGIN.ASSET_CACHE.object_key(
+            "pr-9-bbbbbbbbbbbb", "staging-generators.tar.gz"
+        )
+        objects[abandoned_key] = b"old"
+        infos.append(
+            PLUGIN.ASSET_CACHE.ObjectInfo(
+                abandoned_key, 3, now - dt.timedelta(days=40)
+            )
+        )
+        cache = self.MemoryCache(objects)
+        cache.list = mock.Mock(
+            side_effect=lambda prefix: [item for item in infos if item.key.startswith(prefix)]
+        )
+
+        with mock.patch.object(
+            PLUGIN.ASSET_CACHE.S3Cache,
+            "from_environment",
+            return_value=cache,
+        ):
+            PLUGIN._cleanup_asset_cache()
+
+        self.assertIn(staging_key, cache.objects)
+        self.assertNotIn(abandoned_key, cache.objects)
 
 
 if __name__ == "__main__":

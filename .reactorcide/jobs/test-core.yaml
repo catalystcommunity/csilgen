@@ -17,6 +17,6 @@ job:
   run_as:
     user: root
 environment:
-  REACTORCIDE_CSILGEN_JOB: core
+  CSILGEN_JOB: core
 run_local:
   user: root

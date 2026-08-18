@@ -1,24 +1,16 @@
-name: csilgen-package
-description: "Build all release archives without publishing them."
-triggers:
-  events:
-    - pull_request_opened
-    - pull_request_updated
-  branches:
-    - main
+name: csilgen-asset-build
+description: "Build and upload one CLI or generator cache asset."
 job:
   image: containers.catalystsquad.com/public/reactorcide/runnerbase:latest
   command: "runnerlib run --job-command true"
   timeout: 5400
   priority: 10
   working_dir: /job
-  depends_on:
-    - csilgen-conventional-commits
   capabilities:
     - builder
   run_as:
     user: root
 environment:
-  CSILGEN_JOB: package
+  CSILGEN_JOB: asset-build
 run_local:
   user: root
