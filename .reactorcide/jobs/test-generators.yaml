@@ -15,6 +15,6 @@ job:
   depends_on:
     - csilgen-conventional-commits
 environment:
-  REACTORCIDE_CSILGEN_JOB: generators
+  CSILGEN_JOB: generators
 run_local:
   user: host

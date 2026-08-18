@@ -1,0 +1,29 @@
+version: 1
+
+defaults:
+  ci_source: base
+  profile: standard
+
+policy_maintainers:
+  any:
+    - vcs_user:github/todpunk
+
+head_ci:
+  - id: todpunk-ci-development
+    actors:
+      any:
+        - vcs_user:github/todpunk
+    workflows:
+      - csilgen-pr
+    paths:
+      - .reactorcide/**
+    events:
+      - pull_request_opened
+      - pull_request_updated
+    base_branches:
+      - main
+    head_repository: same
+    use:
+      ci_source: head
+      profile: standard
+      workers: default

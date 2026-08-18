@@ -1,10 +1,5 @@
-name: csilgen-release-tag
-description: "Create draft releases and push changed csilgen tags."
-triggers:
-  events:
-    - pull_request_merged
-  branches:
-    - main
+name: csilgen-asset-control
+description: "Prepare, seal, or clean one asset-cache lane."
 job:
   image: containers.catalystsquad.com/public/reactorcide/runnerbase:latest
   command: "runnerlib run --job-command true"
@@ -13,8 +8,6 @@ job:
   working_dir: /job
   disable_run_local: true
 environment:
-  CSILGEN_JOB: release-tag
-  GITHUB_PAT: "${secret:catalystcommunity/ci:githubpat}"
   ASSET_CACHE_ENDPOINT: "${secret:catalystcommunity/asset-cache:endpoint}"
   ASSET_CACHE_BUCKET: "${secret:catalystcommunity/asset-cache:bucket}"
   ASSET_CACHE_ACCESS_KEY: "${secret:catalystcommunity/asset-cache:access_key}"

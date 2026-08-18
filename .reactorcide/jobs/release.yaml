@@ -4,7 +4,7 @@ triggers:
   events:
     - tag_created
   branches:
-    - "*/v*"
+    - "csilgen/v*"
 job:
   image: containers.catalystsquad.com/public/reactorcide/runnerbase:latest
   command: "runnerlib run --job-command true"
@@ -12,11 +12,10 @@ job:
   priority: 15
   working_dir: /job
   disable_run_local: true
-  capabilities:
-    - builder
-  run_as:
-    user: root
 environment:
-  REACTORCIDE_CSILGEN_JOB: release
-  REACTORCIDE_REPO: catalystcommunity/csilgen
+  CSILGEN_JOB: release
   GITHUB_PAT: "${secret:catalystcommunity/ci:githubpat}"
+  ASSET_CACHE_ENDPOINT: "${secret:catalystcommunity/asset-cache:endpoint}"
+  ASSET_CACHE_BUCKET: "${secret:catalystcommunity/asset-cache:bucket}"
+  ASSET_CACHE_ACCESS_KEY: "${secret:catalystcommunity/asset-cache:access_key}"
+  ASSET_CACHE_SECRET_KEY: "${secret:catalystcommunity/asset-cache:secret_key}"

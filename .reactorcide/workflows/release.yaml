@@ -1,10 +1,110 @@
+id: csilgen-release
 name: CSILgen Release
 description: "Build and publish one deliverable when its release tag is pushed."
 on:
   events:
     - tag_created
   branches:
-    - "*/v*"
+    - "csilgen/v*"
 jobs:
+  release-prepare:
+    job_file: asset-control.yaml
+    environment:
+      CSILGEN_JOB: asset-prepare
+      GITHUB_PAT: "${secret:catalystcommunity/ci:githubpat}"
+
+  asset-cli:
+    job_file: asset-build.yaml
+    depends_on:
+      - release-prepare
+    for_each:
+      - linux-x86_64
+      - linux-aarch64
+      - darwin-aarch64
+      - windows-x86_64
+    item_var: CSILGEN_ASSET_ITEM
+    environment:
+      CSILGEN_ASSET_KIND: cli
+
+  asset-generators:
+    job_file: asset-build.yaml
+    depends_on:
+      - release-prepare
+    environment:
+      CSILGEN_ASSET_KIND: generators
+
+  asset-transports:
+    job_file: asset-transport.yaml
+    depends_on:
+      - release-prepare
+    for_each:
+      - c
+      - csharp
+      - dart
+      - elixir
+      - go
+      - java
+      - kotlin
+      - ocaml
+      - php
+      - python
+      - ruby
+      - rust
+      - swift
+      - typescript
+      - zig
+    item_var: CSILGEN_ASSET_ITEM
+    environment:
+      CSILGEN_ASSET_KIND: transport
+
+  release-test-core:
+    job_file: test-core.yaml
+    depends_on:
+      - release-prepare
+
+  release-test-generators:
+    job_file: test-generators.yaml
+    depends_on:
+      - release-prepare
+
+  release-test-transports:
+    job_file: test-transports.yaml
+    depends_on:
+      - release-prepare
+
+  release-test-interop:
+    job_file: test-interop.yaml
+    depends_on:
+      - release-prepare
+    for_each:
+      - rust,go,python,typescript
+      - java,csharp,c
+      - ruby,elixir,dart
+      - ocaml,zig,kotlin
+    item_var: CSILGEN_INTEROP_SERVERS
+
+  asset-seal:
+    job_file: asset-control.yaml
+    depends_on:
+      - asset-cli
+      - asset-generators
+      - asset-transports
+      - release-test-core
+      - release-test-generators
+      - release-test-transports
+      - release-test-interop
+    environment:
+      CSILGEN_JOB: asset-seal
+
   release:
     job_file: release.yaml
+    depends_on:
+      - asset-seal
+
+  asset-cleanup:
+    job_file: asset-control.yaml
+    depends_on:
+      - release
+    condition: always
+    environment:
+      CSILGEN_JOB: asset-cleanup

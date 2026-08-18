@@ -1,5 +1,6 @@
+id: csilgen-pr
 name: CSILgen PR
-description: "Validate commits, tests, interoperability, and release archives."
+description: "Validate commits and tests, and build sealed release assets."
 on:
   events:
     - pull_request_opened
@@ -36,7 +37,66 @@ jobs:
       - ocaml,zig,kotlin
     item_var: CSILGEN_INTEROP_SERVERS
 
-  package:
-    job_file: package.yaml
+  asset-prepare:
+    job_file: asset-control.yaml
     depends_on:
       - conventional-commits
+    environment:
+      CSILGEN_JOB: asset-prepare
+
+  asset-cli:
+    job_file: asset-build.yaml
+    depends_on:
+      - asset-prepare
+    for_each:
+      - linux-x86_64
+      - linux-aarch64
+      - darwin-aarch64
+      - windows-x86_64
+    item_var: CSILGEN_ASSET_ITEM
+    environment:
+      CSILGEN_ASSET_KIND: cli
+
+  asset-generators:
+    job_file: asset-build.yaml
+    depends_on:
+      - asset-prepare
+    environment:
+      CSILGEN_ASSET_KIND: generators
+
+  asset-transports:
+    job_file: asset-transport.yaml
+    depends_on:
+      - asset-prepare
+    for_each:
+      - c
+      - csharp
+      - dart
+      - elixir
+      - go
+      - java
+      - kotlin
+      - ocaml
+      - php
+      - python
+      - ruby
+      - rust
+      - swift
+      - typescript
+      - zig
+    item_var: CSILGEN_ASSET_ITEM
+    environment:
+      CSILGEN_ASSET_KIND: transport
+
+  asset-seal:
+    job_file: asset-control.yaml
+    depends_on:
+      - asset-cli
+      - asset-generators
+      - asset-transports
+      - test-core
+      - test-generators
+      - test-transports
+      - test-interop
+    environment:
+      CSILGEN_JOB: asset-seal
