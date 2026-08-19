@@ -21,9 +21,35 @@ Replace `test-core.yaml` with one of these job files:
 - `package.yaml` builds all release archives. It does not publish a release.
 - `asset-build.yaml` builds one cache asset from a workflow item.
 
-The transport and interoperability jobs build a CI image before they run the
-tests. This build can take several minutes. The package job can pull
-cross-build images.
+The transport and interoperability jobs use a prebuilt CI image. The package
+job can pull cross-build images.
+
+## CI toolchain image
+
+The transport and interoperability jobs use one prebuilt Linux toolchain
+image. The image is in the private Catalyst Community registry. The
+Reactorcide workers have pull access.
+
+Build the image on a local AMD64 host:
+
+```text
+./tools.sh build-ci-image
+```
+
+Build and publish a content-derived tag and `latest`:
+
+```text
+./tools.sh publish-ci-image
+```
+
+The publish command reads the registry user and password from the local
+`catalystcommunity/registry` secret path. It sends the password to Docker on
+standard input. It keeps the Docker configuration in a temporary directory and
+deletes that directory when the command stops.
+
+The command prints the immutable image digest after the push. Put that digest
+in `jobs/test-transports.yaml` and `jobs/test-interop.yaml`. Do not use `latest`
+in these job files.
 
 The YAML job command starts runnerlib. Remote jobs load the Python lifecycle
 plugin from the trusted CI checkout of `main`. The tested source stays in a
