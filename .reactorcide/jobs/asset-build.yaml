@@ -8,8 +8,6 @@ job:
   working_dir: /job
   capabilities:
     - builder
-  run_as:
-    user: root
 environment:
   CSILGEN_JOB: asset-build
 run_local:
