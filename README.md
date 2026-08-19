@@ -18,13 +18,10 @@ The core architecture is in place and the CLI is functional end-to-end: parsing,
 From a fresh clone, the minimal commands to generate code from CSIL files:
 
 ```bash
-# Clone and build
+# Clone and install from the source tree
 git clone <repo-url>
 cd csilgen
-cargo build --workspace --release
-
-# Build and install the WASM generators to ~/.csilgen/generators/
-cargo run -p xtask install-wasm
+./tools.sh build-install-all
 
 # Generate code from CSIL files
 cargo run -p csilgen -- generate --input your-file.csil --target rust --output ./generated/
@@ -40,14 +37,27 @@ cargo run -p csilgen -- generate --input your-file.csil --target php --output ./
 # available targets — see the full list in "Current Status" above
 cargo run -p csilgen -- generate --input your-file.csil --target java --output ./generated/
 
-# Or install and use the CLI directly
-cargo install --path crates/csilgen-cli
+# Or install the latest unified GitHub Release for this system
+./tools.sh install-all
 csilgen generate --input your-file.csil --target rust --output ./generated/
 ```
 
 See the examples directory for sample CSIL files to experiment with.
 
 ### Use a released CLI
+
+Run this command from a CSILgen checkout:
+
+```bash
+./tools.sh install-all
+```
+
+The command selects the newest published `csilgen/v*` release. It detects the
+operating system and architecture. It installs the CLI to the Cargo binary
+directory. It installs all production generators to
+`~/.csilgen/generators/`.
+
+For a manual installation, use these steps:
 
 Download the CLI archive for your operating system and architecture from the
 GitHub Release. Extract the archive. Put `csilgen` or `csilgen.exe` in a
