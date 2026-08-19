@@ -23,6 +23,7 @@ from typing import Any, List, Mapping, NamedTuple, Sequence
 
 from src.logging import log_stdout
 from src.plugins import Plugin, PluginContext, PluginPhase
+from src.workflow import workflow_vars
 
 
 ASSET_CACHE_PATH = (
@@ -735,13 +736,7 @@ def _build_tag_artifacts(root: Path, tag: str) -> Path:
 
 
 def _workflow_vars() -> Mapping[str, Any]:
-    path = os.environ.get("RC_WF_VARS_FILE", "")
-    if not path:
-        raise RuntimeError("RC_WF_VARS_FILE is required for asset jobs")
-    value = json.loads(Path(path).read_text(encoding="utf-8"))
-    if not isinstance(value, dict):
-        raise RuntimeError("The workflow variables are invalid")
-    return value
+    return workflow_vars()
 
 
 def _set_workflow_vars(values: Mapping[str, Any]) -> None:

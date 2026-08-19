@@ -7,7 +7,9 @@ import hashlib
 import io
 import json
 import os
+import re
 import sys
+import tempfile
 import unittest
 import datetime as dt
 from contextlib import redirect_stdout
@@ -15,6 +17,7 @@ from pathlib import Path
 from unittest import mock
 
 import yaml
+import src.workflow as runner_workflow
 from src.plugins import PluginManager
 
 
@@ -115,7 +118,98 @@ class CommandTests(unittest.TestCase):
         self.assertIs(result, completed)
         log_stdout.assert_called_once_with("+ example [REDACTED]")
 
+
+class WorkflowVariablesTests(unittest.TestCase):
+    def test_remote_inline_input_does_not_require_the_local_file(self) -> None:
+        environment = {
+            "RC_WF_VARS_FILE": "/job/workflow-vars.json",
+            "RC_WF_VARS_JSON": '{"asset_cache_lane":"v0.2.2"}',
+        }
+        with (
+            mock.patch.dict(os.environ, environment, clear=True),
+            mock.patch.object(runner_workflow, "_global_context", None),
+        ):
+            self.assertEqual(
+                PLUGIN._workflow_vars(),
+                {"asset_cache_lane": "v0.2.2"},
+            )
+
+    def test_local_input_uses_the_workflow_variables_file(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "workflow-vars.json"
+            path.write_text(
+                '{"asset_cache_lane":"v0.2.2"}',
+                encoding="utf-8",
+            )
+            with (
+                mock.patch.dict(
+                    os.environ,
+                    {"RC_WF_VARS_FILE": str(path)},
+                    clear=True,
+                ),
+                mock.patch.object(runner_workflow, "_global_context", None),
+            ):
+                self.assertEqual(
+                    PLUGIN._workflow_vars(),
+                    {"asset_cache_lane": "v0.2.2"},
+                )
+
+    def test_asset_job_uses_remote_inline_upload_map(self) -> None:
+        asset = "transport-c.tar.gz"
+        uploads = {
+            asset: {
+                "asset": "https://cache.example.test/asset",
+                "sha256": "https://cache.example.test/digest",
+            }
+        }
+        environment = {
+            "CSILGEN_ASSET_ITEM": "c",
+            "CSILGEN_ASSET_KIND": "transport",
+            "RC_WF_VARS_JSON": json.dumps(
+                {"asset_cache_uploads": uploads}
+            ),
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            archive = Path(directory) / asset
+            archive.write_bytes(b"archive")
+            with (
+                mock.patch.dict(os.environ, environment, clear=True),
+                mock.patch.object(runner_workflow, "_global_context", None),
+                mock.patch.object(
+                    PLUGIN,
+                    "_build_cache_asset",
+                    return_value=archive,
+                ),
+                mock.patch.object(PLUGIN, "_put_presigned") as put_presigned,
+            ):
+                PLUGIN._build_and_upload_asset(ROOT)
+
+        self.assertEqual(put_presigned.call_count, 2)
+        self.assertEqual(
+            put_presigned.call_args_list[0].args[0],
+            uploads[asset]["asset"],
+        )
+        self.assertEqual(put_presigned.call_args_list[0].args[1], b"archive")
+        self.assertEqual(
+            put_presigned.call_args_list[1].args[0],
+            uploads[asset]["sha256"],
+        )
+
+
 class TrustedImplementationTests(unittest.TestCase):
+    def test_install_commands_cover_all_release_generators(self) -> None:
+        tools = (ROOT / "tools.sh").read_text(encoding="utf-8")
+        match = re.search(
+            r"CSILGEN_GENERATOR_PACKAGES=\(\n(?P<packages>.*?)\n\)",
+            tools,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(match)
+        packages = tuple(match.group("packages").split())
+        self.assertEqual(packages, PLUGIN.GENERATOR_PACKAGES)
+        self.assertIn("build-install-all)", tools)
+        self.assertIn("install-all)", tools)
+
     def test_toolchain_image_does_not_copy_tested_source(self) -> None:
         dockerfile = (ROOT / "tools/ci-image/Dockerfile").read_text(
             encoding="utf-8"
