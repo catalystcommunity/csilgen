@@ -14,11 +14,10 @@ job:
   working_dir: /job
   depends_on:
     - csilgen-conventional-commits
-  capabilities:
-    - docker
-  run_as:
-    user: root
 environment:
   CSILGEN_JOB: interop
+  GOPATH: /job/cache/go
+  GOMODCACHE: /job/cache/go/pkg/mod
+  GOCACHE: /job/cache/go-build
 run_local:
   user: root

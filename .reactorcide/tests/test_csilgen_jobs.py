@@ -118,6 +118,22 @@ class CommandTests(unittest.TestCase):
         self.assertIs(result, completed)
         log_stdout.assert_called_once_with("+ example [REDACTED]")
 
+    def test_openssl_install_uses_runner_sudo_policy(self) -> None:
+        with (
+            mock.patch.object(PLUGIN.Path, "exists", return_value=False),
+            mock.patch.object(PLUGIN, "_run") as run,
+        ):
+            PLUGIN._ensure_openssl_headers(ROOT)
+
+        self.assertEqual(
+            run.call_args_list[0].args[0],
+            ("sudo", "apt-get", "update"),
+        )
+        self.assertEqual(
+            run.call_args_list[1].args[0][:3],
+            ("sudo", "apt-get", "install"),
+        )
+
 
 class WorkflowVariablesTests(unittest.TestCase):
     def test_remote_inline_input_does_not_require_the_local_file(self) -> None:
@@ -236,6 +252,55 @@ class TrustedImplementationTests(unittest.TestCase):
                 )
                 self.assertEqual(job["job"]["image"], expected)
                 self.assertNotIn("image_pull_secrets", job["job"])
+
+    def test_pr_head_jobs_do_not_request_root_or_docker(self) -> None:
+        job_names = (
+            "test-core.yaml",
+            "test-generators.yaml",
+            "test-transports.yaml",
+            "test-interop.yaml",
+            "asset-build.yaml",
+            "asset-transport.yaml",
+        )
+        for name in job_names:
+            with self.subTest(name=name):
+                document = yaml.safe_load(
+                    (ROOT / ".reactorcide/jobs" / name).read_text(
+                        encoding="utf-8"
+                    )
+                )
+                job = document["job"]
+                self.assertNotEqual(
+                    job.get("run_as", {}).get("user"),
+                    "root",
+                )
+                self.assertNotIn("docker", job.get("capabilities", []))
+
+        asset_build = yaml.safe_load(
+            (ROOT / ".reactorcide/jobs/asset-build.yaml").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(asset_build["job"]["capabilities"], ["builder"])
+
+    def test_go_jobs_use_writable_cache_paths(self) -> None:
+        for name in (
+            "test-core.yaml",
+            "test-transports.yaml",
+            "test-interop.yaml",
+        ):
+            with self.subTest(name=name):
+                document = yaml.safe_load(
+                    (ROOT / ".reactorcide/jobs" / name).read_text(
+                        encoding="utf-8"
+                    )
+                )
+                environment = document["environment"]
+                self.assertTrue(environment["GOPATH"].startswith("/job/"))
+                self.assertTrue(
+                    environment["GOMODCACHE"].startswith("/job/")
+                )
+                self.assertTrue(environment["GOCACHE"].startswith("/job/"))
 
     def test_interop_launches_programs_without_shell_wrappers(self) -> None:
         for language in INTEROP.LANGUAGES:

@@ -216,11 +216,12 @@ def _validate_conventional_commits(root: Path) -> None:
         )
 
 
-def _test_core(root: Path) -> None:
+def _ensure_openssl_headers(root: Path) -> None:
     if not Path("/usr/include/openssl/ssl.h").exists():
-        _run(("apt-get", "update"), cwd=root)
+        _run(("sudo", "apt-get", "update"), cwd=root)
         _run(
             (
+                "sudo",
                 "apt-get",
                 "install",
                 "-y",
@@ -229,6 +230,10 @@ def _test_core(root: Path) -> None:
             ),
             cwd=root,
         )
+
+
+def _test_core(root: Path) -> None:
+    _ensure_openssl_headers(root)
     _run(("rustup", "target", "add", "wasm32-unknown-unknown"), cwd=root)
     _run(("rustup", "component", "add", "rustfmt", "clippy"), cwd=root)
     _cargo(
