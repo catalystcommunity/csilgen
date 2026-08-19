@@ -115,32 +115,33 @@ class CommandTests(unittest.TestCase):
         self.assertIs(result, completed)
         log_stdout.assert_called_once_with("+ example [REDACTED]")
 
-    def test_container_runtime_uses_the_mounted_docker_socket(self) -> None:
-        with (
-            mock.patch.dict(os.environ, {}, clear=True),
-            mock.patch.object(PLUGIN.shutil, "which", return_value=None),
-            mock.patch.object(PLUGIN.Path, "exists", return_value=True),
-            mock.patch.object(
-                PLUGIN,
-                "_install_docker_client",
-                return_value="/tmp/docker/docker",
-            ) as install_docker,
-        ):
-            runtime = PLUGIN._container_runtime()
-
-            self.assertEqual(
-                os.environ["DOCKER_HOST"],
-                "unix:///var/run/docker.sock",
-            )
-
-        self.assertEqual(runtime, "/tmp/docker/docker")
-        install_docker.assert_called_once_with()
-
-
 class TrustedImplementationTests(unittest.TestCase):
     def test_toolchain_image_does_not_copy_tested_source(self) -> None:
-        self.assertNotIn("COPY .", PLUGIN.CI_TOOLCHAIN_DOCKERFILE)
-        self.assertIn("mkdir -p /job/src /job/ci", PLUGIN.CI_TOOLCHAIN_DOCKERFILE)
+        dockerfile = (ROOT / "tools/ci-image/Dockerfile").read_text(
+            encoding="utf-8"
+        )
+        self.assertNotIn("COPY .", dockerfile)
+        self.assertIn("mkdir -p /job/src /job/ci", dockerfile)
+        self.assertIn(
+            "containers.catalystsquad.com/public/reactorcide/runnerbase:latest",
+            dockerfile,
+        )
+
+    def test_slow_jobs_use_the_published_toolchain_image(self) -> None:
+        expected = (
+            "containers.catalystsquad.com/private/catalystcommunity/"
+            "csilgen/ci-toolchain@sha256:"
+            "3bc81e33f1abfac291e663e6692428a8376f3d1c9d44fd47dfb38d7726a07a90"
+        )
+        for name in ("test-interop.yaml", "test-transports.yaml"):
+            with self.subTest(name=name):
+                job = yaml.safe_load(
+                    (ROOT / ".reactorcide/jobs" / name).read_text(
+                        encoding="utf-8"
+                    )
+                )
+                self.assertEqual(job["job"]["image"], expected)
+                self.assertNotIn("image_pull_secrets", job["job"])
 
     def test_interop_launches_programs_without_shell_wrappers(self) -> None:
         for language in INTEROP.LANGUAGES:
@@ -224,7 +225,7 @@ class TrustedImplementationTests(unittest.TestCase):
 
         self.assertIn("interop summary: 2/2 cells passed", output.getvalue())
 
-    def test_interop_shard_environment_is_forwarded(self) -> None:
+    def test_interop_shard_environment_is_parsed(self) -> None:
         with mock.patch.dict(
             os.environ,
             {"CSILGEN_INTEROP_SERVERS": "rust,go"},
@@ -233,10 +234,6 @@ class TrustedImplementationTests(unittest.TestCase):
             self.assertEqual(
                 PLUGIN._interop_server_names(),
                 ("rust", "go"),
-            )
-            self.assertEqual(
-                PLUGIN._forwarded_ci_environment(),
-                ("--env", "CSILGEN_INTEROP_SERVERS=rust,go"),
             )
 
     def test_pr_workflow_defines_four_interop_shards(self) -> None:

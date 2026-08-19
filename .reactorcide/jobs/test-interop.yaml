@@ -7,7 +7,7 @@ triggers:
   branches:
     - main
 job:
-  image: containers.catalystsquad.com/public/reactorcide/runnerbase:latest
+  image: containers.catalystsquad.com/private/catalystcommunity/csilgen/ci-toolchain@sha256:3bc81e33f1abfac291e663e6692428a8376f3d1c9d44fd47dfb38d7726a07a90
   command: "runnerlib run --job-command true"
   timeout: 3600
   priority: 10
