@@ -256,14 +256,68 @@ class TrustedImplementationTests(unittest.TestCase):
             sorted(language.name for language in INTEROP.LANGUAGES),
         )
 
-    def test_named_release_targets_do_not_use_marker_paths(self) -> None:
-        config = (ROOT / ".semver-tags.yaml").read_text(encoding="utf-8")
-        self.assertIn("targets:", config)
-        self.assertNotIn(".release-targets", config)
-        self.assertIn("skip_short_versions: true", config)
+    def test_unified_release_config_uses_one_target(self) -> None:
+        config = yaml.safe_load(
+            (ROOT / PLUGIN.SEMVER_TAGS_CONFIG).read_text(encoding="utf-8")
+        )
+        self.assertTrue(config["skip_short_versions"])
+        self.assertEqual(
+            config["targets"], [{"name": "csilgen", "paths": ["."]}]
+        )
+
+    def test_default_semver_config_remains_base_ci_compatible(self) -> None:
+        config = yaml.safe_load(
+            (ROOT / ".semver-tags.yaml").read_text(encoding="utf-8")
+        )
+        targets = [target["name"] for target in config["targets"]]
+        generator_targets = [
+            "generator-"
+            + package.removeprefix("csilgen-").removesuffix("-generator")
+            for package in PLUGIN.GENERATOR_PACKAGES
+        ]
+        expected = [
+            "csilgen-core",
+            *generator_targets,
+            *(f"transport-{name}" for name in PLUGIN.TRANSPORTS),
+        ]
+        self.assertEqual(targets, expected)
+        self.assertTrue(
+            all(
+                target["paths"]
+                == [".reactorcide/legacy-base-ci-only"]
+                for target in config["targets"]
+            )
+        )
 
 
 class ReleaseTests(unittest.TestCase):
+    def test_semver_tags_uses_unified_release_config(self) -> None:
+        binary = Path("/tools/semver-tags")
+        completed = mock.Mock(stdout="{}")
+        with (
+            mock.patch.object(
+                PLUGIN,
+                "_semver_tags_binary",
+                return_value=(binary, {}),
+            ),
+            mock.patch.object(
+                PLUGIN, "_run", return_value=completed
+            ) as run,
+        ):
+            self.assertEqual(PLUGIN._semver_tags(ROOT, dry_run=True), {})
+
+        command = run.call_args.args[0]
+        self.assertEqual(
+            command[:4],
+            [
+                str(binary),
+                "--config",
+                str(ROOT / PLUGIN.SEMVER_TAGS_CONFIG),
+                "run",
+            ],
+        )
+        self.assertIn("--dry_run", command)
+
     def test_release_has_twenty_unique_logical_assets(self) -> None:
         self.assertEqual(len(PLUGIN.EXPECTED_CACHE_ASSETS), 20)
         self.assertEqual(len(set(PLUGIN.EXPECTED_CACHE_ASSETS)), 20)

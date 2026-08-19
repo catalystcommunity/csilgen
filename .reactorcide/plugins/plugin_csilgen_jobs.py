@@ -79,6 +79,7 @@ TRANSPORTS = (
 
 RELEASE_PACKAGE = "csilgen"
 RELEASE_PACKAGES = (RELEASE_PACKAGE,)
+SEMVER_TAGS_CONFIG = Path(".reactorcide/semver-tags-release.yaml")
 RELEASE_TAG = re.compile(
     r"^csilgen/v(?P<version>"
     r"(?:0|[1-9][0-9]*)\."
@@ -999,7 +1000,15 @@ def _semver_tags_binary(root: Path) -> tuple[Path, Mapping[str, str]]:
 
 def _semver_tags(root: Path, *, dry_run: bool) -> dict:
     binary, environment = _semver_tags_binary(root)
-    args = [str(binary), "run", "--output_json", "--branch", ""]
+    args = [
+        str(binary),
+        "--config",
+        str(root / SEMVER_TAGS_CONFIG),
+        "run",
+        "--output_json",
+        "--branch",
+        "",
+    ]
     if dry_run:
         args.append("--dry_run")
     result = _run(args, cwd=root, env=environment, capture=True)
