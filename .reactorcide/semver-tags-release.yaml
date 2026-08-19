@@ -1,0 +1,4 @@
+skip_short_versions: true
+targets:
+  - name: csilgen
+    paths: [.]

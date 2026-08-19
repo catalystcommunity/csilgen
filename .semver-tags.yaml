@@ -1,4 +1,70 @@
+# This file supports the trusted-base workflow during the CI migration.
+# Release jobs use .reactorcide/semver-tags-release.yaml.
 skip_short_versions: true
 targets:
-  - name: csilgen
-    paths: [.]
+  - name: csilgen-core
+    paths: [.reactorcide/legacy-base-ci-only]
+  - name: generator-c
+    paths: [.reactorcide/legacy-base-ci-only]
+  - name: generator-csharp
+    paths: [.reactorcide/legacy-base-ci-only]
+  - name: generator-dart
+    paths: [.reactorcide/legacy-base-ci-only]
+  - name: generator-elixir
+    paths: [.reactorcide/legacy-base-ci-only]
+  - name: generator-go
+    paths: [.reactorcide/legacy-base-ci-only]
+  - name: generator-java
+    paths: [.reactorcide/legacy-base-ci-only]
+  - name: generator-json
+    paths: [.reactorcide/legacy-base-ci-only]
+  - name: generator-kotlin
+    paths: [.reactorcide/legacy-base-ci-only]
+  - name: generator-ocaml
+    paths: [.reactorcide/legacy-base-ci-only]
+  - name: generator-openapi
+    paths: [.reactorcide/legacy-base-ci-only]
+  - name: generator-php
+    paths: [.reactorcide/legacy-base-ci-only]
+  - name: generator-python
+    paths: [.reactorcide/legacy-base-ci-only]
+  - name: generator-ruby
+    paths: [.reactorcide/legacy-base-ci-only]
+  - name: generator-rust
+    paths: [.reactorcide/legacy-base-ci-only]
+  - name: generator-swift
+    paths: [.reactorcide/legacy-base-ci-only]
+  - name: generator-typescript
+    paths: [.reactorcide/legacy-base-ci-only]
+  - name: generator-zig
+    paths: [.reactorcide/legacy-base-ci-only]
+  - name: transport-c
+    paths: [.reactorcide/legacy-base-ci-only]
+  - name: transport-csharp
+    paths: [.reactorcide/legacy-base-ci-only]
+  - name: transport-dart
+    paths: [.reactorcide/legacy-base-ci-only]
+  - name: transport-elixir
+    paths: [.reactorcide/legacy-base-ci-only]
+  - name: transport-go
+    paths: [.reactorcide/legacy-base-ci-only]
+  - name: transport-java
+    paths: [.reactorcide/legacy-base-ci-only]
+  - name: transport-kotlin
+    paths: [.reactorcide/legacy-base-ci-only]
+  - name: transport-ocaml
+    paths: [.reactorcide/legacy-base-ci-only]
+  - name: transport-php
+    paths: [.reactorcide/legacy-base-ci-only]
+  - name: transport-python
+    paths: [.reactorcide/legacy-base-ci-only]
+  - name: transport-ruby
+    paths: [.reactorcide/legacy-base-ci-only]
+  - name: transport-rust
+    paths: [.reactorcide/legacy-base-ci-only]
+  - name: transport-swift
+    paths: [.reactorcide/legacy-base-ci-only]
+  - name: transport-typescript
+    paths: [.reactorcide/legacy-base-ci-only]
+  - name: transport-zig
+    paths: [.reactorcide/legacy-base-ci-only]
