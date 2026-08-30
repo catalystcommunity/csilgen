@@ -102,13 +102,14 @@ module Csilgen
       # single self-contained item, so leftover bytes are a malformed frame.
       def decode(data)
         data = data.b
-        value, pos = decode_at(data, 0)
+        value, pos = decode_at(data, 0, 0)
         raise CBORError, "trailing bytes after CBOR item" if pos != data.bytesize
 
         value
       end
 
-      def decode_at(data, pos)
+      def decode_at(data, pos, depth)
+        raise CBORError, "CBOR nesting limit exceeded" if depth > 64
         need(data, pos, 1)
         initial = data.getbyte(pos)
         pos += 1
@@ -133,22 +134,24 @@ module Csilgen
 
           [text, pos + arg]
         when 4
+          raise CBORError, "array length exceeds remaining input" if arg > data.bytesize - pos
           items = []
           arg.times do
-            item, pos = decode_at(data, pos)
+            item, pos = decode_at(data, pos, depth + 1)
             items << item
           end
           [items, pos]
         when 5
+          raise CBORError, "map length exceeds remaining input" if arg > data.bytesize - pos
           result = {}
           arg.times do
-            key, pos = decode_at(data, pos)
-            val, pos = decode_at(data, pos)
+            key, pos = decode_at(data, pos, depth + 1)
+            val, pos = decode_at(data, pos, depth + 1)
             result[key] = val
           end
           [result, pos]
         when 6
-          inner, pos = decode_at(data, pos)
+          inner, pos = decode_at(data, pos, depth + 1)
           [Tag.new(tag: arg, value: inner), pos]
         else
           raise CBORError, "unsupported CBOR major type #{major}"

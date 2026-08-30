@@ -108,15 +108,18 @@ final class CBOR
     public static function decode($bytes)
     {
         $pos = 0;
-        $value = self::decodeAt($bytes, $pos);
+        $value = self::decodeAt($bytes, $pos, 0);
         if ($pos !== strlen($bytes)) {
             throw new CborException('trailing bytes after CBOR item');
         }
         return $value;
     }
 
-    private static function decodeAt($bytes, &$pos)
+    private static function decodeAt($bytes, &$pos, $depth)
     {
+        if ($depth > 64) {
+            throw new CborException('CBOR nesting limit exceeded');
+        }
         self::need($bytes, $pos, 1);
         $initial = ord($bytes[$pos++]);
         $major = $initial >> 5;
@@ -146,25 +149,34 @@ final class CBOR
             self::need($bytes, $pos, $arg);
             $s = substr($bytes, $pos, $arg);
             $pos += $arg;
+            if ($major === 3 && preg_match('//u', $s) !== 1) {
+                throw new CborException('invalid UTF-8 text string');
+            }
             return $s;
         }
         if ($major === 4) {
+            if ($arg > strlen($bytes) - $pos) {
+                throw new CborException('array length exceeds remaining input');
+            }
             $items = array();
             for ($i = 0; $i < $arg; $i++) {
-                $items[] = self::decodeAt($bytes, $pos);
+                $items[] = self::decodeAt($bytes, $pos, $depth + 1);
             }
             return $items;
         }
         if ($major === 5) {
+            if ($arg > strlen($bytes) - $pos) {
+                throw new CborException('map length exceeds remaining input');
+            }
             $map = array();
             for ($i = 0; $i < $arg; $i++) {
-                $key = self::decodeAt($bytes, $pos);
-                $map[$key] = self::decodeAt($bytes, $pos);
+                $key = self::decodeAt($bytes, $pos, $depth + 1);
+                $map[$key] = self::decodeAt($bytes, $pos, $depth + 1);
             }
             return $map;
         }
         if ($major === 6) {
-            return new Tag($arg, self::decodeAt($bytes, $pos));
+            return new Tag($arg, self::decodeAt($bytes, $pos, $depth + 1));
         }
         throw new CborException('unsupported CBOR major type ' . $major);
     }

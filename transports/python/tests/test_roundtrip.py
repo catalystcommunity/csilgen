@@ -261,6 +261,18 @@ class CborTest(unittest.TestCase):
         with self.assertRaises(cbor.CborError):
             cbor.decode(cbor.encode(1) + b"\x00")
 
+    def test_hostile_lengths_depth_and_text_rejected(self) -> None:
+        bad = [
+            bytes.fromhex("9b0000010000000000"),
+            bytes.fromhex("bb0000010000000000"),
+            b"\x61\xff",
+            b"\xc0" * 65 + b"\x00",
+        ]
+        for payload in bad:
+            with self.assertRaises((cbor.CborError, UnicodeDecodeError)):
+                cbor.decode(payload)
+        self.assertIsNotNone(cbor.decode(b"\xc0" * 64 + b"\x00"))
+
 
 if __name__ == "__main__":
     unittest.main()

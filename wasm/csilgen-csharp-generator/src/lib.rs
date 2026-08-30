@@ -3836,7 +3836,7 @@ public static partial class Cbor
     public static CborValue Decode(byte[] b)
     {
         int csilPos = 0;
-        var v = Dec(b, ref csilPos);
+        var v = Dec(b, ref csilPos, 0);
         if (csilPos != b.Length) { throw new CborException("trailing bytes"); }
         return v;
     }
@@ -3844,6 +3844,11 @@ public static partial class Cbor
     static ulong ReadArg(byte[] b, ref int csilPos, byte low)
     {
         if (low < 24) { csilPos += 1; return low; }
+        int csilWidth = low == 24 ? 1 : low == 25 ? 2 : low == 26 ? 4 : low == 27 ? 8 : 0;
+        if (csilWidth == 0 || csilPos >= b.Length || b.Length - csilPos - 1 < csilWidth)
+        {
+            throw new CborException("truncated argument");
+        }
         switch (low)
         {
             case 24:
@@ -3877,8 +3882,10 @@ public static partial class Cbor
         }
     }
 
-    static CborValue Dec(byte[] b, ref int csilPos)
+    static CborValue Dec(byte[] b, ref int csilPos, int csilDepth)
     {
+        if (csilDepth > 64) { throw new CborException("nesting limit exceeded"); }
+        if (csilPos >= b.Length) { throw new CborException("unexpected end of input"); }
         var ib = b[csilPos];
         var major = (byte)(ib >> 5);
         var low = (byte)(ib & 0x1f);
@@ -3914,6 +3921,7 @@ public static partial class Cbor
                 return new CborValue.Int(-1 - (long)arg);
             case 2:
             {
+                if (arg > (ulong)(b.Length - csilPos)) { throw new CborException("truncated byte string"); }
                 var n = (int)arg;
                 var slice = new byte[n];
                 System.Array.Copy(b, csilPos, slice, 0, n);
@@ -3922,33 +3930,38 @@ public static partial class Cbor
             }
             case 3:
             {
+                if (arg > (ulong)(b.Length - csilPos)) { throw new CborException("truncated text string"); }
                 var n = (int)arg;
-                var s = System.Text.Encoding.UTF8.GetString(b, csilPos, n);
+                string s;
+                try { s = new System.Text.UTF8Encoding(false, true).GetString(b, csilPos, n); }
+                catch (System.Text.DecoderFallbackException) { throw new CborException("invalid utf-8"); }
                 csilPos += n;
                 return new CborValue.Text(s);
             }
             case 4:
             {
+                if (arg > (ulong)(b.Length - csilPos)) { throw new CborException("array length exceeds remaining input"); }
                 var n = (int)arg;
                 var items = new System.Collections.Generic.List<CborValue>(n);
-                for (int csilI = 0; csilI < n; csilI++) { items.Add(Dec(b, ref csilPos)); }
+                for (int csilI = 0; csilI < n; csilI++) { items.Add(Dec(b, ref csilPos, csilDepth + 1)); }
                 return new CborValue.Array(items);
             }
             case 5:
             {
+                if (arg > (ulong)(b.Length - csilPos)) { throw new CborException("map length exceeds remaining input"); }
                 var n = (int)arg;
                 var kvs = new System.Collections.Generic.List<(CborValue, CborValue)>(n);
                 for (int csilI = 0; csilI < n; csilI++)
                 {
-                    var k = Dec(b, ref csilPos);
-                    var val = Dec(b, ref csilPos);
+                    var k = Dec(b, ref csilPos, csilDepth + 1);
+                    var val = Dec(b, ref csilPos, csilDepth + 1);
                     kvs.Add((k, val));
                 }
                 return new CborValue.Map(kvs);
             }
             case 6:
             {
-                var inner = Dec(b, ref csilPos);
+                var inner = Dec(b, ref csilPos, csilDepth + 1);
                 return new CborValue.Tag(arg, inner);
             }
             default:
@@ -4140,6 +4153,24 @@ const CODEC_DECIMAL_LIBRARY_CSHARP: &str = r#"public static partial class Cbor
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn decoder_checks_declared_lengths_before_conversion_or_allocation() {
+        for guard in [
+            "if (arg > (ulong)(b.Length - csilPos)) { throw new CborException(\"truncated byte string\"); }",
+            "if (arg > (ulong)(b.Length - csilPos)) { throw new CborException(\"truncated text string\"); }",
+            "if (arg > (ulong)(b.Length - csilPos)) { throw new CborException(\"array length exceeds remaining input\"); }",
+            "if (arg > (ulong)(b.Length - csilPos)) { throw new CborException(\"map length exceeds remaining input\"); }",
+        ] {
+            assert!(
+                CODEC_RUNTIME_CSHARP.contains(guard),
+                "missing guard: {guard}"
+            );
+        }
+        assert!(CODEC_RUNTIME_CSHARP.contains("if (csilDepth > 64)"));
+        assert!(CODEC_RUNTIME_CSHARP.contains("new System.Text.UTF8Encoding(false, true)"));
+        assert!(CODEC_RUNTIME_CSHARP.contains("b.Length - csilPos - 1 < csilWidth"));
+    }
 
     fn config() -> CsharpConfig {
         CsharpConfig {

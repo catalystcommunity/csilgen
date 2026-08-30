@@ -244,6 +244,26 @@ class RoundtripTest {
     }
 
     @Test
+    void decoderRejectsHostileLengthsDepthAndText() {
+        byte[][] bad = {
+            {(byte) 0x9B, 0, 0, 1, 0, 0, 0, 0, 0},
+            {(byte) 0xBB, 0, 0, 1, 0, 0, 0, 0, 0},
+            {0x61, (byte) 0xFF}
+        };
+        for (byte[] payload : bad) {
+            assertThrows(DecodeException.class, () -> Cbor.decodeEnvelope(payload));
+        }
+
+        byte[] tooDeep = new byte[66];
+        java.util.Arrays.fill(tooDeep, 0, 65, (byte) 0xC0);
+        assertThrows(DecodeException.class, () -> Cbor.decodeEnvelope(tooDeep));
+
+        byte[] allowed = new byte[65];
+        java.util.Arrays.fill(allowed, 0, 64, (byte) 0xC0);
+        Cbor.decodeEnvelope(allowed);
+    }
+
+    @Test
     void canonicalMapKeyOrdering() {
         // Keys come out in deterministic order regardless of insertion order.
         byte[] a = Conventions.encodeMap(List.of(

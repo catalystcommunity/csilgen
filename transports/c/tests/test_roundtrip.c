@@ -280,6 +280,18 @@ static void test_decode_rejects_garbage(void) {
     const uint8_t truncated[] = {0x62, 0x6f}; /* claims 2-byte text, has 1 */
     CHECK(csil_rpc_request_decode(truncated, sizeof truncated, &req) != CSIL_OK,
           "truncated input rejected");
+    const uint8_t huge_array[] = {0x9b, 0x00, 0x00, 0x01, 0x00,
+                                  0x00, 0x00, 0x00, 0x00};
+    CHECK(csil_rpc_request_decode(huge_array, sizeof huge_array, &req) != CSIL_OK,
+          "hostile array length rejected");
+    const uint8_t invalid_utf8[] = {0x61, 0xff};
+    CHECK(csil_rpc_request_decode(invalid_utf8, sizeof invalid_utf8, &req) != CSIL_OK,
+          "invalid UTF-8 rejected");
+    uint8_t too_deep[66];
+    memset(too_deep, 0xc0, 65);
+    too_deep[65] = 0x00;
+    CHECK(csil_rpc_request_decode(too_deep, sizeof too_deep, &req) != CSIL_OK,
+          "excessive nesting rejected");
 }
 
 int main(void) {

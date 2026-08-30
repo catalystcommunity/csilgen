@@ -150,7 +150,7 @@ pub const Decoded = struct { value: Value, consumed: usize };
 /// rather than silently ignoring them. All decoded storage is owned by `alloc`
 /// (pass an arena); the caller frees the whole tree at once.
 pub fn decode_envelope(alloc: std.mem.Allocator, b: []const u8) Error!Value {
-    const d = try decode_value(alloc, b);
+    const d = try decode_value_depth(alloc, b, 0);
     if (d.consumed != b.len) return error.TrailingBytes;
     return d.value;
 }
@@ -159,6 +159,11 @@ pub fn decode_envelope(alloc: std.mem.Allocator, b: []const u8) Error!Value {
 /// number of bytes consumed. It may leave trailing bytes (it is the recursive
 /// workhorse used for nested items); envelope decoders use decode_envelope.
 pub fn decode_value(alloc: std.mem.Allocator, b: []const u8) Error!Decoded {
+    return decode_value_depth(alloc, b, 0);
+}
+
+fn decode_value_depth(alloc: std.mem.Allocator, b: []const u8, depth: usize) Error!Decoded {
+    if (depth > 64) return error.Malformed;
     if (b.len == 0) return error.UnexpectedEof;
     const ib = b[0];
     const major: u8 = ib >> 5;
@@ -178,38 +183,41 @@ pub fn decode_value(alloc: std.mem.Allocator, b: []const u8) Error!Decoded {
         },
         2, 3 => {
             const end = try content_end(b, n, arg);
+            if (major == 3 and !std.unicode.utf8ValidateSlice(b[n..end])) return error.Malformed;
             const slice = try alloc.dupe(u8, b[n..end]);
             const value: Value = if (major == 2) .{ .bytes = slice } else .{ .text = slice };
             return .{ .value = value, .consumed = end };
         },
         4 => {
+            if (arg > b.len - n) return error.UnexpectedEof;
             const count: usize = @intCast(arg);
             const items = try alloc.alloc(Value, count);
             var off = n;
             var i: usize = 0;
             while (i < count) : (i += 1) {
-                const d = try decode_value(alloc, b[off..]);
+                const d = try decode_value_depth(alloc, b[off..], depth + 1);
                 items[i] = d.value;
                 off += d.consumed;
             }
             return .{ .value = .{ .array = items }, .consumed = off };
         },
         5 => {
+            if (arg > b.len - n) return error.UnexpectedEof;
             const count: usize = @intCast(arg);
             const entries = try alloc.alloc(Entry, count);
             var off = n;
             var i: usize = 0;
             while (i < count) : (i += 1) {
-                const k = try decode_value(alloc, b[off..]);
+                const k = try decode_value_depth(alloc, b[off..], depth + 1);
                 off += k.consumed;
-                const v = try decode_value(alloc, b[off..]);
+                const v = try decode_value_depth(alloc, b[off..], depth + 1);
                 off += v.consumed;
                 entries[i] = .{ .key = k.value, .val = v.value };
             }
             return .{ .value = .{ .map = entries }, .consumed = off };
         },
         6 => {
-            const inner = try decode_value(alloc, b[n..]);
+            const inner = try decode_value_depth(alloc, b[n..], depth + 1);
             const content = try alloc.create(Value);
             content.* = inner.value;
             return .{ .value = .{ .tag = .{ .num = arg, .content = content } }, .consumed = n + inner.consumed };

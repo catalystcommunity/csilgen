@@ -3524,7 +3524,7 @@ const CODEC_RUNTIME_JAVA: &str = r#"    /** A minimal canonical-CBOR value tree:
 
     public static CborValue decode(byte[] b) {
         int[] pos = {0};
-        CborValue v = dec(b, pos);
+        CborValue v = dec(b, pos, 0);
         if (pos[0] != b.length) {
             throw new CsilCborException("csil cbor: trailing bytes");
         }
@@ -3537,6 +3537,12 @@ const CODEC_RUNTIME_JAVA: &str = r#"    /** A minimal canonical-CBOR value tree:
         }
     }
 
+    private static void requireRemaining(byte[] b, int pos, int need) {
+        if (pos < 0 || pos > b.length || need > b.length - pos) {
+            throw new CsilCborException("csil cbor: truncated input");
+        }
+    }
+
     private static long readArg(byte[] b, int[] pos, int low) {
         if (low < 24) {
             pos[0] += 1;
@@ -3544,17 +3550,17 @@ const CODEC_RUNTIME_JAVA: &str = r#"    /** A minimal canonical-CBOR value tree:
         }
         switch (low) {
             case 24:
-                requireLen(b, pos[0] + 2);
+                requireRemaining(b, pos[0], 2);
                 long v24 = b[pos[0] + 1] & 0xffL;
                 pos[0] += 2;
                 return v24;
             case 25:
-                requireLen(b, pos[0] + 3);
+                requireRemaining(b, pos[0], 3);
                 long v25 = ((b[pos[0] + 1] & 0xffL) << 8) | (b[pos[0] + 2] & 0xffL);
                 pos[0] += 3;
                 return v25;
             case 26: {
-                requireLen(b, pos[0] + 5);
+                requireRemaining(b, pos[0], 5);
                 long v = 0;
                 for (int i = 1; i <= 4; i++) {
                     v = (v << 8) | (b[pos[0] + i] & 0xffL);
@@ -3563,7 +3569,7 @@ const CODEC_RUNTIME_JAVA: &str = r#"    /** A minimal canonical-CBOR value tree:
                 return v;
             }
             case 27: {
-                requireLen(b, pos[0] + 9);
+                requireRemaining(b, pos[0], 9);
                 long v = 0;
                 for (int i = 1; i <= 8; i++) {
                     v = (v << 8) | (b[pos[0] + i] & 0xffL);
@@ -3576,7 +3582,21 @@ const CODEC_RUNTIME_JAVA: &str = r#"    /** A minimal canonical-CBOR value tree:
         }
     }
 
-    private static CborValue dec(byte[] b, int[] pos) {
+    private static String decodeUtf8(byte[] b, int off, int len) {
+        try {
+            return java.nio.charset.StandardCharsets.UTF_8.newDecoder()
+                    .onMalformedInput(java.nio.charset.CodingErrorAction.REPORT)
+                    .onUnmappableCharacter(java.nio.charset.CodingErrorAction.REPORT)
+                    .decode(java.nio.ByteBuffer.wrap(b, off, len)).toString();
+        } catch (java.nio.charset.CharacterCodingException e) {
+            throw new CsilCborException("csil cbor: invalid utf-8");
+        }
+    }
+
+    private static CborValue dec(byte[] b, int[] pos, int depth) {
+        if (depth > 64) {
+            throw new CsilCborException("csil cbor: nesting limit exceeded");
+        }
         if (pos[0] >= b.length) {
             throw new CsilCborException("csil cbor: unexpected end of input");
         }
@@ -3617,6 +3637,9 @@ const CODEC_RUNTIME_JAVA: &str = r#"    /** A minimal canonical-CBOR value tree:
                 }
                 return new CborInt(-1 - arg);
             case 2: {
+                if (Long.compareUnsigned(arg, b.length - pos[0]) > 0) {
+                    throw new CsilCborException("csil cbor: truncated byte string");
+                }
                 int n = (int) arg;
                 requireLen(b, pos[0] + n);
                 byte[] slice = java.util.Arrays.copyOfRange(b, pos[0], pos[0] + n);
@@ -3624,32 +3647,41 @@ const CODEC_RUNTIME_JAVA: &str = r#"    /** A minimal canonical-CBOR value tree:
                 return new CborBytes(slice);
             }
             case 3: {
+                if (Long.compareUnsigned(arg, b.length - pos[0]) > 0) {
+                    throw new CsilCborException("csil cbor: truncated text string");
+                }
                 int n = (int) arg;
                 requireLen(b, pos[0] + n);
-                String s = new String(b, pos[0], n, java.nio.charset.StandardCharsets.UTF_8);
+                String s = decodeUtf8(b, pos[0], n);
                 pos[0] += n;
                 return new CborText(s);
             }
             case 4: {
+                if (Long.compareUnsigned(arg, b.length - pos[0]) > 0) {
+                    throw new CsilCborException("csil cbor: array length exceeds remaining input");
+                }
                 int n = (int) arg;
                 java.util.List<CborValue> items = new java.util.ArrayList<>(n);
                 for (int i = 0; i < n; i++) {
-                    items.add(dec(b, pos));
+                    items.add(dec(b, pos, depth + 1));
                 }
                 return new CborArray(items);
             }
             case 5: {
+                if (Long.compareUnsigned(arg, b.length - pos[0]) > 0) {
+                    throw new CsilCborException("csil cbor: map length exceeds remaining input");
+                }
                 int n = (int) arg;
                 java.util.List<CborEntry> entries = new java.util.ArrayList<>(n);
                 for (int i = 0; i < n; i++) {
-                    CborValue k = dec(b, pos);
-                    CborValue val = dec(b, pos);
+                    CborValue k = dec(b, pos, depth + 1);
+                    CborValue val = dec(b, pos, depth + 1);
                     entries.add(new CborEntry(k, val));
                 }
                 return new CborMap(entries);
             }
             case 6:
-                return new CborTag(arg, dec(b, pos));
+                return new CborTag(arg, dec(b, pos, depth + 1));
             default:
                 throw new CsilCborException("csil cbor: unexpected major type");
         }
@@ -3942,6 +3974,20 @@ const CODEC_DECIMAL_JAVA: &str = r#"    public static CborValue encDecimal(java.
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn decoder_checks_declared_lengths_before_conversion_or_allocation() {
+        assert_eq!(
+            CODEC_RUNTIME_JAVA
+                .matches("if (Long.compareUnsigned(arg, b.length - pos[0]) > 0)")
+                .count(),
+            4
+        );
+        assert!(CODEC_RUNTIME_JAVA.contains("array length exceeds remaining input"));
+        assert!(CODEC_RUNTIME_JAVA.contains("map length exceeds remaining input"));
+        assert!(CODEC_RUNTIME_JAVA.contains("if (depth > 64)"));
+        assert!(CODEC_RUNTIME_JAVA.contains("CodingErrorAction.REPORT"));
+    }
     use csilgen_common::{
         CsilFieldMetadata, CsilGroupExpression, CsilPosition, CsilRule, CsilServiceOperation,
         CsilSpecSerialized, GeneratorConfig,
@@ -4818,8 +4864,9 @@ mod tests {
         let files = generate_java(&input_for(corndogs_rules(), "java-client")).unwrap();
         let f = file(&files, "CsilCbor.java");
         assert!(
-            f.content
-                .contains("case 6:\n                return new CborTag(arg, dec(b, pos));"),
+            f.content.contains(
+                "case 6:\n                return new CborTag(arg, dec(b, pos, depth + 1));"
+            ),
             "decoder missing `case 6` that reconstructs a CborTag"
         );
     }

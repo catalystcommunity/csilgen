@@ -11,6 +11,7 @@ import (
 	"bytes"
 	"fmt"
 	"math"
+	"unicode/utf8"
 	"sort"
 )
 
@@ -119,7 +120,7 @@ func canonMap(entries []cEntry) cMap {
 // leftover bytes are a malformed frame and rejected — matching the Rust and Python
 // references rather than silently ignoring them.
 func decodeEnvelope(b []byte) (cborValue, int, error) {
-	v, n, err := decodeValue(b)
+	v, n, err := decodeValueDepth(b, 0)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -134,6 +135,13 @@ func decodeEnvelope(b []byte) (cborValue, int, error) {
 // workhorse used for nested items); envelope decoders use decodeEnvelope, which
 // rejects trailing bytes.
 func decodeValue(b []byte) (cborValue, int, error) {
+	return decodeValueDepth(b, 0)
+}
+
+func decodeValueDepth(b []byte, depth int) (cborValue, int, error) {
+	if depth > 64 {
+		return nil, 0, fmt.Errorf("CBOR decode error: nesting limit exceeded")
+	}
 	if len(b) == 0 {
 		return nil, 0, fmt.Errorf("CBOR decode error: empty input")
 	}
@@ -155,22 +163,28 @@ func decodeValue(b []byte) (cborValue, int, error) {
 		}
 		return cInt(-1 - int64(arg)), n, nil
 	case 2:
-		if uint64(len(b)) < uint64(n)+arg {
+		if arg > uint64(len(b)-n) {
 			return nil, 0, fmt.Errorf("CBOR decode error: truncated byte string")
 		}
 		out := make([]byte, arg)
 		copy(out, b[n:uint64(n)+arg])
 		return cBytes(out), n + int(arg), nil
 	case 3:
-		if uint64(len(b)) < uint64(n)+arg {
+		if arg > uint64(len(b)-n) {
 			return nil, 0, fmt.Errorf("CBOR decode error: truncated text string")
+		}
+		if !utf8.Valid(b[n : uint64(n)+arg]) {
+			return nil, 0, fmt.Errorf("CBOR decode error: invalid UTF-8 text string")
 		}
 		return cText(string(b[n : uint64(n)+arg])), n + int(arg), nil
 	case 4:
+		if arg > uint64(len(b)-n) {
+			return nil, 0, fmt.Errorf("CBOR decode error: array length exceeds remaining input")
+		}
 		items := make(cArray, 0, arg)
 		off := n
 		for i := uint64(0); i < arg; i++ {
-			item, m, err := decodeValue(b[off:])
+			item, m, err := decodeValueDepth(b[off:], depth+1)
 			if err != nil {
 				return nil, 0, err
 			}
@@ -179,15 +193,18 @@ func decodeValue(b []byte) (cborValue, int, error) {
 		}
 		return items, off, nil
 	case 5:
+		if arg > uint64(len(b)-n) {
+			return nil, 0, fmt.Errorf("CBOR decode error: map length exceeds remaining input")
+		}
 		entries := make(cMap, 0, arg)
 		off := n
 		for i := uint64(0); i < arg; i++ {
-			k, m, err := decodeValue(b[off:])
+			k, m, err := decodeValueDepth(b[off:], depth+1)
 			if err != nil {
 				return nil, 0, err
 			}
 			off += m
-			v, m2, err := decodeValue(b[off:])
+			v, m2, err := decodeValueDepth(b[off:], depth+1)
 			if err != nil {
 				return nil, 0, err
 			}
@@ -196,7 +213,7 @@ func decodeValue(b []byte) (cborValue, int, error) {
 		}
 		return entries, off, nil
 	case 6:
-		content, m, err := decodeValue(b[n:])
+		content, m, err := decodeValueDepth(b[n:], depth+1)
 		if err != nil {
 			return nil, 0, err
 		}

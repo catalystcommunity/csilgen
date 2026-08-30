@@ -56,6 +56,18 @@ defmodule Csilgen.Transport.RoundtripTest do
       assert {:error, :indefinite_or_reserved} = CBOR.decode(<<0x1C>>)
     end
 
+    test "hostile lengths, depth, and text are rejected" do
+      assert {:error, :array_length_exceeds_remaining_input} =
+               CBOR.decode(<<0x9B, 0, 0, 1, 0, 0, 0, 0, 0>>)
+
+      assert {:error, :map_length_exceeds_remaining_input} =
+               CBOR.decode(<<0xBB, 0, 0, 1, 0, 0, 0, 0, 0>>)
+
+      assert {:error, :invalid_utf8} = CBOR.decode(<<0x61, 0xFF>>)
+      assert {:error, :nesting_limit_exceeded} = CBOR.decode(:binary.copy(<<0xC0>>, 65) <> <<0>>)
+      assert {:ok, _} = CBOR.decode(:binary.copy(<<0xC0>>, 64) <> <<0>>)
+    end
+
     test "tag-24 payload wrap/unwrap round-trips" do
       wrapped = Conventions.tag24(<<0xA0>>)
       assert {:ok, {:tag, 24, {:bytes, <<0xA0>>}}} = CBOR.decode(CBOR.encode(wrapped))

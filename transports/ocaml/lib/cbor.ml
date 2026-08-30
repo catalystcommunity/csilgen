@@ -81,7 +81,38 @@ let canon_map entries =
   Map (List.map (fun (_, k, v) -> (k, v)) sorted)
 
 let need b off n =
-  if off + n > Bytes.length b then raise (Decode_error "truncated input")
+  let len = Bytes.length b in
+  if off < 0 || n < 0 || off > len || n > len - off then
+    raise (Decode_error "truncated input")
+
+let valid_utf8 s =
+  let n = String.length s in
+  let code i = Char.code s.[i] in
+  let cont i = i < n && let c = code i in c >= 0x80 && c <= 0xbf in
+  let rec loop i =
+    if i = n then true else
+    let c = code i in
+    if c < 0x80 then loop (i + 1)
+    else if c >= 0xc2 && c <= 0xdf && cont (i + 1) then loop (i + 2)
+    else if c >= 0xe0 && c <= 0xef && i + 2 < n then
+      let d = code (i + 1) in
+      let second =
+        if c = 0xe0 then d >= 0xa0 && d <= 0xbf
+        else if c = 0xed then d >= 0x80 && d <= 0x9f
+        else d >= 0x80 && d <= 0xbf
+      in
+      second && cont (i + 2) && loop (i + 3)
+    else if c >= 0xf0 && c <= 0xf4 && i + 3 < n then
+      let d = code (i + 1) in
+      let second =
+        if c = 0xf0 then d >= 0x90 && d <= 0xbf
+        else if c = 0xf4 then d >= 0x80 && d <= 0x8f
+        else d >= 0x80 && d <= 0xbf
+      in
+      second && cont (i + 2) && cont (i + 3) && loop (i + 4)
+    else false
+  in
+  loop 0
 
 (* Read the additional-information argument for the head byte at [off] whose low
    five bits are [low], returning the argument (as the unsigned bit pattern in an
@@ -115,7 +146,8 @@ let to_len (arg : int64) =
   then raise (Decode_error "length out of range")
   else Int64.to_int arg
 
-let rec decode_at b off =
+let rec decode_at b off depth =
+  if depth > 64 then raise (Decode_error "CBOR nesting limit exceeded");
   if off >= Bytes.length b then raise (Decode_error "empty input");
   let ib = Bytes.get_uint8 b off in
   let major = ib lsr 5 in
@@ -137,36 +169,40 @@ let rec decode_at b off =
   | 3 ->
       let len = to_len arg in
       need b next len;
-      (Text (Bytes.sub_string b next len), next + len)
+      let text = Bytes.sub_string b next len in
+      if not (valid_utf8 text) then raise (Decode_error "invalid UTF-8 text string");
+      (Text text, next + len)
   | 4 ->
       let len = to_len arg in
+      need b next len;
       let rec loop i off acc =
         if i = len then (List.rev acc, off)
         else
-          let item, o = decode_at b off in
+          let item, o = decode_at b off (depth + 1) in
           loop (i + 1) o (item :: acc)
       in
       let items, off' = loop 0 next [] in
       (Array items, off')
   | 5 ->
       let len = to_len arg in
+      need b next len;
       let rec loop i off acc =
         if i = len then (List.rev acc, off)
         else
-          let k, o1 = decode_at b off in
-          let v, o2 = decode_at b o1 in
+          let k, o1 = decode_at b off (depth + 1) in
+          let v, o2 = decode_at b o1 (depth + 1) in
           loop (i + 1) o2 ((k, v) :: acc)
       in
       let entries, off' = loop 0 next [] in
       (Map entries, off')
   | 6 ->
-      let content, o = decode_at b next in
+      let content, o = decode_at b next (depth + 1) in
       (Tag (arg, content), o)
   | _ -> raise (Decode_error "unsupported major type")
 
 let decode b =
   try
-    let v, n = decode_at b 0 in
+    let v, n = decode_at b 0 0 in
     if n <> Bytes.length b then
       Error "CBOR decode error: trailing bytes after CBOR item"
     else Ok v

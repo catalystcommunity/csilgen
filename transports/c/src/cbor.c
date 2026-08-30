@@ -415,6 +415,9 @@ static csil_err read_arg(const uint8_t *b, size_t len, uint8_t low, uint64_t *ar
  * result is usable directly as a C string. */
 static const uint8_t *arena_copy(csil_arena *a, const uint8_t *src, size_t n,
                                  bool as_text) {
+    if (as_text && n == SIZE_MAX) {
+        return NULL;
+    }
     size_t total = as_text ? n + 1 : (n ? n : 1);
     uint8_t *dst = csil_arena_alloc(a, total);
     if (!dst) {
@@ -429,8 +432,34 @@ static const uint8_t *arena_copy(csil_arena *a, const uint8_t *src, size_t n,
     return dst;
 }
 
+static bool valid_utf8(const uint8_t *s, size_t n) {
+    size_t i = 0;
+    while (i < n) {
+        uint8_t c = s[i++];
+        if (c < 0x80) continue;
+        size_t need;
+        uint32_t cp;
+        if (c >= 0xc2 && c <= 0xdf) { need = 1; cp = c & 0x1f; }
+        else if (c >= 0xe0 && c <= 0xef) { need = 2; cp = c & 0x0f; }
+        else if (c >= 0xf0 && c <= 0xf4) { need = 3; cp = c & 0x07; }
+        else return false;
+        if (need > n - i) return false;
+        for (size_t j = 0; j < need; j++) {
+            uint8_t d = s[i++];
+            if ((d & 0xc0) != 0x80) return false;
+            cp = (cp << 6) | (uint32_t)(d & 0x3f);
+        }
+        if ((need == 2 && cp < 0x800) || (need == 3 && cp < 0x10000) ||
+            (cp >= 0xd800 && cp <= 0xdfff) || cp > 0x10ffff) return false;
+    }
+    return true;
+}
+
 static csil_err decode_value(csil_arena *a, const uint8_t *b, size_t len,
-                             csil_cbor_value *out, size_t *consumed) {
+                             csil_cbor_value *out, size_t *consumed, size_t depth) {
+    if (depth > 64) {
+        return CSIL_ERR_MALFORMED;
+    }
     if (len == 0) {
         return CSIL_ERR_TRUNCATED;
     }
@@ -465,6 +494,9 @@ static csil_err decode_value(csil_arena *a, const uint8_t *b, size_t len,
             return CSIL_ERR_TRUNCATED;
         }
         bool as_text = major == 3;
+        if (as_text && !valid_utf8(b + head, (size_t)arg)) {
+            return CSIL_ERR_MALFORMED;
+        }
         const uint8_t *copy = arena_copy(a, b + head, (size_t)arg, as_text);
         if (!copy) {
             return CSIL_ERR_OOM;
@@ -476,6 +508,9 @@ static csil_err decode_value(csil_arena *a, const uint8_t *b, size_t len,
         return CSIL_OK;
     }
     case 4: {
+        if (arg > len - head || arg > SIZE_MAX / sizeof(csil_cbor_value)) {
+            return CSIL_ERR_TRUNCATED;
+        }
         csil_cbor_value *items = NULL;
         if (arg) {
             items = csil_arena_alloc(a, (size_t)arg * sizeof(*items));
@@ -486,7 +521,7 @@ static csil_err decode_value(csil_arena *a, const uint8_t *b, size_t len,
         size_t off = head;
         for (uint64_t i = 0; i < arg; i++) {
             size_t m = 0;
-            e = decode_value(a, b + off, len - off, &items[i], &m);
+            e = decode_value(a, b + off, len - off, &items[i], &m, depth + 1);
             if (e) {
                 return e;
             }
@@ -499,6 +534,9 @@ static csil_err decode_value(csil_arena *a, const uint8_t *b, size_t len,
         return CSIL_OK;
     }
     case 5: {
+        if (arg > len - head || arg > SIZE_MAX / sizeof(csil_cbor_pair)) {
+            return CSIL_ERR_TRUNCATED;
+        }
         csil_cbor_pair *pairs = NULL;
         if (arg) {
             pairs = csil_arena_alloc(a, (size_t)arg * sizeof(*pairs));
@@ -514,12 +552,12 @@ static csil_err decode_value(csil_arena *a, const uint8_t *b, size_t len,
                 return CSIL_ERR_OOM;
             }
             size_t m = 0;
-            e = decode_value(a, b + off, len - off, k, &m);
+            e = decode_value(a, b + off, len - off, k, &m, depth + 1);
             if (e) {
                 return e;
             }
             off += m;
-            e = decode_value(a, b + off, len - off, v, &m);
+            e = decode_value(a, b + off, len - off, v, &m, depth + 1);
             if (e) {
                 return e;
             }
@@ -539,7 +577,7 @@ static csil_err decode_value(csil_arena *a, const uint8_t *b, size_t len,
             return CSIL_ERR_OOM;
         }
         size_t m = 0;
-        e = decode_value(a, b + head, len - head, content, &m);
+        e = decode_value(a, b + head, len - head, content, &m, depth + 1);
         if (e) {
             return e;
         }
@@ -568,7 +606,7 @@ csil_err csil_cbor_decode_envelope(const uint8_t *b, size_t len,
         return CSIL_ERR_OOM;
     }
     size_t consumed = 0;
-    csil_err e = decode_value(a, b, len, root, &consumed);
+    csil_err e = decode_value(a, b, len, root, &consumed, 0);
     if (e) {
         csil_arena_free(a);
         return e;

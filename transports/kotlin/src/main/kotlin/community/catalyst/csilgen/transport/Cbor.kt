@@ -131,14 +131,15 @@ fun canonMap(entries: List<CEntry>): CMap {
 /** Decode a complete envelope: one self-contained CBOR item with no trailing bytes
  *  (an envelope is a single CBOR item, so leftover bytes are a malformed frame). */
 fun decodeEnvelope(b: ByteArray): CborValue {
-    val (v, n) = decodeValue(b, 0)
+    val (v, n) = decodeValue(b, 0, 0)
     if (n != b.size) throw CborException("trailing bytes after CBOR item")
     return v
 }
 
 /** Parse one CBOR item starting at `off`, returning it and the number of bytes
  *  consumed (relative to `off`). The recursive workhorse for nested items. */
-private fun decodeValue(b: ByteArray, off: Int): Pair<CborValue, Int> {
+private fun decodeValue(b: ByteArray, off: Int, depth: Int): Pair<CborValue, Int> {
+    if (depth > 64) throw CborException("CBOR nesting limit exceeded")
     if (off >= b.size) throw CborException("empty input")
     val ib = b[off].toInt() and 0xFF
     val major = ib shr 5
@@ -162,14 +163,23 @@ private fun decodeValue(b: ByteArray, off: Int): Pair<CborValue, Int> {
             val len = boundedLen(arg)
             val start = off + headLen
             if (b.size.toLong() < start.toLong() + len.toLong()) throw CborException("truncated text string")
-            return Pair(CText(String(b, start, len, Charsets.UTF_8)), headLen + len)
+            val text = try {
+                Charsets.UTF_8.newDecoder()
+                    .onMalformedInput(java.nio.charset.CodingErrorAction.REPORT)
+                    .onUnmappableCharacter(java.nio.charset.CodingErrorAction.REPORT)
+                    .decode(java.nio.ByteBuffer.wrap(b, start, len)).toString()
+            } catch (_: java.nio.charset.CharacterCodingException) {
+                throw CborException("invalid UTF-8 text string")
+            }
+            return Pair(CText(text), headLen + len)
         }
         4 -> {
             var offset = off + headLen
+            if (arg > (b.size - offset).toULong()) throw CborException("array length exceeds remaining input")
             val items = ArrayList<CborValue>()
             var i = 0uL
             while (i < arg) {
-                val (item, m) = decodeValue(b, offset)
+                val (item, m) = decodeValue(b, offset, depth + 1)
                 items.add(item)
                 offset += m
                 i++
@@ -178,12 +188,13 @@ private fun decodeValue(b: ByteArray, off: Int): Pair<CborValue, Int> {
         }
         5 -> {
             var offset = off + headLen
+            if (arg > (b.size - offset).toULong()) throw CborException("map length exceeds remaining input")
             val entries = ArrayList<CEntry>()
             var i = 0uL
             while (i < arg) {
-                val (k, m1) = decodeValue(b, offset)
+                val (k, m1) = decodeValue(b, offset, depth + 1)
                 offset += m1
-                val (v, m2) = decodeValue(b, offset)
+                val (v, m2) = decodeValue(b, offset, depth + 1)
                 offset += m2
                 entries.add(CEntry(k, v))
                 i++
@@ -191,7 +202,7 @@ private fun decodeValue(b: ByteArray, off: Int): Pair<CborValue, Int> {
             return Pair(CMap(entries), offset - off)
         }
         6 -> {
-            val (content, m) = decodeValue(b, off + headLen)
+            val (content, m) = decodeValue(b, off + headLen, depth + 1)
             return Pair(CTag(arg, content), headLen + m)
         }
         else -> throw CborException("unsupported major type $major")
@@ -212,22 +223,22 @@ private fun readArg(b: ByteArray, off: Int, low: Int): Pair<ULong, Int> {
     return when {
         low < 24 -> Pair(low.toULong(), 1)
         low == 24 -> {
-            requireLen(b, off + 2, "1-byte argument")
+            requireAvailable(b, off, 2, "1-byte argument")
             Pair((b[off + 1].toInt() and 0xFF).toULong(), 2)
         }
         low == 25 -> {
-            requireLen(b, off + 3, "2-byte argument")
+            requireAvailable(b, off, 3, "2-byte argument")
             val v = ((b[off + 1].toInt() and 0xFF) shl 8) or (b[off + 2].toInt() and 0xFF)
             Pair(v.toULong(), 3)
         }
         low == 26 -> {
-            requireLen(b, off + 5, "4-byte argument")
+            requireAvailable(b, off, 5, "4-byte argument")
             var v = 0uL
             for (i in 1..4) v = (v shl 8) or (b[off + i].toInt() and 0xFF).toULong()
             Pair(v, 5)
         }
         low == 27 -> {
-            requireLen(b, off + 9, "8-byte argument")
+            requireAvailable(b, off, 9, "8-byte argument")
             var v = 0uL
             for (i in 1..8) v = (v shl 8) or (b[off + i].toInt() and 0xFF).toULong()
             Pair(v, 9)
@@ -237,6 +248,6 @@ private fun readArg(b: ByteArray, off: Int, low: Int): Pair<ULong, Int> {
     }
 }
 
-private fun requireLen(b: ByteArray, needEnd: Int, what: String) {
-    if (b.size < needEnd) throw CborException("truncated $what")
+private fun requireAvailable(b: ByteArray, off: Int, count: Int, what: String) {
+    if (off < 0 || off > b.size || count > b.size - off) throw CborException("truncated $what")
 }

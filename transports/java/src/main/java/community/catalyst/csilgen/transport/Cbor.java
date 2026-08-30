@@ -127,6 +127,13 @@ final class Cbor {
         }
 
         CborValue value() {
+            return value(0);
+        }
+
+        CborValue value(int depth) {
+            if (depth > 64) {
+                throw new DecodeException("CBOR nesting limit exceeded");
+            }
             if (pos >= b.length) {
                 throw new DecodeException("empty input");
             }
@@ -153,7 +160,15 @@ final class Cbor {
                 }
                 case 3: {
                     int len = lengthGuard(arg, "text string");
-                    String s = new String(b, pos, len, StandardCharsets.UTF_8);
+                    String s;
+                    try {
+                        s = StandardCharsets.UTF_8.newDecoder()
+                                .onMalformedInput(java.nio.charset.CodingErrorAction.REPORT)
+                                .onUnmappableCharacter(java.nio.charset.CodingErrorAction.REPORT)
+                                .decode(java.nio.ByteBuffer.wrap(b, pos, len)).toString();
+                    } catch (java.nio.charset.CharacterCodingException e) {
+                        throw new DecodeException("invalid UTF-8 text string");
+                    }
                     pos += len;
                     return new CText(s);
                 }
@@ -161,7 +176,7 @@ final class Cbor {
                     int count = lengthGuard(arg, "array");
                     List<CborValue> items = new ArrayList<>(count);
                     for (int i = 0; i < count; i++) {
-                        items.add(value());
+                        items.add(value(depth + 1));
                     }
                     return new CArray(items);
                 }
@@ -169,14 +184,14 @@ final class Cbor {
                     int count = lengthGuard(arg, "map");
                     List<CEntry> entries = new ArrayList<>(count);
                     for (int i = 0; i < count; i++) {
-                        CborValue k = value();
-                        CborValue val = value();
+                        CborValue k = value(depth + 1);
+                        CborValue val = value(depth + 1);
                         entries.add(new CEntry(k, val));
                     }
                     return new CMap(entries);
                 }
                 case 6: {
-                    CborValue content = value();
+                    CborValue content = value(depth + 1);
                     return new CTag(arg, content);
                 }
                 default:

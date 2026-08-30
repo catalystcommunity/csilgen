@@ -29,7 +29,7 @@ defmodule Csilgen.Transport.CBOR do
   @doc "Decodes one complete CBOR item, rejecting any trailing bytes."
   @spec decode(binary()) :: {:ok, term()} | {:error, atom()}
   def decode(bin) when is_binary(bin) do
-    with {:ok, value, rest} <- decode_value(bin) do
+    with {:ok, value, rest} <- decode_value(bin, 0) do
       if rest == <<>>, do: {:ok, value}, else: {:error, :trailing_bytes}
     end
   end
@@ -76,13 +76,15 @@ defmodule Csilgen.Transport.CBOR do
 
   # --- decode ---------------------------------------------------------------
 
-  defp decode_value(<<major::3, info::5, rest::binary>>) do
+  defp decode_value(_bin, depth) when depth > 64, do: {:error, :nesting_limit_exceeded}
+
+  defp decode_value(<<major::3, info::5, rest::binary>>, depth) do
     with {:ok, arg, rest} <- read_arg(info, rest) do
-      decode_item(major, arg, rest)
+      decode_item(major, arg, rest, depth)
     end
   end
 
-  defp decode_value(<<>>), do: {:error, :empty_input}
+  defp decode_value(<<>>, _depth), do: {:error, :empty_input}
 
   defp read_arg(info, rest) when info < 24, do: {:ok, info, rest}
   defp read_arg(24, <<n::8, rest::binary>>), do: {:ok, n, rest}
@@ -93,11 +95,11 @@ defmodule Csilgen.Transport.CBOR do
   # 28..30 (reserved) and 31 (indefinite) are forbidden in CSIL envelopes.
   defp read_arg(_info, _rest), do: {:error, :indefinite_or_reserved}
 
-  defp decode_item(0, arg, rest), do: {:ok, arg, rest}
+  defp decode_item(0, arg, rest, _depth), do: {:ok, arg, rest}
   # Bignum integers make -1-arg exact with no signed-64 floor guard needed.
-  defp decode_item(1, arg, rest), do: {:ok, -1 - arg, rest}
+  defp decode_item(1, arg, rest, _depth), do: {:ok, -1 - arg, rest}
 
-  defp decode_item(2, arg, rest) do
+  defp decode_item(2, arg, rest, _depth) do
     # Pattern-matching a fixed-size slice never over-allocates on a forged length:
     # it only matches when the bytes are actually present.
     case rest do
@@ -106,37 +108,44 @@ defmodule Csilgen.Transport.CBOR do
     end
   end
 
-  defp decode_item(3, arg, rest) do
+  defp decode_item(3, arg, rest, _depth) do
     case rest do
-      <<s::binary-size(^arg), rest2::binary>> -> {:ok, s, rest2}
+      <<s::binary-size(^arg), rest2::binary>> ->
+        if String.valid?(s), do: {:ok, s, rest2}, else: {:error, :invalid_utf8}
       _ -> {:error, :truncated_text_string}
     end
   end
 
-  defp decode_item(4, arg, rest), do: decode_seq(arg, rest, [])
+  defp decode_item(4, arg, rest, depth) when arg <= byte_size(rest),
+    do: decode_seq(arg, rest, [], depth + 1)
 
-  defp decode_item(5, arg, rest), do: decode_map(arg, rest, [])
+  defp decode_item(4, _arg, _rest, _depth), do: {:error, :array_length_exceeds_remaining_input}
 
-  defp decode_item(6, arg, rest) do
-    with {:ok, value, rest2} <- decode_value(rest), do: {:ok, {:tag, arg, value}, rest2}
+  defp decode_item(5, arg, rest, depth) when arg <= byte_size(rest),
+    do: decode_map(arg, rest, [], depth + 1)
+
+  defp decode_item(5, _arg, _rest, _depth), do: {:error, :map_length_exceeds_remaining_input}
+
+  defp decode_item(6, arg, rest, depth) do
+    with {:ok, value, rest2} <- decode_value(rest, depth + 1), do: {:ok, {:tag, arg, value}, rest2}
   end
 
-  defp decode_item(7, _arg, _rest), do: {:error, :unsupported_simple_or_float}
+  defp decode_item(7, _arg, _rest, _depth), do: {:error, :unsupported_simple_or_float}
 
-  defp decode_seq(0, rest, acc), do: {:ok, Enum.reverse(acc), rest}
+  defp decode_seq(0, rest, acc, _depth), do: {:ok, Enum.reverse(acc), rest}
 
-  defp decode_seq(n, rest, acc) do
-    with {:ok, item, rest2} <- decode_value(rest) do
-      decode_seq(n - 1, rest2, [item | acc])
+  defp decode_seq(n, rest, acc, depth) do
+    with {:ok, item, rest2} <- decode_value(rest, depth) do
+      decode_seq(n - 1, rest2, [item | acc], depth)
     end
   end
 
-  defp decode_map(0, rest, acc), do: {:ok, Map.new(acc), rest}
+  defp decode_map(0, rest, acc, _depth), do: {:ok, Map.new(acc), rest}
 
-  defp decode_map(n, rest, acc) do
-    with {:ok, key, rest2} <- decode_value(rest),
-         {:ok, value, rest3} <- decode_value(rest2) do
-      decode_map(n - 1, rest3, [{key, value} | acc])
+  defp decode_map(n, rest, acc, depth) do
+    with {:ok, key, rest2} <- decode_value(rest, depth),
+         {:ok, value, rest3} <- decode_value(rest2, depth) do
+      decode_map(n - 1, rest3, [{key, value} | acc], depth)
     end
   end
 end

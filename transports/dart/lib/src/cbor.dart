@@ -164,6 +164,7 @@ class _Reader {
   _Reader(this.data);
 
   bool get atEnd => pos == data.length;
+  int get remaining => data.length - pos;
 
   int _byte() {
     if (pos >= data.length) {
@@ -208,7 +209,10 @@ class _Reader {
         'unsupported CBOR additional info $ai (indefinite lengths are not allowed)');
   }
 
-  Cbor value() {
+  Cbor value([int depth = 0]) {
+    if (depth > 64) {
+      throw DecodeException('CBOR nesting limit exceeded');
+    }
     final head = _byte();
     final major = head >> 5;
     final arg = _argument(head & 0x1f);
@@ -222,21 +226,27 @@ class _Reader {
       case 3:
         return CborText(utf8.decode(_take(arg)));
       case 4:
+        if (arg > remaining) {
+          throw DecodeException('CBOR array length exceeds remaining input');
+        }
         final items = <Cbor>[];
         for (var i = 0; i < arg; i++) {
-          items.add(value());
+          items.add(value(depth + 1));
         }
         return CborArray(items);
       case 5:
+        if (arg > remaining) {
+          throw DecodeException('CBOR map length exceeds remaining input');
+        }
         final entries = <(Cbor, Cbor)>[];
         for (var i = 0; i < arg; i++) {
-          final k = value();
-          final v = value();
+          final k = value(depth + 1);
+          final v = value(depth + 1);
           entries.add((k, v));
         }
         return CborMap(entries);
       case 6:
-        return CborTag(arg, value());
+        return CborTag(arg, value(depth + 1));
       default:
         throw DecodeException('unsupported CBOR major type $major');
     }
