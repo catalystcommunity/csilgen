@@ -3244,6 +3244,7 @@ fn generate_codec(input: &WasmGeneratorInput, config: &GoConfig) -> Option<Strin
     content.push_str("import (\n");
     content.push_str(&format!("{}\"fmt\"\n", config.indent_style));
     content.push_str(&format!("{}\"math\"\n", config.indent_style));
+    content.push_str(&format!("{}\"unicode/utf8\"\n", config.indent_style));
     if uses_timestamp {
         content.push_str(&format!("{}\"time\"\n", config.indent_style));
     }
@@ -3520,7 +3521,7 @@ func cborEnc(v cborValue, out *[]byte) {
 // is not exactly one value is an error rather than a silently-truncated read.
 func cborDecode(b []byte) (cborValue, error) {
 	pos := 0
-	v, err := cborDec(b, &pos)
+	v, err := cborDec(b, &pos, 0)
 	if err != nil {
 		return nil, err
 	}
@@ -3537,21 +3538,21 @@ func cborReadArg(b []byte, pos *int, low byte) (uint64, error) {
 	}
 	switch low {
 	case 24:
-		if *pos+2 > len(b) {
+		if len(b)-*pos < 2 {
 			return 0, fmt.Errorf("csil cbor: truncated argument")
 		}
 		v := uint64(b[*pos+1])
 		*pos += 2
 		return v, nil
 	case 25:
-		if *pos+3 > len(b) {
+		if len(b)-*pos < 3 {
 			return 0, fmt.Errorf("csil cbor: truncated argument")
 		}
 		v := uint64(b[*pos+1])<<8 | uint64(b[*pos+2])
 		*pos += 3
 		return v, nil
 	case 26:
-		if *pos+5 > len(b) {
+		if len(b)-*pos < 5 {
 			return 0, fmt.Errorf("csil cbor: truncated argument")
 		}
 		var v uint64
@@ -3561,7 +3562,7 @@ func cborReadArg(b []byte, pos *int, low byte) (uint64, error) {
 		*pos += 5
 		return v, nil
 	case 27:
-		if *pos+9 > len(b) {
+		if len(b)-*pos < 9 {
 			return 0, fmt.Errorf("csil cbor: truncated argument")
 		}
 		var v uint64
@@ -3575,7 +3576,10 @@ func cborReadArg(b []byte, pos *int, low byte) (uint64, error) {
 	}
 }
 
-func cborDec(b []byte, pos *int) (cborValue, error) {
+func cborDec(b []byte, pos *int, depth int) (cborValue, error) {
+	if depth > 64 {
+		return nil, fmt.Errorf("csil cbor: nesting limit exceeded")
+	}
 	if *pos >= len(b) {
 		return nil, fmt.Errorf("csil cbor: unexpected end of input")
 	}
@@ -3622,27 +3626,33 @@ func cborDec(b []byte, pos *int) (cborValue, error) {
 		}
 		return cborInt(-1 - int64(arg)), nil
 	case 2:
-		n := int(arg)
-		if *pos+n > len(b) {
+		if arg > uint64(len(b)-*pos) {
 			return nil, fmt.Errorf("csil cbor: truncated byte string")
 		}
+		n := int(arg)
 		slice := make([]byte, n)
 		copy(slice, b[*pos:*pos+n])
 		*pos += n
 		return cborBytes(slice), nil
 	case 3:
-		n := int(arg)
-		if *pos+n > len(b) {
+		if arg > uint64(len(b)-*pos) {
 			return nil, fmt.Errorf("csil cbor: truncated text string")
+		}
+		n := int(arg)
+		if !utf8.Valid(b[*pos : *pos+n]) {
+			return nil, fmt.Errorf("csil cbor: invalid utf-8")
 		}
 		s := string(b[*pos : *pos+n])
 		*pos += n
 		return cborText(s), nil
 	case 4:
+		if arg > uint64(len(b)-*pos) {
+			return nil, fmt.Errorf("csil cbor: array length exceeds remaining input")
+		}
 		n := int(arg)
 		items := make(cborArray, 0, n)
 		for i := 0; i < n; i++ {
-			item, err := cborDec(b, pos)
+			item, err := cborDec(b, pos, depth+1)
 			if err != nil {
 				return nil, err
 			}
@@ -3650,14 +3660,17 @@ func cborDec(b []byte, pos *int) (cborValue, error) {
 		}
 		return items, nil
 	case 5:
+		if arg > uint64(len(b)-*pos) {
+			return nil, fmt.Errorf("csil cbor: map length exceeds remaining input")
+		}
 		n := int(arg)
 		entries := make(cborMap, 0, n)
 		for i := 0; i < n; i++ {
-			k, err := cborDec(b, pos)
+			k, err := cborDec(b, pos, depth+1)
 			if err != nil {
 				return nil, err
 			}
-			val, err := cborDec(b, pos)
+			val, err := cborDec(b, pos, depth+1)
 			if err != nil {
 				return nil, err
 			}
@@ -3665,7 +3678,7 @@ func cborDec(b []byte, pos *int) (cborValue, error) {
 		}
 		return entries, nil
 	case 6:
-		inner, err := cborDec(b, pos)
+		inner, err := cborDec(b, pos, depth+1)
 		if err != nil {
 			return nil, err
 		}
@@ -6034,6 +6047,20 @@ fn create_error_result(error_code: i32) -> *mut u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn decoder_checks_declared_lengths_before_conversion_or_allocation() {
+        assert_eq!(
+            CODEC_RUNTIME_GO
+                .matches("if arg > uint64(len(b)-*pos) {")
+                .count(),
+            4
+        );
+        assert!(CODEC_RUNTIME_GO.contains("array length exceeds remaining input"));
+        assert!(CODEC_RUNTIME_GO.contains("map length exceeds remaining input"));
+        assert!(CODEC_RUNTIME_GO.contains("if depth > 64"));
+        assert!(CODEC_RUNTIME_GO.contains("if !utf8.Valid("));
+    }
     use csilgen_common::{
         CsilPosition, CsilRule, CsilServiceDefinition, CsilServiceOperation, CsilSpecSerialized,
         GeneratorConfig,

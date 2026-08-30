@@ -2,6 +2,18 @@
 //! (the Go/C generator in-lib test style) and assert on the emitted Zig substrings.
 
 use super::*;
+
+#[test]
+fn decoder_checks_collection_lengths_before_allocation() {
+    assert_eq!(
+        CSIL_CODEC_RUNTIME_ZIG
+            .matches("if (arg > b.len - n) return error.UnexpectedEof;")
+            .count(),
+        3
+    );
+    assert!(CSIL_CODEC_RUNTIME_ZIG.contains("if (depth > 64) return error.Malformed;"));
+    assert!(CSIL_CODEC_RUNTIME_ZIG.contains("std.unicode.utf8ValidateSlice"));
+}
 use csilgen_common::{
     CsilGroupKey, CsilPosition, CsilRule, CsilServiceOperation, CsilSpecSerialized,
     GeneratorConfig, GeneratorMetadata,

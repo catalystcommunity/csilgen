@@ -128,7 +128,7 @@ func canonMap(_ entries: [CBOREntry]) -> CBORValue {
 /// An envelope is a single CBOR item, so any leftover bytes are a malformed frame and
 /// rejected — matching the Rust and Go references rather than silently ignoring them.
 func decodeEnvelope(_ b: [UInt8]) throws -> CBORValue {
-    let (value, next) = try decodeValue(b, 0)
+    let (value, next) = try decodeValue(b, 0, 0)
     guard next == b.count else {
         throw TransportError.decode("trailing bytes after CBOR item")
     }
@@ -138,7 +138,10 @@ func decodeEnvelope(_ b: [UInt8]) throws -> CBORValue {
 /// Parse one CBOR item starting at `start`, returning it and the index just past it.
 /// The recursive workhorse; envelope decoders use `decodeEnvelope`, which additionally
 /// rejects trailing bytes.
-func decodeValue(_ b: [UInt8], _ start: Int) throws -> (CBORValue, Int) {
+func decodeValue(_ b: [UInt8], _ start: Int, _ depth: Int) throws -> (CBORValue, Int) {
+    guard depth <= 64 else {
+        throw TransportError.decode("CBOR nesting limit exceeded")
+    }
     guard start < b.count else {
         throw TransportError.decode("unexpected end of input")
     }
@@ -162,34 +165,43 @@ func decodeValue(_ b: [UInt8], _ start: Int) throws -> (CBORValue, Int) {
         return (.bytes(Array(b[off..<end])), end)
     case 3:
         let end = try sliceEnd(b, off, arg, "text string")
-        return (.text(String(decoding: b[off..<end], as: UTF8.self)), end)
+        guard let text = String(validating: b[off..<end], as: UTF8.self) else {
+            throw TransportError.decode("invalid UTF-8 text string")
+        }
+        return (.text(text), end)
     case 4:
+        guard arg <= UInt64(b.count - off) else {
+            throw TransportError.decode("array length exceeds remaining input")
+        }
         var items: [CBORValue] = []
         items.reserveCapacity(Int(min(arg, 1024)))
         var cursor = off
         var i: UInt64 = 0
         while i < arg {
-            let (item, next) = try decodeValue(b, cursor)
+            let (item, next) = try decodeValue(b, cursor, depth + 1)
             items.append(item)
             cursor = next
             i += 1
         }
         return (.array(items), cursor)
     case 5:
+        guard arg <= UInt64(b.count - off) else {
+            throw TransportError.decode("map length exceeds remaining input")
+        }
         var entries: [CBOREntry] = []
         entries.reserveCapacity(Int(min(arg, 1024)))
         var cursor = off
         var i: UInt64 = 0
         while i < arg {
-            let (key, afterKey) = try decodeValue(b, cursor)
-            let (value, afterValue) = try decodeValue(b, afterKey)
+            let (key, afterKey) = try decodeValue(b, cursor, depth + 1)
+            let (value, afterValue) = try decodeValue(b, afterKey, depth + 1)
             entries.append(CBOREntry(key: key, value: value))
             cursor = afterValue
             i += 1
         }
         return (.map(entries), cursor)
     case 6:
-        let (content, next) = try decodeValue(b, off)
+        let (content, next) = try decodeValue(b, off, depth + 1)
         return (.tag(arg, content), next)
     default:
         throw TransportError.decode("unsupported major type \(major)")
@@ -212,17 +224,17 @@ func readArg(_ b: [UInt8], _ start: Int, _ low: UInt8) throws -> (UInt64, Int) {
     case 0...23:
         return (UInt64(low), 1)
     case 24:
-        guard start + 1 < b.count else {
+        guard start >= 0, start < b.count, b.count - start > 1 else {
             throw TransportError.decode("truncated 1-byte argument")
         }
         return (UInt64(b[start + 1]), 2)
     case 25:
-        guard start + 2 < b.count else {
+        guard start >= 0, start < b.count, b.count - start > 2 else {
             throw TransportError.decode("truncated 2-byte argument")
         }
         return (UInt64(b[start + 1]) << 8 | UInt64(b[start + 2]), 3)
     case 26:
-        guard start + 4 < b.count else {
+        guard start >= 0, start < b.count, b.count - start > 4 else {
             throw TransportError.decode("truncated 4-byte argument")
         }
         let v =
@@ -230,7 +242,7 @@ func readArg(_ b: [UInt8], _ start: Int, _ low: UInt8) throws -> (UInt64, Int) {
             | UInt64(b[start + 4])
         return (v, 5)
     case 27:
-        guard start + 8 < b.count else {
+        guard start >= 0, start < b.count, b.count - start > 8 else {
             throw TransportError.decode("truncated 8-byte argument")
         }
         var v: UInt64 = 0

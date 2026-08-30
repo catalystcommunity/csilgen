@@ -241,6 +241,19 @@ mod tests {
     }
 
     #[test]
+    fn cbor_decoder_rejects_excessive_depth_and_invalid_text() {
+        assert!(crate::conventions::decode_value(&[0x61, 0xff]).is_err());
+
+        let mut too_deep = vec![0xc0; 65];
+        too_deep.push(0x00);
+        assert!(crate::conventions::decode_value(&too_deep).is_err());
+
+        let mut allowed = vec![0xc0; 64];
+        allowed.push(0x00);
+        assert!(crate::conventions::decode_value(&allowed).is_ok());
+    }
+
+    #[test]
     fn length_prefix_framing_round_trips_over_loopback() {
         let mut c = LoopbackFrameCarrier::new();
         c.send_frame(&[1, 2, 3]).unwrap();

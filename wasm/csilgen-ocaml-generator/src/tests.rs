@@ -8,6 +8,14 @@ use csilgen_common::{
 };
 use std::collections::HashMap;
 
+#[test]
+fn decoder_rejects_bad_heads_depth_counts_and_invalid_text() {
+    assert!(CSIL_CBOR_OCAML.contains("nesting limit exceeded"));
+    assert!(CSIL_CBOR_OCAML.contains("truncated input"));
+    assert!(CSIL_CBOR_OCAML.contains("array length exceeds remaining input"));
+    assert!(CSIL_CBOR_OCAML.contains("valid_utf8"));
+}
+
 // --- identifier mapping -----------------------------------------------------
 
 #[test]

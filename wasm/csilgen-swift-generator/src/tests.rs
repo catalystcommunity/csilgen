@@ -1,6 +1,19 @@
 //! Unit tests for the Swift generator's emitter functions.
 
 use super::*;
+
+#[test]
+fn decoder_checks_declared_lengths_before_conversion_or_allocation() {
+    assert_eq!(
+        CODEC_RUNTIME_SWIFT
+            .matches("guard arg <= UInt64(b.count - pos) else")
+            .count(),
+        4
+    );
+    assert!(CODEC_RUNTIME_SWIFT.contains("guard depth <= 64, pos < b.count"));
+    assert!(CODEC_RUNTIME_SWIFT.contains("String(validating:"));
+    assert!(CODEC_RUNTIME_SWIFT.contains("b.count - pos - 1 >= width"));
+}
 use csilgen_common::{
     CsilGroupExpression, CsilPosition, CsilRule, CsilServiceOperation, CsilSpecSerialized,
     GeneratorConfig,

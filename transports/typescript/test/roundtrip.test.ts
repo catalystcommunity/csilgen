@@ -54,6 +54,17 @@ test("cbor canonical map sorts keys by encoded bytes", () => {
   }
 });
 
+test("cbor decoder rejects hostile lengths, depth, and UTF-8", () => {
+  const bad = [
+    b(0x9b, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00),
+    b(0xbb, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00),
+    b(0x61, 0xff),
+    b(...Array(65).fill(0xc0), 0x00),
+  ];
+  for (const payload of bad) assert.throws(() => cborDecode(payload));
+  assert.doesNotThrow(() => cborDecode(b(...Array(64).fill(0xc0), 0x00)));
+});
+
 test("cbor primitives round-trip", () => {
   const values = [
     int(0),

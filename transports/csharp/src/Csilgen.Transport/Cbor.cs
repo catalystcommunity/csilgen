@@ -44,7 +44,7 @@ public static class Cbor
 {
     // GetBytes never emits a BOM, but an explicit non-BOM encoding documents that no preamble can
     // ever leak into the wire bytes.
-    private static readonly UTF8Encoding Utf8 = new(encoderShouldEmitUTF8Identifier: false);
+    private static readonly UTF8Encoding Utf8 = new(encoderShouldEmitUTF8Identifier: false, throwOnInvalidBytes: true);
 
     // Encode serializes a value to canonical CBOR bytes.
     public static byte[] Encode(CborValue value)
@@ -192,8 +192,12 @@ public static class Cbor
     // DecodeValue parses one CBOR item from the front of bytes, returning it and the number of bytes
     // consumed. It may leave trailing bytes (it is the recursive workhorse for nested items);
     // envelope decoders use DecodeEnvelope, which rejects trailing bytes.
-    private static (CborValue Value, int Consumed) DecodeValue(ReadOnlySpan<byte> b)
+    private static (CborValue Value, int Consumed) DecodeValue(ReadOnlySpan<byte> b, int depth = 0)
     {
+        if (depth > 64)
+        {
+            throw new MalformedException("CBOR decode error: nesting limit exceeded");
+        }
         if (b.IsEmpty)
         {
             throw new MalformedException("CBOR decode error: empty input");
@@ -219,7 +223,7 @@ public static class Cbor
                 return (new CborInt(-1L - (long)arg), n);
             case 2:
                 {
-                    if ((ulong)b.Length < (ulong)n + arg)
+                    if (arg > (ulong)(b.Length - n))
                     {
                         throw new MalformedException("CBOR decode error: truncated byte string");
                     }
@@ -230,22 +234,34 @@ public static class Cbor
 
             case 3:
                 {
-                    if ((ulong)b.Length < (ulong)n + arg)
+                    if (arg > (ulong)(b.Length - n))
                     {
                         throw new MalformedException("CBOR decode error: truncated text string");
                     }
 
-                    string s = Utf8.GetString(b.Slice(n, (int)arg));
+                    string s;
+                    try
+                    {
+                        s = Utf8.GetString(b.Slice(n, (int)arg));
+                    }
+                    catch (DecoderFallbackException)
+                    {
+                        throw new MalformedException("CBOR decode error: invalid UTF-8 text string");
+                    }
                     return (new CborText(s), n + (int)arg);
                 }
 
             case 4:
                 {
+                    if (arg > (ulong)(b.Length - n))
+                    {
+                        throw new MalformedException("CBOR decode error: array length exceeds remaining input");
+                    }
                     var items = new List<CborValue>((int)arg);
                     int off = n;
                     for (ulong i = 0; i < arg; i++)
                     {
-                        var (item, m) = DecodeValue(b[off..]);
+                        var (item, m) = DecodeValue(b[off..], depth + 1);
                         items.Add(item);
                         off += m;
                     }
@@ -255,13 +271,17 @@ public static class Cbor
 
             case 5:
                 {
+                    if (arg > (ulong)(b.Length - n))
+                    {
+                        throw new MalformedException("CBOR decode error: map length exceeds remaining input");
+                    }
                     var entries = new List<CborEntry>((int)arg);
                     int off = n;
                     for (ulong i = 0; i < arg; i++)
                     {
-                        var (key, m) = DecodeValue(b[off..]);
+                        var (key, m) = DecodeValue(b[off..], depth + 1);
                         off += m;
-                        var (val, m2) = DecodeValue(b[off..]);
+                        var (val, m2) = DecodeValue(b[off..], depth + 1);
                         off += m2;
                         entries.Add(new CborEntry(key, val));
                     }
@@ -271,7 +291,7 @@ public static class Cbor
 
             case 6:
                 {
-                    var (content, m) = DecodeValue(b[n..]);
+                    var (content, m) = DecodeValue(b[n..], depth + 1);
                     return (new CborTag(arg, content), n + m);
                 }
 

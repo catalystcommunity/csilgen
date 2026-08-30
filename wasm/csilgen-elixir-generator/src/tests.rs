@@ -5,6 +5,13 @@ use csilgen_common::{
 };
 use std::collections::HashMap;
 
+#[test]
+fn decoder_rejects_excessive_depth_counts_and_invalid_text() {
+    assert!(CODEC_RUNTIME_ELIXIR.contains("depth > 64"));
+    assert!(CODEC_RUNTIME_ELIXIR.contains("array length exceeds remaining input"));
+    assert!(CODEC_RUNTIME_ELIXIR.contains("String.valid?"));
+}
+
 fn opts(pairs: &[(&str, serde_json::Value)]) -> HashMap<String, serde_json::Value> {
     pairs
         .iter()

@@ -2694,7 +2694,7 @@ object CsilCbor {
 
     fun decode(b: ByteArray): CborValue {
         val cur = Cursor(b)
-        val v = dec(cur)
+        val v = dec(cur, 0)
         if (cur.pos != b.size) throw CborError("trailing bytes after CBOR value")
         return v
     }
@@ -2703,6 +2703,10 @@ object CsilCbor {
         if (low < 24) {
             cur.pos += 1
             return low.toULong()
+        }
+        val width = when (low) { 24 -> 1; 25 -> 2; 26 -> 4; 27 -> 8; else -> 0 }
+        if (width == 0 || cur.pos >= cur.b.size || cur.b.size - cur.pos - 1 < width) {
+            throw CborError("truncated CBOR argument")
         }
         return when (low) {
             24 -> {
@@ -2731,7 +2735,18 @@ object CsilCbor {
         }
     }
 
-    private fun dec(cur: Cursor): CborValue {
+    private fun decodeUtf8(b: ByteArray, off: Int, len: Int): String = try {
+        Charsets.UTF_8.newDecoder()
+            .onMalformedInput(java.nio.charset.CodingErrorAction.REPORT)
+            .onUnmappableCharacter(java.nio.charset.CodingErrorAction.REPORT)
+            .decode(java.nio.ByteBuffer.wrap(b, off, len)).toString()
+    } catch (_: java.nio.charset.CharacterCodingException) {
+        throw CborError("invalid UTF-8 text string")
+    }
+
+    private fun dec(cur: Cursor, depth: Int): CborValue {
+        if (depth > 64) throw CborError("CBOR nesting limit exceeded")
+        if (cur.pos >= cur.b.size) throw CborError("unexpected end of CBOR input")
         val ib = cur.b[cur.pos].toUByte().toInt()
         val major = ib shr 5
         val low = ib and 0x1f
@@ -2768,34 +2783,38 @@ object CsilCbor {
                 CborValue.CInt(-1L - arg.toLong())
             }
             2 -> {
+                if (arg > (cur.b.size - cur.pos).toULong()) throw CborError("truncated byte string")
                 val n = arg.toInt()
                 val slice = cur.b.copyOfRange(cur.pos, cur.pos + n)
                 cur.pos += n
                 CborValue.CBytes(slice)
             }
             3 -> {
+                if (arg > (cur.b.size - cur.pos).toULong()) throw CborError("truncated text string")
                 val n = arg.toInt()
-                val s = String(cur.b, cur.pos, n, Charsets.UTF_8)
+                val s = decodeUtf8(cur.b, cur.pos, n)
                 cur.pos += n
                 CborValue.CText(s)
             }
             4 -> {
+                if (arg > (cur.b.size - cur.pos).toULong()) throw CborError("array length exceeds remaining input")
                 val n = arg.toInt()
                 val items = ArrayList<CborValue>(n)
-                repeat(n) { items.add(dec(cur)) }
+                repeat(n) { items.add(dec(cur, depth + 1)) }
                 CborValue.CArray(items)
             }
             5 -> {
+                if (arg > (cur.b.size - cur.pos).toULong()) throw CborError("map length exceeds remaining input")
                 val n = arg.toInt()
                 val entries = ArrayList<Pair<CborValue, CborValue>>(n)
                 repeat(n) {
-                    val k = dec(cur)
-                    val value = dec(cur)
+                    val k = dec(cur, depth + 1)
+                    val value = dec(cur, depth + 1)
                     entries.add(k to value)
                 }
                 CborValue.CMap(entries)
             }
-            6 -> CborValue.CTag(arg, dec(cur))
+            6 -> CborValue.CTag(arg, dec(cur, depth + 1))
             else -> throw CborError("malformed CBOR major type")
         }
     }
@@ -3677,6 +3696,21 @@ fn create_error_result(error_code: i32) -> *mut u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn decoder_checks_declared_lengths_before_conversion_or_allocation() {
+        assert_eq!(
+            CODEC_RUNTIME_KT
+                .matches("if (arg > (cur.b.size - cur.pos).toULong())")
+                .count(),
+            4
+        );
+        assert!(CODEC_RUNTIME_KT.contains("array length exceeds remaining input"));
+        assert!(CODEC_RUNTIME_KT.contains("map length exceeds remaining input"));
+        assert!(CODEC_RUNTIME_KT.contains("if (depth > 64)"));
+        assert!(CODEC_RUNTIME_KT.contains("CodingErrorAction.REPORT"));
+        assert!(CODEC_RUNTIME_KT.contains("cur.b.size - cur.pos - 1 < width"));
+    }
     use csilgen_common::{
         CsilPosition, CsilRule, CsilServiceOperation, CsilSpecSerialized, GeneratorConfig,
     };

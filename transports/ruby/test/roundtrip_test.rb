@@ -222,6 +222,17 @@ module Csilgen
         assert_raises(CBOR::CBORError) { CBOR.decode(CBOR.encode(1) + "\x00".b) }
       end
 
+      def test_hostile_lengths_depth_and_text_rejected
+        bad = [
+          ["9b0000010000000000"].pack("H*"),
+          ["bb0000010000000000"].pack("H*"),
+          "\x61\xff".b,
+          "\xc0".b * 65 + "\x00".b,
+        ]
+        bad.each { |payload| assert_raises(CBOR::CBORError) { CBOR.decode(payload) } }
+        CBOR.decode("\xc0".b * 64 + "\x00".b)
+      end
+
       def test_indefinite_length_rejected
         # Major-type-2 with additional info 31 (indefinite) is forbidden in an envelope.
         assert_raises(CBOR::CBORError) { CBOR.decode("\x5f".b) }

@@ -157,7 +157,7 @@ pub fn encode_value(value: &Value) -> Result<Vec<u8>> {
 /// matching the other reference libraries instead of silently ignoring them.
 pub fn decode_value(bytes: &[u8]) -> Result<Value> {
     let mut cursor = std::io::Cursor::new(bytes);
-    let value: Value = ciborium::de::from_reader(&mut cursor)
+    let value: Value = ciborium::de::from_reader_with_recursion_limit(&mut cursor, 64)
         .map_err(|e| TransportError::Decode(e.to_string()))?;
     if (cursor.position() as usize) != bytes.len() {
         return Err(TransportError::Decode(

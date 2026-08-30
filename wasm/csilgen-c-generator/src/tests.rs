@@ -2505,3 +2505,17 @@ fn optional_bytes_encodes_on_presence_not_emptiness() {
         "a present value must stay present after decode:\n{codec}"
     );
 }
+
+#[test]
+fn decoder_checks_collection_lengths_before_allocation() {
+    assert!(
+        CODEC_RUNTIME_C
+            .contains("if (arg > len - head || arg > SIZE_MAX / sizeof(csilc_value)) return -1;")
+    );
+    assert!(
+        CODEC_RUNTIME_C
+            .contains("if (arg > len - head || arg > SIZE_MAX / sizeof(csilc_pair)) return -1;")
+    );
+    assert!(CODEC_RUNTIME_C.contains("if (depth > 64) return -1;"));
+    assert!(CODEC_RUNTIME_C.contains("csilc_valid_utf8"));
+}

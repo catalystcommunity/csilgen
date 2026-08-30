@@ -128,7 +128,9 @@ def _need(data: bytes, pos: int, n: int) -> None:
         raise CborError("unexpected end of CBOR input")
 
 
-def _decode_at(data: bytes, pos: int) -> tuple[Any, int]:
+def _decode_at(data: bytes, pos: int, depth: int) -> tuple[Any, int]:
+    if depth > 64:
+        raise CborError("CBOR nesting limit exceeded")
     _need(data, pos, 1)
     initial = data[pos]
     pos += 1
@@ -151,29 +153,33 @@ def _decode_at(data: bytes, pos: int) -> tuple[Any, int]:
         return data[pos : pos + length].decode("utf-8"), pos + length
     if major == _MAJOR_ARRAY:
         length, pos = _read_argument(data, pos, info)
+        if length > len(data) - pos:
+            raise CborError("array length exceeds remaining input")
         items = []
         for _ in range(length):
-            item, pos = _decode_at(data, pos)
+            item, pos = _decode_at(data, pos, depth + 1)
             items.append(item)
         return items, pos
     if major == _MAJOR_MAP:
         length, pos = _read_argument(data, pos, info)
+        if length > len(data) - pos:
+            raise CborError("map length exceeds remaining input")
         result: dict[Any, Any] = {}
         for _ in range(length):
-            key, pos = _decode_at(data, pos)
-            val, pos = _decode_at(data, pos)
+            key, pos = _decode_at(data, pos, depth + 1)
+            val, pos = _decode_at(data, pos, depth + 1)
             result[key] = val
         return result, pos
     if major == _MAJOR_TAG:
         tag, pos = _read_argument(data, pos, info)
-        inner, pos = _decode_at(data, pos)
+        inner, pos = _decode_at(data, pos, depth + 1)
         return Tag(tag, inner), pos
     raise CborError(f"unsupported CBOR major type {major}")
 
 
 def decode(data: bytes) -> Any:
     """Decode exactly one CBOR item; reject trailing bytes (an envelope is one item)."""
-    value, pos = _decode_at(data, 0)
+    value, pos = _decode_at(data, 0, 0)
     if pos != len(data):
         raise CborError("trailing bytes after CBOR item")
     return value

@@ -423,6 +423,25 @@ func TestNegativeIntOutOfInt64Range(t *testing.T) {
 	}
 }
 
+func TestCBORDecoderRejectsHostileLengthsDepthAndText(t *testing.T) {
+	bad := [][]byte{
+		{0x9b, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00},
+		{0xbb, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00},
+		{0x61, 0xff},
+	}
+	tooDeep := append(bytes.Repeat([]byte{0xc0}, 65), 0x00)
+	bad = append(bad, tooDeep)
+	for _, payload := range bad {
+		if _, _, err := decodeValue(payload); err == nil {
+			t.Fatalf("expected hostile CBOR rejection for %x", payload)
+		}
+	}
+	allowed := append(bytes.Repeat([]byte{0xc0}, 64), 0x00)
+	if _, _, err := decodeValue(allowed); err != nil {
+		t.Fatalf("64 nested items must remain valid: %v", err)
+	}
+}
+
 func TestLoopbackFrameCarrierRoundTrip(t *testing.T) {
 	c := NewLoopbackFrameCarrier()
 	if err := c.SendFrame([]byte{1, 2, 3}); err != nil {
