@@ -4,7 +4,7 @@ pub mod error_reporting;
 
 use crate::error_reporting::{CliOutputConfig, ErrorReporter, format_generation_summary};
 use clap::{Parser, Subcommand};
-use csilgen::generate_code_with_progress;
+use csilgen::generate_code_with_progress_and_schema;
 use csilgen_core::{
     CsilSpec, FormatConfig, ImportResolver, LintConfig, detect_breaking_changes_from_files,
     format_directory, lint_directory, parse_csil_file, parse_csil_file_streaming,
@@ -56,6 +56,9 @@ enum Commands {
         /// Output directory
         #[arg(short, long)]
         output: PathBuf,
+        /// Do not emit a CSIL schema descriptor
+        #[arg(long)]
+        no_schema: bool,
         /// Include the CSIL-RPC example in the generated quickstart
         ///
         /// Use one or more readme transport options to select examples. If you
@@ -144,6 +147,7 @@ fn run_command(cli: &Cli, reporter: &ErrorReporter) -> Result<(), csilgen_common
             input,
             target,
             output,
+            no_schema,
             readme_csil_rpc,
             readme_csil_events,
             readme_csil_datagrams,
@@ -170,7 +174,14 @@ fn run_command(cli: &Cli, reporter: &ErrorReporter) -> Result<(), csilgen_common
             }
             let readme_transports = (!readme_transports.is_empty()).then_some(readme_transports);
 
-            match generate_code_with_progress(input, target, output, pb, readme_transports) {
+            match generate_code_with_progress_and_schema(
+                input,
+                target,
+                output,
+                pb,
+                readme_transports,
+                !no_schema,
+            ) {
                 Ok(result) => {
                     let summary = format_generation_summary(
                         result.processed_files,
@@ -405,6 +416,7 @@ mod tests {
         let help = generate.clone().render_long_help().to_string();
 
         for option in [
+            "--no-schema",
             "--readme-csil-rpc",
             "--readme-csil-events",
             "--readme-csil-datagrams",

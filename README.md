@@ -42,6 +42,12 @@ cargo run -p csilgen -- generate --input your-file.csil --target java --output .
 csilgen generate --input your-file.csil --target rust --output ./generated/
 ```
 
+Each generation command also writes
+`<entry-stem>.csil-schema.cbor`. This file contains the stable wire schema. Use
+`--no-schema` when you do not want this file. See
+[`docs/csil-schema-descriptor.md`](docs/csil-schema-descriptor.md) for the
+format and diagnostic unmarshal API.
+
 See the examples directory for sample CSIL files to experiment with.
 
 ### Use a released CLI

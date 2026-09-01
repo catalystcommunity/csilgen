@@ -29,6 +29,7 @@ generated
 
 erl_crash.dump
 
+docs/csilgen-requests/
 # Project-local generator overrides (discovery path 2; see docs/generator-plugin-contract.md).
 # Binary wasm drops for local pinning/testing — never committed.
 .generators/

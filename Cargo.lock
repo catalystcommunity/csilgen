@@ -558,6 +558,7 @@ dependencies = [
  "console",
  "csilgen-common",
  "csilgen-core",
+ "csilgen-schema",
  "csilgen-wasm-generators",
  "glob",
  "indicatif",
@@ -742,6 +743,18 @@ dependencies = [
  "csilgen-common",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "csilgen-schema"
+version = "0.1.0"
+dependencies = [
+ "ciborium",
+ "csilgen-core",
+ "regex",
+ "serde",
+ "sha2",
+ "thiserror 1.0.69",
 ]
 
 [[package]]

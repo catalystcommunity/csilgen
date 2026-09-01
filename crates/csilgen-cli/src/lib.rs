@@ -7,6 +7,7 @@ use csilgen_core::{
     CsilSpec, FileDependencyGraph, ImportResolver, LiteralValue, parse_csil_file,
     validate_spec_optimized,
 };
+use csilgen_schema::SchemaDescriptor;
 use csilgen_wasm_generators::WasmGeneratorRuntime;
 use dependency_report::{
     report_circular_dependency_error, report_dependency_strategy, report_generation_summary,
@@ -16,6 +17,7 @@ use glob::glob;
 use indicatif::ProgressBar;
 use std::collections::HashMap;
 use std::fs;
+use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 
 /// Result type for CLI operations
@@ -91,6 +93,25 @@ pub fn generate_code_with_progress(
     progress_bar: Option<ProgressBar>,
     readme_transports: Option<Vec<String>>,
 ) -> CliResult<GenerationResult> {
+    generate_code_with_progress_and_schema(
+        input_pattern,
+        target,
+        output_dir,
+        progress_bar,
+        readme_transports,
+        true,
+    )
+}
+
+/// Generate code and optionally emit the default schema descriptor.
+pub fn generate_code_with_progress_and_schema(
+    input_pattern: &str,
+    target: &str,
+    output_dir: &Path,
+    progress_bar: Option<ProgressBar>,
+    readme_transports: Option<Vec<String>>,
+    emit_schema: bool,
+) -> CliResult<GenerationResult> {
     let input_files = discover_input_files(input_pattern)?;
 
     if input_files.len() == 1 {
@@ -100,6 +121,7 @@ pub fn generate_code_with_progress(
             output_dir,
             progress_bar,
             readme_transports.as_deref(),
+            emit_schema,
         )
     } else {
         process_multiple_files_with_dependencies(
@@ -108,6 +130,7 @@ pub fn generate_code_with_progress(
             output_dir,
             progress_bar,
             readme_transports.as_deref(),
+            emit_schema,
         )
     }
 }
@@ -167,6 +190,7 @@ fn process_single_file(
     output_dir: &Path,
     progress_bar: Option<ProgressBar>,
     readme_transports: Option<&[String]>,
+    emit_schema: bool,
 ) -> CliResult<GenerationResult> {
     fs::create_dir_all(output_dir).map_err(|e| {
         format!(
@@ -175,6 +199,11 @@ fn process_single_file(
             e
         )
     })?;
+
+    let schema_path = schema_output_path(input_file, output_dir)?;
+    if !emit_schema {
+        remove_stale_schema(&schema_path)?;
+    }
 
     if let Some(pb) = &progress_bar {
         pb.set_length(3);
@@ -198,6 +227,10 @@ fn process_single_file(
     // code from a spec `csilgen validate` would reject.
     validate_spec_optimized(&spec)
         .map_err(|e| format!("Validation failed for {}: {}", input_file.display(), e))?;
+
+    let schema_bytes = emit_schema
+        .then(|| build_schema_descriptor(input_file, &spec))
+        .transpose()?;
 
     if let Some(pb) = &progress_bar {
         pb.set_message(format!("Generating {target}"));
@@ -224,13 +257,28 @@ fn process_single_file(
             )
         })?;
 
+    if emit_schema {
+        reject_generator_schema_collision(
+            &generator_id,
+            &generated_files,
+            output_dir,
+            &schema_path,
+        )?;
+    }
+
     if let Some(pb) = &progress_bar {
         pb.set_message(format!("Writing {} files", generated_files.len()));
         pb.set_position(2);
     }
 
-    let (files_written, total_size) =
+    let (mut files_written, mut total_size) =
         write_generated_files(&generator_id, &generated_files, output_dir)?;
+
+    if let Some(schema_bytes) = schema_bytes {
+        write_atomic(&schema_path, &schema_bytes)?;
+        files_written += 1;
+        total_size += schema_bytes.len();
+    }
 
     if let Some(pb) = &progress_bar {
         pb.finish_with_message(format!(
@@ -253,6 +301,7 @@ fn process_multiple_files_with_dependencies(
     output_dir: &Path,
     progress_bar: Option<ProgressBar>,
     readme_transports: Option<&[String]>,
+    emit_schema: bool,
 ) -> CliResult<GenerationResult> {
     fs::create_dir_all(output_dir).map_err(|e| {
         format!(
@@ -269,11 +318,14 @@ fn process_multiple_files_with_dependencies(
         return Err(report_circular_dependency_error(&cycles).into());
     }
 
-    let entry_points = dependency_graph.find_entry_points();
+    let mut entry_points = dependency_graph.find_entry_points();
+    entry_points.sort();
 
     if entry_points.is_empty() {
         return Err(report_no_entry_points_error(&input_files).into());
     }
+
+    preflight_schema_paths(&entry_points, output_dir, emit_schema)?;
 
     let dependency_files = dependency_graph.get_dependency_files();
     report_dependency_strategy(&dependency_graph, &entry_points);
@@ -285,6 +337,7 @@ fn process_multiple_files_with_dependencies(
         output_dir,
         progress_bar,
         readme_transports,
+        emit_schema,
     )
 }
 
@@ -295,6 +348,7 @@ fn process_entry_points(
     output_dir: &Path,
     progress_bar: Option<ProgressBar>,
     readme_transports: Option<&[String]>,
+    emit_schema: bool,
 ) -> CliResult<GenerationResult> {
     if let Some(pb) = &progress_bar {
         pb.set_length(entry_points.len() as u64 * 3);
@@ -336,6 +390,35 @@ fn process_entry_points(
             continue;
         }
 
+        let schema_path = match schema_output_path(input_file, output_dir) {
+            Ok(path) => path,
+            Err(e) => {
+                eprintln!(
+                    "Failed to derive schema path for {}: {}",
+                    input_file.display(),
+                    e
+                );
+                error_count += 1;
+                continue;
+            }
+        };
+        let schema_bytes = if emit_schema {
+            match build_schema_descriptor(input_file, &spec) {
+                Ok(bytes) => Some(bytes),
+                Err(e) => {
+                    eprintln!(
+                        "Failed to create schema descriptor for {}: {}",
+                        input_file.display(),
+                        e
+                    );
+                    error_count += 1;
+                    continue;
+                }
+            }
+        } else {
+            None
+        };
+
         if let Some(pb) = &progress_bar {
             pb.set_message(format!("Generating {target}"));
             pb.set_position((i * 3 + 1) as u64);
@@ -365,6 +448,23 @@ fn process_entry_points(
             }
         };
 
+        if emit_schema
+            && let Err(e) = reject_generator_schema_collision(
+                &generator_id,
+                &generated_files,
+                output_dir,
+                &schema_path,
+            )
+        {
+            eprintln!(
+                "Failed to reserve the schema descriptor path for {}: {}",
+                input_file.display(),
+                e
+            );
+            error_count += 1;
+            continue;
+        }
+
         if let Some(pb) = &progress_bar {
             pb.set_message(format!("Writing {} files", generated_files.len()));
             pb.set_position((i * 3 + 2) as u64);
@@ -374,6 +474,22 @@ fn process_entry_points(
             Ok((files_written, size)) => {
                 total_files_written += files_written;
                 total_size += size;
+                if let Some(schema_bytes) = &schema_bytes {
+                    match write_atomic(&schema_path, schema_bytes) {
+                        Ok(()) => {
+                            total_files_written += 1;
+                            total_size += schema_bytes.len();
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "Failed to write schema descriptor for {}: {}",
+                                input_file.display(),
+                                e
+                            );
+                            error_count += 1;
+                        }
+                    }
+                }
             }
             Err(e) => {
                 eprintln!(
@@ -402,6 +518,132 @@ fn process_entry_points(
         total_size,
         error_count,
     })
+}
+
+fn schema_output_path(input_file: &Path, output_dir: &Path) -> CliResult<PathBuf> {
+    let stem = input_file.file_stem().ok_or_else(|| {
+        format!(
+            "Cannot derive a schema descriptor name from {}",
+            input_file.display()
+        )
+    })?;
+    Ok(output_dir.join(format!("{}.csil-schema.cbor", stem.to_string_lossy())))
+}
+
+fn preflight_schema_paths(
+    entry_points: &[PathBuf],
+    output_dir: &Path,
+    emit_schema: bool,
+) -> CliResult<()> {
+    let mut paths: HashMap<PathBuf, &PathBuf> = HashMap::new();
+    for entry_point in entry_points {
+        let schema_path = schema_output_path(entry_point, output_dir)?;
+        if emit_schema {
+            if let Some(previous) = paths.insert(schema_path.clone(), entry_point) {
+                return Err(format!(
+                    "Schema descriptor output collision: '{}' and '{}' both resolve to '{}'",
+                    previous.display(),
+                    entry_point.display(),
+                    schema_path.display()
+                )
+                .into());
+            }
+        } else {
+            remove_stale_schema(&schema_path)?;
+        }
+    }
+    Ok(())
+}
+
+fn remove_stale_schema(path: &Path) -> CliResult<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!(
+            "Failed to remove stale schema descriptor {}: {}",
+            path.display(),
+            error
+        )
+        .into()),
+    }
+}
+
+fn reject_generator_schema_collision(
+    generator_id: &str,
+    generated_files: &[csilgen_common::GeneratedFile],
+    output_dir: &Path,
+    schema_path: &Path,
+) -> CliResult<()> {
+    for generated_file in generated_files {
+        let path = sanitize_output_path(generator_id, output_dir, &generated_file.path)?;
+        if path == schema_path {
+            return Err(format!(
+                "Generator '{generator_id}' emitted the reserved schema descriptor path '{}'",
+                schema_path.display()
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+
+fn build_schema_descriptor(input_file: &Path, spec: &CsilSpec) -> CliResult<Vec<u8>> {
+    let root = input_file
+        .file_stem()
+        .ok_or_else(|| format!("Cannot derive an entry name from {}", input_file.display()))?
+        .to_string_lossy()
+        .into_owned();
+    SchemaDescriptor::from_spec(root, spec)?
+        .encode()
+        .map_err(|error| error.into())
+}
+
+fn write_atomic(path: &Path, bytes: &[u8]) -> CliResult<()> {
+    let parent = path.parent().ok_or_else(|| {
+        format!(
+            "Schema descriptor path has no parent directory: {}",
+            path.display()
+        )
+    })?;
+    fs::create_dir_all(parent).map_err(|error| {
+        format!(
+            "Failed to create schema descriptor directory {}: {}",
+            parent.display(),
+            error
+        )
+    })?;
+    let mut temporary = tempfile::NamedTempFile::new_in(parent).map_err(|error| {
+        format!(
+            "Failed to create a temporary schema descriptor in {}: {}",
+            parent.display(),
+            error
+        )
+    })?;
+    temporary.write_all(bytes).map_err(|error| {
+        format!(
+            "Failed to write the temporary schema descriptor for {}: {}",
+            path.display(),
+            error
+        )
+    })?;
+    temporary.as_file().sync_all().map_err(|error| {
+        format!(
+            "Failed to sync the temporary schema descriptor for {}: {}",
+            path.display(),
+            error
+        )
+    })?;
+    temporary
+        .persist(path)
+        .map_err(|error| -> Box<dyn std::error::Error> {
+            format!(
+                "Failed to install schema descriptor {}: {}",
+                path.display(),
+                error.error
+            )
+            .into()
+        })?;
+    Ok(())
 }
 
 /// Initialize WASM runtime and validate generator availability
@@ -604,6 +846,7 @@ mod tests {
                 assert_eq!(gen_result.processed_files, 1);
                 assert!(gen_result.generated_files > 0);
                 assert_eq!(gen_result.error_count, 0);
+                assert!(output_dir.join("user.csil-schema.cbor").is_file());
             }
             Err(e) => {
                 // This test might fail if WASM generators are not available
@@ -1066,5 +1309,126 @@ mod tests {
         assert_eq!(files_written, 1);
         assert_eq!(total_size, "class Types {}".len());
         assert!(output_dir.join("csilgen/api/Types.java").exists());
+    }
+
+    #[test]
+    fn test_schema_descriptor_name_uses_entry_stem() {
+        let path = schema_output_path(Path::new("csil/linkkeys.csil"), Path::new("generated"))
+            .expect("path should be valid");
+        assert_eq!(path, Path::new("generated/linkkeys.csil-schema.cbor"));
+    }
+
+    #[test]
+    fn test_no_schema_removes_only_the_expected_descriptor() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let schema = temp_dir.path().join("entry.csil-schema.cbor");
+        let other = temp_dir.path().join("other.csil-schema.cbor");
+        fs::write(&schema, b"stale").unwrap();
+        fs::write(&other, b"keep").unwrap();
+
+        remove_stale_schema(&schema).unwrap();
+
+        assert!(!schema.exists());
+        assert_eq!(fs::read(other).unwrap(), b"keep");
+    }
+
+    #[test]
+    fn test_schema_path_collision_is_a_generation_error() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let entries = vec![
+            temp_dir.path().join("a/root.csil"),
+            temp_dir.path().join("b/root.csil"),
+        ];
+        let error = preflight_schema_paths(&entries, temp_dir.path(), true).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("collision"));
+        assert!(message.contains("a/root.csil"));
+        assert!(message.contains("b/root.csil"));
+    }
+
+    #[test]
+    fn test_atomic_schema_write_replaces_a_complete_file() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let schema = temp_dir.path().join("entry.csil-schema.cbor");
+        fs::write(&schema, b"old-complete").unwrap();
+
+        write_atomic(&schema, b"new-complete").unwrap();
+
+        assert_eq!(fs::read(schema).unwrap(), b"new-complete");
+        assert_eq!(fs::read_dir(temp_dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn test_generator_cannot_use_reserved_schema_path() {
+        let output = Path::new("/tmp/csilgen-out");
+        let files = vec![csilgen_common::GeneratedFile {
+            path: "entry.csil-schema.cbor".to_string(),
+            content: "wrong format".to_string(),
+        }];
+        let error = reject_generator_schema_collision(
+            "custom",
+            &files,
+            output,
+            &output.join("entry.csil-schema.cbor"),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("reserved"));
+    }
+
+    #[test]
+    fn test_schema_bytes_do_not_depend_on_target_configuration() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let input = create_test_csil_file(
+            temp_dir.path(),
+            "entry.csil",
+            "Item = { data: bstr }\nservice Api { get: null -> Item }",
+        );
+        let spec = parse_csil_with_imports(&input).unwrap();
+
+        let first = build_schema_descriptor(&input, &spec).unwrap();
+        let second = build_schema_descriptor(&input, &spec).unwrap();
+
+        assert_eq!(first, second);
+        csilgen_schema::SchemaDescriptor::decode(&first).unwrap();
+    }
+
+    #[test]
+    fn test_generate_no_schema_removes_stale_default_output() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let input = create_test_csil_file(
+            temp_dir.path(),
+            "entry.csil",
+            "Item = { data: bstr }\nservice Api { get: null -> Item }",
+        );
+        let output = temp_dir.path().join("output");
+        fs::create_dir_all(&output).unwrap();
+        let schema = output.join("entry.csil-schema.cbor");
+        fs::write(&schema, b"stale").unwrap();
+
+        let result = generate_code_with_progress_and_schema(
+            input.to_str().unwrap(),
+            "noop",
+            &output,
+            None,
+            None,
+            false,
+        );
+
+        match result {
+            Ok(result) => {
+                assert_eq!(result.error_count, 0);
+                assert!(!schema.exists());
+            }
+            Err(error) => {
+                assert!(!schema.exists());
+                let message = error.to_string();
+                assert!(
+                    message.contains("Generator")
+                        || message.contains("WASM")
+                        || message.contains("runtime"),
+                    "Unexpected error: {message}"
+                );
+            }
+        }
     }
 }

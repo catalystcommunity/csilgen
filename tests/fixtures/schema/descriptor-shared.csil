@@ -1,0 +1,6 @@
+SharedID = uint
+
+shared_fields = (
+  shared_id: SharedID,
+  ? shared_note: text,
+)
