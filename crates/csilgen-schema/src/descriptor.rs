@@ -11,7 +11,7 @@ use std::io::Cursor;
 use thiserror::Error;
 
 pub const FORMAT_NAME: &str = "csil-schema";
-pub const FORMAT_VERSION: u64 = 1;
+pub const FORMAT_VERSION: &str = "v1alpha1";
 pub const MEDIA_TYPE: &str = "application/csil-schema+cbor";
 
 /// A CBOR byte string. This wrapper prevents Serde from encoding bytes as an array.
@@ -60,12 +60,12 @@ impl<'de> Deserialize<'de> for ByteString {
     }
 }
 
-/// Version 1 descriptor. The digest is SHA-256 over the deterministic encoding
+/// `v1alpha1` descriptor. The digest is SHA-256 over the deterministic encoding
 /// of [`SchemaBody`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SchemaDescriptor {
     pub format: String,
-    pub version: u64,
+    pub version: String,
     pub digest: ByteString,
     pub body: SchemaBody,
 }
@@ -267,7 +267,7 @@ pub enum DescriptorError {
     #[error("cannot decode the schema descriptor: {0}")]
     Decode(String),
     #[error("unsupported schema descriptor format '{format}' version {version}")]
-    UnsupportedVersion { format: String, version: u64 },
+    UnsupportedVersion { format: String, version: String },
     #[error("schema descriptor digest must contain 32 bytes, found {0}")]
     InvalidDigestLength(usize),
     #[error("schema descriptor digest does not match its body")]
@@ -327,7 +327,7 @@ impl SchemaDescriptor {
         let digest = body_digest(&body)?;
         Ok(Self {
             format: FORMAT_NAME.to_string(),
-            version: FORMAT_VERSION,
+            version: FORMAT_VERSION.to_string(),
             digest: ByteString(digest.to_vec()),
             body,
         })
@@ -354,7 +354,7 @@ impl SchemaDescriptor {
         if self.format != FORMAT_NAME || self.version != FORMAT_VERSION {
             return Err(DescriptorError::UnsupportedVersion {
                 format: self.format.clone(),
-                version: self.version,
+                version: self.version.clone(),
             });
         }
         if self.digest.0.len() != 32 {
@@ -382,7 +382,7 @@ pub fn body_digest(body: &SchemaBody) -> Result<[u8; 32], DescriptorError> {
 }
 
 /// Encode with recursively sorted map keys. Keys are ordered by their encoded
-/// bytes. This rule is part of descriptor version 1.
+/// bytes. This rule is part of descriptor version `v1alpha1`.
 pub fn canonical_encode<T: Serialize + ?Sized>(value: &T) -> Result<Vec<u8>, DescriptorError> {
     let mut value =
         Value::serialized(value).map_err(|error| DescriptorError::Encode(error.to_string()))?;
@@ -665,6 +665,7 @@ mod tests {
         )
         .unwrap();
         let descriptor = SchemaDescriptor::from_spec("example", &spec).unwrap();
+        assert_eq!(descriptor.version, "v1alpha1");
         let first = descriptor.encode().unwrap();
         let second = descriptor.encode().unwrap();
         assert_eq!(first, second);
@@ -709,10 +710,11 @@ mod tests {
         ));
 
         let mut descriptor = SchemaDescriptor::from_spec("value", &spec).unwrap();
-        descriptor.version = 2;
+        descriptor.version = "v1alpha2".to_string();
         assert!(matches!(
             descriptor.verify(),
-            Err(DescriptorError::UnsupportedVersion { version: 2, .. })
+            Err(DescriptorError::UnsupportedVersion { version, .. })
+                if version == "v1alpha2"
         ));
 
         assert!(matches!(

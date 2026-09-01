@@ -1,4 +1,4 @@
-# CSIL Schema Descriptor Version 1
+# CSIL Schema Descriptor `v1alpha1`
 
 ## Purpose
 
@@ -24,13 +24,13 @@ The descriptor is one CBOR map. It has these keys:
 | Key | CBOR type | Meaning |
 | --- | --- | --- |
 | `format` | text | The value is `csil-schema`. |
-| `version` | unsigned integer | The value is `1`. |
+| `version` | text | The value is `v1alpha1`. |
 | `digest` | byte string | The value is a 32-byte SHA-256 digest. |
 | `body` | map | The value is the semantic schema body. |
 
-Reject a descriptor when `format` is not `csil-schema`. Reject a major version
-that the consumer does not support. A version 1 consumer can ignore an unknown
-map key.
+Reject a descriptor when `format` is not `csil-schema`. Reject a version that
+the consumer does not support. A `v1alpha1` consumer can ignore an unknown map
+key.
 
 The `body` map has these keys:
 
