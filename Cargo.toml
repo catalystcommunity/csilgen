@@ -4,6 +4,7 @@ members = [
     "crates/csilgen-core",
     "crates/csilgen-cli",
     "crates/csilgen-common",
+    "crates/csilgen-schema",
     "wasm/csilgen-wasm-core",
     "wasm/csilgen-wasm-generators",
     "wasm/csilgen-noop-generator",
@@ -46,6 +47,7 @@ atty = "0.2"
 # Internal crate dependencies
 csilgen-core = { path = "crates/csilgen-core" }
 csilgen-common = { path = "crates/csilgen-common" }
+csilgen-schema = { path = "crates/csilgen-schema" }
 csilgen-wasm-generators = { path = "wasm/csilgen-wasm-generators" }
 
 

@@ -1,0 +1,86 @@
+include "descriptor-shared.csil"
+
+IntRange = -10..10
+LiteralEnum = "first" / "second" / "third"
+TaggedUnion = [tag: LiteralEnum, value: any]
+Homogeneous = [1*5 uint]
+ZeroOrMore = [* text]
+OneOrMore = [+ text]
+ExactCount = [3 text]
+MinimumCount = [2* text]
+MaximumCount = [*4 text]
+FixedTuple = [name: text, count: uint, ? note: text]
+NonTextMap = {1*4 [uint, text] => any}
+
+Sized = text .size (1..64)
+ExactSize = text .size 3
+MinimumSize = text .size (2..)
+MaximumSize = text .size (..5)
+Pattern = text .regex "^[a-z]+$"
+Defaulted = int .default 1
+Compared = int .ge -10 .le 10 .gt -11 .lt 11 .ne 0
+Equal = bool .eq true
+BitSet = uint .bits "0x00ff"
+Intersection = text .and (text .size (1..10))
+Subset = int .within (1 / 2 / 3)
+JsonText = text .json
+EmbeddedCbor = bytes .cbor
+CborSequence = bytes .cborseq
+
+open-type = text
+open-group = (open_value: uint)
+SocketUse = $open-type
+PlugUse = { $$open-group }
+
+AllBuiltins = {
+  shared_fields,
+  signed: int,
+  unsigned: uint,
+  negative: nint,
+  text_value: text,
+  text_alias: tstr,
+  bytes_value: bytes,
+  bytes_alias: bstr,
+  boolean: bool,
+  literal_true: true,
+  literal_false: false,
+  null_value: null,
+  undefined_value: undefined,
+  generic_float: float,
+  half_float: float16,
+  single_float: float32,
+  double_float: float64,
+  arbitrary: any,
+  time: timestamp,
+  money: decimal,
+  array: Homogeneous,
+  tuple: FixedTuple,
+  map: NonTextMap,
+  union: TaggedUnion,
+  ranged: IntRange,
+  constrained: Sized,
+  @send-only
+  send_field: text,
+  @receive-only
+  receive_field: text,
+  @bidirectional
+  both_field: text,
+  @depends-on(send_field = "yes" & both_field != "no")
+  dependent?: text,
+  @depends-on(send_field)
+  presence_dependent?: text,
+  @depends-on(send_field = "yes")
+  value_dependent?: text,
+  @min-length(1)
+  checked: text,
+}
+
+@wire-id(5)
+service DiagnosticService {
+  @wire-id(1)
+  request: AllBuiltins -> LiteralEnum / TaggedUnion,
+  @wire-id(2)
+  stream: FixedTuple <-> TaggedUnion,
+  @wire-id(3)
+  pushed: <- AllBuiltins,
+}
