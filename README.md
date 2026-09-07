@@ -18,7 +18,7 @@ The core architecture is in place and the CLI is functional end-to-end: parsing,
 From a fresh clone, the minimal commands to generate code from CSIL files:
 
 ```bash
-# Clone and install from the source tree
+# Clone and install a development build from the source tree
 git clone <repo-url>
 cd csilgen
 ./tools.sh build-install-all
@@ -60,8 +60,16 @@ Run this command from a CSILgen checkout:
 
 The command selects the newest published `csilgen/v*` release. It detects the
 operating system and architecture. It installs the CLI to the Cargo binary
-directory. It installs all production generators to
-`~/.csilgen/generators/`.
+directory. It creates `~/.local/bin/csilgen` as a link to the installed CLI.
+It replaces an existing file or link at that path. It installs all production
+generators to `~/.csilgen/generators/`. Set `CSILGEN_BIN_DIR` to use a different
+link directory.
+
+Run this command to build and activate the current checkout:
+
+```bash
+./tools.sh build-install-all
+```
 
 For a manual installation, use these steps:
 

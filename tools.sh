@@ -36,8 +36,8 @@ usage() {
         "       ./tools.sh build-ci-image [TAG]" \
         "       ./tools.sh publish-ci-image [TAG]" \
         "" \
-        "build-install-all builds and installs the CLI and production generators." \
-        "install-all installs the latest GitHub Release for this system." \
+        "build-install-all builds and installs the CLI and generators from this checkout." \
+        "install-all installs and activates the latest GitHub Release for this system." \
         "build-ci-image builds the CSILgen CI toolchain for linux/amd64." \
         "publish-ci-image builds and publishes TAG and latest." \
         "The default image TAG is derived from the Dockerfile content."
@@ -69,6 +69,35 @@ generator_install_dir() {
 generator_wasm_name() {
     local package_name="$1"
     printf '%s.wasm\n' "${package_name//-/_}"
+}
+
+activate_cli() {
+    local binary_path="$1"
+    local binary_name="$2"
+    local bin_dir="${CSILGEN_BIN_DIR:-$HOME/.local/bin}"
+    local link_path="$bin_dir/$binary_name"
+
+    if [[ "$link_path" == "$binary_path" ]]; then
+        printf 'Active CLI: %s\n' "$binary_path"
+        return
+    fi
+
+    require_command ln
+    require_command unlink
+    mkdir -p "$bin_dir"
+    if [[ -d "$link_path" && ! -L "$link_path" ]]; then
+        printf 'The CLI activation path is a directory: %s\n' "$link_path" >&2
+        exit 1
+    fi
+    if [[ -e "$link_path" || -L "$link_path" ]]; then
+        unlink "$link_path"
+    fi
+    ln -s "$binary_path" "$link_path"
+    if [[ ! -L "$link_path" || ! -x "$link_path" ]]; then
+        printf 'The CLI activation link is not usable: %s\n' "$link_path" >&2
+        exit 1
+    fi
+    printf 'Active CLI: %s -> %s\n' "$link_path" "$binary_path"
 }
 
 verify_installation() {
@@ -134,6 +163,7 @@ build_install_all() {
     done
 
     verify_installation "$binary_path" "$generator_dir"
+    activate_cli "$binary_path" "csilgen"
 }
 
 current_release_platform() {
@@ -272,6 +302,7 @@ install_all() {
     done
 
     verify_installation "$binary_path" "$generator_dir"
+    activate_cli "$binary_path" "$binary_name"
     printf 'Installed GitHub Release: %s\n' "$release_tag"
 }
 

@@ -182,7 +182,10 @@ class WorkflowVariablesTests(unittest.TestCase):
             "CSILGEN_ASSET_ITEM": "c",
             "CSILGEN_ASSET_KIND": "transport",
             "RC_WF_VARS_JSON": json.dumps(
-                {"asset_cache_uploads": uploads}
+                {
+                    "asset_cache_release_version": "1.2.3",
+                    "asset_cache_uploads": uploads,
+                }
             ),
         }
         with tempfile.TemporaryDirectory() as directory:
@@ -195,11 +198,12 @@ class WorkflowVariablesTests(unittest.TestCase):
                     PLUGIN,
                     "_build_cache_asset",
                     return_value=archive,
-                ),
+                ) as build_cache_asset,
                 mock.patch.object(PLUGIN, "_put_presigned") as put_presigned,
             ):
                 PLUGIN._build_and_upload_asset(ROOT)
 
+        build_cache_asset.assert_called_once_with(ROOT, asset, "1.2.3")
         self.assertEqual(put_presigned.call_count, 2)
         self.assertEqual(
             put_presigned.call_args_list[0].args[0],
@@ -549,6 +553,63 @@ class ReleaseTests(unittest.TestCase):
             root, {"csilgen": "1.2.3"}
         )
 
+    def test_release_version_is_passed_to_the_cargo_build(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+
+            def build(_args: object, **_kwargs: object) -> mock.Mock:
+                destination = (
+                    root
+                    / "target"
+                    / "release-container-builds"
+                    / "x86_64-unknown-linux-gnu.2.28"
+                    / "csilgen"
+                )
+                destination.write_bytes(b"binary")
+                return mock.Mock()
+
+            with (
+                mock.patch.object(
+                    PLUGIN, "_install_buildctl", return_value=Path("/tools/buildctl")
+                ),
+                mock.patch.object(PLUGIN, "_wait_for_buildkit"),
+                mock.patch.object(PLUGIN, "_run", side_effect=build),
+            ):
+                PLUGIN._builder_build(
+                    root,
+                    "example.test/rust:latest",
+                    "x86_64-unknown-linux-gnu.2.28",
+                    ("cargo", "zigbuild"),
+                    "target/x86_64-unknown-linux-gnu/release/csilgen",
+                    "1.2.3",
+                )
+
+            dockerfile = (
+                root
+                / "target"
+                / "release-container-builds"
+                / "x86_64-unknown-linux-gnu.2.28.Dockerfile"
+            ).read_text(encoding="utf-8")
+            self.assertIn(
+                'RUN ["env", "CSILGEN_VERSION=1.2.3", "cargo", "zigbuild",',
+                dockerfile,
+            )
+
+    def test_release_cli_version_output_must_match_the_tag(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            binary = root / "version-check"
+            binary.write_text(
+                "#!/bin/sh\nprintf 'csilgen 1.2.3\\n'\n",
+                encoding="utf-8",
+            )
+            archive = root / "csilgen-1.2.3-linux-x86_64.tar.gz"
+            PLUGIN._tar_files(archive, ((binary, "csilgen"),))
+
+            PLUGIN._verify_cli_archive_version(archive, "1.2.3")
+            with self.assertRaisesRegex(RuntimeError, "does not match"):
+                PLUGIN._verify_cli_archive_version(archive, "1.2.4")
+
 
 class AssetCacheTests(unittest.TestCase):
     class MemoryCache:
@@ -576,6 +637,38 @@ class AssetCacheTests(unittest.TestCase):
         self.assertEqual(PLUGIN.ASSET_CACHE.pr_lane("12", sha), "pr-12-aaaaaaaaaaaa")
         self.assertEqual(PLUGIN.ASSET_CACHE.main_lane(sha), "main-aaaaaaaaaaaa")
         self.assertEqual(PLUGIN.ASSET_CACHE.version_lane("1.2.3"), "v1.2.3")
+
+    def test_pr_asset_lane_uses_the_semver_tags_version(self) -> None:
+        cache = mock.Mock()
+        cache.presign.return_value = "https://cache.example.test/upload"
+        plan = PLUGIN.ReleasePlan(
+            "csilgen", True, "1.2.3", "csilgen/v1.2.3", "a" * 40, "notes"
+        )
+        environment = {
+            "REACTORCIDE_EVENT_TYPE": "pull_request_updated",
+            "REACTORCIDE_PR_NUMBER": "12",
+            "REACTORCIDE_SHA": "a" * 40,
+        }
+        with (
+            mock.patch.dict(os.environ, environment, clear=True),
+            mock.patch.object(
+                PLUGIN.ASSET_CACHE.S3Cache,
+                "from_environment",
+                return_value=cache,
+            ),
+            mock.patch.object(PLUGIN, "_fetch_tags"),
+            mock.patch.object(PLUGIN, "_semver_tags", return_value={}),
+            mock.patch.object(PLUGIN, "_release_plans", return_value=[plan]),
+            mock.patch.object(
+                PLUGIN, "_read_lane_manifest", side_effect=FileNotFoundError
+            ),
+            mock.patch.object(PLUGIN, "_git_tree", return_value="b" * 40),
+            mock.patch.object(PLUGIN, "_set_workflow_vars") as set_vars,
+        ):
+            PLUGIN._prepare_asset_lane(ROOT)
+
+        values = set_vars.call_args.args[0]
+        self.assertEqual(values["asset_cache_release_version"], "1.2.3")
 
     def test_presign_does_not_include_the_secret_key(self) -> None:
         cache = PLUGIN.ASSET_CACHE.S3Cache(
@@ -607,6 +700,7 @@ class AssetCacheTests(unittest.TestCase):
             "asset_cache_lane": lane,
             "asset_cache_source_sha": "a" * 40,
             "asset_cache_source_tree": "b" * 40,
+            "asset_cache_release_version": "1.2.3",
             "asset_cache_uploads": uploads,
         }
 
@@ -624,6 +718,7 @@ class AssetCacheTests(unittest.TestCase):
             lane, PLUGIN.ASSET_CACHE.MANIFEST
         )
         manifest = PLUGIN.ASSET_CACHE.decode_manifest(cache.objects[manifest_key])
+        self.assertEqual(manifest["release_version"], "1.2.3")
         self.assertEqual(len(manifest["assets"]), 20)
         self.assertEqual(len(cache.copies), 20)
         self.assertFalse(any("/staging-" in key for key in cache.objects))
@@ -659,6 +754,65 @@ class AssetCacheTests(unittest.TestCase):
             )
 
         self.assertFalse(promoted)
+
+    def test_stale_pr_version_uses_tag_build_fallback(self) -> None:
+        lane = "pr-12-aaaaaaaaaaaa"
+        objects: dict[str, bytes] = {}
+        assets = []
+        for name in PLUGIN.EXPECTED_CACHE_ASSETS:
+            content = ("content-" + name).encode()
+            objects[PLUGIN.ASSET_CACHE.object_key(lane, name)] = content
+            assets.append(
+                {
+                    "name": name,
+                    "sha256": hashlib.sha256(content).hexdigest(),
+                    "size": len(content),
+                }
+            )
+        manifest = {
+            "schema": 1,
+            "project": "csilgen",
+            "lane": lane,
+            "source_sha": "a" * 40,
+            "source_tree": "c" * 40,
+            "release_version": "1.2.2",
+            "created_at": 0,
+            "assets": assets,
+        }
+        objects[
+            PLUGIN.ASSET_CACHE.object_key(lane, PLUGIN.ASSET_CACHE.MANIFEST)
+        ] = PLUGIN.ASSET_CACHE.encode_manifest(manifest)
+        pull = {
+            "merged": True,
+            "merge_commit_sha": "b" * 40,
+            "base": {
+                "ref": "main",
+                "repo": {"full_name": "catalystcommunity/csilgen"},
+            },
+            "head": {
+                "sha": "a" * 40,
+                "repo": {"full_name": "example/csilgen"},
+            },
+        }
+        plan = PLUGIN.ReleasePlan(
+            "csilgen", True, "1.2.3", "csilgen/v1.2.3", "b" * 40, "notes"
+        )
+        cache = self.MemoryCache(objects)
+        with (
+            mock.patch.dict(os.environ, {"REACTORCIDE_PR_NUMBER": "12"}),
+            mock.patch.object(PLUGIN, "_github_request", return_value=pull),
+            mock.patch.object(
+                PLUGIN.ASSET_CACHE.S3Cache,
+                "from_environment",
+                return_value=cache,
+            ),
+        ):
+            promoted = PLUGIN._promote_merged_pr_assets(
+                ROOT, "token", "catalystcommunity/csilgen", plan
+            )
+
+        self.assertFalse(promoted)
+        self.assertEqual(cache.copies, [])
 
     def test_release_workflow_has_fanout_seal_and_always_cleanup(self) -> None:
         workflow = yaml.safe_load(
