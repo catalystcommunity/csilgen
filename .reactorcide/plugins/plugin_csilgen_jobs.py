@@ -460,6 +460,26 @@ def _tar_files(output: Path, files: Sequence[tuple[Path, str]]) -> None:
             archive.add(source, arcname=archive_name)
 
 
+def _verify_cli_archive_version(archive_path: Path, version: str) -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        binary = Path(directory) / "csilgen"
+        with tarfile.open(archive_path, "r:gz") as archive:
+            member = archive.getmember("csilgen")
+            source = archive.extractfile(member)
+            if not member.isfile() or source is None:
+                raise RuntimeError("The CLI archive does not contain a csilgen binary")
+            with binary.open("wb") as destination:
+                shutil.copyfileobj(source, destination)
+        binary.chmod(0o755)
+        result = _run((binary, "--version"), cwd=binary.parent, capture=True)
+
+    expected = f"csilgen {version}\n"
+    if result.stdout != expected or result.stderr:
+        raise RuntimeError(
+            "The release CLI version output does not match the release tag"
+        )
+
+
 def _install_buildctl(root: Path) -> Path:
     version = "0.17.3"
     architectures = {
@@ -519,12 +539,15 @@ def _builder_build(
     target: str,
     command: Sequence[str],
     binary: str,
+    version: str,
 ) -> Path:
     build_root = root / "target" / "release-container-builds"
     build_root.mkdir(parents=True, exist_ok=True)
     safe_target = re.sub(r"[^a-zA-Z0-9_.-]", "-", target)
     dockerfile = build_root / f"{safe_target}.Dockerfile"
     build_command = [
+        "env",
+        f"CSILGEN_VERSION={version}",
         *command,
         "--release",
         "--package",
@@ -622,6 +645,7 @@ def _cli_builds() -> Mapping[str, tuple[str, str, tuple[str, ...], str, str]]:
 def _build_cli_asset(
     root: Path,
     platform_name: str,
+    version: str,
     output: Path,
     archive_name: str,
 ) -> Path:
@@ -629,7 +653,7 @@ def _build_cli_asset(
     if build is None:
         raise RuntimeError(f"The CLI release platform is invalid: {platform_name}")
     image, target, command, binary, binary_name = build
-    built_binary = _builder_build(root, image, target, command, binary)
+    built_binary = _builder_build(root, image, target, command, binary, version)
     archive = output / archive_name
     _tar_files(
         archive,
@@ -647,6 +671,7 @@ def _build_cli_artifacts(root: Path, version: str, output: Path) -> None:
         _build_cli_asset(
             root,
             platform_name,
+            version,
             output,
             f"csilgen-{version}-{platform_name}.tar.gz",
         )
@@ -695,11 +720,11 @@ def _release_asset_name(asset: str, version: str) -> str:
     raise RuntimeError(f"The release asset is invalid: {asset}")
 
 
-def _build_cache_asset(root: Path, asset: str) -> Path:
+def _build_cache_asset(root: Path, asset: str, version: str) -> Path:
     output = _release_output(root)
     if asset.startswith("cli-"):
         platform_name = asset.removeprefix("cli-").removesuffix(".tar.gz")
-        return _build_cli_asset(root, platform_name, output, asset)
+        return _build_cli_asset(root, platform_name, version, output, asset)
     if asset == GENERATOR_ASSET:
         _build_wasm(root, release=True, packages=GENERATOR_PACKAGES)
         return _archive_generators(root, output, asset)
@@ -785,12 +810,21 @@ def _prepare_asset_lane(root: Path) -> None:
             os.environ.get("REACTORCIDE_PR_NUMBER", ""),
             source_sha,
         )
+        repository = os.environ.get(
+            "REACTORCIDE_REPO", "catalystcommunity/csilgen"
+        )
+        _fetch_tags(root, repository)
+        plans = _release_plans(_semver_tags(root, dry_run=True))
+        if len(plans) != 1:
+            raise RuntimeError("semver-tags must return one csilgen release plan")
+        release_version = plans[0].version
     elif event == "tag_created":
         tag = _release_tag_from_environment(root)
         match = RELEASE_TAG.fullmatch(tag)
         if match is None:
             raise RuntimeError("The release tag is invalid")
-        lane = ASSET_CACHE.version_lane(match.group("version"))
+        release_version = match.group("version")
+        lane = ASSET_CACHE.version_lane(release_version)
         source_sha = _run(("git", "rev-parse", "HEAD"), cwd=root, capture=True).stdout.strip()
         token = os.environ.get("GITHUB_PAT", "")
         if not token:
@@ -811,7 +845,11 @@ def _prepare_asset_lane(root: Path) -> None:
         log_stdout(f"The existing lane {lane} is not reusable; rebuild its assets")
         manifest = None
     if manifest is not None:
-        if manifest.get("source_sha") == source_sha and manifest.get("source_tree") == _git_tree(root):
+        if (
+            manifest.get("source_sha") == source_sha
+            and manifest.get("source_tree") == _git_tree(root)
+            and manifest.get("release_version") == release_version
+        ):
             cached_assets = set(EXPECTED_CACHE_ASSETS)
 
     uploads: dict[str, dict[str, str]] = {}
@@ -834,6 +872,7 @@ def _prepare_asset_lane(root: Path) -> None:
             "asset_cache_uploads": uploads,
             "asset_cache_source_sha": source_sha,
             "asset_cache_source_tree": _git_tree(root),
+            "asset_cache_release_version": release_version,
         }
     )
     log_stdout(
@@ -863,6 +902,12 @@ def _put_presigned(url: str, content: bytes) -> None:
 def _build_and_upload_asset(root: Path) -> None:
     asset = _asset_for_job()
     variables = _workflow_vars()
+    release_version = variables.get("asset_cache_release_version")
+    if (
+        not isinstance(release_version, str)
+        or RELEASE_TAG.fullmatch(f"{RELEASE_PACKAGE}/v{release_version}") is None
+    ):
+        raise RuntimeError("The release asset version is invalid")
     uploads = variables.get("asset_cache_uploads")
     if not isinstance(uploads, dict):
         raise RuntimeError("The asset upload map is missing")
@@ -876,7 +921,7 @@ def _build_and_upload_asset(root: Path) -> None:
     digest_url = upload.get("sha256")
     if not isinstance(asset_url, str) or not isinstance(digest_url, str):
         raise RuntimeError("The asset upload URLs are invalid")
-    archive = _build_cache_asset(root, asset)
+    archive = _build_cache_asset(root, asset, release_version)
     digest = ASSET_CACHE.file_sha256(archive)
     _put_presigned(asset_url, archive.read_bytes())
     _put_presigned(digest_url, (digest + "\n").encode())
@@ -912,8 +957,14 @@ def _seal_asset_lane(root: Path) -> None:
     lane = variables.get("asset_cache_lane")
     source_sha = variables.get("asset_cache_source_sha")
     source_tree = variables.get("asset_cache_source_tree")
-    if not all(isinstance(value, str) for value in (lane, source_sha, source_tree)):
+    release_version = variables.get("asset_cache_release_version")
+    if not all(
+        isinstance(value, str)
+        for value in (lane, source_sha, source_tree, release_version)
+    ):
         raise RuntimeError("The asset lane variables are invalid")
+    if RELEASE_TAG.fullmatch(f"{RELEASE_PACKAGE}/v{release_version}") is None:
+        raise RuntimeError("The release asset version is invalid")
     cache = ASSET_CACHE.S3Cache.from_environment()
     uploads = variables.get("asset_cache_uploads")
     if not isinstance(uploads, dict):
@@ -955,6 +1006,7 @@ def _seal_asset_lane(root: Path) -> None:
         "lane": lane,
         "source_sha": source_sha,
         "source_tree": source_tree,
+        "release_version": release_version,
         "created_at": time.time(),
         "assets": assets,
     }
@@ -1363,6 +1415,9 @@ def _promote_merged_pr_assets(
     if manifest.get("source_sha") != head_sha:
         log_stdout("The PR cache commit is stale; the tag workflow will build assets")
         return False
+    if manifest.get("release_version") != plan.version:
+        log_stdout("The PR cache version is stale; the tag workflow will build assets")
+        return False
     head_api = f"https://api.github.com/repos/{head_repository}"
     try:
         head_commit = _github_request(
@@ -1469,12 +1524,18 @@ def _publish_tag_release(root: Path) -> None:
         raise RuntimeError("The release cache has the wrong source commit")
     if manifest.get("source_tree") != _git_tree(root):
         raise RuntimeError("The release cache has the wrong source tree")
+    if manifest.get("release_version") != version:
+        raise RuntimeError("The release cache has the wrong release version")
     artifacts = _release_output(root)
     for asset in EXPECTED_CACHE_ASSETS:
         cache.get_file(
             ASSET_CACHE.object_key(lane, asset),
             artifacts / _release_asset_name(asset, version),
         )
+    _verify_cli_archive_version(
+        artifacts / _release_asset_name("cli-linux-x86_64.tar.gz", version),
+        version,
+    )
     _upload_release_artifacts(token, repository, release, artifacts)
 
     api = f"https://api.github.com/repos/{repository}"

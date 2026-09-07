@@ -14,7 +14,7 @@ use std::path::PathBuf;
 
 #[derive(Parser)]
 #[command(name = "csilgen")]
-#[command(version)]
+#[command(version = env!("CSILGEN_VERSION"))]
 #[command(about = "Validate CSIL files and generate code from them")]
 struct Cli {
     /// Show detailed diagnostic output
