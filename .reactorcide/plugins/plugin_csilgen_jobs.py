@@ -539,15 +539,14 @@ def _builder_build(
     target: str,
     command: Sequence[str],
     binary: str,
-    version: str,
+    version: str | None,
 ) -> Path:
     build_root = root / "target" / "release-container-builds"
     build_root.mkdir(parents=True, exist_ok=True)
     safe_target = re.sub(r"[^a-zA-Z0-9_.-]", "-", target)
     dockerfile = build_root / f"{safe_target}.Dockerfile"
     build_command = [
-        "env",
-        f"CSILGEN_VERSION={version}",
+        *([] if version is None else ["env", f"CSILGEN_VERSION={version}"]),
         *command,
         "--release",
         "--package",
@@ -645,7 +644,7 @@ def _cli_builds() -> Mapping[str, tuple[str, str, tuple[str, ...], str, str]]:
 def _build_cli_asset(
     root: Path,
     platform_name: str,
-    version: str,
+    version: str | None,
     output: Path,
     archive_name: str,
 ) -> Path:
@@ -720,7 +719,7 @@ def _release_asset_name(asset: str, version: str) -> str:
     raise RuntimeError(f"The release asset is invalid: {asset}")
 
 
-def _build_cache_asset(root: Path, asset: str, version: str) -> Path:
+def _build_cache_asset(root: Path, asset: str, version: str | None) -> Path:
     output = _release_output(root)
     if asset.startswith("cli-"):
         platform_name = asset.removeprefix("cli-").removesuffix(".tar.gz")
@@ -903,7 +902,16 @@ def _build_and_upload_asset(root: Path) -> None:
     asset = _asset_for_job()
     variables = _workflow_vars()
     release_version = variables.get("asset_cache_release_version")
-    if (
+    if release_version is None:
+        event = os.environ.get("REACTORCIDE_EVENT_TYPE", "")
+        if event == "tag_created":
+            match = RELEASE_TAG.fullmatch(_release_tag_from_environment(root))
+            if match is None:
+                raise RuntimeError("The release tag is invalid")
+            release_version = match.group("version")
+        elif event not in {"pull_request_opened", "pull_request_updated"}:
+            raise RuntimeError("The release asset version is missing")
+    elif (
         not isinstance(release_version, str)
         or RELEASE_TAG.fullmatch(f"{RELEASE_PACKAGE}/v{release_version}") is None
     ):

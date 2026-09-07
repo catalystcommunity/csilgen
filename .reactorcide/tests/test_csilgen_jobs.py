@@ -215,6 +215,37 @@ class WorkflowVariablesTests(unittest.TestCase):
             uploads[asset]["sha256"],
         )
 
+    def test_pr_cli_build_accepts_base_prepare_without_version(self) -> None:
+        asset = "cli-linux-x86_64.tar.gz"
+        uploads = {
+            asset: {
+                "asset": "https://cache.example.test/asset",
+                "sha256": "https://cache.example.test/digest",
+            }
+        }
+        environment = {
+            "CSILGEN_ASSET_ITEM": "linux-x86_64",
+            "CSILGEN_ASSET_KIND": "cli",
+            "REACTORCIDE_EVENT_TYPE": "pull_request_updated",
+            "RC_WF_VARS_JSON": json.dumps({"asset_cache_uploads": uploads}),
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            archive = Path(directory) / asset
+            archive.write_bytes(b"archive")
+            with (
+                mock.patch.dict(os.environ, environment, clear=True),
+                mock.patch.object(runner_workflow, "_global_context", None),
+                mock.patch.object(
+                    PLUGIN,
+                    "_build_cache_asset",
+                    return_value=archive,
+                ) as build_cache_asset,
+                mock.patch.object(PLUGIN, "_put_presigned"),
+            ):
+                PLUGIN._build_and_upload_asset(ROOT)
+
+        build_cache_asset.assert_called_once_with(ROOT, asset, None)
+
 
 class TrustedImplementationTests(unittest.TestCase):
     def test_install_commands_cover_all_release_generators(self) -> None:
