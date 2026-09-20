@@ -85,6 +85,17 @@ workflow builds the assets again.
 
 The pull request and tag workflows build assets in parallel. An asset job gets
 signed staging URLs. It does not get the bucket keys.
+
+In a pull request, the prepare and seal jobs run the plugin from `main`. The
+build jobs run the plugin from the pull request. The prepare job signs all of
+its asset names or none of them. An empty upload map means that the lane is
+sealed, and the build job does not build. If the map has entries but not the
+asset of the build job, the prepare job ran an older plugin. The build job
+then builds the asset. It uploads the asset only if `LEGACY_CACHE_ASSETS` maps
+the asset to a name that the prepare job signed. Add a mapping when you rename
+a cache asset, and remove it after `main` has the new name. A lane that was
+sealed with legacy names is not promoted. The tag workflow builds its assets
+again.
 A trusted control job verifies each digest and copies the object to a sealed
 key. The release job verifies the draft, source commit, source tree, and sealed
 objects. It then uploads:

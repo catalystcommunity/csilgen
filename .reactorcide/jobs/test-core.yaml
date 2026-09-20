@@ -12,6 +12,12 @@ job:
   timeout: 2400
   priority: 10
   working_dir: /job
+  resources:
+    cpu:
+      request: "4"
+      limit: "8"
+    memory:
+      limit: "8Gi"
   depends_on:
     - csilgen-conventional-commits
 environment:
