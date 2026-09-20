@@ -246,6 +246,77 @@ class WorkflowVariablesTests(unittest.TestCase):
 
         build_cache_asset.assert_called_once_with(ROOT, asset, None)
 
+    def _run_cli_build(
+        self, uploads: dict[str, dict[str, str]]
+    ) -> tuple[mock.Mock, mock.Mock]:
+        asset = "cli-x86_64-unknown-linux-gnu.tar.gz"
+        environment = {
+            "CSILGEN_ASSET_ITEM": "x86_64-unknown-linux-gnu",
+            "CSILGEN_ASSET_KIND": "cli",
+            "REACTORCIDE_EVENT_TYPE": "pull_request_updated",
+            "RC_WF_VARS_JSON": json.dumps({"asset_cache_uploads": uploads}),
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            archive = Path(directory) / asset
+            archive.write_bytes(b"archive")
+            with (
+                mock.patch.dict(os.environ, environment, clear=True),
+                mock.patch.object(runner_workflow, "_global_context", None),
+                mock.patch.object(
+                    PLUGIN,
+                    "_build_cache_asset",
+                    return_value=archive,
+                ) as build_cache_asset,
+                mock.patch.object(PLUGIN, "_put_presigned") as put_presigned,
+            ):
+                PLUGIN._build_and_upload_asset(ROOT)
+        return build_cache_asset, put_presigned
+
+    def test_cli_build_uploads_to_the_name_that_base_prepare_signed(self) -> None:
+        legacy = {
+            "asset": "https://cache.example.test/legacy-asset",
+            "sha256": "https://cache.example.test/legacy-digest",
+        }
+        build_cache_asset, put_presigned = self._run_cli_build(
+            {"cli-linux-x86_64.tar.gz": legacy}
+        )
+
+        build_cache_asset.assert_called_once_with(
+            ROOT, "cli-x86_64-unknown-linux-gnu.tar.gz", None
+        )
+        self.assertEqual(
+            [call.args[0] for call in put_presigned.call_args_list],
+            [legacy["asset"], legacy["sha256"]],
+        )
+
+    def test_legacy_names_cover_each_cli_platform_once(self) -> None:
+        self.assertEqual(
+            set(PLUGIN.LEGACY_CACHE_ASSETS),
+            {f"cli-{platform}.tar.gz" for platform in PLUGIN.CLI_PLATFORMS},
+        )
+        legacy_names = set(PLUGIN.LEGACY_CACHE_ASSETS.values())
+        self.assertEqual(len(legacy_names), len(PLUGIN.CLI_PLATFORMS))
+        self.assertFalse(legacy_names & set(PLUGIN.EXPECTED_CACHE_ASSETS))
+
+    def test_build_without_a_signed_upload_is_not_a_cache_reuse(self) -> None:
+        build_cache_asset, put_presigned = self._run_cli_build(
+            {
+                "generators.tar.gz": {
+                    "asset": "https://cache.example.test/asset",
+                    "sha256": "https://cache.example.test/digest",
+                }
+            }
+        )
+
+        build_cache_asset.assert_called_once()
+        put_presigned.assert_not_called()
+
+    def test_sealed_lane_skips_the_build(self) -> None:
+        build_cache_asset, put_presigned = self._run_cli_build({})
+
+        build_cache_asset.assert_not_called()
+        put_presigned.assert_not_called()
+
 
 class TrustedImplementationTests(unittest.TestCase):
     def test_install_commands_cover_all_release_generators(self) -> None:
@@ -324,6 +395,25 @@ class TrustedImplementationTests(unittest.TestCase):
                 )
                 self.assertEqual(job["job"]["image"], expected)
                 self.assertNotIn("image_pull_secrets", job["job"])
+
+    def test_cpu_bound_jobs_ask_for_more_than_the_cluster_default(self) -> None:
+        for name in ("test-interop.yaml", "test-core.yaml"):
+            with self.subTest(name=name):
+                job = yaml.safe_load(
+                    (ROOT / ".reactorcide/jobs" / name).read_text(
+                        encoding="utf-8"
+                    )
+                )
+                resources = job["job"]["resources"]
+                self.assertEqual(set(resources), {"cpu", "memory"})
+                self.assertEqual(set(resources["cpu"]), {"request", "limit"})
+                self.assertEqual(set(resources["memory"]), {"limit"})
+                # The cluster default limit is 2 CPUs, and both jobs used all
+                # of it. Four interop shards and the core job start together,
+                # so a request above 4 CPUs can make a shard unschedulable.
+                self.assertGreater(int(resources["cpu"]["limit"]), 2)
+                self.assertLessEqual(int(resources["cpu"]["request"]), 4)
+                self.assertRegex(resources["memory"]["limit"], r"^[0-9]+Gi$")
 
     def test_pr_head_jobs_do_not_request_root_or_docker(self) -> None:
         job_names = (

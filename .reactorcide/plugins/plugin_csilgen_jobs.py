@@ -98,6 +98,16 @@ CLI_PLATFORMS = (
     "aarch64-apple-darwin",
     "x86_64-pc-windows-gnu",
 )
+# The prepare and seal jobs of a pull request run the plugin from `main`. Until
+# `main` has the target-triple names, they sign and seal only these names. A
+# build job must upload to them, or the pull request that renames the assets
+# cannot pass its own seal job. Remove this map after `main` has the new names.
+LEGACY_CACHE_ASSETS = {
+    "cli-x86_64-unknown-linux-gnu.tar.gz": "cli-linux-x86_64.tar.gz",
+    "cli-aarch64-unknown-linux-gnu.tar.gz": "cli-linux-aarch64.tar.gz",
+    "cli-aarch64-apple-darwin.tar.gz": "cli-darwin-aarch64.tar.gz",
+    "cli-x86_64-pc-windows-gnu.tar.gz": "cli-windows-x86_64.tar.gz",
+}
 GENERATOR_ASSET = "generators.tar.gz"
 TRANSPORT_ASSETS = tuple(f"transport-{language}.tar.gz" for language in TRANSPORTS)
 EXPECTED_CACHE_ASSETS = (
@@ -923,6 +933,20 @@ def _build_and_upload_asset(root: Path) -> None:
     if not isinstance(uploads, dict):
         raise RuntimeError("The asset upload map is missing")
     upload = uploads.get(asset)
+    if upload is None and uploads:
+        # The prepare job signs all of its asset names or none of them. A
+        # map that has entries but not this asset means that the prepare job
+        # ran an older plugin. That is not a sealed lane, so a skipped build
+        # here would let an unbuilt asset pass the pull request.
+        legacy_asset = LEGACY_CACHE_ASSETS.get(asset)
+        upload = None if legacy_asset is None else uploads.get(legacy_asset)
+        if upload is None:
+            _build_cache_asset(root, asset, release_version)
+            log_stdout(
+                f"Built cache asset {asset}; the prepare job has no upload for it"
+            )
+            return
+        log_stdout(f"Upload cache asset {asset} as {legacy_asset}")
     if upload is None:
         log_stdout(f"Reuse sealed cache asset {asset}")
         return
