@@ -89,11 +89,14 @@ RELEASE_TAG = re.compile(
     r"(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?)$"
 )
 RELEASE_MARKER_PREFIX = "<!-- csilgen-release-source:"
+# Platform names are full Rust target triples because installers such as Webi
+# read the libc requirement from the asset name. A name without `-gnu` makes a
+# glibc-linked binary look safe for musl hosts such as Alpine.
 CLI_PLATFORMS = (
-    "linux-x86_64",
-    "linux-aarch64",
-    "darwin-aarch64",
-    "windows-x86_64",
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "aarch64-apple-darwin",
+    "x86_64-pc-windows-gnu",
 )
 GENERATOR_ASSET = "generators.tar.gz"
 TRANSPORT_ASSETS = tuple(f"transport-{language}.tar.gz" for language in TRANSPORTS)
@@ -606,7 +609,7 @@ def _cli_builds() -> Mapping[str, tuple[str, str, tuple[str, ...], str, str]]:
         platform: (image, target, command, binary, archive_name)
         for platform, image, target, command, binary, archive_name in (
         (
-            "linux-x86_64",
+            "x86_64-unknown-linux-gnu",
             zig_image,
             "x86_64-unknown-linux-gnu.2.28",
             ("cargo", "zigbuild"),
@@ -614,7 +617,7 @@ def _cli_builds() -> Mapping[str, tuple[str, str, tuple[str, ...], str, str]]:
             "csilgen",
         ),
         (
-            "linux-aarch64",
+            "aarch64-unknown-linux-gnu",
             zig_image,
             "aarch64-unknown-linux-gnu.2.28",
             ("cargo", "zigbuild"),
@@ -622,7 +625,7 @@ def _cli_builds() -> Mapping[str, tuple[str, str, tuple[str, ...], str, str]]:
             "csilgen",
         ),
         (
-            "darwin-aarch64",
+            "aarch64-apple-darwin",
             zig_image,
             "aarch64-apple-darwin",
             ("cargo", "zigbuild"),
@@ -630,7 +633,7 @@ def _cli_builds() -> Mapping[str, tuple[str, str, tuple[str, ...], str, str]]:
             "csilgen",
         ),
         (
-            "windows-x86_64",
+            "x86_64-pc-windows-gnu",
             zig_image,
             "x86_64-pc-windows-gnu",
             ("cargo", "zigbuild"),
@@ -1541,7 +1544,7 @@ def _publish_tag_release(root: Path) -> None:
             artifacts / _release_asset_name(asset, version),
         )
     _verify_cli_archive_version(
-        artifacts / _release_asset_name("cli-linux-x86_64.tar.gz", version),
+        artifacts / _release_asset_name("cli-x86_64-unknown-linux-gnu.tar.gz", version),
         version,
     )
     _upload_release_artifacts(token, repository, release, artifacts)

@@ -174,20 +174,43 @@ current_release_platform() {
     machine="$(uname -m)"
     case "$system:$machine" in
         Linux:x86_64|Linux:amd64)
-            printf '%s\n' "linux-x86_64"
+            printf '%s\n' "x86_64-unknown-linux-gnu"
             ;;
         Linux:aarch64|Linux:arm64)
-            printf '%s\n' "linux-aarch64"
+            printf '%s\n' "aarch64-unknown-linux-gnu"
             ;;
         Darwin:arm64|Darwin:aarch64)
-            printf '%s\n' "darwin-aarch64"
+            printf '%s\n' "aarch64-apple-darwin"
             ;;
         MINGW*:x86_64|MSYS*:x86_64|CYGWIN*:x86_64)
-            printf '%s\n' "windows-x86_64"
+            printf '%s\n' "x86_64-pc-windows-gnu"
             ;;
         *)
             printf 'No CSILgen release is available for %s on %s.\n' \
                 "$machine" "$system" >&2
+            exit 1
+            ;;
+    esac
+}
+
+# Releases before the target-triple rename used short platform names. The
+# latest release can still be one of them, so install-all must find both.
+legacy_release_platform() {
+    case "$1" in
+        x86_64-unknown-linux-gnu)
+            printf '%s\n' "linux-x86_64"
+            ;;
+        aarch64-unknown-linux-gnu)
+            printf '%s\n' "linux-aarch64"
+            ;;
+        aarch64-apple-darwin)
+            printf '%s\n' "darwin-aarch64"
+            ;;
+        x86_64-pc-windows-gnu)
+            printf '%s\n' "windows-x86_64"
+            ;;
+        *)
+            printf 'The release platform is invalid: %s\n' "$1" >&2
             exit 1
             ;;
     esac
@@ -238,6 +261,7 @@ install_all() {
     local release_tag
     local version
     local cli_asset
+    local legacy_cli_asset
     local generator_asset
     local cli_url
     local generator_url
@@ -251,7 +275,7 @@ install_all() {
     require_command tar
 
     platform="$(current_release_platform)"
-    if [[ "$platform" == "windows-x86_64" ]]; then
+    if [[ "$platform" == "x86_64-pc-windows-gnu" ]]; then
         binary_name="csilgen.exe"
     fi
     cargo_root="$(install_root)"
@@ -273,7 +297,14 @@ install_all() {
     version="${BASH_REMATCH[1]}"
     cli_asset="csilgen-$version-$platform.tar.gz"
     generator_asset="csilgen-generators-$version.tar.gz"
-    cli_url="$(release_asset_url "$release_file" "$cli_asset")"
+    if ! cli_url="$(release_asset_url "$release_file" "$cli_asset" 2>/dev/null)"; then
+        legacy_cli_asset="csilgen-$version-$(legacy_release_platform "$platform").tar.gz"
+        if ! cli_url="$(release_asset_url "$release_file" "$legacy_cli_asset" 2>/dev/null)"; then
+            printf 'The release must contain one %s asset\n' "$cli_asset" >&2
+            exit 1
+        fi
+        cli_asset="$legacy_cli_asset"
+    fi
     generator_url="$(release_asset_url "$release_file" "$generator_asset")"
 
     curl --fail --location --silent --show-error \

@@ -49,10 +49,10 @@ jobs:
     depends_on:
       - asset-prepare
     for_each:
-      - linux-x86_64
-      - linux-aarch64
-      - darwin-aarch64
-      - windows-x86_64
+      - x86_64-unknown-linux-gnu
+      - aarch64-unknown-linux-gnu
+      - aarch64-apple-darwin
+      - x86_64-pc-windows-gnu
     item_var: CSILGEN_ASSET_ITEM
     environment:
       CSILGEN_ASSET_KIND: cli

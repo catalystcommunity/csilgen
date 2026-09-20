@@ -216,7 +216,7 @@ class WorkflowVariablesTests(unittest.TestCase):
         )
 
     def test_pr_cli_build_accepts_base_prepare_without_version(self) -> None:
-        asset = "cli-linux-x86_64.tar.gz"
+        asset = "cli-x86_64-unknown-linux-gnu.tar.gz"
         uploads = {
             asset: {
                 "asset": "https://cache.example.test/asset",
@@ -224,7 +224,7 @@ class WorkflowVariablesTests(unittest.TestCase):
             }
         }
         environment = {
-            "CSILGEN_ASSET_ITEM": "linux-x86_64",
+            "CSILGEN_ASSET_ITEM": "x86_64-unknown-linux-gnu",
             "CSILGEN_ASSET_KIND": "cli",
             "REACTORCIDE_EVENT_TYPE": "pull_request_updated",
             "RC_WF_VARS_JSON": json.dumps({"asset_cache_uploads": uploads}),
@@ -260,6 +260,43 @@ class TrustedImplementationTests(unittest.TestCase):
         self.assertEqual(packages, PLUGIN.GENERATOR_PACKAGES)
         self.assertIn("build-install-all)", tools)
         self.assertIn("install-all)", tools)
+
+    def test_cli_platforms_are_target_triples_that_name_the_libc(self) -> None:
+        for platform_name in PLUGIN.CLI_PLATFORMS:
+            with self.subTest(platform=platform_name):
+                self.assertRegex(
+                    platform_name,
+                    r"^(x86_64|aarch64)-(unknown-linux-gnu|apple-darwin|pc-windows-gnu)$",
+                )
+                self.assertIn(platform_name, PLUGIN._cli_builds())
+                self.assertEqual(
+                    PLUGIN._release_asset_name(
+                        f"cli-{platform_name}.tar.gz", "1.2.3"
+                    ),
+                    f"csilgen-1.2.3-{platform_name}.tar.gz",
+                )
+
+    def test_workflows_and_installer_use_the_release_platforms(self) -> None:
+        for name in ("pr.yaml", "release.yaml"):
+            with self.subTest(workflow=name):
+                workflow = yaml.safe_load(
+                    (ROOT / ".reactorcide/workflows" / name).read_text(
+                        encoding="utf-8"
+                    )
+                )
+                self.assertEqual(
+                    tuple(workflow["jobs"]["asset-cli"]["for_each"]),
+                    PLUGIN.CLI_PLATFORMS,
+                )
+        tools = (ROOT / "tools.sh").read_text(encoding="utf-8")
+        match = re.search(
+            r"current_release_platform\(\) \{\n(?P<body>.*?)\n\}\n",
+            tools,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(match)
+        installed = re.findall(r"printf '%s\\n' \"([^\"]+)\"", match.group("body"))
+        self.assertEqual(tuple(installed), PLUGIN.CLI_PLATFORMS)
 
     def test_toolchain_image_does_not_copy_tested_source(self) -> None:
         dockerfile = (ROOT / "tools/ci-image/Dockerfile").read_text(
@@ -634,7 +671,7 @@ class ReleaseTests(unittest.TestCase):
                 "#!/bin/sh\nprintf 'csilgen 1.2.3\\n'\n",
                 encoding="utf-8",
             )
-            archive = root / "csilgen-1.2.3-linux-x86_64.tar.gz"
+            archive = root / "csilgen-1.2.3-x86_64-unknown-linux-gnu.tar.gz"
             PLUGIN._tar_files(archive, ((binary, "csilgen"),))
 
             PLUGIN._verify_cli_archive_version(archive, "1.2.3")
