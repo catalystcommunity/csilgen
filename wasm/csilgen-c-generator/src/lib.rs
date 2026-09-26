@@ -4600,6 +4600,22 @@ static inline void *csilc_arena_alloc(CsilCodecArena *a, size_t size) {
     return p;
 }
 
+/* The most elements a decoded array or map reserves before it reads them. The
+ * declared length is checked against the remaining input, but one input byte can
+ * become a much larger value, so reserving the full declared length lets a small
+ * frame reserve a large multiple of its size at every nesting level. Past this
+ * bound, the storage doubles only as elements are actually read. */
+#define CSILC_PREALLOC_LIMIT 1024u
+
+/* A bump arena cannot resize in place, so growth copies into a fresh allocation.
+ * The abandoned block is freed with the arena; doubling keeps that waste below
+ * the final size. */
+static inline void *csilc_arena_grow(CsilCodecArena *a, const void *old, size_t used, size_t size) {
+    void *p = csilc_arena_alloc(a, size);
+    if (p && used) memcpy(p, old, used);
+    return p;
+}
+
 /* Free the whole decoded value tree (and the C arrays mapped out of it) at once. */
 static inline void csil_codec_arena_free(CsilCodecArena *a) {
     if (!a) return;
@@ -4789,12 +4805,19 @@ static inline int csilc_decode_value(CsilCodecArena *a, const uint8_t *b, size_t
     case 4: {
         if (arg > len - head || arg > SIZE_MAX / sizeof(csilc_value)) return -1;
         csilc_value *items = NULL;
-        if (arg) {
-            items = (csilc_value *)csilc_arena_alloc(a, (size_t)arg * sizeof(*items));
+        size_t cap = arg < CSILC_PREALLOC_LIMIT ? (size_t)arg : CSILC_PREALLOC_LIMIT;
+        if (cap) {
+            items = (csilc_value *)csilc_arena_alloc(a, cap * sizeof(*items));
             if (!items) return -1;
         }
         size_t off = head;
         for (uint64_t i = 0; i < arg; i++) {
+            if (i == cap) {
+                size_t grown = cap * 2 < (size_t)arg ? cap * 2 : (size_t)arg;
+                items = (csilc_value *)csilc_arena_grow(a, items, cap * sizeof(*items), grown * sizeof(*items));
+                if (!items) return -1;
+                cap = grown;
+            }
             size_t m = 0;
             if (csilc_decode_value(a, b + off, len - off, &items[i], &m, depth + 1)) return -1;
             off += m;
@@ -4808,12 +4831,19 @@ static inline int csilc_decode_value(CsilCodecArena *a, const uint8_t *b, size_t
     case 5: {
         if (arg > len - head || arg > SIZE_MAX / sizeof(csilc_pair)) return -1;
         csilc_pair *pairs = NULL;
-        if (arg) {
-            pairs = (csilc_pair *)csilc_arena_alloc(a, (size_t)arg * sizeof(*pairs));
+        size_t cap = arg < CSILC_PREALLOC_LIMIT ? (size_t)arg : CSILC_PREALLOC_LIMIT;
+        if (cap) {
+            pairs = (csilc_pair *)csilc_arena_alloc(a, cap * sizeof(*pairs));
             if (!pairs) return -1;
         }
         size_t off = head;
         for (uint64_t i = 0; i < arg; i++) {
+            if (i == cap) {
+                size_t grown = cap * 2 < (size_t)arg ? cap * 2 : (size_t)arg;
+                pairs = (csilc_pair *)csilc_arena_grow(a, pairs, cap * sizeof(*pairs), grown * sizeof(*pairs));
+                if (!pairs) return -1;
+                cap = grown;
+            }
             csilc_value *k = (csilc_value *)csilc_arena_alloc(a, sizeof(*k));
             csilc_value *v = (csilc_value *)csilc_arena_alloc(a, sizeof(*v));
             if (!k || !v) return -1;

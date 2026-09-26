@@ -3881,6 +3881,12 @@ fn half_to_f64(h: u16) f64 {
     return @as(f64, @as(f32, @bitCast(bits)));
 }
 
+// The most elements a decoded array or map reserves before it reads them. The
+// declared length is checked against the remaining input, but one input byte can
+// become a much larger value, so reserving the full declared length lets a small
+// frame reserve a large multiple of its size at every nesting level.
+const prealloc_limit: usize = 1024;
+
 fn decode_value(alloc: std.mem.Allocator, b: []const u8, depth: usize) CodecError!Decoded {
     if (depth > 64) return error.Malformed;
     if (b.len == 0) return error.UnexpectedEof;
@@ -3907,20 +3913,20 @@ fn decode_value(alloc: std.mem.Allocator, b: []const u8, depth: usize) CodecErro
         4 => {
             if (arg > b.len - n) return error.UnexpectedEof;
             const count: usize = @intCast(arg);
-            const items = try alloc.alloc(Value, count);
+            var items = try std.ArrayListUnmanaged(Value).initCapacity(alloc, @min(count, prealloc_limit));
             var off = n;
             var i: usize = 0;
             while (i < count) : (i += 1) {
                 const d = try decode_value(alloc, b[off..], depth + 1);
-                items[i] = d.value;
+                try items.append(alloc, d.value);
                 off += d.consumed;
             }
-            return .{ .value = .{ .array = items }, .consumed = off };
+            return .{ .value = .{ .array = try items.toOwnedSlice(alloc) }, .consumed = off };
         },
         5 => {
             if (arg > b.len - n) return error.UnexpectedEof;
             const count: usize = @intCast(arg);
-            const pairs = try alloc.alloc(Pair, count);
+            var pairs = try std.ArrayListUnmanaged(Pair).initCapacity(alloc, @min(count, prealloc_limit));
             var off = n;
             var i: usize = 0;
             while (i < count) : (i += 1) {
@@ -3928,9 +3934,9 @@ fn decode_value(alloc: std.mem.Allocator, b: []const u8, depth: usize) CodecErro
                 off += k.consumed;
                 const v = try decode_value(alloc, b[off..], depth + 1);
                 off += v.consumed;
-                pairs[i] = .{ .key = k.value, .val = v.value };
+                try pairs.append(alloc, .{ .key = k.value, .val = v.value });
             }
-            return .{ .value = .{ .map = pairs }, .consumed = off };
+            return .{ .value = .{ .map = try pairs.toOwnedSlice(alloc) }, .consumed = off };
         },
         6 => {
             const inner = try decode_value(alloc, b[n..], depth + 1);

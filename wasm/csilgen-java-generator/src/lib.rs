@@ -3593,6 +3593,12 @@ const CODEC_RUNTIME_JAVA: &str = r#"    /** A minimal canonical-CBOR value tree:
         }
     }
 
+    /** Bounds the elements a decoded array or map reserves before it reads
+     * them. The declared length is checked against the remaining input, but one input
+     * byte can become a much larger value, so reserving the full declared length lets a
+     * small frame reserve a large multiple of its size at every nesting level. */
+    private static final int PREALLOC_LIMIT = 1024;
+
     private static CborValue dec(byte[] b, int[] pos, int depth) {
         if (depth > 64) {
             throw new CsilCborException("csil cbor: nesting limit exceeded");
@@ -3661,7 +3667,7 @@ const CODEC_RUNTIME_JAVA: &str = r#"    /** A minimal canonical-CBOR value tree:
                     throw new CsilCborException("csil cbor: array length exceeds remaining input");
                 }
                 int n = (int) arg;
-                java.util.List<CborValue> items = new java.util.ArrayList<>(n);
+                java.util.List<CborValue> items = new java.util.ArrayList<>(Math.min(n, PREALLOC_LIMIT));
                 for (int i = 0; i < n; i++) {
                     items.add(dec(b, pos, depth + 1));
                 }
@@ -3672,7 +3678,7 @@ const CODEC_RUNTIME_JAVA: &str = r#"    /** A minimal canonical-CBOR value tree:
                     throw new CsilCborException("csil cbor: map length exceeds remaining input");
                 }
                 int n = (int) arg;
-                java.util.List<CborEntry> entries = new java.util.ArrayList<>(n);
+                java.util.List<CborEntry> entries = new java.util.ArrayList<>(Math.min(n, PREALLOC_LIMIT));
                 for (int i = 0; i < n; i++) {
                     CborValue k = dec(b, pos, depth + 1);
                     CborValue val = dec(b, pos, depth + 1);
@@ -3984,6 +3990,12 @@ mod tests {
             4
         );
         assert!(CODEC_RUNTIME_JAVA.contains("array length exceeds remaining input"));
+        assert_eq!(
+            CODEC_RUNTIME_JAVA
+                .matches("new java.util.ArrayList<>(Math.min(n, PREALLOC_LIMIT))")
+                .count(),
+            2
+        );
         assert!(CODEC_RUNTIME_JAVA.contains("map length exceeds remaining input"));
         assert!(CODEC_RUNTIME_JAVA.contains("if (depth > 64)"));
         assert!(CODEC_RUNTIME_JAVA.contains("CodingErrorAction.REPORT"));

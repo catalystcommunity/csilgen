@@ -138,6 +138,12 @@ func decodeValue(b []byte) (cborValue, int, error) {
 	return decodeValueDepth(b, 0)
 }
 
+// The most elements a decoded array or map reserves before it reads them. The
+// declared length is checked against the remaining input, but one input byte can
+// become a much larger value, so reserving the full declared length lets a small
+// frame reserve a large multiple of its size at every nesting level.
+const preallocLimit = 1024
+
 func decodeValueDepth(b []byte, depth int) (cborValue, int, error) {
 	if depth > 64 {
 		return nil, 0, fmt.Errorf("CBOR decode error: nesting limit exceeded")
@@ -181,7 +187,7 @@ func decodeValueDepth(b []byte, depth int) (cborValue, int, error) {
 		if arg > uint64(len(b)-n) {
 			return nil, 0, fmt.Errorf("CBOR decode error: array length exceeds remaining input")
 		}
-		items := make(cArray, 0, arg)
+		items := make(cArray, 0, min(arg, preallocLimit))
 		off := n
 		for i := uint64(0); i < arg; i++ {
 			item, m, err := decodeValueDepth(b[off:], depth+1)
@@ -196,7 +202,7 @@ func decodeValueDepth(b []byte, depth int) (cborValue, int, error) {
 		if arg > uint64(len(b)-n) {
 			return nil, 0, fmt.Errorf("CBOR decode error: map length exceeds remaining input")
 		}
-		entries := make(cMap, 0, arg)
+		entries := make(cMap, 0, min(arg, preallocLimit))
 		off := n
 		for i := uint64(0); i < arg; i++ {
 			k, m, err := decodeValueDepth(b[off:], depth+1)

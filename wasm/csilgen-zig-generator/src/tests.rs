@@ -13,6 +13,14 @@ fn decoder_checks_collection_lengths_before_allocation() {
     );
     assert!(CSIL_CODEC_RUNTIME_ZIG.contains("if (depth > 64) return error.Malformed;"));
     assert!(CSIL_CODEC_RUNTIME_ZIG.contains("std.unicode.utf8ValidateSlice"));
+    assert_eq!(
+        CSIL_CODEC_RUNTIME_ZIG
+            .matches(".initCapacity(alloc, @min(count, prealloc_limit))")
+            .count(),
+        2
+    );
+    assert!(!CSIL_CODEC_RUNTIME_ZIG.contains("alloc.alloc(Value, count)"));
+    assert!(!CSIL_CODEC_RUNTIME_ZIG.contains("alloc.alloc(Pair, count)"));
 }
 use csilgen_common::{
     CsilGroupKey, CsilPosition, CsilRule, CsilServiceOperation, CsilSpecSerialized,
@@ -1332,6 +1340,41 @@ pub fn main() !void {
     const empty_bytes = try codec.encode_GetQueuesRequest(a, &empty_req);
     var empty_back: types.GetQueuesRequest = undefined;
     try codec.decode_GetQueuesRequest(a, empty_bytes, &empty_back);
+
+    // a list longer than the decoder's reservation clamp must grow past it and keep
+    // every element in order
+    const big = 3000;
+    const big_tags = try a.alloc([]const u8, big);
+    for (big_tags, 0..) |*t, i| t.* = try std.fmt.allocPrint(a, "k{d}", .{i});
+    var task_big = task;
+    task_big.tags = big_tags;
+    const reqv_big = types.SubmitTaskRequest{ .task = task_big, .queue = "default", .related = related };
+    const bytes_big = try codec.encode_SubmitTaskRequest(a, &reqv_big);
+    var back_big: types.SubmitTaskRequest = undefined;
+    try codec.decode_SubmitTaskRequest(a, bytes_big, &back_big);
+    std.debug.assert(back_big.task.tags.len == big);
+    for (back_big.task.tags, 0..) |t, i| std.debug.assert(std.mem.eql(u8, t, big_tags[i]));
+
+    // a hostile 1 MiB frame of 65 nested arrays, each declaring every remaining byte
+    // as its element count, must hit the nesting limit inside a 4 MiB budget rather
+    // than exhaust it by reserving from the declared counts
+    const frame_len: usize = 1 << 20;
+    const frame = try a.alloc(u8, frame_len);
+    @memset(frame, 0x80);
+    var level: usize = 0;
+    while (level < 65) : (level += 1) {
+        const remaining: u32 = @intCast(frame_len - (level + 1) * 5);
+        frame[level * 5] = 0x9a;
+        std.mem.writeInt(u32, frame[level * 5 + 1 ..][0..4], remaining, .big);
+    }
+    const budget = try a.alloc(u8, 4 * frame_len);
+    var fba = std.heap.FixedBufferAllocator.init(budget);
+    var hostile: types.SubmitTaskRequest = undefined;
+    if (codec.decode_SubmitTaskRequest(fba.allocator(), frame, &hostile)) |_| {
+        return error.HostileFrameDecoded;
+    } else |err| {
+        if (err != error.Malformed) return err;
+    }
 
     const stdout = std.io.getStdOut().writer();
     try stdout.print("ok\n", .{});

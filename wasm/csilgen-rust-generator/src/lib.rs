@@ -801,6 +801,13 @@ fn cbor_read_arg(b: &[u8], pos: &mut usize, low: u8) -> Result<u64, CsilCborErro
     Ok(v)
 }
 
+/// The most elements a decoded array or map reserves before it reads them. The
+/// declared length is checked against the remaining input, but one input byte can
+/// become a much larger value, so reserving the full declared length lets a small
+/// frame reserve a large multiple of its size at every nesting level. Past this
+/// bound, the vector grows only as elements are actually read.
+const CSIL_CBOR_PREALLOC_LIMIT: usize = 1024;
+
 fn cbor_dec(b: &[u8], pos: &mut usize, depth: usize) -> Result<CsilCborValue, CsilCborError> {
     if depth > 64 {
         return Err(CsilCborError(
@@ -884,7 +891,7 @@ fn cbor_dec(b: &[u8], pos: &mut usize, depth: usize) -> Result<CsilCborValue, Cs
                 ));
             }
             let n = arg as usize;
-            let mut items = Vec::with_capacity(n);
+            let mut items = Vec::with_capacity(n.min(CSIL_CBOR_PREALLOC_LIMIT));
             for _ in 0..n {
                 items.push(cbor_dec(b, pos, depth + 1)?);
             }
@@ -897,7 +904,7 @@ fn cbor_dec(b: &[u8], pos: &mut usize, depth: usize) -> Result<CsilCborValue, Cs
                 ));
             }
             let n = arg as usize;
-            let mut entries = Vec::with_capacity(n);
+            let mut entries = Vec::with_capacity(n.min(CSIL_CBOR_PREALLOC_LIMIT));
             for _ in 0..n {
                 let k = cbor_dec(b, pos, depth + 1)?;
                 let val = cbor_dec(b, pos, depth + 1)?;
@@ -6103,6 +6110,12 @@ mod tests {
                 .count(),
             4
         );
+        assert_eq!(
+            CODEC_RUNTIME_RUST
+                .matches("Vec::with_capacity(n.min(CSIL_CBOR_PREALLOC_LIMIT))")
+                .count(),
+            2
+        );
         assert!(CODEC_RUNTIME_RUST.contains("array length exceeds remaining input"));
         assert!(CODEC_RUNTIME_RUST.contains("map length exceeds remaining input"));
         assert!(CODEC_RUNTIME_RUST.contains("if depth > 64"));
@@ -10360,6 +10373,121 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// Compile the generated codec with a counting global allocator and decode a
+    /// hostile 1 MiB frame: 65 nested arrays that each declare every remaining byte
+    /// as an element count. Each declared count passes the remaining-input check, so
+    /// before the reservation clamp each level reserved about 32 MiB before it read
+    /// one element. The peak must stay a small multiple of the frame size. Skips
+    /// cleanly when no cargo toolchain is on PATH.
+    #[test]
+    fn hostile_nested_frame_reservation_is_clamped_through_cargo() {
+        let probe = std::process::Command::new("cargo")
+            .arg("--version")
+            .output();
+        if probe.map(|o| !o.status.success()).unwrap_or(true) {
+            eprintln!("skipping: no cargo toolchain on PATH");
+            return;
+        }
+
+        let mut input = corndogs_client_input();
+        input.config.options.insert(
+            "module_root_filename".to_string(),
+            serde_json::Value::String("lib.rs".to_string()),
+        );
+        let files = RustCodeGenerator::new(&input)
+            .generate()
+            .expect("generation ok");
+
+        let dir =
+            std::env::temp_dir().join(format!("csilgen-rust-prealloc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let src = dir.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        for file in &files {
+            std::fs::write(src.join(&file.path), &file.content).unwrap();
+        }
+        std::fs::write(
+            dir.join("Cargo.toml"),
+            "[package]\nname = \"csilroundtrip\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\n[workspace]\n\n[dependencies]\n",
+        )
+        .unwrap();
+        std::fs::write(src.join("main.rs"), RUST_PREALLOC_DRIVER).unwrap();
+
+        let run = std::process::Command::new("cargo")
+            .arg("run")
+            .arg("--quiet")
+            .current_dir(&dir)
+            .env("CARGO_TARGET_DIR", dir.join("target"))
+            .env("CARGO_NET_OFFLINE", "true")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&run.stdout);
+        let stderr = String::from_utf8_lossy(&run.stderr);
+        assert!(
+            run.status.success(),
+            "cargo run failed:\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        assert_eq!(
+            stdout.trim(),
+            "ok",
+            "unexpected output:\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    const RUST_PREALLOC_DRIVER: &str = r#"use std::alloc::{GlobalAlloc, Layout, System};
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+use csilroundtrip::*;
+
+struct Counting;
+
+static LIVE: AtomicUsize = AtomicUsize::new(0);
+static PEAK: AtomicUsize = AtomicUsize::new(0);
+
+unsafe impl GlobalAlloc for Counting {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        let live = LIVE.fetch_add(layout.size(), Ordering::SeqCst) + layout.size();
+        PEAK.fetch_max(live, Ordering::SeqCst);
+        System.alloc(layout)
+    }
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        LIVE.fetch_sub(layout.size(), Ordering::SeqCst);
+        System.dealloc(ptr, layout)
+    }
+}
+
+#[global_allocator]
+static GLOBAL: Counting = Counting;
+
+fn main() {
+    const FRAME: usize = 1 << 20;
+    const LEVELS: usize = 65;
+    let mut frame = Vec::with_capacity(FRAME);
+    for level in 0..LEVELS {
+        let remaining = (FRAME - (level + 1) * 5) as u32;
+        frame.push(0x9a);
+        frame.extend_from_slice(&remaining.to_be_bytes());
+    }
+    frame.resize(FRAME, 0x80);
+
+    let before = LIVE.load(Ordering::SeqCst);
+    PEAK.store(before, Ordering::SeqCst);
+    let result = decode_task(&frame);
+    let reserved = PEAK.load(Ordering::SeqCst) - before;
+
+    if result.is_ok() {
+        eprintln!("FAIL: hostile frame decoded");
+        std::process::exit(1);
+    }
+    if reserved > 4 * FRAME {
+        eprintln!("FAIL: decoding a {FRAME}-byte frame reserved {reserved} bytes");
+        std::process::exit(1);
+    }
+    println!("ok");
+}
+"#;
 
     /// Compile the mixed-kind literal enum (`Order.status: "pending" / "shipped" /
     /// 0 / 1`) and, through a real `cargo run`, (a) prove it compiles cleanly, (b)

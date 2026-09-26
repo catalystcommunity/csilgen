@@ -122,6 +122,12 @@ final class Cbor {
         final byte[] b;
         int pos;
 
+        // The most elements a decoded array or map reserves before it reads them. The
+        // declared length is checked against the remaining input, but one input byte can
+        // become a much larger value, so reserving the full declared length lets a small
+        // frame reserve a large multiple of its size at every nesting level.
+        private static final int PREALLOC_LIMIT = 1024;
+
         Decoder(byte[] b) {
             this.b = b;
         }
@@ -174,7 +180,7 @@ final class Cbor {
                 }
                 case 4: {
                     int count = lengthGuard(arg, "array");
-                    List<CborValue> items = new ArrayList<>(count);
+                    List<CborValue> items = new ArrayList<>(Math.min(count, PREALLOC_LIMIT));
                     for (int i = 0; i < count; i++) {
                         items.add(value(depth + 1));
                     }
@@ -182,7 +188,7 @@ final class Cbor {
                 }
                 case 5: {
                     int count = lengthGuard(arg, "map");
-                    List<CEntry> entries = new ArrayList<>(count);
+                    List<CEntry> entries = new ArrayList<>(Math.min(count, PREALLOC_LIMIT));
                     for (int i = 0; i < count; i++) {
                         CborValue k = value(depth + 1);
                         CborValue val = value(depth + 1);
