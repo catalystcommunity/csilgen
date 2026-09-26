@@ -3576,6 +3576,12 @@ func cborReadArg(b []byte, pos *int, low byte) (uint64, error) {
 	}
 }
 
+// csilCborPreallocLimit bounds the elements a decoded array or map reserves before
+// it reads them. The declared length is checked against the remaining input, but one
+// input byte can become a much larger value, so reserving the full declared length
+// lets a small frame reserve a large multiple of its size at every nesting level.
+const csilCborPreallocLimit = 1024
+
 func cborDec(b []byte, pos *int, depth int) (cborValue, error) {
 	if depth > 64 {
 		return nil, fmt.Errorf("csil cbor: nesting limit exceeded")
@@ -3650,7 +3656,11 @@ func cborDec(b []byte, pos *int, depth int) (cborValue, error) {
 			return nil, fmt.Errorf("csil cbor: array length exceeds remaining input")
 		}
 		n := int(arg)
-		items := make(cborArray, 0, n)
+		reserve := n
+		if reserve > csilCborPreallocLimit {
+			reserve = csilCborPreallocLimit
+		}
+		items := make(cborArray, 0, reserve)
 		for i := 0; i < n; i++ {
 			item, err := cborDec(b, pos, depth+1)
 			if err != nil {
@@ -3664,7 +3674,11 @@ func cborDec(b []byte, pos *int, depth int) (cborValue, error) {
 			return nil, fmt.Errorf("csil cbor: map length exceeds remaining input")
 		}
 		n := int(arg)
-		entries := make(cborMap, 0, n)
+		reserve := n
+		if reserve > csilCborPreallocLimit {
+			reserve = csilCborPreallocLimit
+		}
+		entries := make(cborMap, 0, reserve)
 		for i := 0; i < n; i++ {
 			k, err := cborDec(b, pos, depth+1)
 			if err != nil {
@@ -6057,6 +6071,14 @@ mod tests {
             4
         );
         assert!(CODEC_RUNTIME_GO.contains("array length exceeds remaining input"));
+        assert_eq!(
+            CODEC_RUNTIME_GO
+                .matches("reserve = csilCborPreallocLimit")
+                .count(),
+            2
+        );
+        assert!(!CODEC_RUNTIME_GO.contains("make(cborArray, 0, n)"));
+        assert!(!CODEC_RUNTIME_GO.contains("make(cborMap, 0, n)"));
         assert!(CODEC_RUNTIME_GO.contains("map length exceeds remaining input"));
         assert!(CODEC_RUNTIME_GO.contains("if depth > 64"));
         assert!(CODEC_RUNTIME_GO.contains("if !utf8.Valid("));

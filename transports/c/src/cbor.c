@@ -455,6 +455,24 @@ static bool valid_utf8(const uint8_t *s, size_t n) {
     return true;
 }
 
+/* The most elements a decoded array or map reserves before it reads them. The
+ * declared length is checked against the remaining input, but one input byte can
+ * become a much larger value, so reserving the full declared length lets a small
+ * frame reserve a large multiple of its size at every nesting level. Past this
+ * bound, the storage doubles only as elements are actually read. */
+#define CSIL_PREALLOC_LIMIT 1024u
+
+/* A bump arena cannot resize in place, so growth copies into a fresh allocation.
+ * The abandoned block is freed with the arena; doubling keeps that waste below
+ * the final size. */
+static void *arena_grow(csil_arena *a, const void *old, size_t used, size_t size) {
+    void *p = csil_arena_alloc(a, size);
+    if (p && used) {
+        memcpy(p, old, used);
+    }
+    return p;
+}
+
 static csil_err decode_value(csil_arena *a, const uint8_t *b, size_t len,
                              csil_cbor_value *out, size_t *consumed, size_t depth) {
     if (depth > 64) {
@@ -512,14 +530,23 @@ static csil_err decode_value(csil_arena *a, const uint8_t *b, size_t len,
             return CSIL_ERR_TRUNCATED;
         }
         csil_cbor_value *items = NULL;
-        if (arg) {
-            items = csil_arena_alloc(a, (size_t)arg * sizeof(*items));
+        size_t cap = arg < CSIL_PREALLOC_LIMIT ? (size_t)arg : CSIL_PREALLOC_LIMIT;
+        if (cap) {
+            items = csil_arena_alloc(a, cap * sizeof(*items));
             if (!items) {
                 return CSIL_ERR_OOM;
             }
         }
         size_t off = head;
         for (uint64_t i = 0; i < arg; i++) {
+            if (i == cap) {
+                size_t grown = cap * 2 < (size_t)arg ? cap * 2 : (size_t)arg;
+                items = arena_grow(a, items, cap * sizeof(*items), grown * sizeof(*items));
+                if (!items) {
+                    return CSIL_ERR_OOM;
+                }
+                cap = grown;
+            }
             size_t m = 0;
             e = decode_value(a, b + off, len - off, &items[i], &m, depth + 1);
             if (e) {
@@ -538,14 +565,23 @@ static csil_err decode_value(csil_arena *a, const uint8_t *b, size_t len,
             return CSIL_ERR_TRUNCATED;
         }
         csil_cbor_pair *pairs = NULL;
-        if (arg) {
-            pairs = csil_arena_alloc(a, (size_t)arg * sizeof(*pairs));
+        size_t cap = arg < CSIL_PREALLOC_LIMIT ? (size_t)arg : CSIL_PREALLOC_LIMIT;
+        if (cap) {
+            pairs = csil_arena_alloc(a, cap * sizeof(*pairs));
             if (!pairs) {
                 return CSIL_ERR_OOM;
             }
         }
         size_t off = head;
         for (uint64_t i = 0; i < arg; i++) {
+            if (i == cap) {
+                size_t grown = cap * 2 < (size_t)arg ? cap * 2 : (size_t)arg;
+                pairs = arena_grow(a, pairs, cap * sizeof(*pairs), grown * sizeof(*pairs));
+                if (!pairs) {
+                    return CSIL_ERR_OOM;
+                }
+                cap = grown;
+            }
             csil_cbor_value *k = csil_arena_alloc(a, sizeof(*k));
             csil_cbor_value *v = csil_arena_alloc(a, sizeof(*v));
             if (!k || !v) {

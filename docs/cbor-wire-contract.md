@@ -253,6 +253,29 @@ verbatim" above) is that this validation is emitted **once, in generated code,
 at the boundary**, rather than relied on ambiently from a runtime
 reflection/derive library that may or may not enforce it.
 
+### Decoder resource limits
+
+A decoder reads input from a network peer. The input can be hostile. Every
+generated decoder and every transport decoder MUST obey these limits:
+
+- **Declared length against remaining input.** Before you convert or allocate
+  for a declared array, map, byte-string, or text-string length, compare the
+  length with the bytes that remain. If the length is larger, return an error.
+  Each item uses a minimum of one byte, so this bound is exact.
+- **Reservation clamp.** Do not reserve collection storage for more than
+  **1024** elements before you read them. One input byte can become a much
+  larger in-memory value. If a decoder reserves the full declared length, a
+  small frame can reserve a large multiple of its size at each nesting level.
+  After 1024 elements, grow the storage only as you read elements. A bump arena
+  cannot resize in place, so copy into a larger block and double its size.
+- **Nesting depth.** Return an error for input that has more than 64 nested
+  values.
+- **Text.** Return an error for a text string that is not valid UTF-8.
+
+A frame that contains N elements still decodes to N in-memory values. The
+carrier's maximum frame size is the limit for that cost (see
+`csil-transport-conventions.md`, section 5).
+
 ## RPC call naming (generated clients)
 
 The `*-client` targets emit one method per unary operation that delegates to a

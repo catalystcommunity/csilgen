@@ -969,6 +969,67 @@ int main(void) {
     free(mb);
     csil_codec_arena_free(mowner);
 
+    /* collections longer than the decoder's reservation clamp must grow past it
+     * and keep every element in order */
+    enum { BIG = 3000 };
+    static char big_names[BIG][16];
+    static char *big_tags[BIG];
+    static int64_t big_vals[BIG];
+    for (int i = 0; i < BIG; i++) {
+        snprintf(big_names[i], sizeof big_names[i], "k%d", i);
+        big_tags[i] = big_names[i];
+        big_vals[i] = i;
+    }
+    SubmitTaskRequest rbig = req;
+    rbig.task.tags = big_tags;
+    rbig.task.tags_count = BIG;
+    rbig.task.labels_keys = big_tags;
+    rbig.task.labels_values = big_vals;
+    rbig.task.labels_count = BIG;
+    uint8_t *bb = NULL;
+    size_t bn = 0;
+    assert(csil_encode_SubmitTaskRequest(&rbig, &bb, &bn) == 0);
+    SubmitTaskRequest bback;
+    CsilCodecArena *bowner = NULL;
+    assert(csil_decode_SubmitTaskRequest(bb, bn, &bback, &bowner) == 0);
+    assert(bback.task.tags_count == BIG && bback.task.labels_count == BIG);
+    for (int i = 0; i < BIG; i++) {
+        assert(strcmp(bback.task.tags[i], big_names[i]) == 0);
+        assert(strcmp(bback.task.labels_keys[i], big_names[i]) == 0);
+        assert(bback.task.labels_values[i] == i);
+    }
+    free(bb);
+    csil_codec_arena_free(bowner);
+
+    /* a hostile 1 MiB frame of 65 nested arrays, each declaring every remaining
+     * byte as its element count, must fail without the arena reserving a large
+     * multiple of the frame */
+    size_t frame_len = (size_t)1 << 20;
+    uint8_t *frame = (uint8_t *)malloc(frame_len);
+    assert(frame);
+    memset(frame, 0x80, frame_len);
+    for (size_t level = 0; level < 65; level++) {
+        uint32_t remaining = (uint32_t)(frame_len - (level + 1) * 5);
+        uint8_t *h = frame + level * 5;
+        h[0] = 0x9a;
+        h[1] = (uint8_t)(remaining >> 24);
+        h[2] = (uint8_t)(remaining >> 16);
+        h[3] = (uint8_t)(remaining >> 8);
+        h[4] = (uint8_t)remaining;
+    }
+    CsilCodecArena *harena = csilc_arena_new();
+    csilc_value hv;
+    size_t hm = 0;
+    assert(csilc_decode_value(harena, frame, frame_len, &hv, &hm, 0) != 0);
+    size_t reserved = 0;
+    for (const csilc_arena_block *blk = harena->head; blk; blk = blk->next) reserved += blk->cap;
+    if (reserved > 4 * frame_len) {
+        fprintf(stderr, "hostile frame reserved %zu bytes\n", reserved);
+        return 1;
+    }
+    csil_codec_arena_free(harena);
+    free(frame);
+
     printf("ok\n");
     return 0;
 }
@@ -2518,4 +2579,14 @@ fn decoder_checks_collection_lengths_before_allocation() {
     );
     assert!(CODEC_RUNTIME_C.contains("if (depth > 64) return -1;"));
     assert!(CODEC_RUNTIME_C.contains("csilc_valid_utf8"));
+    assert_eq!(
+        CODEC_RUNTIME_C
+            .matches(
+                "size_t cap = arg < CSILC_PREALLOC_LIMIT ? (size_t)arg : CSILC_PREALLOC_LIMIT;"
+            )
+            .count(),
+        2
+    );
+    assert!(!CODEC_RUNTIME_C.contains("(size_t)arg * sizeof(*items)"));
+    assert!(!CODEC_RUNTIME_C.contains("(size_t)arg * sizeof(*pairs)"));
 }

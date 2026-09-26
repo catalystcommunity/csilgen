@@ -192,6 +192,12 @@ public static class Cbor
     // DecodeValue parses one CBOR item from the front of bytes, returning it and the number of bytes
     // consumed. It may leave trailing bytes (it is the recursive workhorse for nested items);
     // envelope decoders use DecodeEnvelope, which rejects trailing bytes.
+    // The most elements a decoded array or map reserves before it reads them. The
+    // declared length is checked against the remaining input, but one input byte can
+    // become a much larger value, so reserving the full declared length lets a small
+    // frame reserve a large multiple of its size at every nesting level.
+    private const int PreallocLimit = 1024;
+
     private static (CborValue Value, int Consumed) DecodeValue(ReadOnlySpan<byte> b, int depth = 0)
     {
         if (depth > 64)
@@ -257,7 +263,7 @@ public static class Cbor
                     {
                         throw new MalformedException("CBOR decode error: array length exceeds remaining input");
                     }
-                    var items = new List<CborValue>((int)arg);
+                    var items = new List<CborValue>((int)Math.Min(arg, PreallocLimit));
                     int off = n;
                     for (ulong i = 0; i < arg; i++)
                     {
@@ -275,7 +281,7 @@ public static class Cbor
                     {
                         throw new MalformedException("CBOR decode error: map length exceeds remaining input");
                     }
-                    var entries = new List<CborEntry>((int)arg);
+                    var entries = new List<CborEntry>((int)Math.Min(arg, PreallocLimit));
                     int off = n;
                     for (ulong i = 0; i < arg; i++)
                     {

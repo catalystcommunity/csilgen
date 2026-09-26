@@ -162,6 +162,12 @@ pub fn decode_value(alloc: std.mem.Allocator, b: []const u8) Error!Decoded {
     return decode_value_depth(alloc, b, 0);
 }
 
+// The most elements a decoded array or map reserves before it reads them. The
+// declared length is checked against the remaining input, but one input byte can
+// become a much larger value, so reserving the full declared length lets a small
+// frame reserve a large multiple of its size at every nesting level.
+const prealloc_limit: usize = 1024;
+
 fn decode_value_depth(alloc: std.mem.Allocator, b: []const u8, depth: usize) Error!Decoded {
     if (depth > 64) return error.Malformed;
     if (b.len == 0) return error.UnexpectedEof;
@@ -191,20 +197,20 @@ fn decode_value_depth(alloc: std.mem.Allocator, b: []const u8, depth: usize) Err
         4 => {
             if (arg > b.len - n) return error.UnexpectedEof;
             const count: usize = @intCast(arg);
-            const items = try alloc.alloc(Value, count);
+            var items = try std.ArrayListUnmanaged(Value).initCapacity(alloc, @min(count, prealloc_limit));
             var off = n;
             var i: usize = 0;
             while (i < count) : (i += 1) {
                 const d = try decode_value_depth(alloc, b[off..], depth + 1);
-                items[i] = d.value;
+                try items.append(alloc, d.value);
                 off += d.consumed;
             }
-            return .{ .value = .{ .array = items }, .consumed = off };
+            return .{ .value = .{ .array = try items.toOwnedSlice(alloc) }, .consumed = off };
         },
         5 => {
             if (arg > b.len - n) return error.UnexpectedEof;
             const count: usize = @intCast(arg);
-            const entries = try alloc.alloc(Entry, count);
+            var entries = try std.ArrayListUnmanaged(Entry).initCapacity(alloc, @min(count, prealloc_limit));
             var off = n;
             var i: usize = 0;
             while (i < count) : (i += 1) {
@@ -212,9 +218,9 @@ fn decode_value_depth(alloc: std.mem.Allocator, b: []const u8, depth: usize) Err
                 off += k.consumed;
                 const v = try decode_value_depth(alloc, b[off..], depth + 1);
                 off += v.consumed;
-                entries[i] = .{ .key = k.value, .val = v.value };
+                try entries.append(alloc, .{ .key = k.value, .val = v.value });
             }
-            return .{ .value = .{ .map = entries }, .consumed = off };
+            return .{ .value = .{ .map = try entries.toOwnedSlice(alloc) }, .consumed = off };
         },
         6 => {
             const inner = try decode_value_depth(alloc, b[n..], depth + 1);
@@ -292,6 +298,37 @@ test "negative int decode guard rejects below i64 floor" {
     // major type 1 with an 8-byte argument of all 0xff names -(2^64), far below i64.
     const bad = [_]u8{ 0x3b, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff };
     try std.testing.expectError(error.Malformed, decode_envelope(arena.allocator(), &bad));
+}
+
+test "decode grows collections past the reservation clamp" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const items = 3000;
+    const frame = try a.alloc(u8, 3 + items);
+    frame[0] = 0x99;
+    std.mem.writeInt(u16, frame[1..3], items, .big);
+    for (frame[3..], 0..) |*b, i| b.* = @intCast(i % 24);
+    const v = try decode_envelope(a, frame);
+    try std.testing.expectEqual(@as(usize, items), v.array.len);
+    for (v.array, 0..) |item, i| try std.testing.expectEqual(@as(u64, i % 24), item.uint);
+}
+
+test "hostile nested lengths reserve within a small multiple of the frame" {
+    const frame_len: usize = 1 << 20;
+    const frame = try std.testing.allocator.alloc(u8, frame_len);
+    defer std.testing.allocator.free(frame);
+    @memset(frame, 0x80);
+    var level: usize = 0;
+    while (level < 65) : (level += 1) {
+        const remaining: u32 = @intCast(frame_len - (level + 1) * 5);
+        frame[level * 5] = 0x9a;
+        std.mem.writeInt(u32, frame[level * 5 + 1 ..][0..4], remaining, .big);
+    }
+    const budget = try std.testing.allocator.alloc(u8, 4 * frame_len);
+    defer std.testing.allocator.free(budget);
+    var fba = std.heap.FixedBufferAllocator.init(budget);
+    try std.testing.expectError(error.Malformed, decode_envelope(fba.allocator(), frame));
 }
 
 test "decode rejects trailing bytes" {

@@ -3882,6 +3882,12 @@ public static partial class Cbor
         }
     }
 
+    // PreallocLimit bounds the elements a decoded array or map reserves before it reads
+    // them. The declared length is checked against the remaining input, but one input
+    // byte can become a much larger value, so reserving the full declared length lets a
+    // small frame reserve a large multiple of its size at every nesting level.
+    const int PreallocLimit = 1024;
+
     static CborValue Dec(byte[] b, ref int csilPos, int csilDepth)
     {
         if (csilDepth > 64) { throw new CborException("nesting limit exceeded"); }
@@ -3942,7 +3948,7 @@ public static partial class Cbor
             {
                 if (arg > (ulong)(b.Length - csilPos)) { throw new CborException("array length exceeds remaining input"); }
                 var n = (int)arg;
-                var items = new System.Collections.Generic.List<CborValue>(n);
+                var items = new System.Collections.Generic.List<CborValue>(System.Math.Min(n, PreallocLimit));
                 for (int csilI = 0; csilI < n; csilI++) { items.Add(Dec(b, ref csilPos, csilDepth + 1)); }
                 return new CborValue.Array(items);
             }
@@ -3950,7 +3956,7 @@ public static partial class Cbor
             {
                 if (arg > (ulong)(b.Length - csilPos)) { throw new CborException("map length exceeds remaining input"); }
                 var n = (int)arg;
-                var kvs = new System.Collections.Generic.List<(CborValue, CborValue)>(n);
+                var kvs = new System.Collections.Generic.List<(CborValue, CborValue)>(System.Math.Min(n, PreallocLimit));
                 for (int csilI = 0; csilI < n; csilI++)
                 {
                     var k = Dec(b, ref csilPos, csilDepth + 1);
@@ -4167,6 +4173,12 @@ mod tests {
                 "missing guard: {guard}"
             );
         }
+        assert_eq!(
+            CODEC_RUNTIME_CSHARP
+                .matches(">(System.Math.Min(n, PreallocLimit))")
+                .count(),
+            2
+        );
         assert!(CODEC_RUNTIME_CSHARP.contains("if (csilDepth > 64)"));
         assert!(CODEC_RUNTIME_CSHARP.contains("new System.Text.UTF8Encoding(false, true)"));
         assert!(CODEC_RUNTIME_CSHARP.contains("b.Length - csilPos - 1 < csilWidth"));

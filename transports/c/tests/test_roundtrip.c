@@ -294,6 +294,46 @@ static void test_decode_rejects_garbage(void) {
           "excessive nesting rejected");
 }
 
+/* Collections longer than the decoder's reservation clamp grow as elements are
+ * read. An unknown envelope key carries a 3000-element array and a 1500-pair map,
+ * so the growth path runs under the sanitizers and the known keys still decode. */
+static void test_decode_grows_past_reservation_clamp(void) {
+    enum { ITEMS = 3000, PAIRS = 1500 };
+    size_t cap = 64 + ITEMS + PAIRS * 6;
+    uint8_t *b = malloc(cap);
+    CHECK(b != NULL, "allocate test frame");
+    if (!b) {
+        return;
+    }
+    size_t n = 0;
+    const uint8_t head[] = {0xa6, 0x61, 'v', 0x01, 0x61, 'x', 0x99, (uint8_t)(ITEMS >> 8), (uint8_t)ITEMS};
+    memcpy(b + n, head, sizeof head);
+    n += sizeof head;
+    memset(b + n, 0x00, ITEMS);
+    n += ITEMS;
+    const uint8_t map_head[] = {0x61, 'y', 0xb9, (uint8_t)(PAIRS >> 8), (uint8_t)PAIRS};
+    memcpy(b + n, map_head, sizeof map_head);
+    n += sizeof map_head;
+    for (unsigned i = 0; i < PAIRS; i++) {
+        b[n++] = 0x19;
+        b[n++] = (uint8_t)(i >> 8);
+        b[n++] = (uint8_t)i;
+        b[n++] = 0x01;
+    }
+    const uint8_t tail[] = {0x62, 'o', 'p', 0x61, 'o', 0x67, 's', 'e', 'r', 'v', 'i', 'c', 'e',
+                            0x61, 'S', 0x67, 'p', 'a', 'y', 'l', 'o', 'a', 'd', 0xd8, 0x18, 0x41,
+                            0xf6};
+    memcpy(b + n, tail, sizeof tail);
+    n += sizeof tail;
+
+    csil_rpc_request req;
+    CHECK(csil_rpc_request_decode(b, n, &req) == CSIL_OK, "large collections decode");
+    CHECK(strcmp(req.service, "S") == 0 && strcmp(req.op, "o") == 0,
+          "known keys survive large unknown collections");
+    csil_rpc_request_free(&req);
+    free(b);
+}
+
 int main(void) {
     test_server();
     test_server_transport_error();
@@ -302,6 +342,7 @@ int main(void) {
     test_frame_too_large();
     test_seq_tracker();
     test_decode_rejects_garbage();
+    test_decode_grows_past_reservation_clamp();
     printf("roundtrip: %d checks, %d failures\n", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;
 }
