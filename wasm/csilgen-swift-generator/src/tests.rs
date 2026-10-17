@@ -11,7 +11,7 @@ fn decoder_checks_declared_lengths_before_conversion_or_allocation() {
         4
     );
     assert!(CODEC_RUNTIME_SWIFT.contains("guard depth <= 64, pos < b.count"));
-    assert!(CODEC_RUNTIME_SWIFT.contains("String(validating:"));
+    assert!(CODEC_RUNTIME_SWIFT.contains("guard s.utf8.elementsEqual(bytes)"));
     assert!(CODEC_RUNTIME_SWIFT.contains("b.count - pos - 1 >= width"));
 }
 use csilgen_common::{
@@ -200,7 +200,7 @@ fn optional_bytes_encodes_on_presence_not_emptiness() {
     // Encode gates on presence (`if let`), not on emptiness.
     assert!(
         codec.contains(
-            "if let csilV = self.payload { csilEntries.append((\"payload\", .bytes(csilV))) }"
+            "if let csilV = self.payload { csilEntries.append((.text(\"payload\"), .bytes(csilV))) }"
         ),
         "encode must gate on presence, not emptiness:\n{codec}"
     );
@@ -688,7 +688,7 @@ fn struct_field_referencing_a_union_round_trips_through_its_own_codec() {
     assert!(!body.contains("\"status\", .null"));
     assert!(!body.contains("CsilCbor.asText((try CsilCbor.require(cborValue, \"status\"))"));
     // Encode/decode delegate to OrderStatus's own codec.
-    assert!(body.contains("csilEntries.append((\"status\", self.status.toCborValue()))"));
+    assert!(body.contains("csilEntries.append((.text(\"status\"), self.status.toCborValue()))"));
     assert!(body.contains(
         "let status = try OrderStatus(cborValue: (try CsilCbor.require(cborValue, \"status\")))"
     ));
@@ -2323,3 +2323,237 @@ fn case_insensitive_collision_between_existing_rule_and_hoisted_inline_choice_is
         "the synthesized mixed-choice type must not collide with the UserData struct: {types}"
     );
 }
+
+fn compile_regression_input() -> WasmGeneratorInput {
+    let event = opt_entry(
+        "event",
+        CsilTypeExpression::Constrained {
+            base_type: Box::new(reference("NodeEvent")),
+            constraints: vec![CsilControlOperator::Default(CsilLiteralValue::Text(
+                "state".into(),
+            ))],
+        },
+    );
+    input_from_rules(
+        "swift-client",
+        vec![
+            CsilRule {
+                name: "NodeEvent".into(),
+                rule_type: CsilRuleType::TypeDef(CsilTypeExpression::Choice(vec![
+                    text_literal("ready"),
+                    text_literal("state"),
+                    text_literal("default"),
+                ])),
+                position: pos(),
+                doc_comments: vec![],
+            },
+            group_rule(
+                "NodeReport",
+                vec![bare_entry("query", builtin("text")), event],
+            ),
+            service_rule(
+                "NodeService",
+                vec![make_op(
+                    "report",
+                    reference("NodeReport"),
+                    reference("NodeReport"),
+                    CsilServiceDirection::Unidirectional,
+                )],
+                None,
+            ),
+        ],
+        1,
+    )
+}
+
+#[test]
+fn enum_defaults_use_the_declared_case_names() {
+    let mut input = compile_regression_input();
+    input.csil_spec.rules.extend([
+        typedef_rule("EventAlias", reference("NodeEvent")),
+        typedef_rule(
+            "Priority",
+            CsilTypeExpression::Choice(vec![int_literal(-1), int_literal(2)]),
+        ),
+        typedef_rule(
+            "Flag",
+            CsilTypeExpression::Choice(vec![bool_literal(true), bool_literal(false)]),
+        ),
+        typedef_rule(
+            "Mixed",
+            CsilTypeExpression::Choice(vec![text_literal("ready"), int_literal(2)]),
+        ),
+    ]);
+    let cases = [
+        (
+            reference("NodeEvent"),
+            CsilLiteralValue::Text("default".into()),
+            ".`default`",
+        ),
+        (
+            reference("EventAlias"),
+            CsilLiteralValue::Text("state".into()),
+            ".state",
+        ),
+        (
+            reference("Priority"),
+            CsilLiteralValue::Integer(-1),
+            ".vNeg1",
+        ),
+        (reference("Flag"), CsilLiteralValue::Bool(false), ".vFalse"),
+        (reference("Mixed"), CsilLiteralValue::Integer(2), ".v2"),
+        (
+            builtin("text"),
+            CsilLiteralValue::Text("state".into()),
+            "\"state\"",
+        ),
+    ];
+    for (ty, value, expected) in cases {
+        let mut field = bare_entry("value", ty);
+        field.metadata.push(CsilFieldMetadata::Constraint(
+            CsilValidationConstraint::Custom {
+                name: "default".into(),
+                value,
+            },
+        ));
+        let mut case_input = input.clone();
+        case_input
+            .csil_spec
+            .rules
+            .push(group_rule("Defaults", vec![field]));
+        let files = build_files(&case_input).unwrap();
+        let types = &files
+            .iter()
+            .find(|file| file.path == "Types.swift")
+            .unwrap()
+            .content;
+        assert!(types.contains(&format!(" = {expected})")), "{types}");
+    }
+    assert_eq!(
+        enum_default_swift(
+            &CsilLiteralValue::Text("missing".into()),
+            &reference("NodeEvent"),
+            &input
+        ),
+        None
+    );
+    input
+        .csil_spec
+        .rules
+        .push(typedef_rule("Cycle", reference("Cycle")));
+    assert_eq!(
+        enum_default_swift(&CsilLiteralValue::Integer(1), &reference("Cycle"), &input),
+        None
+    );
+}
+
+/// Compile the client and check the CBOR wire format with a Swift compiler.
+#[test]
+fn generated_client_compiles_and_preserves_cbor() {
+    let swiftc = std::env::var("SWIFTC").unwrap_or_else(|_| "swiftc".into());
+    match std::process::Command::new(&swiftc)
+        .arg("--version")
+        .output()
+    {
+        Ok(output) => assert!(output.status.success(), "Swift compiler is not usable"),
+        Err(error)
+            if error.kind() == std::io::ErrorKind::NotFound
+                && std::env::var_os("CSILGEN_REQUIRE_SWIFTC").is_none() =>
+        {
+            eprintln!("skipping Swift compiler test: install swiftc or set SWIFTC");
+            return;
+        }
+        Err(error) => panic!("Swift compiler is required: {error}"),
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let files = build_files(&compile_regression_input()).unwrap();
+    let mut sources = Vec::new();
+    for file in files {
+        if file.path.ends_with(".swift") {
+            std::fs::write(dir.path().join(&file.path), file.content).unwrap();
+            sources.push(file.path);
+        }
+    }
+    std::fs::write(dir.path().join("main.swift"), SWIFT_COMPILE_DRIVER).unwrap();
+    sources.push("main.swift".into());
+    let output = std::process::Command::new(&swiftc)
+        .current_dir(dir.path())
+        .args(["-swift-version", "5"])
+        .args(&sources)
+        .args(["-o", "regression"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "Swift compile failed:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let run = std::process::Command::new(dir.path().join("regression"))
+        .output()
+        .unwrap();
+    assert!(
+        run.status.success(),
+        "Swift runtime check failed:\n{}\n{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    // Apple SDK checks must use the oldest supported deployment target.
+    #[cfg(target_os = "macos")]
+    {
+        let sdk = std::process::Command::new("xcrun")
+            .args(["--sdk", "iphoneos", "--show-sdk-path"])
+            .output()
+            .unwrap();
+        assert!(sdk.status.success(), "iOS SDK is required");
+        let output = std::process::Command::new(&swiftc)
+            .current_dir(dir.path())
+            .args([
+                "-swift-version",
+                "5",
+                "-typecheck",
+                "-target",
+                "arm64-apple-ios16.0",
+                "-sdk",
+            ])
+            .arg(String::from_utf8(sdk.stdout).unwrap().trim())
+            .args(&sources)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "iOS 16 compile failed:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+const SWIFT_COMPILE_DRIVER: &str = r#"
+import Foundation
+
+let report = NodeReport(query: "ok")
+precondition(report.event == .state)
+// {"event": "state", "query": "ok"}, in canonical CBOR key order.
+let expected: [UInt8] = [0xa2, 0x65, 0x65, 0x76, 0x65, 0x6e, 0x74,
+    0x65, 0x73, 0x74, 0x61, 0x74, 0x65, 0x65, 0x71, 0x75, 0x65, 0x72, 0x79,
+    0x62, 0x6f, 0x6b]
+precondition(CsilCbor.encode(report.toCborValue()) == expected)
+let decoded = try NodeReport(cborValue: CsilCbor.decode(expected))
+precondition(decoded == report)
+let absent = NodeReport(query: "ok", event: nil)
+let absentBytes = CsilCbor.encode(absent.toCborValue())
+precondition(absentBytes == [0xa1, 0x65, 0x71, 0x75, 0x65, 0x72, 0x79, 0x62, 0x6f, 0x6b])
+let decodedAbsent = try NodeReport(cborValue: CsilCbor.decode(absentBytes))
+precondition(decodedAbsent == absent)
+precondition(CsilCbor.valueEquals(.double(1.5), .double(1.5)))
+precondition(!CsilCbor.valueEquals(.double(1.5), .double(2.5)))
+let unicode = "\u{0}é🎵"
+let decodedUnicode = try CsilCbor.asText(CsilCbor.decode(CsilCbor.encode(.text(unicode))))
+precondition(decodedUnicode == unicode)
+for invalid: [UInt8] in [[0x61, 0xff], [0x62, 0xc0, 0xaf], [0x63, 0xed, 0xa0, 0x80], [0x61, 0xc2]] {
+    do {
+        _ = try CsilCbor.decode(invalid)
+        fatalError("invalid UTF-8 was accepted")
+    } catch CsilCborError.malformed {}
+}
+"#;

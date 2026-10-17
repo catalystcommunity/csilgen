@@ -769,6 +769,7 @@ dependencies = [
  "csilgen-common",
  "serde",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]

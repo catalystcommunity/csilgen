@@ -321,6 +321,12 @@ def _test_generators(root: Path) -> None:
 
 
 def _test_transports(root: Path) -> None:
+    # This job has the Swift compiler. Require the generated client check here.
+    _cargo(
+        ("test", "-p", "csilgen-swift-generator"),
+        root,
+        env={"CSILGEN_REQUIRE_SWIFTC": "1"},
+    )
     conformance = str(root / "transports" / "conformance")
     c_build = root / "transports" / "c" / "build-test"
     if c_build.exists():

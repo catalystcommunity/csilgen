@@ -1444,12 +1444,22 @@ fn generate_types(input: &WasmGeneratorInput) -> Option<String> {
         match &rule.rule_type {
             CsilRuleType::GroupDef(group) => {
                 any = true;
-                body.push_str(&emit_struct(&rule.name, group, &mut needs_validation));
+                body.push_str(&emit_struct(
+                    &rule.name,
+                    group,
+                    &mut needs_validation,
+                    input,
+                ));
             }
             CsilRuleType::TypeDef(type_expr) => match type_expr {
                 CsilTypeExpression::Group(group) => {
                     any = true;
-                    body.push_str(&emit_struct(&rule.name, group, &mut needs_validation));
+                    body.push_str(&emit_struct(
+                        &rule.name,
+                        group,
+                        &mut needs_validation,
+                        input,
+                    ));
                 }
                 CsilTypeExpression::Choice(choices) => {
                     any = true;
@@ -1492,7 +1502,12 @@ fn generate_types(input: &WasmGeneratorInput) -> Option<String> {
 /// A `struct` record: camelCased `let` properties (wire keys kept verbatim in a doc
 /// comment), a public memberwise init that pins `.default`s and defaults optionals to
 /// `nil`, `Equatable`/`Sendable`, and a `validate()` when the spec carries checks.
-fn emit_struct(name: &str, group: &CsilGroupExpression, needs_validation: &mut bool) -> String {
+fn emit_struct(
+    name: &str,
+    group: &CsilGroupExpression,
+    needs_validation: &mut bool,
+    input: &WasmGeneratorInput,
+) -> String {
     let type_name = swift_type_name(name);
     let mut out = String::new();
     out.push_str(&format!(
@@ -1536,7 +1551,11 @@ fn emit_struct(name: &str, group: &CsilGroupExpression, needs_validation: &mut b
             let optional = matches!(entry.occurrence, Some(CsilOccurrence::Optional));
             let default = entry_default(entry);
             let suffix = match (default, optional) {
-                (Some(value), _) => format!(" = {}", literal_to_swift(value)),
+                (Some(value), _) => format!(
+                    " = {}",
+                    enum_default_swift(value, &entry.value_type, input)
+                        .unwrap_or_else(|| literal_to_swift(value))
+                ),
                 (None, true) => " = nil".to_string(),
                 (None, false) => String::new(),
             };
@@ -1932,6 +1951,59 @@ fn emit_enum(name: &str, choices: &[CsilTypeExpression]) -> String {
     }
     out.push_str("}\n\n");
     out
+}
+
+/// Resolve an enum default with the same case names as the enum declaration.
+fn enum_default_swift(
+    value: &CsilLiteralValue,
+    value_type: &CsilTypeExpression,
+    input: &WasmGeneratorInput,
+) -> Option<String> {
+    let mut ty = value_type;
+    let mut seen = std::collections::HashSet::new();
+    let choices = loop {
+        match ty {
+            CsilTypeExpression::Constrained { base_type, .. } => ty = base_type,
+            CsilTypeExpression::Choice(choices) => break choices,
+            CsilTypeExpression::Reference(name) => {
+                if !seen.insert(name) {
+                    return None;
+                }
+                let rule = input
+                    .csil_spec
+                    .rules
+                    .iter()
+                    .find(|rule| rule.name == *name)?;
+                match &rule.rule_type {
+                    CsilRuleType::TypeDef(inner) => ty = inner,
+                    CsilRuleType::TypeChoice(choices) => break choices,
+                    _ => return None,
+                }
+            }
+            _ => return None,
+        }
+    };
+    let case = match swift_choice_shape(choices) {
+        SwiftChoiceShape::StringEnum(labels) => {
+            let CsilLiteralValue::Text(label) = value else {
+                return None;
+            };
+            labels
+                .iter()
+                .find(|candidate| *candidate == label)
+                .map(|s| swift_ident(s))?
+        }
+        SwiftChoiceShape::ScalarEnum(lits) => {
+            let index = lits.iter().position(|lit| lit == value)?;
+            scalar_enum_case_names(&lits).get(index)?.clone()
+        }
+        SwiftChoiceShape::MixedEnum(lits) => {
+            let index = lits.iter().position(|lit| lit == value)?;
+            mixed_enum_case_names(&lits).get(index)?.clone()
+        }
+        SwiftChoiceShape::Union => return None,
+    };
+    Some(format!(".{case}"))
 }
 
 /// The default literal for a field: the `.default(...)` control operator or the
@@ -2641,7 +2713,7 @@ fn emit_struct_codec(
         if matches!(entry.occurrence, Some(CsilOccurrence::Optional)) {
             let enc = swift_enc_value(ty, "csilV", records, aliases, choice_codecs);
             out.push_str(&format!(
-                "        if let csilV = self.{member} {{ csilEntries.append(({wire_lit}, {enc})) }}\n"
+                "        if let csilV = self.{member} {{ csilEntries.append((.text({wire_lit}), {enc})) }}\n"
             ));
         } else {
             let enc = swift_enc_value(
@@ -2652,7 +2724,7 @@ fn emit_struct_codec(
                 choice_codecs,
             );
             out.push_str(&format!(
-                "        csilEntries.append(({wire_lit}, {enc}))\n"
+                "        csilEntries.append((.text({wire_lit}), {enc}))\n"
             ));
         }
     }
@@ -3809,7 +3881,10 @@ public enum CsilCbor {
         case 3:
             guard arg <= UInt64(b.count - pos) else { throw CsilCborError.malformed }
             let n = Int(arg)
-            guard let s = String(validating: b[pos..<pos + n], as: UTF8.self) else { throw CsilCborError.malformed }
+            let bytes = b[pos..<pos + n]
+            let s = String(decoding: bytes, as: UTF8.self)
+            // Reject repaired bytes. This also accepts valid embedded NUL bytes.
+            guard s.utf8.elementsEqual(bytes) else { throw CsilCborError.malformed }
             pos += n
             return .text(s)
         case 4:
@@ -3860,7 +3935,7 @@ public enum CsilCbor {
         case (.uint(let x), .uint(let y)): return x == y
         case (.int(let x), .int(let y)): return x == y
         case (.bool(let x), .bool(let y)): return x == y
-        case (.float(let x), .float(let y)): return x == y
+        case (.double(let x), .double(let y)): return x == y
         case (.null, .null): return true
         case (.text(let x), .text(let y)): return x == y
         case (.bytes(let x), .bytes(let y)): return x == y
