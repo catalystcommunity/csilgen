@@ -7,6 +7,9 @@ require 'codec.php';
 require 'server.php';
 require 'client.php';
 
+assert(RpErrorCode::toNumber(RpErrorCode::ACCOUNT_RATE_LIMITED) === 42);
+assert(RpErrorCode::fromNumber(42) === RpErrorCode::ACCOUNT_RATE_LIMITED);
+
 class Handler implements RpHandler
 {
     public function decryptToken($req)

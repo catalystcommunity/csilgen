@@ -2141,16 +2141,24 @@ fn emit_named_choice_type(body: &mut String, name: &str, choices: &[CsilTypeExpr
                     _ => None,
                 })
                 .collect();
-            if csilgen_common::enum_numbers(choices).is_some() {
+            if let Some(numbers) = csilgen_common::enum_numbers(choices) {
                 let labels = csilgen_common::text_enum_members(choices).unwrap();
                 let entries = variants
                     .iter()
                     .zip(labels)
-                    .map(|(member, (_, label))| format!("{member}(\"{}\")", kotlin_escape(label)))
+                    .zip(numbers)
+                    .map(|((member, (_, label)), n)| {
+                        let number = if n == i64::MIN {
+                            "Long.MIN_VALUE".into()
+                        } else {
+                            format!("{n}L")
+                        };
+                        format!("{member}(\"{}\", {number})", kotlin_escape(label))
+                    })
                     .collect::<Vec<_>>()
                     .join(",\n    ");
                 body.push_str(&format!(
-                    "enum class {iface}(val label: String) {{\n    {entries}\n}}\n\n"
+                    "enum class {iface}(val label: String, val wireNumber: Long) {{\n    {entries};\n\n    companion object {{\n        private val byNumber = values().associateBy {{ it.wireNumber }}\n        fun fromNumber(number: Long): {iface}? = byNumber[number]\n    }}\n}}\n\n"
                 ));
                 return;
             }
@@ -2217,27 +2225,7 @@ fn emit_choice_codec(
     let dec = camel_case(name);
     match classify_choice(choices) {
         ChoiceKind::EnumText if csilgen_common::enum_numbers(choices).is_some() => {
-            let numbers = csilgen_common::enum_numbers(choices).unwrap();
-            let fields = choices
-                .iter()
-                .map(|c| match choice_arm_literal(c) {
-                    Some(CsilLiteralValue::Text(s)) => enum_text_variant(s),
-                    _ => unreachable!(),
-                })
-                .collect::<Vec<_>>();
-            body.push_str(&format!(
-                "fun {tn}.toCborValue(): CborValue = when (this) {{\n"
-            ));
-            for (field, n) in fields.iter().zip(&numbers) {
-                body.push_str(&format!("    {tn}.{field} -> CborValue.CInt({n})\n"));
-            }
-            body.push_str(&format!("}}\n\nfun {dec}FromCborValue(cbor: CborValue): {tn} = when (CsilCbor.asLong(cbor)) {{\n"));
-            for (field, n) in fields.iter().zip(&numbers) {
-                body.push_str(&format!("    {n}L -> {tn}.{field}\n"));
-            }
-            body.push_str(&format!(
-                "    else -> throw CborError(\"unknown {tn} value\")\n}}\n\n"
-            ));
+            body.push_str(&format!("fun {tn}.toCborValue(): CborValue = CborValue.CInt(wireNumber)\n\nfun {dec}FromCborValue(cbor: CborValue): {tn} = {tn}.fromNumber(CsilCbor.asLong(cbor)) ?: throw CborError(\"unknown {tn} value\")\n\n"));
         }
         ChoiceKind::EnumText => {
             let lits: Vec<(String, String)> = choices

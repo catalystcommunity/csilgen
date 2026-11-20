@@ -306,6 +306,15 @@ fn ts_enc_value(
             format!("to{}CborValue({expr})", common::to_pascal(name))
         }
         CsilTypeExpression::Reference(name) => match ctx.aliases.get(&common::to_pascal(name)) {
+            Some(CsilTypeExpression::Choice(arms))
+                if csilgen_common::enum_numbers(arms).is_some() =>
+            {
+                let ty = common::to_pascal(name);
+                imports.insert(format!("{ty}Numbers"));
+                format!(
+                    "{ty}Numbers.numberFromEnum({expr} as Parameters<typeof {ty}Numbers.numberFromEnum>[0])"
+                )
+            }
             Some(underlying) => ts_enc_value(underlying, expr, ctx, imports),
             None => expr.to_string(),
         },
@@ -426,12 +435,9 @@ fn ts_dec_value(
             Some(CsilTypeExpression::Choice(arms))
                 if csilgen_common::enum_numbers(arms).is_some() =>
             {
-                imports.insert("enumFromNumber".into());
-                format!(
-                    "(enumFromNumber({expr}, [{}]) as {})",
-                    named_numbers(arms),
-                    common::to_pascal(name)
-                )
+                let ty = common::to_pascal(name);
+                imports.insert(format!("{ty}Numbers"));
+                format!("{ty}Numbers.enumFromNumber({expr})")
             }
             Some(underlying) => ts_dec_value(underlying, expr, ctx, imports),
             None => format!(
@@ -1107,6 +1113,14 @@ pub fn generate(input: &WasmGeneratorInput) -> Option<String> {
     let module = string_option(input, "codec_types_module", &default_types_module);
     if uses_decimal && mapping == DecimalMapping::Library {
         out.push_str("import Decimal from \"decimal.js\";\n");
+    }
+    for rule in &spec.rules {
+        if csilgen_common::rule_enum_numbers(rule).is_some() {
+            let ty = common::to_pascal(&rule.name);
+            out.push_str(&format!(
+                "import {{ {ty}Numbers }} from \"{module}\";\nexport {{ {ty}Numbers }};\n"
+            ));
+        }
     }
     if uses_decimal && mapping == DecimalMapping::Csil {
         out.push_str(&format!("import {{ CsilDecimal }} from \"{module}\";\n"));

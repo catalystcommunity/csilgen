@@ -4,6 +4,9 @@ from api.client import RpClient
 from api.codec import RpErrorRefusal, encode_rp_decrypt_token_reply, resolve_rpc_reply
 from api.types import Req, Resp, RpError, RpErrorCode
 
+assert RpErrorCode.ACCOUNT_RATE_LIMITED.wire_number == 42
+assert RpErrorCode.from_number(42) is RpErrorCode.ACCOUNT_RATE_LIMITED
+
 
 def handle(req):
     if req.a == "limit":

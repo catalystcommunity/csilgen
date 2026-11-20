@@ -38,21 +38,35 @@ pub fn generate(input: &WasmGeneratorInput) -> String {
         out.push('\n');
     }
 
+    if spec
+        .rules
+        .iter()
+        .any(|rule| csilgen_common::rule_enum_numbers(rule).is_some())
+    {
+        out.push_str(ENUM_NUMBERS);
+    }
     for rule in &spec.rules {
         if let CsilRuleType::TypeDef(CsilTypeExpression::Choice(arms))
         | CsilRuleType::TypeChoice(arms) = &rule.rule_type
             && let Some(members) = csilgen_common::text_enum_members(arms)
         {
             let name = common::to_pascal(&rule.name);
-            if csilgen_common::enum_numbers(arms).is_some() {
+            if let Some(numbers) = csilgen_common::enum_numbers(arms) {
                 out.push_str(&format!("export enum {name} {{\n"));
-                for (member, label) in members {
+                for (member, label) in &members {
                     out.push_str(&format!(
                         "  {member} = {},\n",
                         serde_json::to_string(label).unwrap()
                     ));
                 }
                 out.push_str("}\n\n");
+                out.push_str(&format!(
+                    "export const {name}Numbers = makeEnumNumbers<{name}>([\n"
+                ));
+                for ((member, _), number) in members.iter().zip(numbers) {
+                    out.push_str(&format!("  [{name}.{member}, {number}n],\n"));
+                }
+                out.push_str("]);\n\n");
                 continue;
             }
             out.push_str(&format!("export const {name} = {{\n"));
@@ -810,3 +824,24 @@ fn literal_ts(value: &CsilLiteralValue) -> String {
         CsilLiteralValue::Bytes(_) | CsilLiteralValue::Array(_) => "null".to_string(),
     }
 }
+
+const ENUM_NUMBERS: &str = r#"function makeEnumNumbers<E extends string>(entries: readonly (readonly [E, bigint])[]) {
+  const numbers = new Map(entries);
+  const members = new Map(entries.map(([member, number]) => [number, member] as const));
+  return {
+    numberFromEnum(member: E): bigint {
+      const value = numbers.get(member);
+      if (value === undefined) throw new RangeError("unknown enum member");
+      return value;
+    },
+    enumFromNumber(value: unknown): E {
+      if (typeof value === "bigint" || (typeof value === "number" && Number.isSafeInteger(value))) {
+        const member = members.get(BigInt(value));
+        if (member !== undefined) return member;
+      }
+      throw new RangeError("unknown enum number");
+    },
+  };
+}
+
+"#;

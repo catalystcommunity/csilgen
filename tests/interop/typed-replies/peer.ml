@@ -14,6 +14,9 @@ let call ~service ~op ~payload =
   | Transport_error { status; _ } -> Error (Int64.to_string status)
 
 let () =
+  assert (rp_error_code_to_number Account_rate_limited = 42L);
+  assert (rp_error_code_of_number 42L = Some Account_rate_limited);
+  assert (rp_error_code_of_number 1L = None);
   let client = Client.make_client ~call in
   assert (Client.Rp.decrypt_token client { a = "ok" } = Ok { b = "ok" });
   assert (Client.Rp.decrypt_token client { a = "limit" } =

@@ -2434,30 +2434,13 @@ fn go_dec_func(
         // to a named `Tags`, so the wrapper makes the decoder yield the field's exact
         // type — which also lets `cborDecArray`/`cborDecMap` infer the right element type
         // (`[]MemberID`, not `[]string`).
-        CsilTypeExpression::Reference(name) if matches!(aliases.get(name), Some(CsilTypeExpression::Choice(arms)) if csilgen_common::enum_numbers(arms).is_some()) =>
-        {
-            let Some(CsilTypeExpression::Choice(arms)) = aliases.get(name) else {
-                unreachable!()
-            };
-            let numbers = csilgen_common::enum_numbers(arms).unwrap();
-            let unknown = numbers
-                .iter()
-                .map(|n| format!("n != {n}"))
-                .collect::<Vec<_>>()
-                .join(" && ");
+        CsilTypeExpression::Reference(name) if matches!(aliases.get(name), Some(CsilTypeExpression::Choice(arms)) if csilgen_common::enum_numbers(arms).is_some()) => {
             go_closure(
                 &format!("func(csilV cborValue) ({name}, error)"),
                 &[
                     "n, err := cborAsI64(csilV)".into(),
                     go_if("err != nil", &["return 0, err".into()], indent + 1),
-                    go_if(
-                        &unknown,
-                        &[format!(
-                            "return 0, fmt.Errorf(\"unknown {name} value %d\", n)"
-                        )],
-                        indent + 1,
-                    ),
-                    format!("return {name}(n), nil"),
+                    format!("return {}FromNumber(n)", pascal_case(name)),
                 ],
                 indent,
             )
@@ -4131,7 +4114,13 @@ fn go_text_enum(name: &str, arms: &[CsilTypeExpression]) -> String {
             out.push_str(&format!("\t{constant:width$} {name} = {n}\n"));
         }
         out.push_str(&format!(
-            ")\n\nfunc (v {name}) MarshalText() ([]byte, error) {{\n\tswitch v {{\n"
+            ")\n\nfunc (v {name}) ToNumber() int64 {{ return int64(v) }}\n\n"
+        ));
+        let public_name = pascal_case(name);
+        let cases = constants.join(", ");
+        out.push_str(&format!("func {public_name}FromNumber(number int64) ({name}, error) {{\n\tv := {name}(number)\n\tswitch v {{\n\tcase {cases}:\n\t\treturn v, nil\n\t}}\n\treturn 0, fmt.Errorf(\"unknown {name} value %d\", number)\n}}\n\n"));
+        out.push_str(&format!(
+            "func (v {name}) MarshalText() ([]byte, error) {{\n\tswitch v {{\n"
         ));
         for ((_, label), constant) in members.iter().zip(&constants) {
             let label = serde_json::to_string(label).unwrap();

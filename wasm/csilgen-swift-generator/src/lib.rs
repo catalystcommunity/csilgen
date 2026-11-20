@@ -1730,8 +1730,8 @@ fn classify_enum_literals(literals: &[&CsilLiteralValue]) -> SwiftChoiceShape {
 /// A closed set of string literals as a `String`-backed Swift enum: the raw value is the
 /// wire string verbatim (so case order/spelling never drifts onto the wire), the case
 /// name is the camelCased label, and `CaseIterable` is free and conventional here.
-fn emit_string_enum(type_name: &str, labels: &[String], numeric: bool) -> String {
-    let codable = if numeric { ", Codable" } else { "" };
+fn emit_string_enum(type_name: &str, labels: &[String], numbers: Option<Vec<i64>>) -> String {
+    let codable = if numbers.is_some() { ", Codable" } else { "" };
     let mut out = String::new();
     out.push_str(&format!(
         "/// {type_name} is a generated CSIL string enum (a closed set of wire values).\n"
@@ -1745,6 +1745,23 @@ fn emit_string_enum(type_name: &str, labels: &[String], numeric: bool) -> String
             swift_ident(label),
             swift_string_lit(label)
         ));
+    }
+    if let Some(numbers) = numbers {
+        out.push_str("\n    public var wireNumber: Int64 {\n        switch self {\n");
+        for (label, n) in labels.iter().zip(&numbers) {
+            out.push_str(&format!(
+                "        case .{}: return {n}\n",
+                swift_ident(label)
+            ));
+        }
+        out.push_str("        }\n    }\n\n    public init?(wireNumber: Int64) {\n        switch wireNumber {\n");
+        for (label, n) in labels.iter().zip(&numbers) {
+            out.push_str(&format!(
+                "        case {n}: self = .{}\n",
+                swift_ident(label)
+            ));
+        }
+        out.push_str("        default: return nil\n        }\n    }\n");
     }
     out.push_str("}\n\n");
     out
@@ -1931,11 +1948,7 @@ fn emit_enum(name: &str, choices: &[CsilTypeExpression]) -> String {
     let type_name = swift_type_name(name);
     match swift_choice_shape(choices) {
         SwiftChoiceShape::StringEnum(labels) => {
-            return emit_string_enum(
-                &type_name,
-                &labels,
-                csilgen_common::enum_numbers(choices).is_some(),
-            );
+            return emit_string_enum(&type_name, &labels, csilgen_common::enum_numbers(choices));
         }
         SwiftChoiceShape::ScalarEnum(lits) => return emit_scalar_enum(&type_name, &lits),
         SwiftChoiceShape::MixedEnum(lits) => return emit_mixed_enum(&type_name, &lits),
@@ -3254,27 +3267,8 @@ fn generate_codec(input: &WasmGeneratorInput) -> Option<String> {
             ));
         } else if string_enums.contains_key(&rule.name) {
             let ty = swift_type_name(&rule.name);
-            if let Some(numbers) = csilgen_common::rule_enum_numbers(rule) {
-                body.push_str(&format!("public extension {ty} {{\n    func toCborValue() -> CsilCborValue {{\n        switch self {{\n"));
-                for (label, n) in string_enums[&rule.name].iter().zip(&numbers) {
-                    let value = if *n >= 0 {
-                        format!(".uint({n})")
-                    } else {
-                        format!(".int({n})")
-                    };
-                    body.push_str(&format!(
-                        "        case .{}: return {value}\n",
-                        swift_ident(label)
-                    ));
-                }
-                body.push_str("        }\n    }\n\n    init(cborValue: CsilCborValue) throws {\n        switch try CsilCbor.asI64(cborValue) {\n");
-                for (label, n) in string_enums[&rule.name].iter().zip(&numbers) {
-                    body.push_str(&format!(
-                        "        case {n}: self = .{}\n",
-                        swift_ident(label)
-                    ));
-                }
-                body.push_str(&format!("        default: throw CsilCborError.typeMismatch\n        }}\n    }}\n\n    func toCbor() -> [UInt8] {{ CsilCbor.encode(toCborValue()) }}\n\n    static func fromCbor(_ bytes: [UInt8]) throws -> {ty} {{ try {ty}(cborValue: CsilCbor.decode(bytes)) }}\n}}\n\n"));
+            if csilgen_common::rule_enum_numbers(rule).is_some() {
+                body.push_str(&format!("public extension {ty} {{\n    func toCborValue() -> CsilCborValue {{ wireNumber >= 0 ? .uint(UInt64(wireNumber)) : .int(wireNumber) }}\n\n    init(cborValue: CsilCborValue) throws {{\n        guard let value = Self(wireNumber: try CsilCbor.asI64(cborValue)) else {{ throw CsilCborError.typeMismatch }}\n        self = value\n    }}\n\n    func toCbor() -> [UInt8] {{ CsilCbor.encode(toCborValue()) }}\n\n    static func fromCbor(_ bytes: [UInt8]) throws -> {ty} {{ try {ty}(cborValue: CsilCbor.decode(bytes)) }}\n}}\n\n"));
             } else {
                 body.push_str(&emit_string_enum_codec(&ty));
             }

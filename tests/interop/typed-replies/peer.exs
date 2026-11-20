@@ -1,4 +1,8 @@
 alias Csilgen.Generated.{Cbor, Req, Resp, RpClient, RpError, RpErrorRefusal}
+alias Csilgen.Generated.RpErrorCode
+
+42 = RpErrorCode.to_number(:account_rate_limited)
+:account_rate_limited = RpErrorCode.from_number(42)
 
 defmodule Handler do
   @behaviour Csilgen.Generated.RpServer

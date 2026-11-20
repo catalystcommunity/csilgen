@@ -514,13 +514,12 @@ fn generate_types(input: &WasmGeneratorInput, config: &CConfig) -> Option<String
         match kind {
             TypeKind::Enum(variants) => {
                 emit_enum(&mut enums, name, variants);
-                if input
+                if let Some(numbers) = input
                     .csil_spec
                     .rules
                     .iter()
                     .find(|r| r.name == *name)
                     .and_then(csilgen_common::rule_enum_numbers)
-                    .is_some()
                 {
                     enums.push_str(&format!("static inline const char *csil_{name}_label({name} value) {{\n    switch (value) {{\n"));
                     for label in variants {
@@ -532,6 +531,26 @@ fn generate_types(input: &WasmGeneratorInput, config: &CConfig) -> Option<String
                         ));
                     }
                     enums.push_str("    default: return (const char *)0;\n    }\n}\n\n");
+                    let mut to = format!(
+                        "static inline bool csil_{name}_to_number({name} value, int64_t *out) {{\n    switch (value) {{\n"
+                    );
+                    let mut from = format!(
+                        "static inline bool csil_{name}_from_number(int64_t number, {name} *out) {{\n    switch (number) {{\n"
+                    );
+                    for (label, n) in variants.iter().zip(numbers) {
+                        let member = format!("{}_{}", to_upper_snake(name), to_upper_snake(label));
+                        let n = if n == i64::MIN {
+                            "INT64_MIN".into()
+                        } else {
+                            n.to_string()
+                        };
+                        to.push_str(&format!("    case {member}: *out = {n}; return true;\n"));
+                        from.push_str(&format!("    case {n}: *out = {member}; return true;\n"));
+                    }
+                    for function in [to, from] {
+                        enums.push_str(&function);
+                        enums.push_str("    default: return false;\n    }\n}\n\n");
+                    }
                 }
             }
             TypeKind::IntEnum(values) => emit_int_enum(&mut enums, name, values),
@@ -2473,26 +2492,15 @@ fn generate_codec(
                 decls.push_str(&format!(
                     "static inline int csilc_dec_{name}(const csilc_value *src, CsilCodecArena *a, {name} *out);\n"
                 ));
-                if let Some(numbers) = input
+                if input
                     .csil_spec
                     .rules
                     .iter()
                     .find(|r| r.name == *name)
                     .and_then(csilgen_common::rule_enum_numbers)
+                    .is_some()
                 {
-                    bodies.push_str(&format!("static inline int csilc_enc_{name}(csilc_buf *b, const {name} *v) {{\n    switch (*v) {{\n"));
-                    for (index, n) in numbers.iter().enumerate() {
-                        bodies
-                            .push_str(&format!("    case {index}: return csilc_w_int(b, {n});\n"));
-                    }
-                    bodies.push_str("    default: return -1;\n    }\n}\n\n");
-                    bodies.push_str(&format!("static inline int csilc_dec_{name}(const csilc_value *src, CsilCodecArena *a, {name} *out) {{\n    (void)a;\n    int64_t number;\n    if (!csilc_as_i64(src, &number)) return -1;\n    switch (number) {{\n"));
-                    for (index, n) in numbers.iter().enumerate() {
-                        bodies.push_str(&format!(
-                            "    case {n}: *out = ({name}){index}; return 0;\n"
-                        ));
-                    }
-                    bodies.push_str("    default: return -1;\n    }\n}\n\n");
+                    bodies.push_str(&format!("static inline int csilc_enc_{name}(csilc_buf *b, const {name} *v) {{\n    int64_t number;\n    return csil_{name}_to_number(*v, &number) ? csilc_w_int(b, number) : -1;\n}}\n\nstatic inline int csilc_dec_{name}(const csilc_value *src, CsilCodecArena *a, {name} *out) {{\n    (void)a;\n    int64_t number;\n    return csilc_as_i64(src, &number) && csil_{name}_from_number(number, out) ? 0 : -1;\n}}\n\n"));
                 } else {
                     emit_enum_codec(&mut bodies, name, variants);
                 }

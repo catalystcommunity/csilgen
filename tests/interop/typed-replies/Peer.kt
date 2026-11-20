@@ -1,6 +1,9 @@
 package community.catalyst.csilgen.generated
 
 fun main() {
+    check(RpErrorCode.AccountRateLimited.wireNumber == 42L)
+    check(RpErrorCode.fromNumber(42L) == RpErrorCode.AccountRateLimited)
+    check(RpErrorCode.fromNumber(1L) == null)
     val handler = object : Rp {
         override fun decryptToken(request: Req): Resp {
             if (request.a == "limit") throw RpErrorRefusal(RpError(RpErrorCode.ApplicationUserLimit, "limit"))

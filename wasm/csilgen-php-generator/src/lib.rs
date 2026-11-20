@@ -261,8 +261,24 @@ fn generate_types_file(spec: &CsilSpecSerialized, namespace: &str) -> String {
                 if let Some(members) = csilgen_common::text_enum_members(arms) {
                     let class = php_class(&rule.name);
                     out.push_str(&format!("final class {class}\n{{\n"));
-                    for (member, wire) in members {
+                    for (member, wire) in &members {
                         out.push_str(&format!("    const {member} = {};\n", php_string(wire)));
+                    }
+                    if let Some(numbers) = csilgen_common::enum_numbers(arms) {
+                        let pairs = members
+                            .iter()
+                            .zip(numbers)
+                            .map(|((member, _), n)| {
+                                let number = if n == i64::MIN {
+                                    "(-PHP_INT_MAX - 1)".into()
+                                } else {
+                                    n.to_string()
+                                };
+                                format!("{number} => self::{member}")
+                            })
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        out.push_str(&format!("\n    private static $byNumber = array({pairs});\n\n    public static function toNumber($member)\n    {{\n        static $byMember = null;\n        if ($byMember === null) $byMember = array_flip(self::$byNumber);\n        if (!is_string($member) || !isset($byMember[$member])) throw new \\InvalidArgumentException('unknown {class} member');\n        return $byMember[$member];\n    }}\n\n    public static function fromNumber($number)\n    {{\n        if (!is_int($number) || !isset(self::$byNumber[$number])) throw new \\InvalidArgumentException('unknown {class} number');\n        return self::$byNumber[$number];\n    }}\n"));
                     }
                     out.push_str("\n    private function __construct() {}\n}\n\n");
                 }
@@ -556,16 +572,10 @@ fn emit_enum_codec(
         .map(php_literal)
         .collect::<Vec<_>>()
         .join(", ");
-    if let Some(numbers) = numbers {
-        let members = numbers
-            .iter()
-            .zip(literals)
-            .map(|(n, lit)| format!("{n} => {}", php_literal(lit)))
-            .collect::<Vec<_>>()
-            .join(", ");
-        out.push_str(&format!(
-            "    public static function toCbor{suffix}($value)\n    {{\n        static $members = array({members});\n        $index = array_search($value, $members, true);\n        if ($index === false) throw new CodecException('unknown {name} label');\n        return $index;\n    }}\n\n    public static function fromCbor{suffix}($value)\n    {{\n        static $members = array({members});\n        if (!is_int($value) || !isset($members[$value])) throw new CodecException('unknown {name} number');\n        return $members[$value];\n    }}\n\n"
-        ));
+    if numbers.is_some() {
+        for (direction, method) in [("toCbor", "toNumber"), ("fromCbor", "fromNumber")] {
+            out.push_str(&format!("    public static function {direction}{suffix}($value)\n    {{\n        try {{ return {suffix}::{method}($value); }}\n        catch (\\InvalidArgumentException $e) {{ throw new CodecException($e->getMessage()); }}\n    }}\n\n"));
+        }
         return;
     }
     out.push_str(&format!(

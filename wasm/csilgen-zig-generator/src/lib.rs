@@ -436,7 +436,15 @@ fn generate_types(input: &WasmGeneratorInput, config: &ZigConfig) -> Option<Stri
 
     for (name, kind) in &typed {
         match kind {
-            TypeKind::Enum(variants) => emit_enum(&mut enums, name, variants),
+            TypeKind::Enum(variants) => {
+                let numbers = input
+                    .csil_spec
+                    .rules
+                    .iter()
+                    .find(|r| r.name == *name)
+                    .and_then(csilgen_common::rule_enum_numbers);
+                emit_enum(&mut enums, name, variants, numbers.as_deref());
+            }
             TypeKind::IntEnum(values) => emit_int_enum(&mut enums, name, values),
             TypeKind::MixedEnum(literals) => emit_mixed_enum(&mut enums, name, literals),
             TypeKind::Alias(t) => {
@@ -578,11 +586,19 @@ fn topo_emit(
     out
 }
 
-fn emit_enum(content: &mut String, name: &str, variants: &[String]) {
+fn emit_enum(content: &mut String, name: &str, variants: &[String], numbers: Option<&[i64]>) {
     content.push_str(&format!("/// {name} is an enumeration.\n"));
-    content.push_str(&format!("pub const {name} = enum {{\n"));
-    for variant in variants {
-        content.push_str(&format!("    {},\n", zig_field_ident(&to_snake(variant))));
+    let repr = if numbers.is_some() { "(i64)" } else { "" };
+    content.push_str(&format!("pub const {name} = enum{repr} {{\n"));
+    for (i, variant) in variants.iter().enumerate() {
+        let tag = numbers.map(|n| format!(" = {}", n[i])).unwrap_or_default();
+        content.push_str(&format!(
+            "    {}{tag},\n",
+            zig_field_ident(&to_snake(variant))
+        ));
+    }
+    if numbers.is_some() {
+        content.push_str(&format!("\n    pub fn to_number(self: {name}) i64 {{\n        return @intFromEnum(self);\n    }}\n\n    pub fn from_number(number: i64) ?{name} {{\n        return @import(\"std\").meta.intToEnum({name}, number) catch null;\n    }}\n"));
     }
     // The wire form of a closed CSIL enum is the original literal text, which may
     // differ from the snake_case Zig tag; wire_name maps each tag back verbatim.
@@ -2037,29 +2053,15 @@ fn generate_codec(
                 emit_record_codec(&mut bodies, name, group, &codec_names, &aliases, warnings)
             }
             TypeKind::Enum(labels) => {
-                if let Some(numbers) = input
+                if input
                     .csil_spec
                     .rules
                     .iter()
                     .find(|r| r.name == *name)
                     .and_then(csilgen_common::rule_enum_numbers)
+                    .is_some()
                 {
-                    bodies.push_str(&format!("fn enc_{name}(out: *std.ArrayList(u8), v: *const types.{name}) CodecError!void {{\n    try w_int(out, switch (v.*) {{\n"));
-                    for (label, n) in labels.iter().zip(&numbers) {
-                        bodies.push_str(&format!(
-                            "        .{} => {n},\n",
-                            zig_field_ident(&to_snake(label))
-                        ));
-                    }
-                    bodies.push_str("    });\n}\n\n");
-                    bodies.push_str(&format!("fn dec_{name}(alloc: std.mem.Allocator, src: Value, out: *types.{name}) CodecError!void {{\n    _ = alloc;\n    out.* = switch (try as_i64(src)) {{\n"));
-                    for (label, n) in labels.iter().zip(&numbers) {
-                        bodies.push_str(&format!(
-                            "        {n} => .{},\n",
-                            zig_field_ident(&to_snake(label))
-                        ));
-                    }
-                    bodies.push_str("        else => return error.WrongType,\n    };\n}\n\n");
+                    emit_int_enum_codec(&mut bodies, name);
                 } else {
                     emit_enum_codec(&mut bodies, name, labels);
                 }

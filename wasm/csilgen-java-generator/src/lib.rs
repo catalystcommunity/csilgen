@@ -1023,13 +1023,32 @@ fn generate_java(input: &WasmGeneratorInput) -> Result<Vec<GeneratedFile>, i32> 
                 let class = rule.name.to_case(Case::Pascal);
                 let mut code = config.header();
                 code.push_str(&javadoc("", &clean_doc(doc), &[]));
+                let numbers = csilgen_common::enum_numbers(arms);
                 let members = csilgen_common::text_enum_members(arms)
                     .unwrap()
                     .iter()
-                    .map(|(name, wire)| format!("    {name}({})", java_string(wire)))
+                    .enumerate()
+                    .map(|(i, (name, wire))| {
+                        let number = numbers
+                            .as_ref()
+                            .map(|n| format!(", {}L", n[i]))
+                            .unwrap_or_default();
+                        format!("    {name}({}{number})", java_string(wire))
+                    })
                     .collect::<Vec<_>>()
                     .join(",\n");
-                code.push_str(&format!("public enum {class} {{\n{members};\n\n    private final String value;\n\n    {class}(String value) {{ this.value = value; }}\n\n    public String value() {{ return value; }}\n\n    public static {class} fromWire(String value) {{\n        for ({class} member : values()) {{\n            if (member.value.equals(value)) return member;\n        }}\n        throw new IllegalArgumentException(\"unknown {class} value: \" + value);\n    }}\n}}\n"));
+                let (number_arg, assign, numeric_api) = if numbers.is_some() {
+                    (
+                        ", long number",
+                        " this.number = number;",
+                        format!(
+                            "    private final long number;\n    private static final java.util.Map<Long, {class}> byNumber = new java.util.HashMap<>();\n    static {{\n        for ({class} member : values()) byNumber.put(member.number, member);\n    }}\n\n    public long toNumber() {{ return number; }}\n\n    public static {class} fromNumber(long number) {{\n        {class} member = byNumber.get(number);\n        if (member != null) return member;\n        throw new IllegalArgumentException(\"unknown {class} number: \" + number);\n    }}\n\n"
+                        ),
+                    )
+                } else {
+                    ("", "", String::new())
+                };
+                code.push_str(&format!("public enum {class} {{\n{members};\n\n    private final String value;\n\n    {class}(String value{number_arg}) {{ this.value = value;{assign} }}\n\n{numeric_api}    public String value() {{ return value; }}\n\n    public static {class} fromWire(String value) {{\n        for ({class} member : values()) {{\n            if (member.value.equals(value)) return member;\n        }}\n        throw new IllegalArgumentException(\"unknown {class} value: \" + value);\n    }}\n}}\n"));
                 files.push(GeneratedFile {
                     path: config.path_for(&class),
                     content: code,
@@ -2242,24 +2261,9 @@ fn emit_choice_codec(
     // arm's `Constrained` wrapper, so a closed enum's last arm is still recognized here.
     match csilgen_common::classify_choice(choices) {
         ChoiceClass::Enum(_) if csilgen_common::enum_numbers(choices).is_some() => {
-            let numbers = csilgen_common::enum_numbers(choices).unwrap();
-            let members = csilgen_common::text_enum_members(choices).unwrap();
-            let mut code = format!(
-                "    static CborValue enc{class}({class} v) {{\n        return new CborInt(switch (v) {{\n"
-            );
-            for ((member, _), n) in members.iter().zip(&numbers) {
-                code.push_str(&format!("            case {member} -> {n}L;\n"));
-            }
-            code.push_str(&format!("        }});\n    }}\n\n    static {class} dec{class}(CborValue root) {{\n        long n = asI64(root);\n"));
-            for ((member, _), n) in members.iter().zip(&numbers) {
-                code.push_str(&format!(
-                    "        if (n == {n}L) return {class}.{member};\n"
-                ));
-            }
-            code.push_str(&format!(
-                "        throw new CsilCborException(\"unknown {class} number\");\n    }}\n\n"
-            ));
-            code
+            format!(
+                "    static CborValue enc{class}({class} v) {{\n        return new CborInt(v.toNumber());\n    }}\n\n    static {class} dec{class}(CborValue root) {{\n        try {{ return {class}.fromNumber(asI64(root)); }}\n        catch (IllegalArgumentException e) {{ throw new CsilCborException(e.getMessage()); }}\n    }}\n\n"
+            )
         }
         ChoiceClass::Enum(literals) => emit_enum_codec(&class, &literals),
         ChoiceClass::Union(_) => {

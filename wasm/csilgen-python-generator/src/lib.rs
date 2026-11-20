@@ -2403,7 +2403,7 @@ impl PythonGenerator {
         self.imports.insert("from enum import Enum as _Enum".into());
         let mut code = format!("class {class}(str, _Enum):\n    __str__ = str.__str__\n");
         let mut members = HashSet::new();
-        for value in values {
+        for value in &values {
             let words = value
                 .split(|c: char| !c.is_ascii_alphanumeric())
                 .filter(|word| !word.is_empty())
@@ -2421,6 +2421,19 @@ impl PythonGenerator {
             }
             let literal = serde_json::to_string(value).expect("serialize text literal");
             code.push_str(&format!("    {member} = {literal}\n"));
+        }
+        if let Some(numbers) = csilgen_common::enum_numbers(choices) {
+            let table = format!("_{class}_by_number");
+            code.push_str(&format!("\n    @property\n    def wire_number(self) -> int:\n        return _{class}_numbers[self]\n\n    @classmethod\n    def from_number(cls, number: int) -> '{class}':\n        if type(number) is not int or number not in {table}:\n            raise ValueError(f'unknown {class} number: {{number!r}}')\n        return {table}[number]\n\n{table} = {{\n"));
+            for (label, number) in values.iter().zip(numbers) {
+                code.push_str(&format!(
+                    "    {number}: {class}({}),\n",
+                    serde_json::to_string(label).unwrap()
+                ));
+            }
+            code.push_str(&format!(
+                "}}\n_{class}_numbers = {{member: n for n, member in {table}.items()}}\n"
+            ));
         }
         code.push('\n');
         Some(code)
@@ -4161,16 +4174,10 @@ fn emit_union_codec(
 /// assume (and previously did assume) every member is text or every member is int.
 fn emit_enum_codec(name: &str, literals: &[CsilLiteralValue], numbers: Option<Vec<i64>>) -> String {
     let suffix = record_suffix(name);
-    if let Some(numbers) = numbers {
+    if numbers.is_some() {
         let class = name.to_case(Case::Pascal);
-        let entries = literals
-            .iter()
-            .zip(numbers)
-            .map(|(label, n)| format!("{n}: {}", csil_literal_to_python_str(label)))
-            .collect::<Vec<_>>()
-            .join(", ");
         return format!(
-            "_{suffix}_labels = {{{entries}}}\n_{suffix}_numbers = {{label: n for n, label in _{suffix}_labels.items()}}\n\n\ndef _encode_{suffix}_value(value):\n    return _{suffix}_numbers[value]\n\n\ndef _decode_{suffix}_value(value):\n    n = _csil_expect_int(value)\n    if n not in _{suffix}_labels:\n        raise CsilDecodeError(f\"csil cbor: unknown {name} number {{n}}\")\n    return {class}(_{suffix}_labels[n])\n\n\n"
+            "def _encode_{suffix}_value(value):\n    return {class}(value).wire_number\n\n\ndef _decode_{suffix}_value(value):\n    try:\n        return {class}.from_number(_csil_expect_int(value))\n    except ValueError as exc:\n        raise CsilDecodeError(str(exc)) from exc\n\n\n"
         );
     }
     let literal_refs: Vec<&CsilLiteralValue> = literals.iter().collect();

@@ -1402,9 +1402,9 @@ fn generate_types(spec: &CsilSpecSerialized) -> (String, String) {
     // hide, the `.mli` simply publishes the type surface.
     let mut mli = format!("{preamble}{joined}\n");
     for rule in &spec.rules {
-        if csilgen_common::rule_enum_numbers(rule).is_none() {
+        let Some(numbers) = csilgen_common::rule_enum_numbers(rule) else {
             continue;
-        }
+        };
         let CsilRuleType::TypeDef(CsilTypeExpression::Choice(choices)) = &rule.rule_type else {
             continue;
         };
@@ -1413,10 +1413,23 @@ fn generate_types(spec: &CsilSpecSerialized) -> (String, String) {
         };
         let tn = ocaml_type_name(&rule.name);
         ml.push_str(&format!("\nlet {tn}_label (v : {tn}) =\n  match v with\n"));
-        for (ctor, label) in arms {
+        for (ctor, label) in &arms {
             ml.push_str(&format!("  | {ctor} -> \"{label}\"\n"));
         }
-        mli.push_str(&format!("\nval {tn}_label : {tn} -> string\n"));
+        ml.push_str(&format!(
+            "\nlet {tn}_to_number (v : {tn}) =\n  match v with\n"
+        ));
+        for ((ctor, _), n) in arms.iter().zip(&numbers) {
+            ml.push_str(&format!("  | {ctor} -> {n}L\n"));
+        }
+        ml.push_str(&format!(
+            "\nlet {tn}_of_number (n : int64) : {tn} option =\n  match n with\n"
+        ));
+        for ((ctor, _), n) in arms.iter().zip(numbers) {
+            ml.push_str(&format!("  | {n}L -> Some {ctor}\n"));
+        }
+        ml.push_str("  | _ -> None\n");
+        mli.push_str(&format!("\nval {tn}_label : {tn} -> string\nval {tn}_to_number : {tn} -> int64\nval {tn}_of_number : int64 -> {tn} option\n"));
     }
     (ml, mli)
 }
@@ -1927,27 +1940,13 @@ fn emit_choice_codec(
             arms,
             open_other: None,
         } => {
-            if let Some(numbers) = csilgen_common::enum_numbers(choices) {
-                let enc_arms: Vec<String> = arms
-                    .iter()
-                    .zip(&numbers)
-                    .map(|((ctor, _), i)| format!("{ctor} -> Cbor.int64 {i}L"))
-                    .collect();
-                let mut dec_arms: Vec<String> = arms
-                    .iter()
-                    .zip(&numbers)
-                    .map(|((ctor, _), i)| format!("{i}L -> {ctor}"))
-                    .collect();
-                dec_arms.push("_ -> failwith \"csilgen: unknown enum ordinal\"".to_string());
-                let enc = format!(
-                    "encode_{tn} (v : {tn}) : Cbor.t =\n  match v with {}",
-                    enc_arms.join(" | ")
+            if csilgen_common::enum_numbers(choices).is_some() {
+                return (
+                    format!("encode_{tn} (v : {tn}) : Cbor.t = Cbor.int64 ({tn}_to_number v)"),
+                    format!(
+                        "decode_{tn} (csil_c : Cbor.t) : {tn} =\n  match {tn}_of_number (Cbor.to_i64 csil_c) with Some v -> v | None -> failwith \"csilgen: unknown enum number\""
+                    ),
                 );
-                let dec = format!(
-                    "decode_{tn} (csil_c : Cbor.t) : {tn} =\n  match Cbor.to_i64 csil_c with {}",
-                    dec_arms.join(" | ")
-                );
-                return (enc, dec);
             }
             // A closed string enum (every arm a text literal): the bare CBOR text is
             // its own discriminant, matching the locked ALL-literal wire contract.

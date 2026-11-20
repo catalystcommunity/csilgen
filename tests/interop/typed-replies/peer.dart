@@ -18,6 +18,8 @@ final class Carrier implements CsilTransport {
 }
 
 void main() {
+  assert(RpErrorCode.accountRateLimited.wireNumber == 42);
+  assert(RpErrorCode.fromNumber(42) == RpErrorCode.accountRateLimited);
   final client = RpClient(Carrier());
   assert(client.decryptToken(const Req(a: 'ok')).b == 'ok');
   try {

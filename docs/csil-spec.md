@@ -283,6 +283,44 @@ the assigned integer. The text label for this member is
 Keep the assigned numbers when you reorder members. Reserve the number of a
 removed member to prevent old data from acquiring a different meaning.
 
+The generator supplies both conversions. Use the generated API to get the
+assigned integer from a member or to find a member by its integer. The following
+example uses TypeScript.
+
+```ts
+import { RpErrorCode, RpErrorCodeNumbers } from "./types.gen.ts";
+
+const member = RpErrorCode.ACCOUNT_RATE_LIMITED;
+const number = RpErrorCodeNumbers.numberFromEnum(member); // 42n
+const decoded = RpErrorCodeNumbers.enumFromNumber(number); // same member
+```
+
+TypeScript returns a `bigint` to preserve all signed 64-bit values. For the
+reverse lookup, pass a `bigint` or a safe integer `number`. The following
+table shows the generated API for an enum named `Code`.
+
+| Language | Member to integer | Integer to member |
+| --- | --- | --- |
+| C | `csil_Code_to_number(member, &n)` | `csil_Code_from_number(n, &member)` |
+| C# | `member.ToNumber()` | `CodeNumbers.FromNumber(n)` |
+| Dart | `member.wireNumber` | `Code.fromNumber(n)` |
+| Elixir | `Code.to_number(member)` | `Code.from_number(n)` |
+| Go | `member.ToNumber()` | `CodeFromNumber(n)` |
+| Java | `member.toNumber()` | `Code.fromNumber(n)` |
+| Kotlin | `member.wireNumber` | `Code.fromNumber(n)` |
+| OCaml | `code_to_number member` | `code_of_number n` |
+| PHP | `Code::toNumber($member)` | `Code::fromNumber($n)` |
+| Python | `member.wire_number` | `Code.from_number(n)` |
+| Ruby | `Code.to_number(member)` | `Code.from_number(n)` |
+| Rust | `member.to_number()` | `Code::from_number(n)` |
+| Swift | `member.wireNumber` | `Code(wireNumber: n)` |
+| TypeScript | `CodeNumbers.numberFromEnum(member)` | `CodeNumbers.enumFromNumber(n)` |
+| Zig | `member.to_number()` | `Code.from_number(n)` |
+
+For an undeclared number, C returns false and Go returns an error. Kotlin,
+OCaml, Rust, Swift, and Zig return an empty optional value. The other
+targets raise an error.
+
 A quoted choice such as `"busy" / "denied"` sends the selected text.
 By default, `csilgen lint DIR` reports a warning for each such choice.
 Set `lint_text_enums` in the file options to change the severity.
