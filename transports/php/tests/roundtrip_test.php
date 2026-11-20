@@ -14,6 +14,8 @@ assert_true(CBOR::decode(CBOR::encode($value)) == $value, 'cbor value roundtrip'
 
 $encoded = CBOR::encode(array('b' => 2, 'a' => 1));
 assert_true(bin2hex($encoded) === 'a2616101616202', 'canonical map ordering');
+assert_true(bin2hex(CBOR::encode(CBOR::mapEntries(array(array(1, 'b'), array(0, 'a'))))) === 'a2006161016162', 'enum keys retain their assigned integers in canonical order');
+assert_true(bin2hex(CBOR::encode(CBOR::mapEntries(array()))) === 'a0', 'empty enum map');
 
 // -- CSIL-RPC request: all fields.
 $payload = CBOR::encode($value);

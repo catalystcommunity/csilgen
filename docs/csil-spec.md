@@ -264,6 +264,29 @@ bare-literal enum vs. a `[variant_index, value]` tagged sum, respectively. See
 normative, byte-level rule (including the mixed-literal-kind and encode-order
 edge cases).
 
+#### Named numbers
+
+Use a CDDL group enumeration to assign a number to each member.
+
+```csil
+RpErrorCode = &(application_user_limit: 7, account_rate_limited: 42)
+RpError = { code: RpErrorCode, message: text }
+```
+
+To reuse a group, declare `codes = (busy: 7, denied: 42)` and
+`Code = &codes`. A member must have a name and an integer literal.
+
+Use the named member in application code. For example, assign
+`api.RpErrorCodeApplicationUserLimit` to a Go field. The CBOR encoder writes
+the assigned integer. The text label for this member is
+`application_user_limit`. Give each member a unique name and integer.
+Keep the assigned numbers when you reorder members. Reserve the number of a
+removed member to prevent old data from acquiring a different meaning.
+
+A quoted choice such as `"busy" / "denied"` sends the selected text.
+By default, `csilgen lint DIR` reports a warning for each such choice.
+Set `lint_text_enums` in the file options to change the severity.
+
 #### Type Choice Extension (`/=`)
 
 `/=` follows RFC 8610's socket-extension semantics (CDDL §3.8), not a plain
@@ -633,6 +656,14 @@ order = {
 
 ### Import Resolution
 
+Use `csilgen validate --input FILE` to check the schema after import
+resolution. A type reference can use a built-in type, a type declared later
+in the file, or an imported type. An unknown type is a validation error.
+
+Use `csilgen linted-validate --input FILE` to also lint each source file
+after validation succeeds. Each file uses its own lint options. Add
+`--fail-on-warnings` to make a lint warning return exit status 1.
+
 1. Relative paths are resolved from the current file's directory (falling back
    to any additional search paths the caller registered).
 2. An absolute path is checked directly on the filesystem.
@@ -703,7 +734,8 @@ options {
     package: "com.example.api",
     version: "1.0.0",
     namespace: "UserAPI",
-    go_package: "github.com/example/api/user"
+    go_package: "github.com/example/api/user",
+    lint_text_enums: "warn"
 }
 
 ;; Rest of the CSIL definitions
@@ -714,6 +746,11 @@ Common options:
 - `package`: Package/module name for generated code
 - `version`: API version
 - `namespace`: Namespace for generated types
+- `lint_text_enums` sets the severity for quoted text enums in this file.
+  Use `"off"` to skip this check, `"warn"` to report a warning (the default),
+  or `"error"` to make lint fail. Each file uses its own setting.
+  Run `csilgen lint DIR --fail-on-warnings` to make any lint warning return
+  exit status 1.
 - `*_package`: Language-specific package names (`go_package`, `java_package`,
   `kotlin_package`), `go_module` for the Go module path
 - `package_name` / `package_version`: package coordinates (name and version)

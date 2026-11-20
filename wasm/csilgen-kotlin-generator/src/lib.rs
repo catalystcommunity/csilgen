@@ -159,6 +159,7 @@ fn process_generation(mut input: WasmGeneratorInput) -> Result<WasmGeneratorOutp
     // opaque `Any`/`CborValue.CNull` fallback), so an ALL-literal choice is hoisted
     // too (`hoist_all_literal_choices: true`) — unlike TypeScript/Go, Kotlin has no
     // bare-inline-enum rendering to fall back to; every choice needs a name.
+    input.csil_spec.supply_implicit_service_error();
     input.csil_spec = hoist_inline_composites(
         &input.csil_spec,
         HoistOptions {
@@ -598,12 +599,7 @@ class HttpRpcTransport(baseUrl: String) : Transport {
         val resp = RpcResponse.decode(httpResp.body())
         // A non-zero transport status is a StatusException, distinct from an application error.
         resp.asTransportError()?.let { throw ClientError(message = "csil-rpc $service/$op: ${it.message}") }
-        // A typed ServiceError arm rides as a status-0 variant; surface it so the typed
-        // client decodes a success payload only.
-        if (resp.variant == "ServiceError") {
-            throw ClientError(message = "csil-rpc $service/$op: ServiceError")
-        }
-        return resp.payload
+        return resolveRpcReply(service, op, resp.variant, resp.payload)
     }
 }
 "#;
@@ -871,7 +867,7 @@ fn first_unary_example(input: &WasmGeneratorInput) -> Option<UnaryExample> {
             if !matches!(op.direction, CsilServiceDirection::Unidirectional) {
                 continue;
             }
-            let success = success_type(&op.output_type);
+            let success = success_type(op.success_output());
             let null_input = op_input_is_null(&op.input_type);
             if !is_record_ref(&success, &records)
                 || !(null_input || is_record_ref(&op.input_type, &records))
@@ -947,7 +943,7 @@ fn first_channel_example(input: &WasmGeneratorInput) -> Option<ChannelExample> {
             if !matches!(op.direction, CsilServiceDirection::Bidirectional) {
                 continue;
             }
-            let success = success_type(&op.output_type);
+            let success = success_type(op.success_output());
             if !is_record_ref(&op.input_type, &records) || !is_record_ref(&success, &records) {
                 continue;
             }
@@ -1066,6 +1062,9 @@ fn enum_default_kotlin(
     let name = referenced_type_name(value_type)?;
     let choices = find_choice(input, name)?;
     let iface = pascal_case(name);
+    if let Some(label) = csilgen_common::enum_number_label(choices, value) {
+        return Some(format!("{iface}.{}", enum_text_variant(label)));
+    }
     match classify_choice(choices) {
         ChoiceKind::EnumText => match value {
             CsilLiteralValue::Text(s) => Some(format!("{iface}.{}", enum_text_variant(s))),
@@ -1464,7 +1463,7 @@ fn emit_client_class(
             ));
             continue;
         }
-        let success = success_type(&operation.output_type);
+        let success = success_type(operation.success_output());
         let null_input = op_input_is_null(&operation.input_type);
         let req_ok =
             null_input || kotlin_op_boundary_expressible(&operation.input_type, named, aliases);
@@ -1625,7 +1624,7 @@ fn emit_service_interface(body: &mut String, name: &str, service: &CsilServiceDe
         match operation.direction {
             CsilServiceDirection::Unidirectional => {
                 let output_type =
-                    map_csil_type_to_kotlin(&success_type(&operation.output_type), &None);
+                    map_csil_type_to_kotlin(&success_type(operation.success_output()), &None);
                 if op_input_is_null(&operation.input_type) {
                     body.push_str(&format!("    fun {method}(): {output_type}\n"));
                 } else {
@@ -2142,6 +2141,19 @@ fn emit_named_choice_type(body: &mut String, name: &str, choices: &[CsilTypeExpr
                     _ => None,
                 })
                 .collect();
+            if csilgen_common::enum_numbers(choices).is_some() {
+                let labels = csilgen_common::text_enum_members(choices).unwrap();
+                let entries = variants
+                    .iter()
+                    .zip(labels)
+                    .map(|(member, (_, label))| format!("{member}(\"{}\")", kotlin_escape(label)))
+                    .collect::<Vec<_>>()
+                    .join(",\n    ");
+                body.push_str(&format!(
+                    "enum class {iface}(val label: String) {{\n    {entries}\n}}\n\n"
+                ));
+                return;
+            }
             body.push_str(&format!("/** {name} enum (bare-literal wire). */\n"));
             body.push_str(&format!(
                 "enum class {iface} {{ {} }}\n\n",
@@ -2204,6 +2216,29 @@ fn emit_choice_codec(
     let tn = pascal_case(name);
     let dec = camel_case(name);
     match classify_choice(choices) {
+        ChoiceKind::EnumText if csilgen_common::enum_numbers(choices).is_some() => {
+            let numbers = csilgen_common::enum_numbers(choices).unwrap();
+            let fields = choices
+                .iter()
+                .map(|c| match choice_arm_literal(c) {
+                    Some(CsilLiteralValue::Text(s)) => enum_text_variant(s),
+                    _ => unreachable!(),
+                })
+                .collect::<Vec<_>>();
+            body.push_str(&format!(
+                "fun {tn}.toCborValue(): CborValue = when (this) {{\n"
+            ));
+            for (field, n) in fields.iter().zip(&numbers) {
+                body.push_str(&format!("    {tn}.{field} -> CborValue.CInt({n})\n"));
+            }
+            body.push_str(&format!("}}\n\nfun {dec}FromCborValue(cbor: CborValue): {tn} = when (CsilCbor.asLong(cbor)) {{\n"));
+            for (field, n) in fields.iter().zip(&numbers) {
+                body.push_str(&format!("    {n}L -> {tn}.{field}\n"));
+            }
+            body.push_str(&format!(
+                "    else -> throw CborError(\"unknown {tn} value\")\n}}\n\n"
+            ));
+        }
         ChoiceKind::EnumText => {
             let lits: Vec<(String, String)> = choices
                 .iter()
@@ -2488,7 +2523,7 @@ fn emit_op_codecs(
             if !matches!(op.direction, CsilServiceDirection::Unidirectional) {
                 continue;
             }
-            let success = success_type(&op.output_type);
+            let success = success_type(op.success_output());
             let null_input = op_input_is_null(&op.input_type);
             let req_ok =
                 null_input || kotlin_op_boundary_expressible(&op.input_type, named, aliases);
@@ -2540,7 +2575,7 @@ fn emit_op_codec_pair(
 /// and the generic dispatch. `None` when the spec declares no record types.
 fn generate_codec(input: &WasmGeneratorInput, config: &KotlinConfig) -> Option<String> {
     let records = kotlin_record_names(input);
-    if records.is_empty() {
+    if records.is_empty() && input.csil_spec.rpc_operations().next().is_none() {
         return None;
     }
     let aliases = codec_aliases(input);
@@ -2567,6 +2602,52 @@ fn generate_codec(input: &WasmGeneratorInput, config: &KotlinConfig) -> Option<S
     // responses, …), so the client and a consumer-side server share one codec surface for
     // every op — not just record↔record.
     emit_op_codecs(&mut body, input, &codec_named, &aliases);
+    {
+        let mut emitted = std::collections::BTreeSet::new();
+        let mut resolve = String::from(
+            "fun resolveRpcReply(service: String, op: String, variant: String?, payload: ByteArray): ByteArray {\n",
+        );
+        body.push_str("data class RpcReply(val variant: String, val payload: ByteArray)\n\n");
+        for (service, op, arms) in input.csil_spec.rpc_operations() {
+            let method = &op.name;
+            let stem = op_codec_stem(service, op);
+            let success = map_csil_type_to_kotlin(&arms[0], &None);
+            let mut encode = format!(
+                "fun encode{stem}Reply(handler: () -> {success}): RpcReply =\n    try {{\n        val value = handler()\n"
+            );
+            resolve.push_str(&format!("    if (service == \"{service}\" && op == \"{method}\") {{\n        return when (variant) {{\n"));
+            for (i, arm) in arms.iter().enumerate() {
+                let wire = arm.rpc_variant_name().unwrap();
+                let ty = map_csil_type_to_kotlin(arm, &None);
+                let exception = format!("{}Refusal", pascal_case(wire));
+                let source = if i == 0 { "value" } else { "refusal.value" };
+                let enc = kotlin_enc_value(arm, source, &codec_named, &aliases);
+                if i == 0 {
+                    encode.push_str(&format!(
+                        "        RpcReply(\"{wire}\", CsilCbor.encode({enc}))\n"
+                    ));
+                    resolve.push_str(&format!("            \"{wire}\" -> payload\n"));
+                } else {
+                    let dec =
+                        kotlin_dec_value(arm, "CsilCbor.decode(payload)", &codec_named, &aliases);
+                    if emitted.insert(exception.clone()) {
+                        body.push_str(&format!(
+                            "class {exception}(val value: {ty}) : RuntimeException(\"{wire}\")\n\n"
+                        ));
+                    }
+                    encode.push_str(&format!("    }} catch (refusal: {exception}) {{\n        RpcReply(\"{wire}\", CsilCbor.encode({enc}))\n"));
+                    resolve.push_str(&format!(
+                        "            \"{wire}\" -> throw {exception}({dec})\n"
+                    ));
+                }
+            }
+            encode.push_str("    }\n\n");
+            body.push_str(&encode);
+            resolve.push_str("            else -> throw CborError(\"invalid RPC reply variant: $variant\")\n        }\n    }\n");
+        }
+        resolve.push_str("    return payload\n}\n");
+        body.push_str(&resolve);
+    }
 
     let mut content = file_header(
         config,
@@ -5326,7 +5407,7 @@ mod tests {
         // Non-zero transport status + typed ServiceError arm handled distinctly.
         assert!(c.contains("val resp = RpcResponse.decode(httpResp.body())"));
         assert!(c.contains("resp.asTransportError()?.let"));
-        assert!(c.contains("if (resp.variant == \"ServiceError\")"));
+        assert!(c.contains("resolveRpcReply(service, op, resp.variant, resp.payload)"));
         // Typed client + the first `->` call with a generated sample literal.
         assert!(c.contains("val client = CorndogsClient(HttpRpcTransport("));
         assert!(c.contains("client.submitTask(SubmitTaskRequest(task = Task("));

@@ -1,0 +1,7 @@
+RpErrorCode = &(application_user_limit: 7, account_rate_limited: 42)
+RpError = { code: RpErrorCode, message: text }
+Req = { a: text }
+Resp = { b: text }
+service Rp {
+    decrypt-token: Req -> Resp / RpError
+}

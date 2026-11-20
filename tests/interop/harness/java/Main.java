@@ -86,9 +86,9 @@ public final class Main {
             // inline all-literal choice (not hoisted).
             "medium",
             // named enum with a trailing `.default`-constrained last arm.
-            new Level("high"),
+            Level.HIGH,
             // named enum assembled via base rule + `/=` extension.
-            new Season("autumn"),
+            Season.AUTUMN,
             // named all-literal enum with mixed literal kinds (text + int arms);
             // still gets a wrapper record for a NAMED reference (unlike Java's
             // un-hoisted inline choices, which render bare with no wrapper).
@@ -108,8 +108,8 @@ public final class Main {
             List.of(10L, 20L),
             List.of(7L, 8L, 9L),
             scores,
-            new Color("green"),
-            new Color("blue"),
+            Color.GREEN,
+            Color.BLUE,
             new Priority(2L),
             new IdOrName(4242L),
             Arrays.<Object>asList("p", 5L),

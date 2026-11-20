@@ -168,7 +168,17 @@ fn rpc_section(input: &WasmGeneratorInput, pkg: &str, ex: Option<&UnaryExample>)
     out.push_str(&format!(
         "import {{ {aggregate}, type AsyncServiceTransport }} from \"{pkg}\";\n\n"
     ));
+    let typed = input.csil_spec.rpc_operations().next().is_some();
+    if typed {
+        out.push_str(&format!("import {{ resolveRpcReply }} from \"{pkg}\";\n"));
+    }
     out.push_str(RPC_CARRIER_TS);
+    if typed {
+        out.push_str("    return resolveRpcReply(service, op, resp.variant, resp.payload);\n");
+    } else {
+        out.push_str("    return resp.payload;\n");
+    }
+    out.push_str("  }\n}\n");
     out.push('\n');
     out.push_str(&format!(
         "async function main() {{\n  const client = new {aggregate}(new HttpRpcCarrier(\"http://localhost:5080\"));\n  "
@@ -213,14 +223,6 @@ class HttpRpcCarrier implements AsyncServiceTransport {
     const resp = RpcResponse.decode(
       new Uint8Array(await http.arrayBuffer()),
     ).intoTransportError();
-    // A typed application error rides as a status-0 `ServiceError` variant — distinct
-    // from a transport failure. Surface it so the typed client decodes success only.
-    if (resp.variant === "ServiceError") {
-      throw new Error(`csil-rpc ${service}/${op}: ServiceError`);
-    }
-    return resp.payload;
-  }
-}
 "#;
 
 /// CSIL-Events over TLS: a full session example. Opens a TLS byte stream wrapped as
@@ -527,7 +529,7 @@ fn first_unary_example(input: &WasmGeneratorInput) -> Option<UnaryExample> {
             if !common::is_unidirectional(op) {
                 continue;
             }
-            let success = common::success_type(&op.output_type);
+            let success = common::success_type(op.success_output());
             let null_input = common::is_null_type(&op.input_type);
             if !codec::is_record_ref(&success, &records)
                 || !(null_input || codec::is_record_ref(&op.input_type, &records))
@@ -582,7 +584,7 @@ fn first_channel_example(input: &WasmGeneratorInput) -> Option<ChannelExample> {
             }
             // Client-side inbound is the success output; the outbound encoder (only for
             // `<->`) takes the input. Require both to be records for a compiling sample.
-            let success = common::success_type(&op.output_type);
+            let success = common::success_type(op.success_output());
             if !codec::is_record_ref(&success, &records)
                 || !codec::is_record_ref(&op.input_type, &records)
                 || !common::is_bidirectional(op)

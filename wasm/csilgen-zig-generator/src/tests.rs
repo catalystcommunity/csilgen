@@ -1104,18 +1104,16 @@ fn codec_emitted_with_typed_client() {
         .find(|f| f.path == "client.gen.zig")
         .expect("client.gen.zig emitted");
     assert!(client.content.contains(
-        "pub fn submit_task(self: CorndogsClient, alloc: std.mem.Allocator, req: *const types.SubmitTaskRequest, out: *types.Task) anyerror!void"
+        "pub fn submit_task(self: CorndogsClient, alloc: std.mem.Allocator, req: *const types.SubmitTaskRequest, out: *types.CorndogsServiceSubmitTaskReply) anyerror!void"
     ));
     assert!(
         client
             .content
             .contains("codec.encode_SubmitTaskRequest(alloc, req)")
     );
-    assert!(
-        client
-            .content
-            .contains("codec.decode_Task(alloc, csil_respb, out)")
-    );
+    assert!(client.content.contains(
+        "codec.decode_CorndogsServiceSubmitTaskReply(alloc, reply.variant, reply.payload, out)"
+    ));
 }
 
 #[test]
@@ -1257,6 +1255,11 @@ fn stub_call(ptr: *anyopaque, alloc: std.mem.Allocator, service: []const u8, op:
     return codec.encode_Task(alloc, &in.task);
 }
 
+fn stub_reply(ptr: *anyopaque, alloc: std.mem.Allocator, service: []const u8, op: []const u8, reqb: []const u8) anyerror!client.WireReply {
+    const payload = try stub_call(ptr, alloc, service, op, reqb);
+    return .{ .variant = try alloc.dupe(u8, "Task"), .payload = payload };
+}
+
 pub fn main() !void {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
@@ -1324,10 +1327,11 @@ pub fn main() !void {
 
     // typed client round-trip over the loopback carrier
     var dummy: u8 = 0;
-    const tr = client.CsilgenTransport{ .ptr = @ptrCast(&dummy), .call = &stub_call };
+    const tr = client.CsilgenTransport{ .ptr = @ptrCast(&dummy), .call = &stub_call, .call_reply = &stub_reply };
     const c = client.CorndogsClient.init(tr);
-    var resp: types.Task = undefined;
-    try c.submit_task(a, &reqv, &resp);
+    var reply: types.CorndogsServiceSubmitTaskReply = undefined;
+    try c.submit_task(a, &reqv, &reply);
+    const resp = reply.task;
     std.debug.assert(std.mem.eql(u8, resp.uuid, "u-123"));
     std.debug.assert(std.mem.eql(u8, resp.payload, &payload));
     std.debug.assert(resp.priority.? == 7);
@@ -1760,7 +1764,7 @@ fn rpc_section_uses_library_envelope_and_typed_client() {
         "carrier must POST the canonical mount:\n{readme}"
     );
     assert!(
-        readme.contains("as_transport_error()") && readme.contains("\"ServiceError\""),
+        readme.contains("as_transport_error()") && readme.contains("resp.variant"),
         "carrier must surface the transport status and the ServiceError arm:\n{readme}"
     );
     assert!(

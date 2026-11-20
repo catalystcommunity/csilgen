@@ -253,10 +253,8 @@ let rpc_server listener =
 let rpc_carrier_call (client : Rpc.client) ~service ~op ~payload =
   match Rpc.call client ~service ~op ~payload () with
   | Error e -> Error ("transport: " ^ Conventions.error_message e)
-  | Ok (resp : Rpc.response) -> (
-    match resp.Rpc.variant with
-    | Some "ServiceError" -> Error "ServiceError"
-    | _ -> Ok resp.Rpc.payload)
+  | Ok (resp : Rpc.response) ->
+    Ok (C.resolve_rpc_reply ~service ~op ~variant:resp.Rpc.variant resp.Rpc.payload)
 
 let rpc_client fd =
   let cs = new_cases "rpc" in
@@ -277,11 +275,12 @@ let rpc_client fd =
    | Error e -> fail cs "echo-nested/success" e);
   (match Interop_api.Client.Interop.validate_constrained client (constrained_ok ()) with
    | Ok r -> check cs "validate-constrained/success" (r = constrained_ok ()) "mismatch"
-   | Error e -> fail cs "validate-constrained/success" e);
+   | Error (`Service_error e) -> fail cs "validate-constrained/success" e.message
+   | Error (`Decode e | `Transport e) -> fail cs "validate-constrained/success" e);
   (match Interop_api.Client.Interop.validate_constrained client (constrained_bad ()) with
    | Ok _ -> fail cs "validate-constrained/failure" "server accepted invalid input"
-   | Error "ServiceError" -> pass cs "validate-constrained/failure"
-   | Error e -> fail cs "validate-constrained/failure" ("expected service error, got " ^ e));
+   | Error (`Service_error _) -> pass cs "validate-constrained/failure"
+   | Error (`Decode e | `Transport e) -> fail cs "validate-constrained/failure" ("expected service error, got " ^ e));
   (* Optional-bytes presence: absent, present-empty, and present-non-empty are three
      distinct states that must each survive the round trip unchanged. [None] is absent;
      [Some Bytes.empty] is present-and-empty and must not come back as [None]. *)

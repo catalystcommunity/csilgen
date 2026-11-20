@@ -265,13 +265,13 @@ fn server_module_emits_handler_and_routers() {
     assert!(out.contains("let op_deposit_claim_wire_id = 1L"));
     // Handler record with a bytes-taking field that returns an outcome.
     assert!(out.contains("type handler = {"));
-    assert!(out.contains("deposit_claim : bytes -> outcome;"));
+    assert!(out.contains("deposit_claim : deposit_claim_request -> (deposit_claim_response, [ `Service_error of service_error ]) result;"));
     // Verbose router dispatches by the verbatim wire op name (kebab preserved).
     assert!(out.contains("let route (h : handler) ~(op : string) ~(payload : bytes) ="));
-    assert!(out.contains("| \"deposit-claim\" -> h.deposit_claim payload"));
+    assert!(out.contains("| \"deposit-claim\" -> dispatch_deposit_claim h payload"));
     // Compact router dispatches by ordinal, emitted because the service has a wire id.
     assert!(out.contains("let route_compact (h : handler) ~(op_ord : int64)"));
-    assert!(out.contains("| 1L -> h.deposit_claim payload"));
+    assert!(out.contains("| 1L -> dispatch_deposit_claim h payload"));
 }
 
 #[test]
@@ -323,7 +323,7 @@ fn client_module_emits_typed_calls() {
     assert!(out.contains("type client = {"));
     assert!(out.contains("module Attestation = struct"));
     // The success type drops the ServiceError arm.
-    assert!(out.contains("decode_response : bytes -> deposit_claim_response"));
+    assert!(out.contains("Codec.decode_attestation_deposit_claim_success bytes"));
     // The wire service/op strings are the CSIL names verbatim; the OCaml fn name is
     // snake_case.
     assert!(out.contains("let deposit_claim (c : client)"));
@@ -645,11 +645,9 @@ fn codec_emitted_with_typed_client() {
 
     let client = generate_client(&spec);
     // Typed seam: a typed request in, a typed reply out, codec called internally.
-    assert!(client.contains(
-        "let submit_task (c : client) (req : submit_task_request) : (task, string) result"
-    ));
-    assert!(client.contains("Codec.encode_submit_task_request_bytes req"));
-    assert!(client.contains("Codec.decode_task_bytes payload"));
+    assert!(client.contains("let submit_task (c : client) (req : submit_task_request) ="));
+    assert!(client.contains("Codec.encode_corndogs_service_submit_task_request req"));
+    assert!(client.contains("Codec.decode_corndogs_service_submit_task_success bytes"));
 }
 
 /// Compile the generated OCaml and round-trip a typed request/response with dune.
@@ -719,7 +717,7 @@ const CODEC_DRIVER_OCAML: &str = r#"let () =
   in
   let req : Types.submit_task_request = { task; queue = "default" } in
   (* direct codec round-trip through the nested record *)
-  let bytes = Codec.encode_submit_task_request_bytes req in
+  let bytes = Codec.encode_corndogs_service_submit_task_request req in
   let back = Codec.decode_submit_task_request_bytes bytes in
   assert (back.task.uuid = "u-123");
   assert (back.task.current_state = "PENDING");
@@ -730,7 +728,7 @@ const CODEC_DRIVER_OCAML: &str = r#"let () =
   assert (back.queue = "default");
   (* an absent optional must round-trip to None *)
   let req2 = { req with task = { task with priority = None } } in
-  let back2 = Codec.decode_submit_task_request_bytes (Codec.encode_submit_task_request_bytes req2) in
+  let back2 = Codec.decode_submit_task_request_bytes (Codec.encode_corndogs_service_submit_task_request req2) in
   assert (back2.task.priority = None);
   (* typed client over a loopback carrier: decode the request, encode its task *)
   let call ~service:_ ~op:_ ~payload =
@@ -743,7 +741,8 @@ const CODEC_DRIVER_OCAML: &str = r#"let () =
      assert (t.uuid = "u-123");
      assert (Bytes.equal t.payload payload);
      assert (t.priority = Some 7L)
-   | Error e -> failwith e);
+   | Error (`Transport e | `Decode e) -> failwith e
+   | Error (`Service_error _) -> failwith "unexpected service error");
   (* a named map alias and a map-of-record alias must survive the round-trip
      intact rather than being stubbed to an empty list / failwith *)
   let holder : Types.alias_holder =
@@ -1695,7 +1694,7 @@ fn genquickstart_rpc_section_uses_lib_envelope_over_http() {
     assert!(c.contains("/csil/v1/rpc"));
     assert!(c.contains("POST %s HTTP/1.1"));
     // The typed ServiceError application arm is surfaced distinctly.
-    assert!(c.contains("\"ServiceError\""));
+    assert!(c.contains("Codec.resolve_rpc_reply"));
     // The typed client is constructed over the carrier with a base URL, and the example
     // call passes a generated sample request literal.
     assert!(c.contains("make_rpc_client \"http://localhost:5080\""));

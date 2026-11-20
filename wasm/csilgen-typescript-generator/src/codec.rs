@@ -239,6 +239,36 @@ fn enc_is_identity(ty: &CsilTypeExpression, ctx: &Ctx) -> bool {
 /// value). Records every codec-module export the expression names into `imports`, so
 /// a caller emitting the expression outside `codec.gen.ts` (the client, for a
 /// non-record op boundary) imports exactly the helpers it references.
+fn named_number_key(ty: &CsilTypeExpression, ctx: &Ctx) -> bool {
+    let mut ty = ty;
+    for _ in 0..=ctx.aliases.len() {
+        match unwrap_constrained(ty) {
+            CsilTypeExpression::Reference(name) => {
+                match ctx.aliases.get(&common::to_pascal(name)) {
+                    Some(target) => ty = target,
+                    None => return false,
+                }
+            }
+            CsilTypeExpression::Choice(arms) => {
+                return csilgen_common::enum_numbers(arms).is_some();
+            }
+            _ => return false,
+        }
+    }
+    false
+}
+
+fn named_numbers(arms: &[CsilTypeExpression]) -> String {
+    let numbers = csilgen_common::enum_numbers(arms).unwrap();
+    let labels = csilgen_common::text_enum_members(arms).unwrap();
+    labels
+        .iter()
+        .zip(numbers)
+        .map(|((_, label), n)| format!("[{}, {n}n]", serde_json::to_string(label).unwrap()))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 fn ts_enc_value(
     ty: &CsilTypeExpression,
     expr: &str,
@@ -261,6 +291,10 @@ fn ts_enc_value(
             "null" | "nil" => "null".to_string(),
             _ => expr.to_string(),
         },
+        CsilTypeExpression::Choice(arms) if csilgen_common::enum_numbers(arms).is_some() => {
+            imports.insert("enumToNumber".into());
+            format!("enumToNumber({expr}, [{}])", named_numbers(arms))
+        }
         CsilTypeExpression::Reference(name) if ctx.records.contains(&common::to_pascal(name)) => {
             imports.insert(format!("to{}CborValue", common::to_pascal(name)));
             format!("to{}CborValue({expr})", common::to_pascal(name))
@@ -284,14 +318,22 @@ fn ts_enc_value(
                 format!("{expr}.map((csilE): CborValue => {inner})")
             }
         }
-        CsilTypeExpression::Map { value, .. } => {
+        CsilTypeExpression::Map { key, value, .. } => {
             // The in-memory type is `Record<string, V>`; the wire form is a CBOR
             // map, so the object's entries are rebuilt as a `Map` (insertion order).
             imports.insert("CborValue".to_string());
             let inner = ts_enc_value(value, "csilV", ctx, imports);
-            format!(
-                "new Map<CborValue, CborValue>(Object.entries({expr}).map(([csilK, csilV]): [CborValue, CborValue] => [csilK, {inner}]))"
-            )
+            if named_number_key(key, ctx) {
+                imports.insert("enumNumberMap".into());
+                let number = ts_enc_value(key, "csilK", ctx, imports);
+                format!(
+                    "enumNumberMap(Object.entries({expr}).map(([csilK, csilV]): [bigint, CborValue] => [{number}, {inner}]))"
+                )
+            } else {
+                format!(
+                    "new Map<CborValue, CborValue>(Object.entries({expr}).map(([csilK, csilV]): [CborValue, CborValue] => [csilK, {inner}]))"
+                )
+            }
         }
         CsilTypeExpression::Tuple(group) => {
             // A tuple is a fixed-length positional CBOR array; an absent optional
@@ -381,6 +423,16 @@ fn ts_dec_value(
             format!("from{}CborValue({expr})", common::to_pascal(name))
         }
         CsilTypeExpression::Reference(name) => match ctx.aliases.get(&common::to_pascal(name)) {
+            Some(CsilTypeExpression::Choice(arms))
+                if csilgen_common::enum_numbers(arms).is_some() =>
+            {
+                imports.insert("enumFromNumber".into());
+                format!(
+                    "(enumFromNumber({expr}, [{}]) as {})",
+                    named_numbers(arms),
+                    common::to_pascal(name)
+                )
+            }
             Some(underlying) => ts_dec_value(underlying, expr, ctx, imports),
             None => format!(
                 "({expr} as unknown as {})",
@@ -392,12 +444,17 @@ fn ts_dec_value(
             let inner = ts_dec_value(element_type, "csilE", ctx, imports);
             format!("asArray({expr}).map((csilE) => {inner})")
         }
-        CsilTypeExpression::Map { value, .. } => {
+        CsilTypeExpression::Map { key, value, .. } => {
             imports.insert("asMap".to_string());
-            imports.insert("asString".to_string());
+            let key = if named_number_key(key, ctx) {
+                ts_dec_value(key, "csilK", ctx, imports)
+            } else {
+                imports.insert("asString".to_string());
+                "asString(csilK)".into()
+            };
             let inner = ts_dec_value(value, "csilV", ctx, imports);
             format!(
-                "Object.fromEntries(Array.from(asMap({expr}), ([csilK, csilV]): [string, {}] => [asString(csilK), {inner}]))",
+                "Object.fromEntries(Array.from(asMap({expr}), ([csilK, csilV]): [string, {}] => [{key}, {inner}]))",
                 common::ts_type(value, ctx.mapping)
             )
         }
@@ -919,12 +976,78 @@ fn emit_record_codec(name: &str, group: &CsilGroupExpression, ctx: &Ctx) -> Stri
     out
 }
 
+fn rpc_replies(spec: &CsilSpecSerialized, ctx: &Ctx) -> String {
+    let mut out = String::new();
+    let mut exceptions = BTreeSet::new();
+    let mut imports = BTreeSet::new();
+    let mut resolve = String::from(
+        "export function resolveRpcReply(service: string, op: string, variant: string | null | undefined, payload: Uint8Array): Uint8Array {\n",
+    );
+    for (service, op, arms) in spec.rpc_operations() {
+        let stem = format!(
+            "{}{}",
+            common::to_pascal(service),
+            common::to_pascal(&op.name)
+        );
+        let success = common::ts_type(&arms[0], ctx.mapping);
+        let mut encode = format!(
+            "export async function encode{stem}Reply(handler: () => Promise<{success}> | {success}): Promise<RpcReply> {{\n  try {{\n    const value = await handler();\n"
+        );
+        resolve.push_str(&format!(
+            "  if (service === {service:?} && op === {:?}) {{\n    switch (variant) {{\n",
+            op.name
+        ));
+        for (index, arm) in arms.iter().enumerate() {
+            let wire = arm.rpc_variant_name().unwrap();
+            let cls = format!("{}Refusal", common::to_pascal(wire));
+            if index == 0 {
+                let value = ts_enc_value(arm, "value", ctx, &mut imports);
+                encode.push_str(&format!("    return {{ variant: {wire:?}, payload: encodeValue({value}) }};\n  }} catch (error) {{\n"));
+                resolve.push_str(&format!("      case {wire:?}: return payload;\n"));
+            } else {
+                if exceptions.insert(cls.clone()) {
+                    let ty = common::ts_type(arm, ctx.mapping);
+                    out.push_str(&format!("export class {cls} extends Error {{\n  constructor(readonly value: {ty}) {{ super({wire:?}); }}\n}}\n\n"));
+                }
+                let fallback =
+                    wire == "ServiceError" && !spec.rules.iter().any(|rule| rule.name == wire);
+                let value = if fallback {
+                    "new Map<CborValue, CborValue>([[\"code\", error.value.code], [\"message\", error.value.message]])".into()
+                } else {
+                    ts_enc_value(arm, "error.value", ctx, &mut imports)
+                };
+                encode.push_str(&format!("    if (error instanceof {cls}) return {{ variant: {wire:?}, payload: encodeValue({value}) }};\n"));
+                let value = if fallback {
+                    "{ code: asNumber(requireKey(tree, \"code\")), message: asString(requireKey(tree, \"message\")) }".into()
+                } else {
+                    ts_dec_value(arm, "tree", ctx, &mut imports)
+                };
+                resolve.push_str(&format!("      case {wire:?}: {{ const tree = decode(payload); throw new {cls}({value}); }}\n"));
+            }
+        }
+        out.push_str(&encode);
+        out.push_str("    throw error;\n  }\n}\n\n");
+        resolve.push_str(
+            "      default: throw new Error(`invalid RPC reply variant ${variant}`);\n    }\n  }\n",
+        );
+    }
+    if !out.is_empty() {
+        out.insert_str(
+            0,
+            "export interface RpcReply { variant: string; payload: Uint8Array }\n\n",
+        );
+        out.push_str(&resolve);
+        out.push_str("  return payload;\n}\n");
+    }
+    out
+}
+
 /// Build `codec.gen.ts`: the self-contained canonical-CBOR runtime plus a codec
 /// per record. `None` when the spec declares no record types.
 pub fn generate(input: &WasmGeneratorInput) -> Option<String> {
     let spec = &input.csil_spec;
     let records = record_names(spec);
-    if records.is_empty() {
+    if records.is_empty() && spec.rpc_operations().next().is_none() {
         return None;
     }
     let mapping = common::decimal_mapping(input).unwrap_or(DecimalMapping::Csil);
@@ -957,6 +1080,12 @@ pub fn generate(input: &WasmGeneratorInput) -> Option<String> {
                     uses_decimal = true;
                 }
             }
+        }
+    }
+    for (_, _, arms) in spec.rpc_operations() {
+        for arm in arms {
+            common::collect_type_refs(arm, &mut imports);
+            uses_decimal |= type_uses_decimal(arm);
         }
     }
     // Each union's codec signature names the union type and may reference records or
@@ -1008,6 +1137,7 @@ pub fn generate(input: &WasmGeneratorInput) -> Option<String> {
         }
     }
 
+    out.push_str(&rpc_replies(spec, &ctx));
     Some(out)
 }
 
@@ -1342,6 +1472,32 @@ export function asLiteral<T extends CborValue>(value: CborValue, expected: T): T
 /** Validate a decoded scalar against a literal-enum's declared vocabulary, erroring
  * on an unknown value. The caller reads through `asNumber`/`asString`/`asBool`, which
  * already normalize a decoded `bigint` to `number`, so a plain membership check suffices. */
+/** CBOR orders unsigned integer keys first, then negative keys by magnitude. */
+export function enumNumberMap(entries: [bigint, CborValue][]): Map<CborValue, CborValue> {
+  return new Map(entries.sort(([a], [b]) => {
+    if (a === b) return 0;
+    if ((a < 0n) !== (b < 0n)) return a < 0n ? 1 : -1;
+    if (a < 0n) return a > b ? -1 : 1;
+    return a < b ? -1 : 1;
+  }));
+}
+
+export function enumToNumber(label: string, entries: readonly (readonly [string, bigint])[]): bigint {
+  for (const [name, number] of entries) {
+    if (name === label) return number;
+  }
+  throw new Error("unknown enum label");
+}
+
+export function enumFromNumber(value: CborValue, entries: readonly (readonly [string, bigint])[]): string {
+  if (typeof value === "bigint" || (typeof value === "number" && Number.isSafeInteger(value))) {
+    for (const [name, number] of entries) {
+      if (BigInt(value) === number) return name;
+    }
+  }
+  throw new Error("unknown enum number");
+}
+
 export function asEnumMember<T extends number | string | boolean | null>(
   value: T,
   members: readonly T[],

@@ -132,6 +132,7 @@ pub fn generate_ruby_code_from_serialized(
     spec: &CsilSpecSerialized,
     config: &GeneratorConfig,
 ) -> Result<Vec<GeneratedFile>, i32> {
+    let spec = &csilgen_common::hoist_inline_named_numbers(spec);
     let surface = match config.target.as_str() {
         "ruby" | "ruby-server" => Surface::Server,
         "ruby-client" => Surface::Client,
@@ -487,10 +488,7 @@ class HttpRpcTransport
 
     # The library parses the envelope and raises StatusError on a non-zero transport status.
     reply = RPC::RpcResponse.decode((res.body || "").b).into_transport_error
-    # A typed ServiceError arm rides as a status-0 variant, distinct from a transport
-    # failure; surface it so the typed client decodes a success payload only.
-    raise "csil-rpc #{service}/#{op}: ServiceError" if reply.variant == "ServiceError"
-    reply.payload
+    CsilCbor.resolve_rpc_reply(service, op, reply.variant, reply.payload)
   end
 end
 "##;
@@ -724,7 +722,7 @@ fn first_unary_example(spec: &CsilSpecSerialized) -> Option<UnaryExample> {
             continue;
         };
         let has_request = !op_input_is_null(&op.input_type);
-        let success = success_type(&op.output_type);
+        let success = success_type(op.success_output());
         return Some(UnaryExample {
             client_class: format!("{}Client", service_base(&rule.name)),
             method: ruby_method_name(&op.name),
@@ -787,7 +785,7 @@ fn first_channel_example(spec: &CsilSpecSerialized) -> Option<ChannelExample> {
             if !matches!(op.direction, CsilServiceDirection::Bidirectional) {
                 continue;
             }
-            let success = success_type(&op.output_type);
+            let success = success_type(op.success_output());
             let (Some(inbound), Some(outbound)) = (
                 record_class(spec, &op.input_type),
                 record_class(spec, &success),
@@ -1263,6 +1261,36 @@ fn generate_types_file(spec: &CsilSpecSerialized) -> Option<String> {
             body.push_str(&emit_value_type(&rule.name, &rule.doc_comments, group));
             continue;
         }
+        if let CsilRuleType::TypeDef(CsilTypeExpression::Choice(arms))
+        | CsilRuleType::TypeChoice(arms) = &rule.rule_type
+            && let Some(members) = csilgen_common::text_enum_members(arms)
+        {
+            has_types = true;
+            let class = ruby_class_name(&rule.name);
+            body.push_str(&format!("class {class} < String\n"));
+            for (member, wire) in &members {
+                body.push_str(&format!(
+                    "  {member} = new({}).freeze\n",
+                    ruby_string_literal(wire)
+                ));
+            }
+            let names = members
+                .iter()
+                .map(|(name, _)| name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            if let Some(numbers) = csilgen_common::enum_numbers(arms) {
+                let entries = members
+                    .iter()
+                    .zip(&numbers)
+                    .map(|((member, _), n)| format!("{member} => {n}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                body.push_str(&format!("  NUMBERS = {{{entries}}}.freeze\n  BY_NUMBER = NUMBERS.invert.freeze\n  def self.to_number(value)\n    NUMBERS.fetch(value) {{ raise ArgumentError, \"unknown {class} member\" }}\n  end\n\n  def self.from_number(value)\n    BY_NUMBER.fetch(value) {{ raise ArgumentError, \"unknown {class} number\" }}\n  end\n\n"));
+            }
+            body.push_str(&format!("  MEMBERS_BY_WIRE = [{names}].to_h {{ |v| [v, v] }}.freeze\n  private_class_method :new\n\n  def self.from_wire(value)\n    MEMBERS_BY_WIRE.fetch(value) {{ raise ArgumentError, \"unknown {class} value: #{{value.inspect}}\" }}\n  end\nend\n\n"));
+            continue;
+        }
         if let CsilRuleType::TypeDef(type_expr) = &rule.rule_type {
             has_types = true;
             // Ruby is dynamically typed and has no type alias; surface the aliased
@@ -1278,7 +1306,7 @@ fn generate_types_file(spec: &CsilSpecSerialized) -> Option<String> {
         }
     }
 
-    if !has_types {
+    if !has_types && spec.rpc_operations().next().is_none() {
         return None;
     }
 
@@ -1644,6 +1672,7 @@ fn emit_control_op_check(
 ) {
     let name = field.name;
     match op {
+        CsilControlOperator::EnumNumber(_) => {}
         CsilControlOperator::GreaterEqual(v) => {
             emit_ordered_check(out, field, value_type, ("<", "at least"), v)
         }
@@ -1990,6 +2019,10 @@ fn enc_tree(
         // just the underlying Hash/Array/scalar, so encode it as the underlying type and
         // let the same `expr` flow through. A map-of-record alias recurses into the
         // record codec via the underlying Map's value type.
+        CsilTypeExpression::Reference(name) if matches!(aliases.get(name), Some(CsilTypeExpression::Choice(arms)) if csilgen_common::enum_numbers(arms).is_some()) =>
+        {
+            format!("{}.to_number({expr})", ruby_class_name(name))
+        }
         CsilTypeExpression::Reference(name) if aliases.contains_key(name) => {
             enc_tree(&aliases[name], expr, records, aliases, unions)
         }
@@ -2085,6 +2118,18 @@ fn dec_tree(
         // A reference to a transparent alias decodes as its underlying type; the decoded
         // Hash/Array/scalar is the alias's Ruby value verbatim. A map-of-record alias
         // recurses into the record codec via the underlying Map's value type.
+        CsilTypeExpression::Reference(name) if matches!(aliases.get(name), Some(CsilTypeExpression::Choice(arms)) if csilgen_common::text_enum_members(arms).is_some()) =>
+        {
+            let Some(CsilTypeExpression::Choice(arms)) = aliases.get(name) else {
+                unreachable!()
+            };
+            let method = if csilgen_common::enum_numbers(arms).is_some() {
+                "from_number"
+            } else {
+                "from_wire"
+            };
+            format!("{}.{method}({expr})", ruby_class_name(name))
+        }
         CsilTypeExpression::Reference(name) if aliases.contains_key(name) => {
             dec_tree(&aliases[name], expr, records, aliases, unions)
         }
@@ -2467,7 +2512,7 @@ fn emit_record_codec(
 /// consumer can `require_relative "codec"`.
 fn generate_codec_file(spec: &CsilSpecSerialized) -> Option<String> {
     let records = codec_record_names(spec);
-    if records.is_empty() {
+    if records.is_empty() && spec.rpc_operations().next().is_none() {
         return None;
     }
     let aliases = codec_aliases(spec);
@@ -2517,6 +2562,39 @@ fn generate_codec_file(spec: &CsilSpecSerialized) -> Option<String> {
         }
     }
 
+    let mut refusals = std::collections::BTreeSet::new();
+    content.push_str("module CsilCbor\n  module_function\n\n");
+    let mut resolve = String::from("  def resolve_rpc_reply(service, op, variant, payload)\n");
+    for (service, op, arms) in spec.rpc_operations() {
+        let stem = ruby_method_name(&format!("{service}_{}", op.name));
+        let method = &op.name;
+        let success = arms[0].rpc_variant_name().unwrap();
+        let enc = enc_tree(&arms[0], "value", &records, &aliases, &unions);
+        let mut handler = format!(
+            "  def encode_{stem}_reply\n    value = yield\n    [{success:?}, encode({enc})]\n"
+        );
+        resolve.push_str(&format!("    if service == {service:?} && op == {method:?}\n      case variant\n      when {success:?} then return payload\n"));
+        for arm in &arms[1..] {
+            let wire = arm.rpc_variant_name().unwrap();
+            let class = format!("{}Refusal", ruby_class_name(wire));
+            if refusals.insert(class.clone()) {
+                content.push_str(&format!("  class {class} < StandardError\n    attr_reader :value\n\n    def initialize(value)\n      @value = value\n      super({wire:?})\n    end\n  end\n\n"));
+            }
+            let enc = enc_tree(arm, "refusal.value", &records, &aliases, &unions);
+            let dec = dec_tree(arm, "decode(payload)", &records, &aliases, &unions);
+            handler.push_str(&format!(
+                "  rescue {class} => refusal\n    [{wire:?}, encode({enc})]\n"
+            ));
+            resolve.push_str(&format!(
+                "      when {wire:?} then raise {class}.new({dec})\n"
+            ));
+        }
+        content.push_str(&handler);
+        content.push_str("  end\n\n");
+        resolve.push_str("      else raise ArgumentError, \"invalid RPC reply variant: #{variant.inspect}\"\n      end\n    end\n");
+    }
+    content.push_str(&resolve);
+    content.push_str("    payload\n  end\nend\n");
     Some(finalize(content))
 }
 
@@ -2890,11 +2968,15 @@ const CLIENT_PRELUDE: &str = "\
 
 fn generate_client_file(spec: &CsilSpecSerialized) -> Option<String> {
     let records = codec_record_names(spec);
+    let aliases = codec_aliases(spec);
+    let unions = codec_unions(spec);
     let mut body = String::new();
     let mut emitted = false;
     for rule in &spec.rules {
         if let CsilRuleType::ServiceDef(service) = &rule.rule_type {
-            body.push_str(&emit_client_class(&rule.name, service));
+            body.push_str(&emit_client_class(
+                &rule.name, service, &records, &aliases, &unions,
+            ));
             if let Some(wire_ids) = emit_wire_ids(&rule.name, service) {
                 body.push_str(&wire_ids);
             }
@@ -2911,7 +2993,7 @@ fn generate_client_file(spec: &CsilSpecSerialized) -> Option<String> {
     content.push_str("# Code generated by csilgen; DO NOT EDIT.\n\n");
     // The typed methods call `to_cbor`/`from_cbor` on the generated value classes,
     // which the codec defines; pull it in (it requires the types) when records exist.
-    if !records.is_empty() {
+    if !records.is_empty() || spec.rpc_operations().next().is_some() {
         content.push_str("require_relative \"codec\"\n\n");
     }
     content.push_str(CLIENT_PRELUDE);
@@ -2920,7 +3002,13 @@ fn generate_client_file(spec: &CsilSpecSerialized) -> Option<String> {
     Some(finalize(content))
 }
 
-fn emit_client_class(name: &str, service: &CsilServiceDefinition) -> String {
+fn emit_client_class(
+    name: &str,
+    service: &CsilServiceDefinition,
+    records: &std::collections::HashSet<String>,
+    aliases: &std::collections::HashMap<String, CsilTypeExpression>,
+    unions: &std::collections::HashMap<String, Vec<CsilTypeExpression>>,
+) -> String {
     let base = service_base(name);
     let client = format!("{base}Client");
     // The wire service string is the CSIL service name verbatim
@@ -2947,7 +3035,7 @@ fn emit_client_class(name: &str, service: &CsilServiceDefinition) -> String {
         let method = ruby_method_name(&op.name);
         let wire_method = &op.name;
         let has_input = !op_input_is_null(&op.input_type);
-        let success = success_type(&op.output_type);
+        let success = success_type(op.success_output());
         let out_ty = map_csil_type_to_ruby(&success);
 
         out.push('\n');
@@ -2960,9 +3048,21 @@ fn emit_client_class(name: &str, service: &CsilServiceDefinition) -> String {
         }
         // The request encodes to its canonical CBOR bytes; a null-input op sends an
         // empty byte payload since it carries no request body.
+        let typed_codec = op.rpc_reply_arms().is_some()
+            || matches!(&success, CsilTypeExpression::Reference(name) if unions.contains_key(name));
         let payload = match (has_input, &op.input_type) {
             (false, _) => "\"\".b".to_string(),
-            (true, CsilTypeExpression::Reference(_)) => "req.to_cbor".to_string(),
+            (true, CsilTypeExpression::Reference(name))
+                if records.contains(name)
+                    || !typed_codec
+                    || (!aliases.contains_key(name) && !unions.contains_key(name)) =>
+            {
+                "req.to_cbor".to_string()
+            }
+            (true, ty) if typed_codec => {
+                let tree = enc_tree(ty, "req", records, aliases, unions);
+                format!("CsilCbor.encode({tree})")
+            }
             // A non-record request can't self-serialize; the caller passes ready bytes.
             (true, _) => "req".to_string(),
         };
@@ -2970,9 +3070,20 @@ fn emit_client_class(name: &str, service: &CsilServiceDefinition) -> String {
         // A reference success type is a generated value class, so decode the reply
         // bytes through its codec; anything else rides back as raw bytes.
         let body = match &success {
-            CsilTypeExpression::Reference(resp) => {
+            CsilTypeExpression::Reference(resp)
+                if records.contains(resp)
+                    || !typed_codec
+                    || (!aliases.contains_key(resp) && !unions.contains_key(resp)) =>
+            {
                 format!("{}.from_cbor({call})", ruby_class_name(resp))
             }
+            ty if typed_codec => dec_tree(
+                ty,
+                &format!("CsilCbor.decode({call})"),
+                records,
+                aliases,
+                unions,
+            ),
             _ => call,
         };
         if has_input {
@@ -3598,7 +3709,13 @@ mod tests {
             }],
             wire_id: None,
         };
-        let out = emit_client_class("CorndogsService", &service);
+        let out = emit_client_class(
+            "CorndogsService",
+            &service,
+            &["SubmitTaskRequest".into(), "Task".into()].into(),
+            &Default::default(),
+            &Default::default(),
+        );
         // The request self-encodes, the reply self-decodes; the transport only moves
         // bytes over the verbatim CSIL service/op wire strings. The ServiceError arm
         // is dropped from the success type.
@@ -3759,7 +3876,9 @@ mod tests {
         assert!(
             body.contains("RPC::RpcResponse.decode((res.body || \"\").b).into_transport_error")
         );
-        assert!(body.contains("if reply.variant == \"ServiceError\""));
+        assert!(
+            body.contains("CsilCbor.resolve_rpc_reply(service, op, reply.variant, reply.payload)")
+        );
         // Typed client + the first `->` call with a generated sample literal.
         assert!(body.contains("UserClient.new(HttpRpcTransport.new(\"http://localhost:5080\"))"));
         assert!(body.contains("resp = client.get_user(User.new(name: \"example\", id: 0))"));

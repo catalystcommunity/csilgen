@@ -257,6 +257,7 @@ pub fn render(mut input: WasmGeneratorInput) -> Result<WasmGeneratorOutput, i32>
     // hoists to a synthesized `ScalarsSize` enum today. Passing `false` here would silently
     // regress that field (and every field like it) back to an untyped `object` with a
     // null-emitting codec.
+    input.csil_spec.supply_implicit_service_error();
     input.csil_spec = csilgen_common::hoist_inline_composites(
         &input.csil_spec,
         csilgen_common::HoistOptions {
@@ -675,9 +676,7 @@ public sealed class HttpRpcCarrier : ICsilTransport, IDisposable
             throw ex;
         // A typed application error rides as a status-0 "ServiceError" variant — distinct
         // from a transport failure. Surface it so the typed client decodes success only.
-        if (resp.Variant == "ServiceError")
-            throw new System.Exception($"csil-rpc {service}/{op}: ServiceError");
-        return resp.Payload;
+        return Codec.ResolveRpcReply(service, op, resp.Variant, resp.Payload);
     }
 
     public void Dispose() => _http.Dispose();
@@ -949,7 +948,7 @@ fn first_readme_example(
             if !matches!(op.direction, CsilServiceDirection::Unidirectional) {
                 continue;
             }
-            let success = success_type(&op.output_type);
+            let success = success_type(op.success_output());
             let req_null = op_input_is_null(&op.input_type);
             if !is_record_ref(&success, records)
                 || !(req_null || is_record_ref(&op.input_type, records))
@@ -1044,7 +1043,7 @@ fn csharp_handler_stubs(service: &CsilServiceDefinition, config: &CsharpConfig) 
         let method = pascal_ident(&op.name);
         match op.direction {
             CsilServiceDirection::Unidirectional => {
-                let output = map_csil_type(&success_type(&op.output_type), config);
+                let output = map_csil_type(&success_type(op.success_output()), config);
                 if op_input_is_null(&op.input_type) {
                     out.push_str(&format!(
                         "        public {output} {method}() => throw new System.NotImplementedException();\n"
@@ -1439,7 +1438,12 @@ fn enum_member_ident(enum_name: &str, literal: &CsilLiteralValue, index: usize) 
 
 fn emit_enum(body: &mut String, name: &str, choices: &[CsilTypeExpression]) {
     let enum_name = pascal_ident(name);
-    body.push_str(&format!("public enum {enum_name}\n{{\n"));
+    let numbers = csilgen_common::enum_numbers(choices);
+    if numbers.is_some() {
+        body.push_str(&format!("[System.Text.Json.Serialization.JsonConverter(typeof({enum_name}JsonConverter))]\npublic enum {enum_name} : long\n{{\n"));
+    } else {
+        body.push_str(&format!("public enum {enum_name}\n{{\n"));
+    }
     for (index, choice) in choices.iter().enumerate() {
         // `choice_arm_literal` sees through a `.default`-style control-operator wrapper so a
         // trailing-`.default` literal arm still contributes its enum member. `classify_choice`
@@ -1450,6 +1454,12 @@ fn emit_enum(body: &mut String, name: &str, choices: &[CsilTypeExpression]) {
         };
         let member = enum_member_ident(&enum_name, literal, index);
         match literal {
+            CsilLiteralValue::Text(_) if numbers.is_some() => {
+                body.push_str(&format!(
+                    "    {member} = {},\n",
+                    numbers.as_ref().unwrap()[index]
+                ));
+            }
             CsilLiteralValue::Text(text) => {
                 // The literal text is the wire value verbatim; the member name is a
                 // generator-side PascalCase mapping of it.
@@ -1465,6 +1475,21 @@ fn emit_enum(body: &mut String, name: &str, choices: &[CsilTypeExpression]) {
         }
     }
     body.push_str("}\n\n");
+    if numbers.is_some() {
+        let mut read = String::new();
+        let mut write = String::new();
+        for (i, arm) in choices.iter().enumerate() {
+            let literal = choice_arm_literal(arm).unwrap();
+            let CsilLiteralValue::Text(label) = literal else {
+                unreachable!()
+            };
+            let member = enum_member_ident(&enum_name, literal, i);
+            let label = csharp_escape(label);
+            read.push_str(&format!("        \"{label}\" => {enum_name}.{member},\n"));
+            write.push_str(&format!("        {enum_name}.{member} => \"{label}\",\n"));
+        }
+        body.push_str(&format!("public sealed class {enum_name}JsonConverter : System.Text.Json.Serialization.JsonConverter<{enum_name}>\n{{\n    public override {enum_name} Read(ref System.Text.Json.Utf8JsonReader reader, System.Type type, System.Text.Json.JsonSerializerOptions options) => reader.GetString() switch\n    {{\n{read}        _ => throw new System.Text.Json.JsonException(\"unknown {enum_name} label\"),\n    }};\n\n    public override void Write(System.Text.Json.Utf8JsonWriter writer, {enum_name} value, System.Text.Json.JsonSerializerOptions options) => writer.WriteStringValue(value switch\n    {{\n{write}        _ => throw new System.Text.Json.JsonException(\"unknown {enum_name} value\"),\n    }});\n}}\n\n"));
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1587,7 +1612,7 @@ fn emit_client_class(
         if !matches!(operation.direction, CsilServiceDirection::Unidirectional) {
             return false;
         }
-        let success = success_type(&operation.output_type);
+        let success = success_type(operation.success_output());
         let null_input = op_input_is_null(&operation.input_type);
         let req_ok =
             null_input || op_boundary_expressible(&operation.input_type, records, aliases, choices);
@@ -1619,7 +1644,7 @@ fn emit_client_class(
             ));
             continue;
         }
-        let success = success_type(&operation.output_type);
+        let success = success_type(operation.success_output());
         let null_input = op_input_is_null(&operation.input_type);
         let req_ok =
             null_input || op_boundary_expressible(&operation.input_type, records, aliases, choices);
@@ -1748,7 +1773,7 @@ fn emit_op_codecs(
             if !matches!(op.direction, CsilServiceDirection::Unidirectional) {
                 continue;
             }
-            let success = success_type(&op.output_type);
+            let success = success_type(op.success_output());
             let null_input = op_input_is_null(&op.input_type);
             let req_ok =
                 null_input || op_boundary_expressible(&op.input_type, records, aliases, choices);
@@ -2300,6 +2325,7 @@ fn ident_suffix(expr: &str) -> String {
 fn emit_enum_codec(type_name: &str, cases: &[CsilTypeExpression]) -> String {
     // `choice_arm_literal` strips a `.default`-style wrapper so a trailing-`.default`
     // literal arm is still classified and encoded as its own literal value.
+    let numbers = csilgen_common::enum_numbers(cases);
     let int_only = cases
         .iter()
         .all(|c| matches!(choice_arm_literal(c), Some(CsilLiteralValue::Integer(_))));
@@ -2317,6 +2343,12 @@ fn emit_enum_codec(type_name: &str, cases: &[CsilTypeExpression]) -> String {
             // Encode is unaffected by the mixed-kind decode bug below: each arm's `value
             // switch` produces its own `CborValue` per enum MEMBER, not per wire kind — kept
             // byte-identical to the pre-migration rendering for these two kinds.
+            CsilLiteralValue::Text(_) if numbers.is_some() => {
+                to_arms.push_str(&format!(
+                    "        {type_name}.{member} => new CborValue.Int({}),\n",
+                    numbers.as_ref().unwrap()[index]
+                ));
+            }
             CsilLiteralValue::Text(text) => {
                 let lit = csharp_escape(text);
                 to_arms.push_str(&format!(
@@ -2356,7 +2388,14 @@ fn emit_enum_codec(type_name: &str, cases: &[CsilTypeExpression]) -> String {
     // literal kind into `Enum`, not just Text/Integer) — takes the general path: each arm
     // matched by ITS OWN kind-appropriate pattern against the raw `CborValue`, so no single
     // scalar extractor has to assume every member shares one wire kind.
-    if int_only {
+    if let Some(numbers) = numbers {
+        let mut arms = String::new();
+        for (index, (case, n)) in cases.iter().zip(numbers).enumerate() {
+            let member = enum_member_ident(type_name, choice_arm_literal(case).unwrap(), index);
+            arms.push_str(&format!("        {n} => {type_name}.{member},\n"));
+        }
+        out.push_str(&format!("    public static {type_name} {type_name}FromCborValue(CborValue value) => Cbor.AsI64(value) switch\n    {{\n{arms}        _ => throw new CborException(\"invalid {type_name} value\"),\n    }};\n\n"));
+    } else if int_only {
         let mut from_arms = String::new();
         for (index, case) in cases.iter().enumerate() {
             if let Some(literal @ CsilLiteralValue::Integer(value)) = choice_arm_literal(case) {
@@ -2454,7 +2493,10 @@ fn generate_codec(input: &WasmGeneratorInput, config: &CsharpConfig) -> Option<S
     // Per-op byte helpers for non-record op boundaries; their presence also means a
     // record-free spec with scalar/array/map ops still needs the codec runtime + class.
     let op_codecs = emit_op_codecs(input, &records, &aliases, &choices, config);
-    if !spec_has_records(input) && op_codecs.is_empty() {
+    if !spec_has_records(input)
+        && op_codecs.is_empty()
+        && input.csil_spec.rpc_operations().next().is_none()
+    {
         return None;
     }
     let uses_timestamp = spec_uses_builtin(input, "timestamp");
@@ -2543,6 +2585,50 @@ fn generate_codec(input: &WasmGeneratorInput, config: &CsharpConfig) -> Option<S
     );
     content.push_str(&methods);
     content.push_str(&op_codecs);
+    {
+        let mut emitted = std::collections::BTreeSet::new();
+        let mut resolve = String::from(
+            "    public static byte[] ResolveRpcReply(string service, string op, string? variant, byte[] payload)\n    {\n",
+        );
+        for (service, op, arms) in input.csil_spec.rpc_operations() {
+            let method = &op.name;
+            let stem = op_codec_stem(service, &op.name);
+            let success = map_csil_type(&arms[0], config);
+            let mut encode = format!(
+                "    public static (string Variant, byte[] Payload) Encode{stem}Reply(System.Func<{success}> handler)\n    {{\n        try\n        {{\n            var value = handler();\n"
+            );
+            resolve.push_str(&format!("        if (service == \"{service}\" && op == \"{method}\")\n        {{\n            return variant switch\n            {{\n"));
+            for (i, arm) in arms.iter().enumerate() {
+                let wire = arm.rpc_variant_name().unwrap();
+                let ty = map_csil_type(arm, config);
+                let exception = format!("{}Refusal", pascal_ident(wire));
+                let source = if i == 0 { "value" } else { "refusal.Value" };
+                let enc = csharp_enc_value(arm, source, &records, &aliases, &choices);
+                if i == 0 {
+                    encode.push_str(&format!(
+                        "            return (\"{wire}\", Cbor.Encode({enc}));\n"
+                    ));
+                    resolve.push_str(&format!("                \"{wire}\" => payload,\n"));
+                } else {
+                    let dec =
+                        csharp_dec_value(arm, "Cbor.Decode(payload)", &records, &aliases, &choices);
+                    if emitted.insert(exception.clone()) {
+                        content.push_str(&format!("    public sealed class {exception}({ty} value) : System.Exception(\"{wire}\")\n    {{\n        public {ty} Value {{ get; }} = value;\n    }}\n\n"));
+                    }
+                    encode.push_str(&format!("        }}\n        catch ({exception} refusal)\n        {{\n            return (\"{wire}\", Cbor.Encode({enc}));\n"));
+                    resolve.push_str(&format!(
+                        "                \"{wire}\" => throw new {exception}({dec}),\n"
+                    ));
+                }
+            }
+            encode.push_str("        }\n    }\n\n");
+            content.push_str(&encode);
+            resolve.push_str("                _ => throw new CborException(\"invalid RPC reply variant: \" + variant),\n            };\n        }\n");
+        }
+        resolve.push_str("        return payload;\n    }\n");
+        content.push_str(&resolve);
+    }
+
     // Drop the trailing blank line the last method leaves so the class closes cleanly.
     while content.ends_with("\n\n") {
         content.pop();
@@ -2614,7 +2700,7 @@ fn emit_service_interface(
         let method = pascal_ident(&operation.name);
         match operation.direction {
             CsilServiceDirection::Unidirectional => {
-                let output = map_csil_type(&success_type(&operation.output_type), config);
+                let output = map_csil_type(&success_type(operation.success_output()), config);
                 match op_param(&operation.input_type) {
                     None => body.push_str(&format!("    {output} {method}();\n")),
                     Some(param) => {
@@ -2944,6 +3030,7 @@ fn emit_control_op_check(
     config: &CsharpConfig,
 ) {
     match op {
+        CsilControlOperator::EnumNumber(_) => {}
         CsilControlOperator::GreaterEqual(v) => {
             emit_ordered_check(body, field, value_type, ("<", "at least"), v, config)
         }
@@ -5080,7 +5167,7 @@ System.Console.WriteLine("ok");
         assert!(rpc.contains("new RpcRequest(service, op, request).Encode()"));
         assert!(rpc.contains("RpcResponse.Decode(body)"));
         assert!(rpc.contains("resp.AsTransportError() is StatusException"));
-        assert!(rpc.contains("resp.Variant == \"ServiceError\""));
+        assert!(rpc.contains("Codec.ResolveRpcReply(service, op, resp.Variant, resp.Payload)"));
         assert!(rpc.contains("new EchoClient(new HttpRpcCarrier("));
         assert!(rpc.contains("client.Ping(new Ping { Msg = \"example\" })"));
 
@@ -6128,6 +6215,13 @@ System.Console.WriteLine("ok");
             .csil_spec
             .rules
             .retain(|r| matches!(r.rule_type, CsilRuleType::ServiceDef(_)));
+        for rule in &mut input.csil_spec.rules {
+            if let CsilRuleType::ServiceDef(service) = &mut rule.rule_type {
+                for op in &mut service.operations {
+                    op.output_type = CsilTypeExpression::Builtin("text".into());
+                }
+            }
+        }
         let output = render(input).expect("generation ok");
         assert!(!output.files.iter().any(|f| f.path == "Codec.gen.cs"));
     }

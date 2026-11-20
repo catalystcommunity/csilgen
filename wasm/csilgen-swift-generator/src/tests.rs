@@ -2025,7 +2025,9 @@ fn readme_rpc_section_uses_lib_envelope_and_example_call() {
     // Decode + both error arms via the lib: non-zero transport status and the ServiceError arm.
     assert!(c.contains("RpcResponse.decode(try outcome.get())"));
     assert!(c.contains("resp.asTransportError()"));
-    assert!(c.contains("resp.variant == \"ServiceError\""));
+    assert!(c.contains(
+        "resolveRpcReply(service: service, op: op, variant: resp.variant, payload: resp.payload)"
+    ));
     // The typed client is built over the carrier and the example calls the first `->` op.
     assert!(
         c.contains("EchoClient(transport: HttpRpcCarrier(baseURL: \"http://localhost:5080\"))")

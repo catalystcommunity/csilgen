@@ -766,14 +766,18 @@ fn codec_emitted_with_typed_client() {
     assert!(
         client
             .content
-            .contains("Task *resp, CsilCodecArena **resp_owner)")
+            .contains("CorndogsServiceSubmitTaskReply *resp, CsilCodecArena **resp_owner)")
     );
     assert!(
         client
             .content
             .contains("csil_encode_SubmitTaskRequest(req,")
     );
-    assert!(client.content.contains("csil_decode_Task(csil_respb,"));
+    assert!(
+        client
+            .content
+            .contains("csil_decode_CorndogsServiceSubmitTaskReply(variant, csil_respb,")
+    );
 }
 
 /// Compile the generated C and round-trip a typed request/response with gcc. Skips
@@ -841,14 +845,20 @@ const CODEC_DRIVER_C: &str = r#"#include "client.gen.h"
  * typed response, exercising decode and encode on the far side of the seam. */
 static int stub_call(void *self, const char *service, const char *op,
                      const uint8_t *req, size_t req_len,
-                     uint8_t **resp, size_t *resp_len) {
+                     uint8_t **resp, size_t *resp_len, char **variant) {
     (void)self;
     assert(strcmp(service, "CorndogsService") == 0);
     assert(strcmp(op, "submit-task") == 0);
     SubmitTaskRequest in;
     CsilCodecArena *owner;
     if (csil_decode_SubmitTaskRequest(req, req_len, &in, &owner)) return 1;
-    int rc = csil_encode_Task(&in.task, resp, resp_len);
+    CorndogsServiceSubmitTaskReply reply = { .kind = CorndogsServiceSubmitTaskReply_as_task, .value.as_task = in.task };
+    const char *wire;
+    int rc = csil_encode_CorndogsServiceSubmitTaskReply(&reply, &wire, resp, resp_len);
+    if (!rc) {
+        *variant = malloc(strlen(wire) + 1);
+        strcpy(*variant, wire);
+    }
     csil_codec_arena_free(owner);
     return rc;
 }
@@ -918,11 +928,13 @@ int main(void) {
 
     /* typed client round-trip over the loopback carrier */
     CsilgenTransport tr;
-    tr.call = stub_call;
+    tr.call_reply = stub_call;
     tr.self = NULL;
-    Task resp;
+    CorndogsServiceSubmitTaskReply reply;
     CsilCodecArena *rowner = NULL;
-    assert(csil_corndogs_submit_task(&tr, &req, &resp, &rowner) == 0);
+    assert(csil_corndogs_submit_task(&tr, &req, &reply, &rowner) == 0);
+    assert(reply.kind == CorndogsServiceSubmitTaskReply_as_task);
+    Task resp = reply.value.as_task;
     assert(strcmp(resp.uuid, "u-123") == 0);
     assert(resp.payload.len == 3 && memcmp(resp.payload.data, pay, 3) == 0);
     assert(resp.priority && *resp.priority == 7);
@@ -1458,14 +1470,14 @@ fn readme_rpc_section_uses_lib_envelope_and_example_call() {
             .contains("static int csil_rpc_call(void *self, const char *service, const char *op,")
     );
     assert!(
-        readme.contains("CsilgenTransport transport = { .call = csil_rpc_call, .self = &carrier }")
+        readme.contains("CsilgenTransport transport = { .call = csil_rpc_call, .self = &carrier, .call_reply = csil_rpc_call_reply }")
     );
     // The envelope is built and parsed with the LIBRARY, not hand-rolled.
     assert!(readme.contains("csil_rpc_request_init(&rq, service, op, req, req_len)"));
     assert!(readme.contains("csil_rpc_request_encode(&rq, &env, &env_len)"));
     assert!(readme.contains("csil_rpc_response_decode(body, body_len, &rsp)"));
     assert!(readme.contains("csil_rpc_response_is_transport_error(&rsp)"));
-    assert!(readme.contains("rsp.variant && strcmp(rsp.variant, \"ServiceError\")"));
+    assert!(readme.contains("memcpy(*variant, rsp.variant, len)"));
     assert!(!readme.contains("csilc_w_tag(&env, 24)")); // no hand-rolled envelope
     // The canonical mount + the example call with a generated sample literal.
     assert!(readme.contains("POST /csil/v1/rpc HTTP/1.1"));

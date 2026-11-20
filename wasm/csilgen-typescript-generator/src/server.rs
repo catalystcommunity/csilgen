@@ -59,6 +59,23 @@ pub fn generate(input: &WasmGeneratorInput) -> Result<String, String> {
         imports.join(", ")
     ));
 
+    let rpc_helpers: Vec<_> = spec
+        .rpc_operations()
+        .map(|(name, op, _)| {
+            format!(
+                "encode{}{}Reply",
+                common::to_pascal(name),
+                common::to_pascal(&op.name)
+            )
+        })
+        .collect();
+    if !rpc_helpers.is_empty() {
+        let module = ext.specifier("codec.gen");
+        out.push_str(&format!(
+            "import {{ type RpcReply, {} }} from \"{module}\";\n\n",
+            rpc_helpers.join(", ")
+        ));
+    }
     // An inline `decimal` in an op signature makes `ts_type` print
     // `CsilDecimal`/`Decimal` straight into this file. The type-import block
     // above carries only named refs (never a builtin), so the value import is
@@ -162,7 +179,7 @@ fn handlers_interface(
 fn unary_handler_method(op: &CsilServiceOperation, mapping: DecimalMapping) -> String {
     let method = common::to_camel(&op.name);
     let req = common::ts_type(&op.input_type, mapping);
-    let res = common::ts_type(&common::success_type(&op.output_type), mapping);
+    let res = common::ts_type(&common::success_type(op.success_output()), mapping);
     let mut out = common::jsdoc(&op.doc_comments, &[], "  ");
     out.push_str(&format!(
         "  {method}(req: {req}, ctx: RequestContext): Promise<{res}>;\n"
@@ -186,7 +203,7 @@ fn rpc_send_handler_method(op: &CsilServiceOperation, mapping: DecimalMapping) -
 fn rpc_check_handler_method(op: &CsilServiceOperation, mapping: DecimalMapping) -> String {
     let camel = common::to_camel(&op.name);
     let pascal = pascal_from_camel(&camel);
-    let res = common::ts_type(&common::success_type(&op.output_type), mapping);
+    let res = common::ts_type(&common::success_type(op.success_output()), mapping);
     let mut out = common::jsdoc(&op.doc_comments, &[], "  ");
     out.push_str(&format!(
         "  check{pascal}(ctx: RequestContext): Promise<{res}[]>;\n"
@@ -319,7 +336,7 @@ fn channel_block(name: &str, def: &CsilServiceDefinition, mapping: DecimalMappin
     for op in &outbound_ops {
         let camel = common::to_camel(&op.name);
         let wire_method = common::method_wire(op);
-        let outbound = common::ts_type(&common::success_type(&op.output_type), mapping);
+        let outbound = common::ts_type(&common::success_type(op.success_output()), mapping);
         let fn_name = format!("encode{base}{}", pascal_from_camel(&camel));
         out.push_str(&format!(
             "\n\
@@ -369,6 +386,16 @@ fn dispatch(
          \x20 switch (service) {\n",
     );
 
+    if services.iter().any(|(_, def)| {
+        def.operations
+            .iter()
+            .any(|op| op.rpc_reply_arms().is_some())
+    }) {
+        out = out.replace(
+            "): Promise<Uint8Array> {",
+            "): Promise<Uint8Array | RpcReply> {",
+        );
+    }
     for (name, def) in services {
         let wire_service = common::service_wire(name);
         let field = common::to_camel(&common::service_base(name));
@@ -384,10 +411,19 @@ fn dispatch(
                     out.push_str(&format!(
                         "          const req = codec.decode<{req}>(reqBytes);\n"
                     ));
-                    out.push_str(&format!(
-                        "          const res = await handlers.{field}.{method}(req, ctx);\n"
-                    ));
-                    out.push_str("          return codec.encode(res);\n");
+                    if op.rpc_reply_arms().is_some() {
+                        let helper = format!(
+                            "encode{}{}Reply",
+                            common::to_pascal(name),
+                            common::to_pascal(&op.name)
+                        );
+                        out.push_str(&format!("          return {helper}(() => handlers.{field}.{method}(req, ctx));\n"));
+                    } else {
+                        out.push_str(&format!(
+                            "          const res = await handlers.{field}.{method}(req, ctx);\n"
+                        ));
+                        out.push_str("          return codec.encode(res);\n");
+                    }
                     out.push_str("        }\n");
                 }
                 (BidiTransport::Rpc, csilgen_common::CsilServiceDirection::Bidirectional) => {
@@ -476,6 +512,16 @@ fn dispatch_compact(
          \x20 switch (service) {\n",
     );
 
+    if services.iter().any(|(_, def)| {
+        def.operations
+            .iter()
+            .any(|op| op.rpc_reply_arms().is_some())
+    }) {
+        out = out.replace(
+            "): Promise<Uint8Array> {",
+            "): Promise<Uint8Array | RpcReply> {",
+        );
+    }
     for (name, def) in services {
         let Some(service_id) = def.wire_id else {
             continue;
@@ -501,10 +547,21 @@ fn dispatch_compact(
             out.push_str(&format!(
                 "          const req = codec.decode<{req}>(reqBytes);\n"
             ));
-            out.push_str(&format!(
-                "          const res = await handlers.{field}.{method}(req, ctx);\n"
-            ));
-            out.push_str("          return codec.encode(res);\n");
+            if op.rpc_reply_arms().is_some() {
+                let helper = format!(
+                    "encode{}{}Reply",
+                    common::to_pascal(name),
+                    common::to_pascal(&op.name)
+                );
+                out.push_str(&format!(
+                    "          return {helper}(() => handlers.{field}.{method}(req, ctx));\n"
+                ));
+            } else {
+                out.push_str(&format!(
+                    "          const res = await handlers.{field}.{method}(req, ctx);\n"
+                ));
+                out.push_str("          return codec.encode(res);\n");
+            }
             out.push_str("        }\n");
         }
         out.push_str("        default:\n");

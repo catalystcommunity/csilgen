@@ -5,7 +5,6 @@ use crate::lexer::Position;
 use anyhow::{Result, bail};
 use regex::Regex;
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex};
 use std::thread;
 
 /// Validation error types
@@ -16,6 +15,11 @@ pub enum ValidationError {
         field_context: String,
         first: FieldVisibility,
         second: FieldVisibility,
+    },
+    UnknownType {
+        context: String,
+        name: String,
+        suggestion: Option<String>,
     },
     /// Dependency references non-existent field
     UnknownDependencyField {
@@ -98,6 +102,17 @@ impl std::fmt::Display for ValidationError {
                     f,
                     "Field {field_context} has conflicting visibility metadata: {first:?} and {second:?}"
                 )
+            }
+            ValidationError::UnknownType {
+                context,
+                name,
+                suggestion,
+            } => {
+                write!(f, "Unknown type '{name}' in {context}.")?;
+                if let Some(suggestion) = suggestion {
+                    write!(f, " Did you mean '{suggestion}'?")?;
+                }
+                Ok(())
             }
             ValidationError::UnknownDependencyField {
                 field_context,
@@ -229,181 +244,53 @@ impl std::error::Error for ValidationError {}
 
 /// Validate a CSIL interface definition for correctness
 pub fn validate_spec(spec: &CsilSpec) -> Result<()> {
-    let mut errors = Vec::new();
-
-    // Check for duplicate rule names
-    if let Err(duplicate_errors) = validate_unique_rule_names(spec) {
-        errors.extend(duplicate_errors);
-    }
-
-    // @wire-id is a spec-wide contract (all-or-nothing, cross-service uniqueness).
-    errors.extend(validate_wire_ids(spec));
-
-    for rule in &spec.rules {
-        if let Err(validation_errors) = validate_rule(rule, spec) {
-            errors.extend(validation_errors);
-        }
-    }
-
-    if !errors.is_empty() {
-        let error_messages: Vec<String> = errors.iter().map(|e| e.to_string()).collect();
-        bail!("Validation errors:\n{}", error_messages.join("\n"));
-    }
-
-    Ok(())
+    validate_rules(spec, false)
 }
 
-/// Validate a complete CSIL specification with optimizations for large specs
+/// Validate large specifications in parallel.
 pub fn validate_spec_optimized(spec: &CsilSpec) -> Result<()> {
-    use std::collections::BTreeSet;
+    validate_rules(spec, spec.rules.len() > 1000)
+}
 
-    // Pre-build lookup tables for faster validation
-    let type_names: BTreeSet<String> = spec.rules.iter().map(|rule| rule.name.clone()).collect();
+type TypeNames<'a> = HashSet<&'a str>;
 
-    let lookup_context = ValidationContext { type_names };
+fn validate_rules(spec: &CsilSpec, parallel: bool) -> Result<()> {
+    let names: TypeNames = spec
+        .rules
+        .iter()
+        .filter(|rule| !matches!(rule.rule_type, RuleType::ServiceDef(_)))
+        .map(|rule| rule.name.as_str())
+        .collect();
+    let mut errors = validate_unique_rule_names(spec).err().unwrap_or_default();
+    errors.extend(validate_wire_ids(spec));
 
-    let mut errors = Vec::new();
-
-    // Rule-name uniqueness is a single O(n) HashMap pass over the whole spec, not one
-    // of the per-reference O(n) scans (multiplied by rule count) that the BTreeSet
-    // lookup table and chunked/parallel dispatch below exist to avoid — so it runs
-    // unconditionally here rather than being folded into either optimization.
-    if let Err(duplicate_errors) = validate_unique_rule_names(spec) {
-        errors.extend(duplicate_errors);
-    }
-
-    // For large specs (>1000 rules), use parallel validation
-    let rule_validation_result = if spec.rules.len() > 1000 {
-        validate_spec_parallel(spec, lookup_context)
-    } else {
-        validate_spec_sequential(spec, lookup_context)
+    let check = |rules: &[Rule]| {
+        let mut issues = Vec::new();
+        for rule in rules {
+            issues.extend(validate_rule(rule, &names));
+        }
+        issues
     };
-
-    if let Err(rule_errors) = rule_validation_result {
-        errors.extend(rule_errors);
+    if parallel {
+        thread::scope(|scope| {
+            let workers: Vec<_> = spec
+                .rules
+                .chunks(100)
+                .map(|rules| scope.spawn(move || check(rules)))
+                .collect();
+            for worker in workers {
+                errors.extend(worker.join().expect("validation worker panicked"));
+            }
+        });
+    } else {
+        errors.extend(check(&spec.rules));
     }
 
     if !errors.is_empty() {
-        let error_messages: Vec<String> = errors.iter().map(|e| e.to_string()).collect();
-        bail!("Validation errors:\n{}", error_messages.join("\n"));
+        let messages: Vec<_> = errors.iter().map(ToString::to_string).collect();
+        bail!("Validation errors:\n{}", messages.join("\n"));
     }
-
     Ok(())
-}
-
-#[derive(Clone)]
-struct ValidationContext {
-    type_names: std::collections::BTreeSet<String>,
-}
-
-fn validate_spec_sequential(
-    spec: &CsilSpec,
-    context: ValidationContext,
-) -> Result<(), Vec<ValidationError>> {
-    let mut errors = Vec::new();
-
-    errors.extend(validate_wire_ids(spec));
-
-    for rule in &spec.rules {
-        if let Err(validation_errors) = validate_rule_optimized(rule, spec, &context) {
-            errors.extend(validation_errors);
-        }
-    }
-
-    if errors.is_empty() {
-        Ok(())
-    } else {
-        Err(errors)
-    }
-}
-
-fn validate_spec_parallel(
-    spec: &CsilSpec,
-    context: ValidationContext,
-) -> Result<(), Vec<ValidationError>> {
-    let spec = Arc::new(spec);
-    let context = Arc::new(context);
-    let errors = Arc::new(Mutex::new(validate_wire_ids(&spec)));
-
-    // Split rules into chunks for parallel processing
-    const CHUNK_SIZE: usize = 100;
-    let chunks: Vec<_> = spec.rules.chunks(CHUNK_SIZE).collect();
-
-    thread::scope(|s| {
-        for chunk in chunks {
-            let spec = Arc::clone(&spec);
-            let context = Arc::clone(&context);
-            let errors = Arc::clone(&errors);
-
-            s.spawn(move || {
-                let mut local_errors = Vec::new();
-
-                for rule in chunk {
-                    if let Err(validation_errors) = validate_rule_optimized(rule, &spec, &context) {
-                        local_errors.extend(validation_errors);
-                    }
-                }
-
-                if !local_errors.is_empty() {
-                    let mut global_errors = errors.lock().unwrap();
-                    global_errors.extend(local_errors);
-                }
-            });
-        }
-    });
-
-    let final_errors = errors.lock().unwrap();
-    if final_errors.is_empty() {
-        Ok(())
-    } else {
-        Err(final_errors.clone())
-    }
-}
-
-fn validate_rule_optimized(
-    rule: &Rule,
-    spec: &CsilSpec,
-    context: &ValidationContext,
-) -> Result<(), Vec<ValidationError>> {
-    let mut errors = Vec::new();
-
-    match &rule.rule_type {
-        RuleType::TypeDef(TypeExpression::Group(group)) => {
-            if let Err(group_errors) = validate_group_optimized(group, &rule.name, context) {
-                errors.extend(group_errors);
-            }
-        }
-        RuleType::GroupDef(group) => {
-            if let Err(group_errors) = validate_group_optimized(group, &rule.name, context) {
-                errors.extend(group_errors);
-            }
-        }
-        RuleType::ServiceDef(service) => {
-            if let Err(service_errors) = validate_service_optimized(service, &rule.name, context) {
-                errors.extend(service_errors);
-            }
-        }
-        _ => {
-            // Other rule types use the standard validation
-            return validate_rule(rule, spec);
-        }
-    }
-
-    if errors.is_empty() {
-        Ok(())
-    } else {
-        Err(errors)
-    }
-}
-
-fn validate_group_optimized(
-    group: &GroupExpression,
-    context_name: &str,
-    _validation_context: &ValidationContext,
-) -> Result<(), Vec<ValidationError>> {
-    // Use the existing validate_group implementation for now
-    // In a more advanced optimization, we could cache field lookups
-    validate_group(group, context_name)
 }
 
 /// Validate that all rule names in the spec are unique
@@ -554,152 +441,51 @@ fn validate_unique_operation_names(
     }
 }
 
-fn validate_service_optimized(
-    service: &ServiceDefinition,
-    context_name: &str,
-    validation_context: &ValidationContext,
-) -> Result<(), Vec<ValidationError>> {
+fn validate_rule(rule: &Rule, names: &TypeNames) -> Vec<ValidationError> {
     let mut errors = Vec::new();
-
-    // Check for duplicate operation names within the service
-    if let Err(duplicate_errors) = validate_unique_operation_names(service, context_name) {
-        errors.extend(duplicate_errors);
-    }
-
-    // Validate service operations with optimized type lookups
-    for operation in &service.operations {
-        // Extract type names from TypeExpression for validation
-        let input_type_name = extract_type_name(&operation.input_type);
-        let output_type_name = extract_type_name(&operation.output_type);
-
-        // Use fast BTreeSet lookup instead of iterating through all rules
-        if let Some(input_name) = input_type_name
-            && !validation_context.type_names.contains(&input_name)
-        {
-            // Suggest similar type names for typos
-            let available_names: Vec<String> =
-                validation_context.type_names.iter().cloned().collect();
-            let suggestions =
-                csilgen_common::CsilgenError::suggest_similar_names(&input_name, &available_names);
-
-            let suggestion_text = if !suggestions.is_empty() {
-                format!(" Did you mean: {}?", suggestions.join(", "))
-            } else {
-                String::new()
-            };
-
-            errors.push(ValidationError::UnknownDependencyField {
-                field_context: format!(
-                    "{}::{} input type{suggestion_text}",
-                    context_name, operation.name
-                ),
-                depends_on: input_name,
-            });
+    let mut collect = |result: Result<(), Vec<ValidationError>>| {
+        if let Err(issues) = result {
+            errors.extend(issues);
         }
-
-        if let Some(output_name) = output_type_name
-            && !validation_context.type_names.contains(&output_name)
-        {
-            // Suggest similar type names for typos
-            let available_names: Vec<String> =
-                validation_context.type_names.iter().cloned().collect();
-            let suggestions =
-                csilgen_common::CsilgenError::suggest_similar_names(&output_name, &available_names);
-
-            let suggestion_text = if !suggestions.is_empty() {
-                format!(" Did you mean: {}?", suggestions.join(", "))
-            } else {
-                String::new()
-            };
-
-            errors.push(ValidationError::UnknownDependencyField {
-                field_context: format!(
-                    "{}::{} output type{suggestion_text}",
-                    context_name, operation.name
-                ),
-                depends_on: output_name,
-            });
-        }
-    }
-
-    if errors.is_empty() {
-        Ok(())
-    } else {
-        Err(errors)
-    }
-}
-
-/// Extract the primary type name from a TypeExpression for validation
-fn extract_type_name(type_expr: &TypeExpression) -> Option<String> {
-    match type_expr {
-        // Builtins are always valid (an unknown type name lexes as a Reference, not a
-        // Builtin), so there is nothing to resolve — this also lets a builtin, or a
-        // `null` no-input op, stand as an operation input/output type.
-        TypeExpression::Builtin(_) => None,
-        TypeExpression::Reference(name) => Some(name.clone()),
-        TypeExpression::Group(_) => None, // Inline groups don't have names to validate
-        TypeExpression::Tuple(_) => None, // Inline tuples don't have a single name
-        TypeExpression::Array { element_type, .. } => extract_type_name(element_type),
-        TypeExpression::Map { key, value, .. } => {
-            // For maps, validate both key and value types
-            extract_type_name(key).or_else(|| extract_type_name(value))
-        }
-        TypeExpression::Choice(choices) => {
-            // For choices, validate the first non-builtin type
-            choices.iter().find_map(extract_type_name)
-        }
-        TypeExpression::Range { .. } => None, // Range expressions don't have a base type to validate
-        TypeExpression::Literal(_) => None,   // Literals don't need validation
-        TypeExpression::Socket(name) => Some(name.clone()), // Socket references need validation
-        TypeExpression::Plug(name) => Some(name.clone()), // Plug references need validation
-        TypeExpression::Constrained {
-            base_type,
-            constraints: _,
-        } => {
-            // Extract the type name from the base type, constraints don't affect the type name
-            extract_type_name(base_type)
-        }
-    }
-}
-
-fn validate_rule(rule: &Rule, spec: &CsilSpec) -> Result<(), Vec<ValidationError>> {
-    let mut errors = Vec::new();
-
+    };
     match &rule.rule_type {
-        RuleType::TypeDef(type_expr) => {
-            // Validate the type expression (this includes constrained types)
-            if let Err(type_errors) = validate_type_expression(type_expr, &rule.name) {
-                errors.extend(type_errors);
+        RuleType::TypeDef(ty) => collect(validate_type_expression(ty, &rule.name, names)),
+        RuleType::GroupDef(group) => collect(validate_group(group, &rule.name, names)),
+        RuleType::TypeChoice(arms) => {
+            for arm in arms {
+                collect(validate_type_expression(arm, &rule.name, names));
             }
         }
-        RuleType::GroupDef(group) => {
-            if let Err(group_errors) = validate_group(group, &rule.name) {
-                errors.extend(group_errors);
+        RuleType::GroupChoice(groups) => {
+            for group in groups {
+                collect(validate_group(group, &rule.name, names));
             }
         }
         RuleType::ServiceDef(service) => {
-            // Check for duplicate operation names within the service
-            if let Err(duplicate_errors) = validate_unique_operation_names(service, &rule.name) {
-                errors.extend(duplicate_errors);
-            }
-
-            for operation in &service.operations {
-                if let Err(op_errors) = validate_service_operation(operation, spec) {
-                    errors.extend(op_errors);
-                }
+            collect(validate_unique_operation_names(service, &rule.name));
+            for op in &service.operations {
+                let owner = format!("{}::{}", rule.name, op.name);
+                collect(validate_type_expression(
+                    &op.input_type,
+                    &format!("{owner} input"),
+                    names,
+                ));
+                collect(validate_type_expression(
+                    &op.output_type,
+                    &format!("{owner} output"),
+                    names,
+                ));
             }
         }
-        _ => {} // Other rule types don't need metadata validation yet
     }
-
-    if errors.is_empty() {
-        Ok(())
-    } else {
-        Err(errors)
-    }
+    errors
 }
 
-fn validate_group(group: &GroupExpression, context: &str) -> Result<(), Vec<ValidationError>> {
+fn validate_group(
+    group: &GroupExpression,
+    context: &str,
+    names: &TypeNames,
+) -> Result<(), Vec<ValidationError>> {
     let mut errors = Vec::new();
     let mut field_names = HashSet::new();
 
@@ -727,8 +513,15 @@ fn validate_group(group: &GroupExpression, context: &str) -> Result<(), Vec<Vali
             errors.extend(field_errors);
         }
 
+        if let Some(GroupKey::Type(key)) = &entry.key
+            && let Err(key_errors) = validate_type_expression(key, &field_context, names)
+        {
+            errors.extend(key_errors);
+        }
+
         // Validate constrained types if present
-        if let Err(type_errors) = validate_type_expression(&entry.value_type, &field_context) {
+        if let Err(type_errors) = validate_type_expression(&entry.value_type, &field_context, names)
+        {
             errors.extend(type_errors);
         }
     }
@@ -748,56 +541,74 @@ fn validate_group(group: &GroupExpression, context: &str) -> Result<(), Vec<Vali
 fn validate_type_expression(
     type_expr: &TypeExpression,
     context: &str,
+    names: &TypeNames,
 ) -> Result<(), Vec<ValidationError>> {
     let mut errors = Vec::new();
 
     match type_expr {
+        TypeExpression::Reference(name) if !names.contains(name.as_str()) => {
+            let candidates: Vec<String> = crate::lexer::BUILTIN_TYPES
+                .iter()
+                .chain(names.iter())
+                .map(|s| (*s).to_owned())
+                .collect();
+            let suggestion = csilgen_common::CsilgenError::suggest_similar_names(name, &candidates)
+                .into_iter()
+                .next();
+            errors.push(ValidationError::UnknownType {
+                context: context.to_owned(),
+                name: name.clone(),
+                suggestion,
+            });
+        }
         TypeExpression::Constrained {
             base_type,
             constraints,
         } => {
             // Validate the base type first
-            if let Err(base_errors) = validate_type_expression(base_type, context) {
+            if let Err(base_errors) = validate_type_expression(base_type, context, names) {
                 errors.extend(base_errors);
             }
 
             // Validate constraints
             for constraint in constraints {
                 if let Err(constraint_errors) =
-                    validate_control_operator(constraint, base_type, context)
+                    validate_control_operator(constraint, base_type, context, names)
                 {
                     errors.extend(constraint_errors);
                 }
             }
         }
         TypeExpression::Array { element_type, .. } => {
-            if let Err(element_errors) = validate_type_expression(element_type, context) {
+            if let Err(element_errors) = validate_type_expression(element_type, context, names) {
                 errors.extend(element_errors);
             }
         }
         TypeExpression::Map { key, value, .. } => {
-            if let Err(key_errors) = validate_type_expression(key, context) {
+            if let Err(key_errors) = validate_type_expression(key, context, names) {
                 errors.extend(key_errors);
             }
-            if let Err(value_errors) = validate_type_expression(value, context) {
+            if let Err(value_errors) = validate_type_expression(value, context, names) {
                 errors.extend(value_errors);
             }
         }
         TypeExpression::Group(group) => {
-            if let Err(group_errors) = validate_group(group, context) {
+            if let Err(group_errors) = validate_group(group, context, names) {
                 errors.extend(group_errors);
             }
         }
         TypeExpression::Tuple(group) => {
             for entry in &group.entries {
-                if let Err(entry_errors) = validate_type_expression(&entry.value_type, context) {
+                if let Err(entry_errors) =
+                    validate_type_expression(&entry.value_type, context, names)
+                {
                     errors.extend(entry_errors);
                 }
             }
         }
         TypeExpression::Choice(choices) => {
             for choice in choices {
-                if let Err(choice_errors) = validate_type_expression(choice, context) {
+                if let Err(choice_errors) = validate_type_expression(choice, context, names) {
                     errors.extend(choice_errors);
                 }
             }
@@ -817,6 +628,7 @@ fn validate_control_operator(
     constraint: &ControlOperator,
     base_type: &TypeExpression,
     context: &str,
+    names: &TypeNames,
 ) -> Result<(), Vec<ValidationError>> {
     let mut errors = Vec::new();
 
@@ -897,14 +709,14 @@ fn validate_control_operator(
         }
         ControlOperator::And(type_expr) => {
             // Validate the intersected type expression
-            if let Err(type_errors) = validate_type_expression(type_expr, context) {
+            if let Err(type_errors) = validate_type_expression(type_expr, context, names) {
                 errors.extend(type_errors);
             }
             // TODO: Add semantic validation for type intersection compatibility
         }
         ControlOperator::Within(type_expr) => {
             // Validate the subset type expression
-            if let Err(type_errors) = validate_type_expression(type_expr, context) {
+            if let Err(type_errors) = validate_type_expression(type_expr, context, names) {
                 errors.extend(type_errors);
             }
             // TODO: Add semantic validation for subset constraint compatibility
@@ -1197,6 +1009,15 @@ fn format_type_expression(type_expr: &TypeExpression) -> String {
                 format_type_expression(value)
             )
         }
+        TypeExpression::NamedNumberGroup(name, _) => format!("&{name}"),
+        TypeExpression::NamedNumbers(members) => format!(
+            "&({})",
+            members
+                .iter()
+                .map(|(k, v)| format!("{k}: {v}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
         TypeExpression::Group(_) => "group".to_string(),
         TypeExpression::Tuple(group) => {
             let parts: Vec<String> = group
@@ -1573,33 +1394,6 @@ fn detect_cycle(
     None
 }
 
-fn validate_service_operation(
-    operation: &ServiceOperation,
-    _spec: &CsilSpec,
-) -> Result<(), Vec<ValidationError>> {
-    // Service operation metadata validation can be added here
-    // For now, we'll just validate the input/output types if they contain groups
-    let mut errors = Vec::new();
-
-    if let TypeExpression::Group(group) = &operation.input_type
-        && let Err(group_errors) = validate_group(group, &format!("{}[input]", operation.name))
-    {
-        errors.extend(group_errors);
-    }
-
-    if let TypeExpression::Group(group) = &operation.output_type
-        && let Err(group_errors) = validate_group(group, &format!("{}[output]", operation.name))
-    {
-        errors.extend(group_errors);
-    }
-
-    if errors.is_empty() {
-        Ok(())
-    } else {
-        Err(errors)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1625,7 +1419,7 @@ mod tests {
     #[test]
     fn test_wire_id_complete_is_valid() {
         let spec = crate::parser::parse_csil(
-            "@wire-id(1)\nservice A {\n@wire-id(0)\nfoo: X -> Y,\n@wire-id(1)\nbar: X -> Y\n}\n",
+            "@wire-id(1)\nservice A {\n@wire-id(0)\nfoo: text -> int,\n@wire-id(1)\nbar: text -> int\n}\n",
         )
         .unwrap();
         assert!(validate_spec(&spec).is_ok());
@@ -1634,7 +1428,8 @@ mod tests {
     #[test]
     fn test_wire_id_absent_everywhere_is_valid() {
         let spec =
-            crate::parser::parse_csil("service A {\nfoo: X -> Y,\nbar: X -> Y\n}\n").unwrap();
+            crate::parser::parse_csil("service A {\nfoo: text -> int,\nbar: text -> int\n}\n")
+                .unwrap();
         assert!(validate_spec(&spec).is_ok());
     }
 
@@ -1642,7 +1437,7 @@ mod tests {
     fn test_wire_id_partial_is_error() {
         // Service has an id; one operation is missing one.
         let spec = crate::parser::parse_csil(
-            "@wire-id(1)\nservice A {\n@wire-id(0)\nfoo: X -> Y,\nbar: X -> Y\n}\n",
+            "@wire-id(1)\nservice A {\n@wire-id(0)\nfoo: text -> int,\nbar: text -> int\n}\n",
         )
         .unwrap();
         let err = validate_spec(&spec).unwrap_err().to_string();
@@ -1651,9 +1446,10 @@ mod tests {
 
     #[test]
     fn test_wire_id_service_zero_is_reserved() {
-        let spec =
-            crate::parser::parse_csil("@wire-id(0)\nservice A {\n@wire-id(0)\nfoo: X -> Y\n}\n")
-                .unwrap();
+        let spec = crate::parser::parse_csil(
+            "@wire-id(0)\nservice A {\n@wire-id(0)\nfoo: text -> int\n}\n",
+        )
+        .unwrap();
         let err = validate_spec(&spec).unwrap_err().to_string();
         assert!(err.contains("reserved"), "got: {err}");
     }
@@ -1661,7 +1457,7 @@ mod tests {
     #[test]
     fn test_wire_id_duplicate_service_ordinals() {
         let spec = crate::parser::parse_csil(
-            "@wire-id(1)\nservice A {\n@wire-id(0)\nfoo: X -> Y\n}\n@wire-id(1)\nservice B {\n@wire-id(0)\nbar: X -> Y\n}\n",
+            "@wire-id(1)\nservice A {\n@wire-id(0)\nfoo: text -> int\n}\n@wire-id(1)\nservice B {\n@wire-id(0)\nbar: text -> int\n}\n",
         )
         .unwrap();
         let err = validate_spec(&spec).unwrap_err().to_string();
@@ -1671,7 +1467,7 @@ mod tests {
     #[test]
     fn test_wire_id_duplicate_operation_ordinals() {
         let spec = crate::parser::parse_csil(
-            "@wire-id(1)\nservice A {\n@wire-id(0)\nfoo: X -> Y,\n@wire-id(0)\nbar: X -> Y\n}\n",
+            "@wire-id(1)\nservice A {\n@wire-id(0)\nfoo: text -> int,\n@wire-id(0)\nbar: text -> int\n}\n",
         )
         .unwrap();
         let err = validate_spec(&spec).unwrap_err().to_string();
@@ -1680,9 +1476,10 @@ mod tests {
 
     #[test]
     fn test_wire_id_negative_is_invalid() {
-        let spec =
-            crate::parser::parse_csil("@wire-id(-1)\nservice A {\n@wire-id(0)\nfoo: X -> Y\n}\n")
-                .unwrap();
+        let spec = crate::parser::parse_csil(
+            "@wire-id(-1)\nservice A {\n@wire-id(0)\nfoo: text -> int\n}\n",
+        )
+        .unwrap();
         let err = validate_spec(&spec).unwrap_err().to_string();
         assert!(err.contains("non-negative integer"), "got: {err}");
     }
@@ -1690,10 +1487,57 @@ mod tests {
     #[test]
     fn test_wire_id_operation_zero_allowed() {
         // Operation ordinals start at 0; only the *service* ordinal 0 is reserved.
-        let spec =
-            crate::parser::parse_csil("@wire-id(7)\nservice A {\n@wire-id(0)\nfoo: X -> Y\n}\n")
-                .unwrap();
+        let spec = crate::parser::parse_csil(
+            "@wire-id(7)\nservice A {\n@wire-id(0)\nfoo: text -> int\n}\n",
+        )
+        .unwrap();
         assert!(validate_spec(&spec).is_ok());
+    }
+
+    #[test]
+    fn unresolved_references_are_checked_in_each_type_position() {
+        let source = r#"
+            alias = tex
+            record = { items: [* missing_item], tuple: [text, missing_slot] }
+            mapping = {* missing_key => missing_value}
+            bounded = text .within missing_bound
+            extended /= int / missing_arm
+            service api { call: record -> alias / missing_reply }
+            invalid = api
+        "#;
+        let spec = crate::parse_csil(source).unwrap();
+        let expected = validate_spec(&spec).unwrap_err().to_string();
+        assert!(expected.contains("Unknown type 'tex' in alias. Did you mean 'text'?"));
+        for name in [
+            "missing_item",
+            "missing_slot",
+            "missing_key",
+            "missing_value",
+            "missing_bound",
+            "missing_arm",
+            "missing_reply",
+            "api",
+        ] {
+            assert!(
+                expected.contains(&format!("Unknown type '{name}'")),
+                "{expected}"
+            );
+        }
+        assert_eq!(
+            expected,
+            validate_spec_optimized(&spec).unwrap_err().to_string()
+        );
+        let mut large = spec;
+        for i in 0..1001 {
+            large.rules.push(create_test_rule(
+                &format!("valid_{i}"),
+                RuleType::TypeDef(TypeExpression::Builtin("text".into())),
+            ));
+        }
+        assert_eq!(
+            expected,
+            validate_spec_optimized(&large).unwrap_err().to_string()
+        );
     }
 
     #[test]

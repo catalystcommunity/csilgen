@@ -449,7 +449,11 @@ fn package_readme(input: &WasmGeneratorInput, module_path: &str, config: &GoConf
     let unary = first_unary_go_example(input, config);
     let channel = first_channel_go_example(input, config);
     if rpc {
-        out.push_str(&go_rpc_section(&import_path, unary.as_ref()));
+        out.push_str(&go_rpc_section(
+            &import_path,
+            unary.as_ref(),
+            input.csil_spec.rpc_operations().next().is_some(),
+        ));
     }
     if events {
         out.push_str(&go_events_section(&import_path, channel.as_ref()));
@@ -505,7 +509,7 @@ fn first_unary_go_example(input: &WasmGeneratorInput, config: &GoConfig) -> Opti
             if !matches!(op.direction, CsilServiceDirection::Unidirectional) {
                 continue;
             }
-            let success = go_success_type(&op.output_type);
+            let success = go_success_type(op.success_output());
             let null_input = op_input_is_null(&op.input_type);
             if !is_record_ref(&success, &records)
                 || !(null_input || is_record_ref(&op.input_type, &records))
@@ -549,7 +553,7 @@ fn first_channel_go_example(
             if !matches!(op.direction, CsilServiceDirection::Bidirectional) {
                 continue;
             }
-            let success = go_success_type(&op.output_type);
+            let success = go_success_type(op.success_output());
             if !is_record_ref(&success, &records) || !is_record_ref(&op.input_type, &records) {
                 continue;
             }
@@ -577,7 +581,7 @@ fn first_channel_go_example(
 /// client decodes the success payload; a non-zero transport status and the
 /// `ServiceError` arm are surfaced distinctly. Rendered only when the package emits a
 /// typed client (the `go-client` target); otherwise a short note points there.
-fn go_rpc_section(import_path: &str, ex: Option<&GoExample>) -> String {
+fn go_rpc_section(import_path: &str, ex: Option<&GoExample>, typed_rpc: bool) -> String {
     let mut out = String::from("## CSIL-RPC (HTTP)\n\n");
     out.push_str(
         "Request/response. The library owns the envelope (`RpcRequest`/`RpcResponse`);\n\
@@ -602,6 +606,11 @@ fn go_rpc_section(import_path: &str, ex: Option<&GoExample>) -> String {
         "\ttransport \"{GO_TRANSPORT_MODULE}\"\n\tapi \"{import_path}\"\n)\n\n"
     ));
     out.push_str(RPC_CARRIER_GO);
+    if typed_rpc {
+        out.push_str("\treturn api.ResolveRPCReply(service, op, resp.Variant, resp.Payload)\n}\n");
+    } else {
+        out.push_str("\treturn resp.Payload, nil\n}\n");
+    }
     out.push('\n');
     out.push_str("func main() {\n");
     out.push_str(&format!(
@@ -1075,13 +1084,6 @@ func (t *HTTPRpcCarrier) Call(ctx context.Context, service, op string, req []byt
 	if err := resp.AsTransportError(); err != nil {
 		return nil, err
 	}
-	// A typed application error rides as a status-0 "ServiceError" variant — distinct
-	// from a transport failure. Surface it so the typed client decodes success only.
-	if resp.Variant != nil && *resp.Variant == "ServiceError" {
-		return nil, fmt.Errorf("csil-rpc %s/%s: ServiceError", service, op)
-	}
-	return resp.Payload, nil
-}
 "#;
 
 /// The TLS `StreamCarrier` opener — spec-independent. It dials a TLS byte stream and
@@ -1342,6 +1344,15 @@ fn generate_types(
     // shopspring. The default decimal mapping pulls no third-party package here —
     // its CsilDecimal lives in the same package, in its own generated file.
     let mut imports = config.go_imports.clone();
+    if input
+        .csil_spec
+        .rules
+        .iter()
+        .any(|r| csilgen_common::rule_enum_numbers(r).is_some())
+        && !imports.iter().any(|i| i == "fmt")
+    {
+        imports.push("fmt".to_string());
+    }
     if spec_uses_builtin(input, "timestamp") {
         imports.push("time".to_string());
     }
@@ -1455,6 +1466,13 @@ fn generate_types(
                 content.push_str(&render_go_field_runs(&rows, 1));
 
                 content.push_str("}\n\n");
+            }
+            CsilRuleType::TypeDef(CsilTypeExpression::Choice(arms))
+            | CsilRuleType::TypeChoice(arms)
+                if csilgen_common::is_text_enum(arms) =>
+            {
+                has_types = true;
+                content.push_str(&go_text_enum(&rule.name, arms));
             }
             CsilRuleType::TypeDef(type_expr) => {
                 has_types = true;
@@ -1813,6 +1831,11 @@ fn hoist_inline_groups(spec: &CsilSpecSerialized) -> CsilSpecSerialized {
             continue;
         }
         match &rule.rule_type {
+            CsilRuleType::TypeDef(CsilTypeExpression::Choice(arms))
+                if csilgen_common::is_text_enum(arms) =>
+            {
+                rename_groups.insert(rule.name.clone(), pascal_case(&rule.name));
+            }
             CsilRuleType::TypeDef(choice @ CsilTypeExpression::Choice(_)) => {
                 drop_choices.insert(rule.name.clone(), choice.clone());
             }
@@ -1870,9 +1893,14 @@ impl HoistRewrite {
             CsilRuleType::GroupChoice(groups) => {
                 CsilRuleType::GroupChoice(groups.iter().map(|g| self.group(g)).collect())
             }
-            // Service op signatures are untouched by the hoister itself (see
-            // `hoist.rs`'s `rewrite_rule`), so there is nothing to rewrite here.
-            CsilRuleType::ServiceDef(def) => CsilRuleType::ServiceDef(def.clone()),
+            CsilRuleType::ServiceDef(def) => {
+                let mut service = def.clone();
+                for op in &mut service.operations {
+                    op.input_type = self.ty(&op.input_type);
+                    op.output_type = self.ty(&op.output_type);
+                }
+                CsilRuleType::ServiceDef(service)
+            }
         };
         CsilRule {
             name: self
@@ -2268,6 +2296,10 @@ fn go_enc_value(
         // parameter type (`CsilDecimal`/`time.Time`), which a distinct named alias
         // (`type unit_price CsilDecimal`) is NOT implicitly assignable to — so the
         // conversion must be made explicit at the alias boundary before recursing.
+        CsilTypeExpression::Reference(name) if matches!(aliases.get(name), Some(CsilTypeExpression::Choice(arms)) if csilgen_common::enum_numbers(arms).is_some()) =>
+        {
+            format!("cborInt({expr})")
+        }
         CsilTypeExpression::Reference(name) if aliases.contains_key(name) => {
             let target = &aliases[name];
             let unwrapped = codec_unwrap_constrained(target);
@@ -2402,6 +2434,34 @@ fn go_dec_func(
         // to a named `Tags`, so the wrapper makes the decoder yield the field's exact
         // type — which also lets `cborDecArray`/`cborDecMap` infer the right element type
         // (`[]MemberID`, not `[]string`).
+        CsilTypeExpression::Reference(name) if matches!(aliases.get(name), Some(CsilTypeExpression::Choice(arms)) if csilgen_common::enum_numbers(arms).is_some()) =>
+        {
+            let Some(CsilTypeExpression::Choice(arms)) = aliases.get(name) else {
+                unreachable!()
+            };
+            let numbers = csilgen_common::enum_numbers(arms).unwrap();
+            let unknown = numbers
+                .iter()
+                .map(|n| format!("n != {n}"))
+                .collect::<Vec<_>>()
+                .join(" && ");
+            go_closure(
+                &format!("func(csilV cborValue) ({name}, error)"),
+                &[
+                    "n, err := cborAsI64(csilV)".into(),
+                    go_if("err != nil", &["return 0, err".into()], indent + 1),
+                    go_if(
+                        &unknown,
+                        &[format!(
+                            "return 0, fmt.Errorf(\"unknown {name} value %d\", n)"
+                        )],
+                        indent + 1,
+                    ),
+                    format!("return {name}(n), nil"),
+                ],
+                indent,
+            )
+        }
         CsilTypeExpression::Reference(name) if aliases.contains_key(name) => {
             let inner = go_dec_func(&aliases[name], records, aliases, config, indent + 1);
             let go_type = map_csil_type_to_go(ty, &None, config.decimal_go_type());
@@ -3143,7 +3203,7 @@ fn emit_op_codecs(
             if !matches!(op.direction, CsilServiceDirection::Unidirectional) {
                 continue;
             }
-            let success = go_success_type(&op.output_type);
+            let success = go_success_type(op.success_output());
             let null_input = op_input_is_null(&op.input_type);
             // A bare reference to an already-defined record already has its own
             // Encode<T>/Decode<T> pair from the record-codec emission pass (see
@@ -3223,8 +3283,72 @@ fn emit_op_codec_pair(
     )
 }
 
+/// Encode a handler result and resolve a carrier reply at the typed RPC boundary.
+fn emit_rpc_replies(
+    input: &WasmGeneratorInput,
+    records: &std::collections::HashSet<String>,
+    aliases: &std::collections::HashMap<String, CsilTypeExpression>,
+    config: &GoConfig,
+) -> String {
+    let mut out = String::from(
+        r#"// RPCDecodeError reports a malformed typed RPC reply.
+type RPCDecodeError struct{ Err error }
+
+func (e *RPCDecodeError) Error() string { return e.Err.Error() }
+func (e *RPCDecodeError) Unwrap() error { return e.Err }
+
+// RPCApplicationError carries the declared value of an application refusal.
+type RPCApplicationError[T any] struct{ Value T }
+
+func (e *RPCApplicationError[T]) Error() string { return fmt.Sprintf("application error: %v", e.Value) }
+
+"#,
+    );
+    let mut dispatch = String::from(
+        "func ResolveRPCReply(service, op string, variant *string, payload []byte) ([]byte, error) {\n\tswitch {\n",
+    );
+    for (service, op, arms) in input.csil_spec.rpc_operations() {
+        let stem = op_codec_stem(service, op);
+        let success = map_csil_type_to_go(&arms[0], &None, config.decimal_go_type());
+        let mut encoder = format!(
+            "func Encode{stem}Reply(value {success}, err error) (string, []byte, error) {{\n"
+        );
+        dispatch.push_str(&format!("\tcase service == {service:?} && op == {:?}:\n\t\tif variant == nil {{\n\t\t\treturn nil, &RPCDecodeError{{fmt.Errorf(\"missing RPC reply variant\")}}\n\t\t}}\n\t\tswitch *variant {{\n", op.name));
+        for (i, arm) in arms.iter().enumerate() {
+            let wire = arm.rpc_variant_name().unwrap();
+            let helper = if is_record_ref(arm, records) {
+                wire.to_string()
+            } else if i == 0 {
+                format!("{stem}Response")
+            } else {
+                let name = format!("{stem}Error{i}");
+                out.push_str(&emit_op_codec_pair(&name, arm, records, aliases, config));
+                name
+            };
+            dispatch.push_str(&format!("\t\tcase {wire:?}:\n"));
+            if i == 0 {
+                encoder.push_str(&format!(
+                    "\tif err == nil {{\n\t\treturn {wire:?}, Encode{helper}(value), nil\n\t}}\n"
+                ));
+                dispatch.push_str("\t\t\treturn payload, nil\n");
+            } else {
+                let ty = map_csil_type_to_go(arm, &None, config.decimal_go_type());
+                encoder.push_str(&format!("\tvar refusal{i} *RPCApplicationError[{ty}]\n\tif errors.As(err, &refusal{i}) && refusal{i} != nil {{\n\t\treturn {wire:?}, Encode{helper}(refusal{i}.Value), nil\n\t}}\n"));
+                dispatch.push_str(&format!("\t\t\tvalue, err := Decode{helper}(payload)\n\t\t\tif err != nil {{\n\t\t\t\treturn nil, &RPCDecodeError{{err}}\n\t\t\t}}\n\t\t\treturn nil, &RPCApplicationError[{ty}]{{Value: value}}\n"));
+            }
+        }
+        encoder.push_str("\treturn \"\", nil, err\n}\n\n");
+        out.push_str(&encoder);
+        dispatch.push_str("\t\tdefault:\n\t\t\treturn nil, &RPCDecodeError{fmt.Errorf(\"unknown RPC reply variant %q\", *variant)}\n\t\t}\n");
+    }
+    dispatch.push_str("\t}\n\treturn payload, nil\n}\n");
+    out.push_str(&dispatch);
+    out
+}
+
 fn generate_codec(input: &WasmGeneratorInput, config: &GoConfig) -> Option<String> {
-    if !spec_has_records(input) {
+    let typed_rpc = input.csil_spec.rpc_operations().next().is_some();
+    if !spec_has_records(input) && !typed_rpc {
         return None;
     }
     let records = record_names(input);
@@ -3242,6 +3366,9 @@ fn generate_codec(input: &WasmGeneratorInput, config: &GoConfig) -> Option<Strin
     content.push_str(&format!("package {}\n\n", config.package_name));
 
     content.push_str("import (\n");
+    if typed_rpc {
+        content.push_str("\t\"errors\"\n");
+    }
     content.push_str(&format!("{}\"fmt\"\n", config.indent_style));
     content.push_str(&format!("{}\"math\"\n", config.indent_style));
     content.push_str(&format!("{}\"unicode/utf8\"\n", config.indent_style));
@@ -3303,6 +3430,9 @@ fn generate_codec(input: &WasmGeneratorInput, config: &GoConfig) -> Option<Strin
     // Per-op byte helpers for non-record (and record) op boundaries, so client and a
     // consumer-side server share one codec surface for every op.
     content.push_str(&emit_op_codecs(input, &records, &aliases, config));
+    if typed_rpc {
+        content.push_str(&emit_rpc_replies(input, &records, &aliases, config));
+    }
     Some(content)
 }
 
@@ -3987,6 +4117,45 @@ func csilAsDecimal(v cborValue) (decimal.Decimal, error) {
 /// identifier stem for generated names (`CorndogsService` -> `CorndogsClient`),
 /// matching the sibling generators. Wire strings never derive from this: they
 /// carry the CSIL names verbatim (docs/cbor-wire-contract.md "RPC call naming").
+fn go_text_enum(name: &str, arms: &[CsilTypeExpression]) -> String {
+    let members = csilgen_common::text_enum_members(arms).expect("text enum");
+    let mut out = String::new();
+    let constants = members
+        .iter()
+        .map(|(member, _)| format!("{name}{}", pascal_case(&member.to_ascii_lowercase())))
+        .collect::<Vec<_>>();
+    let width = constants.iter().map(String::len).max().unwrap_or_default();
+    if let Some(numbers) = csilgen_common::enum_numbers(arms) {
+        out.push_str(&format!("type {name} int64\n\nconst (\n"));
+        for (constant, n) in constants.iter().zip(&numbers) {
+            out.push_str(&format!("\t{constant:width$} {name} = {n}\n"));
+        }
+        out.push_str(&format!(
+            ")\n\nfunc (v {name}) MarshalText() ([]byte, error) {{\n\tswitch v {{\n"
+        ));
+        for ((_, label), constant) in members.iter().zip(&constants) {
+            let label = serde_json::to_string(label).unwrap();
+            out.push_str(&format!(
+                "\tcase {constant}:\n\t\treturn []byte({label}), nil\n"
+            ));
+        }
+        out.push_str(&format!("\t}}\n\treturn nil, fmt.Errorf(\"unknown {name} value %d\", v)\n}}\n\nfunc (v *{name}) UnmarshalText(text []byte) error {{\n\tswitch string(text) {{\n"));
+        for ((_, label), constant) in members.iter().zip(&constants) {
+            let label = serde_json::to_string(label).unwrap();
+            out.push_str(&format!("\tcase {label}:\n\t\t*v = {constant}\n"));
+        }
+        out.push_str(&format!("\tdefault:\n\t\treturn fmt.Errorf(\"unknown {name} label %q\", text)\n\t}}\n\treturn nil\n}}\n\n"));
+    } else {
+        out.push_str(&format!("type {name} string\n\nconst (\n"));
+        for ((_, label), constant) in members.iter().zip(&constants) {
+            let label = serde_json::to_string(label).unwrap();
+            out.push_str(&format!("\t{constant:width$} {name} = {label}\n"));
+        }
+        out.push_str(")\n\n");
+    }
+    out
+}
+
 fn go_service_base(name: &str) -> String {
     let pascal = pascal_case(name);
     pascal
@@ -4091,7 +4260,7 @@ fn emit_client_struct(
             ));
             continue;
         }
-        let success = go_success_type(&operation.output_type);
+        let success = go_success_type(operation.success_output());
         let null_input = op_input_is_null(&operation.input_type);
         let req_ok = null_input
             || go_op_boundary_expressible(&operation.input_type, records, aliases, config);
@@ -4151,7 +4320,11 @@ fn emit_client_struct(
         } else {
             format!("Decode{stem}Response(csilResp)")
         };
-        content.push_str(&format!("{}return {decode_resp}\n", config.indent_style));
+        if operation.rpc_reply_arms().is_some() {
+            content.push_str(&format!("\tvalue, err := {decode_resp}\n\tif err != nil {{\n\t\treturn csilZero, &RPCDecodeError{{err}}\n\t}}\n\treturn value, nil\n"));
+        } else {
+            content.push_str(&format!("{}return {decode_resp}\n", config.indent_style));
+        }
         content.push_str("}\n\n");
     }
 }
@@ -4256,7 +4429,7 @@ fn emit_service_interface(
             CsilServiceDirection::Unidirectional => {
                 let output_type = reflow_go_type(
                     &map_csil_type_to_go(
-                        &go_success_type(&operation.output_type),
+                        &go_success_type(operation.success_output()),
                         &None,
                         config.decimal_go_type(),
                     ),
@@ -5015,6 +5188,7 @@ fn emit_control_op_check(
         emit_ordered_check(content, config, field, value_type, op_pair, v, imports);
     };
     match op {
+        CsilControlOperator::EnumNumber(_) => {}
         CsilControlOperator::GreaterEqual(v) => ordered(content, ("<", ">="), v, imports),
         CsilControlOperator::LessEqual(v) => ordered(content, (">", "<="), v, imports),
         CsilControlOperator::GreaterThan(v) => ordered(content, ("<=", ">"), v, imports),
@@ -6702,7 +6876,11 @@ mod tests {
         assert!(client.content.contains(
             "csilResp, csilErr := c.transport.Call(ctx, \"CorndogsService\", \"submit-task\", EncodeSubmitTaskRequest(req))"
         ));
-        assert!(client.content.contains("return DecodeTask(csilResp)"));
+        assert!(
+            client
+                .content
+                .contains("value, err := DecodeTask(csilResp)")
+        );
         // The codec ships alongside the client.
         assert!(output.files.iter().any(|f| f.path == "codec.gen.go"));
         // Server interface must not be emitted for the client target.

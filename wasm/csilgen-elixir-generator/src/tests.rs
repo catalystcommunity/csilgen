@@ -415,19 +415,10 @@ fn test_callback_success_union_breaks_like_mix() {
     );
     let out = process_generation(input).unwrap();
     let server = file(&out, "server.gen.ex");
-    assert!(server.contains(concat!(
-        "  @callback get_notifications(req :: Csilgen.Generated.GetNotificationsRequest.t(), ctx :: map()) ::\n",
-        "              {:ok,\n",
-        "               Csilgen.Generated.GetNotificationsResponse.t()\n",
-        "               | Csilgen.Generated.NotificationError.t()}\n",
-        "              | {:error, Csilgen.Generated.ServiceError.t()}\n",
-    )));
-    assert!(server.contains(concat!(
-        "  @callback delete_notification(req :: Csilgen.Generated.NotificationID.t(), ctx :: map()) ::\n",
-        "              {:ok,\n",
-        "               Csilgen.Generated.DeleteResponse.t() | Csilgen.Generated.NotificationError.t()}\n",
-        "              | {:error, Csilgen.Generated.ServiceError.t()}\n",
-    )));
+    assert!(server.contains("{:ok, Csilgen.Generated.GetNotificationsResponse.t()}"));
+    assert!(server.contains("{:ok, Csilgen.Generated.DeleteResponse.t()}"));
+    assert!(server.contains("{:notification_error, Csilgen.Generated.NotificationError.t()}"));
+    assert!(server.contains("{:service_error, Csilgen.Generated.ServiceError.t()}"));
 }
 
 #[test]
@@ -1700,7 +1691,7 @@ sample =
     colors: ["red", "blue"],
     flags: %{"a" => "on", "b" => "off"},
     pair: {"hi", "yes"},
-    grade: "low",
+    grade: :low,
     level: "low"
   )
 
@@ -1763,7 +1754,7 @@ raised_grade =
     Torture.from_cbor_value(bad_grade)
     false
   rescue
-    RuntimeError -> true
+    ArgumentError -> true
   end
 
 true = raised_grade
@@ -2281,7 +2272,7 @@ fn genquickstart_rpc_section_uses_lib_envelope_over_http() {
     assert!(!body.contains(":inets"));
 
     // The typed ServiceError application arm is handled distinctly.
-    assert!(body.contains("resp.variant == \"ServiceError\""));
+    assert!(body.contains("Cbor.resolve_rpc_reply(service, op, resp.variant, resp.payload)"));
 
     // Client construction over the carrier + the first unary call with a generated
     // sample struct literal (required fields only, struct field atoms).

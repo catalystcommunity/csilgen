@@ -56,9 +56,9 @@ Scalars scalarsOk() => Scalars(
       // inline all-literal choice (not hoisted).
       size: 'medium',
       // named enum with a trailing `.default`-constrained last arm.
-      level: 'high',
+      level: Level.high,
       // named enum assembled via base rule + `/=` extension.
-      season: 'autumn',
+      season: Season.autumn,
       // named all-literal enum with mixed literal kinds (text + int arms);
       // renders as `typedef ShipMode = Object?;`, bare value.
       shipText: 'ground',
@@ -71,8 +71,8 @@ Collections collectionsOk() => Collections(
       bounded: [10, 20],
       exact3: [7, 8, 9],
       scores: {'x': 1, 'y': 2},
-      color: 'green',
-      tone: 'blue',
+      color: Color.green,
+      tone: Color.blue,
       prio: 2,
       who: IdOrNameVariant0(4242),
       pair: ('p', 5),

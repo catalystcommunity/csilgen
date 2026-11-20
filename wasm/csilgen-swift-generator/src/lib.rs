@@ -219,6 +219,7 @@ fn build_files(input: &WasmGeneratorInput) -> Result<Vec<GeneratedFile>, i32> {
                 hoist_all_literal_choices: true,
             },
         );
+        cloned.csil_spec.supply_implicit_service_error();
         cloned
     };
     let input = &hoisted;
@@ -546,7 +547,7 @@ fn first_swift_unary_example(input: &WasmGeneratorInput) -> Option<SwiftUnaryExa
             if !matches!(op.direction, CsilServiceDirection::Unidirectional) {
                 continue;
             }
-            let success = success_type(&op.output_type);
+            let success = success_type(op.success_output());
             if !is_record_ref(&success, &records) {
                 continue;
             }
@@ -618,7 +619,7 @@ fn first_swift_channel_example(input: &WasmGeneratorInput) -> Option<SwiftChanne
             if !matches!(op.direction, CsilServiceDirection::Bidirectional) {
                 continue;
             }
-            let success = success_type(&op.output_type);
+            let success = success_type(op.success_output());
             if !is_record_ref(&success, &records) || !is_record_ref(&op.input_type, &records) {
                 continue;
             }
@@ -1018,12 +1019,7 @@ struct HttpRpcCarrier: CsilTransport {
         // transport status (distinct from a typed application error).
         let resp = try RpcResponse.decode(try outcome.get())
         if let err = resp.asTransportError() { throw err }
-        // A typed application error rides as a status-0 `ServiceError` variant — surface it
-        // so the typed client decodes success only.
-        if resp.variant == "ServiceError" {
-            throw TransportError.carrier("csil-rpc \(service)/\(op): ServiceError")
-        }
-        return resp.payload
+        return try resolveRpcReply(service: service, op: op, variant: resp.variant, payload: resp.payload)
     }
 }
 "#;
@@ -1734,13 +1730,14 @@ fn classify_enum_literals(literals: &[&CsilLiteralValue]) -> SwiftChoiceShape {
 /// A closed set of string literals as a `String`-backed Swift enum: the raw value is the
 /// wire string verbatim (so case order/spelling never drifts onto the wire), the case
 /// name is the camelCased label, and `CaseIterable` is free and conventional here.
-fn emit_string_enum(type_name: &str, labels: &[String]) -> String {
+fn emit_string_enum(type_name: &str, labels: &[String], numeric: bool) -> String {
+    let codable = if numeric { ", Codable" } else { "" };
     let mut out = String::new();
     out.push_str(&format!(
         "/// {type_name} is a generated CSIL string enum (a closed set of wire values).\n"
     ));
     out.push_str(&format!(
-        "public enum {type_name}: String, Equatable, Sendable, CaseIterable {{\n"
+        "public enum {type_name}: String, Equatable, Sendable, CaseIterable{codable} {{\n"
     ));
     for label in labels {
         out.push_str(&format!(
@@ -1933,7 +1930,13 @@ fn emit_mixed_enum(type_name: &str, lits: &[CsilLiteralValue]) -> String {
 fn emit_enum(name: &str, choices: &[CsilTypeExpression]) -> String {
     let type_name = swift_type_name(name);
     match swift_choice_shape(choices) {
-        SwiftChoiceShape::StringEnum(labels) => return emit_string_enum(&type_name, &labels),
+        SwiftChoiceShape::StringEnum(labels) => {
+            return emit_string_enum(
+                &type_name,
+                &labels,
+                csilgen_common::enum_numbers(choices).is_some(),
+            );
+        }
         SwiftChoiceShape::ScalarEnum(lits) => return emit_scalar_enum(&type_name, &lits),
         SwiftChoiceShape::MixedEnum(lits) => return emit_mixed_enum(&type_name, &lits),
         SwiftChoiceShape::Union => {}
@@ -1983,6 +1986,9 @@ fn enum_default_swift(
             _ => return None,
         }
     };
+    if let Some(label) = csilgen_common::enum_number_label(choices, value) {
+        return Some(format!(".{}", swift_ident(label)));
+    }
     let case = match swift_choice_shape(choices) {
         SwiftChoiceShape::StringEnum(labels) => {
             let CsilLiteralValue::Text(label) = value else {
@@ -2244,6 +2250,7 @@ fn emit_control_check(
         }
     };
     match op {
+        CsilControlOperator::EnumNumber(_) => {}
         CsilControlOperator::GreaterEqual(v) => ordered("<", v, "at least"),
         CsilControlOperator::LessEqual(v) => ordered(">", v, "at most"),
         CsilControlOperator::GreaterThan(v) => ordered("<=", v, "greater than"),
@@ -3128,7 +3135,7 @@ fn emit_op_codecs(
             if !matches!(op.direction, CsilServiceDirection::Unidirectional) {
                 continue;
             }
-            let success = success_type(&op.output_type);
+            let success = success_type(op.success_output());
             let null_input = is_null_input(&op.input_type);
             let req_ok = null_input
                 || swift_op_boundary_expressible(&op.input_type, records, aliases, choice_codecs);
@@ -3199,6 +3206,7 @@ fn generate_codec(input: &WasmGeneratorInput) -> Option<String> {
         && string_enums.is_empty()
         && scalar_enums.is_empty()
         && mixed_enums.is_empty()
+        && input.csil_spec.rpc_operations().next().is_none()
     {
         return None;
     }
@@ -3245,7 +3253,31 @@ fn generate_codec(input: &WasmGeneratorInput) -> Option<String> {
                 &choice_codecs,
             ));
         } else if string_enums.contains_key(&rule.name) {
-            body.push_str(&emit_string_enum_codec(&swift_type_name(&rule.name)));
+            let ty = swift_type_name(&rule.name);
+            if let Some(numbers) = csilgen_common::rule_enum_numbers(rule) {
+                body.push_str(&format!("public extension {ty} {{\n    func toCborValue() -> CsilCborValue {{\n        switch self {{\n"));
+                for (label, n) in string_enums[&rule.name].iter().zip(&numbers) {
+                    let value = if *n >= 0 {
+                        format!(".uint({n})")
+                    } else {
+                        format!(".int({n})")
+                    };
+                    body.push_str(&format!(
+                        "        case .{}: return {value}\n",
+                        swift_ident(label)
+                    ));
+                }
+                body.push_str("        }\n    }\n\n    init(cborValue: CsilCborValue) throws {\n        switch try CsilCbor.asI64(cborValue) {\n");
+                for (label, n) in string_enums[&rule.name].iter().zip(&numbers) {
+                    body.push_str(&format!(
+                        "        case {n}: self = .{}\n",
+                        swift_ident(label)
+                    ));
+                }
+                body.push_str(&format!("        default: throw CsilCborError.typeMismatch\n        }}\n    }}\n\n    func toCbor() -> [UInt8] {{ CsilCbor.encode(toCborValue()) }}\n\n    static func fromCbor(_ bytes: [UInt8]) throws -> {ty} {{ try {ty}(cborValue: CsilCbor.decode(bytes)) }}\n}}\n\n"));
+            } else {
+                body.push_str(&emit_string_enum_codec(&ty));
+            }
         } else if let Some(lits) = scalar_enums.get(&rule.name) {
             body.push_str(&emit_scalar_enum_codec(&swift_type_name(&rule.name), lits));
         } else if let Some(lits) = mixed_enums.get(&rule.name) {
@@ -3255,6 +3287,56 @@ fn generate_codec(input: &WasmGeneratorInput) -> Option<String> {
     // Per-op byte helpers for non-record/non-union op boundaries, so the client and a
     // consumer-side server share one codec surface for every op, not just record↔record.
     body.push_str(&emit_op_codecs(input, &records, &aliases, &choice_codecs));
+    {
+        let mut emitted = std::collections::BTreeSet::new();
+        let mut resolve = String::from(
+            "public func resolveRpcReply(service: String, op: String, variant: String?, payload: [UInt8]) throws -> [UInt8] {\n",
+        );
+        for (service, op, arms) in input.csil_spec.rpc_operations() {
+            let method = &op.name;
+            let stem = op_codec_stem(service, op);
+            let success = map_type(&arms[0], false);
+            let mut encode = format!(
+                "public func encode{stem}Reply(_ handler: () throws -> {success}) throws -> (variant: String, payload: [UInt8]) {{\n    do {{\n        let value = try handler()\n"
+            );
+            resolve.push_str(&format!("    if service == \"{service}\" && op == \"{method}\" {{\n        switch variant {{\n"));
+            for (i, arm) in arms.iter().enumerate() {
+                let wire = arm.rpc_variant_name().unwrap();
+                let ty = map_type(arm, false);
+                let exception = format!("{}Refusal", swift_type_name(wire));
+                let source = if i == 0 { "value" } else { "refusal.value" };
+                let enc = swift_enc_value(arm, source, &records, &aliases, &choice_codecs);
+                if i == 0 {
+                    encode.push_str(&format!(
+                        "        return (\"{wire}\", CsilCbor.encode({enc}))\n"
+                    ));
+                    resolve.push_str(&format!("        case \"{wire}\": return payload\n"));
+                } else {
+                    let dec = swift_dec_value(
+                        arm,
+                        "CsilCbor.decode(payload)",
+                        &records,
+                        &aliases,
+                        &choice_codecs,
+                    );
+                    if emitted.insert(exception.clone()) {
+                        body.push_str(&format!("public struct {exception}: Error {{\n    public let value: {ty}\n    public init(value: {ty}) {{ self.value = value }}\n}}\n\n"));
+                    }
+                    encode.push_str(&format!("    }} catch let refusal as {exception} {{\n        return (\"{wire}\", CsilCbor.encode({enc}))\n"));
+                    resolve.push_str(&format!(
+                        "        case \"{wire}\": throw {exception}(value: {dec})\n"
+                    ));
+                }
+            }
+            encode.push_str("    }\n}\n\n");
+            body.push_str(&encode);
+            resolve
+                .push_str("        default: throw CsilCborError.typeMismatch\n        }\n    }\n");
+        }
+        resolve.push_str("    return payload\n}\n");
+        body.push_str(&resolve);
+    }
+
     let mut content = header("Generated CBOR (de)serializers for the CSIL value types.");
     content.push_str(CODEC_RUNTIME_SWIFT);
     content.push('\n');
@@ -3377,7 +3459,7 @@ fn emit_client_struct(
             ));
             continue;
         }
-        let success = success_type(&op.output_type);
+        let success = success_type(op.success_output());
         let null_input = is_null_input(&op.input_type);
         let req_ok = null_input
             || swift_op_boundary_expressible(&op.input_type, records, aliases, choice_codecs);
@@ -3490,7 +3572,7 @@ fn emit_service_protocol(name: &str, service: &CsilServiceDefinition) -> String 
         let method = swift_ident(&op.name);
         match op.direction {
             CsilServiceDirection::Unidirectional => {
-                let output = map_type(&success_type(&op.output_type), false);
+                let output = map_type(&success_type(op.success_output()), false);
                 if is_null_input(&op.input_type) {
                     out.push_str(&format!("    func {method}() throws -> {output}\n"));
                 } else {
@@ -3623,7 +3705,7 @@ fn emit_channel_encoders(name: &str, service: &CsilServiceDefinition) -> String 
         let method = swift_type_name(&op.name);
         // The pushed message is the success arm; the error half is surfaced as a
         // transport status, not encoded into the outbound frame.
-        let output = map_type(&success_type(&op.output_type), false);
+        let output = map_type(&success_type(op.success_output()), false);
         out.push_str(&format!(
             "/// encode{type_name}{method} encodes a '{}' message the server pushes to a peer.\n",
             op.name

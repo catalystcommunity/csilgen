@@ -563,6 +563,19 @@ fn convert_type_expression(type_expr: &TypeExpression) -> CsilTypeExpression {
         TypeExpression::Tuple(group_expr) => {
             CsilTypeExpression::Tuple(convert_group_expression(group_expr))
         }
+        TypeExpression::NamedNumberGroup(_, members) | TypeExpression::NamedNumbers(members) => {
+            CsilTypeExpression::Choice(
+                members
+                    .iter()
+                    .map(|(label, number)| CsilTypeExpression::Constrained {
+                        base_type: Box::new(CsilTypeExpression::Literal(CsilLiteralValue::Text(
+                            label.clone(),
+                        ))),
+                        constraints: vec![CsilControlOperator::EnumNumber(*number)],
+                    })
+                    .collect(),
+            )
+        }
         TypeExpression::Choice(choices) => {
             CsilTypeExpression::Choice(choices.iter().map(convert_type_expression).collect())
         }

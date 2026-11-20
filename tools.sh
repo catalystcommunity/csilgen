@@ -6,7 +6,7 @@ CSILGEN_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CSILGEN_CI_DOCKERFILE="$CSILGEN_ROOT/tools/ci-image/Dockerfile"
 CSILGEN_CI_IMAGE="containers.catalystsquad.com/private/catalystcommunity/csilgen/ci-toolchain"
 CSILGEN_REGISTRY="containers.catalystsquad.com"
-CSILGEN_GITHUB_API="${CSILGEN_GITHUB_API:-https://api.github.com/repos/catalystcommunity/csilgen/releases?per_page=100}"
+CSILGEN_RELEASES_URL="https://api.github.com/repos/catalystcommunity/csilgen/releases"
 CSILGEN_DOCKER_CONFIG=""
 CSILGEN_INSTALL_TEMP=""
 CSILGEN_GENERATOR_PACKAGES=(
@@ -32,12 +32,12 @@ CSILGEN_GENERATOR_PACKAGES=(
 usage() {
     printf '%s\n' \
         "Usage: ./tools.sh build-install-all" \
-        "       ./tools.sh install-all" \
+        "       ./tools.sh install-all [csilgen/vVERSION]" \
         "       ./tools.sh build-ci-image [TAG]" \
         "       ./tools.sh publish-ci-image [TAG]" \
         "" \
         "build-install-all builds and installs the CLI and generators from this checkout." \
-        "install-all installs and activates the latest GitHub Release for this system." \
+        "install-all installs the specified release. With no tag, it installs the newest release." \
         "build-ci-image builds the CSILgen CI toolchain for linux/amd64." \
         "publish-ci-image builds and publishes TAG and latest." \
         "The default image TAG is derived from the Dockerfile content."
@@ -221,10 +221,7 @@ release_asset_url() {
     local asset_name="$2"
     python3 -c \
         'import json, sys
-releases = json.load(open(sys.argv[1], encoding="utf-8"))
-release = next((item for item in releases if not item.get("draft") and not item.get("prerelease") and item.get("tag_name", "").startswith("csilgen/v")), None)
-if release is None:
-    raise SystemExit("No published csilgen/v* release is available")
+release = json.load(open(sys.argv[1], encoding="utf-8"))
 matches = [asset["browser_download_url"] for asset in release.get("assets", []) if asset.get("name") == sys.argv[2]]
 if len(matches) != 1:
     raise SystemExit(f"The release must contain one {sys.argv[2]} asset")
@@ -232,16 +229,24 @@ print(matches[0])' \
         "$release_file" "$asset_name"
 }
 
-latest_release_tag() {
+select_release() {
     local release_file="$1"
+    local requested="$2"
     python3 -c \
         'import json, sys
-releases = json.load(open(sys.argv[1], encoding="utf-8"))
-release = next((item for item in releases if not item.get("draft") and not item.get("prerelease") and item.get("tag_name", "").startswith("csilgen/v")), None)
-if release is None:
-    raise SystemExit("No published csilgen/v* release is available")
-print(release["tag_name"])' \
-        "$release_file"
+data = json.load(open(sys.argv[1], encoding="utf-8"))
+requested = sys.argv[2]
+releases = data if isinstance(data, list) else [data]
+for item in releases:
+    tag = item.get("tag_name", "")
+    if item.get("draft") or not tag.startswith("csilgen/v"):
+        continue
+    if (requested and tag == requested) or (not requested and not item.get("prerelease")):
+        json.dump(item, sys.stdout)
+        break
+else:
+    raise SystemExit("No published release matches " + (requested or "csilgen/v*"))' \
+        "$release_file" "$requested"
 }
 
 cleanup_install_temp() {
@@ -252,12 +257,23 @@ cleanup_install_temp() {
 }
 
 install_all() {
+    local requested="${1-}"
+    local tag_pattern='^csilgen/v([0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?)$'
+    local api_url="${CSILGEN_GITHUB_API:-$CSILGEN_RELEASES_URL?per_page=100}"
+    if (( $# > 1 )) || { (( $# == 1 )) && [[ ! "$requested" =~ $tag_pattern ]]; }; then
+        printf 'Usage: ./tools.sh install-all [csilgen/vVERSION]\n' >&2
+        exit 1
+    fi
+    if [[ -n "$requested" && -z "${CSILGEN_GITHUB_API:-}" ]]; then
+        api_url="$CSILGEN_RELEASES_URL/tags/${requested/\//%2F}"
+    fi
     local platform
     local binary_name="csilgen"
     local cargo_root
     local binary_path
     local generator_dir
     local release_file
+    local http_status
     local release_tag
     local version
     local cli_asset
@@ -285,13 +301,20 @@ install_all() {
     CSILGEN_INSTALL_TEMP="$(mktemp -d /tmp/csilgen-install.XXXXXX)"
     trap cleanup_install_temp EXIT
     release_file="$CSILGEN_INSTALL_TEMP/release.json"
-    curl --fail --location --silent --show-error \
-        --retry 3 --retry-all-errors \
-        --output "$release_file" "$CSILGEN_GITHUB_API"
-
-    release_tag="$(latest_release_tag "$release_file")"
-    if [[ ! "$release_tag" =~ ^csilgen/v([0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?)$ ]]; then
-        printf 'The latest release tag is not a CSILgen release: %s\n' "$release_tag" >&2
+    if ! http_status="$(curl --fail --location --silent --show-error \
+        --retry 3 --retry-all-errors --write-out '%{http_code}' \
+        --output "$CSILGEN_INSTALL_TEMP/releases.json" "$api_url")"; then
+        if [[ "$http_status" == "404" && -n "$requested" ]]; then
+            printf 'No published release matches %s\n' "$requested" >&2
+        else
+            printf 'Cannot get release metadata for %s\n' "${requested:-the newest release}" >&2
+        fi
+        exit 1
+    fi
+    select_release "$CSILGEN_INSTALL_TEMP/releases.json" "$requested" > "$release_file"
+    release_tag="$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["tag_name"])' "$release_file")"
+    if [[ ! "$release_tag" =~ $tag_pattern ]]; then
+        printf 'Invalid CSILgen release tag: %s\n' "$release_tag" >&2
         exit 1
     fi
     version="${BASH_REMATCH[1]}"
@@ -450,7 +473,8 @@ case "$command_name" in
         build_install_all
         ;;
     install-all)
-        install_all
+        shift
+        install_all "$@"
         ;;
     build-ci-image)
         build_ci_image "${2:-$(default_ci_image_tag)}"

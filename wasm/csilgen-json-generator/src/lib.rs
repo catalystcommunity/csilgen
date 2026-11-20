@@ -345,6 +345,9 @@ impl<'a> JsonSchemaGenerator<'a> {
             schema.insert("x-csil-wire-id".to_string(), Value::Number(wire_id.into()));
         }
 
+        if !self.definitions.is_empty() {
+            schema.insert("$defs".into(), Value::Object(self.definitions.clone()));
+        }
         let mut operations = Map::new();
         // Operations skipped because JSON Schema doesn't meaningfully describe
         // their persistent-channel semantics. We record them as a vendor
@@ -400,7 +403,21 @@ impl<'a> JsonSchemaGenerator<'a> {
             let input_schema = self.generate_type_schema(&operation.input_type)?;
             op_properties.insert("input".to_string(), input_schema);
 
-            let output_schema = self.generate_type_schema(&operation.output_type)?;
+            let output_schema = self.generate_type_schema(operation.success_output())?;
+            if let Some(arms) = operation.rpc_reply_arms() {
+                let mut errors = Map::new();
+                for arm in &arms[1..] {
+                    errors.insert(
+                        arm.rpc_variant_name().unwrap().into(),
+                        self.generate_type_schema(arm)?,
+                    );
+                }
+                op_schema.insert(
+                    "x-csil-success-variant".into(),
+                    Value::from(arms[0].rpc_variant_name()),
+                );
+                op_schema.insert("x-csil-error-variants".into(), Value::Object(errors));
+            }
             op_properties.insert("output".to_string(), output_schema);
 
             op_schema.insert("properties".to_string(), Value::Object(op_properties));
@@ -692,6 +709,21 @@ impl<'a> JsonSchemaGenerator<'a> {
     }
 
     fn generate_choice_schema(&mut self, choices: &[CsilTypeExpression]) -> Result<Value, String> {
+        if let Some(numbers) = csilgen_common::enum_numbers(choices) {
+            let labels = csilgen_common::text_enum_members(choices)
+                .unwrap()
+                .into_iter()
+                .map(|(_, label)| label)
+                .collect::<Vec<_>>();
+            let mapping = labels
+                .iter()
+                .zip(numbers)
+                .map(|(s, n)| ((*s).to_owned(), serde_json::Value::from(n)))
+                .collect::<serde_json::Map<_, _>>();
+            return Ok(
+                serde_json::json!({"type":"string", "enum":labels, "x-csil-cbor-values":mapping}),
+            );
+        }
         let mut schema = Map::new();
 
         let mut any_of = Vec::new();
@@ -878,6 +910,9 @@ impl<'a> JsonSchemaGenerator<'a> {
     ) -> Result<(), String> {
         for constraint in constraints {
             match constraint {
+                CsilControlOperator::EnumNumber(number) => {
+                    schema.insert("x-csil-cbor-value".into(), Value::from(*number));
+                }
                 CsilControlOperator::Size(size) => apply_size_constraint(schema, size),
                 CsilControlOperator::Regex(pattern) => {
                     schema.insert("pattern".to_string(), Value::String(pattern.clone()));

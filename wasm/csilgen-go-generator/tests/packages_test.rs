@@ -398,7 +398,7 @@ fn each_section_names_its_library_imports_and_seam() {
     assert!(rpc.contains("transport.DecodeRpcResponse(body)"));
     assert!(rpc.contains("/csil/v1/rpc"));
     assert!(rpc.contains("resp.AsTransportError()"));
-    assert!(rpc.contains("*resp.Variant == \"ServiceError\""));
+    assert!(rpc.contains("return resp.Payload, nil"));
     assert!(rpc.contains("api.NewEchoClient(&HTTPRpcCarrier{BaseURL:"));
     assert!(rpc.contains("client.Ping(context.Background(), api.Ping{Msg: \"example\"})"));
     assert!(

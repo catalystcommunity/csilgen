@@ -413,12 +413,7 @@ fn rpc_carrier_elixir(config: &ElixirConfig) -> String {
       {{:error, reason}} -> raise "csil-rpc #{{service}}/#{{op}}: #{{inspect(reason)}}"
     end
 
-    # A typed `ServiceError` arm rides as a status-0 `variant` — an application error
-    # distinct from a transport failure. Surface it so the client decodes success only.
-    if resp.variant == "ServiceError",
-      do: raise("csil-rpc #{{service}}/#{{op}}: ServiceError")
-
-    resp.payload
+    {root}.Cbor.resolve_rpc_reply(service, op, resp.variant, resp.payload)
   end
 
   # --- Plain-HTTP POST over :gen_tcp ---
@@ -841,7 +836,7 @@ fn first_unary_example(input: &WasmGeneratorInput, config: &ElixirConfig) -> Opt
             if !matches!(op.direction, CsilServiceDirection::Unidirectional) {
                 continue;
             }
-            let success = success_type(&op.output_type);
+            let success = success_type(op.success_output());
             let null_input = is_null_input(&op.input_type);
             if !is_record_ref(&success, &records)
                 || !(null_input || is_record_ref(&op.input_type, &records))
@@ -901,7 +896,7 @@ fn first_channel_example(
             }
             // The router decodes the input; the encoder encodes the success output.
             // Require both to be records for a compiling sample.
-            let success = success_type(&op.output_type);
+            let success = success_type(op.success_output());
             if !is_record_ref(&op.input_type, &records) || !is_record_ref(&success, &records) {
                 continue;
             }
@@ -1009,7 +1004,9 @@ fn find_record<'a>(input: &'a WasmGeneratorInput, name: &str) -> Option<&'a Csil
         })
 }
 
-fn process_generation(input: WasmGeneratorInput) -> Result<WasmGeneratorOutput, i32> {
+fn process_generation(mut input: WasmGeneratorInput) -> Result<WasmGeneratorOutput, i32> {
+    input.csil_spec = csilgen_common::hoist_inline_named_numbers(&input.csil_spec);
+    input.csil_spec.supply_implicit_service_error();
     let config = ElixirConfig::from_options(&input.config.options)?;
     let surface = match input.config.target.as_str() {
         "elixir" | "elixir-server" => Surface::Server,
@@ -1183,6 +1180,41 @@ fn generate_types(
             // A bare type alias has no struct, but a `@type` keeps the name visible
             // and usable in specs that reference it.
             let module = config.module(&rule.name);
+            if let CsilTypeExpression::Choice(arms) = type_expr
+                && let Some(members) = csilgen_common::text_enum_members(arms)
+            {
+                let tags = members
+                    .iter()
+                    .map(|(name, _)| format!(":{}", name.to_ascii_lowercase()))
+                    .collect::<Vec<_>>();
+                content.push_str(&format!(
+                    "defmodule {module} do\n  @type t :: {}\n",
+                    tags.join(" | ")
+                ));
+                for ((_, wire), tag) in members.iter().zip(&tags) {
+                    let literal = literal_to_elixir(&CsilLiteralValue::Text(wire.to_string()));
+                    content.push_str(&format!("  def to_wire({tag}), do: {literal}\n"));
+                }
+                for ((_, wire), tag) in members.iter().zip(&tags) {
+                    let literal = literal_to_elixir(&CsilLiteralValue::Text(wire.to_string()));
+                    content.push_str(&format!("  def from_wire({literal}), do: {tag}\n"));
+                }
+                content.push_str(&format!("  def from_wire(value), do: raise(ArgumentError, \"unknown {}: #{{inspect(value)}}\")\n", rule.name));
+                if let Some(numbers) = csilgen_common::enum_numbers(arms) {
+                    for (index, tag) in numbers.iter().zip(&tags) {
+                        content.push_str(&format!("  def to_number({tag}), do: {index}\n"));
+                    }
+                    for (index, tag) in numbers.iter().zip(&tags) {
+                        content.push_str(&format!("  def from_number({index}), do: {tag}\n"));
+                    }
+                    content.push_str(
+                        "  def from_number(_), do: raise(ArgumentError, \"unknown enum number\")\n",
+                    );
+                }
+                content.push_str("end\n\n");
+                emitted = true;
+                continue;
+            }
             let mapped = map_type(type_expr, config);
             content.push_str(&format!("defmodule {module} do\n"));
             content.push_str(&format!("  @moduledoc \"Type alias for {}.\"\n", rule.name));
@@ -1242,8 +1274,21 @@ fn emit_struct_module(
     let defaulted_fields: Vec<String> = keyed
         .iter()
         .filter_map(|(e, atom)| {
-            entry_default_value(e)
-                .map(|value| format!("{atom}: {}", default_literal(&e.value_type, value, config)))
+            entry_default_value(e).map(|value| {
+                let mut ty = &e.value_type;
+                if let CsilTypeExpression::Constrained { base_type, .. } = ty {
+                    ty = base_type;
+                }
+                if let (CsilTypeExpression::Reference(name), CsilLiteralValue::Text(text)) =
+                    (ty, value)
+                    && let Some(arms) = cx.choices.get(name)
+                    && let Some(members) = csilgen_common::text_enum_members(arms)
+                    && let Some((tag, _)) = members.iter().find(|(_, wire)| wire == text)
+                {
+                    return format!("{atom}: :{}", tag.to_ascii_lowercase());
+                }
+                format!("{atom}: {}", default_literal(&e.value_type, value, config))
+            })
         })
         .collect();
     let struct_fields: Vec<String> = bare_fields.into_iter().chain(defaulted_fields).collect();
@@ -1849,7 +1894,19 @@ fn enc_named(name: &str, expr: &str, cx: &Codec) -> Doc {
     if cx.records.contains(name) {
         call1(format!("{}.to_cbor_value", cx.config.module(name)), expr)
     } else if let Some(variants) = cx.choices.get(name) {
-        enc_choice(name, variants, expr, cx)
+        if csilgen_common::text_enum_members(variants).is_some() {
+            let (kind, method) = if csilgen_common::enum_numbers(variants).is_some() {
+                ("int", "to_number")
+            } else {
+                ("text", "to_wire")
+            };
+            Doc::flat(format!(
+                "{{:{kind}, {}.{method}({expr})}}",
+                cx.config.module(name)
+            ))
+        } else {
+            enc_choice(name, variants, expr, cx)
+        }
     } else if let Some(underlying) = cx.aliases.get(name) {
         enc_value(underlying, expr, cx)
     } else {
@@ -2032,7 +2089,23 @@ fn dec_named(name: &str, expr: &str, cx: &Codec) -> Doc {
     if cx.records.contains(name) {
         call1(format!("{}.from_cbor_value", cx.config.module(name)), expr)
     } else if let Some(variants) = cx.choices.get(name) {
-        dec_choice(name, variants, expr, cx)
+        if csilgen_common::text_enum_members(variants).is_some() {
+            let (kind, method) = if csilgen_common::enum_numbers(variants).is_some() {
+                ("to_int", "from_number")
+            } else {
+                ("to_text", "from_wire")
+            };
+            Doc::Call {
+                fun: format!("{}.{method}", cx.config.module(name)),
+                args: vec![call1(
+                    format!("{}.Cbor.{kind}", cx.config.module_root),
+                    expr,
+                )],
+                tail_fn: None,
+            }
+        } else {
+            dec_choice(name, variants, expr, cx)
+        }
     } else if let Some(underlying) = cx.aliases.get(name) {
         dec_value(underlying, expr, cx)
     } else {
@@ -2163,14 +2236,59 @@ fn emit_from_cbor_fields(content: &mut String, fields: &[CodecField<'_>], cx: &C
 /// per-struct `to_cbor`/`from_cbor` build on. `None` when the spec declares no
 /// record types (nothing references the codec).
 fn generate_codec(input: &WasmGeneratorInput, config: &ElixirConfig) -> Option<String> {
-    if record_csil_names(input).is_empty() {
+    if record_csil_names(input).is_empty() && input.csil_spec.rpc_operations().next().is_none() {
         return None;
     }
     let mut content = String::new();
     content.push_str(GEN_HEADER);
     content.push_str(&format!("defmodule {}.Cbor do\n", config.module_root));
     content.push_str(CODEC_RUNTIME_ELIXIR);
+    let records = record_csil_names(input);
+    let aliases = codec_aliases(input);
+    let choices = choice_csil_types(input);
+    let cx = Codec {
+        config,
+        records: &records,
+        aliases: &aliases,
+        choices: &choices,
+    };
+    let mut exceptions = std::collections::BTreeMap::new();
+    let mut resolve = String::new();
+    for (service, op, arms) in input.csil_spec.rpc_operations() {
+        let stem = snake_case(&format!("{service}_{}", op.name));
+        let method = &op.name;
+        let success = arms[0].rpc_variant_name().unwrap();
+        let value = enc_value(&arms[0], "value", &cx).render(4, 0);
+        content.push_str(&format!("\n  def encode_{stem}_reply({{:ok, value}}) do\n    {{{success:?}, encode({value})}}\n  end\n"));
+        resolve.push_str(&format!("\n  def resolve_rpc_reply({service:?}, {method:?}, {success:?}, payload), do: payload\n"));
+        for arm in &arms[1..] {
+            let wire = arm.rpc_variant_name().unwrap();
+            let tag = snake_case(wire);
+            let pattern = if arms.len() == 2 {
+                "value".into()
+            } else {
+                format!("{{:{tag}, value}}")
+            };
+            let enc = enc_value(arm, "value", &cx).render(4, 0);
+            let dec = dec_value(arm, "decode(payload)", &cx).render(4, 0);
+            let exception = format!("{}Refusal", config.module(wire));
+            exceptions.insert(exception.clone(), wire);
+            content.push_str(&format!("\n  def encode_{stem}_reply({{:error, {pattern}}}) do\n    {{{wire:?}, encode({enc})}}\n  end\n"));
+            resolve.push_str(&format!("\n  def resolve_rpc_reply({service:?}, {method:?}, {wire:?}, payload) do\n    value = {dec}\n    raise {exception}, value: value\n  end\n"));
+        }
+        resolve.push_str(&format!("\n  def resolve_rpc_reply({service:?}, {method:?}, variant, _payload) do\n    raise ArgumentError, \"invalid reply variant: #{{inspect(variant)}}\"\n  end\n"));
+    }
+    content.push_str(&resolve);
+    content.push_str("\n  def resolve_rpc_reply(_service, _op, _variant, payload), do: payload\n");
     content.push_str("end\n");
+    for (exception, wire) in exceptions {
+        content.insert_str(
+            GEN_HEADER.len(),
+            &format!(
+                "defmodule {exception} do\n  defexception [:value, message: {wire:?}]\nend\n\n"
+            ),
+        );
+    }
     // The exact-decimal core type rides on a self-contained struct (Elixir has no
     // stdlib decimal); emit it only when the spec actually uses `decimal`.
     if spec_uses_decimal(input) {
@@ -2314,6 +2432,21 @@ fn ref_name(ty: &CsilTypeExpression) -> String {
     }
 }
 
+fn rpc_error_type(op: &CsilServiceOperation, config: &ElixirConfig) -> String {
+    match op.rpc_reply_arms() {
+        Some([_, error]) => map_type(error, config),
+        Some(arms) => arms[1..]
+            .iter()
+            .map(|arm| {
+                let tag = snake_case(arm.rpc_variant_name().unwrap());
+                format!("{{:{tag}, {}}}", map_type(arm, config))
+            })
+            .collect::<Vec<_>>()
+            .join(" | "),
+        None => format!("{}.ServiceError.t()", config.module_root),
+    }
+}
+
 fn emit_client_module(
     content: &mut String,
     name: &str,
@@ -2330,7 +2463,11 @@ fn emit_client_module(
     let wire_service = name;
     // The shared `<root>.Cbor` module the per-op helpers call is only emitted when the
     // spec declares records; without it a non-record boundary has no (de)serializer.
-    let has_codec = !records.is_empty();
+    let has_codec = !records.is_empty()
+        || service
+            .operations
+            .iter()
+            .any(|op| op.rpc_reply_arms().is_some());
 
     content.push_str(&format!("defmodule {module} do\n"));
     content.push_str(&format!(
@@ -2357,7 +2494,7 @@ fn emit_client_module(
             ));
             continue;
         }
-        let success = success_type(&op.output_type);
+        let success = success_type(op.success_output());
         let null_input = is_null_input(&op.input_type);
         let req_ok =
             null_input || op_boundary_expressible(&op.input_type, records, cx.aliases, cx.choices);
@@ -2531,7 +2668,6 @@ fn emit_server_module(
 ) {
     let base = service_base(name);
     let module = format!("{}.{base}Server", config.module_root);
-    let root = &config.module_root;
 
     content.push_str(&format!("defmodule {module} do\n"));
     content.push_str(&format!(
@@ -2579,10 +2715,11 @@ fn emit_server_module(
         let ctx = "ctx :: map()".to_string();
         match op.direction {
             CsilServiceDirection::Unidirectional => {
-                let out_ty = map_type(&success_type(&op.output_type), config);
+                let out_ty = map_type(&success_type(op.success_output()), config);
+                let errors = rpc_error_type(op, config);
                 let ret = vec![
                     format!("{{:ok, {out_ty}}}"),
-                    format!("{{:error, {root}.ServiceError.t()}}"),
+                    format!("{{:error, {errors}}}"),
                 ];
                 let args = if is_null_input(&op.input_type) {
                     vec![ctx]

@@ -2,6 +2,30 @@
 
 use std::fmt;
 
+/// Built-in type names accepted by the lexer.
+pub(crate) const BUILTIN_TYPES: &[&str] = &[
+    "int",
+    "uint",
+    "nint",
+    "text",
+    "tstr",
+    "bytes",
+    "bstr",
+    "bool",
+    "true",
+    "false",
+    "null",
+    "nil",
+    "undefined",
+    "float",
+    "float16",
+    "float32",
+    "float64",
+    "any",
+    "timestamp",
+    "decimal",
+];
+
 /// Position information for tokens
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Position {
@@ -732,13 +756,7 @@ impl Lexer {
             "from" => TokenType::From,
             "as" => TokenType::As,
 
-            // CDDL built-in types, plus CSIL tagged extensions: `timestamp` is CBOR
-            // tag 0 (RFC3339 text, always UTC) and `decimal` is CBOR tag 4 (exact
-            // decimal fraction), so neither is expressible as a plain CDDL primitive.
-            "int" | "uint" | "nint" | "text" | "tstr" | "bytes" | "bstr" | "bool" | "true"
-            | "false" | "null" | "undefined" | "float" | "float16" | "float32" | "float64"
-            | "any" | "timestamp" | "decimal" => TokenType::Builtin(lexeme.clone()),
-
+            name if BUILTIN_TYPES.contains(&name) => TokenType::Builtin(lexeme.clone()),
             _ => TokenType::Identifier(lexeme.clone()),
         };
 

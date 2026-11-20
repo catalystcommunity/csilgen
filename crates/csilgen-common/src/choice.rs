@@ -99,6 +99,83 @@ pub fn all_literal(choices: &[CsilTypeExpression]) -> bool {
     matches!(classify_choice(choices), ChoiceClass::Enum(_))
 }
 
+/// Read the explicit CBOR integers of a CDDL named-number enumeration.
+pub fn enum_numbers(arms: &[CsilTypeExpression]) -> Option<Vec<i64>> {
+    if arms.is_empty() {
+        return None;
+    }
+    arms.iter()
+        .map(|arm| match arm {
+            CsilTypeExpression::Constrained { constraints, .. } => {
+                constraints.iter().find_map(|c| match c {
+                    crate::CsilControlOperator::EnumNumber(n) => Some(*n),
+                    _ => None,
+                })
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// Get the wire values for a named-number rule in the normalized generator input.
+pub fn rule_enum_numbers(rule: &crate::CsilRule) -> Option<Vec<i64>> {
+    match &rule.rule_type {
+        crate::CsilRuleType::TypeDef(CsilTypeExpression::Choice(arms))
+        | crate::CsilRuleType::TypeChoice(arms) => enum_numbers(arms),
+        _ => None,
+    }
+}
+
+/// Get the public text label for a default expressed as a CBOR integer.
+pub fn enum_number_label<'a>(
+    arms: &'a [CsilTypeExpression],
+    value: &CsilLiteralValue,
+) -> Option<&'a str> {
+    let CsilLiteralValue::Integer(n) = value else {
+        return None;
+    };
+    let i = enum_numbers(arms)?.iter().position(|v| v == n)?;
+    match choice_arm_literal(&arms[i])? {
+        CsilLiteralValue::Text(label) => Some(label),
+        _ => None,
+    }
+}
+
+/// Whether every member has a text label.
+pub fn is_text_enum(arms: &[CsilTypeExpression]) -> bool {
+    !arms.is_empty()
+        && arms
+            .iter()
+            .all(|arm| matches!(choice_arm_literal(arm), Some(CsilLiteralValue::Text(_))))
+}
+
+/// Return identifiers and text labels for a named choice of text values.
+pub fn text_enum_members(choices: &[CsilTypeExpression]) -> Option<Vec<(String, &str)>> {
+    let mut seen = std::collections::BTreeSet::new();
+    let mut members = Vec::new();
+    for arm in choices {
+        let CsilLiteralValue::Text(value) = choice_arm_literal(arm)? else {
+            return None;
+        };
+        let words: Vec<_> = value
+            .split(|c: char| !c.is_ascii_alphanumeric())
+            .filter(|s| !s.is_empty())
+            .collect();
+        let mut base = words.join("_").to_ascii_uppercase();
+        if !base.starts_with(|c: char| c.is_ascii_alphabetic()) {
+            base.insert_str(0, "VALUE_");
+        }
+        let mut name = base.clone();
+        let mut suffix = 2;
+        while !seen.insert(name.clone()) {
+            name = format!("{base}_{suffix}");
+            suffix += 1;
+        }
+        members.push((name, value.as_str()));
+    }
+    (!members.is_empty()).then_some(members)
+}
+
 /// Declaration indices of a `Union`'s arms, reordered so every literal arm comes
 /// before any general arm (stable within each group — relative order among
 /// literals, and among general arms, is unchanged).

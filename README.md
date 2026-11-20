@@ -58,7 +58,11 @@ Run this command from a CSILgen checkout:
 ./tools.sh install-all
 ```
 
-The command selects the newest published `csilgen/v*` release. It detects the
+With no tag, the installer selects the newest published `csilgen/v*` release, even
+from a tagged checkout. To install an exact release, pass its full tag. For example,
+run `./tools.sh install-all csilgen/v0.2.10`.
+
+The installer detects the
 operating system and architecture. It installs the CLI to the Cargo binary
 directory. It creates `~/.local/bin/csilgen` as a link to the installed CLI.
 It replaces an existing file or link at that path. It installs all production
@@ -174,7 +178,7 @@ composes with the control operators above; both are honored by every generator.
 ### ✅ Working today
 - **Parser**: CDDL syntax plus the CSIL extensions (services, `/=`/`//=` choices, field metadata, `;;;` doc comments, options block, imports).
 - **Validator**: Constraint checking, dependency analysis, breaking-change detection.
-- **CLI tools**: `validate`, `generate`, `format`, `lint`, `breaking`.
+- **CLI tools** include `validate`, `linted-validate`, `generate`, `format`, `lint`, and `breaking`.
 - **Plugin runtime**: Dynamic generator discovery from `~/.csilgen/generators/`, `./.generators/`, and `target/wasm32-unknown-unknown/release/` — first-write-wins precedence. Generators are conforming `csilgen_<target>_generator.wasm` cdylibs; no CLI map to edit.
 - **Generators**: Rust, Go, TypeScript, Python, PHP (each with `-typesonly` / `-client` / `-server` sub-targets, e.g. `rust-client`, `go-typesonly`, `php-client`), Java, C#, C, Swift, Kotlin, Zig, OCaml, Elixir, Ruby, Dart, plus JSON Schema and OpenAPI — 18 targets total (`noop` included, a test fixture). Service directions `->`, `<->`, `<-` all emit consistently (handler + router + outbound encoders).
 - **Constraints & tagged types**: the full RFC 8610 control-operator set and the `@`-annotation constraints are honored across every generator; the `timestamp` (tag 0) and `decimal` (tag 4) core types emit per the CBOR wire contract.
@@ -233,16 +237,29 @@ csilgen generate --input examples/basic-usage/simple-service.csil --target noop 
 
 ```bash
 csilgen validate --input interface.csil
+csilgen linted-validate --input interface.csil --fail-on-warnings
 csilgen generate --input interface.csil --target rust --output ./generated/
 csilgen generate --input ./schemas/ --target rust --output ./generated/  # Multi-file with dependency analysis
 csilgen breaking --current A.csil --new B.csil
 csilgen format path/to/dir/ --dry-run
 csilgen lint path/to/dir/ --fix
+csilgen lint path/to/dir/ --fail-on-warnings
 ```
+
+The `validate` command checks type names after it resolves imports. For example,
+`user = tex` fails unless the schema defines `tex`. The `generate` command
+applies the same check before it writes code.
+
+Use `linted-validate` (also `linted_validate`) to validate an entry file, then
+lint that file and each imported file once. Each file uses its own lint options.
+Add `--fail-on-warnings` to return exit status 1 for a lint warning.
 
 The `validate` and `breaking` commands accept file paths. The `format` command
 processes a directory tree. The `lint` command processes CSIL files directly
-in one directory.
+in one directory. By default, it warns when an enum sends a text label.
+To change the severity for a file, set `lint_text_enums` in its `options`
+block. Use `"off"`, `"warn"`, or `"error"`. Use `--fail-on-warnings` to
+make any lint warning return exit status 1.
 
 Generators can create a `genquickstart.md` file with transport examples. By
 default, this file contains the CSIL-RPC, CSIL-Events, and CSIL-Datagrams

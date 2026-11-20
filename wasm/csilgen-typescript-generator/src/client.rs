@@ -331,7 +331,7 @@ fn unary_method(
     records: &HashSet<String>,
     codec_imports: &mut BTreeSet<String>,
 ) -> String {
-    let success = common::success_type(&op.output_type);
+    let success = common::success_type(op.success_output());
     if !codec::op_boundary_expressible(spec, records, &op.input_type)
         || !codec::op_boundary_expressible(spec, records, &success)
     {
@@ -344,10 +344,20 @@ fn unary_method(
 
     let (async_kw, await_kw) = (shape.async_kw(), shape.await_kw());
     let ret = shape.ret(&common::ts_type(&success, mapping));
-    let throws = vec![
-        "@throws {ServiceError} when the API returns an error response".to_string(),
-        "@throws transport errors (network, timeout) raised by the transport".to_string(),
-    ];
+    let mut throws = if let Some(arms) = op.rpc_reply_arms() {
+        arms[1..]
+            .iter()
+            .map(|arm| {
+                format!(
+                    "@throws {{{}Refusal}} for the declared application error",
+                    common::to_pascal(arm.rpc_variant_name().unwrap())
+                )
+            })
+            .collect()
+    } else {
+        Vec::from(["@throws {ServiceError} when the API returns an error response".into()])
+    };
+    throws.push("@throws transport errors (network, timeout) raised by the transport".into());
     let mut out = common::jsdoc(&op.doc_comments, &throws, "  ");
     out.push_str(&format!("  {async_kw}{method}({req_param}): {ret} {{\n"));
     out.push_str(&format!(
@@ -400,7 +410,7 @@ fn rpc_check(
     records: &HashSet<String>,
     codec_imports: &mut BTreeSet<String>,
 ) -> String {
-    let success = common::success_type(&op.output_type);
+    let success = common::success_type(op.success_output());
     if !codec::op_boundary_expressible(spec, records, &success) {
         return unsupported_op_note(op);
     }
@@ -472,7 +482,7 @@ fn channel_block(
     out.push_str(&format!("export interface {handlers_iface} {{\n"));
     for op in &channel_ops {
         let method = common::to_camel(&op.name);
-        let inbound = common::ts_type(&common::success_type(&op.output_type), mapping);
+        let inbound = common::ts_type(&common::success_type(op.success_output()), mapping);
         out.push_str(&common::jsdoc(&op.doc_comments, &[], "  "));
         out.push_str(&format!("  {method}(msg: {inbound}): {handler_ret};\n"));
     }
@@ -499,7 +509,7 @@ fn channel_block(
     for op in &channel_ops {
         let wire_method = common::method_wire(op);
         let method = common::to_camel(&op.name);
-        let inbound = common::ts_type(&common::success_type(&op.output_type), mapping);
+        let inbound = common::ts_type(&common::success_type(op.success_output()), mapping);
         out.push_str(&format!("    case \"{wire_method}\":\n"));
         out.push_str(&format!(
             "      {await_kw}handlers.{method}(codec.decode<{inbound}>(bytes));\n"

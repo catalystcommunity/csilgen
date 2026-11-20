@@ -36,11 +36,15 @@ pub struct AutoFix {
     pub new_text: String,
 }
 
+pub const TEXT_ENUM_LINT_OPTION: &str = "lint_text_enums";
+
 /// Configuration for CSIL linting
 #[derive(Debug, Clone)]
 pub struct LintConfig {
     /// Whether to enforce snake_case naming convention
     pub enforce_snake_case: bool,
+    /// Optional severity for enums that transmit text labels.
+    pub text_enum_severity: Option<LintSeverity>,
     /// Whether to require documentation comments
     pub require_docs: bool,
     /// Whether to warn on `;;;` documentation comments (a CSIL extension beyond CDDL)
@@ -68,6 +72,7 @@ impl Default for LintConfig {
     fn default() -> Self {
         Self {
             enforce_snake_case: true,
+            text_enum_severity: Some(LintSeverity::Warning),
             require_docs: false,
             warn_doc_comments: true,
             warn_degenerate_constraints: true,
@@ -152,9 +157,36 @@ impl LintResult {
 pub fn lint_spec(spec: &CsilSpec, config: &LintConfig) -> Result<LintResult> {
     let mut result = LintResult::new();
 
+    let mut config = config.clone();
+    if let Some(options) = &spec.options {
+        let mut entries = options
+            .entries
+            .iter()
+            .filter(|e| e.key == TEXT_ENUM_LINT_OPTION);
+        if let Some(entry) = entries.next() {
+            let level = match &entry.value {
+                crate::ast::LiteralValue::Text(level) => Some(level.as_str()),
+                _ => None,
+            };
+            let setting = match level {
+                _ if entries.next().is_some() => Err("Set lint_text_enums only once per file."),
+                Some("off") => Ok(None),
+                Some("warn") => Ok(Some(LintSeverity::Warning)),
+                Some("error") => Ok(Some(LintSeverity::Error)),
+                _ => Err(r#"Expected "off", "warn", or "error" for lint_text_enums."#),
+            };
+            match setting {
+                Ok(severity) => config.text_enum_severity = severity,
+                Err(message) => {
+                    result.add_simple_issue(LintSeverity::Error, entry.key.clone(), message.into())
+                }
+            }
+        }
+    }
+
     // Check each rule
     for rule in &spec.rules {
-        lint_rule(rule, config, &mut result);
+        lint_rule(rule, &config, &mut result);
     }
 
     // Check for unused rules only if there are multiple rules
@@ -268,7 +300,7 @@ fn lint_rule(rule: &Rule, config: &LintConfig, result: &mut LintResult) {
             lint_type_expression_with_config(type_expr, &rule.name, result, config);
         }
         RuleType::GroupDef(group_expr) => {
-            lint_group_expression(group_expr, &rule.name, result);
+            lint_group_expression_with_config(group_expr, &rule.name, result, config);
             lint_metadata_consistency(&group_expr.entries, &rule.name, config, result);
             lint_complexity(
                 &TypeExpression::Group(group_expr.clone()),
@@ -279,6 +311,7 @@ fn lint_rule(rule: &Rule, config: &LintConfig, result: &mut LintResult) {
             );
         }
         RuleType::TypeChoice(choices) => {
+            lint_text_enum(choices, &rule.name, result, config);
             for choice in choices {
                 lint_type_expression_with_config(choice, &rule.name, result, config);
             }
@@ -290,7 +323,47 @@ fn lint_rule(rule: &Rule, config: &LintConfig, result: &mut LintResult) {
         }
         RuleType::ServiceDef(service) => {
             lint_service_definition(service, &rule.name, config, result);
+            for op in &service.operations {
+                let owner = format!("{}.{}", rule.name, op.name);
+                lint_type_expression_with_config(&op.input_type, &owner, result, config);
+                lint_type_expression_with_config(&op.output_type, &owner, result, config);
+            }
         }
+    }
+}
+
+fn lint_text_enum(
+    arms: &[TypeExpression],
+    rule_name: &str,
+    result: &mut LintResult,
+    config: &LintConfig,
+) {
+    let Some(severity) = &config.text_enum_severity else {
+        return;
+    };
+    fn is_text(ty: &TypeExpression) -> bool {
+        match ty {
+            TypeExpression::Literal(crate::ast::LiteralValue::Text(_)) => true,
+            TypeExpression::Constrained { base_type, .. } => is_text(base_type),
+            _ => false,
+        }
+    }
+    if arms.len() > 1 && arms.iter().all(is_text) {
+        result.add_issue(LintIssue {
+            severity: severity.clone(),
+            rule_name: TEXT_ENUM_LINT_OPTION.into(),
+            message: format!(
+                "{rule_name} contains a text enum. CBOR transmits the full label string."
+            ),
+            suggestion: Some(
+                "Use a named-number enum such as &(busy: 0, denied: 1) for a compact wire value."
+                    .into(),
+            ),
+            auto_fixable: false,
+            line: None,
+            column: None,
+            fix: None,
+        });
     }
 }
 
@@ -304,7 +377,10 @@ fn lint_type_expression_with_config(
     lint_complexity(expr, rule_name, config, result, 0);
 
     match expr {
-        TypeExpression::Builtin(_) | TypeExpression::Reference(_) => {
+        TypeExpression::NamedNumberGroup(_, _)
+        | TypeExpression::NamedNumbers(_)
+        | TypeExpression::Builtin(_)
+        | TypeExpression::Reference(_) => {
             // No specific linting for basic types
         }
         TypeExpression::Array { element_type, .. } => {
@@ -323,6 +399,7 @@ fn lint_type_expression_with_config(
             }
         }
         TypeExpression::Choice(choices) => {
+            lint_text_enum(choices, rule_name, result, config);
             for choice in choices {
                 lint_type_expression_with_config(choice, rule_name, result, config);
             }
@@ -344,10 +421,6 @@ fn lint_type_expression_with_config(
             lint_type_expression_with_config(base_type, rule_name, result, config);
         }
     }
-}
-
-fn lint_group_expression(group: &GroupExpression, rule_name: &str, result: &mut LintResult) {
-    lint_group_expression_with_config(group, rule_name, result, &LintConfig::default());
 }
 
 fn lint_group_expression_with_config(
@@ -714,6 +787,10 @@ fn to_kebab_case(s: &str) -> String {
 
 fn find_type_references(expr: &TypeExpression, used_rules: &mut std::collections::HashSet<String>) {
     match expr {
+        TypeExpression::NamedNumberGroup(name, _) => {
+            used_rules.insert(name.clone());
+        }
+        TypeExpression::NamedNumbers(_) => {}
         TypeExpression::Reference(name) => {
             used_rules.insert(name.clone());
         }
@@ -867,6 +944,56 @@ mod tests {
             imports: Vec::new(),
             options: None,
             rules,
+        }
+    }
+
+    #[test]
+    fn text_enum_policy_uses_each_files_options() {
+        let schema = r#"numbers = &(busy: 7, denied: 42)
+            quoted = "busy" / "denied"
+            record = { items: [* "yes" / "no"], code: numbers }"#;
+        let config = LintConfig::default();
+        for (header, expected) in [
+            (
+                r#"options { lint_text_enums: "error" }"#,
+                Some(LintSeverity::Error),
+            ),
+            (r#"options { lint_text_enums: "off" }"#, None),
+            ("", Some(LintSeverity::Warning)),
+            (r#"options { package: "api" }"#, Some(LintSeverity::Warning)),
+            (
+                r#"options { lint_text_enums: "warn" }"#,
+                Some(LintSeverity::Warning),
+            ),
+        ] {
+            let spec = crate::parse_csil(&format!("{header}\n{schema}")).unwrap();
+            let result = lint_spec(&spec, &config).unwrap();
+            let issues: Vec<_> = result
+                .issues
+                .iter()
+                .filter(|i| i.rule_name == TEXT_ENUM_LINT_OPTION)
+                .collect();
+            assert_eq!(issues.len(), if expected.is_some() { 2 } else { 0 });
+            assert!(
+                issues
+                    .iter()
+                    .all(|i| Some(&i.severity) == expected.as_ref() && !i.auto_fixable)
+            );
+            assert_eq!(result.has_errors(), expected == Some(LintSeverity::Error));
+        }
+    }
+
+    #[test]
+    fn invalid_text_enum_policy_is_a_lint_error() {
+        for settings in [
+            r#"lint_text_enums: "warning""#,
+            "lint_text_enums: false",
+            r#"lint_text_enums: "off", lint_text_enums: "warn""#,
+        ] {
+            let spec = crate::parse_csil(&format!("options {{ {settings} }}\ncode = int")).unwrap();
+            let result = lint_spec(&spec, &LintConfig::default()).unwrap();
+            assert_eq!(result.error_count, 1);
+            assert_eq!(result.issues[0].rule_name, TEXT_ENUM_LINT_OPTION);
         }
     }
 

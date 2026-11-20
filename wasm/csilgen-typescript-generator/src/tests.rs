@@ -562,10 +562,7 @@ fn service_error_is_stripped_from_return_union() {
 }
 
 #[test]
-fn domain_error_union_success_is_a_non_record_payload() {
-    // Under the typed-codec byte seam a method's success must be a single record so
-    // it can call `from<T>Cbor`. A `Res / DomainError` union success is not a record
-    // reference, so the op is skipped with a note for the consumer to handle.
+fn domain_error_union_returns_the_success_record() {
     let mut spec = sample_spec();
     if let CsilRuleType::ServiceDef(def) = &mut spec.rules[6].rule_type {
         def.operations[0].output_type =
@@ -579,11 +576,12 @@ fn domain_error_union_success_is_a_non_record_payload() {
     ));
     let mut input = input_for("typescript-client");
     input.csil_spec = spec;
-    let client = file(&generate_files(&input).expect("generate"), "client.gen.ts").to_string();
-    assert!(
-        client.contains("// operation 'Login' has a non-record payload; (de)serialize it manually")
-    );
-    assert!(!client.contains("fromLoginResponseCbor"));
+    let files = generate_files(&input).expect("generate");
+    let client = file(&files, "client.gen.ts");
+    assert!(client.contains("login(req: LoginRequest): LoginResponse {"));
+    assert!(client.contains("return fromLoginResponseCbor(csilResp);"));
+    let codec = file(&files, "codec.gen.ts");
+    assert!(codec.contains("class LoginErrorRefusal"));
 }
 
 #[test]

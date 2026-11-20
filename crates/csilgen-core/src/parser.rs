@@ -141,6 +141,7 @@ impl Parser {
         // include graph is assembled.
         crate::ast::merge_type_choice_extensions(&mut rules, false);
 
+        crate::ast::resolve_number_groups(&mut rules, false)?;
         Ok(CsilSpec {
             imports,
             options,
@@ -360,8 +361,33 @@ impl Parser {
         let token = self.peek().clone();
 
         let base_type = match &token.token_type {
+            TokenType::Ampersand => {
+                self.advance();
+                self.skip_whitespace_and_comments();
+                if let TokenType::Identifier(name) = &self.peek().token_type {
+                    let name = name.clone();
+                    self.advance();
+                    TypeExpression::NamedNumberGroup(name, Vec::new())
+                } else {
+                    self.consume_token(&TokenType::LeftParen)?;
+                    let entries = self.parse_group_entries(&TokenType::RightParen, "')'")?;
+                    self.consume_token(&TokenType::RightParen)?;
+                    let members =
+                        crate::ast::named_number_members(&entries).map_err(|message| {
+                            ParseError::ExpectedToken {
+                                expected: message,
+                                found: token.clone(),
+                            }
+                        })?;
+                    TypeExpression::NamedNumbers(members)
+                }
+            }
             TokenType::Builtin(name) => {
-                let name = name.clone();
+                let name = if name == "nil" {
+                    "null".into()
+                } else {
+                    name.clone()
+                };
                 self.advance();
                 TypeExpression::Builtin(name)
             }
@@ -1953,7 +1979,7 @@ impl Parser {
                 self.advance();
                 Ok(LiteralValue::Bool(false))
             }
-            TokenType::Builtin(name) if name == "null" => {
+            TokenType::Builtin(name) if name == "null" || name == "nil" => {
                 self.advance();
                 Ok(LiteralValue::Null)
             }
@@ -2097,6 +2123,38 @@ impl From<LexerError> for ParseError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cddl_named_numbers_keep_labels_and_explicit_signed_values() {
+        let spec = parse_csil(
+            "Code = &codes\ncodes = (denied: 42, busy: -7)\nOther = &(busy: -7, denied: 42)",
+        )
+        .unwrap();
+        let RuleType::TypeDef(TypeExpression::NamedNumberGroup(name, values)) =
+            &spec.rules[0].rule_type
+        else {
+            panic!("expected group reference")
+        };
+        assert_eq!(name, "codes");
+        assert_eq!(values, &[("denied".into(), 42), ("busy".into(), -7)]);
+        let RuleType::TypeDef(TypeExpression::NamedNumbers(values)) = &spec.rules[2].rule_type
+        else {
+            panic!("expected inline group")
+        };
+        assert_eq!(values, &[("busy".into(), -7), ("denied".into(), 42)]);
+        for invalid in [
+            "&()",
+            "&(a: 1, a: 2)",
+            "&(a: 1, b: 1)",
+            "&(a: text)",
+            "&(a: 1.5)",
+        ] {
+            assert!(
+                parse_csil(&format!("Code = {invalid}")).is_err(),
+                "{invalid}"
+            );
+        }
+    }
 
     #[test]
     fn test_parse_simple_type_definition() {

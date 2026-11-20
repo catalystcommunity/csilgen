@@ -24,6 +24,29 @@ it is in both sets. The tests use one loopback port for each server on
 `127.0.0.1`. Swift is excluded because the test image does not contain
 `swiftc`.
 
+## Typed RPC replies
+
+Build the CLI and the WASM generators in release mode. Run the Rust and Go
+test from the repository root. Each peer writes reply envelopes and reads
+the other peer's bytes. The test checks success, a declared error, transport
+status 2, missing and unknown variants, and a malformed payload. The
+refusal uses the named member `application_user_limit`. The test checks
+the assigned CBOR integer `7` against the expected payload bytes.
+
+```bash
+tests/interop/typed-replies/run.sh
+```
+
+Run the same operation with the other language targets. Each test needs
+the compiler or runtime for its target. The JSON and OpenAPI tests check
+the schema references for multiple error arms and for a named success union.
+
+```bash
+for target in c csharp dart elixir java kotlin ocaml php python ruby swift typescript zig json openapi; do
+    tests/interop/typed-replies/check.sh "$target" || exit 1
+done
+```
+
 ## Transports & carriers
 
 The matrix runs over loopback **TCP** and **UDP** (not Unix sockets) — both are in

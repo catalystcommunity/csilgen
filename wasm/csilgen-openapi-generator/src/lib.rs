@@ -255,7 +255,7 @@ impl OpenApiGenerator {
             }))
         };
         let response_schema =
-            self.type_expression_to_schema(&operation.output_type, type_definitions)?;
+            self.type_expression_to_schema(operation.success_output(), type_definitions)?;
 
         let mut operation_spec = json!({
             "summary": format!("{} operation", operation.name),
@@ -277,6 +277,19 @@ impl OpenApiGenerator {
                 }
             }
         });
+        if let Some(arms) = operation.rpc_reply_arms() {
+            let mut errors = serde_json::Map::new();
+            for arm in &arms[1..] {
+                errors.insert(
+                    arm.rpc_variant_name().unwrap().into(),
+                    self.type_expression_to_schema(arm, type_definitions)?,
+                );
+            }
+            let response = &mut operation_spec["responses"]["200"];
+            response["description"] = json!("Typed RPC reply");
+            response["x-csil-success-variant"] = json!(arms[0].rpc_variant_name());
+            response["x-csil-error-variants"] = Value::Object(errors);
+        }
         if let Some(body) = request_body {
             operation_spec["requestBody"] = body;
         }
@@ -408,6 +421,21 @@ impl OpenApiGenerator {
                 }))
             }
             CsilTypeExpression::Choice(choices) => {
+                if let Some(numbers) = csilgen_common::enum_numbers(choices) {
+                    let labels = csilgen_common::text_enum_members(choices)
+                        .unwrap()
+                        .into_iter()
+                        .map(|(_, label)| label)
+                        .collect::<Vec<_>>();
+                    let mapping = labels
+                        .iter()
+                        .zip(numbers)
+                        .map(|(s, n)| ((*s).to_owned(), serde_json::Value::from(n)))
+                        .collect::<serde_json::Map<_, _>>();
+                    return Ok(
+                        serde_json::json!({"type":"string", "enum":labels, "x-csil-cbor-values":mapping}),
+                    );
+                }
                 let choice_schemas: Result<Vec<Value>> = choices
                     .iter()
                     .map(|choice| self.type_expression_to_schema(choice, type_definitions))
