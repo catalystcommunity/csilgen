@@ -484,7 +484,8 @@ fn type_uses_decimal(type_expr: &CsilTypeExpression) -> bool {
 pub fn services_use_decimal_inline(services: &[(&str, &CsilServiceDefinition)]) -> bool {
     services.iter().any(|(_, def)| {
         def.operations.iter().any(|op| {
-            type_uses_decimal(&op.input_type) || type_uses_decimal(&success_type(&op.output_type))
+            type_uses_decimal(&op.input_type)
+                || type_uses_decimal(&success_type(op.success_output()))
         })
     })
 }
@@ -556,7 +557,7 @@ pub fn referenced_types(services: &[(&str, &CsilServiceDefinition)]) -> Vec<Stri
     for (_, def) in services {
         for op in &def.operations {
             collect_type_refs(&op.input_type, &mut set);
-            collect_type_refs(&success_type(&op.output_type), &mut set);
+            collect_type_refs(&success_type(op.success_output()), &mut set);
         }
     }
     set.into_iter().collect()

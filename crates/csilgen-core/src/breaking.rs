@@ -664,6 +664,10 @@ fn are_type_expressions_compatible(old: &TypeExpression, new: &TypeExpression) -
         }
 
         // Choices are compatible if all old choices have compatible new choices
+        (
+            TypeExpression::NamedNumbers(old) | TypeExpression::NamedNumberGroup(_, old),
+            TypeExpression::NamedNumbers(new) | TypeExpression::NamedNumberGroup(_, new),
+        ) => old.iter().all(|member| new.contains(member)),
         (TypeExpression::Choice(old_choices), TypeExpression::Choice(new_choices)) => {
             old_choices.iter().all(|old_choice| {
                 new_choices

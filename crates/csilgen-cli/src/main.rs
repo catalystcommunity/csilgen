@@ -41,6 +41,16 @@ enum Commands {
         #[arg(short, long)]
         input: PathBuf,
     },
+    /// Validate a CSIL file and lint each source file in its import graph
+    #[command(visible_alias = "linted_validate")]
+    LintedValidate {
+        /// Path to the CSIL file
+        #[arg(short, long)]
+        input: PathBuf,
+        /// Exit with status 1 if lint reports any warnings
+        #[arg(long)]
+        fail_on_warnings: bool,
+    },
     /// Generate code from CSIL file(s)
     Generate {
         /// CSIL file, directory, or glob pattern
@@ -96,6 +106,9 @@ enum Commands {
         /// Automatically fix linting issues where possible
         #[arg(long)]
         fix: bool,
+        /// Exit with status 1 if lint reports any warnings
+        #[arg(long)]
+        fail_on_warnings: bool,
     },
 }
 
@@ -121,10 +134,11 @@ fn main() -> anyhow::Result<()> {
 
 fn run_command(cli: &Cli, reporter: &ErrorReporter) -> Result<(), csilgen_common::CsilgenError> {
     match &cli.command {
-        Commands::Validate { input } => {
+        Commands::Validate { input } | Commands::LintedValidate { input, .. } => {
             reporter.report_info(&format!("Validating CSIL file: {}", input.display()))?;
 
-            let spec = parse_csil_with_imports(input).map_err(|e| {
+            let mut resolver = ImportResolver::new();
+            let spec = parse_csil_with_imports(input, &mut resolver).map_err(|e| {
                 csilgen_common::CsilgenError::parse_error_with_suggestion(
                     &e.to_string(),
                     None,
@@ -141,6 +155,25 @@ fn run_command(cli: &Cli, reporter: &ErrorReporter) -> Result<(), csilgen_common
                 ))?;
             } else {
                 reporter.report_success("CSIL file validated successfully")?;
+            }
+            if let Commands::LintedValidate {
+                fail_on_warnings, ..
+            } = &cli.command
+            {
+                let mut imports: Vec<_> = resolver.imported_paths().collect();
+                imports.sort_unstable();
+                let mut results = Vec::new();
+                for path in std::iter::once(input.as_path()).chain(imports) {
+                    let result =
+                        csilgen_core::lint_file(path, &LintConfig::default()).map_err(|e| {
+                            csilgen_common::CsilgenError::GenericError(format!(
+                                "Failed to lint {}: {e}",
+                                path.display()
+                            ))
+                        })?;
+                    results.push((path.display().to_string(), result));
+                }
+                report_lint_results(&results, *fail_on_warnings, reporter)?;
             }
         }
         Commands::Generate {
@@ -312,9 +345,11 @@ fn run_command(cli: &Cli, reporter: &ErrorReporter) -> Result<(), csilgen_common
                 }
             }
         }
-        Commands::Lint { path, fix } => {
-            let config = LintConfig::default();
-
+        Commands::Lint {
+            path,
+            fix,
+            fail_on_warnings,
+        } => {
             if *fix {
                 reporter.report_info(&format!(
                     "Linting and fixing CSIL files in: {}",
@@ -324,68 +359,77 @@ fn run_command(cli: &Cli, reporter: &ErrorReporter) -> Result<(), csilgen_common
                 reporter.report_info(&format!("Linting CSIL files in: {}", path.display()))?;
             }
 
-            match lint_directory(path, &config, *fix) {
-                Ok(results) => {
-                    let pb = reporter.create_progress_bar(results.len() as u64, "Linting files");
-                    let mut total_errors = 0;
-                    let mut total_warnings = 0;
-
-                    for (file_path, result) in &results {
-                        pb.inc(1);
-                        if !result.issues.is_empty() {
-                            reporter.report_debug(&format!("\n{file_path}:"))?;
-                            for issue in &result.issues {
-                                let severity_symbol = match issue.severity {
-                                    csilgen_core::LintSeverity::Error => "❌",
-                                    csilgen_core::LintSeverity::Warning => "⚠️",
-                                    csilgen_core::LintSeverity::Info => "ℹ️",
-                                };
-                                reporter.report_debug(&format!(
-                                    "  {} [{}] {}",
-                                    severity_symbol, issue.rule_name, issue.message
-                                ))?;
-                                if let Some(suggestion) = &issue.suggestion {
-                                    reporter.report_debug(&format!("      💡 {suggestion}"))?;
-                                }
-                            }
-                        }
-                        total_errors += result.error_count;
-                        total_warnings += result.warning_count;
-                    }
-
-                    pb.finish_and_clear();
-                    reporter.report_info(&format!(
-                        "Summary: {total_errors} error(s), {total_warnings} warning(s)"
-                    ))?;
-
-                    if total_errors > 0 {
-                        return Err(csilgen_common::CsilgenError::ValidationError(
-                            csilgen_common::ValidationError {
-                                message: format!("Linting found {total_errors} error(s)"),
-                                location: None,
-                                suggestion: Some(
-                                    "Fix the errors and run linting again".to_string(),
-                                ),
-                                error_kind:
-                                    csilgen_common::ValidationErrorKind::MissingRequiredField,
-                            },
-                        ));
-                    }
-                }
-                Err(e) => {
-                    return Err(csilgen_common::CsilgenError::IoError(e.to_string()));
-                }
-            }
+            let results = lint_directory(path, &LintConfig::default(), *fix)
+                .map_err(|e| csilgen_common::CsilgenError::IoError(e.to_string()))?;
+            report_lint_results(&results, *fail_on_warnings, reporter)?;
         }
     }
 
     Ok(())
 }
 
-/// Parse a CSIL file with import resolution
-fn parse_csil_with_imports(path: &std::path::Path) -> anyhow::Result<CsilSpec> {
-    let mut resolver = ImportResolver::new();
+fn report_lint_results(
+    results: &[(String, csilgen_core::LintResult)],
+    fail_on_warnings: bool,
+    reporter: &ErrorReporter,
+) -> Result<(), csilgen_common::CsilgenError> {
+    let pb = reporter.create_progress_bar(results.len() as u64, "Linting files");
+    let mut total_errors = 0;
+    let mut total_warnings = 0;
 
+    for (file_path, result) in results {
+        pb.inc(1);
+        if !result.issues.is_empty() {
+            reporter.report_debug(&format!("\n{file_path}:"))?;
+            for issue in &result.issues {
+                let severity_symbol = match issue.severity {
+                    csilgen_core::LintSeverity::Error => "❌",
+                    csilgen_core::LintSeverity::Warning => "⚠️",
+                    csilgen_core::LintSeverity::Info => "ℹ️",
+                };
+                let message = format!(
+                    "{file_path}: {severity_symbol} [{}] {}",
+                    issue.rule_name, issue.message
+                );
+                if issue.rule_name == csilgen_core::TEXT_ENUM_LINT_OPTION
+                    || (fail_on_warnings && issue.severity != csilgen_core::LintSeverity::Info)
+                {
+                    reporter.report_info(&message)?;
+                } else {
+                    reporter.report_debug(&message)?;
+                }
+                if let Some(suggestion) = &issue.suggestion {
+                    reporter.report_debug(&format!("      💡 {suggestion}"))?;
+                }
+            }
+        }
+        total_errors += result.error_count;
+        total_warnings += result.warning_count;
+    }
+
+    pb.finish_and_clear();
+    reporter.report_info(&format!(
+        "Summary: {total_errors} error(s), {total_warnings} warning(s)"
+    ))?;
+
+    if total_errors > 0 {
+        return Err(csilgen_common::CsilgenError::GenericError(format!(
+            "Linting found {total_errors} error(s)"
+        )));
+    }
+    if fail_on_warnings && total_warnings > 0 {
+        return Err(csilgen_common::CsilgenError::GenericError(format!(
+            "Linting found {total_warnings} warning(s) with --fail-on-warnings"
+        )));
+    }
+    Ok(())
+}
+
+/// Parse a CSIL file with import resolution
+fn parse_csil_with_imports(
+    path: &std::path::Path,
+    resolver: &mut ImportResolver,
+) -> anyhow::Result<CsilSpec> {
     let file_size = std::fs::metadata(path)?.len();
     let mut spec = if file_size > 10 * 1024 * 1024 {
         parse_csil_file_streaming(path)?

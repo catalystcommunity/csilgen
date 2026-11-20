@@ -495,6 +495,19 @@ fn inspect(
         SchemaType::Group(group) => {
             inspect_group(descriptor, group, value, path, diagnostics, depth + 1)
         }
+        SchemaType::NamedNumbers(members) => {
+            if !matches!(value.value, DiagnosticValue::Integer(n) if members.iter().any(|(_, v)| i128::from(*v) == n))
+            {
+                mismatch(
+                    diagnostics,
+                    path,
+                    value,
+                    "declared enum number",
+                    value.value.shape(),
+                );
+            }
+            TypedValue::Value(value.clone())
+        }
         SchemaType::Choice(arms) => {
             for (arm_index, arm) in arms.iter().enumerate() {
                 let mut arm_diagnostics = Vec::new();

@@ -394,14 +394,25 @@ fn rpcClientCall(
     op: []const u8,
     req: []const u8,
 ) anyerror![]u8 {
+    const reply = try rpcClientReply(ptr, alloc, service, op, req);
+    if (reply.variant) |variant| alloc.free(variant);
+    return reply.payload;
+}
+
+fn rpcClientReply(
+    ptr: *anyopaque,
+    alloc: std.mem.Allocator,
+    service: []const u8,
+    op: []const u8,
+    req: []const u8,
+) anyerror!gen_client.WireReply {
     const self: *ClientCtx = @ptrCast(@alignCast(ptr));
     var arena = std.heap.ArenaAllocator.init(self.base);
     defer arena.deinit();
     const resp = try self.client.call(self.base, arena.allocator(), service, op, req, null);
-    if (resp.variant) |variant| {
-        if (streq(variant, "ServiceError")) return error.ServiceError;
-    }
-    return try alloc.dupe(u8, resp.payload);
+    const payload = try alloc.dupe(u8, resp.payload);
+    errdefer alloc.free(payload);
+    return .{ .variant = if (resp.variant) |v| try alloc.dupe(u8, v) else null, .payload = payload };
 }
 
 fn rpcClient(a: std.mem.Allocator, stream: std.net.Stream) Cases {
@@ -409,7 +420,7 @@ fn rpcClient(a: std.mem.Allocator, stream: std.net.Stream) Cases {
     var sc = carrier.StreamCarrier.init(stream);
     var client = rpc.RpcClient.init(sc.carrier(), false);
     var cctx = ClientCtx{ .client = &client, .base = a };
-    const tr = gen_client.CsilgenTransport{ .ptr = &cctx, .call = rpcClientCall };
+    const tr = gen_client.CsilgenTransport{ .ptr = &cctx, .call = rpcClientCall, .call_reply = rpcClientReply };
     const c = gen_client.InteropClient.init(tr);
 
     {
@@ -440,22 +451,22 @@ fn rpcClient(a: std.mem.Allocator, stream: std.net.Stream) Cases {
         }
     }
     {
-        var got: Constrained = undefined;
+        var got: gen_types.InteropValidateConstrainedReply = undefined;
         const want = constrainedOk(a) catch unreachable;
         if (c.validate_constrained(a, &want, &got)) {
-            cases.check("validate-constrained/success", constrainedEql(got, want), "mismatch");
+            cases.check("validate-constrained/success", got == .constrained and constrainedEql(got.constrained, want), "mismatch");
         } else |err| {
             cases.fail("validate-constrained/success", @errorName(err));
         }
     }
     {
-        var got: Constrained = undefined;
+        var got: gen_types.InteropValidateConstrainedReply = undefined;
         const bad = constrainedBad(a) catch unreachable;
         if (c.validate_constrained(a, &bad, &got)) {
-            cases.fail("validate-constrained/failure", "server accepted invalid input");
+            cases.check("validate-constrained/failure", got == .service_error, "expected a service error");
         } else |err| {
             // The typed error arm must surface as a service error.
-            cases.check("validate-constrained/failure", err == error.ServiceError, @errorName(err));
+            cases.fail("validate-constrained/failure", @errorName(err));
         }
     }
     // Optional-bytes presence: absent, present-empty, and present-non-empty are three
@@ -528,7 +539,7 @@ fn chEncodeScalars(ptr: *anyopaque, value: *const anyopaque) anyerror![]u8 {
 fn chEchoScalars(_: *anyopaque, _: *const Scalars, _: *Scalars) anyerror!void {}
 fn chEchoCollections(_: *anyopaque, _: *const Collections, _: *Collections) anyerror!void {}
 fn chEchoNested(_: *anyopaque, _: *const Nested, _: *EchoNestedResult) anyerror!void {}
-fn chValidateConstrained(_: *anyopaque, _: *const Constrained, _: *Constrained) anyerror!void {}
+fn chValidateConstrained(_: *anyopaque, _: *const Constrained, _: *gen_types.InteropValidateConstrainedReply) anyerror!void {}
 fn chDuplex(_: *anyopaque, _: *const Scalars) anyerror!void {}
 fn chEchoOptBytes(_: *anyopaque, _: *const OptBytes, _: *OptBytes) anyerror!void {}
 

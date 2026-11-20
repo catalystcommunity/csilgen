@@ -545,7 +545,7 @@ fn int_lit(n: i64) -> CsilTypeExpression {
 }
 
 #[test]
-fn all_literal_string_choice_becomes_string_typedef_not_sealed() {
+fn all_literal_string_choice_generates_enum() {
     // `"open" / "closed"` (no general `text`/`tstr` arm) is a closed string set:
     // idiomatic Dart is a `String` alias, and the bare string round-trips — a
     // sealed wrapper wouldn't.
@@ -558,8 +558,8 @@ fn all_literal_string_choice_becomes_string_typedef_not_sealed() {
     let files = generate_dart_code(&spec(rules, 0), &config("dart")).unwrap();
     let code = types_file(&files);
     assert!(
-        code.contains("typedef Status = String;"),
-        "all-literal string choice -> typedef: {code}"
+        code.contains("enum Status {"),
+        "expected a closed enum: {code}"
     );
     assert!(
         !code.contains("sealed class Status"),
@@ -586,7 +586,7 @@ fn mixed_text_choice_becomes_sealed_union_not_typedef() {
     let files = generate_dart_code(&spec(rules, 0), &config("dart")).unwrap();
     let code = types_file(&files);
     assert!(
-        !code.contains("typedef Status = String;"),
+        !code.contains("enum Status {"),
         "mixed text choice must not collapse to a bare typedef: {code}"
     );
     assert!(
@@ -1085,7 +1085,7 @@ fn hoisted_enum_reference_field_gets_membership_check_on_decode() {
     let files = generate_dart_code(&spec(enum_reference_rules(), 0), &config("dart")).unwrap();
     let code = types_file(&files);
     assert!(
-        code.contains("CsilCbor.expectOneOf<String>(map['color']"),
+        code.contains("Color.fromWire(map['color'])"),
         "a field referencing a named string choice must decode through expectOneOf: {code}"
     );
     assert!(
@@ -1139,17 +1139,17 @@ void _check(bool ok, String what) {
 
 void main() {
   // Valid member round-trips byte-identical.
-  final item = Item(color: 'red', level: 2);
+  final item = Item(color: Color.red, level: 2);
   final back = Item.fromCbor(item.toCbor());
-  _check(back.color == 'red' && back.level == 2, 'valid round-trip');
+  _check(back.color == Color.red && back.level == 2, 'valid round-trip');
 
   // An out-of-set string must be rejected with the codec's standard error.
   try {
     Item.fromCborValue({'color': 'purple', 'level': 2});
     throw StateError('out-of-set color was accepted');
-  } on ArgumentError catch (e) {
+  } on FormatException catch (e) {
     _check(
-      e.toString().contains('not a member of the closed set'),
+      e.toString().contains('unknown Color value'),
       'color error shape: $e',
     );
   }
@@ -1960,7 +1960,7 @@ fn client_package_readme_has_rpc_and_datagram_sections() {
         "posts to the path: {readme}"
     );
     assert!(
-        readme.contains("resp.variant == 'ServiceError'"),
+        readme.contains("return resp.payload;"),
         "typed ServiceError arm handled: {readme}"
     );
     assert!(

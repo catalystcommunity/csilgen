@@ -422,7 +422,7 @@ fn generate_types(input: &WasmGeneratorInput, config: &ZigConfig) -> Option<Stri
         .iter()
         .filter_map(|r| classify_rule(&r.rule_type).map(|k| (r.name.as_str(), k)))
         .collect();
-    if typed.is_empty() {
+    if typed.is_empty() && input.csil_spec.rpc_operations().next().is_none() {
         return None;
     }
     let names: std::collections::HashSet<&str> = typed.iter().map(|(n, _)| *n).collect();
@@ -527,6 +527,16 @@ fn generate_types(input: &WasmGeneratorInput, config: &ZigConfig) -> Option<Stri
     content.push_str(&enums);
     content.push_str(&aliases);
     content.push_str(&definitions);
+    for (service, op, arms) in input.csil_spec.rpc_operations() {
+        let reply = rpc_reply_type(service, &op.name);
+        content.push_str(&format!("pub const {reply} = union(enum) {{\n"));
+        for arm in arms {
+            let tag = zig_field_ident(&to_snake(arm.rpc_variant_name().unwrap()));
+            let ty = map_zig_type(arm, "");
+            content.push_str(&format!("    {tag}: {ty},\n"));
+        }
+        content.push_str("};\n");
+    }
     Some(content)
 }
 
@@ -2014,7 +2024,7 @@ fn generate_codec(
         })
         .map(|(n, _)| n.to_string())
         .collect();
-    if codec_names.is_empty() {
+    if codec_names.is_empty() && input.csil_spec.rpc_operations().next().is_none() {
         return None;
     }
     let aliases = codec_aliases(input);
@@ -2026,7 +2036,34 @@ fn generate_codec(
             TypeKind::Struct(group) => {
                 emit_record_codec(&mut bodies, name, group, &codec_names, &aliases, warnings)
             }
-            TypeKind::Enum(variants) => emit_enum_codec(&mut bodies, name, variants),
+            TypeKind::Enum(labels) => {
+                if let Some(numbers) = input
+                    .csil_spec
+                    .rules
+                    .iter()
+                    .find(|r| r.name == *name)
+                    .and_then(csilgen_common::rule_enum_numbers)
+                {
+                    bodies.push_str(&format!("fn enc_{name}(out: *std.ArrayList(u8), v: *const types.{name}) CodecError!void {{\n    try w_int(out, switch (v.*) {{\n"));
+                    for (label, n) in labels.iter().zip(&numbers) {
+                        bodies.push_str(&format!(
+                            "        .{} => {n},\n",
+                            zig_field_ident(&to_snake(label))
+                        ));
+                    }
+                    bodies.push_str("    });\n}\n\n");
+                    bodies.push_str(&format!("fn dec_{name}(alloc: std.mem.Allocator, src: Value, out: *types.{name}) CodecError!void {{\n    _ = alloc;\n    out.* = switch (try as_i64(src)) {{\n"));
+                    for (label, n) in labels.iter().zip(&numbers) {
+                        bodies.push_str(&format!(
+                            "        {n} => .{},\n",
+                            zig_field_ident(&to_snake(label))
+                        ));
+                    }
+                    bodies.push_str("        else => return error.WrongType,\n    };\n}\n\n");
+                } else {
+                    emit_enum_codec(&mut bodies, name, labels);
+                }
+            }
             TypeKind::IntEnum(_) => emit_int_enum_codec(&mut bodies, name),
             TypeKind::MixedEnum(literals) => {
                 emit_mixed_enum_codec(&mut bodies, name, literals, warnings)
@@ -2073,6 +2110,73 @@ fn generate_codec(
     content.push('\n');
     content.push_str(&bodies);
     content.push_str(&public);
+    if input.csil_spec.rpc_operations().next().is_some() {
+        content.push_str("pub const RpcReply = struct { variant: []const u8, payload: []u8 };\n\n");
+    }
+    for (service, op, arms) in input.csil_spec.rpc_operations() {
+        let reply = rpc_reply_type(service, &op.name);
+        if !op_input_is_null(&op.input_type)
+            && !codec_names.contains(&type_codec_name(&op.input_type))
+        {
+            let ty = map_zig_type(&op.input_type, "types.");
+            content.push_str(&format!("pub fn encode_{reply}Request(alloc: std.mem.Allocator, req: *const {ty}) CodecError![]u8 {{\n    var buf = std.ArrayList(u8).init(alloc);\n    errdefer buf.deinit();\n    const out = &buf;\n"));
+            emit_enc_value(
+                &mut content,
+                "    ",
+                &op.input_type,
+                "req.*",
+                &codec_names,
+                &aliases,
+                warnings,
+            );
+            content.push_str("    return buf.toOwnedSlice();\n}\n\n");
+        }
+        content.push_str(&format!("pub fn encode_{reply}(alloc: std.mem.Allocator, value: types.{reply}) CodecError!RpcReply {{\n    var buf = std.ArrayList(u8).init(alloc);\n    errdefer buf.deinit();\n    const out = &buf;\n    switch (value) {{\n"));
+        for arm in arms {
+            let wire = arm.rpc_variant_name().unwrap();
+            let tag = zig_field_ident(&to_snake(wire));
+            let capture = if enc_arm_uses_capture(arm, &aliases) {
+                "|v| "
+            } else {
+                ""
+            };
+            content.push_str(&format!("        .{tag} => {capture}{{\n"));
+            emit_enc_value(
+                &mut content,
+                "            ",
+                arm,
+                "v",
+                &codec_names,
+                &aliases,
+                warnings,
+            );
+            content.push_str(&format!("            return .{{ .variant = \"{wire}\", .payload = try buf.toOwnedSlice() }};\n        }},\n"));
+        }
+        content.push_str("    }\n}\n\n");
+        content.push_str(&format!("pub fn decode_{reply}(alloc: std.mem.Allocator, variant: ?[]const u8, payload: []const u8, out: *types.{reply}) CodecError!void {{\n    const name = variant orelse return error.WrongType;\n    const src = try decode(alloc, payload);\n"));
+        for arm in arms {
+            let wire = arm.rpc_variant_name().unwrap();
+            let tag = zig_field_ident(&to_snake(wire));
+            let ty = map_zig_type(arm, "types.");
+            content.push_str(&format!(
+                "    if (std.mem.eql(u8, name, \"{wire}\")) {{\n        var v: {ty} = undefined;\n"
+            ));
+            emit_dec_value(
+                &mut content,
+                "        ",
+                arm,
+                "src",
+                "v",
+                &codec_names,
+                &aliases,
+                warnings,
+            );
+            content.push_str(&format!(
+                "        out.* = .{{ .{tag} = v }};\n        return;\n    }}\n"
+            ));
+        }
+        content.push_str("    return error.WrongType;\n}\n\n");
+    }
     Some(content)
 }
 
@@ -2088,7 +2192,10 @@ const CLIENT_PRELUDE_ZIG: &str = "\
 /// by (service, op) with the already-encoded req bytes (CBOR over HTTP, say) and
 /// returns the response bytes, allocated with `alloc` so the generated client frees
 /// them. The generator owns serialization; the carrier only moves bytes.
+pub const WireReply = struct { variant: ?[]u8, payload: []u8 };
+
 pub const CsilgenTransport = struct {
+    call_reply: ?*const fn (*anyopaque, std.mem.Allocator, []const u8, []const u8, []const u8) anyerror!WireReply = null,
     ptr: *anyopaque,
     call: *const fn (ptr: *anyopaque, alloc: std.mem.Allocator, service: []const u8, op: []const u8, req: []const u8) anyerror![]u8,
 };
@@ -2099,7 +2206,7 @@ fn generate_client(input: &WasmGeneratorInput) -> Option<String> {
     let mut emitted = false;
     for rule in &input.csil_spec.rules {
         if let CsilRuleType::ServiceDef(service) = &rule.rule_type {
-            emit_client_struct(&mut body, &rule.name, service);
+            emit_client_struct(&mut body, &rule.name, service, input);
             emitted = true;
         }
     }
@@ -2117,7 +2224,12 @@ fn generate_client(input: &WasmGeneratorInput) -> Option<String> {
     Some(content)
 }
 
-fn emit_client_struct(content: &mut String, name: &str, service: &CsilServiceDefinition) {
+fn emit_client_struct(
+    content: &mut String,
+    name: &str,
+    service: &CsilServiceDefinition,
+    input: &WasmGeneratorInput,
+) {
     let base = service_base(name);
     let client = format!("{base}Client");
     content.push_str(&format!(
@@ -2142,11 +2254,33 @@ fn emit_client_struct(content: &mut String, name: &str, service: &CsilServiceDef
         }
         let method = zig_ident(&to_snake(&op.name));
         let wire_op = &op.name;
-        let resp_type = map_zig_type(&success_type(&op.output_type), "types.");
-        let resp_codec = type_codec_name(&success_type(&op.output_type));
+        let resp_type = if op.rpc_reply_arms().is_some() {
+            format!("types.{}", rpc_reply_type(name, &op.name))
+        } else {
+            map_zig_type(op.success_output(), "types.")
+        };
+        let resp_codec = type_codec_name(&success_type(op.success_output()));
         let has_input = !op_input_is_null(&op.input_type);
         let req_type = map_zig_type(&op.input_type, "types.");
-        let req_codec = type_codec_name(&op.input_type);
+        let mut req_codec = type_codec_name(&op.input_type);
+        if has_input
+            && op.rpc_reply_arms().is_some()
+            && !input.csil_spec.rules.iter().any(|rule| {
+                rule.name == req_codec
+                    && matches!(
+                        classify_rule(&rule.rule_type),
+                        Some(
+                            TypeKind::Struct(_)
+                                | TypeKind::Enum(_)
+                                | TypeKind::IntEnum(_)
+                                | TypeKind::MixedEnum(_)
+                                | TypeKind::Union(_)
+                        )
+                    )
+            })
+        {
+            req_codec = format!("{}Request", rpc_reply_type(name, wire_op));
+        }
 
         content.push_str(&format!(
             "\n    /// Invoke {name}/{wire_op} with a typed request, returning the decoded\n\
@@ -2166,6 +2300,11 @@ fn emit_client_struct(content: &mut String, name: &str, service: &CsilServiceDef
                 "    pub fn {method}(self: {client}, alloc: std.mem.Allocator, out: *{resp_type}) anyerror!void {{\n"
             ));
             content.push_str("        const csil_reqb: []const u8 = &.{};\n");
+        }
+        if op.rpc_reply_arms().is_some() {
+            let reply = rpc_reply_type(name, wire_op);
+            content.push_str(&format!("        const call = self.transport.call_reply orelse return error.MissingRpcReplyCarrier;\n        const reply = try call(self.transport.ptr, alloc, \"{name}\", \"{wire_op}\", csil_reqb);\n        defer if (reply.variant) |variant| alloc.free(variant);\n        defer alloc.free(reply.payload);\n        try codec.decode_{reply}(alloc, reply.variant, reply.payload, out);\n    }}\n"));
+            continue;
         }
         content.push_str(&format!(
             "        const csil_respb = try self.transport.call(self.transport.ptr, alloc, \"{name}\", \"{wire_op}\", csil_reqb);\n"
@@ -2233,6 +2372,10 @@ fn generate_server(
     Some(content)
 }
 
+fn rpc_reply_type(service: &str, method: &str) -> String {
+    format!("{}{}Reply", simple_pascal(service), simple_pascal(method))
+}
+
 fn emit_handlers_struct(content: &mut String, name: &str, service: &CsilServiceDefinition) {
     let base = service_base(name);
     content.push_str(&format!(
@@ -2243,7 +2386,11 @@ fn emit_handlers_struct(content: &mut String, name: &str, service: &CsilServiceD
         let method = zig_field_ident(&to_snake(&op.name));
         match op.direction {
             CsilServiceDirection::Unidirectional => {
-                let out_type = map_zig_type(&success_type(&op.output_type), "types.");
+                let out_type = if op.rpc_reply_arms().is_some() {
+                    format!("types.{}", rpc_reply_type(name, &op.name))
+                } else {
+                    map_zig_type(op.success_output(), "types.")
+                };
                 if op_input_is_null(&op.input_type) {
                     content.push_str(&format!(
                         "    {method}: *const fn (ctx: *anyopaque, resp: *{out_type}) anyerror!void,\n"
@@ -2573,6 +2720,7 @@ fn wanted_transports(input: &WasmGeneratorInput) -> (bool, bool, bool) {
 /// compiling request literal, the response type, and — for the datagram section —
 /// the request/response codec names and the op's datagram ordinal.
 struct ZigUnaryExample {
+    rpc_reply: Option<String>,
     client_type: String,
     method: String,
     wire_service: String,
@@ -2602,7 +2750,7 @@ fn first_unary_example(input: &WasmGeneratorInput) -> Option<ZigUnaryExample> {
             if !matches!(op.direction, CsilServiceDirection::Unidirectional) {
                 continue;
             }
-            let success = success_type(&op.output_type);
+            let success = success_type(op.success_output());
             let null_input = op_input_is_null(&op.input_type);
             let res_codec = match record_ref_name(input, &success) {
                 Some(name) => name,
@@ -2614,6 +2762,9 @@ fn first_unary_example(input: &WasmGeneratorInput) -> Option<ZigUnaryExample> {
             let base = service_base(&rule.name);
             let has_request = !null_input;
             return Some(ZigUnaryExample {
+                rpc_reply: op
+                    .rpc_reply_arms()
+                    .map(|_| format!("types.{}", rpc_reply_type(&rule.name, &op.name))),
                 client_type: format!("{base}Client"),
                 method: zig_field_ident(&to_snake(&op.name)),
                 wire_service: rule.name.clone(),
@@ -2666,7 +2817,7 @@ fn first_channel_example(input: &WasmGeneratorInput) -> Option<ZigChannelExample
             if !matches!(op.direction, CsilServiceDirection::Bidirectional) {
                 continue;
             }
-            let success = success_type(&op.output_type);
+            let success = success_type(op.success_output());
             let (Some(in_codec), Some(out_codec)) = (
                 record_ref_name(input, &op.input_type),
                 record_ref_name(input, &success),
@@ -2860,7 +3011,10 @@ fn rpc_section(ex: Option<&ZigUnaryExample>) -> String {
          \x20   var arena = std.heap.ArenaAllocator.init(alloc);\n\
          \x20   defer arena.deinit();\n\n",
     );
-    out.push_str(&format!("    var resp: {} = undefined;\n", ex.resp_type));
+    out.push_str(&format!(
+        "    var resp: {} = undefined;\n",
+        ex.rpc_reply.as_ref().unwrap_or(&ex.resp_type)
+    ));
     if ex.has_request {
         out.push_str(&format!("    const req = {};\n", ex.req_literal));
         out.push_str(&format!(
@@ -2873,7 +3027,11 @@ fn rpc_section(ex: Option<&ZigUnaryExample>) -> String {
             ex.method
         ));
     }
-    match &ex.resp_print_field {
+    match ex
+        .resp_print_field
+        .as_ref()
+        .filter(|_| ex.rpc_reply.is_none())
+    {
         Some(field) => out.push_str(&format!(
             "    std.debug.print(\"{}/{} -> {{s}}\\n\", .{{resp.{field}}});\n",
             ex.wire_service, ex.wire_op
@@ -2906,10 +3064,16 @@ const HttpRpcCarrier = struct {
     base_url: []const u8, // e.g. "http://127.0.0.1:5080"
 
     fn transport(self: *HttpRpcCarrier) client.CsilgenTransport {
-        return .{ .ptr = self, .call = call };
+        return .{ .ptr = self, .call = call, .call_reply = callReply };
     }
 
     fn call(ptr: *anyopaque, alloc: std.mem.Allocator, service: []const u8, op: []const u8, req: []const u8) anyerror![]u8 {
+        const reply = try callReply(ptr, alloc, service, op, req);
+        if (reply.variant) |variant| alloc.free(variant);
+        return reply.payload;
+    }
+
+    fn callReply(ptr: *anyopaque, alloc: std.mem.Allocator, service: []const u8, op: []const u8, req: []const u8) anyerror!client.WireReply {
         const self: *HttpRpcCarrier = @ptrCast(@alignCast(ptr));
 
         // Build the request envelope with the library (NOT hand-rolled).
@@ -2938,11 +3102,9 @@ const HttpRpcCarrier = struct {
         defer arena.deinit();
         const resp = try rpc.decode_rpc_response(arena.allocator(), resp_body.items);
         resp.as_transport_error() catch return error.CsilRpcTransportStatus;
-        if (resp.variant) |variant| {
-            if (std.mem.eql(u8, variant, "ServiceError")) return error.CsilRpcServiceError;
-        }
-        // Hand the typed payload bytes back to the generated client (it frees them).
-        return alloc.dupe(u8, resp.payload);
+        const payload = try alloc.dupe(u8, resp.payload);
+        errdefer alloc.free(payload);
+        return .{ .variant = if (resp.variant) |v| try alloc.dupe(u8, v) else null, .payload = payload };
     }
 };
 "#;

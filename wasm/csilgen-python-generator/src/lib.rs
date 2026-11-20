@@ -116,7 +116,9 @@ fn process_generation(
 
 fn csil_literal_to_python_str(value: &CsilLiteralValue) -> String {
     match value {
-        CsilLiteralValue::Text(text) => format!("\"{text}\""),
+        CsilLiteralValue::Text(text) => {
+            serde_json::to_string(text).expect("serialize text literal")
+        }
         CsilLiteralValue::Integer(num) => num.to_string(),
         // Python's bool keywords are capitalized (`True`/`False`); Rust's `bool`
         // `Display` is lowercase and would emit an undefined bare name.
@@ -371,7 +373,7 @@ pub fn generate_python_code_from_serialized(
     config: &GeneratorConfig,
 ) -> Result<GeneratedFiles> {
     let mut generator = PythonGenerator::new(config);
-    generator.generate(spec)
+    generator.generate(&csilgen_common::hoist_inline_named_numbers(spec))
 }
 
 /// Reduce an operation output to its success type by dropping a top-level
@@ -581,7 +583,11 @@ fn readme(
     let unary = first_unary_example(spec, records);
     let channel = first_channel_example(spec, records);
     if rpc {
-        out.push_str(&rpc_section(import, unary.as_ref()));
+        out.push_str(&rpc_section(
+            import,
+            unary.as_ref(),
+            spec.rpc_operations().next().is_some(),
+        ));
     }
     if events {
         out.push_str(&events_section(import, channel.as_ref()));
@@ -597,7 +603,7 @@ fn readme(
 /// hand-rolled), POSTing to `{base_url}/csil/v1/rpc` with the stdlib `urllib`. A
 /// non-zero transport status (via `into_transport_error`) and the typed `ServiceError`
 /// arm are surfaced distinctly. Then the typed client calls the first `->` op.
-fn rpc_section(import: &str, ex: Option<&UnaryExample>) -> String {
+fn rpc_section(import: &str, ex: Option<&UnaryExample>, typed_rpc: bool) -> String {
     let mut out = String::from("## CSIL-RPC (HTTP)\n\n");
     out.push_str(
         "Request/response. The library owns the envelope (`RpcRequest`/`RpcResponse`);\n\
@@ -615,7 +621,15 @@ fn rpc_section(import: &str, ex: Option<&UnaryExample>) -> String {
     out.push_str("```python\n");
     out.push_str("from csilgen_transport.rpc import RpcRequest, RpcResponse\n");
     out.push_str(&format!("from {import} import {}\n\n", names.join(", ")));
+    if typed_rpc {
+        out.push_str(&format!("from {import}.codec import resolve_rpc_reply\n"));
+    }
     out.push_str(RPC_CARRIER_PYTHON);
+    if typed_rpc {
+        out.push_str("        return resolve_rpc_reply(service, op, env.variant, env.payload)\n");
+    } else {
+        out.push_str("        return env.payload\n");
+    }
     out.push_str("\n\ndef main() -> None:\n");
     out.push_str(&format!(
         "    client = {}(HttpRpcCarrier(\"http://localhost:5080\"))\n",
@@ -670,11 +684,6 @@ class HttpRpcCarrier:
 
         # into_transport_error() raises StatusError for any non-zero transport status.
         env = RpcResponse.decode(raw).into_transport_error()
-        # A typed application error rides as a status-0 `ServiceError` variant — distinct
-        # from a transport failure. Surface it so the typed client decodes success only.
-        if env.variant == "ServiceError":
-            raise RuntimeError(f"csil-rpc {service}/{op}: ServiceError")
-        return env.payload
 "#;
 
 /// CSIL-Events over TLS: a full session example. Opens a TLS byte stream wrapped as the
@@ -962,7 +971,7 @@ fn first_unary_example(
             if !matches!(op.direction, CsilServiceDirection::Unidirectional) {
                 continue;
             }
-            let success = python_success_type(&op.output_type);
+            let success = python_success_type(op.success_output());
             let resp_record = is_record_ref(&success, records);
             let req_ok = is_null_input(&op.input_type) || is_record_ref(&op.input_type, records);
             if !resp_record || !req_ok {
@@ -1142,6 +1151,7 @@ struct PythonGenerator {
     config: GeneratorConfig,
     use_pydantic: bool,
     generated_types: HashSet<String>,
+    enum_choices: HashMap<String, Vec<CsilTypeExpression>>,
     // BTreeSet, not HashSet: the import block is emitted by iterating this set directly,
     // and HashSet iteration order varies between wasm builds of the same source rev, which
     // breaks reproducible-codegen checks that regen + `git diff --exit-code`.
@@ -1160,6 +1170,7 @@ impl PythonGenerator {
             config: config.clone(),
             use_pydantic,
             generated_types: HashSet::new(),
+            enum_choices: HashMap::new(),
             imports: BTreeSet::new(),
         }
     }
@@ -1226,6 +1237,14 @@ impl PythonGenerator {
         self.setup_imports();
         self.collect_special_imports(spec);
 
+        for rule in &spec.rules {
+            if let CsilRuleType::TypeDef(CsilTypeExpression::Choice(arms))
+            | CsilRuleType::TypeChoice(arms) = &rule.rule_type
+                && csilgen_common::is_text_enum(arms)
+            {
+                self.enum_choices.insert(rule.name.clone(), arms.clone());
+            }
+        }
         let mut types_code = String::new();
         let mut services_code = String::new();
 
@@ -1238,7 +1257,9 @@ impl PythonGenerator {
 
         let mut prelude_emitted = false;
 
-        for rule in &spec.rules {
+        let mut ordered = spec.rules.iter().collect::<Vec<_>>();
+        ordered.sort_by_key(|r| !self.enum_choices.contains_key(&r.name));
+        for rule in ordered {
             match &rule.rule_type {
                 CsilRuleType::TypeDef(type_expr) => {
                     types_code.push_str(&self.generate_type_def(&rule.name, type_expr)?);
@@ -1540,6 +1561,12 @@ impl PythonGenerator {
             return self.generate_group_def(name, group);
         }
 
+        if let CsilTypeExpression::Choice(choices) = type_expr
+            && let Some(code) = self.text_enum(name, choices)
+        {
+            return Ok(code);
+        }
+
         let class_name = name.to_case(Case::Pascal);
         self.generated_types.insert(class_name.clone());
 
@@ -1650,7 +1677,7 @@ impl PythonGenerator {
                         // (`Decimal(...)`/`datetime(...)`), not the raw str, or the
                         // field defaults to a str of the wrong type.
                         CsilControlOperator::Default(value) => {
-                            Some(python_bound_expr(value, &entry.value_type))
+                            Some(self.default_expr(&entry.value_type, value))
                         }
                         _ => None,
                     });
@@ -1663,6 +1690,50 @@ impl PythonGenerator {
         }
 
         Ok(field_definition)
+    }
+
+    fn default_expr(&self, ty: &CsilTypeExpression, value: &CsilLiteralValue) -> String {
+        if let CsilTypeExpression::Reference(name) = unwrap_constrained(ty)
+            && let Some(arms) = self.enum_choices.get(name)
+        {
+            let label = csilgen_common::enum_number_label(arms, value).or(match value {
+                CsilLiteralValue::Text(s) => Some(s.as_str()),
+                _ => None,
+            });
+            if let Some(member) = label.and_then(|s| {
+                csilgen_common::text_enum_members(arms)?
+                    .into_iter()
+                    .find(|(_, v)| *v == s)
+            }) {
+                return format!("{}.{}", name.to_case(Case::Pascal), member.0);
+            }
+        }
+        python_bound_expr(value, ty)
+    }
+
+    fn enum_from_json(&self, ty: &CsilTypeExpression, expr: &str) -> Option<String> {
+        match unwrap_constrained(ty) {
+            CsilTypeExpression::Reference(name) if self.enum_choices.contains_key(name) => {
+                Some(format!("{}({expr})", name.to_case(Case::Pascal)))
+            }
+            CsilTypeExpression::Array { element_type, .. } => self
+                .enum_from_json(element_type, "item")
+                .map(|inner| format!("[{inner} for item in {expr}]")),
+            CsilTypeExpression::Map { key, value, .. } => {
+                let k = self.enum_from_json(key, "k");
+                let v = self.enum_from_json(value, "v");
+                if k.is_none() && v.is_none() {
+                    None
+                } else {
+                    Some(format!(
+                        "{{{}: {} for k, v in {expr}.items()}}",
+                        k.as_deref().unwrap_or("k"),
+                        v.as_deref().unwrap_or("v")
+                    ))
+                }
+            }
+            _ => None,
+        }
     }
 
     fn generate_pydantic_field_config(&self, entry: &CsilGroupEntry) -> Result<String> {
@@ -1750,7 +1821,7 @@ impl PythonGenerator {
                     push_kwarg("lt", python_bound_expr(value, &entry.value_type));
                 }
                 CsilControlOperator::Default(value) => {
-                    push_kwarg("default", python_bound_expr(value, &entry.value_type));
+                    push_kwarg("default", self.default_expr(&entry.value_type, value));
                 }
                 CsilControlOperator::Size(CsilSizeConstraint::Min(n)) => {
                     push_kwarg("min_length", n.to_string());
@@ -1834,7 +1905,24 @@ impl PythonGenerator {
                     continue;
                 }
                 _ => {
-                    field_assignments.push(format!("{field_name}=data.get('{field_name}')"));
+                    let read = format!("data.get('{field_name}')");
+                    let converted =
+                        self.enum_from_json(&entry.value_type, &format!("data['{field_name}']"));
+                    let value = converted
+                        .map(|expr| {
+                            let default = control_operators(&entry.value_type)
+                                .iter()
+                                .find_map(|op| match op {
+                                    CsilControlOperator::Default(v) => {
+                                        Some(self.default_expr(&entry.value_type, v))
+                                    }
+                                    _ => None,
+                                })
+                                .unwrap_or_else(|| "None".into());
+                            format!("({default} if {read} is None else {expr})")
+                        })
+                        .unwrap_or(read);
+                    field_assignments.push(format!("{field_name}={value}"));
                 }
             }
         }
@@ -2096,6 +2184,7 @@ impl PythonGenerator {
         value_type: &CsilTypeExpression,
     ) -> String {
         match op {
+            CsilControlOperator::EnumNumber(_) => String::new(),
             CsilControlOperator::Size(size) => Self::size_guard(field_name, size),
             CsilControlOperator::Regex(pattern) => {
                 // A bare `r"<pattern>"` breaks on an embedded `"` or a trailing
@@ -2297,11 +2386,54 @@ impl PythonGenerator {
         })
     }
 
+    fn text_enum(&mut self, name: &str, choices: &[CsilTypeExpression]) -> Option<String> {
+        let values: Vec<_> = choices
+            .iter()
+            .map(|arm| match choice_arm_literal(arm)? {
+                CsilLiteralValue::Text(value) => Some(value),
+                _ => None,
+            })
+            .collect::<Option<_>>()?;
+        if values.is_empty() {
+            return None;
+        }
+
+        let class = name.to_case(Case::Pascal);
+        self.generated_types.insert(class.clone());
+        self.imports.insert("from enum import Enum as _Enum".into());
+        let mut code = format!("class {class}(str, _Enum):\n    __str__ = str.__str__\n");
+        let mut members = HashSet::new();
+        for value in values {
+            let words = value
+                .split(|c: char| !c.is_ascii_alphanumeric())
+                .filter(|word| !word.is_empty())
+                .collect::<Vec<_>>()
+                .join("_");
+            let mut base = words.to_case(Case::UpperSnake);
+            if !base.starts_with(|c: char| c.is_ascii_alphabetic()) {
+                base = format!("VALUE_{base}");
+            }
+            let mut member = base.clone();
+            let mut n = 2;
+            while !members.insert(member.clone()) {
+                member = format!("{base}_{n}");
+                n += 1;
+            }
+            let literal = serde_json::to_string(value).expect("serialize text literal");
+            code.push_str(&format!("    {member} = {literal}\n"));
+        }
+        code.push('\n');
+        Some(code)
+    }
+
     fn generate_type_choice(
         &mut self,
         name: &str,
         choices: &[CsilTypeExpression],
     ) -> Result<String> {
+        if let Some(code) = self.text_enum(name, choices) {
+            return Ok(code);
+        }
         let class_name = name.to_case(Case::Pascal);
         self.generated_types.insert(class_name.clone());
 
@@ -2492,7 +2624,7 @@ impl PythonGenerator {
             // emittable when a codec module exists (i.e. the spec has records); without
             // one, and for a genuinely inexpressible shape, the op is skipped with a
             // note rather than a call that can't (de)serialize itself.
-            let success = python_success_type(&op.output_type);
+            let success = python_success_type(op.success_output());
             let null_input = is_null_input(&op.input_type);
             let resp_record = is_record_ref(&success, records);
             let req_record_or_null = null_input || is_record_ref(&op.input_type, records);
@@ -2501,7 +2633,7 @@ impl PythonGenerator {
             let resp_ok = py_op_boundary_expressible(&success, records, aliases, unions);
             // A non-record/non-null boundary on either side needs the per-op helpers.
             let needs_helpers = !req_record_or_null || !resp_record;
-            let has_codec = !records.is_empty();
+            let has_codec = !records.is_empty() || op.rpc_reply_arms().is_some();
             if !req_ok || !resp_ok || (needs_helpers && !has_codec) {
                 out.push_str(&format!(
                     "\n    # operation {} has a payload csilgen can't (de)serialize; handle it manually\n",
@@ -2692,7 +2824,7 @@ impl PythonGenerator {
                 out.push_str("    @abstractmethod\n");
                 match op.direction {
                     CsilServiceDirection::Unidirectional => {
-                        let output_type = self.map_type_expression(&op.output_type)?;
+                        let output_type = self.map_type_expression(op.success_output())?;
                         out.push_str(&format!(
                             "    def {method_name}(self, {input_param}ctx: dict) -> {output_type}:\n"
                         ));
@@ -2815,7 +2947,7 @@ impl PythonGenerator {
                     continue;
                 }
                 let method_name = op.name.to_case(Case::Snake);
-                let output_type = self.map_type_expression(&op.output_type)?;
+                let output_type = self.map_type_expression(op.success_output())?;
                 // The event name pushed on the verbose wire is the CSIL operation
                 // name verbatim, matching what the routers key on.
                 let wire = &op.name;
@@ -3203,7 +3335,7 @@ fn emit_op_codecs(
             if !matches!(op.direction, CsilServiceDirection::Unidirectional) {
                 continue;
             }
-            let success = python_success_type(&op.output_type);
+            let success = python_success_type(op.success_output());
             let null_input = is_null_input(&op.input_type);
             let req_ok =
                 null_input || py_op_boundary_expressible(&op.input_type, records, aliases, unions);
@@ -3353,7 +3485,10 @@ fn py_enc_value(
             let suffix = record_suffix(name);
             // Records and unions both have a generated `_encode_<suffix>_value` helper
             // (a record map codec, or a union tagged-sum codec).
-            if records.contains(&suffix) || unions.contains(&suffix) {
+            if records.contains(&suffix)
+                || unions.contains(&suffix)
+                || matches!(aliases.get(&suffix), Some(CsilTypeExpression::Choice(arms)) if csilgen_common::is_text_enum(arms))
+            {
                 format!("_encode_{suffix}_value({expr})")
             } else if let Some(underlying) = aliases.get(&suffix) {
                 // A transparent alias has no codec of its own; encode its underlying
@@ -3768,6 +3903,11 @@ fn codec_aliases(spec: &CsilSpecSerialized) -> HashMap<String, CsilTypeExpressio
         .iter()
         .filter_map(|rule| match &rule.rule_type {
             CsilRuleType::TypeDef(t) => match t {
+                CsilTypeExpression::Choice(arms)
+                    if csilgen_common::enum_numbers(arms).is_some() =>
+                {
+                    Some((record_suffix(&rule.name), t.clone()))
+                }
                 CsilTypeExpression::Group(_) | CsilTypeExpression::Choice(_) => None,
                 other => Some((record_suffix(&rule.name), other.clone())),
             },
@@ -4019,8 +4159,20 @@ fn emit_union_codec(
 /// `csil_dec_<enum>`. `literals` may mix kinds (`"pending" / "shipped" / 0 / 1`) —
 /// THE contract treats that the same as a uniform-kind enum, so this must not
 /// assume (and previously did assume) every member is text or every member is int.
-fn emit_enum_codec(name: &str, literals: &[CsilLiteralValue]) -> String {
+fn emit_enum_codec(name: &str, literals: &[CsilLiteralValue], numbers: Option<Vec<i64>>) -> String {
     let suffix = record_suffix(name);
+    if let Some(numbers) = numbers {
+        let class = name.to_case(Case::Pascal);
+        let entries = literals
+            .iter()
+            .zip(numbers)
+            .map(|(label, n)| format!("{n}: {}", csil_literal_to_python_str(label)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        return format!(
+            "_{suffix}_labels = {{{entries}}}\n_{suffix}_numbers = {{label: n for n, label in _{suffix}_labels.items()}}\n\n\ndef _encode_{suffix}_value(value):\n    return _{suffix}_numbers[value]\n\n\ndef _decode_{suffix}_value(value):\n    n = _csil_expect_int(value)\n    if n not in _{suffix}_labels:\n        raise CsilDecodeError(f\"csil cbor: unknown {name} number {{n}}\")\n    return {class}(_{suffix}_labels[n])\n\n\n"
+        );
+    }
     let literal_refs: Vec<&CsilLiteralValue> = literals.iter().collect();
     let expect_fn = uniform_enum_expect_fn(&literal_refs);
     let mut out = String::new();
@@ -4036,7 +4188,65 @@ fn emit_enum_codec(name: &str, literals: &[CsilLiteralValue]) -> String {
     out.push_str(&format!(
         "        raise CsilDecodeError(f\"csil cbor: unknown {name} value {{csil_v!r}}\")\n"
     ));
-    out.push_str("    return csil_v\n\n\n");
+    if literals
+        .iter()
+        .all(|lit| matches!(lit, CsilLiteralValue::Text(_)))
+    {
+        let class = name.to_case(Case::Pascal);
+        out.push_str(&format!("    return {class}(csil_v)\n\n\n"));
+    } else {
+        out.push_str("    return csil_v\n\n\n");
+    }
+    out
+}
+
+/// Convert between handler results and the variant and payload of a status-zero reply.
+fn emit_rpc_replies(
+    spec: &CsilSpecSerialized,
+    records: &HashSet<String>,
+    aliases: &HashMap<String, CsilTypeExpression>,
+    unions: &HashSet<String>,
+    enums: &HashSet<String>,
+) -> String {
+    let mut out = String::new();
+    let mut emitted = HashSet::new();
+    let mut resolve = String::from("def resolve_rpc_reply(service, op, variant, payload):\n");
+    for (service, op, arms) in spec.rpc_operations() {
+        let mut encode = format!(
+            "def encode_{}_reply(handler, *args, **kwargs):\n    try:\n        value = handler(*args, **kwargs)\n",
+            op_codec_stem(service, &op.name)
+        );
+        resolve.push_str(&format!(
+            "    if (service, op) == ({service:?}, {:?}):\n",
+            op.name
+        ));
+        for (index, arm) in arms.iter().enumerate() {
+            let wire = arm.rpc_variant_name().unwrap();
+            let exception = format!("{}Refusal", wire.to_case(Case::Pascal));
+            resolve.push_str(&format!("        if variant == {wire:?}:\n"));
+            if index == 0 {
+                resolve.push_str("            return payload\n");
+            } else {
+                if emitted.insert(exception.clone()) {
+                    out.push_str(&format!("class {exception}(Exception):\n    def __init__(self, value):\n        super().__init__(value)\n        self.value = value\n\n\n"));
+                }
+                let decoded = py_dec_value(arm, "tree", records, aliases, unions, enums);
+                resolve.push_str(&format!("            tree = cbor_decode(payload)\n            raise {exception}({decoded})\n"));
+                let encoded = py_enc_value(arm, "refusal.value", records, aliases, unions);
+                encode.push_str(&format!("    except {exception} as refusal:\n        return {wire:?}, cbor_encode({encoded})\n"));
+            }
+        }
+        let wire = arms[0].rpc_variant_name().unwrap();
+        let value = py_enc_value(&arms[0], "value", records, aliases, unions);
+        encode.push_str(&format!("    return {wire:?}, cbor_encode({value})\n\n\n"));
+        out.push_str(&encode);
+        resolve
+            .push_str("        raise CsilDecodeError(f'invalid RPC reply variant {variant!r}')\n");
+    }
+    if !out.is_empty() {
+        out.push_str(&resolve);
+        out.push_str("    return payload\n\n\n");
+    }
     out
 }
 
@@ -4047,7 +4257,7 @@ fn generate_codec_file(
     spec: &CsilSpecSerialized,
     records: &HashSet<String>,
 ) -> Option<GeneratedFile> {
-    if records.is_empty() {
+    if records.is_empty() && spec.rpc_operations().next().is_none() {
         return None;
     }
 
@@ -4103,7 +4313,12 @@ fn generate_codec_file(
     // Bare-literal codec helpers for enums (all-literal type-choices) referenced by
     // record fields — validates the CBOR major type and declared-member membership.
     for (name, literals) in &enum_defs {
-        body.push_str(&emit_enum_codec(name, literals));
+        let numbers = spec
+            .rules
+            .iter()
+            .find(|r| record_suffix(&r.name) == *name)
+            .and_then(csilgen_common::rule_enum_numbers);
+        body.push_str(&emit_enum_codec(name, literals, numbers));
     }
     // Per-op byte helpers for non-record op boundaries. Their boundary types may pull
     // tagged core types (timestamp/decimal) or tuples no record field uses, so scan
@@ -4116,7 +4331,7 @@ fn generate_codec_file(
             if !matches!(op.direction, CsilServiceDirection::Unidirectional) {
                 continue;
             }
-            let success = python_success_type(&op.output_type);
+            let success = python_success_type(op.success_output());
             if !is_null_input(&op.input_type) && !is_record_ref(&op.input_type, records) {
                 scan_special_types(
                     &op.input_type,
@@ -4138,6 +4353,7 @@ fn generate_codec_file(
         }
     }
     body.push_str(&emit_op_codecs(spec, records, &aliases, &unions, &enums));
+    body.push_str(&emit_rpc_replies(spec, records, &aliases, &unions, &enums));
 
     let mut content = String::new();
     content.push_str("# Generated CBOR codec from CSIL specification\n");
@@ -7499,7 +7715,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from csil_gen_pkg.types import Widget
+from csil_gen_pkg.types import Color, Widget
 from csil_gen_pkg.codec import cbor_encode, CborTag, CsilDecodeError
 
 
@@ -7541,7 +7757,9 @@ assert w.name == "hello"
 assert w.blob == b"\x01\x02"
 assert w.ratio == 1.5
 assert w.items == [b"\x01", b"\x02"]
-assert w.color == "red"
+assert w.color is Color.RED
+assert str(w.color) == "red"
+assert Widget.from_cbor(w.to_cbor()).color is Color.RED
 assert w.choice == 5
 assert w.inner.n == 3
 assert w.pair == ("x", 1)

@@ -146,6 +146,15 @@ alone" (absent) versus "replace the stored value with nothing" (present-empty),
 and the three states — absent, present-empty, present-non-empty — must survive an
 encode/decode round trip in every generated language.
 
+## Named numbers
+
+For `Code = &(busy: 7, denied: 42)`, encode `busy` as the CBOR integer
+`7` (hex `07`). Encode `denied` as `42` (hex `18 2a`). The same rule
+applies inside records and containers. Use the number in the schema even
+if the member changes position. Reject a text label or an unknown number
+during CBOR decode. A change from a quoted choice to a named number
+requires a coordinated upgrade of all peers that use that field.
+
 ## Choices: enum vs. union on the wire
 
 A CSIL choice (`A / B / ...`, whether declared inline or via `Name = A / B` /
@@ -189,11 +198,8 @@ validated for equality against that literal (a `[1, "confirmed"]` for an arm
 declared as the literal `"pending"` at index 1 is a decode error, not a coerced
 value).
 
-This is normative for all 14 code-generating targets — a generator that groups
-arms by runtime type before treating a choice as an enum, or that requires
-literal arms be uniform in kind, does not follow this contract (a real
-regression this shared module was written to fix; see the module's rustdoc for
-the TypeScript/OCaml history).
+All code generators must use these rules. Preserve the declared order of the
+arms, including literal arms of different types.
 
 ## Inline composite hoisting (generated-surface naming)
 
@@ -305,8 +311,17 @@ verbatim names.
 
 ## Operation error channel
 
-An operation `Op: Req -> Res / ServiceError` carries `ServiceError` as the
-**error channel**, not part of the success payload. On the wire a call yields
-either a `Res` map or a `ServiceError` map; generators surface the error per
-language idiom (Go `error`, Rust `Result::Err`, Python `ServiceError` return /
-raise, TypeScript thrown) and type the success path as `Res`.
+For a unary operation such as `Op: Req -> Res / Refusal / Retry`, the first
+type is the success type. Each subsequent type is an application error. Use
+the declared type name as the CSIL-RPC response `variant`. Set `status` to
+zero and encode the selected value directly in `payload` for each arm.
+Receivers must reject a missing or unknown variant for these operations.
+A nonzero status reports a transport failure.
+
+To return several successful alternatives, define a named union such as
+`Reply = A / B` and declare `Op: Req -> Reply`. Its payload uses the standard
+union encoding `[index, value]`. Text-literal enums retain their bare text
+encoding.
+
+For an existing inline unary choice, upgrade both peers together. Older
+generators can encode the choice index inside the payload.

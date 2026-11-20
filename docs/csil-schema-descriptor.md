@@ -40,6 +40,9 @@ The `body` map has these keys:
 | `rules` | array | All resolved non-service rules in declaration order. |
 | `services` | array | All resolved services in declaration order. |
 
+The `NamedNumbers` type carries each label and its assigned signed integer.
+Use the integer when reading CBOR and the label when displaying the value.
+
 The body does not contain source text, source paths, source positions,
 documentation, file options, or target-language configuration.
 

@@ -1,6 +1,6 @@
 //! CSIL code formatting functionality
 
-use crate::ast::CsilSpec;
+use crate::ast::{CsilSpec, ImportStatement};
 use anyhow::Result;
 use std::path::Path;
 
@@ -38,8 +38,44 @@ pub struct FormatResult {
 pub fn format_spec(spec: &CsilSpec, config: &FormatConfig) -> Result<String> {
     let mut output = String::new();
 
-    for (i, rule) in spec.rules.iter().enumerate() {
-        if i > 0 {
+    for import in &spec.imports {
+        match import {
+            ImportStatement::Include { path, alias, .. } => {
+                output.push_str("include ");
+                format_quoted_text(path, &mut output);
+                if let Some(alias) = alias {
+                    output.push_str(" as ");
+                    output.push_str(alias);
+                }
+            }
+            ImportStatement::SelectiveImport { path, items, .. } => {
+                output.push_str("from ");
+                format_quoted_text(path, &mut output);
+                output.push_str(" include ");
+                output.push_str(&items.join(", "));
+            }
+        }
+        output.push('\n');
+    }
+    if let Some(options) = &spec.options {
+        if !output.is_empty() {
+            output.push('\n');
+        }
+        output.push_str("options {\n");
+        for (i, entry) in options.entries.iter().enumerate() {
+            output.push_str(&" ".repeat(config.indent_size));
+            output.push_str(&entry.key);
+            output.push_str(": ");
+            format_literal_value(&entry.value, &mut output);
+            if i + 1 < options.entries.len() || config.trailing_commas {
+                output.push(',');
+            }
+            output.push('\n');
+        }
+        output.push_str("}\n");
+    }
+    for rule in &spec.rules {
+        if !output.is_empty() {
             output.push('\n');
         }
 
@@ -176,6 +212,19 @@ fn format_type_expression(
         }
         crate::ast::TypeExpression::Group(group) => {
             format_group_expression(group, output, indent, config);
+        }
+        crate::ast::TypeExpression::NamedNumberGroup(name, _) => {
+            output.push_str(&format!("&{name}"))
+        }
+        crate::ast::TypeExpression::NamedNumbers(members) => {
+            output.push_str("&(");
+            for (i, (name, value)) in members.iter().enumerate() {
+                if i > 0 {
+                    output.push_str(", ");
+                }
+                output.push_str(&format!("{name}: {value}"));
+            }
+            output.push(')');
         }
         crate::ast::TypeExpression::Choice(types) => {
             for (i, type_expr) in types.iter().enumerate() {
@@ -542,11 +591,31 @@ fn format_field_metadata(metadata: &crate::ast::FieldMetadata, output: &mut Stri
     }
 }
 
+fn format_quoted_text(text: &str, output: &mut String) {
+    output.push('"');
+    for c in text.chars() {
+        match c {
+            '"' => output.push_str("\\\""),
+            '\\' => output.push_str("\\\\"),
+            '\n' => output.push_str("\\n"),
+            '\r' => output.push_str("\\r"),
+            '\t' => output.push_str("\\t"),
+            _ => output.push(c),
+        }
+    }
+    output.push('"');
+}
+
 fn format_literal_value(value: &crate::ast::LiteralValue, output: &mut String) {
     match value {
         crate::ast::LiteralValue::Integer(i) => output.push_str(&i.to_string()),
-        crate::ast::LiteralValue::Float(f) => output.push_str(&f.to_string()),
-        crate::ast::LiteralValue::Text(s) => output.push_str(&format!("\"{s}\"")),
+        crate::ast::LiteralValue::Float(f) => {
+            output.push_str(&f.to_string());
+            if f.fract() == 0.0 {
+                output.push_str(".0");
+            }
+        }
+        crate::ast::LiteralValue::Text(s) => format_quoted_text(s, output),
         crate::ast::LiteralValue::Bytes(bytes) => {
             output.push_str("h'");
             for byte in bytes {
@@ -691,6 +760,34 @@ mod tests {
             position: crate::lexer::Position::new(1, 1, 0),
             doc_comments: Vec::new(),
         }
+    }
+
+    #[test]
+    fn file_headers_survive_formatting() {
+        let source = r#"include "common.csil" as common
+from "shared.csil" include id, time
+options { lint_text_enums: "error", generators: ["go", "rust"], label: "a\"b", scale: 2.0 }
+status = "busy" / "denied""#;
+        let spec = crate::parse_csil(source).unwrap();
+        let formatted = format_spec(&spec, &FormatConfig::default()).unwrap();
+        let parsed = crate::parse_csil(&formatted).unwrap();
+        assert_eq!(parsed.imports.len(), 2);
+        let original = spec.options.unwrap().entries;
+        let entries = &parsed.options.as_ref().unwrap().entries;
+        assert_eq!(entries.len(), original.len());
+        for (a, b) in entries.iter().zip(original) {
+            assert_eq!((&a.key, &a.value), (&b.key, &b.value));
+        }
+        assert_eq!(
+            format_spec(&parsed, &FormatConfig::default()).unwrap(),
+            formatted
+        );
+        assert_eq!(
+            crate::lint_spec(&parsed, &crate::LintConfig::default())
+                .unwrap()
+                .error_count,
+            1
+        );
     }
 
     #[test]

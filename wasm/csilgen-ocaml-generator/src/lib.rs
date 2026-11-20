@@ -144,12 +144,13 @@ fn generate_ocaml(
     // because OCaml has no anonymous sum-type field syntax at all — even a closed
     // all-literal choice (`Pending | Shipped | Delivered`) must be a *named* `type`
     // (see the crate's original hoist-pass module doc, preserved in git history).
-    let hoisted_spec = csilgen_common::hoist_inline_composites(
+    let mut hoisted_spec = csilgen_common::hoist_inline_composites(
         spec,
         csilgen_common::HoistOptions {
             hoist_all_literal_choices: true,
         },
     );
+    hoisted_spec.supply_implicit_service_error();
     let spec = &hoisted_spec;
 
     // Types are shared by every surface (the client/server reference them), so the
@@ -471,6 +472,7 @@ fn readme(spec: &CsilSpecSerialized, pkg: &str, transports: (bool, bool, bool)) 
 /// request-less op), the request/response codec type names (so the datagram section can
 /// name `encode_<t>_bytes`/`decode_<t>_bytes`), and the op's datagram ordinal.
 struct UnaryExample {
+    typed_reply: bool,
     service_module: String,
     fn_name: String,
     sample: Option<(String, String)>,
@@ -492,7 +494,7 @@ fn first_unary_example(spec: &CsilSpecSerialized) -> Option<UnaryExample> {
             if !matches!(op.direction, CsilServiceDirection::Unidirectional) {
                 continue;
             }
-            let res_codec = op_codec_type(&success_type(&op.output_type), &records);
+            let res_codec = op_codec_type(&success_type(op.success_output()), &records);
             if res_codec.is_none() {
                 continue;
             }
@@ -512,6 +514,7 @@ fn first_unary_example(spec: &CsilSpecSerialized) -> Option<UnaryExample> {
                 )
             };
             return Some(UnaryExample {
+                typed_reply: op.rpc_reply_arms().is_some(),
                 service_module: ocaml_module_name(&rule.name),
                 fn_name: ocaml_ident(&op.name),
                 sample,
@@ -570,7 +573,11 @@ fn rpc_section(root: &str, ex: Option<&UnaryExample>) -> String {
         }
     }
     out.push_str("  | Ok _resp -> print_endline \"ok: received typed response\"\n");
-    out.push_str("  | Error e -> prerr_endline e\n");
+    if ex.typed_reply {
+        out.push_str("  | Error (`Transport e | `Decode e) -> prerr_endline e\n  | Error _ -> prerr_endline \"application refusal\"\n");
+    } else {
+        out.push_str("  | Error e -> prerr_endline e\n");
+    }
     out.push_str("```\n\n");
     out
 }
@@ -715,14 +722,8 @@ let csil_rpc_call base_url ~service ~op ~(payload : bytes) : (bytes, string) res
     | Ok resp -> (
       (* A non-zero transport status is a transport failure: no typed payload. *)
       match Rpc.as_transport_error resp with
-      | Some _ -> Error "csil-rpc: non-zero transport status"
-      | None -> (
-        (* A typed ServiceError arm rides as a status-0 [variant] — an application
-           error distinct from a transport failure. Surface it so the client decodes
-           success only. *)
-        match resp.Rpc.variant with
-        | Some "ServiceError" -> Error "csil-rpc: ServiceError"
-        | _ -> Ok resp.Rpc.payload)))
+      | Some err -> Error (Conventions.error_message err)
+      | None -> Ok (Codec.resolve_rpc_reply ~service ~op ~variant:resp.Rpc.variant resp.Rpc.payload)))
 
 (* Build the typed client over the carrier; change the base URL to your server. *)
 let make_rpc_client base_url =
@@ -1003,7 +1004,7 @@ fn first_channel_example(spec: &CsilSpecSerialized) -> Option<ChannelExample> {
             if !matches!(op.direction, CsilServiceDirection::Bidirectional) {
                 continue;
             }
-            let success = success_type(&op.output_type);
+            let success = success_type(op.success_output());
             let (Some(in_codec), Some(out_codec)) = (
                 op_codec_type(&op.input_type, &records),
                 op_codec_type(&success, &records),
@@ -1052,6 +1053,7 @@ fn ocaml_handler_record(
             ));
         } else {
             match op.direction {
+                CsilServiceDirection::Unidirectional if op.rpc_reply_arms().is_some() => fields.push(format!("{field} = (fun _ -> failwith \"unused RPC handler\")")),
                 CsilServiceDirection::Unidirectional => fields.push(format!(
                     "{field} = (fun _payload -> Services.transport_error ~status:0L ~message:\"unhandled in this events demo\")"
                 )),
@@ -1395,10 +1397,27 @@ fn generate_types(spec: &CsilSpecSerialized) -> (String, String) {
     // other regardless of source order, so a non-recursive `type` would fail to
     // resolve a forward reference.
     let joined = join_type_decls(&decls);
-    let ml = format!("{preamble}{joined}\n");
+    let mut ml = format!("{preamble}{joined}\n");
     // The interface re-exposes exactly the same declarations; with no functions to
     // hide, the `.mli` simply publishes the type surface.
-    let mli = format!("{preamble}{joined}\n");
+    let mut mli = format!("{preamble}{joined}\n");
+    for rule in &spec.rules {
+        if csilgen_common::rule_enum_numbers(rule).is_none() {
+            continue;
+        }
+        let CsilRuleType::TypeDef(CsilTypeExpression::Choice(choices)) = &rule.rule_type else {
+            continue;
+        };
+        let ChoiceShape::StringEnum { arms, .. } = classify_choice(choices) else {
+            continue;
+        };
+        let tn = ocaml_type_name(&rule.name);
+        ml.push_str(&format!("\nlet {tn}_label (v : {tn}) =\n  match v with\n"));
+        for (ctor, label) in arms {
+            ml.push_str(&format!("  | {ctor} -> \"{label}\"\n"));
+        }
+        mli.push_str(&format!("\nval {tn}_label : {tn} -> string\n"));
+    }
     (ml, mli)
 }
 
@@ -1908,6 +1927,28 @@ fn emit_choice_codec(
             arms,
             open_other: None,
         } => {
+            if let Some(numbers) = csilgen_common::enum_numbers(choices) {
+                let enc_arms: Vec<String> = arms
+                    .iter()
+                    .zip(&numbers)
+                    .map(|((ctor, _), i)| format!("{ctor} -> Cbor.int64 {i}L"))
+                    .collect();
+                let mut dec_arms: Vec<String> = arms
+                    .iter()
+                    .zip(&numbers)
+                    .map(|((ctor, _), i)| format!("{i}L -> {ctor}"))
+                    .collect();
+                dec_arms.push("_ -> failwith \"csilgen: unknown enum ordinal\"".to_string());
+                let enc = format!(
+                    "encode_{tn} (v : {tn}) : Cbor.t =\n  match v with {}",
+                    enc_arms.join(" | ")
+                );
+                let dec = format!(
+                    "decode_{tn} (csil_c : Cbor.t) : {tn} =\n  match Cbor.to_i64 csil_c with {}",
+                    dec_arms.join(" | ")
+                );
+                return (enc, dec);
+            }
             // A closed string enum (every arm a text literal): the bare CBOR text is
             // its own discriminant, matching the locked ALL-literal wire contract.
             let enc_arms: Vec<String> = arms
@@ -2372,7 +2413,7 @@ fn emit_record_codec(
 /// separate hoisted-type pass.
 fn generate_codec(spec: &CsilSpecSerialized) -> Option<String> {
     let records = codec_record_names(spec);
-    if records.is_empty() {
+    if records.is_empty() && spec.rpc_operations().next().is_none() {
         return None;
     }
     let choice_set = codec_choice_names(spec);
@@ -2421,13 +2462,61 @@ fn generate_codec(spec: &CsilSpecSerialized) -> Option<String> {
     // module so the `any` core type (a `Csil_cbor.t` field) and the codec share one
     // value type without a cycle between `types.ml` and `codec.ml`.
     out.push_str("module Cbor = Csil_cbor\n\n");
-    out.push_str("let rec ");
-    out.push_str(&enc_clauses.join("\n\nand "));
-    out.push_str("\n\n");
-    out.push_str("let rec ");
-    out.push_str(&dec_clauses.join("\n\nand "));
-    out.push_str("\n\n");
+    if !enc_clauses.is_empty() {
+        out.push_str("let rec ");
+        out.push_str(&enc_clauses.join("\n\nand "));
+        out.push_str("\n\n");
+        out.push_str("let rec ");
+        out.push_str(&dec_clauses.join("\n\nand "));
+        out.push_str("\n\n");
+    }
     out.push_str(&wrappers);
+    let mut exceptions = std::collections::BTreeSet::new();
+    let mut resolve = String::from(
+        "let resolve_rpc_reply ~service ~op ~variant payload =\n  match service, op, variant with\n",
+    );
+    for (service, op, arms) in spec.rpc_operations() {
+        let method = &op.name;
+        let stem = ocaml_ident(&format!("{service}_{method}"));
+        let req = &op.input_type;
+        let success = arms[0].rpc_variant_name().unwrap();
+        let root = "root";
+        if !op_input_is_null(req) {
+            let enc = enc_value(req, "value", &records, &choice_set, &aliases);
+            let dec = dec_value(req, root, &records, &choice_set, &aliases);
+            out.push_str(&format!("let encode_{stem}_request value = Cbor.encode {enc}\nlet decode_{stem}_request bytes =\n  match Cbor.decode bytes with Ok root -> {dec} | Error e -> failwith e\n\n"));
+        }
+        let enc = enc_value(&arms[0], "value", &records, &choice_set, &aliases);
+        let dec = dec_value(&arms[0], root, &records, &choice_set, &aliases);
+        out.push_str(&format!("let decode_{stem}_success bytes =\n  match Cbor.decode bytes with Ok root -> {dec} | Error e -> failwith e\n\n"));
+        let mut encoder = format!(
+            "let encode_{stem}_reply = function\n  | Ok value -> ({success:?}, Cbor.encode {enc})\n"
+        );
+        resolve.push_str(&format!(
+            "  | {service:?}, {method:?}, Some {success:?} -> payload\n"
+        ));
+        for arm in &arms[1..] {
+            let wire = arm.rpc_variant_name().unwrap();
+            let tag = ocaml_module_name(wire);
+            if exceptions.insert(tag.clone()) {
+                let ty = map_type(arm);
+                out.push_str(&format!("exception {tag}_refusal of {ty}\n\n"));
+            }
+            let enc = enc_value(arm, "value", &records, &choice_set, &aliases);
+            let dec = dec_value(arm, root, &records, &choice_set, &aliases);
+            encoder.push_str(&format!(
+                "  | Error (`{tag} value) -> ({wire:?}, Cbor.encode {enc})\n"
+            ));
+            resolve.push_str(&format!("  | {service:?}, {method:?}, Some {wire:?} ->\n      (match Cbor.decode payload with Ok root -> raise ({tag}_refusal ({dec})) | Error e -> failwith e)\n"));
+        }
+        out.push_str(&encoder);
+        out.push('\n');
+        resolve.push_str(&format!(
+            "  | {service:?}, {method:?}, _ -> failwith \"invalid RPC reply variant\"\n"
+        ));
+    }
+    out.push_str(&resolve);
+    out.push_str("  | _ -> payload\n");
     Some(format!("{}\n", out.trim_end()))
 }
 
@@ -2520,7 +2609,7 @@ fn client_uses_types(spec: &CsilSpecSerialized) -> bool {
         CsilRuleType::ServiceDef(service) => service.operations.iter().any(|op| {
             matches!(op.direction, CsilServiceDirection::Unidirectional)
                 && ((!op_input_is_null(&op.input_type) && expr_uses_named_type(&op.input_type))
-                    || expr_uses_named_type(&success_type(&op.output_type)))
+                    || expr_uses_named_type(&success_type(op.success_output())))
         }),
         _ => false,
     })
@@ -2607,11 +2696,32 @@ fn emit_client_module(
             continue;
         }
         let fn_name = ocaml_ident(&op.name);
-        let out_type = map_type(&success_type(&op.output_type));
+        let out_type = map_type(&success_type(op.success_output()));
         let null_input = op_input_is_null(&op.input_type);
-        let resp_codec = op_codec_type(&success_type(&op.output_type), records);
+        let resp_codec = op_codec_type(&success_type(op.success_output()), records);
         let req_codec = op_codec_type(&op.input_type, records);
 
+        if let Some(arms) = op.rpc_reply_arms() {
+            let stem = ocaml_ident(&format!("{name}_{}", op.name));
+            let (param, payload) = if null_input {
+                (String::new(), "Bytes.empty".into())
+            } else {
+                let ty = map_type(&op.input_type);
+                (
+                    format!(" (req : {ty})"),
+                    format!("(Codec.encode_{stem}_request req)"),
+                )
+            };
+            out.push_str(&format!("  let {fn_name} (c : client){param} =\n    try\n      match c.call ~service:{name:?} ~op:{:?} ~payload:{payload} with\n      | Ok bytes -> Ok (Codec.decode_{stem}_success bytes)\n      | Error e -> Error (`Transport e)\n    with\n", op.name));
+            for arm in &arms[1..] {
+                let tag = ocaml_module_name(arm.rpc_variant_name().unwrap());
+                out.push_str(&format!(
+                    "    | Codec.{tag}_refusal value -> Error (`{tag} value)\n"
+                ));
+            }
+            out.push_str("    | Failure e | Invalid_argument e -> Error (`Decode e)\n\n");
+            continue;
+        }
         // The typed seam: when both ends are records the codec covers, the generated
         // method serializes/deserializes itself. Otherwise it keeps the explicit
         // encode/decode closures so an exotic payload stays callable.
@@ -2688,6 +2798,9 @@ fn generate_services(spec: &CsilSpecSerialized) -> String {
     // The server surface is codec-agnostic: handlers receive opaque payload bytes
     // and decode them with the consumer's codec, so it never names a [Types]
     // declaration (an `open Types` here would be an unused-open warning).
+    if spec.rpc_operations().next().is_some() {
+        out.push_str("open Types\n\n");
+    }
     out.push_str(SERVER_PRELUDE);
 
     for rule in &spec.rules {
@@ -2734,6 +2847,24 @@ fn emit_service_module(name: &str, service: &CsilServiceDefinition) -> String {
         } else {
             map_type(&op.input_type)
         };
+        if let Some(arms) = op.rpc_reply_arms() {
+            let success = map_type(&arms[0]);
+            let errors = arms[1..]
+                .iter()
+                .map(|arm| {
+                    format!(
+                        "`{} of {}",
+                        ocaml_module_name(arm.rpc_variant_name().unwrap()),
+                        map_type(arm)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(" | ");
+            out.push_str(&format!(
+                "    {field} : {in_ty} -> ({success}, [ {errors} ]) result;\n"
+            ));
+            continue;
+        }
         match op.direction {
             CsilServiceDirection::Unidirectional => {
                 out.push_str(&format!(
@@ -2750,6 +2881,18 @@ fn emit_service_module(name: &str, service: &CsilServiceDefinition) -> String {
     }
     out.push_str("  }\n\n");
 
+    for op in &service.operations {
+        if op.rpc_reply_arms().is_some() {
+            let field = ocaml_ident(&op.name);
+            let stem = ocaml_ident(&format!("{name}_{}", op.name));
+            let request = if op_input_is_null(&op.input_type) {
+                "ignore payload; ()".into()
+            } else {
+                format!("Codec.decode_{stem}_request payload")
+            };
+            out.push_str(&format!("  let dispatch_{field} h payload =\n    let request = {request} in\n    let variant, payload = Codec.encode_{stem}_reply (h.{field} request) in\n    reply ~variant ~payload\n\n"));
+        }
+    }
     out.push_str(&emit_router_verbose(service));
     if service.wire_id.is_some() {
         out.push_str(&emit_router_compact(service));
@@ -2798,6 +2941,11 @@ fn emit_router_verbose(service: &CsilServiceDefinition) -> String {
             continue;
         }
         let field = ocaml_ident(&op.name);
+        if op.rpc_reply_arms().is_some() {
+            let pattern = format!("{:?}", op.name);
+            out.push_str(&format!("    | {pattern} -> dispatch_{field} h payload\n"));
+            continue;
+        }
         if op_input_is_null(&op.input_type) {
             out.push_str(&format!(
                 "    | \"{}\" -> ignore payload; h.{field} Bytes.empty\n",
@@ -2829,6 +2977,11 @@ fn emit_router_compact(service: &CsilServiceDefinition) -> String {
             continue;
         };
         let field = ocaml_ident(&op.name);
+        if op.rpc_reply_arms().is_some() {
+            let pattern = format!("{op_id}L");
+            out.push_str(&format!("    | {pattern} -> dispatch_{field} h payload\n"));
+            continue;
+        }
         if op_input_is_null(&op.input_type) {
             out.push_str(&format!(
                 "    | {op_id}L -> ignore payload; h.{field} Bytes.empty\n"

@@ -39,6 +39,31 @@ pub fn generate(input: &WasmGeneratorInput) -> String {
     }
 
     for rule in &spec.rules {
+        if let CsilRuleType::TypeDef(CsilTypeExpression::Choice(arms))
+        | CsilRuleType::TypeChoice(arms) = &rule.rule_type
+            && let Some(members) = csilgen_common::text_enum_members(arms)
+        {
+            let name = common::to_pascal(&rule.name);
+            if csilgen_common::enum_numbers(arms).is_some() {
+                out.push_str(&format!("export enum {name} {{\n"));
+                for (member, label) in members {
+                    out.push_str(&format!(
+                        "  {member} = {},\n",
+                        serde_json::to_string(label).unwrap()
+                    ));
+                }
+                out.push_str("}\n\n");
+                continue;
+            }
+            out.push_str(&format!("export const {name} = {{\n"));
+            for (member, wire) in members {
+                out.push_str(&format!(
+                    "  {member}: {},\n",
+                    serde_json::to_string(wire).expect("string literal")
+                ));
+            }
+            out.push_str("} as const;\n");
+        }
         match &rule.rule_type {
             CsilRuleType::TypeDef(CsilTypeExpression::Group(group)) => {
                 out.push_str(&interface(&rule.name, group, &rule.doc_comments, mapping));
@@ -578,6 +603,7 @@ fn control_check(
     hoist: &mut RegexHoist,
 ) -> Option<String> {
     let line = match op {
+        CsilControlOperator::EnumNumber(_) => return None,
         CsilControlOperator::Size(size) => match size {
             CsilSizeConstraint::Exact(n) => guard(
                 indent,

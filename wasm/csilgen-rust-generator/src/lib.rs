@@ -376,12 +376,14 @@ const CLIENT_ERROR: &str = r#"/// Error from a generated client call: a structur
 pub enum ClientError {
     Service { code: i64, message: String },
     Transport(String),
+    Decode(String),
 }
 
 impl std::fmt::Display for ClientError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ClientError::Service { code, message } => write!(f, "service error {code}: {message}"),
+            Self::Decode(msg) => write!(f, "invalid reply: {msg}"),
             ClientError::Transport(msg) => write!(f, "transport error: {msg}"),
         }
     }
@@ -416,6 +418,29 @@ struct RustChannelExample {
     op_name: String,
     outbound_sample: String,
 }
+
+const CHANNEL_ROUTE_ERROR: &str = r#"#[derive(Debug)]
+pub enum ChannelRouteError {
+    UnknownMethod(String),
+    UnknownOrdinal(u64),
+    Decode(String),
+    Handler(ServiceError),
+}
+
+impl std::fmt::Display for ChannelRouteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnknownMethod(method) => write!(f, "unknown channel {method}"),
+            Self::UnknownOrdinal(op) => write!(f, "unknown channel ordinal {op}"),
+            Self::Decode(message) => write!(f, "invalid channel payload: {message}"),
+            Self::Handler(error) => write!(f, "channel handler failed: {error:?}"),
+        }
+    }
+}
+
+impl std::error::Error for ChannelRouteError {}
+
+"#;
 
 /// The CSIL-RPC HTTP carrier the Quickstart embeds — spec-independent, so a constant.
 /// It builds the request envelope with the library's `RpcRequest`, POSTs it to
@@ -460,17 +485,6 @@ impl Transport for HttpRpcCarrier {
             .map_err(|e| ClientError::Transport(e.to_string()))?
             .into_transport_error()
             .map_err(|e| ClientError::Transport(e.to_string()))?;
-        // A typed application error rides as a status-0 "ServiceError" variant — distinct
-        // from a transport failure. Surface it so the typed client decodes success only.
-        if decoded.variant.as_deref() == Some("ServiceError") {
-            return Err(ClientError::Service {
-                code: 0,
-                message: format!("csil-rpc {service}/{op}: ServiceError"),
-            });
-        }
-        Ok(decoded.payload)
-    }
-}
 "#;
 
 /// The TLS `StreamCarrier` opener — spec-independent. std has no TLS, so the example
@@ -606,12 +620,22 @@ impl ClientShape {
 /// clients; the marked twin imports it from the sync module) plus the
 /// caller-supplied byte-carrier trait, whose `call` is `async fn` for the async
 /// shapes. The generator never owns the wire (CBOR-over-HTTP etc.).
-fn client_prelude(shape: ClientShape) -> String {
+fn client_prelude(shape: ClientShape, variants: &str, displays: &str) -> String {
     let mut out = String::new();
     // A marked twin shares the sync module's `ClientError`; redefining it would
     // collide when both clients are re-exported from the module root.
     if shape.marker.is_empty() {
-        out.push_str(CLIENT_ERROR);
+        out.push_str(
+            &CLIENT_ERROR
+                .replace(
+                    "    Decode(String),",
+                    &format!("{variants}    Decode(String),"),
+                )
+                .replace(
+                    "            Self::Decode(msg)",
+                    &format!("{displays}            Self::Decode(msg)"),
+                ),
+        );
         out.push_str("\n\n");
     }
     let trait_name = shape.transport_trait();
@@ -1564,7 +1588,9 @@ impl<'a> RustCodeGenerator<'a> {
                             &mut synthesized,
                         );
                     }
-                    if !Self::choice_needs_error_split(&op.output_type) {
+                    if op.rpc_reply_arms().is_none()
+                        && !Self::choice_needs_error_split(&op.output_type)
+                    {
                         op.output_type = Self::rewrite_hoisted_choices(
                             op.output_type.clone(),
                             &format!("{owner}_{op_snake}_response"),
@@ -2094,6 +2120,12 @@ impl<'a> RustCodeGenerator<'a> {
             "use {krate}::*;\nuse csilgen_transport::rpc::{{RpcRequest, RpcResponse}};\nuse std::io::Read;\n\n"
         ));
         out.push_str(RPC_CARRIER_RUST);
+        if self.spec.rpc_operations().next().is_some() {
+            out.push_str("        resolve_rpc_reply(service, op, decoded.variant.as_deref(), decoded.payload)\n");
+        } else {
+            out.push_str("        Ok(decoded.payload)\n");
+        }
+        out.push_str("    }\n}\n");
         out.push('\n');
         out.push_str("fn main() {\n");
         out.push_str(&format!(
@@ -2174,15 +2206,16 @@ impl<'a> RustCodeGenerator<'a> {
             match op.direction {
                 CsilServiceDirection::Unidirectional => {
                     let output_type =
-                        self.map_type_to_rust(&success_type(&op.output_type), &None)?;
+                        self.map_type_to_rust(&success_type(op.success_output()), &None)?;
+                    let error = self.rpc_handler_error(&ch.service_trait, op)?;
                     if is_null_input(&op.input_type) {
                         out.push_str(&format!(
-                            "    fn {op_snake}(&self, _ctx: &Self::Context) -> Result<{output_type}, ServiceError> {{\n        unimplemented!(\"request/response op; see the CSIL-RPC section\")\n    }}\n"
+                            "    fn {op_snake}(&self, _ctx: &Self::Context) -> Result<{output_type}, {error}> {{\n        unimplemented!(\"request/response op; see the CSIL-RPC section\")\n    }}\n"
                         ));
                     } else {
                         let input_type = self.map_type_to_rust(&op.input_type, &None)?;
                         out.push_str(&format!(
-                            "    fn {op_snake}(&self, _ctx: &Self::Context, _input: {input_type}) -> Result<{output_type}, ServiceError> {{\n        unimplemented!(\"request/response op; see the CSIL-RPC section\")\n    }}\n"
+                            "    fn {op_snake}(&self, _ctx: &Self::Context, _input: {input_type}) -> Result<{output_type}, {error}> {{\n        unimplemented!(\"request/response op; see the CSIL-RPC section\")\n    }}\n"
                         ));
                     }
                 }
@@ -2394,7 +2427,7 @@ fn main() {{
                 if !matches!(op.direction, CsilServiceDirection::Unidirectional) {
                     continue;
                 }
-                let success = success_type(&op.output_type);
+                let success = success_type(op.success_output());
                 let null_input = is_null_input(&op.input_type);
                 if !Self::is_record_ref(&success, &records)
                     || !(null_input || Self::is_record_ref(&op.input_type, &records))
@@ -2437,7 +2470,7 @@ fn main() {{
                 if !matches!(op.direction, CsilServiceDirection::Bidirectional) {
                     continue;
                 }
-                let success = success_type(&op.output_type);
+                let success = success_type(op.success_output());
                 if !Self::is_record_ref(&success, &records)
                     || !Self::is_record_ref(&op.input_type, &records)
                 {
@@ -2574,6 +2607,18 @@ fn main() {{
             }
         }
 
+        for (service, op, arms) in self.spec.clone().rpc_operations() {
+            if arms.len() > 2 {
+                let error = self.rpc_handler_error(service, op)?;
+                body.push_str(&format!("#[derive(Debug, Clone)]\npub enum {error} {{\n"));
+                for arm in &arms[1..] {
+                    let name = Self::to_pascal_case(arm.rpc_variant_name().unwrap());
+                    let ty = self.map_type_to_rust(arm, &None)?;
+                    body.push_str(&format!("    {name}({ty}),\n"));
+                }
+                body.push_str("}\n\n");
+            }
+        }
         let mut content = String::new();
         content.push_str("//! Generated types from CSIL specification\n\n");
         // Every CSIL rule name — and every `<Record>_<field>`/`<Service>_<op>_...`
@@ -2598,7 +2643,14 @@ fn main() {{
         // exactly the enums whose sibling arms happen to be small, an asymmetry
         // that buys nothing at the wire and would ripple through every
         // `rust_enc_value`/`rust_dec_func` call site that touches a union.
-        content.push_str("#![allow(non_camel_case_types, clippy::large_enum_variant)]\n\n");
+        if rules
+            .iter()
+            .any(|rule| rule.name.contains('_') || rule.name.starts_with(char::is_lowercase))
+        {
+            content.push_str("#![allow(non_camel_case_types, clippy::large_enum_variant)]\n\n");
+        } else {
+            content.push_str("#![allow(clippy::large_enum_variant)]\n\n");
+        }
 
         // The exact-decimal helper is emitted only when the spec uses `decimal`
         // under the default mapping; under `library` mode the type is
@@ -2717,6 +2769,7 @@ fn main() {{
         constraints
             .iter()
             .map(|op| match op {
+                CsilControlOperator::EnumNumber(n) => format!("CBOR integer {n}"),
                 CsilControlOperator::Size(s) => format!("constraint: size {}", Self::size_doc(s)),
                 CsilControlOperator::Regex(p) => format!("constraint: matches regex {p:?}"),
                 CsilControlOperator::Default(v) => {
@@ -2960,6 +3013,23 @@ fn main() {{
         }
 
         content.push('}');
+        if csilgen_common::enum_numbers(choices).is_some() {
+            let literals = Self::enum_literals(choices).unwrap();
+            let idents = Self::enum_variant_idents(&literals);
+            content.push_str(&format!("\n\nimpl {name} {{\n    pub fn as_str(&self) -> &'static str {{\n        match self {{\n"));
+            for (id, literal) in idents.iter().zip(&literals) {
+                if let CsilLiteralValue::Text(label) = literal {
+                    content.push_str(&format!("            Self::{id} => {label:?},\n"));
+                }
+            }
+            content.push_str("        }\n    }\n\n    pub fn from_label(label: &str) -> Option<Self> {\n        match label {\n");
+            for (id, literal) in idents.iter().zip(&literals) {
+                if let CsilLiteralValue::Text(label) = literal {
+                    content.push_str(&format!("            {label:?} => Some(Self::{id}),\n"));
+                }
+            }
+            content.push_str("            _ => None,\n        }\n    }\n}");
+        }
         Ok(content)
     }
 
@@ -2976,6 +3046,153 @@ fn main() {{
                 Ok(format!("pub type {name} = {rust_type};"))
             }
         }
+    }
+
+    fn rpc_handler_error(
+        &mut self,
+        service: &str,
+        op: &CsilServiceOperation,
+    ) -> Result<String, String> {
+        match op.rpc_reply_arms() {
+            Some([_, error]) => self.map_type_to_rust(error, &None),
+            Some(_) => Ok(format!(
+                "{}{}Error",
+                Self::to_pascal_case(service),
+                Self::to_pascal_case(&op.name)
+            )),
+            None => Ok("ServiceError".into()),
+        }
+    }
+
+    fn rpc_codecs(
+        &mut self,
+        records: &HashSet<String>,
+        aliases: &HashMap<String, CsilTypeExpression>,
+    ) -> Result<String, String> {
+        let spec = self.spec.clone();
+        let mut out = String::new();
+        for (service, op, arms) in spec.rpc_operations() {
+            if !arms
+                .iter()
+                .all(|arm| self.op_boundary_expressible(arm, records, aliases))
+            {
+                continue;
+            }
+            let stem = self.op_codec_stem(service, &op.name);
+            let success = self.map_type_to_rust(&arms[0], &None)?;
+            let error = self.rpc_handler_error(service, op)?;
+            let header = Self::rust_sig(
+                "pub ",
+                &format!("encode_{stem}_reply"),
+                &format!("reply: Result<{success}, {error}>"),
+                "(&'static str, Vec<u8>)",
+            );
+            let mut encoder = format!("{header}    match reply {{\n");
+            for (index, arm) in arms.iter().enumerate() {
+                let wire = arm.rpc_variant_name().unwrap();
+                let helper = if Self::is_record_ref(arm, records) {
+                    Self::to_snake_case(wire)
+                } else if index == 0 {
+                    format!("{stem}_response")
+                } else {
+                    let helper = format!("{stem}_error_{index}");
+                    out.push_str(&self.emit_op_codec_pair(&helper, arm, records, aliases)?);
+                    helper
+                };
+                let pattern = if index == 0 {
+                    "Ok(value)".into()
+                } else if arms.len() == 2 {
+                    "Err(value)".into()
+                } else {
+                    format!("Err({error}::{}(value))", Self::to_pascal_case(wire))
+                };
+                let expr = format!("({wire:?}, encode_{helper}(&value))");
+                let line = format!("        {pattern} => {expr},");
+                if line.len() <= 100 {
+                    encoder.push_str(&format!("{line}\n"));
+                } else {
+                    encoder.push_str(&format!(
+                        "        {pattern} => {{\n            {expr}\n        }}\n"
+                    ));
+                }
+            }
+            out.push_str(&encoder);
+            out.push_str("    }\n}\n\n");
+        }
+        Ok(out)
+    }
+
+    fn rpc_client_dispatch(&mut self) -> Result<(String, String, String), String> {
+        let spec = self.spec.clone();
+        let records = self.record_names();
+        let aliases = self.codec_aliases();
+        let mut enums = std::collections::BTreeMap::new();
+        let mut body = String::new();
+        for (service, op, arms) in spec.rpc_operations() {
+            if !arms
+                .iter()
+                .all(|arm| self.op_boundary_expressible(arm, &records, &aliases))
+            {
+                continue;
+            }
+            let stem = self.op_codec_stem(service, &op.name);
+            body.push_str(&format!(
+                "        ({service:?}, {:?}) => match variant {{\n",
+                op.name
+            ));
+            for (i, arm) in arms.iter().enumerate() {
+                let wire = arm.rpc_variant_name().unwrap();
+                if i == 0 {
+                    body.push_str(&format!("            Some({wire:?}) => Ok(payload),\n"));
+                } else {
+                    let var = format!("Application{}", Self::to_pascal_case(wire));
+                    enums.insert(var.clone(), self.map_type_to_rust(arm, &None)?);
+                    let suffix = if Self::is_record_ref(arm, &records) {
+                        Self::to_snake_case(wire)
+                    } else {
+                        format!("{stem}_error_{i}")
+                    };
+                    body.push_str(&format!("            Some({wire:?}) => {{\n                let value = decode_{suffix}(&payload)?;\n                Err(ClientError::{var}(Box::new(value)))\n            }}\n"));
+                }
+            }
+            body.push_str("            _ => Err(ClientError::Decode(format!(\n                \"invalid reply variant {variant:?}\"\n            ))),\n        },\n");
+        }
+        let variants = enums
+            .iter()
+            .map(|(v, t)| format!("    {v}(Box<{t}>),\n"))
+            .collect();
+        let displays = enums
+            .keys()
+            .map(|v| {
+                format!("            Self::{v}(e) => write!(f, \"application error: {{e:?}}\"),\n")
+            })
+            .collect();
+        let dispatch = if body.is_empty() {
+            String::new()
+        } else {
+            format!(
+                r#"impl From<CsilCborError> for ClientError {{
+    fn from(error: CsilCborError) -> Self {{
+        Self::Decode(error.0)
+    }}
+}}
+
+/// Resolve a status-zero RPC reply before returning its payload to the client.
+pub fn resolve_rpc_reply(
+    service: &str,
+    op: &str,
+    variant: Option<&str>,
+    payload: Vec<u8>,
+) -> Result<Vec<u8>, ClientError> {{
+    match (service, op) {{
+{body}        _ => Ok(payload),
+    }}
+}}
+
+"#
+            )
+        };
+        Ok((variants, displays, dispatch))
     }
 
     fn generate_services(&mut self) -> Result<String, String> {
@@ -2997,6 +3214,20 @@ fn main() {{
         }
 
         let rules = self.spec.rules.clone();
+        let mut route_error = String::from("ChannelRouteError");
+        while rules.iter().any(|rule| rule.name == route_error) {
+            route_error.insert_str(0, "Generated");
+        }
+        if rules.iter().any(|rule| {
+            matches!(&rule.rule_type, CsilRuleType::ServiceDef(service) if Self::service_has_channel_ops(service))
+        }) {
+            body.push_str(&CHANNEL_ROUTE_ERROR.replace("ChannelRouteError", &route_error));
+            if !self.record_names().is_empty() {
+                body.push_str(&format!(
+                    "impl From<CsilCborError> for {route_error} {{\n    fn from(error: CsilCborError) -> Self {{\n        Self::Decode(error.0)\n    }}\n}}\n\n"
+                ));
+            }
+        }
         for rule in &rules {
             if let CsilRuleType::ServiceDef(service) = &rule.rule_type {
                 let trait_code = self.generate_service_trait(&rule.name, service)?;
@@ -3011,12 +3242,16 @@ fn main() {{
                 }
 
                 if Self::service_has_channel_ops(service) {
-                    body.push_str(&self.generate_service_router(&rule.name, service)?);
+                    body.push_str(&self.generate_service_router(
+                        &rule.name,
+                        service,
+                        &route_error,
+                    )?);
                     body.push('\n');
                     // Compact-profile twin, emitted only for wire-id-bearing
                     // services so wire-id-free specs stay byte-identical.
                     if let Some(compact) =
-                        self.generate_service_router_compact(&rule.name, service)?
+                        self.generate_service_router_compact(&rule.name, service, &route_error)?
                     {
                         body.push_str(&compact);
                         body.push('\n');
@@ -3054,7 +3289,12 @@ fn main() {{
         // `body` would call the codec — `client_prelude` (the `ClientError`/
         // `Transport` trait boilerplate) never references it either.
         let mut body = String::new();
-        body.push_str(&client_prelude(shape));
+        let (variants, displays, dispatch) = self.rpc_client_dispatch()?;
+        body.push_str(&client_prelude(shape, &variants, &displays));
+        if shape.marker.is_empty() {
+            body.push_str(dispatch.trim_end());
+            body.push('\n');
+        }
         body.push('\n');
 
         let rules = self.spec.rules.clone();
@@ -3153,7 +3393,7 @@ fn main() {{
                 ));
                 continue;
             }
-            let success = success_type(&operation.output_type);
+            let success = success_type(operation.success_output());
             let null_input = is_null_input(&operation.input_type);
             let req_ok = null_input
                 || self.op_boundary_expressible(&operation.input_type, &records, &aliases);
@@ -3226,15 +3466,20 @@ fn main() {{
                     dot_await,
                 ));
             }
+            let error_kind = if operation.rpc_reply_arms().is_some() {
+                "Decode"
+            } else {
+                "Transport"
+            };
             let decode_line = format!(
-                "        {resp_dec}(&csil_resp).map_err(|e| ClientError::Transport(e.to_string()))\n"
+                "        {resp_dec}(&csil_resp).map_err(|e| ClientError::{error_kind}(e.to_string()))\n"
             );
             if decode_line.trim_end().len() <= 100 {
                 content.push_str(&decode_line);
             } else {
                 content.push_str(&format!(
                     "        {resp_dec}(&csil_resp)\n\
-                     \x20           .map_err(|e| ClientError::Transport(e.to_string()))\n"
+                     \x20           .map_err(|e| ClientError::{error_kind}(e.to_string()))\n"
                 ));
             }
             content.push_str("    }\n");
@@ -4033,13 +4278,13 @@ fn main() {{
         Self::render_let(indent, "csil_decode", dec)
     }
 
-    fn rust_trait_method(name: &str, args: &[String], ret: &str) -> String {
+    fn rust_trait_method(name: &str, args: &[String], ret: &str, error: &str) -> String {
         let params = if args.is_empty() {
             "&self".to_string()
         } else {
             format!("&self, {}", args.join(", "))
         };
-        let one_line = format!("    fn {name}({params}) -> Result<{ret}, ServiceError>;\n");
+        let one_line = format!("    fn {name}({params}) -> Result<{ret}, {error}>;\n");
         // rustfmt's ladder for a bodyless trait fn: one line through 99 columns,
         // return type alone pushed to the next line at exactly 100 (the reserved
         // terminator column), params one-per-line beyond that.
@@ -4047,7 +4292,7 @@ fn main() {{
             return one_line;
         }
         if one_line.trim_end().len() == 100 {
-            return format!("    fn {name}({params})\n        -> Result<{ret}, ServiceError>;\n");
+            return format!("    fn {name}({params})\n        -> Result<{ret}, {error}>;\n");
         }
 
         let mut out = format!("    fn {name}(\n        &self,\n");
@@ -4056,7 +4301,7 @@ fn main() {{
             out.push_str(arg);
             out.push_str(",\n");
         }
-        out.push_str(&format!("    ) -> Result<{ret}, ServiceError>;\n"));
+        out.push_str(&format!("    ) -> Result<{ret}, {error}>;\n"));
         out
     }
 
@@ -4348,7 +4593,7 @@ fn main() {{
                 if !matches!(op.direction, CsilServiceDirection::Unidirectional) {
                     continue;
                 }
-                let success = success_type(&op.output_type);
+                let success = success_type(op.success_output());
                 let stem = self.op_codec_stem(&rule.name, &op.name);
                 if !is_null_input(&op.input_type)
                     && !Self::is_record_ref(&op.input_type, records)
@@ -4458,9 +4703,7 @@ fn main() {{
             // a long synthesized hoisted-choice name (`<Record>_<field>`, which can
             // run well past a source-declared rule name) still wraps like rustfmt
             // instead of leaving a fixed line rustfmt would reformat.
-            out.push_str(&format!(
-                "/// Encode a {name} enum as its bare literal value.\n"
-            ));
+            out.push_str(&format!("/// Encode a {name} enum as its CBOR value.\n"));
             out.push_str(&Self::rust_sig(
                 "",
                 &format!("csil_enc_{snake}"),
@@ -4468,8 +4711,16 @@ fn main() {{
                 "CsilCborValue",
             ));
             out.push_str("    match csil_v {\n");
-            for (ident, lit) in idents.iter().zip(lits.iter()) {
-                let value = Self::rust_literal_cbor_expr(lit);
+            let all_text = lits
+                .iter()
+                .all(|lit| matches!(lit, CsilLiteralValue::Text(_)));
+            let numbers = csilgen_common::enum_numbers(choices);
+            for (index, (ident, lit)) in idents.iter().zip(&lits).enumerate() {
+                let value = if let Some(numbers) = &numbers {
+                    Self::rust_literal_cbor_expr(&CsilLiteralValue::Integer(numbers[index]))
+                } else {
+                    Self::rust_literal_cbor_expr(lit)
+                };
                 out.push_str(&Self::rust_match_arm(&format!("{name}::{ident}"), &value));
             }
             out.push_str("    }\n}\n\n");
@@ -4487,7 +4738,6 @@ fn main() {{
             // vocabulary outright (required a uniform text-only or int-only
             // choice) and it fell through to the union path below, wrapping each
             // literal in a per-arm payload type it didn't have.
-            let all_text = lits.iter().all(|l| matches!(l, CsilLiteralValue::Text(_)));
             let all_int = lits
                 .iter()
                 .all(|l| matches!(l, CsilLiteralValue::Integer(_)));
@@ -4499,7 +4749,15 @@ fn main() {{
                 "csil_v",
                 name,
             ));
-            if all_text {
+            if let Some(numbers) = numbers {
+                out.push_str("    match cbor_as_i64(csil_v)? {\n");
+                for (index, ident) in numbers.iter().zip(&idents) {
+                    out.push_str(&Self::rust_match_arm(
+                        &index.to_string(),
+                        &format!("Ok({name}::{ident})"),
+                    ));
+                }
+            } else if all_text {
                 out.push_str(
                     "    let csil_val = cbor_as_text(csil_v)?;\n    match csil_val.as_str() {\n",
                 );
@@ -4690,7 +4948,7 @@ fn main() {{
     /// the codec can model.
     fn generate_codec(&mut self) -> Result<Option<String>, String> {
         let records = self.record_names();
-        if records.is_empty() {
+        if records.is_empty() && self.spec.rpc_operations().next().is_none() {
             return Ok(None);
         }
         let aliases = self.codec_aliases();
@@ -4758,6 +5016,7 @@ fn main() {{
         // a consumer-side server share one codec surface for every op.
         content.push_str(&self.emit_op_codecs(&records, &aliases)?);
 
+        content.push_str(&self.rpc_codecs(&records, &aliases)?);
         Ok(Some(content))
     }
 
@@ -4839,7 +5098,11 @@ fn main() {{
                     // success signature uses the response half only — otherwise the
                     // whole union falls back to the untyped `serde_json::Value`.
                     let output_type =
-                        self.map_type_to_rust(&success_type(&operation.output_type), &None)?;
+                        self.map_type_to_rust(&success_type(operation.success_output()), &None)?;
+                    let error = self.rpc_handler_error(name, operation)?;
+                    if operation.rpc_reply_arms().is_some() {
+                        content.push_str("    #[allow(clippy::result_large_err)]\n");
+                    }
                     Self::write_op_doc(&mut content, operation, "request/response");
                     // A push-style op (`op: -> Event`) has a `null` input: emit no
                     // request parameter rather than a meaningless `input: ()`.
@@ -4848,6 +5111,7 @@ fn main() {{
                             &op_name,
                             &["ctx: &Self::Context".to_string()],
                             &output_type,
+                            &error,
                         ));
                     } else {
                         let input_type = self.map_type_to_rust(&operation.input_type, &None)?;
@@ -4858,6 +5122,7 @@ fn main() {{
                                 format!("input: {input_type}"),
                             ],
                             &output_type,
+                            &error,
                         ));
                     }
                 }
@@ -4874,6 +5139,7 @@ fn main() {{
                             &op_name,
                             &["ctx: &Self::Context".to_string()],
                             "()",
+                            "ServiceError",
                         ));
                     } else {
                         let input_type = self.map_type_to_rust(&operation.input_type, &None)?;
@@ -4884,6 +5150,7 @@ fn main() {{
                                 format!("msg: {input_type}"),
                             ],
                             "()",
+                            "ServiceError",
                         ));
                     }
                 }
@@ -4952,59 +5219,8 @@ fn main() {{
             "decode_{}",
             Self::to_snake_case(&Self::type_ref_name(&op.input_type))
         );
-        // rustfmt's ladder for this statement, probed against the defaults: hang
-        // the struct literal off `.map_err` while its head line fits; then break
-        // after `=`; then give the closure a block body (which reserves one extra
-        // column); then break after `=` with the block body; then break the chain.
-        let d = decode_fn.len();
-        let msg_stmt = if 58 + d <= 100 {
-            format!(
-                "            let msg = {decode_fn}(bytes).map_err(|err| ServiceError {{\n\
-                 \x20               code: 400,\n\
-                 \x20               message: err.to_string(),\n\
-                 \x20           }})?;\n"
-            )
-        } else if 52 + d <= 100 {
-            format!(
-                "            let msg =\n\
-                 \x20               {decode_fn}(bytes).map_err(|err| ServiceError {{\n\
-                 \x20                   code: 400,\n\
-                 \x20                   message: err.to_string(),\n\
-                 \x20               }})?;\n"
-            )
-        } else if 45 + d <= 99 {
-            format!(
-                "            let msg = {decode_fn}(bytes).map_err(|err| {{\n\
-                 \x20               ServiceError {{\n\
-                 \x20                   code: 400,\n\
-                 \x20                   message: err.to_string(),\n\
-                 \x20               }}\n\
-                 \x20           }})?;\n"
-            )
-        } else if 39 + d <= 99 {
-            format!(
-                "            let msg =\n\
-                 \x20               {decode_fn}(bytes).map_err(|err| {{\n\
-                 \x20                   ServiceError {{\n\
-                 \x20                       code: 400,\n\
-                 \x20                       message: err.to_string(),\n\
-                 \x20                   }}\n\
-                 \x20               }})?;\n"
-            )
-        } else {
-            format!(
-                "            let msg = {decode_fn}(bytes)\n\
-                 \x20               .map_err(|err| ServiceError {{\n\
-                 \x20                   code: 400,\n\
-                 \x20                   message: err.to_string(),\n\
-                 \x20               }})?;\n"
-            )
-        };
         Some(format!(
-            "        {label} => {{\n\
-             {msg_stmt}\
-             \x20           handlers.{op_snake}(ctx, msg)\n\
-             \x20       }}\n"
+            "        {label} => {{\n            let msg = {decode_fn}(bytes)?;\n            handlers.{op_snake}(ctx, msg)\n        }}\n"
         ))
     }
 
@@ -5015,6 +5231,7 @@ fn main() {{
         &mut self,
         service_name: &str,
         service: &CsilServiceDefinition,
+        route_error: &str,
     ) -> Result<String, String> {
         let inbound_ops: Vec<&CsilServiceOperation> = service
             .operations
@@ -5047,26 +5264,24 @@ fn main() {{
              \x20   {ctx}: &H::Context,\n\
              \x20   method: &str,\n\
              \x20   {bytes}: &[u8],\n\
-             ) -> Result<(), ServiceError>\n\
+             ) -> Result<(), {route_error}>\n\
              where\n\
              \x20   H: {service_name},\n\
              {{\n"
         ));
         if arms.is_empty() {
-            content.push_str("    Err(ServiceError {\n");
-            content.push_str("        code: 404,\n");
-            content.push_str("        message: format!(\"unknown channel {method}\"),\n");
-            content.push_str("    })\n");
+            content.push_str(&format!(
+                "    Err({route_error}::UnknownMethod(method.to_owned()))\n"
+            ));
         } else {
             content.push_str("    match method {\n");
             for arm in arms {
                 content.push_str(&arm);
             }
-            content.push_str("        other => Err(ServiceError {\n");
-            content.push_str("            code: 404,\n");
-            content.push_str("            message: format!(\"unknown channel {other}\"),\n");
-            content.push_str("        }),\n");
-            content.push_str("    }\n");
+            content.push_str(&format!(
+                "        _ => return Err({route_error}::UnknownMethod(method.to_owned())),\n"
+            ));
+            content.push_str(&format!("    }}\n    .map_err({route_error}::Handler)\n"));
         }
         content.push_str("}\n");
         Ok(content)
@@ -5082,6 +5297,7 @@ fn main() {{
         &mut self,
         service_name: &str,
         service: &CsilServiceDefinition,
+        route_error: &str,
     ) -> Result<Option<String>, String> {
         if service.wire_id.is_none() {
             return Ok(None);
@@ -5120,28 +5336,23 @@ fn main() {{
              \x20   {ctx}: &H::Context,\n\
              \x20   op: u64,\n\
              \x20   {bytes}: &[u8],\n\
-             ) -> Result<(), ServiceError>\n\
+             ) -> Result<(), {route_error}>\n\
              where\n\
              \x20   H: {service_name},\n\
              {{\n",
             Self::to_snake_case(service_name)
         ));
         if arms.is_empty() {
-            content.push_str("    Err(ServiceError {\n");
-            content.push_str("        code: 404,\n");
-            content.push_str("        message: format!(\"unknown channel ordinal {op}\"),\n");
-            content.push_str("    })\n");
+            content.push_str(&format!("    Err({route_error}::UnknownOrdinal(op))\n"));
         } else {
             content.push_str("    match op {\n");
             for arm in arms {
                 content.push_str(&arm);
             }
-            content.push_str("        other => Err(ServiceError {\n");
-            content.push_str("            code: 404,\n");
-            content
-                .push_str("            message: format!(\"unknown channel ordinal {other}\"),\n");
-            content.push_str("        }),\n");
-            content.push_str("    }\n");
+            content.push_str(&format!(
+                "        _ => return Err({route_error}::UnknownOrdinal(op)),\n"
+            ));
+            content.push_str(&format!("    }}\n    .map_err({route_error}::Handler)\n"));
         }
         content.push_str("}\n");
         Ok(Some(content))
@@ -6505,7 +6716,7 @@ mod tests {
         assert!(
             client
                 .content
-                .contains("decode_submit_task_response(&csil_resp).map_err(|e| ClientError::Transport(e.to_string()))")
+                .contains("decode_submit_task_response(&csil_resp).map_err(|e| ClientError::Decode(e.to_string()))")
         );
         // The codec ships alongside the client.
         assert!(files.iter().any(|f| f.path == "codec.gen.rs"));
@@ -6922,16 +7133,8 @@ mod tests {
         assert!(matches!(success_type(&plain), CsilTypeExpression::Reference(n) if n == "Res"));
     }
 
-    /// Regression for the `examples/build-integration/npm-project/api.csil` shape:
-    /// a hoisted op-boundary union (`delete-notification: NotificationID ->
-    /// DeleteResponse / NotificationError`, neither arm named `ServiceError`)
-    /// whose synthesized name (`NotificationAPI_delete_notification_response`) is
-    /// long enough that the union encoder's per-arm value no longer fits
-    /// rustfmt's single-line-in-braces budget and must render as a fully
-    /// multi-line `CsilCborValue::Array(vec![...])`. This previously came out
-    /// flat-in-braces because the fallback called `render_expr` at a reset column
-    /// that let its own `max_width`-based shortcut re-flatten an element list the
-    /// caller had already rejected on the narrower `fn_call_width` budget.
+    /// A channel output remains a payload union. Its synthesized name can force
+    /// rustfmt to wrap the array expression in its encoder.
     #[test]
     fn union_arm_with_long_hoisted_name_forces_multiline_array() {
         let mut input = create_test_input();
@@ -6991,7 +7194,7 @@ mod tests {
                         CsilTypeExpression::Reference("DeleteResponse".to_string()),
                         CsilTypeExpression::Reference("NotificationError".to_string()),
                     ]),
-                    direction: CsilServiceDirection::Unidirectional,
+                    direction: CsilServiceDirection::Bidirectional,
                     position: CsilPosition {
                         line: 1,
                         column: 1,
@@ -8138,6 +8341,7 @@ mod tests {
             "get",
             &["input: serde_json::Value".to_string()],
             "Cart",
+            "ServiceError",
         );
         assert_eq!(
             short,
@@ -8152,6 +8356,7 @@ mod tests {
                 "input: serde_json::Value".to_string(),
             ],
             "Cart",
+            "ServiceError",
         );
         assert_eq!(
             exactly_100,
@@ -8166,6 +8371,7 @@ mod tests {
                 "input: serde_json::Value".to_string(),
             ],
             "Cart",
+            "ServiceError",
         );
         assert_eq!(
             long,
@@ -9471,7 +9677,7 @@ mod tests {
             "compact router dispatches to the handler, got:\n{services}"
         );
         assert!(
-            services.contains("unknown channel ordinal {other}"),
+            services.contains("_ => return Err(ChannelRouteError::UnknownOrdinal(op))"),
             "compact router has an ordinal fallthrough, got:\n{services}"
         );
     }
@@ -10239,6 +10445,13 @@ mod tests {
                             metadata: vec![],
                             doc_comments: Vec::new(),
                         },
+                        CsilGroupEntry {
+                            key: Some(CsilGroupKey::Bare("detail".to_string())),
+                            value_type: CsilTypeExpression::Builtin("text".to_string()),
+                            occurrence: Some(CsilOccurrence::Optional),
+                            metadata: vec![],
+                            doc_comments: Vec::new(),
+                        },
                     ],
                 });
             }
@@ -10941,7 +11154,7 @@ fn main() {
         assert!(rpc.contains("RpcResponse::decode(&body)"));
         assert!(rpc.contains("/csil/v1/rpc"));
         assert!(rpc.contains("into_transport_error()"));
-        assert!(rpc.contains("== Some(\"ServiceError\")"));
+        assert!(rpc.contains("Ok(decoded.payload)") || rpc.contains("resolve_rpc_reply("));
         assert!(rpc.contains("impl Transport for HttpRpcCarrier"));
         assert!(rpc.contains("EchoClient::new(HttpRpcCarrier::new("));
         assert!(rpc.contains("client.ping(Ping { msg: \"example\".to_string() })"));

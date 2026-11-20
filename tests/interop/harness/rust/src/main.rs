@@ -17,9 +17,9 @@ use csilgen_transport::rpc::{HandlerOutcome, RpcClient, RpcRequest, RpcServer};
 use csilgen_transport::Status;
 
 use interop_api::{
-    decode_collections, decode_constrained, decode_nested, decode_scalars, decode_service_error,
-    decode_tick, encode_collections, encode_constrained, encode_interop_on_tick, encode_scalars,
-    encode_service_error, route_interop_channel, ClientError, Collections, Color, Constrained,
+    decode_collections, decode_constrained, decode_nested, decode_scalars,
+    decode_tick, encode_collections, encode_interop_on_tick, encode_scalars,
+    route_interop_channel, ClientError, Collections, Color, Constrained,
     CsilCborValue, EchoNestedResult, IdOrName, Interop, Level, MixedStatus, Nested, OptBytes,
     Priority,
     Scalars, Scalars_note, Scalars_size, Season, ServiceError, ShipMode, Tick, Transport,
@@ -246,20 +246,7 @@ impl Transport for RpcTransport {
             .borrow_mut()
             .call(service, op, req.to_vec(), None)
         {
-            // A status-0 reply whose variant is the `ServiceError` arm is a typed
-            // application error; surface it as ClientError::Service (the carrier owns
-            // this mapping, per the transport conventions). Otherwise hand the success
-            // payload to the typed client to decode.
-            Ok(resp) if resp.variant.as_deref() == Some("ServiceError") => {
-                match decode_service_error(&resp.payload) {
-                    Ok(se) => Err(ClientError::Service {
-                        code: se.code,
-                        message: se.message,
-                    }),
-                    Err(e) => Err(ClientError::Transport(e.to_string())),
-                }
-            }
-            Ok(resp) => Ok(resp.payload),
+            Ok(resp) => interop_api::resolve_rpc_reply(service, op, resp.variant.as_deref(), resp.payload),
             Err(e) => Err(ClientError::Transport(e.to_string())),
         }
     }
@@ -311,11 +298,10 @@ fn rpc_server(listener: TcpListener) {
                     Err(e) => HandlerOutcome::Transport(Status::MalformedEnvelope, e.to_string()),
                 },
                 "validate-constrained" => match decode_constrained(&req.payload) {
-                    Ok(v) => match handlers.validate_constrained(&(), v) {
-                        Ok(r) => reply("Constrained", encode_constrained(&r)),
-                        // The typed error arm rides as a status-0 `ServiceError` variant.
-                        Err(e) => reply("ServiceError", encode_service_error(&e)),
-                    },
+                    Ok(v) => {
+                        let (variant, payload) = interop_api::encode_interop_validate_constrained_reply(handlers.validate_constrained(&(), v));
+                        reply(variant, payload)
+                    }
                     Err(e) => HandlerOutcome::Transport(Status::MalformedEnvelope, e.to_string()),
                 },
                 other => HandlerOutcome::Transport(
@@ -377,7 +363,7 @@ fn rpc_client(stream: TcpStream) -> Cases {
             "server accepted invalid input",
         ),
         // The typed error arm must surface as a service error, not a transport error.
-        Err(ClientError::Service { .. }) => cases.pass("validate-constrained/failure"),
+        Err(ClientError::ApplicationServiceError(_)) => cases.pass("validate-constrained/failure"),
         Err(e) => cases.fail(
             "validate-constrained/failure",
             format!("expected service error, got {e}"),

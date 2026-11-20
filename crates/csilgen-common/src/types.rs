@@ -185,6 +185,8 @@ pub enum CsilTypeExpression {
 /// CSIL control operators for constraints
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum CsilControlOperator {
+    /// Internal generator mapping from the public enum label to its CBOR integer.
+    EnumNumber(i64),
     /// Size constraint
     Size(CsilSizeConstraint),
     /// Regex constraint
@@ -306,6 +308,86 @@ pub struct CsilServiceOperation {
     /// The `@wire-id(N)` operation ordinal, if assigned (transport compact profiles).
     #[serde(default)]
     pub wire_id: Option<u64>,
+}
+
+impl CsilSpecSerialized {
+    /// Older service schemas refer to the conventional error record implicitly.
+    pub fn supply_implicit_service_error(&mut self) {
+        if self.rules.iter().any(|rule| rule.name == "ServiceError") {
+            return;
+        }
+        let position = self.rpc_operations().find_map(|(_, op, arms)| {
+            arms[1..]
+                .iter()
+                .any(|arm| arm.rpc_variant_name() == Some("ServiceError"))
+                .then(|| op.position.clone())
+        });
+        if let Some(position) = position {
+            let entries = [("code", "int"), ("message", "text")]
+                .map(|(key, ty)| CsilGroupEntry {
+                    key: Some(CsilGroupKey::Bare(key.into())),
+                    value_type: CsilTypeExpression::Builtin(ty.into()),
+                    occurrence: None,
+                    metadata: Vec::new(),
+                    doc_comments: Vec::new(),
+                })
+                .into();
+            self.rules.push(CsilRule {
+                name: "ServiceError".into(),
+                position,
+                doc_comments: Vec::new(),
+                rule_type: CsilRuleType::GroupDef(CsilGroupExpression { entries }),
+            });
+        }
+    }
+
+    pub fn rpc_operations(
+        &self,
+    ) -> impl Iterator<Item = (&str, &CsilServiceOperation, &[CsilTypeExpression])> {
+        self.rules
+            .iter()
+            .filter_map(|rule| match &rule.rule_type {
+                CsilRuleType::ServiceDef(service) => Some((rule.name.as_str(), service)),
+                _ => None,
+            })
+            .flat_map(|(name, service)| {
+                service
+                    .operations
+                    .iter()
+                    .filter_map(move |op| Some((name, op, op.rpc_reply_arms()?)))
+            })
+    }
+}
+
+impl CsilTypeExpression {
+    /// Name used in the CSIL-RPC response envelope.
+    pub fn rpc_variant_name(&self) -> Option<&str> {
+        match self {
+            Self::Reference(name) | Self::Builtin(name) => Some(name),
+            _ => None,
+        }
+    }
+}
+
+impl CsilServiceOperation {
+    /// Inline alternatives at a unary reply boundary, in declaration order.
+    /// A reference to a named union remains a single payload type.
+    pub fn rpc_reply_arms(&self) -> Option<&[CsilTypeExpression]> {
+        if self.direction == CsilServiceDirection::Unidirectional
+            && let CsilTypeExpression::Choice(arms) = &self.output_type
+            && arms.len() >= 2
+            && arms.iter().all(|arm| arm.rpc_variant_name().is_some())
+        {
+            Some(arms)
+        } else {
+            None
+        }
+    }
+
+    pub fn success_output(&self) -> &CsilTypeExpression {
+        self.rpc_reply_arms()
+            .map_or(&self.output_type, |arms| &arms[0])
+    }
 }
 
 /// CSIL service direction for WASM boundary

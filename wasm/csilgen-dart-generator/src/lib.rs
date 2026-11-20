@@ -207,6 +207,44 @@ fn dart_type_name(name: &str) -> String {
 }
 
 /// A Dart member name: `lowerCamelCase`, with a reserved-word guard.
+fn dart_enum_member(name: &str) -> String {
+    let value = dart_member_name(name);
+    if [
+        "values",
+        "index",
+        "name",
+        "wireValue",
+        "fromWire",
+        "hashCode",
+        "runtimeType",
+        "toString",
+        "noSuchMethod",
+    ]
+    .contains(&value.as_str())
+    {
+        format!("{value}_")
+    } else {
+        value
+    }
+}
+
+fn dart_text_enum<'a>(
+    ty: &'a CsilTypeExpression,
+    aliases: &std::collections::HashMap<String, CsilTypeExpression>,
+) -> Option<&'a str> {
+    if let CsilTypeExpression::Constrained { base_type, .. } = ty {
+        return dart_text_enum(base_type, aliases);
+    }
+    if let CsilTypeExpression::Reference(name) = ty
+        && let Some(CsilTypeExpression::Choice(arms)) = aliases.get(name)
+        && csilgen_common::text_enum_members(arms).is_some()
+    {
+        Some(name)
+    } else {
+        None
+    }
+}
+
 fn dart_member_name(name: &str) -> String {
     escape_reserved(&name.to_case(Case::Camel))
 }
@@ -993,6 +1031,7 @@ fn dart_sorted_services(spec: &CsilSpecSerialized) -> Vec<(&str, &CsilServiceDef
 /// request), the request/response record type names (so the datagram section can name
 /// `Type.toCbor`/`Type.fromCbor`), and the op's datagram ordinal.
 struct DartUnaryExample {
+    has_refusals: bool,
     client_class: String,
     method: String,
     has_request: bool,
@@ -1019,8 +1058,9 @@ fn dart_first_unary_example(
         {
             let base = service_base_name(name);
             let has_request = !is_null_input(&op.input_type);
-            let success = success_type(&op.output_type);
+            let success = success_type(op.success_output());
             return Some(DartUnaryExample {
+                has_refusals: spec.rpc_operations().next().is_some(),
                 client_class: format!("{base}{marker}Client"),
                 method: dart_member_name(&op.name),
                 has_request,
@@ -1061,7 +1101,7 @@ fn dart_handler_stub_methods(def: &CsilServiceDefinition, decimal: DecimalMappin
         let method = dart_member_name(&op.name);
         match op.direction {
             CsilServiceDirection::Unidirectional => {
-                let out_type = map_type(&success_type(&op.output_type), &None, dec);
+                let out_type = map_type(&success_type(op.success_output()), &None, dec);
                 if is_null_input(&op.input_type) {
                     out.push_str(&format!(
                         "  @override\n  {out_type} {method}() => throw UnimplementedError();\n"
@@ -1112,7 +1152,7 @@ fn dart_first_channel_example(
             if !matches!(op.direction, CsilServiceDirection::Bidirectional) {
                 continue;
             }
-            let success = success_type(&op.output_type);
+            let success = success_type(op.success_output());
             let Some(message_type) = dart_record_ref(spec, &op.input_type) else {
                 continue;
             };
@@ -1343,7 +1383,14 @@ fn dart_rpc_section(
     out.push_str(&format!(
         "import 'package:{package_name}/{package_name}.dart';\n\n"
     ));
-    out.push_str(&DART_RPC_CARRIER.replace("__SEAM__", seam));
+    out.push_str(&DART_RPC_CARRIER.replace("__SEAM__", seam).replace(
+        "__RESOLVE__",
+        if ex.has_refusals {
+            "return resolveRpcReply(service, op, resp.variant, resp.payload);"
+        } else {
+            "return resp.payload;"
+        },
+    ));
     out.push('\n');
     out.push_str("Future<void> main() async {\n");
     out.push_str(&format!(
@@ -1581,12 +1628,7 @@ class HttpRpcCarrier implements __SEAM__ {
     // RpcResponse.decode + intoTransportError throws a StatusException for any non-zero
     // transport status, distinct from an application error.
     final resp = RpcResponse.decode(bytes).intoTransportError();
-    // A typed application error rides as a status-0 `ServiceError` variant; surface it
-    // so the typed client decodes success only.
-    if (resp.variant == 'ServiceError') {
-      throw StateError('csil-rpc $service/$op: ServiceError');
-    }
-    return resp.payload;
+    __RESOLVE__
   }
 
   static Future<Uint8List> _httpSend(Uri uri, Uint8List body) async {
@@ -1734,12 +1776,13 @@ impl DartGenerator {
         // (`hoist_all_literal_choices: false`) — `map_type`/`dart_to_cbor_expr`/
         // `dart_from_cbor_expr` already render a correct bare-literal enum for it
         // in the field position itself.
-        let spec = csilgen_common::hoist_inline_composites(
+        let mut spec = csilgen_common::hoist_inline_composites(
             spec,
             csilgen_common::HoistOptions {
                 hoist_all_literal_choices: false,
             },
         );
+        spec.supply_implicit_service_error();
         let spec = &spec;
         let mut files = Vec::new();
 
@@ -1769,6 +1812,52 @@ impl DartGenerator {
             }
         }
 
+        let decimal = self.cfg.decimal_dart_type();
+        let mut refusals = std::collections::BTreeSet::new();
+        let mut resolve = String::from(
+            "Uint8List resolveRpcReply(\n  String service,\n  String op,\n  String? variant,\n  Uint8List payload,\n) {\n",
+        );
+        for (service, op, arms) in spec.rpc_operations() {
+            let method = &op.name;
+            let stem = format!("{}{}", dart_type_name(service), dart_type_name(method));
+            let success = arms[0].rpc_variant_name().unwrap();
+            let ty = map_type(&arms[0], &None, decimal);
+            let enc = dart_to_cbor_expr(&arms[0], "value", &records, &aliases, &unions).flat();
+            let mut handler = format!(
+                "(String, Uint8List) encode{stem}Reply({ty} Function() handler) {{\n  try {{\n    final value = handler();\n    return ('{success}', CsilCbor.encodeValue({enc}));\n"
+            );
+            resolve.push_str(&format!("  if (service == '{service}' && op == '{method}') {{\n    switch (variant) {{\n      case '{success}':\n        return payload;\n"));
+            for arm in &arms[1..] {
+                let wire = arm.rpc_variant_name().unwrap();
+                let ty = map_type(arm, &None, decimal);
+                let class = format!("{}Refusal", dart_type_name(wire));
+                if refusals.insert(class.clone()) {
+                    types_code.push_str(&format!("final class {class} implements Exception {{\n  final {ty} value;\n  const {class}(this.value);\n}}\n\n"));
+                }
+                let enc =
+                    dart_to_cbor_expr(arm, "refusal.value", &records, &aliases, &unions).flat();
+                let dec = dart_from_cbor_expr(
+                    arm,
+                    "CsilCbor.decode(payload)",
+                    &records,
+                    decimal,
+                    &aliases,
+                    &unions,
+                )
+                .flat();
+                handler.push_str(&format!("  }} on {class} catch (refusal) {{\n    return ('{wire}', CsilCbor.encodeValue({enc}));\n"));
+                resolve.push_str(&format!(
+                    "      case '{wire}':\n        throw {class}({dec});\n"
+                ));
+            }
+            types_code.push_str(&handler);
+            types_code.push_str("  }\n}\n\n");
+            resolve.push_str("      default:\n        throw FormatException('invalid RPC reply variant: $variant');\n    }\n  }\n");
+        }
+        if !refusals.is_empty() {
+            types_code.push_str(&resolve);
+            types_code.push_str("  return payload;\n}\n");
+        }
         let has_types = !types_code.is_empty();
         if has_types {
             files.push(GeneratedFile {
@@ -1793,7 +1882,7 @@ impl DartGenerator {
         // whenever there are records to (de)serialize, so the output stays standalone.
         // It learns `CsilDecimal` (CBOR tag 4) only when that helper is emitted, so a
         // spec without `decimal` keeps a dependency-free codec.
-        if !records.is_empty() {
+        if !records.is_empty() || spec.rpc_operations().next().is_some() {
             files.push(GeneratedFile {
                 path: "csil_cbor.gen.dart".to_string(),
                 content: csil_cbor_dart(csil_decimal),
@@ -2066,8 +2155,8 @@ impl DartGenerator {
         out.push_str(&dart_ctor_decl(2, &class_name, &params));
         out.push('\n');
 
-        out.push_str(&self.generate_to_map(&named));
-        out.push_str(&self.generate_from_map(&class_name, &named));
+        out.push_str(&self.generate_to_map(&named, aliases));
+        out.push_str(&self.generate_from_map(&class_name, &named, aliases));
         out.push_str(&self.generate_validate(&named));
         out.push_str(&self.generate_equality(&class_name, &named));
         out.push_str(&self.generate_cbor(&class_name, &named, records, aliases, unions));
@@ -2197,7 +2286,11 @@ impl DartGenerator {
     /// `toMap` maps each Dart member onto its verbatim wire key. A send-only field
     /// is omitted (`@receive-only` excludes it from the inverse), and an absent
     /// optional is dropped so it stays off the wire rather than encoding a null.
-    fn generate_to_map(&self, named: &[(String, String, &CsilGroupEntry)]) -> String {
+    fn generate_to_map(
+        &self,
+        named: &[(String, String, &CsilGroupEntry)],
+        aliases: &std::collections::HashMap<String, CsilTypeExpression>,
+    ) -> String {
         let mut out = String::new();
         out.push_str("  Map<String, Object?> toMap() {\n");
         out.push_str("    final map = <String, Object?>{};\n");
@@ -2209,6 +2302,16 @@ impl DartGenerator {
                 continue;
             }
             let wire_lit = dart_string_lit(wire);
+            if dart_text_enum(&entry.value_type, aliases).is_some() {
+                if matches!(entry.occurrence, Some(CsilOccurrence::Optional)) {
+                    out.push_str(&format!(
+                        "    if ({member} != null) map[{wire_lit}] = {member}!.wireValue;\n"
+                    ));
+                } else {
+                    out.push_str(&format!("    map[{wire_lit}] = {member}.wireValue;\n"));
+                }
+                continue;
+            }
             if matches!(entry.occurrence, Some(CsilOccurrence::Optional)) {
                 out.push_str(&dart_if_stmt(
                     4,
@@ -2229,6 +2332,7 @@ impl DartGenerator {
         &self,
         class_name: &str,
         named: &[(String, String, &CsilGroupEntry)],
+        aliases: &std::collections::HashMap<String, CsilTypeExpression>,
     ) -> String {
         let decimal = self.cfg.decimal_dart_type();
         let mut out = String::new();
@@ -2251,7 +2355,16 @@ impl DartGenerator {
                 // casting it would be a redundant (lint-flagged) no-op. `Cast` (not a
                 // bare `Atom`) so a long hoisted/synthesized `ty` still splits the way
                 // `dart format` would rather than overflowing the page width.
-                let value = if ty == "Object?" {
+                let value = if let Some(name) = dart_text_enum(&entry.value_type, aliases) {
+                    let decode = format!("{}.fromWire(map[{wire_lit}])", dart_type_name(name));
+                    DExpr::Atom(
+                        if matches!(entry.occurrence, Some(CsilOccurrence::Optional)) {
+                            format!("map[{wire_lit}] == null ? null : {decode}")
+                        } else {
+                            decode
+                        },
+                    )
+                } else if ty == "Object?" {
                     DExpr::Atom(format!("map[{wire_lit}]"))
                 } else {
                     DExpr::Cast {
@@ -2686,10 +2799,37 @@ impl DartGenerator {
     /// value, since they have no nameable Dart type.
     fn generate_sealed_choice(&self, name: &str, choices: &[CsilTypeExpression]) -> String {
         let base = dart_type_name(name);
-        // A closed string set is a `String` alias, not a one-arm sealed class: the
-        // wire carries the bare string, so a sealed wrapper would never round-trip.
-        if is_string_choice(choices) {
-            return format!("typedef {base} = String;\n\n");
+        if let Some(members) = csilgen_common::text_enum_members(choices) {
+            let numbers = csilgen_common::enum_numbers(choices);
+            let fields = members
+                .iter()
+                .enumerate()
+                .map(|(i, (name, label))| {
+                    let number = numbers
+                        .as_ref()
+                        .map(|ns| format!(", {}", ns[i]))
+                        .unwrap_or_default();
+                    format!(
+                        "  {}({}{number})",
+                        dart_enum_member(name),
+                        dart_string_lit(label)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(",\n");
+            let (param, extra) = if numbers.is_some() {
+                (
+                    ", this.wireNumber",
+                    format!(
+                        "  final int wireNumber;\n\n  static {base} fromNumber(Object? value) {{\n    if (value is int) {{\n      for (final member in values) {{\n        if (member.wireNumber == value) return member;\n      }}\n    }}\n    throw FormatException('unknown {base} number', value);\n  }}\n"
+                    ),
+                )
+            } else {
+                ("", String::new())
+            };
+            return format!(
+                "enum {base} {{\n{fields};\n\n  const {base}(this.wireValue{param});\n  final String wireValue;\n{extra}\n  String toJson() => wireValue;\n\n  static {base} fromWire(Object? value) {{\n    for (final member in values) {{\n      if (member.wireValue == value) return member;\n    }}\n    throw FormatException('unknown {base} value', value);\n  }}\n}}\n\n"
+            );
         }
         // A closed int set is likewise a bare-integer alias (an int enum): the wire
         // carries the integer itself, which is its own discriminant.
@@ -2856,10 +2996,10 @@ impl DartGenerator {
             }
             let method = dart_member_name(&op.name);
             let wire_op = dart_string_lit(&op.name);
-            let out_type = map_type(&success_type(&op.output_type), &None, decimal);
+            let out_type = map_type(&success_type(op.success_output()), &None, decimal);
             let ret = shape.ret(&out_type);
             let out_decode = dart_from_cbor_expr(
-                &success_type(&op.output_type),
+                &success_type(op.success_output()),
                 "CsilCbor.decode(csilResp)",
                 records,
                 decimal,
@@ -2936,7 +3076,7 @@ impl DartGenerator {
             let method = dart_member_name(&op.name);
             match op.direction {
                 CsilServiceDirection::Unidirectional => {
-                    let out_type = map_type(&success_type(&op.output_type), &None, decimal);
+                    let out_type = map_type(&success_type(op.success_output()), &None, decimal);
                     if is_null_input(&op.input_type) {
                         out.push_str(&format!("  {out_type} {method}();\n"));
                     } else {
@@ -3591,6 +3731,7 @@ fn contains_record(
     match ty {
         // A reference is either a record directly, or a transparent alias whose
         // underlying shape (e.g. `M = {* text => SomeRecord}`) may itself carry one.
+        CsilTypeExpression::Reference(_) if dart_text_enum(ty, aliases).is_some() => true,
         CsilTypeExpression::Reference(name) if records.contains(&dart_type_name(name)) => true,
         // A union value is never a shape the CBOR encoder handles by runtime type —
         // it is lowered to a tagged sum — so a list/map of unions must recurse.
@@ -3628,6 +3769,13 @@ fn dart_to_cbor_expr(
     match ty {
         CsilTypeExpression::Constrained { base_type, .. } => {
             dart_to_cbor_expr(base_type, expr, records, aliases, unions)
+        }
+        CsilTypeExpression::Reference(_) if dart_text_enum(ty, aliases).is_some() => {
+            let numeric = dart_text_enum(ty, aliases).and_then(|name| aliases.get(name)).is_some_and(|t| matches!(t, CsilTypeExpression::Choice(arms) if csilgen_common::enum_numbers(arms).is_some()));
+            DExpr::Atom(format!(
+                "{expr}.{}",
+                if numeric { "wireNumber" } else { "wireValue" }
+            ))
         }
         CsilTypeExpression::Reference(name) if records.contains(&dart_type_name(name)) => {
             DExpr::Atom(format!("{expr}.toCborValue()"))
@@ -3781,6 +3929,21 @@ fn dart_from_cbor_expr(
             "decimal" => format!("{expr} as {decimal}"),
             _ => expr.to_string(),
         }),
+        CsilTypeExpression::Reference(name) if dart_text_enum(ty, aliases).is_some() => {
+            DExpr::Call {
+                callee: format!(
+                    "{}.{}",
+                    dart_type_name(name),
+                    if matches!(aliases.get(name), Some(CsilTypeExpression::Choice(arms)) if csilgen_common::enum_numbers(arms).is_some())
+                    {
+                        "fromNumber"
+                    } else {
+                        "fromWire"
+                    }
+                ),
+                args: vec![DExpr::Atom(expr.into())],
+            }
+        }
         CsilTypeExpression::Reference(name) if records.contains(&dart_type_name(name)) => {
             DExpr::Call {
                 callee: format!("{}.fromCborValue", dart_type_name(name)),
@@ -4335,7 +4498,15 @@ class CsilCbor {
 
   static _CsilRead _readArg(Uint8List b, int pos, int low) {
     if (low < 24) return _CsilRead(low, pos + 1);
-    final width = low == 24 ? 1 : low == 25 ? 2 : low == 26 ? 4 : low == 27 ? 8 : 0;
+    final width = low == 24
+        ? 1
+        : low == 25
+        ? 2
+        : low == 26
+        ? 4
+        : low == 27
+        ? 8
+        : 0;
     if (width == 0 || pos >= b.length || b.length - pos - 1 < width) {
       throw ArgumentError('CsilCbor: truncated argument');
     }
@@ -4360,7 +4531,8 @@ class CsilCbor {
 
   static _CsilDecoded _dec(Uint8List b, int pos, int depth) {
     if (depth > 64) throw ArgumentError('CsilCbor: nesting limit exceeded');
-    if (pos >= b.length) throw ArgumentError('CsilCbor: unexpected end of input');
+    if (pos >= b.length)
+      throw ArgumentError('CsilCbor: unexpected end of input');
     final ib = b[pos];
     final major = ib >> 5;
     final low = ib & 0x1f;
@@ -4369,12 +4541,14 @@ class CsilCbor {
       if (low == 21) return _CsilDecoded(true, pos + 1);
       if (low == 22 || low == 23) return _CsilDecoded(null, pos + 1);
       if (low == 26) {
-        if (b.length - pos < 5) throw ArgumentError('CsilCbor: truncated float');
+        if (b.length - pos < 5)
+          throw ArgumentError('CsilCbor: truncated float');
         final bd = ByteData.sublistView(b, pos + 1, pos + 5);
         return _CsilDecoded(bd.getFloat32(0, Endian.big), pos + 5);
       }
       if (low == 27) {
-        if (b.length - pos < 9) throw ArgumentError('CsilCbor: truncated float');
+        if (b.length - pos < 9)
+          throw ArgumentError('CsilCbor: truncated float');
         final bd = ByteData.sublistView(b, pos + 1, pos + 9);
         return _CsilDecoded(bd.getFloat64(0, Endian.big), pos + 9);
       }
@@ -4389,13 +4563,16 @@ class CsilCbor {
       case 1:
         return _CsilDecoded(-1 - arg, p);
       case 2:
-        if (arg > b.length - p) throw ArgumentError('CsilCbor: truncated byte string');
+        if (arg > b.length - p)
+          throw ArgumentError('CsilCbor: truncated byte string');
         return _CsilDecoded(Uint8List.sublistView(b, p, p + arg), p + arg);
       case 3:
-        if (arg > b.length - p) throw ArgumentError('CsilCbor: truncated text string');
+        if (arg > b.length - p)
+          throw ArgumentError('CsilCbor: truncated text string');
         return _CsilDecoded(utf8.decode(b.sublist(p, p + arg)), p + arg);
       case 4:
-        if (arg > b.length - p) throw ArgumentError('CsilCbor: array length exceeds remaining input');
+        if (arg > b.length - p)
+          throw ArgumentError('CsilCbor: array length exceeds remaining input');
         final list = <Object?>[];
         var off4 = p;
         for (var i = 0; i < arg; i++) {
@@ -4405,7 +4582,8 @@ class CsilCbor {
         }
         return _CsilDecoded(list, off4);
       case 5:
-        if (arg > b.length - p) throw ArgumentError('CsilCbor: map length exceeds remaining input');
+        if (arg > b.length - p)
+          throw ArgumentError('CsilCbor: map length exceeds remaining input');
         final map = <Object?, Object?>{};
         var off5 = p;
         for (var i = 0; i < arg; i++) {

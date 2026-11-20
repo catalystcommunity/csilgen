@@ -40,6 +40,11 @@ impl ImportResolver {
         }
     }
 
+    /// Source files loaded by this resolver, each with its canonical path.
+    pub fn imported_paths(&self) -> impl Iterator<Item = &Path> {
+        self.resolved_cache.keys().map(PathBuf::as_path)
+    }
+
     /// Add a directory to the search paths for import resolution
     pub fn add_search_path(&mut self, path: PathBuf) {
         self.search_paths.push(path);
@@ -55,6 +60,7 @@ impl ImportResolver {
     pub fn resolve_imports(&mut self, spec: &mut CsilSpec, base_path: &Path) -> Result<()> {
         self.resolve_imports_uncollapsed(spec, base_path)?;
         crate::ast::merge_type_choice_extensions(&mut spec.rules, true);
+        crate::ast::resolve_number_groups(&mut spec.rules, true)?;
         Ok(())
     }
 
@@ -189,6 +195,18 @@ impl ImportResolver {
             }
 
             let mut rule = rule;
+            // Qualify references to siblings when the whole imported namespace moves.
+            if let Some(alias) = alias {
+                rule.rule_type.visit_types_mut(&mut |ty| {
+                    if let crate::ast::TypeExpression::Reference(name)
+                    | crate::ast::TypeExpression::NamedNumberGroup(name, _) = ty
+                        && imported_origins.contains_key(name)
+                    {
+                        *name = format!("{alias}.{name}");
+                    }
+                    Ok(())
+                })?;
+            }
             rule.name = final_name.clone();
             spec.rules.push(rule);
             origins.insert(final_name, origin);

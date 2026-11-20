@@ -753,12 +753,7 @@ final class HttpRpcCarrier implements Transport {
         if (te != null) {
             throw new ClientException("csil-rpc " + service + "/" + op + ": " + te.getMessage(), te);
         }
-        // A typed application error rides as a status-0 "ServiceError" variant; surface it
-        // so the typed client decodes success only.
-        if ("ServiceError".equals(decoded.variant())) {
-            throw new ClientException("csil-rpc " + service + "/" + op + ": ServiceError");
-        }
-        return decoded.payload();
+        return CsilCbor.resolveRpcReply(service, op, decoded.variant(), decoded.payload());
     }
 }
 "#;
@@ -791,7 +786,7 @@ fn first_unary_example(input: &WasmGeneratorInput) -> Option<UnaryExample> {
             if !matches!(op.direction, CsilServiceDirection::Unidirectional) {
                 continue;
             }
-            let success = success_type(&op.output_type);
+            let success = success_type(op.success_output());
             let null_input = is_null_input(&op.input_type);
             if !is_record_ref(&success, &records)
                 || !(null_input || is_record_ref(&op.input_type, &records))
@@ -849,7 +844,7 @@ fn first_channel_example(input: &WasmGeneratorInput) -> Option<ChannelExample> {
             if !matches!(op.direction, CsilServiceDirection::Bidirectional) {
                 continue;
             }
-            let success = success_type(&op.output_type);
+            let success = success_type(op.success_output());
             if !is_record_ref(&op.input_type, &records) || !is_record_ref(&success, &records) {
                 continue;
             }
@@ -880,7 +875,7 @@ fn java_handler_stub_methods(def: &CsilServiceDefinition) -> String {
         let camel = op.name.to_case(Case::Camel);
         match op.direction {
             CsilServiceDirection::Unidirectional => {
-                let output = map_type_boxed(&success_type(&op.output_type));
+                let output = map_type_boxed(&success_type(op.success_output()));
                 if is_null_input(&op.input_type) {
                     out.push_str(&format!(
                         "        @Override\n        public {output} {camel}() {{\n            throw new UnsupportedOperationException();\n        }}\n"
@@ -1006,6 +1001,7 @@ fn generate_java(input: &WasmGeneratorInput) -> Result<Vec<GeneratedFile>, i32> 
                 hoist_all_literal_choices: false,
             },
         );
+        cloned.csil_spec.supply_implicit_service_error();
         cloned
     };
     let input = &hoisted;
@@ -1019,6 +1015,25 @@ fn generate_java(input: &WasmGeneratorInput) -> Result<Vec<GeneratedFile>, i32> 
             }
             CsilRuleType::TypeDef(CsilTypeExpression::Group(group)) => {
                 files.push(generate_record(&config, &rule.name, group, doc));
+            }
+            CsilRuleType::TypeDef(CsilTypeExpression::Choice(arms))
+            | CsilRuleType::TypeChoice(arms)
+                if csilgen_common::text_enum_members(arms).is_some() =>
+            {
+                let class = rule.name.to_case(Case::Pascal);
+                let mut code = config.header();
+                code.push_str(&javadoc("", &clean_doc(doc), &[]));
+                let members = csilgen_common::text_enum_members(arms)
+                    .unwrap()
+                    .iter()
+                    .map(|(name, wire)| format!("    {name}({})", java_string(wire)))
+                    .collect::<Vec<_>>()
+                    .join(",\n");
+                code.push_str(&format!("public enum {class} {{\n{members};\n\n    private final String value;\n\n    {class}(String value) {{ this.value = value; }}\n\n    public String value() {{ return value; }}\n\n    public static {class} fromWire(String value) {{\n        for ({class} member : values()) {{\n            if (member.value.equals(value)) return member;\n        }}\n        throw new IllegalArgumentException(\"unknown {class} value: \" + value);\n    }}\n}}\n"));
+                files.push(GeneratedFile {
+                    path: config.path_for(&class),
+                    content: code,
+                });
             }
             CsilRuleType::TypeDef(type_expr) => {
                 files.push(generate_alias(&config, &rule.name, type_expr, doc));
@@ -2226,6 +2241,26 @@ fn emit_choice_codec(
     // `choice_arm_literal` (imported above) already sees through a `.default`-suffixed
     // arm's `Constrained` wrapper, so a closed enum's last arm is still recognized here.
     match csilgen_common::classify_choice(choices) {
+        ChoiceClass::Enum(_) if csilgen_common::enum_numbers(choices).is_some() => {
+            let numbers = csilgen_common::enum_numbers(choices).unwrap();
+            let members = csilgen_common::text_enum_members(choices).unwrap();
+            let mut code = format!(
+                "    static CborValue enc{class}({class} v) {{\n        return new CborInt(switch (v) {{\n"
+            );
+            for ((member, _), n) in members.iter().zip(&numbers) {
+                code.push_str(&format!("            case {member} -> {n}L;\n"));
+            }
+            code.push_str(&format!("        }});\n    }}\n\n    static {class} dec{class}(CborValue root) {{\n        long n = asI64(root);\n"));
+            for ((member, _), n) in members.iter().zip(&numbers) {
+                code.push_str(&format!(
+                    "        if (n == {n}L) return {class}.{member};\n"
+                ));
+            }
+            code.push_str(&format!(
+                "        throw new CsilCborException(\"unknown {class} number\");\n    }}\n\n"
+            ));
+            code
+        }
         ChoiceClass::Enum(literals) => emit_enum_codec(&class, &literals),
         ChoiceClass::Union(_) => {
             // Union (>=1 non-literal arm): the locked tagged sum. A single non-literal
@@ -2274,6 +2309,11 @@ fn emit_enum_codec(class: &str, literals: &[&CsilLiteralValue]) -> String {
 /// single `CborXxx` wrapper on encode and a single `asXxx` reader on decode, with
 /// membership validated against the (necessarily uniform-kind) full literal list.
 fn emit_uniform_enum_codec(class: &str, kind: &str, literals: &[&CsilLiteralValue]) -> String {
+    if kind == "text" {
+        return format!(
+            "    static CborValue enc{class}({class} v) {{\n        return new CborText(v.value());\n    }}\n\n    static {class} dec{class}(CborValue root) {{\n        try {{\n            return {class}.fromWire(asText(root));\n        }} catch (IllegalArgumentException e) {{\n            throw new CsilCborException(e.getMessage());\n        }}\n    }}\n\n"
+        );
+    }
     let (enc, read) = match kind {
         "int" => (
             "new CborInt((Long) v.value())".to_string(),
@@ -2582,7 +2622,7 @@ fn emit_op_codecs(
             if !matches!(op.direction, CsilServiceDirection::Unidirectional) {
                 continue;
             }
-            let success = success_type(&op.output_type);
+            let success = success_type(op.success_output());
             let null_input = is_null_input(&op.input_type);
             let req_ok = null_input
                 || java_op_boundary_expressible(&op.input_type, records, aliases, choices);
@@ -2636,7 +2676,7 @@ fn emit_op_codec_pair(
 
 fn generate_codec(input: &WasmGeneratorInput, config: &JavaConfig) -> Option<GeneratedFile> {
     let records = record_names(input);
-    if records.is_empty() {
+    if records.is_empty() && input.csil_spec.rpc_operations().next().is_none() {
         return None;
     }
     let aliases = codec_aliases(input);
@@ -2665,6 +2705,52 @@ fn generate_codec(input: &WasmGeneratorInput, config: &JavaConfig) -> Option<Gen
     // Per-op byte helpers for non-record op boundaries, so the client and a
     // consumer-side server share one codec surface for every op, not just record↔record.
     body.push_str(&emit_op_codecs(input, &records, &aliases, &choices));
+    {
+        let mut emitted = std::collections::BTreeSet::new();
+        let mut resolve = String::from(
+            "    public static byte[] resolveRpcReply(String service, String op, String variant, byte[] payload) {\n",
+        );
+        body.push_str("    public record RpcReply(String variant, byte[] payload) {}\n\n");
+        for (service, op, arms) in input.csil_spec.rpc_operations() {
+            let method = &op.name;
+            let stem = op_codec_stem(service, op);
+            let success = map_type_boxed(&arms[0]);
+            let mut encode = format!(
+                "    public static RpcReply encode{stem}Reply(java.util.function.Supplier<{success}> handler) {{\n        try {{\n            {success} value = handler.get();\n"
+            );
+            resolve.push_str(&format!(
+                "        if (\"{service}\".equals(service) && \"{method}\".equals(op)) {{\n"
+            ));
+            for (i, arm) in arms.iter().enumerate() {
+                let wire = arm.rpc_variant_name().unwrap();
+                let ty = map_type_boxed(arm);
+                let exception = format!("{}Refusal", pascal_op_name(wire));
+                let source = if i == 0 { "value" } else { "refusal.value" };
+                let enc = java_enc_value(arm, source, &records, &aliases, &choices, 0);
+                if i == 0 {
+                    encode.push_str(&format!(
+                        "            return new RpcReply(\"{wire}\", encode({enc}));\n"
+                    ));
+                    resolve.push_str(&format!(
+                        "            if (\"{wire}\".equals(variant)) return payload;\n"
+                    ));
+                } else {
+                    let dec =
+                        java_dec_value(arm, "decode(payload)", &records, &aliases, &choices, 0);
+                    if emitted.insert(exception.clone()) {
+                        body.push_str(&format!("    public static final class {exception} extends RuntimeException {{\n        private static final long serialVersionUID = 1L;\n        public final {ty} value;\n\n        public {exception}({ty} value) {{\n            super(\"{wire}\");\n            this.value = value;\n        }}\n    }}\n\n"));
+                    }
+                    encode.push_str(&format!("        }} catch ({exception} refusal) {{\n            return new RpcReply(\"{wire}\", encode({enc}));\n"));
+                    resolve.push_str(&format!("            if (\"{wire}\".equals(variant)) throw new {exception}({dec});\n"));
+                }
+            }
+            encode.push_str("        }\n    }\n\n");
+            body.push_str(&encode);
+            resolve.push_str("            throw new CsilCborException(\"invalid RPC reply variant: \" + variant);\n        }\n");
+        }
+        resolve.push_str("        return payload;\n    }\n");
+        body.push_str(&resolve);
+    }
 
     let mut code = config.header();
     code.push_str("/**\n");
@@ -2790,7 +2876,7 @@ fn generate_client(
         if !matches!(op.direction, CsilServiceDirection::Unidirectional) {
             continue;
         }
-        let success = success_type(&op.output_type);
+        let success = success_type(op.success_output());
         let null_input = is_null_input(&op.input_type);
         let req_ok =
             null_input || java_op_boundary_expressible(&op.input_type, records, aliases, choices);
@@ -2924,7 +3010,7 @@ fn generate_server_interface(
         let camel = op.name.to_case(Case::Camel);
         let method = match op.direction {
             CsilServiceDirection::Unidirectional => {
-                let output = map_type_boxed(&success_type(&op.output_type));
+                let output = map_type_boxed(&success_type(op.success_output()));
                 let params = if is_null_input(&op.input_type) {
                     String::new()
                 } else {
@@ -5048,27 +5134,9 @@ public final class Driver {
             &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),
         );
-        assert!(out.contains(
-            "static CborValue encColor(Color v) {\n        return new CborText((String) v.value());\n    }"
-        ));
-        // Decode reads the bare literal AND validates it against the declared set —
-        // an arbitrary string must not silently become a `Color` (see
-        // `enum_decode_rejects_out_of_set_value` for the compiled, run proof).
-        assert!(
-            out.contains("var csilVal = asText(csilRoot);"),
-            "got:\n{out}"
-        );
-        assert!(
-            out.contains("java.util.Objects.equals(csilVal, \"red\")")
-                && out.contains("java.util.Objects.equals(csilVal, \"green\")")
-                && out.contains("java.util.Objects.equals(csilVal, \"blue\")"),
-            "got:\n{out}"
-        );
-        assert!(
-            out.contains("throw new CsilCborException(\"csil cbor: Color value \" + csilVal + \" is not a member of the declared enum\");"),
-            "got:\n{out}"
-        );
-        assert!(out.contains("return new Color(csilVal);"), "got:\n{out}");
+        assert!(out.contains("new CborText(v.value())"));
+        assert!(out.contains("Color.fromWire(asText(root))"));
+        assert!(out.contains("throw new CsilCborException(e.getMessage())"));
         assert!(!out.contains("CborArray"));
     }
 
@@ -5660,7 +5728,7 @@ public final class MixedKindEnumDriver {
             &std::collections::HashMap::new(),
         );
         assert!(out.contains(
-            "static CborValue encSize(Size v) {\n        return new CborText((String) v.value());\n    }"
+            "static CborValue encSize(Size v) {\n        return new CborText(v.value());\n    }"
         ));
         assert!(
             !out.contains("CborArray"),
@@ -6342,7 +6410,9 @@ public final class PomCheck {
         );
         assert!(c.contains("/csil/v1/rpc"), "posts to the path");
         assert!(
-            c.contains("\"ServiceError\".equals(decoded.variant())"),
+            c.contains(
+                "CsilCbor.resolveRpcReply(service, op, decoded.variant(), decoded.payload())"
+            ),
             "typed ServiceError arm handled"
         );
         assert!(

@@ -203,6 +203,141 @@ pub(crate) fn merge_type_choice_extensions(rules: &mut Vec<Rule>, collapse_orpha
     }
 }
 
+pub(crate) fn named_number_members(entries: &[GroupEntry]) -> Result<Vec<(String, i64)>, String> {
+    let mut members = Vec::new();
+    let mut names = std::collections::HashSet::new();
+    let mut numbers = std::collections::HashSet::new();
+    for entry in entries {
+        let (
+            Some(GroupKey::Bare(name)),
+            TypeExpression::Literal(LiteralValue::Integer(number)),
+            None,
+        ) = (&entry.key, &entry.value_type, &entry.occurrence)
+        else {
+            return Err("a named integer member (name: number)".into());
+        };
+        if !names.insert(name) || !numbers.insert(number) {
+            return Err(format!("a unique name and number for enum member {name}"));
+        }
+        members.push((name.clone(), *number));
+    }
+    if members.is_empty() {
+        return Err("at least one named integer member".into());
+    }
+    Ok(members)
+}
+
+/// Resolve group-to-choice references after local rules or all imports are available.
+pub(crate) fn resolve_number_groups(rules: &mut [Rule], require_all: bool) -> anyhow::Result<()> {
+    // Groups may appear after their users. Keep lookup errors until a declaration uses the group.
+    let groups: std::collections::HashMap<_, _> = rules
+        .iter()
+        .filter_map(|rule| match &rule.rule_type {
+            RuleType::GroupDef(group) | RuleType::TypeDef(TypeExpression::Group(group)) => {
+                Some((rule.name.clone(), named_number_members(&group.entries)))
+            }
+            _ => None,
+        })
+        .collect();
+    for rule in rules {
+        rule.rule_type.visit_types_mut(&mut |ty| {
+            if let TypeExpression::NamedNumberGroup(name, values) = ty {
+                match groups.get(name) {
+                    Some(Ok(members)) => values.clone_from(members),
+                    Some(Err(message)) => {
+                        anyhow::bail!("invalid named-number group {name}: expected {message}")
+                    }
+                    None if require_all && values.is_empty() => {
+                        anyhow::bail!("unknown named-number group {name}")
+                    }
+                    None => {}
+                }
+            }
+            Ok(())
+        })?;
+    }
+    Ok(())
+}
+
+impl RuleType {
+    pub(crate) fn visit_types_mut(
+        &mut self,
+        visit: &mut impl FnMut(&mut TypeExpression) -> anyhow::Result<()>,
+    ) -> anyhow::Result<()> {
+        match self {
+            Self::TypeDef(ty) => ty.visit_types_mut(visit)?,
+            Self::GroupDef(group) => group.visit_types_mut(visit)?,
+            Self::GroupChoice(groups) => {
+                for group in groups {
+                    group.visit_types_mut(visit)?;
+                }
+            }
+            Self::TypeChoice(arms) => {
+                for arm in arms {
+                    arm.visit_types_mut(visit)?;
+                }
+            }
+            Self::ServiceDef(service) => {
+                for op in &mut service.operations {
+                    op.input_type.visit_types_mut(visit)?;
+                    op.output_type.visit_types_mut(visit)?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+impl GroupExpression {
+    fn visit_types_mut(
+        &mut self,
+        visit: &mut impl FnMut(&mut TypeExpression) -> anyhow::Result<()>,
+    ) -> anyhow::Result<()> {
+        for entry in &mut self.entries {
+            if let Some(GroupKey::Type(key)) = &mut entry.key {
+                key.visit_types_mut(visit)?;
+            }
+            entry.value_type.visit_types_mut(visit)?;
+        }
+        Ok(())
+    }
+}
+
+impl TypeExpression {
+    fn visit_types_mut(
+        &mut self,
+        visit: &mut impl FnMut(&mut TypeExpression) -> anyhow::Result<()>,
+    ) -> anyhow::Result<()> {
+        visit(self)?;
+        match self {
+            Self::Group(group) | Self::Tuple(group) => group.visit_types_mut(visit)?,
+            Self::Map { key, value, .. } => {
+                key.visit_types_mut(visit)?;
+                value.visit_types_mut(visit)?;
+            }
+            Self::Constrained {
+                base_type,
+                constraints,
+            } => {
+                base_type.visit_types_mut(visit)?;
+                for op in constraints {
+                    if let ControlOperator::And(ty) | ControlOperator::Within(ty) = op {
+                        ty.visit_types_mut(visit)?;
+                    }
+                }
+            }
+            Self::Array { element_type, .. } => element_type.visit_types_mut(visit)?,
+            Self::Choice(arms) => {
+                for arm in arms {
+                    arm.visit_types_mut(visit)?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+}
+
 /// CSIL type expressions
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum TypeExpression {
@@ -228,6 +363,10 @@ pub enum TypeExpression {
     Group(GroupExpression),
     /// Choice between types (type1 / type2 / type3)
     Choice(Vec<TypeExpression>),
+    /// CDDL group enumeration with explicit integer values.
+    NamedNumbers(Vec<(String, i64)>),
+    /// A CDDL group-to-choice reference with its resolved integer members.
+    NamedNumberGroup(String, Vec<(String, i64)>),
     /// Range expression
     Range {
         start: Option<i64>,

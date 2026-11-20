@@ -27,6 +27,17 @@ final class Bytes
     }
 }
 
+/** Explicit map entries preserve the CBOR key type, including dense integer keys. */
+final class MapEntries
+{
+    public $entries;
+
+    public function __construct(array $entries)
+    {
+        $this->entries = $entries;
+    }
+}
+
 final class CBOR
 {
     public static function encode($value)
@@ -44,6 +55,12 @@ final class CBOR
         } elseif ($value instanceof Tag) {
             self::head($out, 6, $value->tag);
             self::encodeInto($out, $value->value);
+        } elseif ($value instanceof MapEntries) {
+            $items = array();
+            foreach ($value->entries as $entry) {
+                $items[] = array(self::encode($entry[0]), $entry[1]);
+            }
+            self::writeMap($out, $items);
         } elseif (is_int($value)) {
             if ($value < 0) {
                 self::head($out, 1, -1 - $value);
@@ -68,17 +85,27 @@ final class CBOR
                 foreach ($value as $k => $v) {
                     $items[] = array(self::encode((string) $k), $v);
                 }
-                usort($items, function ($a, $b) {
-                    return strcmp($a[0], $b[0]);
-                });
-                self::head($out, 5, count($items));
-                foreach ($items as $item) {
-                    $out .= $item[0];
-                    self::encodeInto($out, $item[1]);
-                }
+                self::writeMap($out, $items);
             }
         } else {
             throw new CborException('cannot encode value of type ' . gettype($value));
+        }
+    }
+
+    public static function mapEntries(array $entries)
+    {
+        return new MapEntries($entries);
+    }
+
+    private static function writeMap(&$out, array $items)
+    {
+        usort($items, function ($a, $b) {
+            return strcmp($a[0], $b[0]);
+        });
+        self::head($out, 5, count($items));
+        foreach ($items as $item) {
+            $out .= $item[0];
+            self::encodeInto($out, $item[1]);
         }
     }
 

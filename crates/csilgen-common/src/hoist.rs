@@ -57,6 +57,15 @@ pub fn hoist_inline_composites(
     spec: &CsilSpecSerialized,
     options: HoistOptions,
 ) -> CsilSpecSerialized {
+    hoist(spec, Some(options))
+}
+
+/// Name inline CDDL integer enums for targets that implement other inline shapes directly.
+pub fn hoist_inline_named_numbers(spec: &CsilSpecSerialized) -> CsilSpecSerialized {
+    hoist(spec, None)
+}
+
+fn hoist(spec: &CsilSpecSerialized, options: Option<HoistOptions>) -> CsilSpecSerialized {
     let mut hoister = Hoister {
         synth: Vec::new(),
         // Reserve a case-insensitive, separator-stripped canonical key for every
@@ -103,12 +112,13 @@ enum HoistKind<'a> {
 /// LOOK PAST it when deciding hoistability — `rewrite_type` re-wraps the
 /// synthesized `Reference` in the exact same wrapper via `wrap_constrained`, so
 /// the constraint is never dropped).
-fn hoist_kind(ty: &CsilTypeExpression, options: HoistOptions) -> Option<HoistKind<'_>> {
+fn hoist_kind(ty: &CsilTypeExpression, options: Option<HoistOptions>) -> Option<HoistKind<'_>> {
     match ty {
         CsilTypeExpression::Constrained { base_type, .. } => hoist_kind(base_type, options),
-        CsilTypeExpression::Group(g) => Some(HoistKind::Group(g)),
+        CsilTypeExpression::Group(g) if options.is_some() => Some(HoistKind::Group(g)),
         CsilTypeExpression::Choice(arms)
-            if options.hoist_all_literal_choices || !all_literal(arms) =>
+            if crate::enum_numbers(arms).is_some()
+                || options.is_some_and(|o| o.hoist_all_literal_choices || !all_literal(arms)) =>
         {
             Some(HoistKind::Choice(arms))
         }
@@ -152,7 +162,7 @@ fn entry_suffix(entry: &CsilGroupEntry, index: usize) -> String {
 struct Hoister {
     synth: Vec<CsilRule>,
     used: HashSet<String>,
-    options: HoistOptions,
+    options: Option<HoistOptions>,
 }
 
 impl Hoister {
@@ -176,10 +186,19 @@ impl Hoister {
                     .map(|(i, g)| self.rewrite_group(g, &format!("{}_{i}", rule.name)))
                     .collect(),
             ),
-            // Service op signatures are left untouched: an operation's `Res / Error`
-            // output is a choice that the client/server emitters strip specially
-            // (dropping `/ ServiceError`), so hoisting it here would corrupt that path.
-            CsilRuleType::ServiceDef(def) => CsilRuleType::ServiceDef(def.clone()),
+            CsilRuleType::ServiceDef(def) => {
+                // Only name numeric enums here. The RPC generator owns the outer reply choice.
+                let original = self.options.take();
+                let mut service = def.clone();
+                for op in &mut service.operations {
+                    let owner = format!("{}_{}", rule.name, op.name.replace('-', "_"));
+                    op.input_type = self.rewrite_type(&op.input_type, &format!("{owner}_request"));
+                    op.output_type =
+                        self.rewrite_type(&op.output_type, &format!("{owner}_response"));
+                }
+                self.options = original;
+                CsilRuleType::ServiceDef(service)
+            }
         };
         CsilRule {
             name: rule.name.clone(),

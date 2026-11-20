@@ -1,0 +1,13 @@
+Req = { a: text }
+Resp = { b: text }
+Other = { c: int }
+RefusalCode = &(busy: 7, denied: 42)
+Limit = { code: RefusalCode }
+Retry = { delay: int }
+Reply = Resp / Other
+
+service Api {
+    submit: Req -> Resp / Limit / Retry,
+    fetch: Req -> Reply,
+    poll: Req -> Reply / Retry
+}

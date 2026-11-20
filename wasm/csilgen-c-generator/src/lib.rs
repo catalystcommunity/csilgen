@@ -476,7 +476,7 @@ fn generate_types(input: &WasmGeneratorInput, config: &CConfig) -> Option<String
         .iter()
         .filter_map(|r| classify_rule(&r.rule_type).map(|k| (r.name.clone(), k)))
         .collect();
-    if typed.is_empty() {
+    if typed.is_empty() && input.csil_spec.rpc_operations().next().is_none() {
         return None;
     }
     // Only a Struct/Union/GroupUnion/MixedEnum kind ever joins `order`/`deps`/`defs`
@@ -512,7 +512,28 @@ fn generate_types(input: &WasmGeneratorInput, config: &CConfig) -> Option<String
 
     for (name, kind) in &typed {
         match kind {
-            TypeKind::Enum(variants) => emit_enum(&mut enums, name, variants),
+            TypeKind::Enum(variants) => {
+                emit_enum(&mut enums, name, variants);
+                if input
+                    .csil_spec
+                    .rules
+                    .iter()
+                    .find(|r| r.name == *name)
+                    .and_then(csilgen_common::rule_enum_numbers)
+                    .is_some()
+                {
+                    enums.push_str(&format!("static inline const char *csil_{name}_label({name} value) {{\n    switch (value) {{\n"));
+                    for label in variants {
+                        enums.push_str(&format!(
+                            "    case {}_{}: return \"{}\";\n",
+                            to_upper_snake(name),
+                            to_upper_snake(label),
+                            c_escape(label)
+                        ));
+                    }
+                    enums.push_str("    default: return (const char *)0;\n    }\n}\n\n");
+                }
+            }
             TypeKind::IntEnum(values) => emit_int_enum(&mut enums, name, values),
             TypeKind::Alias(t) => match unwrap_constrained(t) {
                 // A named map alias (`StringInt64Map = {* text => int}`) gets a real
@@ -650,6 +671,21 @@ fn generate_types(input: &WasmGeneratorInput, config: &CConfig) -> Option<String
     }
     content.push_str(&aliases);
     content.push_str(&definitions);
+    for (service, op, arms) in input.csil_spec.rpc_operations() {
+        let reply = rpc_reply_type(service, op);
+        content.push_str(&format!("typedef struct {reply} {{\n    enum {{\n"));
+        for arm in arms {
+            let tag = format!("as_{}", to_snake(arm.rpc_variant_name().unwrap()));
+            content.push_str(&format!("        {reply}_{tag},\n"));
+        }
+        content.push_str("    } kind;\n    union {\n");
+        for arm in arms {
+            let tag = format!("as_{}", to_snake(arm.rpc_variant_name().unwrap()));
+            let field = declarator(&base_c_type(arm, config), 0, &tag);
+            content.push_str(&format!("        {field};\n"));
+        }
+        content.push_str(&format!("    }} value;\n}} {reply};\n\n"));
+    }
     header_close(&mut content, "CSILGEN_TYPES_GEN_H");
     Some(content)
 }
@@ -2437,7 +2473,29 @@ fn generate_codec(
                 decls.push_str(&format!(
                     "static inline int csilc_dec_{name}(const csilc_value *src, CsilCodecArena *a, {name} *out);\n"
                 ));
-                emit_enum_codec(&mut bodies, name, variants);
+                if let Some(numbers) = input
+                    .csil_spec
+                    .rules
+                    .iter()
+                    .find(|r| r.name == *name)
+                    .and_then(csilgen_common::rule_enum_numbers)
+                {
+                    bodies.push_str(&format!("static inline int csilc_enc_{name}(csilc_buf *b, const {name} *v) {{\n    switch (*v) {{\n"));
+                    for (index, n) in numbers.iter().enumerate() {
+                        bodies
+                            .push_str(&format!("    case {index}: return csilc_w_int(b, {n});\n"));
+                    }
+                    bodies.push_str("    default: return -1;\n    }\n}\n\n");
+                    bodies.push_str(&format!("static inline int csilc_dec_{name}(const csilc_value *src, CsilCodecArena *a, {name} *out) {{\n    (void)a;\n    int64_t number;\n    if (!csilc_as_i64(src, &number)) return -1;\n    switch (number) {{\n"));
+                    for (index, n) in numbers.iter().enumerate() {
+                        bodies.push_str(&format!(
+                            "    case {n}: *out = ({name}){index}; return 0;\n"
+                        ));
+                    }
+                    bodies.push_str("    default: return -1;\n    }\n}\n\n");
+                } else {
+                    emit_enum_codec(&mut bodies, name, variants);
+                }
             }
             TypeKind::IntEnum(values) => {
                 decls.push_str(&format!(
@@ -2527,8 +2585,11 @@ fn generate_codec(
             if !matches!(op.direction, CsilServiceDirection::Unidirectional) {
                 continue;
             }
-            let success = success_type(&op.output_type);
-            for ty in [&op.input_type, &success] {
+            let success = success_type(op.success_output());
+            for ty in std::iter::once(&op.input_type).chain(
+                op.rpc_reply_arms()
+                    .unwrap_or(std::slice::from_ref(&success)),
+            ) {
                 let boundary = classify_boundary(ty, &codec_names, config);
                 let Some(synth) = boundary.synth else {
                     continue;
@@ -2599,6 +2660,25 @@ fn generate_codec(
     content.push_str(&synth_bodies);
     content.push_str(&public);
     content.push_str(&synth_public);
+    for (service, op, arms) in input.csil_spec.rpc_operations() {
+        let reply = rpc_reply_type(service, op);
+        content.push_str(&format!("static inline int csil_encode_{reply}(const {reply} *reply, const char **variant, uint8_t **payload, size_t *len) {{\n    switch (reply->kind) {{\n"));
+        for arm in arms {
+            let wire = arm.rpc_variant_name().unwrap();
+            let field = format!("as_{}", to_snake(wire));
+            let codec = classify_boundary(arm, &codec_names, config).codec_name;
+            content.push_str(&format!("    case {reply}_{field}:\n        *variant = \"{wire}\";\n        return csil_encode_{codec}(&reply->value.{field}, payload, len);\n"));
+        }
+        content.push_str("    }\n    return -1;\n}\n\n");
+        content.push_str(&format!("static inline int csil_decode_{reply}(const char *variant, const uint8_t *payload, size_t len, {reply} *reply, CsilCodecArena **owner) {{\n    if (!variant) return -1;\n"));
+        for arm in arms {
+            let wire = arm.rpc_variant_name().unwrap();
+            let field = format!("as_{}", to_snake(wire));
+            let codec = classify_boundary(arm, &codec_names, config).codec_name;
+            content.push_str(&format!("    if (strcmp(variant, \"{wire}\") == 0) {{\n        reply->kind = {reply}_{field};\n        return csil_decode_{codec}(payload, len, &reply->value.{field}, owner);\n    }}\n"));
+        }
+        content.push_str("    return -1;\n}\n\n");
+    }
     header_close(&mut content, "CSILGEN_CODEC_GEN_H");
     Some(content)
 }
@@ -2814,6 +2894,10 @@ typedef struct CsilgenTransport {
                 const uint8_t *req, size_t req_len,
                 uint8_t **resp, size_t *resp_len);
     void *self;
+    /* A status-zero reply transfers ownership of its variant and payload to the client. */
+    int (*call_reply)(void *self, const char *service, const char *op,
+                      const uint8_t *req, size_t req_len,
+                      uint8_t **resp, size_t *resp_len, char **variant);
 } CsilgenTransport;
 ";
 
@@ -2874,10 +2958,15 @@ fn emit_client_calls(
         }
         let fn_name = format!("csil_{prefix}_{}", to_snake(&op.name));
         let wire_op = &op.name;
-        let success = success_type(&op.output_type);
+        let success = success_type(op.success_output());
         let resp = classify_boundary(&success, codec_names, config);
         let req = classify_boundary(&op.input_type, codec_names, config);
-        let resp_type = resp.c_type;
+        let typed = op.rpc_reply_arms().is_some();
+        let resp_type = if typed {
+            rpc_reply_type(name, op)
+        } else {
+            resp.c_type
+        };
         let has_input = !req.is_null;
         let req_type = req.c_type;
 
@@ -2904,6 +2993,10 @@ fn emit_client_calls(
             content.push_str("    uint8_t *csil_reqb = NULL;\n    size_t csil_reqn = 0;\n");
         }
         content.push_str("    uint8_t *csil_respb = NULL;\n    size_t csil_respn = 0;\n");
+        if typed {
+            content.push_str(&format!("    char *variant = NULL;\n    int rc = t->call_reply ? t->call_reply(t->self, \"{name}\", \"{wire_op}\", csil_reqb, csil_reqn, &csil_respb, &csil_respn, &variant) : -1;\n    free(csil_reqb);\n    if (!rc) rc = csil_decode_{resp_type}(variant, csil_respb, csil_respn, resp, resp_owner);\n    free(variant);\n    free(csil_respb);\n    return rc;\n}}\n\n"));
+            continue;
+        }
         content.push_str(&format!(
             "    int csil_rc = t->call(t->self, \"{name}\", \"{wire_op}\", csil_reqb, csil_reqn, &csil_respb, &csil_respn);\n"
         ));
@@ -2973,6 +3066,10 @@ fn generate_server(
     Some(content)
 }
 
+fn rpc_reply_type(service: &str, op: &csilgen_common::CsilServiceOperation) -> String {
+    format!("{}{}Reply", simple_pascal(service), simple_pascal(&op.name))
+}
+
 fn emit_handlers_struct(
     content: &mut String,
     name: &str,
@@ -2989,7 +3086,11 @@ fn emit_handlers_struct(
         match op.direction {
             CsilServiceDirection::Unidirectional => {
                 let in_type = op_in_type(&op.input_type, config);
-                let out_type = base_c_type(&success_type(&op.output_type), config);
+                let out_type = if op.rpc_reply_arms().is_some() {
+                    rpc_reply_type(name, op)
+                } else {
+                    base_c_type(op.success_output(), config)
+                };
                 if in_type == "void" {
                     content.push_str(&format!(
                         "    int (*{method})(void *ctx, {out_type} *resp);\n"
@@ -3552,6 +3653,7 @@ fn package_name(input: &WasmGeneratorInput) -> String {
 /// The first service (in declaration order) that has a `->` operation, reduced to
 /// an example call. `None` for a serviceless / types-only package.
 struct CUnaryExample {
+    rpc_reply: Option<String>,
     fn_name: String,
     wire_service: String,
     wire_op: String,
@@ -3583,9 +3685,10 @@ fn first_unary_example(input: &WasmGeneratorInput, config: &CConfig) -> Option<C
         };
         let base = service_base(&rule.name);
         let prefix = to_snake(&base);
-        let success = success_type(&op.output_type);
+        let success = success_type(op.success_output());
         let has_request = !op_input_is_null(&op.input_type);
         return Some(CUnaryExample {
+            rpc_reply: op.rpc_reply_arms().map(|_| rpc_reply_type(&rule.name, op)),
             fn_name: format!("csil_{prefix}_{}", to_snake(&op.name)),
             wire_service: rule.name.clone(),
             wire_op: op.name.clone(),
@@ -3650,7 +3753,7 @@ fn first_channel_example(input: &WasmGeneratorInput, config: &CConfig) -> Option
             if !matches!(op.direction, CsilServiceDirection::Bidirectional) {
                 continue;
             }
-            let success = success_type(&op.output_type);
+            let success = success_type(op.success_output());
             let (Some(inbound), Some(outbound)) = (
                 record_ref_name(input, &op.input_type),
                 record_ref_name(input, &success),
@@ -3858,10 +3961,10 @@ fn rpc_section(ex: Option<&CUnaryExample>) -> String {
     out.push_str("int main(void) {\n");
     out.push_str("    CsilRpcCarrier carrier = { .host = \"127.0.0.1\", .port = \"5080\" };\n");
     out.push_str(
-        "    CsilgenTransport transport = { .call = csil_rpc_call, .self = &carrier };\n\n",
+        "    CsilgenTransport transport = { .call = csil_rpc_call, .self = &carrier, .call_reply = csil_rpc_call_reply };\n\n",
     );
     out.push_str("    CsilCodecArena *owner = NULL;\n");
-    let resp_decl = declarator(&ex.resp_type, 0, "resp");
+    let resp_decl = declarator(ex.rpc_reply.as_ref().unwrap_or(&ex.resp_type), 0, "resp");
     out.push_str(&format!("    {resp_decl};\n"));
     if ex.has_request {
         let req_decl = declarator(&ex.req_type, 0, "req");
@@ -3881,15 +3984,19 @@ fn rpc_section(ex: Option<&CUnaryExample>) -> String {
         ex.wire_service, ex.wire_op
     ));
     out.push_str("        return 1;\n    }\n");
-    match &ex.resp_print_field {
-        Some(field) => out.push_str(&format!(
-            "    printf(\"{}/{} -> %s\\n\", resp.{field});\n",
-            ex.wire_service, ex.wire_op
-        )),
-        None => out.push_str(&format!(
-            "    printf(\"{}/{} ok\\n\");\n",
-            ex.wire_service, ex.wire_op
-        )),
+    if ex.rpc_reply.is_some() {
+        out.push_str("    printf(\"reply kind %d\\n\", (int)resp.kind);\n");
+    } else {
+        match &ex.resp_print_field {
+            Some(field) => out.push_str(&format!(
+                "    printf(\"{}/{} -> %s\\n\", resp.{field});\n",
+                ex.wire_service, ex.wire_op
+            )),
+            None => out.push_str(&format!(
+                "    printf(\"{}/{} ok\\n\");\n",
+                ex.wire_service, ex.wire_op
+            )),
+        }
     }
     out.push_str("    csil_codec_arena_free(owner); // frees everything `resp` borrows\n");
     out.push_str("    return 0;\n}\n");
@@ -4192,9 +4299,9 @@ static int csil_read_all(int fd, uint8_t **out, size_t *out_len) {
 
 // The CsilgenTransport seam: build the CSIL-RPC envelope with the library, POST it, and
 // decode the library's response — never hand-rolling the envelope.
-static int csil_rpc_call(void *self, const char *service, const char *op,
+static int csil_rpc_call_reply(void *self, const char *service, const char *op,
                          const uint8_t *req, size_t req_len,
-                         uint8_t **resp, size_t *resp_len) {
+                         uint8_t **resp, size_t *resp_len, char **variant) {
     CsilRpcCarrier *c = (CsilRpcCarrier *)self;
 
     // 1. Encode the request envelope with the library (tag-24 payload, canonical CBOR).
@@ -4257,17 +4364,16 @@ static int csil_rpc_call(void *self, const char *service, const char *op,
 
     // A non-zero transport status is a transport failure (no typed payload).
     if (csil_rpc_response_is_transport_error(&rsp)) {
+        int status = (int)csil_status_code(rsp.status);
         csil_rpc_response_free(&rsp);
         free(raw);
-        return -1;
+        return status;
     }
-    // A typed application error rides as a status-0 "ServiceError" variant — surface it
-    // so the typed client decodes success only.
-    if (rsp.variant && strcmp(rsp.variant, "ServiceError") == 0) {
-        fprintf(stderr, "csil-rpc %s/%s: service error\n", service, op);
-        csil_rpc_response_free(&rsp);
-        free(raw);
-        return 1;
+    if (variant && rsp.variant) {
+        size_t len = strlen(rsp.variant) + 1;
+        *variant = malloc(len);
+        if (!*variant) { csil_rpc_response_free(&rsp); free(raw); return -1; }
+        memcpy(*variant, rsp.variant, len);
     }
 
     // 5. Hand a malloc'd copy of the success payload to the generated client.
@@ -4279,6 +4385,11 @@ static int csil_rpc_call(void *self, const char *service, const char *op,
     csil_rpc_response_free(&rsp);
     free(raw);
     return 0;
+}
+
+static int csil_rpc_call(void *self, const char *service, const char *op,
+                         const uint8_t *req, size_t req_len, uint8_t **resp, size_t *resp_len) {
+    return csil_rpc_call_reply(self, service, op, req, req_len, resp, resp_len, NULL);
 }
 "##;
 

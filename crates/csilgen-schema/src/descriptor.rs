@@ -106,6 +106,7 @@ pub enum SchemaType {
     },
     Group(SchemaGroup),
     Choice(Vec<SchemaType>),
+    NamedNumbers(Vec<(String, i64)>),
     Range {
         start: Option<i64>,
         end: Option<i64>,
@@ -447,6 +448,8 @@ impl From<&TypeExpression> for SchemaType {
                 occurrence: occurrence.as_ref().map(Into::into),
             },
             TypeExpression::Group(group) => Self::Group(group.into()),
+            TypeExpression::NamedNumberGroup(_, members)
+            | TypeExpression::NamedNumbers(members) => Self::NamedNumbers(members.clone()),
             TypeExpression::Choice(arms) => Self::Choice(arms.iter().map(Into::into).collect()),
             TypeExpression::Range {
                 start,
