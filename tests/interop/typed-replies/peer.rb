@@ -1,5 +1,8 @@
 require_relative "client"
 
+raise unless RpErrorCode.to_number(RpErrorCode::ACCOUNT_RATE_LIMITED) == 42
+raise unless RpErrorCode.from_number(42) == RpErrorCode::ACCOUNT_RATE_LIMITED
+
 class Carrier
   def call(service, op, payload)
     req = Req.from_cbor(payload)

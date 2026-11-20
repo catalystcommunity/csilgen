@@ -7,6 +7,8 @@ import static csilgen.generated.CsilCbor.*;
 
 public class Peer {
     public static void main(String[] args) throws Exception {
+        assert RpErrorCode.ACCOUNT_RATE_LIMITED.toNumber() == 42;
+        assert RpErrorCode.fromNumber(42) == RpErrorCode.ACCOUNT_RATE_LIMITED;
         Rp handler = req -> {
             if ("limit".equals(req.a())) {
                 throw new RpErrorRefusal(new RpError(RpErrorCode.APPLICATION_USER_LIMIT, "limit"));

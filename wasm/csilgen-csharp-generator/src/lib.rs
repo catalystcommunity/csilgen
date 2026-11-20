@@ -1476,6 +1476,7 @@ fn emit_enum(body: &mut String, name: &str, choices: &[CsilTypeExpression]) {
     }
     body.push_str("}\n\n");
     if numbers.is_some() {
+        body.push_str(&format!("public static class {enum_name}Numbers\n{{\n    public static long ToNumber(this {enum_name} value) => (long)value;\n\n    public static {enum_name} FromNumber(long number) => System.Enum.IsDefined(typeof({enum_name}), number)\n        ? ({enum_name})number\n        : throw new System.ArgumentOutOfRangeException(nameof(number));\n}}\n\n"));
         let mut read = String::new();
         let mut write = String::new();
         for (i, arm) in choices.iter().enumerate() {
@@ -2325,7 +2326,11 @@ fn ident_suffix(expr: &str) -> String {
 fn emit_enum_codec(type_name: &str, cases: &[CsilTypeExpression]) -> String {
     // `choice_arm_literal` strips a `.default`-style wrapper so a trailing-`.default`
     // literal arm is still classified and encoded as its own literal value.
-    let numbers = csilgen_common::enum_numbers(cases);
+    if csilgen_common::enum_numbers(cases).is_some() {
+        return format!(
+            "    public static CborValue {type_name}ToCborValue({type_name} value) => System.Enum.IsDefined(typeof({type_name}), value)\n        ? new CborValue.Int(value.ToNumber())\n        : throw new CborException(\"invalid {type_name}\");\n\n    public static {type_name} {type_name}FromCborValue(CborValue value)\n    {{\n        try {{ return {type_name}Numbers.FromNumber(Cbor.AsI64(value)); }}\n        catch (System.ArgumentOutOfRangeException) {{ throw new CborException(\"invalid {type_name} value\"); }}\n    }}\n\n"
+        );
+    }
     let int_only = cases
         .iter()
         .all(|c| matches!(choice_arm_literal(c), Some(CsilLiteralValue::Integer(_))));
@@ -2343,12 +2348,6 @@ fn emit_enum_codec(type_name: &str, cases: &[CsilTypeExpression]) -> String {
             // Encode is unaffected by the mixed-kind decode bug below: each arm's `value
             // switch` produces its own `CborValue` per enum MEMBER, not per wire kind — kept
             // byte-identical to the pre-migration rendering for these two kinds.
-            CsilLiteralValue::Text(_) if numbers.is_some() => {
-                to_arms.push_str(&format!(
-                    "        {type_name}.{member} => new CborValue.Int({}),\n",
-                    numbers.as_ref().unwrap()[index]
-                ));
-            }
             CsilLiteralValue::Text(text) => {
                 let lit = csharp_escape(text);
                 to_arms.push_str(&format!(
@@ -2388,14 +2387,7 @@ fn emit_enum_codec(type_name: &str, cases: &[CsilTypeExpression]) -> String {
     // literal kind into `Enum`, not just Text/Integer) — takes the general path: each arm
     // matched by ITS OWN kind-appropriate pattern against the raw `CborValue`, so no single
     // scalar extractor has to assume every member shares one wire kind.
-    if let Some(numbers) = numbers {
-        let mut arms = String::new();
-        for (index, (case, n)) in cases.iter().zip(numbers).enumerate() {
-            let member = enum_member_ident(type_name, choice_arm_literal(case).unwrap(), index);
-            arms.push_str(&format!("        {n} => {type_name}.{member},\n"));
-        }
-        out.push_str(&format!("    public static {type_name} {type_name}FromCborValue(CborValue value) => Cbor.AsI64(value) switch\n    {{\n{arms}        _ => throw new CborException(\"invalid {type_name} value\"),\n    }};\n\n"));
-    } else if int_only {
+    if int_only {
         let mut from_arms = String::new();
         for (index, case) in cases.iter().enumerate() {
             if let Some(literal @ CsilLiteralValue::Integer(value)) = choice_arm_literal(case) {

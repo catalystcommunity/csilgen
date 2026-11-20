@@ -3013,7 +3013,7 @@ fn main() {{
         }
 
         content.push('}');
-        if csilgen_common::enum_numbers(choices).is_some() {
+        if let Some(numbers) = csilgen_common::enum_numbers(choices) {
             let literals = Self::enum_literals(choices).unwrap();
             let idents = Self::enum_variant_idents(&literals);
             content.push_str(&format!("\n\nimpl {name} {{\n    pub fn as_str(&self) -> &'static str {{\n        match self {{\n"));
@@ -3027,6 +3027,14 @@ fn main() {{
                 if let CsilLiteralValue::Text(label) = literal {
                     content.push_str(&format!("            {label:?} => Some(Self::{id}),\n"));
                 }
+            }
+            content.push_str("            _ => None,\n        }\n    }\n\n    pub fn to_number(&self) -> i64 {\n        match self {\n");
+            for (id, number) in idents.iter().zip(&numbers) {
+                content.push_str(&format!("            Self::{id} => {number},\n"));
+            }
+            content.push_str("        }\n    }\n\n    pub fn from_number(number: i64) -> Option<Self> {\n        match number {\n");
+            for (id, number) in idents.iter().zip(&numbers) {
+                content.push_str(&format!("            {number} => Some(Self::{id}),\n"));
             }
             content.push_str("            _ => None,\n        }\n    }\n}");
         }
@@ -4710,17 +4718,22 @@ pub fn resolve_rpc_reply(
                 &format!("csil_v: &{name}"),
                 "CsilCborValue",
             ));
+            if csilgen_common::enum_numbers(choices).is_some() {
+                out.push_str("    cbor_int(csil_v.to_number())\n}\n\n");
+                out.push_str(&Self::rust_fn_header(
+                    &format!("csil_dec_{snake}"),
+                    "csil_v",
+                    name,
+                ));
+                out.push_str(&format!("    let number = cbor_as_i64(csil_v)?;\n    {name}::from_number(number)\n        .ok_or_else(|| CsilCborError(format!(\"csil cbor: unknown {name} value {{number}}\")))\n}}\n\n"));
+                return out;
+            }
             out.push_str("    match csil_v {\n");
             let all_text = lits
                 .iter()
                 .all(|lit| matches!(lit, CsilLiteralValue::Text(_)));
-            let numbers = csilgen_common::enum_numbers(choices);
-            for (index, (ident, lit)) in idents.iter().zip(&lits).enumerate() {
-                let value = if let Some(numbers) = &numbers {
-                    Self::rust_literal_cbor_expr(&CsilLiteralValue::Integer(numbers[index]))
-                } else {
-                    Self::rust_literal_cbor_expr(lit)
-                };
+            for (ident, lit) in idents.iter().zip(&lits) {
+                let value = Self::rust_literal_cbor_expr(lit);
                 out.push_str(&Self::rust_match_arm(&format!("{name}::{ident}"), &value));
             }
             out.push_str("    }\n}\n\n");
@@ -4749,15 +4762,7 @@ pub fn resolve_rpc_reply(
                 "csil_v",
                 name,
             ));
-            if let Some(numbers) = numbers {
-                out.push_str("    match cbor_as_i64(csil_v)? {\n");
-                for (index, ident) in numbers.iter().zip(&idents) {
-                    out.push_str(&Self::rust_match_arm(
-                        &index.to_string(),
-                        &format!("Ok({name}::{ident})"),
-                    ));
-                }
-            } else if all_text {
+            if all_text {
                 out.push_str(
                     "    let csil_val = cbor_as_text(csil_v)?;\n    match csil_val.as_str() {\n",
                 );

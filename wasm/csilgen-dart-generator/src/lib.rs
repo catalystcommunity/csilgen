@@ -2821,7 +2821,7 @@ impl DartGenerator {
                 (
                     ", this.wireNumber",
                     format!(
-                        "  final int wireNumber;\n\n  static {base} fromNumber(Object? value) {{\n    if (value is int) {{\n      for (final member in values) {{\n        if (member.wireNumber == value) return member;\n      }}\n    }}\n    throw FormatException('unknown {base} number', value);\n  }}\n"
+                        "  final int wireNumber;\n  static final _byNumber = <int, {base}>{{for (final member in values) member.wireNumber: member}};\n\n  static {base} fromNumber(Object? value) {{\n    final member = value is int ? _byNumber[value] : null;\n    if (member != null) return member;\n    throw FormatException('unknown {base} number', value);\n  }}\n"
                     ),
                 )
             } else {

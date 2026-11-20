@@ -3,6 +3,10 @@ struct Handler: Rp {
         if request.a == "limit" {
             throw RpErrorRefusal(value: RpError(code: .applicationUserLimit, message: "limit"))
         }
+
+precondition(RpErrorCode.accountRateLimited.wireNumber == 42)
+precondition(RpErrorCode(wireNumber: 42) == .accountRateLimited)
+precondition(RpErrorCode(wireNumber: 1) == nil)
         return Resp(b: "ok")
     }
 }

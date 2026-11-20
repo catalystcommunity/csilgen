@@ -26,6 +26,9 @@ class Peer
 {
     static void Main()
     {
+        long number = RpErrorCode.AccountRateLimited.ToNumber();
+        if (number != 42 || RpErrorCodeNumbers.FromNumber(number) != RpErrorCode.AccountRateLimited)
+            throw new System.Exception("incorrect enum number lookup");
         var client = new RpClient(new Carrier());
         if (client.DecryptToken(new Req { A = "ok" }).B != "ok") throw new System.Exception("wrong response");
         try {

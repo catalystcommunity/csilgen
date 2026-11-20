@@ -95,6 +95,14 @@ func run(name string) error {
 }
 
 func main() {
+	codeNumber := api.RpErrorCodeAccountRateLimited.ToNumber()
+	member, err := api.RpErrorCodeFromNumber(codeNumber)
+	if err != nil || codeNumber != 42 || member != api.RpErrorCodeAccountRateLimited {
+		panic("incorrect enum number lookup")
+	}
+	if _, err := api.RpErrorCodeFromNumber(1); err == nil {
+		panic("accepted an unknown enum number")
+	}
 	label, err := json.Marshal(api.RpErrorCodeAccountRateLimited)
 	if err != nil || string(label) != `"account_rate_limited"` {
 		panic("incorrect JSON enum label")

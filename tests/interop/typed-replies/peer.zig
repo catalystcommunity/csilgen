@@ -28,6 +28,9 @@ fn plain(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: [
 }
 
 test "typed refusal and transport failure" {
+    try std.testing.expectEqual(@as(i64, 42), types.RpErrorCode.account_rate_limited.to_number());
+    try std.testing.expectEqual(types.RpErrorCode.account_rate_limited, types.RpErrorCode.from_number(42).?);
+    try std.testing.expect(types.RpErrorCode.from_number(1) == null);
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const alloc = arena.allocator();

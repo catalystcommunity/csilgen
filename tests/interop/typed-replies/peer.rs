@@ -38,6 +38,10 @@ impl Transport for Carrier {
 }
 
 fn main() {
+    let code = RpErrorCode::AccountRateLimited;
+    assert_eq!(code.to_number(), 42);
+    assert_eq!(RpErrorCode::from_number(42), Some(code));
+    assert_eq!(RpErrorCode::from_number(1), None);
     let retry = choices::Retry { delay: 3 };
     let (variant, payload) =
         choices::encode_api_submit_reply(Err(choices::ApiSubmitError::Retry(retry)));

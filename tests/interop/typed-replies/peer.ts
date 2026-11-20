@@ -1,7 +1,11 @@
-import { RpErrorCode } from "./types.gen.ts";
+import { RpErrorCode, RpErrorCodeNumbers } from "./types.gen.ts";
 import { RpClient } from "./client.gen.ts";
 import { fromReqCbor, toReqCbor, resolveRpcReply, RpErrorRefusal } from "./codec.gen.ts";
 import { dispatch } from "./server.gen.ts";
+
+const number = RpErrorCodeNumbers.numberFromEnum(RpErrorCode.ACCOUNT_RATE_LIMITED);
+if (number !== 42n || RpErrorCodeNumbers.enumFromNumber(number) !== RpErrorCode.ACCOUNT_RATE_LIMITED)
+  throw new Error("incorrect enum number lookup");
 
 async function test() {
   const handlers = { rp: { async decryptToken(req: { a: string }) {

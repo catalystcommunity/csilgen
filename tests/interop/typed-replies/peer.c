@@ -37,6 +37,11 @@ static int call(void *ctx, const char *service, const char *op, const uint8_t *d
 }
 
 int main(void) {
+    int64_t number;
+    RpErrorCode code;
+    assert(csil_RpErrorCode_to_number(RP_ERROR_CODE_ACCOUNT_RATE_LIMITED, &number) && number == 42);
+    assert(csil_RpErrorCode_from_number(number, &code) && code == RP_ERROR_CODE_ACCOUNT_RATE_LIMITED);
+    assert(!csil_RpErrorCode_from_number(1, &code));
     CsilgenTransport transport = { .call_reply = call };
     RpDecryptTokenReply reply;
     CsilCodecArena *arena;
