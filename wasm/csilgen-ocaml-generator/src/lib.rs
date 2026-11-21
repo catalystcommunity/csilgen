@@ -2277,11 +2277,10 @@ fn dec_value(
             base_type,
             constraints,
         } if matches!(base_type.as_ref(), CsilTypeExpression::Builtin(n) if n == "date") => {
-            let checked = bounded_date(
+            bounded_date(
                 &dec_value(base_type, expr, records, choices, aliases),
                 constraints,
-            );
-            checked
+            )
         }
         CsilTypeExpression::Constrained { base_type, .. } => {
             dec_value(base_type, expr, records, choices, aliases)
