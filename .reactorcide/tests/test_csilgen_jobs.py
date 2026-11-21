@@ -499,6 +499,28 @@ class TrustedImplementationTests(unittest.TestCase):
             ),
         )
 
+    def test_interop_keeps_fixture_options_in_the_included_file(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fixture = root / "tests" / "interop" / "interop.csil"
+            fixture.parent.mkdir(parents=True)
+            fixture.write_text(
+                'options { lint_text_enums: "off" }\nColor = "red" / "blue"\n',
+                encoding="utf-8",
+            )
+            (go,) = INTEROP._select_languages(("go",))
+            with mock.patch.object(INTEROP, "_run") as run:
+                INTEROP._generate(root, Path("csilgen"), go)
+
+            command, _ = run.call_args.args
+            entry = command[command.index("--input") + 1]
+            source = entry.read_text(encoding="utf-8")
+            relative_path = os.path.relpath(fixture, entry.parent)
+            self.assertTrue(source.startswith(f'include "{Path(relative_path).as_posix()}"\n'))
+            self.assertEqual(source.count("options {"), 1)
+            self.assertIn('emit_packages: ["go"]', source)
+            self.assertIn('package_name: "interopapi"', source)
+
     def test_interop_run_builds_generators_before_cli_use(self) -> None:
         with mock.patch.object(
             INTEROP,

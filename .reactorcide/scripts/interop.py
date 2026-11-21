@@ -95,17 +95,13 @@ def _build_generators(root: Path, languages: Sequence[Language]) -> None:
 
 
 def _generate(root: Path, cli: Path, language: Language) -> None:
-    specification = root / "tests" / "interop" / "interop.csil"
-    options = (
-        "options { emit_packages: "
-        f'["{language.generator}"], package_name: "{language.package}", '
-        'package_version: "0.1.0" }\n\n'
-    )
     input_dir = root / "target" / "interop"
     input_dir.mkdir(parents=True, exist_ok=True)
     generated_input = input_dir / f"gen-input-{language.name}.csil"
     generated_input.write_text(
-        options + specification.read_text(encoding="utf-8"),
+        'include "../../tests/interop/interop.csil"\n'
+        f'options {{ emit_packages: ["{language.generator}"], '
+        f'package_name: "{language.package}", package_version: "0.1.0" }}\n',
         encoding="utf-8",
     )
     destination = _generated(root, language)
