@@ -203,6 +203,9 @@ final class CBOR
             return $map;
         }
         if ($major === 6) {
+            if ($arg === 1004 && (!isset($bytes[$pos]) || ord($bytes[$pos]) >> 5 !== 3)) {
+                throw new CborException('calendar date tag 1004 requires text');
+            }
             return new Tag($arg, self::decodeAt($bytes, $pos, $depth + 1));
         }
         throw new CborException('unsupported CBOR major type ' . $major);

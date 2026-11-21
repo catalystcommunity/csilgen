@@ -2349,6 +2349,7 @@ fn compile_regression_input() -> WasmGeneratorInput {
                 position: pos(),
                 doc_comments: vec![],
             },
+            group_rule("Deadline", vec![bare_entry("due", builtin("date"))]),
             group_rule(
                 "NodeReport",
                 vec![bare_entry("query", builtin("text")), event],
@@ -2533,6 +2534,18 @@ fn generated_client_compiles_and_preserves_cbor() {
 const SWIFT_COMPILE_DRIVER: &str = r#"
 import Foundation
 
+let deadline = Deadline(due: "2000-02-29")
+let dateBytes: [UInt8] = [0xa1, 0x63, 0x64, 0x75, 0x65, 0xd9, 0x03, 0xec, 0x6a]
+    + Array("2000-02-29".utf8)
+precondition(deadline.toCbor() == dateBytes)
+let decodedDate = try Deadline.fromCbor(dateBytes)
+precondition(decodedDate == deadline)
+for text in ["2026-02-30", "1900-02-29", "2026-1-01"] {
+    do {
+        _ = try CsilCbor.decodeDate(.tag(1004, .text(text)))
+        fatalError("invalid date was accepted")
+    } catch CsilCborError.typeMismatch {}
+}
 let report = NodeReport(query: "ok")
 precondition(report.event == .state)
 // {"event": "state", "query": "ok"}, in canonical CBOR key order.

@@ -651,6 +651,7 @@ fn ts_sample(input: &WasmGeneratorInput, ty: &CsilTypeExpression) -> String {
             "text" | "tstr" | "string" => "\"example\"".to_string(),
             "bool" | "boolean" => "false".to_string(),
             "bytes" | "bstr" => "new Uint8Array()".to_string(),
+            "date" => "\"1970-01-01\"".to_string(),
             "timestamp" => "new Date()".to_string(),
             "int" | "uint" | "integer" | "number" | "float" | "float16" | "float32" | "float64"
             | "int8" | "int16" | "int32" | "int64" | "uint8" | "uint16" | "uint32" | "uint64" => {

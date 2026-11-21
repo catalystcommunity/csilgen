@@ -975,6 +975,7 @@ fn kotlin_sample(input: &WasmGeneratorInput, ty: &CsilTypeExpression) -> String 
             "int" => "0L".to_string(),
             "uint" => "0uL".to_string(),
             "float" => "0.0".to_string(),
+            "date" => "java.time.LocalDate.of(1970, 1, 1)".to_string(),
             "timestamp" => "java.time.Instant.now()".to_string(),
             "decimal" => "java.math.BigDecimal.ZERO".to_string(),
             _ => "TODO()".to_string(),
@@ -1862,6 +1863,7 @@ fn kotlin_enc_value(
             "text" | "tstr" => format!("CborValue.CText({expr})"),
             "bytes" | "bstr" => format!("CborValue.CBytes({expr})"),
             "bool" => format!("CborValue.CBool({expr})"),
+            "date" => format!("CsilCbor.encDate({expr})"),
             // timestamp is tag 0 + RFC3339 UTC text; Instant.toString() is RFC3339 with `Z`.
             "timestamp" => format!("CborValue.CTag(0uL, CborValue.CText(({expr}).toString()))"),
             // decimal is tag 4 [exponent, mantissa]; BigDecimal = unscaled * 10^-scale.
@@ -1941,6 +1943,7 @@ fn kotlin_dec_value(
             "text" | "tstr" => format!("CsilCbor.asText({expr})"),
             "bytes" | "bstr" => format!("CsilCbor.asBytes({expr})"),
             "bool" => format!("CsilCbor.asBoolean({expr})"),
+            "date" => format!("CsilCbor.asDate({expr})"),
             "timestamp" => format!("java.time.Instant.parse(CsilCbor.asTaggedText({expr}, 0uL))"),
             "decimal" => format!("CsilCbor.asDecimal({expr})"),
             // `any` keeps the decoded CBOR value verbatim (passes through unchanged).
@@ -2951,6 +2954,18 @@ object CsilCbor {
     fun asMap(v: CborValue): List<Pair<CborValue, CborValue>> =
         (v as? CborValue.CMap)?.entries ?: throw CborError("expected map")
 
+    fun encDate(date: java.time.LocalDate): CborValue {
+        val text = date.toString()
+        require(text.length == 10) { "date requires a four-digit year" }
+        return CborValue.CTag(1004uL, CborValue.CText(text))
+    }
+
+    fun asDate(v: CborValue): java.time.LocalDate {
+        val text = asTaggedText(v, 1004uL)
+        require(text.length == 10) { "expected YYYY-MM-DD" }
+        return java.time.LocalDate.parse(text)
+    }
+
     fun asTaggedText(v: CborValue, tag: ULong): String {
         if (v is CborValue.CTag && v.tag == tag) return asText(v.value)
         throw CborError("expected tag $tag")
@@ -3206,6 +3221,15 @@ fn emit_ordered_check(
                 kotlin_escape(&text),
             )
         }
+        OrderedKind::Date => {
+            let Some(text) = literal_as_text(value) else {
+                return;
+            };
+            (
+                format!("java.time.LocalDate.parse(\"{text}\")"),
+                kotlin_escape(&text),
+            )
+        }
         OrderedKind::Timestamp => {
             let Some(text) = literal_as_text(value) else {
                 return;
@@ -3317,6 +3341,7 @@ enum OrderedKind {
     Numeric,
     Decimal,
     Timestamp,
+    Date,
 }
 
 /// Which Kotlin length member a `.size` constraint compiles against: `String` has
@@ -3347,6 +3372,7 @@ fn ordered_field_kind(value_type: &CsilTypeExpression) -> OrderedKind {
     if let CsilTypeExpression::Builtin(name) = base {
         match name.as_str() {
             "decimal" => OrderedKind::Decimal,
+            "date" => OrderedKind::Date,
             "timestamp" => OrderedKind::Timestamp,
             _ => OrderedKind::Numeric,
         }
@@ -3391,6 +3417,7 @@ fn map_csil_type_to_kotlin(
             "text" | "tstr" => "String".to_string(),
             "bytes" | "bstr" => "ByteArray".to_string(),
             "bool" => "Boolean".to_string(),
+            "date" => "java.time.LocalDate".to_string(),
             // CBOR tag 0 RFC3339 instant; java.time.Instant is exact and stdlib.
             "timestamp" => "java.time.Instant".to_string(),
             // CBOR tag 4 exact decimal; BigDecimal is the JVM-idiomatic exact type.
@@ -3537,6 +3564,11 @@ fn literal_to_kotlin_typed(value: &CsilLiteralValue, value_type: &CsilTypeExpres
         OrderedKind::Decimal => {
             if let Some(text) = literal_as_text(value) {
                 return format!("java.math.BigDecimal(\"{}\")", kotlin_escape(&text));
+            }
+        }
+        OrderedKind::Date => {
+            if let Some(text) = literal_as_text(value) {
+                return format!("java.time.LocalDate.parse(\"{}\")", kotlin_escape(&text));
             }
         }
         OrderedKind::Timestamp => {

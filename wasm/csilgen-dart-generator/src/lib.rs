@@ -381,6 +381,7 @@ fn map_type(
             "text" | "tstr" => "String".to_string(),
             "bytes" | "bstr" => "Uint8List".to_string(),
             "bool" => "bool".to_string(),
+            "date" => "String".to_string(),
             // CBOR tag 0, RFC3339, UTC; Dart's DateTime carries it (kept UTC).
             "timestamp" => "DateTime".to_string(),
             "decimal" => decimal.to_string(),
@@ -1219,6 +1220,7 @@ fn dart_sample(
             "text" | "tstr" => "'example'".to_string(),
             "bool" => "false".to_string(),
             "bytes" | "bstr" => "Uint8List(0)".to_string(),
+            "date" => "'1970-01-01'".to_string(),
             "timestamp" => "DateTime.now()".to_string(),
             "int" | "uint" => "0".to_string(),
             "float" => "0".to_string(),
@@ -2562,6 +2564,18 @@ impl DartGenerator {
             }
         };
         let bang = if optional { "!" } else { "" };
+        if type_uses_builtin(value_type, "date")
+            && let Some((cmp, bound)) = op.text_comparison()
+        {
+            let compare = format!(
+                "{member}{bang}.compareTo({}) {cmp} 0",
+                dart_string_lit(bound)
+            );
+            return self.guard(
+                &g(&format!("!({compare})")),
+                &format!("'{member}' must be {cmp} {bound}"),
+            );
+        }
         // A `decimal`/`timestamp` bound is reconstructed as the matching Dart value so
         // the comparison is type-correct (`rate < CsilDecimal.parse('0.0')`); numeric
         // and text bounds stay literal.
@@ -3729,6 +3743,7 @@ fn contains_record(
     unions: &std::collections::HashMap<String, Vec<CsilTypeExpression>>,
 ) -> bool {
     match ty {
+        CsilTypeExpression::Builtin(name) if name == "date" => true,
         // A reference is either a record directly, or a transparent alias whose
         // underlying shape (e.g. `M = {* text => SomeRecord}`) may itself carry one.
         CsilTypeExpression::Reference(_) if dart_text_enum(ty, aliases).is_some() => true,
@@ -3767,6 +3782,9 @@ fn dart_to_cbor_expr(
     unions: &std::collections::HashMap<String, Vec<CsilTypeExpression>>,
 ) -> DExpr {
     match ty {
+        CsilTypeExpression::Builtin(name) if name == "date" => {
+            DExpr::Atom(format!("CsilCbor.dateValue({expr})"))
+        }
         CsilTypeExpression::Constrained { base_type, .. } => {
             dart_to_cbor_expr(base_type, expr, records, aliases, unions)
         }
@@ -3925,6 +3943,7 @@ fn dart_from_cbor_expr(
             "text" | "tstr" => format!("{expr} as String"),
             "bytes" | "bstr" => format!("{expr} as Uint8List"),
             "bool" => format!("{expr} as bool"),
+            "date" => format!("CsilCbor.asDate({expr})"),
             "timestamp" => format!("{expr} as DateTime"),
             "decimal" => format!("{expr} as {decimal}"),
             _ => expr.to_string(),
@@ -4365,11 +4384,39 @@ const CSIL_CBOR_DART: &str = r#"// The self-contained canonical CSIL CBOR codec.
 import 'dart:convert';
 import 'dart:typed_data';
 
+class _CsilDate {
+  final String text;
+  const _CsilDate(this.text);
+
+  @override
+  bool operator ==(Object other) => other is _CsilDate && other.text == text;
+
+  @override
+  int get hashCode => text.hashCode;
+}
+
 /// A minimal canonical-CBOR (RFC 8949 subset) encoder/decoder over the dynamic
 /// value tree the generated records map to. Scalars, bytes (major type 2),
 /// timestamps (DateTime -> tag 0), lists, and maps are supported; the generated
 /// records call this behind their toCbor/fromCbor.
 class CsilCbor {
+  static Object dateValue(Object? text) {
+    if (text is String && text.length == 10 && RegExp(r'^\d{4}-\d{2}-\d{2}$').hasMatch(text)) {
+      final y = int.parse(text.substring(0, 4));
+      final m = int.parse(text.substring(5, 7));
+      final d = int.parse(text.substring(8));
+      final leap = y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
+      final days = [31, leap ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+      if (m >= 1 && m <= 12 && d >= 1 && d <= days[m - 1]) return _CsilDate(text);
+    }
+    throw FormatException('expected YYYY-MM-DD');
+  }
+
+  static String asDate(Object? value) {
+    if (value is _CsilDate) return value.text;
+    throw FormatException('expected calendar date tag 1004');
+  }
+
   static Uint8List encodeValue(Object? value) {
     final b = BytesBuilder();
     _enc(b, value);
@@ -4422,6 +4469,9 @@ class CsilCbor {
     } else if (v is Uint8List) {
       _head(b, 2, v.length);
       b.add(v);
+    } else if (v is _CsilDate) {
+      _head(b, 6, 1004);
+      _enc(b, v.text);
     } else if (v is DateTime) {
       b.addByte(0xc0);
       // Canonical RFC3339 (tag 0): Dart's toIso8601String always emits a
@@ -4594,7 +4644,12 @@ class CsilCbor {
         }
         return _CsilDecoded(map, off5);
       case 6:
+        if (arg == 1004 && (p >= b.length || b[p] >> 5 != 3)) {
+          throw FormatException('calendar date tag 1004 requires text');
+        }
         final inner = _dec(b, p, depth + 1);
+        if (arg == 1004) return _CsilDecoded(dateValue(inner.value), inner.next);
+        if (inner.value is _CsilDate) throw FormatException('unexpected nested date tag');
         if (arg == 0 && inner.value is String) {
           return _CsilDecoded(
             DateTime.parse(inner.value as String).toUtc(),

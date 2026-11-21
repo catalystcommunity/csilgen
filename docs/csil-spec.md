@@ -157,6 +157,21 @@ CSIL uses UTF-8 encoding and follows CDDL's lexical conventions:
 - **String literals**: Double-quoted with escape sequences
 - **Numeric literals**: Integers, floats, hexadecimal, binary
 
+### Calendar dates and timestamps
+
+Use `date` for a due date, birthday, or other calendar day. Use `timestamp`
+for an instant in UTC. Write a date bound as a quoted Gregorian date in
+`YYYY-MM-DD` format. The operators `.ge` and `.le` include the bound.
+The operators `.gt` and `.lt` exclude it. A bound such as `"2026-02-30"`
+is invalid.
+
+```csil
+Task = {
+    due: date .ge "2026-01-01" .lt "2027-01-01",
+    created_at: timestamp,
+}
+```
+
 ### Grammar Overview
 
 ```ebnf

@@ -1073,6 +1073,31 @@ fn cbor_as_map(v: &CsilCborValue) -> Result<&[(CsilCborValue, CsilCborValue)], C
     }
 }"#;
 
+const CODEC_DATE_RUST: &str = r#"
+fn csil_enc_date(date: &chrono::NaiveDate) -> CsilCborValue {
+    let text = date.to_string();
+    assert!(text.len() == 10, "CSIL date requires a four-digit year");
+    CsilCborValue::Tag(1004, Box::new(CsilCborValue::Text(text)))
+}
+
+fn csil_as_date(v: &CsilCborValue) -> Result<chrono::NaiveDate, CsilCborError> {
+    let CsilCborValue::Tag(1004, inner) = v else {
+        return Err(CsilCborError("expected calendar date tag 1004".into()));
+    };
+    let CsilCborValue::Text(text) = inner.as_ref() else {
+        return Err(CsilCborError("expected calendar date text".into()));
+    };
+    if text.len() == 10 {
+        if let Ok(date) = text.parse::<chrono::NaiveDate>() {
+            if date.to_string() == *text {
+                return Ok(date);
+            }
+        }
+    }
+    Err(CsilCborError("expected a YYYY-MM-DD date".into()))
+}
+"#;
+
 /// Timestamp (CBOR tag 0, RFC3339, always UTC) codec, emitted only when the spec
 /// uses `timestamp` so `chrono` is never an unused dependency.
 const CODEC_TIMESTAMP_RUST: &str = r#"/// Encode a UTC instant as CBOR tag 0 RFC3339 text in UTC, per the wire contract;
@@ -2032,7 +2057,7 @@ impl<'a> RustCodeGenerator<'a> {
     /// the two never drift. Empty for a spec whose codec is fully self-contained.
     fn crate_dependencies(&self) -> Vec<(&'static str, &'static str)> {
         let mut deps = Vec::new();
-        if self.spec_uses_builtin("timestamp") {
+        if self.spec_uses_builtin("timestamp") || self.spec_uses_builtin("date") {
             deps.push(("chrono", "0.4"));
         }
         if self.spec_uses_builtin("decimal") && self.decimal_mapping == DecimalMapping::Library {
@@ -2501,6 +2526,7 @@ fn main() {{
     fn rust_sample(&self, ty: &CsilTypeExpression) -> String {
         match ty {
             CsilTypeExpression::Builtin(name) => match name.as_str() {
+                "date" => "chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap()".to_string(),
                 "text" | "tstr" | "string" => "\"example\".to_string()".to_string(),
                 "bool" | "boolean" => "false".to_string(),
                 "bytes" | "bstr" => "Vec::new()".to_string(),
@@ -3679,6 +3705,7 @@ pub fn resolve_rpc_reply(
                 "bool" => scalar("cbor_bool"),
                 "text" | "tstr" => refed("cbor_text"),
                 "bytes" | "bstr" => refed("cbor_bytes"),
+                "date" => refed("csil_enc_date"),
                 "timestamp" => refed("csil_enc_timestamp"),
                 "decimal" => refed("csil_enc_decimal"),
                 "null" | "nil" => RustExpr::Atom("CsilCborValue::Null".to_string()),
@@ -3789,6 +3816,7 @@ pub fn resolve_rpc_reply(
                 Some(format!("csil_enc_{}", Self::to_snake_case(name)))
             }
             CsilTypeExpression::Builtin(name) => match name.as_str() {
+                "date" => Some("csil_enc_date".to_string()),
                 "timestamp" => Some("csil_enc_timestamp".to_string()),
                 "decimal" => Some("csil_enc_decimal".to_string()),
                 _ => None,
@@ -4044,6 +4072,7 @@ pub fn resolve_rpc_reply(
                 "bool" => RustExpr::Atom("cbor_as_bool".to_string()),
                 "text" | "tstr" => RustExpr::Atom("cbor_as_text".to_string()),
                 "bytes" | "bstr" => RustExpr::Atom("cbor_as_bytes".to_string()),
+                "date" => RustExpr::Atom("csil_as_date".to_string()),
                 "timestamp" => RustExpr::Atom("csil_as_timestamp".to_string()),
                 "decimal" => RustExpr::Atom("csil_as_decimal".to_string()),
                 // `any` is the CBOR value tree itself; clone it through.
@@ -4979,6 +5008,9 @@ pub fn resolve_rpc_reply(
         content.push_str(CODEC_RUNTIME_RUST);
         content.push_str("\n\n");
 
+        if self.spec_uses_builtin("date") {
+            content.push_str(CODEC_DATE_RUST);
+        }
         if self.spec_uses_builtin("timestamp") {
             content.push_str(CODEC_TIMESTAMP_RUST);
             content.push_str("\n\n");
@@ -5635,6 +5667,7 @@ pub fn resolve_rpc_reply(
             // `nint` through the signed-integer path, so it shares `i64`.
             "nint" => "i64".to_string(),
             "float" | "float16" | "float32" | "float64" => "f64".to_string(),
+            "date" => "chrono::NaiveDate".to_string(),
             // A UTC-typed instant; the tag-0 RFC3339 wire form is the codec's job.
             "timestamp" => "chrono::DateTime<chrono::Utc>".to_string(),
             // The injected `CsilDecimal` holds the exact tag-4 value by default;
@@ -5910,6 +5943,13 @@ pub fn resolve_rpc_reply(
         }
         let typed = if Self::is_decimal_shape(base) {
             self.decimal_compare_check(field, fail_op, bound, msg)
+        } else if matches!(base, CsilTypeExpression::Builtin(n) if n == "date") {
+            let CsilLiteralValue::Text(text) = bound else {
+                return;
+            };
+            Some(format!(
+                "            if *v {fail_op} {text:?}.parse::<chrono::NaiveDate>().expect(\"valid CSIL date bound\") {{ return Err(ValidationError {{ field: {field:?}.into(), message: {msg:?}.into() }}); }}\n"
+            ))
         } else if Self::is_timestamp_shape(base) {
             Self::timestamp_compare_check(field, fail_op, bound, msg)
         } else {

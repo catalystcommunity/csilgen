@@ -1945,6 +1945,7 @@ fn csharp_enc_value(
             "text" | "tstr" => format!("new CborValue.Text({expr})"),
             "bytes" | "bstr" => format!("new CborValue.Bytes({expr})"),
             "bool" => format!("new CborValue.Bool({expr})"),
+            "date" => format!("Cbor.EncDate({expr})"),
             "timestamp" => format!("Cbor.EncTimestamp({expr})"),
             "decimal" => format!("Cbor.EncDecimal({expr})"),
             // `any` is already a `CborValue`; carry it through verbatim.
@@ -2045,6 +2046,7 @@ fn csharp_dec_value(
             "text" | "tstr" => format!("Cbor.AsText({expr})"),
             "bytes" | "bstr" => format!("Cbor.AsBytes({expr})"),
             "bool" => format!("Cbor.AsBool({expr})"),
+            "date" => format!("Cbor.AsDate({expr})"),
             "timestamp" => format!("Cbor.AsTimestamp({expr})"),
             "decimal" => format!("Cbor.AsDecimal({expr})"),
             // `any` is carried through as the decoded `CborValue` itself.
@@ -2539,6 +2541,9 @@ fn generate_codec(input: &WasmGeneratorInput, config: &CsharpConfig) -> Option<S
     content.push_str("using System.Linq;\n\n");
     content.push_str(&format!("namespace {};\n\n", config.namespace));
     content.push_str(CODEC_RUNTIME_CSHARP);
+    if spec_uses_builtin(input, "date") {
+        content.push_str(CODEC_DATE_CSHARP);
+    }
     if uses_timestamp {
         content.push('\n');
         content.push_str(CODEC_TIMESTAMP_CSHARP);
@@ -3179,6 +3184,18 @@ fn emit_ordered_check(
             let message = csharp_escape(&format!("field '{}' must be {desc} {text}", field.prop));
             body.push_str(&field.check(&cond, &message));
         }
+        OrderedKind::Date => {
+            let Some(text) = literal_as_timestamp_text(value) else {
+                return;
+            };
+            let bound = format!(
+                "System.DateOnly.ParseExact(\"{}\", \"yyyy-MM-dd\", System.Globalization.CultureInfo.InvariantCulture)",
+                csharp_escape(&text)
+            );
+            let cond = format!("{access} {vop} {bound}");
+            let message = csharp_escape(&format!("field '{}' must be {desc} {text}", field.prop));
+            body.push_str(&field.check(&cond, &message));
+        }
         OrderedKind::Timestamp => {
             let Some(text) = literal_as_timestamp_text(value) else {
                 return;
@@ -3196,6 +3213,7 @@ enum OrderedKind {
     CsilDecimal,
     LibraryDecimal,
     Timestamp,
+    Date,
 }
 
 fn ordered_kind(value_type: &CsilTypeExpression, config: &CsharpConfig) -> OrderedKind {
@@ -3209,6 +3227,7 @@ fn ordered_kind(value_type: &CsilTypeExpression, config: &CsharpConfig) -> Order
                 DecimalMapping::Csil => OrderedKind::CsilDecimal,
                 DecimalMapping::Library => OrderedKind::LibraryDecimal,
             },
+            "date" => OrderedKind::Date,
             "timestamp" => OrderedKind::Timestamp,
             _ => OrderedKind::Numeric,
         }
@@ -3293,6 +3312,7 @@ fn map_csil_type_inner(
             "text" | "tstr" => "string".to_string(),
             "bytes" | "bstr" => "byte[]".to_string(),
             "bool" => "bool".to_string(),
+            "date" => "System.DateOnly".to_string(),
             // CBOR tag 0, RFC3339, always UTC per the wire contract.
             "timestamp" => "System.DateTimeOffset".to_string(),
             // CBOR tag 4 exact decimal; concrete C# type depends on decimal_mapping. Only
@@ -4128,6 +4148,17 @@ public static partial class Cbor
 
     public static string AsTaggedText(CborValue v, ulong num) =>
         v is CborValue.Tag x && x.Number == num ? AsText(x.Inner) : throw new CborException("expected tagged text");
+}
+"#;
+
+const CODEC_DATE_CSHARP: &str = r#"
+public static partial class Cbor
+{
+    public static CborValue EncDate(System.DateOnly value) =>
+        new CborValue.Tag(1004, new CborValue.Text(value.ToString("yyyy-MM-dd", System.Globalization.CultureInfo.InvariantCulture)));
+
+    public static System.DateOnly AsDate(CborValue value) =>
+        System.DateOnly.ParseExact(AsTaggedText(value, 1004), "yyyy-MM-dd", System.Globalization.CultureInfo.InvariantCulture);
 }
 "#;
 

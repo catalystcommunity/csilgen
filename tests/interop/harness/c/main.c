@@ -47,6 +47,7 @@ static Scalars scalars_ok(void) {
     s.raw.data = raw;
     s.raw.len = sizeof(raw);
     s.flag = true;
+    s.due = "2000-02-29";
     s.when.rfc3339 = "2026-06-29T12:34:56Z";
     s.when.epoch_seconds = 0;
     s.amount.exponent = -2; /* 123.45 = 12345 * 10^-2 */
@@ -201,6 +202,7 @@ static bool scalars_eq(const Scalars *a, const Scalars *b) {
     if (a->raw.len != b->raw.len || memcmp(a->raw.data, b->raw.data, a->raw.len) != 0)
         return false;
     if (a->flag != b->flag) return false;
+    if (!streq(a->due, b->due)) return false;
     if (!streq(a->when.rfc3339, b->when.rfc3339)) return false;
     if (a->amount.exponent != b->amount.exponent || a->amount.mantissa != b->amount.mantissa)
         return false;

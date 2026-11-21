@@ -1,7 +1,7 @@
 //! Shared helpers for the TypeScript emitters (types / client / server).
 
 use csilgen_common::{
-    CsilGroupExpression, CsilGroupKey, CsilLiteralValue, CsilOccurrence, CsilRule, CsilRuleType,
+    CsilGroupExpression, CsilGroupKey, CsilLiteralValue, CsilOccurrence, CsilRuleType,
     CsilServiceDefinition, CsilServiceDirection, CsilServiceOperation, CsilSpecSerialized,
     CsilTypeExpression, WasmGeneratorInput,
 };
@@ -414,6 +414,7 @@ fn builtin(name: &str, mapping: DecimalMapping) -> String {
         | "double" | "number" => "number".to_string(),
         "bool" | "boolean" => "boolean".to_string(),
         "bytes" => "Uint8Array".to_string(),
+        "date" => "string".to_string(),
         // `timestamp` is CBOR tag 0 on the wire; in TS it is a UTC-based Date.
         "timestamp" => "Date".to_string(),
         // `decimal` is CBOR tag 4 on the wire; the in-memory type is selectable.
@@ -431,47 +432,7 @@ fn builtin(name: &str, mapping: DecimalMapping) -> String {
 /// inject the `CsilDecimal` helper or the `decimal.js` import)? Walks every rule
 /// and nested type position.
 pub fn spec_uses_decimal(spec: &CsilSpecSerialized) -> bool {
-    spec.rules.iter().any(rule_uses_decimal)
-}
-
-fn rule_uses_decimal(rule: &CsilRule) -> bool {
-    match &rule.rule_type {
-        CsilRuleType::TypeDef(t) => type_uses_decimal(t),
-        CsilRuleType::TypeChoice(choices) => choices.iter().any(type_uses_decimal),
-        CsilRuleType::GroupDef(g) => group_uses_decimal(g),
-        CsilRuleType::GroupChoice(groups) => groups.iter().any(group_uses_decimal),
-        CsilRuleType::ServiceDef(def) => def
-            .operations
-            .iter()
-            .any(|op| type_uses_decimal(&op.input_type) || type_uses_decimal(&op.output_type)),
-    }
-}
-
-fn group_uses_decimal(group: &CsilGroupExpression) -> bool {
-    group
-        .entries
-        .iter()
-        .any(|e| type_uses_decimal(&e.value_type))
-}
-
-fn type_uses_decimal(type_expr: &CsilTypeExpression) -> bool {
-    match type_expr {
-        CsilTypeExpression::Builtin(name) => name == "decimal",
-        CsilTypeExpression::Array { element_type, .. } => type_uses_decimal(element_type),
-        CsilTypeExpression::Map { key, value, .. } => {
-            type_uses_decimal(key) || type_uses_decimal(value)
-        }
-        CsilTypeExpression::Choice(choices) => choices.iter().any(type_uses_decimal),
-        CsilTypeExpression::Constrained { base_type, .. } => type_uses_decimal(base_type),
-        CsilTypeExpression::Group(group) | CsilTypeExpression::Tuple(group) => {
-            group_uses_decimal(group)
-        }
-        CsilTypeExpression::Reference(_)
-        | CsilTypeExpression::Range { .. }
-        | CsilTypeExpression::Socket(_)
-        | CsilTypeExpression::Plug(_)
-        | CsilTypeExpression::Literal(_) => false,
-    }
+    spec.uses_builtin("decimal")
 }
 
 /// Whether any operation signature across these services places a `decimal`
@@ -484,8 +445,8 @@ fn type_uses_decimal(type_expr: &CsilTypeExpression) -> bool {
 pub fn services_use_decimal_inline(services: &[(&str, &CsilServiceDefinition)]) -> bool {
     services.iter().any(|(_, def)| {
         def.operations.iter().any(|op| {
-            type_uses_decimal(&op.input_type)
-                || type_uses_decimal(&success_type(op.success_output()))
+            op.input_type.uses_builtin("decimal")
+                || success_type(op.success_output()).uses_builtin("decimal")
         })
     })
 }

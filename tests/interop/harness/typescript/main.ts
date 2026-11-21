@@ -75,6 +75,7 @@ function scalarsOk(): Scalars {
     t: "héllo 世界",
     raw: new Uint8Array([0x01, 0x02, 0xf0, 0xff]),
     flag: true,
+    due: "2000-02-29",
     when: new Date("2026-06-29T12:34:56Z"),
     amount: CsilDecimal.fromString("123.45"),
     // mixed-union coverage: a value equal to a literal arm must wire as

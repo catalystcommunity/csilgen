@@ -972,6 +972,7 @@ fn elixir_sample(
     };
     match base {
         CsilTypeExpression::Builtin(name) => match name.as_str() {
+            "date" => "~D[1970-01-01]".to_string(),
             "text" | "tstr" => "\"example\"".to_string(),
             "bool" => "false".to_string(),
             "bytes" | "bstr" => "<<>>".to_string(),
@@ -1674,6 +1675,8 @@ fn union_guard(ty: &CsilTypeExpression, expr: &str) -> String {
         CsilTypeExpression::Builtin(name) => match name.as_str() {
             "int" | "uint" | "nint" => format!("is_integer({expr})"),
             "float" | "double" | "float16" | "float32" | "float64" => format!("is_float({expr})"),
+            "timestamp" => format!("is_struct({expr}, DateTime)"),
+            "date" => format!("is_struct({expr}, Date)"),
             "text" | "tstr" | "bytes" | "bstr" => format!("is_binary({expr})"),
             "bool" | "true" | "false" => format!("is_boolean({expr})"),
             _ => "true".to_string(),
@@ -1804,6 +1807,7 @@ fn enc_value(ty: &CsilTypeExpression, expr: &str, cx: &Codec) -> Doc {
             "text" | "tstr" => Doc::flat(format!("{{:text, {expr}}}")),
             "bytes" | "bstr" => Doc::flat(format!("{{:bytes, {expr}}}")),
             "bool" | "true" | "false" => Doc::flat(format!("{{:bool, {expr}}}")),
+            "date" => Doc::flat(format!("{}.Cbor.enc_date({expr})", cx.config.module_root)),
             // CBOR tag 0 RFC3339 UTC instant; normalize through ISO 8601 text.
             "timestamp" => Doc::Tuple(vec![
                 Doc::flat(":tag"),
@@ -1990,6 +1994,7 @@ fn dec_value(ty: &CsilTypeExpression, expr: &str, cx: &Codec) -> Doc {
             "text" | "tstr" => call1(format!("{root}.Cbor.to_text"), expr),
             "bytes" | "bstr" => call1(format!("{root}.Cbor.to_bytes"), expr),
             "bool" | "true" | "false" => call1(format!("{root}.Cbor.to_bool"), expr),
+            "date" => call1(format!("{root}.Cbor.as_date"), expr),
             "timestamp" => Doc::Case {
                 subject: expr.to_string(),
                 clauses: vec![(
@@ -2975,6 +2980,18 @@ fn generate_validation(input: &WasmGeneratorInput, config: &ElixirConfig) -> Opt
             }
             if let CsilTypeExpression::Constrained { constraints, .. } = &entry.value_type {
                 for op in constraints {
+                    if matches!(&entry.value_type, CsilTypeExpression::Constrained {base_type, ..}
+                        if matches!(base_type.as_ref(), CsilTypeExpression::Builtin(n) if n == "date"))
+                        && let Some((cmp, bound)) = op.text_comparison()
+                    {
+                        checks.push(guard_clause(
+                            &atom,
+                            optional,
+                            Doc::flat(format!("Date.to_iso8601(v.{atom}) {cmp} {bound:?}")),
+                            &format!("field '{atom}' must be {cmp} {bound}"),
+                        ));
+                        continue;
+                    }
                     emit_control_check(&mut checks, &atom, optional, size_fn, decimal, op);
                 }
             }
@@ -3443,6 +3460,7 @@ fn map_builtin(name: &str, config: &ElixirConfig) -> String {
         "text" | "tstr" => "String.t()".to_string(),
         "bytes" | "bstr" => "binary()".to_string(),
         "bool" | "true" | "false" => "boolean()".to_string(),
+        "date" => "Date.t()".to_string(),
         // CBOR tag 0 RFC3339 UTC instant.
         "timestamp" => "DateTime.t()".to_string(),
         // CBOR tag 4 exact decimal. Elixir has no stdlib decimal; the value rides as
@@ -3773,6 +3791,19 @@ const CODEC_RUNTIME_ELIXIR: &str = r#"  @moduledoc """
 
   @doc "Unwraps a CBOR text item."
   @spec to_text(value()) :: binary()
+  def enc_date(%Date{calendar: Calendar.ISO} = date) do
+    text = Date.to_iso8601(date)
+    tag = {:tag, 1004, {:text, text}}
+    as_date(tag)
+    tag
+  end
+
+  def as_date({:tag, 1004, {:text, text}}) when byte_size(text) == 10 do
+    date = Date.from_iso8601!(text)
+    ^text = Date.to_iso8601(date)
+    date
+  end
+
   def to_text({:text, s}), do: s
 
   @doc "Unwraps a CBOR byte-string item."

@@ -227,8 +227,13 @@ The generic value keeps these distinctions:
 - arrays;
 - maps as key and value pairs;
 - known and unknown semantic tags;
-- tag 4 decimals as exact exponent and mantissa integers; and
+- tag 4 decimals with an exact exponent and mantissa
+- tag 1004 calendar dates with valid `YYYY-MM-DD` text
 - tag 0 and tag 1 timestamps with the original tag.
+
+The descriptor stores the calendar date as the builtin `date`. Its ordered
+controls store text bounds. The diagnostic decoder compares valid dates in
+calendar order.
 
 The decoder rejects truncated input, invalid UTF-8, unsafe declared lengths,
 trailing bytes, and values deeper than 64 levels.

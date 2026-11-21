@@ -14,7 +14,7 @@ import json
 import socket
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from decimal import Decimal
 
 from csilgen_transport.carrier import StreamCarrier
@@ -77,6 +77,7 @@ def scalars_ok() -> Scalars:
         t="héllo 世界",
         raw=bytes([0x01, 0x02, 0xF0, 0xFF]),
         flag=True,
+        due=date(2000, 2, 29),
         when=ts(),
         amount=Decimal("123.45"),
         # mixed-union coverage: a value equal to a literal arm must wire as

@@ -38,6 +38,7 @@ internal static class Harness
         T = "héllo 世界",
         Raw = new byte[] { 0x01, 0x02, 0xf0, 0xff },
         Flag = true,
+        Due = new DateOnly(2000, 2, 29),
         When = Ts(),
         Amount = CsilDecimal.Parse("123.45"),
         // mixed-union coverage: a value equal to a literal arm must wire as
@@ -106,7 +107,7 @@ internal static class Harness
 
     private static bool ScalarsEq(Scalars a, Scalars b) =>
         a.I == b.I && a.U == b.U && a.N == b.N && a.F.Equals(b.F) && a.T == b.T
-        && a.Raw.SequenceEqual(b.Raw) && a.Flag == b.Flag && a.When == b.When
+        && a.Raw.SequenceEqual(b.Raw) && a.Flag == b.Flag && a.Due == b.Due && a.When == b.When
         && a.Amount.CompareTo(b.Amount) == 0
         && a.StatusLiteral.Equals(b.StatusLiteral) && a.StatusFree.Equals(b.StatusFree)
         && a.Note.Equals(b.Note) && a.Size == b.Size && a.Level == b.Level && a.Season == b.Season

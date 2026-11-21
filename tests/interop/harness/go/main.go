@@ -110,6 +110,7 @@ func scalarsOK() interopapi.Scalars {
 		T:      "héllo 世界",
 		Raw:    []byte{0x01, 0x02, 0xf0, 0xff},
 		Flag:   true,
+		Due:    "2000-02-29",
 		When:   ts(),
 		Amount: mustDecimal("123.45"),
 		// mixed-union coverage: a value equal to a literal arm must wire as

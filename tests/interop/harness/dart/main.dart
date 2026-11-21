@@ -45,6 +45,7 @@ Scalars scalarsOk() => Scalars(
       t: 'héllo 世界',
       raw: Uint8List.fromList([0x01, 0x02, 0xf0, 0xff]),
       flag: true,
+      due: '2000-02-29',
       when_: DateTime.parse('2026-06-29T12:34:56Z').toUtc(),
       amount: CsilDecimal.parse('123.45'),
       // mixed-union coverage: a value equal to a literal arm must wire as

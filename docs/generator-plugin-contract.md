@@ -367,7 +367,7 @@ bytes.
 *runtime codec* — code that claims to encode/decode CSIL types as CBOR bytes
 interoperable with other CSIL implementations — MUST additionally conform to
 [`docs/cbor-wire-contract.md`](cbor-wire-contract.md): map keying by verbatim CSIL
-field name, the scalar/tag encodings (including `timestamp`/tag 0 and
+field name, the scalar/tag encodings (including `date`/tag 1004, `timestamp`/tag 0, and
 `decimal`/tag 4), enum-vs-union choice classification, hoisted-name conventions for
 synthesized types, and decoder strictness. A generator that also emits clients
 and/or servers over that codec MUST further conform to whichever transport

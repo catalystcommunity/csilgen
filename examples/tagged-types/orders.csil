@@ -34,6 +34,7 @@ line_item = {
 
 order = {
     id: order_id,
+    ? due: date .ge "2000-01-01",
     placed_at: timestamp,
     items: [1* line_item],
     subtotal: decimal .ge "0.00",

@@ -25,6 +25,10 @@ pub fn generate(input: &WasmGeneratorInput) -> String {
         out.push('\n');
     }
 
+    if spec.uses_builtin("date") {
+        out.push_str(CALENDAR_DATE);
+    }
+
     // Emit the synthetic transport error unless the spec already declares one
     if common::has_services(spec) && !declares_service_error(spec) {
         out.push_str(SERVICE_ERROR);
@@ -128,6 +132,16 @@ pub fn generate(input: &WasmGeneratorInput) -> String {
 
     out
 }
+
+const CALENDAR_DATE: &str = r#"export function isCalendarDate(value: unknown): value is string {
+  if (typeof value !== "string" || value.length !== 10 || !/^\d{4}-\d{2}-\d{2}$/.test(value)) return false;
+  const [year, month, day] = value.split("-").map(Number);
+  const leap = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
+  const days = [31, leap ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+  return month >= 1 && month <= 12 && day >= 1 && day <= days[month - 1];
+}
+
+"#;
 
 const SERVICE_ERROR: &str = "\
 export interface ServiceError {
@@ -539,6 +553,7 @@ enum CompareKind {
     Decimal,
     /// `timestamp`: compare chronologically via `Date.getTime()`.
     Timestamp,
+    Date,
     /// Anything else (e.g. text): keep the literal-against-literal comparison.
     Plain,
 }
@@ -553,6 +568,7 @@ fn compare_kind(type_expr: &CsilTypeExpression) -> CompareKind {
     match base {
         CsilTypeExpression::Builtin(name) => match name.as_str() {
             "decimal" => CompareKind::Decimal,
+            "date" => CompareKind::Date,
             "timestamp" => CompareKind::Timestamp,
             "int" | "uint" | "integer" | "float" | "float16" | "float32" | "float64" | "number" => {
                 CompareKind::Numeric
@@ -577,6 +593,14 @@ fn scoped_checks(
 ) -> Vec<String> {
     let inner_indent = if optional { "    " } else { "  " };
     let mut checks = Vec::new();
+    if matches!(kind, CompareKind::Date) {
+        checks.push(guard(
+            inner_indent,
+            &format!("!isCalendarDate({access})"),
+            "expected YYYY-MM-DD",
+            access,
+        ));
+    }
     for op in constraints {
         if let Some(line) = control_check(access, op, inner_indent, kind, mapping, hoist) {
             checks.push(line);
@@ -769,7 +793,9 @@ fn cmp(
         CompareKind::Timestamp => {
             format!("{access}.getTime() {op} new Date({lit}).getTime()")
         }
-        CompareKind::Numeric | CompareKind::Plain => format!("{access} {op} {lit}"),
+        CompareKind::Date | CompareKind::Numeric | CompareKind::Plain => {
+            format!("{access} {op} {lit}")
+        }
     };
     guard(indent, &condition, &format!("{message} {lit}"), access)
 }

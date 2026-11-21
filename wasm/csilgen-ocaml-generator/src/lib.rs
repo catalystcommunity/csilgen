@@ -633,6 +633,7 @@ fn ocaml_sample(spec: &CsilSpecSerialized, ty: &CsilTypeExpression) -> String {
             "bool" => "false".to_string(),
             "float" => "0.0".to_string(),
             "bytes" | "bstr" => "(Bytes.of_string \"\")".to_string(),
+            "date" => "\"1970-01-01\"".to_string(),
             "timestamp" => "\"1970-01-01T00:00:00Z\"".to_string(),
             "decimal" => "\"0\"".to_string(),
             "int" | "uint" => "0L".to_string(),
@@ -1220,6 +1221,7 @@ fn map_type(type_expr: &CsilTypeExpression) -> String {
             "text" | "tstr" => "string".to_string(),
             "bytes" | "bstr" => "bytes".to_string(),
             "bool" => "bool".to_string(),
+            "date" => "string".to_string(),
             // CBOR tag 0 RFC3339 text and CBOR tag 4 exact decimal: OCaml's stdlib
             // has neither a datetime nor a decimal type, so both are carried as
             // their exact wire text and documented at the field.
@@ -2160,6 +2162,21 @@ fn codec_aliases(
         .collect()
 }
 
+fn bounded_date(expr: &str, controls: &[csilgen_common::CsilControlOperator]) -> String {
+    let checks: Vec<_> = controls
+        .iter()
+        .filter_map(|op| op.text_comparison())
+        .map(|(op, bound)| format!("day {op} {bound:?}"))
+        .collect();
+    if checks.is_empty() {
+        return expr.into();
+    }
+    format!(
+        "(let day = {expr} in if {} then day else invalid_arg \"date outside bounds\")",
+        checks.join(" && ")
+    )
+}
+
 /// An OCaml expression encoding `expr` (a value of OCaml type for `ty`) to a
 /// `Cbor.t`. Unsupported shapes raise at runtime via `failwith` (and never on the
 /// corndogs/round-trip path), keeping the generated module well-typed.
@@ -2171,6 +2188,13 @@ fn enc_value(
     aliases: &std::collections::HashMap<String, CsilTypeExpression>,
 ) -> String {
     match ty {
+        CsilTypeExpression::Constrained {
+            base_type,
+            constraints,
+        } if matches!(base_type.as_ref(), CsilTypeExpression::Builtin(n) if n == "date") => {
+            let checked = bounded_date(expr, constraints);
+            enc_value(base_type, &checked, records, choices, aliases)
+        }
         CsilTypeExpression::Constrained { base_type, .. } => {
             enc_value(base_type, expr, records, choices, aliases)
         }
@@ -2180,6 +2204,7 @@ fn enc_value(
             "text" | "tstr" => format!("(Cbor.Text {expr})"),
             "bytes" | "bstr" => format!("(Cbor.Bytes {expr})"),
             "bool" => format!("(Cbor.Bool {expr})"),
+            "date" => format!("(Cbor.Tag (1004, Cbor.Text (Cbor.calendar_date {expr})))"),
             "timestamp" => format!("(Cbor.Tag (0, Cbor.Text {expr}))"),
             "decimal" => format!("(Cbor.decimal_to_cbor {expr})"),
             // `any` is already a `Csil_cbor.t` value, so it passes straight through.
@@ -2248,6 +2273,16 @@ fn dec_value(
     aliases: &std::collections::HashMap<String, CsilTypeExpression>,
 ) -> String {
     match ty {
+        CsilTypeExpression::Constrained {
+            base_type,
+            constraints,
+        } if matches!(base_type.as_ref(), CsilTypeExpression::Builtin(n) if n == "date") => {
+            let checked = bounded_date(
+                &dec_value(base_type, expr, records, choices, aliases),
+                constraints,
+            );
+            checked
+        }
         CsilTypeExpression::Constrained { base_type, .. } => {
             dec_value(base_type, expr, records, choices, aliases)
         }
@@ -2257,6 +2292,9 @@ fn dec_value(
             "text" | "tstr" => format!("(Cbor.to_text {expr})"),
             "bytes" | "bstr" => format!("(Cbor.to_bytes {expr})"),
             "bool" => format!("(Cbor.to_bool {expr})"),
+            "date" => format!(
+                "(match {expr} with Cbor.Tag (1004, Cbor.Text s) -> Cbor.calendar_date s | _ -> failwith \"expected calendar date tag 1004\")"
+            ),
             "timestamp" => format!(
                 "(match {expr} with Cbor.Tag (0, Cbor.Text csil_s) -> csil_s | _ -> failwith \"csilgen: bad timestamp\")"
             ),
@@ -2573,6 +2611,7 @@ fn is_primitive_builtin(name: &str) -> bool {
             | "bytes"
             | "bstr"
             | "bool"
+            | "date"
             | "timestamp"
             | "decimal"
             | "nil"
@@ -3192,6 +3231,18 @@ let decode (b : bytes) : (t, string) result =
   | _ -> Error "csilgen: malformed cbor"
 
 let to_i64 = function Uint n | Nint n -> n | _ -> failwith "csilgen: expected int"
+let calendar_date s =
+  let bad () = invalid_arg "expected YYYY-MM-DD" in
+  if String.length s <> 10 || s.[4] <> '-' || s.[7] <> '-' then bad ();
+  String.iteri (fun i c ->
+    if i <> 4 && i <> 7 && (c < '0' || c > '9') then bad ()) s;
+  let number pos len = int_of_string (String.sub s pos len) in
+  let y = number 0 4 and m = number 5 2 and d = number 8 2 in
+  let leap = y mod 4 = 0 && (y mod 100 <> 0 || y mod 400 = 0) in
+  let days = [|31; (if leap then 29 else 28); 31;30;31;30;31;31;30;31;30;31|] in
+  if m < 1 || m > 12 || d < 1 || d > days.(m-1) then bad ();
+  s
+
 let to_text = function Text s -> s | _ -> failwith "csilgen: expected text"
 let to_bytes = function Bytes b -> b | _ -> failwith "csilgen: expected bytes"
 let to_bool = function Bool b -> b | _ -> failwith "csilgen: expected bool"

@@ -53,6 +53,7 @@ fn scalarsOk() Scalars {
         .t = "héllo 世界",
         .raw = &[_]u8{ 0x01, 0x02, 0xf0, 0xff },
         .flag = true,
+        .due = "2000-02-29",
         .when = .{ .rfc3339 = "2026-06-29T12:34:56Z", .epoch_seconds = 0 },
         // 123.45 == 12345 * 10^-2.
         .amount = .{ .exponent = -2, .mantissa = 12345 },
@@ -175,6 +176,7 @@ fn scalarsNoteEql(a: gen_types.Scalars_note, b: gen_types.Scalars_note) bool {
 fn scalarsEql(a: Scalars, b: Scalars) bool {
     return a.i == b.i and a.u == b.u and a.n == b.n and a.f == b.f and
         streq(a.t, b.t) and std.mem.eql(u8, a.raw, b.raw) and a.flag == b.flag and
+        streq(a.due, b.due) and
         streq(a.when.rfc3339, b.when.rfc3339) and
         a.amount.exponent == b.amount.exponent and a.amount.mantissa == b.amount.mantissa and
         mixedStatusEql(a.status_literal, b.status_literal) and

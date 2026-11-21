@@ -1,12 +1,13 @@
 # Tagged core types & CBOR constraints
 
-`orders.csil` demonstrates the two tagged CSIL core types and the full constraint
+`orders.csil` demonstrates the three tagged CSIL core types and the full constraint
 surface, generated consistently across every target.
 
 ## The tagged types
 
 | CSIL        | CBOR     | Meaning                                              |
 | ----------- | -------- | --------------------------------------------------- |
+| `date`      | tag 1004 | Gregorian calendar day in `YYYY-MM-DD` format |
 | `timestamp` | tag 0    | RFC3339 text instant, **always serialized in UTC**  |
 | `decimal`   | tag 4    | exact base-10 value (decimal fraction), never a float |
 

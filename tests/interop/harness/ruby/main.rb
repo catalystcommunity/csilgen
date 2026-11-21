@@ -52,6 +52,7 @@ def scalars_ok
     t: "héllo 世界",
     raw: "\x01\x02\xf0\xff".b,
     flag: true,
+    due: Date.new(2000, 2, 29),
     when: ts,
     amount: BigDecimal("123.45"),
     # mixed-union coverage: a value equal to a literal arm must wire as

@@ -911,6 +911,7 @@ fn java_sample(input: &WasmGeneratorInput, ty: &CsilTypeExpression) -> String {
             "bytes" | "bstr" => "new byte[0]".to_string(),
             "int" | "uint" | "nint" => "0L".to_string(),
             "float" | "float64" | "double" => "0.0".to_string(),
+            "date" => "java.time.LocalDate.of(1970, 1, 1)".to_string(),
             "timestamp" => "java.time.Instant.now()".to_string(),
             "decimal" => "java.math.BigDecimal.ZERO".to_string(),
             _ => "null".to_string(),
@@ -1177,6 +1178,7 @@ const KNOWN_IMPORTS: &[&str] = &[
     "java.math.BigDecimal",
     "java.math.BigInteger",
     "java.nio.charset.StandardCharsets",
+    "java.time.LocalDate",
     "java.time.Instant",
     "java.util.ArrayList",
     "java.util.Arrays",
@@ -1508,11 +1510,11 @@ fn ordered_guard(
                 &format!("field '{field}' must be {desc} {text}"),
             )
         }
-        "java.time.Instant" => {
+        "java.time.Instant" | "java.time.LocalDate" => {
             let Some(text) = literal_as_text(value) else {
                 return String::new();
             };
-            let bound = format!("java.time.Instant.parse({})", java_string(&text));
+            let bound = format!("{jtype}.parse({})", java_string(&text));
             let cond = match op {
                 "<" => format!("{field}.isBefore({bound})"),
                 ">" => format!("{field}.isAfter({bound})"),
@@ -1901,6 +1903,7 @@ fn java_enc_value(
             "text" | "tstr" => format!("new CborText({expr})"),
             "bytes" | "bstr" => format!("new CborBytes({expr})"),
             "bool" => format!("new CborBool({expr})"),
+            "date" => format!("encDate({expr})"),
             "timestamp" => format!("encTimestamp({expr})"),
             "decimal" => format!("encDecimal({expr})"),
             // `any` already holds the codec's own value tree; it passes through verbatim.
@@ -2014,6 +2017,7 @@ fn java_dec_value(
             "text" | "tstr" => format!("asText({expr})"),
             "bytes" | "bstr" => format!("asBytes({expr})"),
             "bool" => format!("asBool({expr})"),
+            "date" => format!("asDate({expr})"),
             "timestamp" => format!("asTimestamp({expr})"),
             "decimal" => format!("asDecimal({expr})"),
             // `any` is the decoded CBOR value tree passed through verbatim.
@@ -2771,6 +2775,9 @@ fn generate_codec(input: &WasmGeneratorInput, config: &JavaConfig) -> Option<Gen
     code.push_str(CODEC_RUNTIME_JAVA);
     // The tagged-core (de)serializers are only worth their JDK imports when the spec
     // actually uses the type; the body references the helper iff a field needs it.
+    if body.contains("encDate(") || body.contains("asDate(") {
+        code.push_str(CODEC_DATE_JAVA);
+    }
     if body.contains("Timestamp(") {
         code.push('\n');
         code.push_str(CODEC_TIMESTAMP_JAVA);
@@ -3188,6 +3195,7 @@ fn map_type(type_expr: &CsilTypeExpression) -> String {
             "text" | "tstr" => "String".to_string(),
             "bytes" | "bstr" => "byte[]".to_string(),
             "bool" => "boolean".to_string(),
+            "date" => "java.time.LocalDate".to_string(),
             // CBOR tag 0, RFC3339, always UTC — Instant is the UTC instant type.
             "timestamp" => "java.time.Instant".to_string(),
             // CBOR tag 4 exact decimal fraction — BigDecimal is Java's exact decimal.
@@ -3928,6 +3936,22 @@ const CODEC_RUNTIME_JAVA: &str = r#"    /** A minimal canonical-CBOR value tree:
             out.put(kf.apply(e.key()), vf.apply(e.val()));
         }
         return out;
+    }
+"#;
+
+const CODEC_DATE_JAVA: &str = r#"
+    public static CborValue encDate(java.time.LocalDate date) {
+        String text = date.toString();
+        if (text.length() != 10) throw new CsilCborException("date requires a four-digit year");
+        return new CborTag(1004, new CborText(text));
+    }
+
+    public static java.time.LocalDate asDate(CborValue value) {
+        if (value instanceof CborTag tag && tag.num() == 1004 && tag.inner() instanceof CborText text
+                && text.value().length() == 10) {
+            return java.time.LocalDate.parse(text.value());
+        }
+        throw new CsilCborException("expected tag 1004 with YYYY-MM-DD text");
     }
 "#;
 
