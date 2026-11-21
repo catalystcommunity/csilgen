@@ -1,0 +1,13 @@
+include "replies.csil"
+options {
+    emit_packages: ["typescript"],
+    lint_text_enums: "off"
+}
+
+Status = "busy" / "ready"
+Reading = { code: RpErrorCode, status: Status, price: decimal }
+
+service Meter {
+    submit: [* Reading] -> decimal,
+    stream: Reading <-> Reading
+}

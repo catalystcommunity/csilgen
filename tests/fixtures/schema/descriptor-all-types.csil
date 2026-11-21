@@ -1,4 +1,6 @@
 include "descriptor-shared.csil"
+options { lint_rule_names: "off", lint_text_enums: "off" }
+
 
 IntRange = -10..10
 LiteralEnum = "first" / "second" / "third"

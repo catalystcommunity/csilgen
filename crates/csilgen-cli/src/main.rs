@@ -392,7 +392,8 @@ fn report_lint_results(
                     issue.rule_name, issue.message
                 );
                 if issue.rule_name == csilgen_core::TEXT_ENUM_LINT_OPTION
-                    || (fail_on_warnings && issue.severity != csilgen_core::LintSeverity::Info)
+                    || issue.severity == csilgen_core::LintSeverity::Error
+                    || (fail_on_warnings && issue.severity == csilgen_core::LintSeverity::Warning)
                 {
                     reporter.report_info(&message)?;
                 } else {

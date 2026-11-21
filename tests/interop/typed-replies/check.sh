@@ -63,8 +63,14 @@ EOF
         ./peer ;;
     typescript)
         cp "$fixture/peer.ts" .
-        # The generated imports use .ts. Compile with TypeScript 5.7 or later.
-        npx --offline --package=typescript tsc --target es2022 --module commonjs --strict --rewriteRelativeImportExtensions --outDir dist *.ts
+        node --test peer.ts
+        if command -v tsc >/dev/null; then tsc_cmd=(tsc); else tsc_cmd=(npx --offline --package=typescript@5 tsc); fi
+        for surface in typescript typescript-typesonly typescript-client typescript-server; do
+            (cd "$root" && "$compiler" generate -q -i "$fixture/strip-types.csil" -t "$surface" -o "$work/$surface")
+            cp "$fixture/strip-types.ts" "$surface/"
+            (cd "$surface" && "${tsc_cmd[@]}" --noEmit --erasableSyntaxOnly && node --test strip-types.ts)
+        done
+        "${tsc_cmd[@]}" --erasableSyntaxOnly --target es2022 --module commonjs --strict --rewriteRelativeImportExtensions --outDir dist *.ts
         node dist/peer.js ;;
     zig) cp "$fixture/peer.zig" .; zig test peer.zig ;;
     *) echo "Unsupported target $lang" >&2; exit 1 ;;

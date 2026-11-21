@@ -1,3 +1,5 @@
+options { lint_rule_names: "off" }
+
 ; Complex array and map structures test case
 
 ; Arrays with complex cardinality

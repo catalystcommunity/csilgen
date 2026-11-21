@@ -1,3 +1,5 @@
+options { lint_rule_names: "off" }
+
 ; Tagged CSIL core types: timestamp is CBOR tag 0 (RFC3339 text, always UTC)
 ; and decimal is CBOR tag 4 (exact decimal fraction).
 created_at = timestamp

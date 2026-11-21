@@ -1,3 +1,5 @@
+options { lint_rule_names: "off" }
+
 ; Arrays and maps test case
 names = [* text]
 ages = [1*10 int]

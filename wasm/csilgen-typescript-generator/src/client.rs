@@ -109,9 +109,22 @@ pub fn generate(input: &WasmGeneratorInput, shape: ClientShape) -> Result<String
     imports.sort();
     imports.dedup();
     let mut any_import = false;
+    let default_types_module = ext.specifier(TYPES_STEM);
+    let module = string_option(input, "client_types_module", &default_types_module);
+    let decodes_csil_decimal = codec_imports.remove("CsilDecimal");
+    if decodes_csil_decimal
+        || (common::services_use_decimal_inline(&services)
+            && (!codec_imports.is_empty() || needs_service_error))
+    {
+        match mapping {
+            DecimalMapping::Csil => {
+                out.push_str(&format!("import {{ CsilDecimal }} from \"{module}\";\n"))
+            }
+            DecimalMapping::Library => out.push_str("import type Decimal from \"decimal.js\";\n"),
+        }
+        any_import = true;
+    }
     if !imports.is_empty() {
-        let default_types_module = ext.specifier(TYPES_STEM);
-        let module = string_option(input, "client_types_module", &default_types_module);
         out.push_str(&format!(
             "import type {{ {} }} from \"{module}\";\n",
             imports.join(", ")
@@ -120,6 +133,9 @@ pub fn generate(input: &WasmGeneratorInput, shape: ClientShape) -> Result<String
     }
     // The typed methods call the generated `to<T>Cbor`/`from<T>Cbor` (and, for the
     // rpc-mode poll path, the value-tree helpers); import exactly those from the codec.
+    if codec_imports.remove("CborValue") {
+        codec_imports.insert("type CborValue".into());
+    }
     if !codec_imports.is_empty() {
         let default_codec_module = ext.specifier(CODEC_STEM);
         let module = string_option(input, "client_codec_module", &default_codec_module);
@@ -202,7 +218,7 @@ fn service_class(
 
     let mut out = format!("export class {class} {{\n");
     out.push_str(&format!(
-        "  constructor(private readonly t: {transport}) {{}}\n"
+        "  private readonly t: {transport};\n\n  constructor(t: {transport}) {{\n    this.t = t;\n  }}\n"
     ));
 
     for op in &def.operations {

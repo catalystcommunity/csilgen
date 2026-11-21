@@ -40,6 +40,9 @@ tests/interop/typed-replies/run.sh
 Run the same operation with the other language targets. Each test needs
 the compiler or runtime for its target. The JSON and OpenAPI tests check
 the schema references for multiple error arms and for a named success union.
+The TypeScript check needs Node 22.18 or later and TypeScript 5.8 or later.
+It imports each target directly in Node and runs the typed-replies peer
+from both TypeScript source and compiled JavaScript.
 
 ```bash
 for target in c csharp dart elixir java kotlin ocaml php python ruby swift typescript zig json openapi; do

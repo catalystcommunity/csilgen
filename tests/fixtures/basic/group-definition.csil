@@ -1,3 +1,5 @@
+options { lint_rule_names: "off" }
+
 ; Group definition test case
 person = {
   name: text,

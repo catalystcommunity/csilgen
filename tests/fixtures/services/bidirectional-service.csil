@@ -1,3 +1,5 @@
+options { lint_text_enums: "off" }
+
 ; Bidirectional service definitions for real-time communication
 
 ; Chat message types

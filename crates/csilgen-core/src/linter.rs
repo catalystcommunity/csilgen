@@ -8,7 +8,7 @@ use anyhow::Result;
 use std::path::Path;
 
 /// Different severity levels for lint issues
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum LintSeverity {
     Error,
     Warning,
@@ -41,7 +41,7 @@ pub const TEXT_ENUM_LINT_OPTION: &str = "lint_text_enums";
 /// Configuration for CSIL linting
 #[derive(Debug, Clone)]
 pub struct LintConfig {
-    /// Whether to enforce snake_case naming convention
+    /// Whether to check type, field, and operation naming conventions
     pub enforce_snake_case: bool,
     /// Optional severity for enums that transmit text labels.
     pub text_enum_severity: Option<LintSeverity>,
@@ -77,7 +77,7 @@ impl Default for LintConfig {
             warn_doc_comments: true,
             warn_degenerate_constraints: true,
             max_rule_name_length: 64,
-            disallow_unused_rules: true,
+            disallow_unused_rules: false,
             enforce_consistent_metadata: true,
             check_incomplete_services: true,
             check_complexity: true,
@@ -153,45 +153,96 @@ impl LintResult {
     }
 }
 
+/// Resolve each policy against the options of the file that owns the rule.
+struct FileLintConfig<'a> {
+    base: &'a LintConfig,
+    rule_names: Option<LintSeverity>,
+    field_names: Option<LintSeverity>,
+    operation_names: Option<LintSeverity>,
+    text_enums: Option<LintSeverity>,
+    unused_rules: Option<LintSeverity>,
+    doc_comments: Option<LintSeverity>,
+    rule_length: Option<LintSeverity>,
+    zero_minimum: Option<LintSeverity>,
+    empty_service: Option<LintSeverity>,
+    nesting_depth: Option<LintSeverity>,
+}
+
+impl<'a> FileLintConfig<'a> {
+    fn new(spec: &CsilSpec, base: &'a LintConfig, result: &mut LintResult) -> Self {
+        let mut policy = |key: &str, default| {
+            let mut entries = spec
+                .options
+                .iter()
+                .flat_map(|o| &o.entries)
+                .filter(|e| e.key == key);
+            let Some(entry) = entries.next() else {
+                return default;
+            };
+            let message = if entries.next().is_some() {
+                format!("Set {key} only once per file.")
+            } else {
+                if let crate::ast::LiteralValue::Text(value) = &entry.value {
+                    match value.as_str() {
+                        "off" => return None,
+                        "warn" => return Some(LintSeverity::Warning),
+                        "error" => return Some(LintSeverity::Error),
+                        _ => {}
+                    }
+                }
+                format!(r#"Expected "off", "warn", or "error" for {key}."#)
+            };
+            result.add_simple_issue(LintSeverity::Error, key.into(), message);
+            default
+        };
+        let warn = Some(LintSeverity::Warning);
+        let naming = base.enforce_snake_case.then_some(LintSeverity::Warning);
+        Self {
+            base,
+            rule_names: policy("lint_rule_names", naming),
+            field_names: policy("lint_field_names", naming),
+            operation_names: policy("lint_operation_names", naming),
+            text_enums: policy(TEXT_ENUM_LINT_OPTION, base.text_enum_severity),
+            unused_rules: policy(
+                "lint_unused_rules",
+                base.disallow_unused_rules.then_some(LintSeverity::Warning),
+            ),
+            doc_comments: policy(
+                "lint_doc_comments",
+                base.warn_doc_comments.then_some(LintSeverity::Warning),
+            ),
+            rule_length: policy("lint_rule_length", warn),
+            zero_minimum: policy(
+                "lint_zero_minimum",
+                base.warn_degenerate_constraints
+                    .then_some(LintSeverity::Warning),
+            ),
+            empty_service: policy(
+                "lint_empty_service",
+                base.check_incomplete_services
+                    .then_some(LintSeverity::Warning),
+            ),
+            nesting_depth: policy(
+                "lint_nesting_depth",
+                base.check_complexity.then_some(LintSeverity::Warning),
+            ),
+        }
+    }
+}
+
 /// Lint a CSIL specification
 pub fn lint_spec(spec: &CsilSpec, config: &LintConfig) -> Result<LintResult> {
     let mut result = LintResult::new();
-
-    let mut config = config.clone();
-    if let Some(options) = &spec.options {
-        let mut entries = options
-            .entries
-            .iter()
-            .filter(|e| e.key == TEXT_ENUM_LINT_OPTION);
-        if let Some(entry) = entries.next() {
-            let level = match &entry.value {
-                crate::ast::LiteralValue::Text(level) => Some(level.as_str()),
-                _ => None,
-            };
-            let setting = match level {
-                _ if entries.next().is_some() => Err("Set lint_text_enums only once per file."),
-                Some("off") => Ok(None),
-                Some("warn") => Ok(Some(LintSeverity::Warning)),
-                Some("error") => Ok(Some(LintSeverity::Error)),
-                _ => Err(r#"Expected "off", "warn", or "error" for lint_text_enums."#),
-            };
-            match setting {
-                Ok(severity) => config.text_enum_severity = severity,
-                Err(message) => {
-                    result.add_simple_issue(LintSeverity::Error, entry.key.clone(), message.into())
-                }
-            }
-        }
-    }
+    let config = FileLintConfig::new(spec, config, &mut result);
 
     // Check each rule
     for rule in &spec.rules {
         lint_rule(rule, &config, &mut result);
     }
 
-    // Check for unused rules only if there are multiple rules
-    if config.disallow_unused_rules && spec.rules.len() > 1 {
-        check_unused_rules(spec, &mut result);
+    // Top-level types can be public entry points. Only check local use on request.
+    if let Some(severity) = config.unused_rules {
+        check_unused_rules(spec, severity, &mut result);
     }
 
     Ok(result)
@@ -200,9 +251,15 @@ pub fn lint_spec(spec: &CsilSpec, config: &LintConfig) -> Result<LintResult> {
 /// `;;;` documentation comments attach to the following definition, but they are a
 /// CSIL extension with no CDDL equivalent (CDDL has only `;` comments), so flag
 /// each definition that uses one.
-fn lint_doc_comments(rule: &Rule, result: &mut LintResult) {
+fn lint_doc_comments(rule: &Rule, severity: LintSeverity, result: &mut LintResult) {
     if !rule.doc_comments.is_empty() {
-        push_doc_comment_warning(result, &rule.name, rule.position.line, rule.position.column);
+        push_doc_comment_warning(
+            severity,
+            result,
+            &rule.name,
+            rule.position.line,
+            rule.position.column,
+        );
     }
 
     let group = match &rule.rule_type {
@@ -211,6 +268,7 @@ fn lint_doc_comments(rule: &Rule, result: &mut LintResult) {
             for op in &service.operations {
                 if !op.doc_comments.is_empty() {
                     push_doc_comment_warning(
+                        severity,
                         result,
                         &op.name,
                         op.position.line,
@@ -229,6 +287,7 @@ fn lint_doc_comments(rule: &Rule, result: &mut LintResult) {
         for entry in &group.entries {
             if !entry.doc_comments.is_empty() {
                 push_doc_comment_warning(
+                    severity,
                     result,
                     &rule.name,
                     rule.position.line,
@@ -239,9 +298,15 @@ fn lint_doc_comments(rule: &Rule, result: &mut LintResult) {
     }
 }
 
-fn push_doc_comment_warning(result: &mut LintResult, name: &str, line: usize, column: usize) {
+fn push_doc_comment_warning(
+    severity: LintSeverity,
+    result: &mut LintResult,
+    name: &str,
+    line: usize,
+    column: usize,
+) {
     result.add_issue(LintIssue {
-        severity: LintSeverity::Warning,
+        severity,
         rule_name: name.to_string(),
         message:
             "`;;;` documentation comments are a CSIL extension beyond CDDL; prefer `;;` comments"
@@ -254,37 +319,39 @@ fn push_doc_comment_warning(result: &mut LintResult, name: &str, line: usize, co
     });
 }
 
-fn lint_rule(rule: &Rule, config: &LintConfig, result: &mut LintResult) {
-    if config.warn_doc_comments {
-        lint_doc_comments(rule, result);
+fn lint_rule(rule: &Rule, config: &FileLintConfig, result: &mut LintResult) {
+    if let Some(severity) = config.doc_comments {
+        lint_doc_comments(rule, severity, result);
     }
 
     // Check naming convention
-    if config.enforce_snake_case && !is_snake_case(&rule.name) {
+    if let Some(severity) = config.rule_names
+        && !(rule.name.starts_with(char::is_uppercase)
+            && rule.name.chars().all(char::is_alphanumeric))
+    {
         result.add_issue(LintIssue {
-            severity: LintSeverity::Warning,
+            severity,
             rule_name: rule.name.clone(),
-            message: "Rule name should use snake_case convention".to_string(),
-            suggestion: Some(to_snake_case(&rule.name)),
-            auto_fixable: true,
+            message: "Rule name should use PascalCase convention".into(),
+            suggestion: Some("Rename the declaration and update its consumers.".into()),
+            // A file-local text replacement cannot update public names safely.
+            auto_fixable: false,
             line: Some(rule.position.line),
             column: Some(rule.position.column),
-            fix: Some(AutoFix {
-                description: "Convert to snake_case".to_string(),
-                old_text: rule.name.clone(),
-                new_text: to_snake_case(&rule.name),
-            }),
+            fix: None,
         });
     }
 
     // Check rule name length
-    if rule.name.len() > config.max_rule_name_length {
+    if let Some(severity) = config.rule_length
+        && rule.name.len() > config.base.max_rule_name_length
+    {
         result.add_issue(LintIssue {
-            severity: LintSeverity::Warning,
+            severity,
             rule_name: rule.name.clone(),
             message: format!(
                 "Rule name exceeds maximum length of {} characters",
-                config.max_rule_name_length
+                config.base.max_rule_name_length
             ),
             suggestion: None,
             auto_fixable: false,
@@ -336,9 +403,9 @@ fn lint_text_enum(
     arms: &[TypeExpression],
     rule_name: &str,
     result: &mut LintResult,
-    config: &LintConfig,
+    config: &FileLintConfig,
 ) {
-    let Some(severity) = &config.text_enum_severity else {
+    let Some(severity) = config.text_enums else {
         return;
     };
     fn is_text(ty: &TypeExpression) -> bool {
@@ -350,7 +417,7 @@ fn lint_text_enum(
     }
     if arms.len() > 1 && arms.iter().all(is_text) {
         result.add_issue(LintIssue {
-            severity: severity.clone(),
+            severity,
             rule_name: TEXT_ENUM_LINT_OPTION.into(),
             message: format!(
                 "{rule_name} contains a text enum. CBOR transmits the full label string."
@@ -371,7 +438,7 @@ fn lint_type_expression_with_config(
     expr: &TypeExpression,
     rule_name: &str,
     result: &mut LintResult,
-    config: &LintConfig,
+    config: &FileLintConfig,
 ) {
     // Check complexity
     lint_complexity(expr, rule_name, config, result, 0);
@@ -427,7 +494,7 @@ fn lint_group_expression_with_config(
     group: &GroupExpression,
     rule_name: &str,
     result: &mut LintResult,
-    config: &LintConfig,
+    config: &FileLintConfig,
 ) {
     let mut seen_keys = Vec::new();
 
@@ -466,15 +533,15 @@ fn lint_group_entry_with_config(
     entry: &GroupEntry,
     rule_name: &str,
     result: &mut LintResult,
-    config: &LintConfig,
+    config: &FileLintConfig,
 ) {
     // Check key naming if present
-    if config.enforce_snake_case
+    if let Some(severity) = config.field_names
         && let Some(crate::ast::GroupKey::Bare(key_name)) = &entry.key
         && !is_snake_case(key_name)
     {
         result.add_issue_with_suggestion(
-            LintSeverity::Warning,
+            severity,
             rule_name.to_string(),
             format!("Field '{key_name}' should use snake_case convention"),
             to_snake_case(key_name),
@@ -482,7 +549,7 @@ fn lint_group_entry_with_config(
         );
     }
 
-    if config.warn_degenerate_constraints {
+    if let Some(severity) = config.zero_minimum {
         for meta in &entry.metadata {
             if let FieldMetadata::Constraint(
                 ValidationConstraint::MinLength(0) | ValidationConstraint::MinItems(0),
@@ -493,7 +560,7 @@ fn lint_group_entry_with_config(
                     _ => "field",
                 };
                 result.add_simple_issue(
-                    LintSeverity::Warning,
+                    severity,
                     rule_name.to_string(),
                     format!(
                         "Field '{field}' has a zero minimum constraint, which is always satisfied; remove it or set a meaningful bound"
@@ -507,7 +574,7 @@ fn lint_group_entry_with_config(
     lint_type_expression_with_config(&entry.value_type, rule_name, result, config);
 }
 
-fn check_unused_rules(spec: &CsilSpec, result: &mut LintResult) {
+fn check_unused_rules(spec: &CsilSpec, severity: LintSeverity, result: &mut LintResult) {
     let mut used_rules = std::collections::HashSet::new();
 
     // Find all rule references
@@ -517,12 +584,12 @@ fn check_unused_rules(spec: &CsilSpec, result: &mut LintResult) {
 
     // Check for unused rules
     for rule in &spec.rules {
-        if !used_rules.contains(&rule.name) {
+        if !matches!(rule.rule_type, RuleType::ServiceDef(_)) && !used_rules.contains(&rule.name) {
             result.add_issue_with_suggestion(
-                LintSeverity::Warning,
+                severity,
                 rule.name.clone(),
-                "Rule is defined but never used".to_string(),
-                "Consider removing this rule if it's not needed".to_string(),
+                "Rule has no references in this file".to_string(),
+                "Check whether application code or another file uses this rule".to_string(),
                 false,
             );
         }
@@ -535,9 +602,7 @@ fn find_rule_references(rule_type: &RuleType, used_rules: &mut std::collections:
             find_type_references(type_expr, used_rules);
         }
         RuleType::GroupDef(group_expr) => {
-            for entry in &group_expr.entries {
-                find_type_references(&entry.value_type, used_rules);
-            }
+            find_group_references(group_expr, used_rules);
         }
         RuleType::TypeChoice(choices) => {
             for choice in choices {
@@ -546,9 +611,7 @@ fn find_rule_references(rule_type: &RuleType, used_rules: &mut std::collections:
         }
         RuleType::GroupChoice(choices) => {
             for choice in choices {
-                for entry in &choice.entries {
-                    find_type_references(&entry.value_type, used_rules);
-                }
+                find_group_references(choice, used_rules);
             }
         }
         RuleType::ServiceDef(service) => {
@@ -563,50 +626,50 @@ fn find_rule_references(rule_type: &RuleType, used_rules: &mut std::collections:
 fn lint_service_definition(
     service: &crate::ast::ServiceDefinition,
     rule_name: &str,
-    config: &LintConfig,
+    config: &FileLintConfig,
     result: &mut LintResult,
 ) {
-    if config.check_incomplete_services {
-        // Check for empty service definition
-        if service.operations.is_empty() {
+    if let Some(severity) = config.empty_service
+        && service.operations.is_empty()
+    {
+        result.add_issue_with_suggestion(
+            severity,
+            rule_name.to_string(),
+            "Service definition is empty".to_string(),
+            "Add at least one operation to this service".to_string(),
+            false,
+        );
+    }
+
+    for operation in &service.operations {
+        if config.base.check_incomplete_services && is_vague_operation_name(&operation.name) {
             result.add_issue_with_suggestion(
-                LintSeverity::Warning,
+                LintSeverity::Info,
                 rule_name.to_string(),
-                "Service definition is empty".to_string(),
-                "Add at least one operation to this service".to_string(),
+                format!(
+                    "Operation '{}' has a vague name that doesn't clearly describe its purpose",
+                    operation.name
+                ),
+                "Consider using a more descriptive name like 'create-user', 'get-orders', etc."
+                    .to_string(),
                 false,
             );
         }
 
-        // Check for operations with vague names
-        for operation in &service.operations {
-            if is_vague_operation_name(&operation.name) {
-                result.add_issue_with_suggestion(
-                    LintSeverity::Info,
-                    rule_name.to_string(),
-                    format!(
-                        "Operation '{}' has a vague name that doesn't clearly describe its purpose",
-                        operation.name
-                    ),
-                    "Consider using a more descriptive name like 'create-user', 'get-orders', etc."
-                        .to_string(),
-                    false,
-                );
-            }
-
-            // Check operation name conventions
-            if config.enforce_snake_case && !is_kebab_case(&operation.name) {
-                result.add_issue_with_suggestion(
-                    LintSeverity::Warning,
-                    rule_name.to_string(),
-                    format!(
-                        "Operation '{}' should use kebab-case convention",
-                        operation.name
-                    ),
-                    to_kebab_case(&operation.name),
-                    true,
-                );
-            }
+        // Check operation name conventions
+        if let Some(severity) = config.operation_names
+            && !is_kebab_case(&operation.name)
+        {
+            result.add_issue_with_suggestion(
+                severity,
+                rule_name.to_string(),
+                format!(
+                    "Operation '{}' should use kebab-case convention",
+                    operation.name
+                ),
+                to_kebab_case(&operation.name),
+                true,
+            );
         }
     }
 }
@@ -614,10 +677,10 @@ fn lint_service_definition(
 fn lint_metadata_consistency(
     entries: &[crate::ast::GroupEntry],
     rule_name: &str,
-    config: &LintConfig,
+    config: &FileLintConfig,
     result: &mut LintResult,
 ) {
-    if !config.enforce_consistent_metadata {
+    if !config.base.enforce_consistent_metadata {
         return;
     }
 
@@ -652,23 +715,25 @@ fn lint_metadata_consistency(
 fn lint_complexity(
     expr: &TypeExpression,
     rule_name: &str,
-    config: &LintConfig,
+    config: &FileLintConfig,
     result: &mut LintResult,
     depth: usize,
 ) {
-    if !config.check_complexity {
+    if !config.base.check_complexity && config.nesting_depth.is_none() {
         return;
     }
 
     // Check nesting depth
-    if depth > config.max_nesting_depth {
+    if let Some(severity) = config.nesting_depth
+        && depth > config.base.max_nesting_depth
+    {
         // Issue will be added with the specified depth
         result.add_issue_with_suggestion(
-            LintSeverity::Warning,
+            severity,
             rule_name.to_string(),
             format!(
                 "Type definition exceeds maximum nesting depth of {}",
-                config.max_nesting_depth
+                config.base.max_nesting_depth
             ),
             "Consider breaking down complex nested structures into separate type definitions"
                 .to_string(),
@@ -680,14 +745,14 @@ fn lint_complexity(
     match expr {
         TypeExpression::Group(group) => {
             // Check group size
-            if group.entries.len() > config.max_group_fields {
+            if config.base.check_complexity && group.entries.len() > config.base.max_group_fields {
                 result.add_issue_with_suggestion(
                     LintSeverity::Info,
                     rule_name.to_string(),
                     format!(
                         "Group has {} fields, exceeding recommended maximum of {}",
                         group.entries.len(),
-                        config.max_group_fields
+                        config.base.max_group_fields
                     ),
                     "Consider breaking large groups into smaller, more focused types".to_string(),
                     false,
@@ -707,7 +772,7 @@ fn lint_complexity(
         }
         TypeExpression::Choice(choices) => {
             // Check for overly complex choices
-            if choices.len() > 10 {
+            if config.base.check_complexity && choices.len() > 10 {
                 result.add_issue_with_suggestion(
                     LintSeverity::Info,
                     rule_name.to_string(),
@@ -753,7 +818,7 @@ fn is_kebab_case(s: &str) -> bool {
         && !s.starts_with('-')
         && !s.ends_with('-')
         && !s.contains("--")
-        && s.contains('-') // Must have at least one dash to be kebab-case
+        && !s.is_empty()
 }
 
 fn to_kebab_case(s: &str) -> String {
@@ -785,15 +850,27 @@ fn to_kebab_case(s: &str) -> String {
     result
 }
 
+fn find_group_references(
+    group: &GroupExpression,
+    used_rules: &mut std::collections::HashSet<String>,
+) {
+    for entry in &group.entries {
+        if let Some(crate::ast::GroupKey::Type(key)) = &entry.key {
+            find_type_references(key, used_rules);
+        }
+        find_type_references(&entry.value_type, used_rules);
+    }
+}
+
 fn find_type_references(expr: &TypeExpression, used_rules: &mut std::collections::HashSet<String>) {
     match expr {
-        TypeExpression::NamedNumberGroup(name, _) => {
+        TypeExpression::NamedNumberGroup(name, _)
+        | TypeExpression::Socket(name)
+        | TypeExpression::Plug(name)
+        | TypeExpression::Reference(name) => {
             used_rules.insert(name.clone());
         }
         TypeExpression::NamedNumbers(_) => {}
-        TypeExpression::Reference(name) => {
-            used_rules.insert(name.clone());
-        }
         TypeExpression::Array { element_type, .. } => {
             find_type_references(element_type, used_rules);
         }
@@ -802,9 +879,7 @@ fn find_type_references(expr: &TypeExpression, used_rules: &mut std::collections
             find_type_references(value, used_rules);
         }
         TypeExpression::Group(group) | TypeExpression::Tuple(group) => {
-            for entry in &group.entries {
-                find_type_references(&entry.value_type, used_rules);
-            }
+            find_group_references(group, used_rules);
         }
         TypeExpression::Builtin(_) => {
             // Built-in types don't reference other rules
@@ -817,17 +892,20 @@ fn find_type_references(expr: &TypeExpression, used_rules: &mut std::collections
         TypeExpression::Range { .. } => {
             // Ranges don't reference other rules
         }
-        TypeExpression::Socket(_) | TypeExpression::Plug(_) => {
-            // Socket/plug references don't reference other rules (for now)
-        }
         TypeExpression::Literal(_) => {
             // Literals don't reference other rules
         }
         TypeExpression::Constrained {
             base_type,
-            constraints: _,
+            constraints,
         } => {
-            // Check the base type for references, constraints don't reference other rules
+            for constraint in constraints {
+                if let crate::ast::ControlOperator::And(ty)
+                | crate::ast::ControlOperator::Within(ty) = constraint
+                {
+                    find_type_references(ty, used_rules);
+                }
+            }
             find_type_references(base_type, used_rules);
         }
     }
@@ -1034,38 +1112,25 @@ mod tests {
     }
 
     #[test]
-    fn test_lint_snake_case_violation() {
-        let spec = create_test_spec(vec![create_test_rule(
-            "CamelCaseRule",
-            RuleType::TypeDef(TypeExpression::Builtin("int".to_string())),
-        )]);
-        let config = LintConfig::default();
-        let result = lint_spec(&spec, &config).unwrap();
-
-        assert_eq!(result.warning_count, 1);
-        assert!(result.issues[0].message.contains("snake_case"));
-        assert_eq!(
-            result.issues[0].suggestion,
-            Some("camel_case_rule".to_string())
-        );
-        assert!(result.issues[0].auto_fixable);
-    }
-
-    #[test]
-    fn test_lint_valid_snake_case() {
-        let spec = create_test_spec(vec![create_test_rule(
-            "valid_name",
-            RuleType::TypeDef(TypeExpression::Builtin("int".to_string())),
-        )]);
-        let config = LintConfig::default();
-        let result = lint_spec(&spec, &config).unwrap();
-
-        assert_eq!(result.issues.len(), 0);
+    fn test_rule_name_convention() {
+        for (name, warnings) in [
+            ("ApiErrorCode", 0),
+            ("UserID", 0),
+            ("bad_name", 1),
+            ("camelCase", 1),
+        ] {
+            let spec = create_test_spec(vec![create_test_rule(
+                name,
+                RuleType::TypeDef(TypeExpression::Builtin("int".into())),
+            )]);
+            let result = lint_spec(&spec, &LintConfig::default()).unwrap();
+            assert_eq!(result.warning_count, warnings, "{name}");
+        }
     }
 
     #[test]
     fn test_lint_rule_name_too_long() {
-        let long_name = "a".repeat(100);
+        let long_name = "A".repeat(100);
         let spec = create_test_spec(vec![create_test_rule(
             &long_name,
             RuleType::TypeDef(TypeExpression::Builtin("int".to_string())),
@@ -1081,7 +1146,7 @@ mod tests {
     #[test]
     fn test_lint_duplicate_keys_in_group() {
         let spec = create_test_spec(vec![create_test_rule(
-            "test_group",
+            "TestGroup",
             RuleType::GroupDef(GroupExpression {
                 entries: vec![
                     GroupEntry {
@@ -1113,7 +1178,7 @@ mod tests {
     #[test]
     fn test_lint_empty_group() {
         let spec = create_test_spec(vec![create_test_rule(
-            "empty_group",
+            "EmptyGroup",
             RuleType::GroupDef(GroupExpression { entries: vec![] }),
         )]);
         let config = LintConfig::default();
@@ -1126,7 +1191,7 @@ mod tests {
     #[test]
     fn test_lint_field_name_snake_case() {
         let spec = create_test_spec(vec![create_test_rule(
-            "test_group",
+            "TestGroup",
             RuleType::GroupDef(GroupExpression {
                 entries: vec![GroupEntry {
                     key: Some(crate::ast::GroupKey::Bare("CamelCaseField".to_string())),
@@ -1150,32 +1215,20 @@ mod tests {
 
     #[test]
     fn test_unused_rule_detection() {
-        let spec = create_test_spec(vec![
-            create_test_rule(
-                "used_rule",
-                RuleType::TypeDef(TypeExpression::Builtin("int".to_string())),
-            ),
-            create_test_rule(
-                "unused_rule",
-                RuleType::TypeDef(TypeExpression::Builtin("text".to_string())),
-            ),
-            create_test_rule(
-                "another_rule",
-                RuleType::TypeDef(TypeExpression::Reference("used_rule".to_string())),
-            ),
-        ]);
-        let config = LintConfig::default();
+        let schema = "Req = { id: int }
+Resp = { req: Req }
+Root = text
+service Api { hello: Req -> Resp }";
+        let spec = crate::parse_csil(schema).unwrap();
+        let result = lint_spec(&spec, &LintConfig::default()).unwrap();
+        assert_eq!(result.warning_count, 0);
+        let config = LintConfig {
+            disallow_unused_rules: true,
+            ..Default::default()
+        };
         let result = lint_spec(&spec, &config).unwrap();
-
-        // unused_rule should be flagged as unused
-        let unused_issues: Vec<_> = result
-            .issues
-            .iter()
-            .filter(|issue| {
-                issue.rule_name == "unused_rule" && issue.message.contains("never used")
-            })
-            .collect();
-        assert_eq!(unused_issues.len(), 1);
+        assert_eq!(result.warning_count, 1);
+        assert_eq!(result.issues[0].rule_name, "Root");
     }
 
     #[test]
@@ -1236,7 +1289,7 @@ mod tests {
     #[test]
     fn test_warn_on_doc_comments() {
         let mut rule = create_test_rule(
-            "documented",
+            "Documented",
             RuleType::TypeDef(TypeExpression::Builtin("int".to_string())),
         );
         rule.doc_comments = vec!["A documented rule.".to_string()];
@@ -1268,7 +1321,7 @@ mod tests {
     #[test]
     fn test_lint_config_customization() {
         let spec = create_test_spec(vec![create_test_rule(
-            "CamelCase",
+            "bad_name",
             RuleType::TypeDef(TypeExpression::Builtin("int".to_string())),
         )]);
 
@@ -1282,7 +1335,7 @@ mod tests {
 
         // Test with unused rules disabled
         let spec2 = create_test_spec(vec![create_test_rule(
-            "unused",
+            "Unused",
             RuleType::TypeDef(TypeExpression::Builtin("int".to_string())),
         )]);
         let config2 = LintConfig {
@@ -1297,7 +1350,7 @@ mod tests {
     fn test_service_definition_linting() {
         // Test empty service
         let empty_service = create_test_rule(
-            "empty_service",
+            "EmptyService",
             RuleType::ServiceDef(crate::ast::ServiceDefinition {
                 operations: vec![],
                 metadata: Vec::new(),
@@ -1467,7 +1520,8 @@ mod tests {
         assert!(!is_kebab_case("-leading-dash"));
         assert!(!is_kebab_case("trailing-dash-"));
         assert!(!is_kebab_case("double--dash"));
-        assert!(!is_kebab_case("nodashes")); // Must have at least one dash
+        assert!(is_kebab_case("hello"));
+        assert!(!is_kebab_case(""));
 
         assert_eq!(to_kebab_case("createUser"), "create-user");
         assert_eq!(to_kebab_case("XMLHttpRequest"), "xmlhttp-request");

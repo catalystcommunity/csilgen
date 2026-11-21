@@ -1,3 +1,5 @@
+options { lint_rule_names: "off" }
+
 ; Basic CDDL types test case
 name = text
 age = int

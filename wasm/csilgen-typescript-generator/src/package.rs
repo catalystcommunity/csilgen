@@ -14,7 +14,7 @@ use csilgen_common::{
     CsilGroupExpression, CsilGroupKey, CsilOccurrence, CsilRuleType, CsilTypeExpression,
     GeneratedFile, WasmGeneratorInput,
 };
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// Whether the consumer asked for a TypeScript package. The option is a JSON
 /// array of target ids; a lone string is accepted too so a hand-written config
@@ -206,7 +206,9 @@ fn rpc_section(input: &WasmGeneratorInput, pkg: &str, ex: Option<&UnaryExample>)
 const RPC_CARRIER_TS: &str = r#"// One example carrier: CSIL-RPC over an HTTP POST. The library owns the envelope;
 // the carrier owns only the transport. Swap `fetch` for any HTTP client.
 class HttpRpcCarrier implements AsyncServiceTransport {
-  constructor(private readonly baseUrl: string) {}
+  private readonly baseUrl: string;
+
+  constructor(baseUrl: string) { this.baseUrl = baseUrl; }
 
   async call(service: string, op: string, req: Uint8Array): Promise<Uint8Array> {
     const envelope = new RpcRequest(service, op, req).encode();
@@ -751,10 +753,7 @@ fn package_json(input: &WasmGeneratorInput) -> String {
     let value = serde_json::json!({
         "name": name,
         "version": version,
-        // CommonJS: the built `dist/` keeps the widest consumer reach; the `.ts`
-        // source specifiers are rewritten to `.js` at build time by
-        // `rewriteRelativeImportExtensions` in the shipped tsconfig.
-        "type": "commonjs",
+        // Node detects ESM syntax in the .ts sources. The compiled dist uses CommonJS.
         "main": "dist/index.js",
         "types": "dist/index.d.ts",
         "exports": {
@@ -828,13 +827,18 @@ fn barrel(input: &WasmGeneratorInput, files: &[GeneratedFile]) -> String {
             continue;
         };
         let names = exported_names(&file.content);
-        if names.iter().any(|n| seen.contains(n)) {
-            let mut fresh: Vec<String> = Vec::new();
-            for n in &names {
-                if !seen.contains(n) && !fresh.contains(n) {
-                    fresh.push(n.clone());
-                }
-            }
+        if names.keys().any(|name| seen.contains(name)) {
+            let fresh: Vec<_> = names
+                .iter()
+                .filter(|(name, _)| !seen.contains(*name))
+                .map(|(name, type_only)| {
+                    if *type_only {
+                        format!("type {name}")
+                    } else {
+                        name.clone()
+                    }
+                })
+                .collect();
             if !fresh.is_empty() {
                 out.push_str(&format!(
                     "export {{ {} }} from \"{specifier}\";\n",
@@ -844,9 +848,7 @@ fn barrel(input: &WasmGeneratorInput, files: &[GeneratedFile]) -> String {
         } else {
             out.push_str(&format!("export * from \"{specifier}\";\n"));
         }
-        for n in names {
-            seen.insert(n);
-        }
+        seen.extend(names.into_keys());
     }
     out
 }
@@ -855,8 +857,8 @@ fn barrel(input: &WasmGeneratorInput, files: &[GeneratedFile]) -> String {
 /// (only `export <kw> <name>` at the start of a line) avoids false positives,
 /// which matter because a name listed in an explicit re-export must really exist
 /// or TS errors; a missed name merely goes un-re-exported.
-fn exported_names(content: &str) -> Vec<String> {
-    let mut out = Vec::new();
+fn exported_names(content: &str) -> BTreeMap<String, bool> {
+    let mut out = BTreeMap::new();
     for line in content.lines() {
         let Some(rest) = line.trim_start().strip_prefix("export ") else {
             continue;
@@ -880,7 +882,10 @@ fn exported_names(content: &str) -> Vec<String> {
             .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '$')
             .collect();
         if !name.is_empty() {
-            out.push(name);
+            let type_only = rest.starts_with("interface ") || rest.starts_with("type ");
+            out.entry(name)
+                .and_modify(|only| *only &= type_only)
+                .or_insert(type_only);
         }
     }
     out

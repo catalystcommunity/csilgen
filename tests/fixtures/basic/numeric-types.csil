@@ -1,3 +1,5 @@
+options { lint_rule_names: "off" }
+
 ; Comprehensive numeric types test case
 uint_type = uint
 nint_type = nint

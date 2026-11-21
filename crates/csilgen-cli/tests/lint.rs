@@ -4,15 +4,15 @@ use std::{fs, process::Command};
 fn fail_on_warnings_uses_the_reported_severity() {
     let directory = tempfile::tempdir().unwrap();
     let schema = directory.path().join("api.csil");
-    let quoted = r#"status = "busy" / "denied""#;
+    let quoted = r#"Status = "busy" / "denied""#;
     let off = format!("options {{ lint_text_enums: \"off\" }}\n{quoted}");
     let error = format!("options {{ lint_text_enums: \"error\" }}\n{quoted}");
     for (source, strict, exit, diagnostic) in [
         (quoted, false, 0, "CBOR transmits the full label string."),
         (quoted, true, 1, "CBOR transmits the full label string."),
-        ("BadName = int", true, 1, "snake_case"),
+        ("bad_name = int", true, 1, "PascalCase"),
         (off.as_str(), true, 0, "0 warning(s)"),
-        ("empty = {}", true, 0, "0 warning(s)"),
+        ("Empty = {}", true, 0, "0 warning(s)"),
         (error.as_str(), false, 1, "1 error(s)"),
     ] {
         fs::write(&schema, source).unwrap();

@@ -1,3 +1,5 @@
+options { lint_text_enums: "off" }
+
 ;; ============================================================
 ;; CSIL cross-language interop spec.
 ;;
