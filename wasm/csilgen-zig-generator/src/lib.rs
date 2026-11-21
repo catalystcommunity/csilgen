@@ -843,6 +843,31 @@ fn emit_validate_fn(content: &mut String, name: &str, group: &CsilGroupExpressio
             }
             if let CsilTypeExpression::Constrained { constraints, .. } = &entry.value_type {
                 for op in constraints {
+                    if matches!(unwrap_constrained(&entry.value_type), CsilTypeExpression::Builtin(n) if n == "date")
+                        && let Some((cmp, bound)) = op.text_comparison()
+                    {
+                        let failure = match cmp {
+                            ">=" => "== .lt",
+                            "<=" => "== .gt",
+                            ">" => "!= .gt",
+                            _ => "!= .lt",
+                        };
+                        let value = if optional {
+                            "day".into()
+                        } else {
+                            format!("v.{ident}")
+                        };
+                        let test =
+                            format!("@import(\"std\").mem.order(u8, {value}, {bound:?}) {failure}");
+                        if optional {
+                            checks.push_str(&format!(
+                                "    if (v.{ident}) |day| {{ if ({test}) return false; }}\n"
+                            ));
+                        } else {
+                            checks.push_str(&format!("    if ({test}) return false;\n"));
+                        }
+                        continue;
+                    }
                     emit_control_check(&mut checks, &ident, optional, op);
                 }
             }
@@ -1070,6 +1095,9 @@ fn emit_enc_value(
             "float16" | "float32" => out.push_str(&format!("{indent}try w_f32(out, {expr});\n")),
             "text" | "tstr" => out.push_str(&format!("{indent}try w_text(out, {expr});\n")),
             "bytes" | "bstr" => out.push_str(&format!("{indent}try w_bytes(out, {expr});\n")),
+            "date" => out.push_str(&format!(
+                "{indent}try w_tag(out, 1004);\n{indent}try w_text(out, try calendar_date({expr}));\n"
+            )),
             "timestamp" => out.push_str(&format!(
                 "{indent}try w_tag(out, 0);\n{indent}try w_text(out, ({expr}).rfc3339);\n"
             )),
@@ -1192,6 +1220,9 @@ fn emit_dec_value(
             }
             "text" | "tstr" => out.push_str(&format!("{indent}{dst} = try as_text({src});\n")),
             "bytes" | "bstr" => out.push_str(&format!("{indent}{dst} = try as_bytes({src});\n")),
+            "date" => out.push_str(&format!(
+                "{indent}{dst} = try calendar_date(try as_tagged_text({src}, 1004));\n"
+            )),
             "timestamp" => out.push_str(&format!(
                 "{indent}{dst} = .{{ .rfc3339 = try as_tagged_text({src}, 0), .epoch_seconds = 0 }};\n"
             )),
@@ -2549,6 +2580,7 @@ fn map_zig_type(type_expr: &CsilTypeExpression, type_prefix: &str) -> String {
             "text" | "tstr" => "[]const u8".to_string(),
             "bytes" | "bstr" => "[]const u8".to_string(),
             "bool" | "true" | "false" => "bool".to_string(),
+            "date" => "[]const u8".to_string(),
             "timestamp" => format!("{type_prefix}CsilTimestamp"),
             "decimal" => format!("{type_prefix}CsilDecimal"),
             // `any` holds an arbitrary decoded CBOR value (the codec's value tree),
@@ -2894,6 +2926,7 @@ fn zig_request_literal(input: &WasmGeneratorInput, ty: &CsilTypeExpression) -> S
 fn zig_sample_value(ty: &CsilTypeExpression) -> String {
     match unwrap_constrained(ty) {
         CsilTypeExpression::Builtin(name) => match name.as_str() {
+            "date" => "\"1970-01-01\"".to_string(),
             "text" | "tstr" => "\"example\"".to_string(),
             "bool" | "true" | "false" => "false".to_string(),
             "int" | "nint" | "uint" => "0".to_string(),
@@ -4183,6 +4216,20 @@ fn as_bytes(v: Value) CodecError![]const u8 {
         .bytes => |s| s,
         else => error.WrongType,
     };
+}
+
+fn calendar_date(s: []const u8) CodecError![]const u8 {
+    if (s.len != 10 or s[4] != '-' or s[7] != '-') return error.WrongType;
+    for (s, 0..) |c, i| {
+        if (i != 4 and i != 7 and (c < '0' or c > '9')) return error.WrongType;
+    }
+    const year = std.fmt.parseInt(u16, s[0..4], 10) catch return error.WrongType;
+    const month = std.fmt.parseInt(u8, s[5..7], 10) catch return error.WrongType;
+    const day = std.fmt.parseInt(u8, s[8..10], 10) catch return error.WrongType;
+    const leap = year % 4 == 0 and (year % 100 != 0 or year % 400 == 0);
+    const days = [_]u8{ 31, if (leap) 29 else 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 };
+    if (month < 1 or month > 12 or day < 1 or day > days[month - 1]) return error.WrongType;
+    return s;
 }
 
 fn as_tagged_text(v: Value, num: u64) CodecError![]const u8 {

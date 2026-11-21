@@ -63,6 +63,7 @@ every party encodes the map keys `uuid`, `current_state`, `payload` — never
 | `uint`        | unsigned integer                       |
 | `bool`        | simple value true/false                |
 | `float*`      | float                                  |
+| `date`        | **tag 1004** + `YYYY-MM-DD` text        |
 | `timestamp`   | **tag 0** + RFC3339 text string, UTC   |
 | `decimal`     | **tag 4** decimal fraction `[exp, mant]`|
 
@@ -71,11 +72,31 @@ integers. Rust achieves this with `#[serde(with = "serde_bytes")]` (emitted
 automatically); Go's `[]byte` does this under `fxamacker/cbor` automatically;
 Python `bytes` and TypeScript `Uint8Array` map to the same.
 
-## Tagged core types: `timestamp` and `decimal`
+## Tagged core types
 
-Two CSIL core types carry CBOR semantic tags and so cannot be expressed as a
-plain CDDL primitive. Both have a single normative wire form; generators differ
-only in the in-memory type they map to.
+Each tagged core type has one wire format.
+
+### Calendar date
+
+Use `date` for a Gregorian calendar day. A date has no time or time zone.
+Encode it with CBOR tag 1004 and a text string of ten ASCII characters.
+Use four digits for the year and two each for the month and day. Put a hyphen
+between the parts. For example, `2000-02-29` encodes as
+`d9 03 ec 6a 32 30 30 30 2d 30 32 2d 32 39`. Reject an incorrect tag, an
+incorrect text format, or an impossible date. [RFC 8943](https://www.rfc-editor.org/rfc/rfc8943.html#section-1)
+
+| Target | Calendar date type |
+| --- | --- |
+| Rust | `chrono::NaiveDate` |
+| Java and Kotlin | `java.time.LocalDate` |
+| C# | `System.DateOnly` |
+| Python | `datetime.date` |
+| Ruby and Elixir | `Date` |
+| C, Dart, Go, OCaml, PHP, Swift, TypeScript, and Zig | Validated ISO date string |
+| JSON Schema and OpenAPI | `{"type":"string","format":"date"}` |
+
+A native date type can limit the year range. For exchange with Python or
+C#, use years 0001 through 9999.
 
 ### `timestamp` — CBOR tag 0, always UTC
 
@@ -246,7 +267,7 @@ ways:
 
 - **Wrong CBOR major type** for the field/type (e.g. a text string where the
   declaration is `bytes`, or a map where an array is expected).
-- **Wrong or missing semantic tag** (`timestamp` not tag 0, `decimal` not tag 4).
+- **Wrong or missing semantic tag** (`date` requires tag 1004, `timestamp` uses tag 0, and `decimal` requires tag 4).
 - **Enum value not in the declared literal vocabulary** (see "Choices" above).
 - **Union `variant_index` out of range, or a literal arm's payload not equal to
   the literal it is declared to be.**

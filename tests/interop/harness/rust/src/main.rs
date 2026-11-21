@@ -48,6 +48,7 @@ fn scalars_ok() -> Scalars {
         t: "héllo 世界".to_string(),
         raw: vec![0x01, 0x02, 0xf0, 0xff],
         flag: true,
+        due: chrono::NaiveDate::from_ymd_opt(2000, 2, 29).unwrap(),
         when: ts(),
         amount: interop_api::CsilDecimal::from_str("123.45").unwrap(),
         // mixed-union coverage: a value equal to a literal arm must wire as

@@ -43,6 +43,7 @@ private fun scalarsOk() = Scalars(
     t = "héllo 世界",
     raw = byteArrayOf(0x01, 0x02, 0xF0.toByte(), 0xFF.toByte()),
     flag = true,
+    due = java.time.LocalDate.of(2000, 2, 29),
     `when` = java.time.Instant.parse("2026-06-29T12:34:56Z"),
     amount = java.math.BigDecimal("123.45"),
     // mixed-union coverage: a value equal to a literal arm must wire as

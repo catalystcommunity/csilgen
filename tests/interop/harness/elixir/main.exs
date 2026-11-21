@@ -39,6 +39,7 @@ defmodule Vectors do
       t: "héllo 世界",
       raw: <<0x01, 0x02, 0xF0, 0xFF>>,
       flag: true,
+      due: ~D[2000-02-29],
       when: ts(),
       amount: G.Decimal.from_string("123.45"),
       # mixed-union coverage: a value equal to a literal arm must wire as

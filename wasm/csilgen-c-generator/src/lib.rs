@@ -1058,6 +1058,13 @@ fn emit_validate_fn(
             }
             if let CsilTypeExpression::Constrained { constraints, .. } = &entry.value_type {
                 for op in constraints {
+                    if matches!(unwrap_constrained(&entry.value_type), CsilTypeExpression::Builtin(n) if n == "date")
+                        && let Some((cmp, bound)) = op.text_comparison()
+                    {
+                        let field = &fc.member;
+                        checks.push_str(&format!("    if (v->{field} && !(strcmp(v->{field}, {bound:?}) {cmp} 0)) return false;\n"));
+                        continue;
+                    }
                     emit_control_check(&mut checks, &fc, op);
                 }
             }
@@ -1387,6 +1394,9 @@ fn emit_enc_value(
             "bytes" | "bstr" => out.push_str(&format!(
                 "{indent}if (csilc_w_bytes(b, ({expr}).data, ({expr}).len)) return -1;\n"
             )),
+            "date" => out.push_str(&format!(
+                "{indent}if (!csilc_valid_date({expr}) || csilc_w_tag(b, 1004) || csilc_w_text(b, {expr}, 10)) return -1;\n"
+            )),
             "timestamp" => out.push_str(&format!(
                 "{indent}if (csilc_w_tag(b, 0)) return -1;\n\
                  {indent}if (csilc_w_text(b, ({expr}).rfc3339, ({expr}).rfc3339 ? strlen(({expr}).rfc3339) : 0)) return -1;\n"
@@ -1472,6 +1482,9 @@ fn emit_dec_value(
             )),
             "bytes" | "bstr" => out.push_str(&format!(
                 "{indent}if (!csilc_get_bytes({src}, &({dst}).data, &({dst}).len)) return -1;\n"
+            )),
+            "date" => out.push_str(&format!(
+                "{indent}if (!csilc_get_date({src}, &({dst}))) return -1;\n"
             )),
             "timestamp" => out.push_str(&format!(
                 "{indent}if (!csilc_get_tagged_text({src}, 0, &({dst}).rfc3339)) return -1;\n\
@@ -1936,7 +1949,10 @@ fn emit_dec_field(
             let is_ptr = c_type.ends_with('*');
             if field.optional && is_ptr {
                 // Optional text (a `char *`): absence is just NULL, no allocation.
-                if matches!(base, CsilTypeExpression::Builtin(n) if n == "text" || n == "tstr") {
+                if matches!(base, CsilTypeExpression::Builtin(n) if n == "date") {
+                    out.push_str(&format!("    out->{member} = NULL;\n    if (csilc_f && !csilc_get_date(csilc_f, &out->{member})) return -1;\n"));
+                } else if matches!(base, CsilTypeExpression::Builtin(n) if n == "text" || n == "tstr")
+                {
                     out.push_str(&format!(
                         "    out->{member} = (csilc_f && csilc_f->kind == CSILC_TEXT) ? (char *)csilc_f->as.bytes.ptr : NULL;\n"
                     ));
@@ -3259,6 +3275,7 @@ fn base_c_type(type_expr: &CsilTypeExpression, config: &CConfig) -> String {
             "text" | "tstr" => "char *".to_string(),
             "bytes" | "bstr" => "CsilBytes".to_string(),
             "bool" | "true" | "false" => "bool".to_string(),
+            "date" => "const char *".to_string(),
             "timestamp" => "CsilTimestamp".to_string(),
             "decimal" => config.decimal_c_type().to_string(),
             "null" | "nil" | "undefined" => "void *".to_string(),
@@ -3828,6 +3845,7 @@ fn c_request_literal(
 fn c_sample_value(ty: &CsilTypeExpression, config: &CConfig) -> String {
     match unwrap_constrained(ty) {
         CsilTypeExpression::Builtin(name) => match name.as_str() {
+            "date" => "\"1970-01-01\"".to_string(),
             "text" | "tstr" => "\"example\"".to_string(),
             "bool" | "true" | "false" => "false".to_string(),
             "int" | "nint" | "uint" => "0".to_string(),
@@ -5130,6 +5148,23 @@ static inline bool csilc_get_tagged_text(const csilc_value *v, uint64_t num, con
     }
     *out = (const char *)v->as.tag.content->as.bytes.ptr;
     return true;
+}
+
+static inline bool csilc_valid_date(const char *s) {
+    if (!s || strlen(s) != 10 || s[4] != '-' || s[7] != '-') return false;
+    for (int i = 0; i < 10; ++i)
+        if (i != 4 && i != 7 && (s[i] < '0' || s[i] > '9')) return false;
+    int year = (s[0]-'0')*1000 + (s[1]-'0')*100 + (s[2]-'0')*10 + (s[3]-'0');
+    int month = (s[5]-'0')*10 + (s[6]-'0');
+    int day = (s[8]-'0')*10 + (s[9]-'0');
+    const int days[] = {31, 28 + (year%4 == 0 && (year%100 != 0 || year%400 == 0)),
+                        31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+    return month >= 1 && month <= 12 && day >= 1 && day <= days[month-1];
+}
+
+static inline bool csilc_get_date(const csilc_value *v, const char **out) {
+    return csilc_get_tagged_text(v, 1004, out) && v->as.tag.content->as.bytes.len == 10
+        && csilc_valid_date(*out);
 }
 
 static inline bool csilc_get_decimal(const csilc_value *v, int64_t *exp, int64_t *mant) {

@@ -219,6 +219,19 @@ pub enum CsilControlOperator {
     Cborseq,
 }
 
+impl CsilControlOperator {
+    /// Return the ordered comparison and its text bound.
+    pub fn text_comparison(&self) -> Option<(&'static str, &str)> {
+        match self {
+            Self::GreaterEqual(CsilLiteralValue::Text(bound)) => Some((">=", bound)),
+            Self::LessEqual(CsilLiteralValue::Text(bound)) => Some(("<=", bound)),
+            Self::GreaterThan(CsilLiteralValue::Text(bound)) => Some((">", bound)),
+            Self::LessThan(CsilLiteralValue::Text(bound)) => Some(("<", bound)),
+            _ => None,
+        }
+    }
+}
+
 /// Size constraint specifications
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum CsilSizeConstraint {
@@ -310,7 +323,29 @@ pub struct CsilServiceOperation {
     pub wire_id: Option<u64>,
 }
 
+impl CsilGroupExpression {
+    fn uses_builtin(&self, name: &str) -> bool {
+        self.entries
+            .iter()
+            .any(|entry| entry.value_type.uses_builtin(name))
+    }
+}
+
 impl CsilSpecSerialized {
+    /// Check all declarations, including operation inputs and outputs.
+    pub fn uses_builtin(&self, name: &str) -> bool {
+        self.rules.iter().any(|rule| match &rule.rule_type {
+            CsilRuleType::TypeDef(ty) => ty.uses_builtin(name),
+            CsilRuleType::TypeChoice(arms) => arms.iter().any(|ty| ty.uses_builtin(name)),
+            CsilRuleType::GroupDef(group) => group.uses_builtin(name),
+            CsilRuleType::GroupChoice(groups) => groups.iter().any(|g| g.uses_builtin(name)),
+            CsilRuleType::ServiceDef(service) => service
+                .operations
+                .iter()
+                .any(|op| op.input_type.uses_builtin(name) || op.output_type.uses_builtin(name)),
+        })
+    }
+
     /// Older service schemas refer to the conventional error record implicitly.
     pub fn supply_implicit_service_error(&mut self) {
         if self.rules.iter().any(|rule| rule.name == "ServiceError") {
@@ -360,6 +395,29 @@ impl CsilSpecSerialized {
 }
 
 impl CsilTypeExpression {
+    pub fn uses_builtin(&self, name: &str) -> bool {
+        match self {
+            Self::Builtin(n) => n == name,
+            Self::Array { element_type, .. } => element_type.uses_builtin(name),
+            Self::Map { key, value, .. } => key.uses_builtin(name) || value.uses_builtin(name),
+            Self::Group(group) | Self::Tuple(group) => group.uses_builtin(name),
+            Self::Choice(arms) => arms.iter().any(|ty| ty.uses_builtin(name)),
+            Self::Constrained {
+                base_type,
+                constraints,
+            } => {
+                base_type.uses_builtin(name)
+                    || constraints.iter().any(|op| match op {
+                        CsilControlOperator::And(ty) | CsilControlOperator::Within(ty) => {
+                            ty.uses_builtin(name)
+                        }
+                        _ => false,
+                    })
+            }
+            _ => false,
+        }
+    }
+
     /// Name used in the CSIL-RPC response envelope.
     pub fn rpc_variant_name(&self) -> Option<&str> {
         match self {

@@ -601,6 +601,7 @@ impl<'a> JsonSchemaGenerator<'a> {
                         );
                         Value::Object(schema)
                     }
+                    "date" => json_string_format("date"),
                     // timestamp is CBOR tag 0 (RFC 3339 UTC) on the wire; the
                     // JSON-Schema view of that instant is a date-time string.
                     "timestamp" => json_string_format("date-time"),

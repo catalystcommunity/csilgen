@@ -343,6 +343,38 @@ fn generate_codec_file(spec: &CsilSpecSerialized, namespace: &str) -> String {
     out.push_str(
         "    /** A literal-typed union/enum arm carries no shape of its own on the wire — the\n     * variant index (or the bare value itself for an enum) already selects it — so\n     * decode only needs to confirm the payload equals the declared literal. */\n    public static function expectLiteral($value, $expected)\n    {\n        if ($value !== $expected) {\n            throw new CodecException('csil cbor: literal mismatch, expected ' . var_export($expected, true) . ', got ' . var_export($value, true));\n        }\n        return $value;\n    }\n\n",
     );
+    if spec.uses_builtin("date") {
+        out.push_str(
+            r#"    private static function calendarDate($text)
+    {
+        if (!is_string($text) || !preg_match('/\A([0-9]{4})-([0-9]{2})-([0-9]{2})\z/', $text, $p)
+            || !checkdate((int)$p[2], (int)$p[3], $p[1] === '0000' ? 400 : (int)$p[1])) {
+            throw new CodecException('expected YYYY-MM-DD');
+        }
+        return $text;
+    }
+
+    public static function encode_calendar_date($value)
+    {
+        return CBOR::encode(new \Csilgen\Transport\Tag(1004, self::calendarDate($value)));
+    }
+
+    public static function decode_calendar_date($bytes)
+    {
+        return self::readDate(CBOR::decode($bytes));
+    }
+
+    private static function readDate($value)
+    {
+        if (!($value instanceof \Csilgen\Transport\Tag) || $value->tag !== 1004) {
+            throw new CodecException('expected calendar date tag 1004');
+        }
+        return self::calendarDate($value->value);
+    }
+
+"#,
+        );
+    }
     let class_names: HashSet<String> = spec
         .rules
         .iter()
@@ -353,7 +385,7 @@ fn generate_codec_file(spec: &CsilSpecSerialized, namespace: &str) -> String {
             _ => None,
         })
         .collect();
-    let mut union_names: HashSet<String> = spec
+    let mut named_codecs: HashSet<String> = spec
         .rules
         .iter()
         .filter_map(|r| match &r.rule_type {
@@ -376,10 +408,14 @@ fn generate_codec_file(spec: &CsilSpecSerialized, namespace: &str) -> String {
         .map(|(name, _)| name)
         .collect();
 
-    union_names.extend(
+    named_codecs.extend(
         spec.rules
             .iter()
-            .filter(|r| csilgen_common::rule_enum_numbers(r).is_some())
+            .filter(|r| {
+                let alias = matches!(&r.rule_type, CsilRuleType::TypeDef(t)
+                    if !matches!(t, CsilTypeExpression::Choice(_) | CsilTypeExpression::Group(_)));
+                alias || csilgen_common::rule_enum_numbers(r).is_some()
+            })
             .map(|r| r.name.clone()),
     );
     for rule in &spec.rules {
@@ -391,7 +427,7 @@ fn generate_codec_file(spec: &CsilSpecSerialized, namespace: &str) -> String {
                     &rule.name,
                     group,
                     &class_names,
-                    &union_names,
+                    &named_codecs,
                     &enum_names,
                 );
             }
@@ -400,7 +436,7 @@ fn generate_codec_file(spec: &CsilSpecSerialized, namespace: &str) -> String {
                 &rule.name,
                 choices,
                 &class_names,
-                &union_names,
+                &named_codecs,
                 &enum_names,
             ),
             CsilRuleType::TypeDef(expr) => emit_alias_codec(
@@ -408,7 +444,7 @@ fn generate_codec_file(spec: &CsilSpecSerialized, namespace: &str) -> String {
                 &rule.name,
                 expr,
                 &class_names,
-                &union_names,
+                &named_codecs,
                 &enum_names,
             ),
             CsilRuleType::TypeChoice(choices) => emit_choice_codec(
@@ -416,7 +452,7 @@ fn generate_codec_file(spec: &CsilSpecSerialized, namespace: &str) -> String {
                 &rule.name,
                 choices,
                 &class_names,
-                &union_names,
+                &named_codecs,
                 &enum_names,
             ),
             _ => {}
@@ -945,6 +981,21 @@ fn emit_alias_codec(
     ));
 }
 
+fn php_date_bounds(expr: &str, controls: &[csilgen_common::CsilControlOperator]) -> String {
+    let checks: Vec<_> = controls
+        .iter()
+        .filter_map(|op| op.text_comparison())
+        .map(|(op, bound)| format!("strcmp($date, {}) {op} 0", php_string(bound)))
+        .collect();
+    if checks.is_empty() {
+        return expr.into();
+    }
+    format!(
+        "(function ($date) {{ if (!({})) throw new CodecException('date outside bounds'); return $date; }})({expr})",
+        checks.join(" && ")
+    )
+}
+
 fn to_cbor_expr(
     var: &str,
     expr: &CsilTypeExpression,
@@ -956,6 +1007,9 @@ fn to_cbor_expr(
             if class_names.contains(name) || unions.contains(name) =>
         {
             format!("self::toCbor{}({var})", php_class(name))
+        }
+        CsilTypeExpression::Builtin(name) if name == "date" => {
+            format!(r"new \Csilgen\Transport\Tag(1004, self::calendarDate({var}))")
         }
         CsilTypeExpression::Builtin(name) if name == "bytes" || name == "bstr" => {
             format!("CBOR::bytes({var})")
@@ -976,6 +1030,13 @@ fn to_cbor_expr(
                     "(function ($m) {{ $entries = array(); foreach (($m === null ? array() : $m) as $k => $v) {{ $entries[] = array({k}, {v}); }} return CBOR::mapEntries($entries); }})({var})"
                 )
             }
+        }
+        CsilTypeExpression::Constrained {
+            base_type,
+            constraints,
+        } if matches!(base_type.as_ref(), CsilTypeExpression::Builtin(n) if n == "date") => {
+            let checked = php_date_bounds(var, constraints);
+            to_cbor_expr(&checked, base_type, class_names, unions)
         }
         CsilTypeExpression::Constrained { base_type, .. } => {
             to_cbor_expr(var, base_type, class_names, unions)
@@ -1044,6 +1105,7 @@ fn from_cbor_expr(
     enums: &HashSet<String>,
 ) -> String {
     match expr {
+        CsilTypeExpression::Builtin(name) if name == "date" => format!("self::readDate({var})"),
         CsilTypeExpression::Reference(name)
             if class_names.contains(name) || unions.contains(name) || enums.contains(name) =>
         {
@@ -1058,6 +1120,15 @@ fn from_cbor_expr(
             from_cbor_expr("$k", key, class_names, unions, enums),
             from_cbor_expr("$v", value, class_names, unions, enums)
         ),
+        CsilTypeExpression::Constrained {
+            base_type,
+            constraints,
+        } if matches!(base_type.as_ref(), CsilTypeExpression::Builtin(n) if n == "date") => {
+            php_date_bounds(
+                &from_cbor_expr(var, base_type, class_names, unions, enums),
+                constraints,
+            )
+        }
         CsilTypeExpression::Constrained { base_type, .. } => {
             from_cbor_expr(var, base_type, class_names, unions, enums)
         }
@@ -1210,6 +1281,7 @@ fn emit_server_class(out: &mut String, service_name: &str, service: &CsilService
 
 fn codec_suffix(expr: &CsilTypeExpression) -> String {
     match expr {
+        CsilTypeExpression::Builtin(name) if name == "date" => "_calendar_date".into(),
         CsilTypeExpression::Reference(name) => php_class(name),
         _ => "Value".to_string(),
     }

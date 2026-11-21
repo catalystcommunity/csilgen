@@ -913,7 +913,7 @@ fn validate_default_value(
             // defaults are RFC3339 strings.
             matches!(
                 name.as_str(),
-                "text" | "tstr" | "string" | "decimal" | "timestamp"
+                "text" | "tstr" | "string" | "decimal" | "date" | "timestamp"
             )
         }
         (LiteralValue::Bool(_), TypeExpression::Builtin(name)) => {
@@ -964,6 +964,9 @@ fn check_tagged_bound_well_formed(
     let TypeExpression::Builtin(name) = base_type else {
         return Ok(());
     };
+    if name == "date" && !matches!(value, LiteralValue::Text(_)) {
+        return Err("calendar date bounds must be YYYY-MM-DD text".into());
+    }
     let LiteralValue::Text(text) = value else {
         return Ok(());
     };
@@ -971,11 +974,22 @@ fn check_tagged_bound_well_formed(
         "decimal" => is_well_formed_decimal(text)
             .then_some(())
             .ok_or_else(|| format!("decimal bound {text:?} is not a valid decimal number")),
+        "date" => is_calendar_date(text)
+            .then_some(())
+            .ok_or_else(|| format!("invalid calendar date {text:?}, expected YYYY-MM-DD")),
         "timestamp" => chrono::DateTime::parse_from_rfc3339(text)
             .map(|_| ())
             .map_err(|e| format!("timestamp bound {text:?} is not a valid RFC3339 instant: {e}")),
         _ => Ok(()),
     }
+}
+
+/// Check the Gregorian date and its canonical four-digit-year spelling.
+pub fn is_calendar_date(text: &str) -> bool {
+    text.len() == 10
+        && text
+            .parse::<chrono::NaiveDate>()
+            .is_ok_and(|date| date.to_string() == text)
 }
 
 /// An optionally-signed integer with an optional fractional part — the exact
@@ -1089,6 +1103,7 @@ fn validate_comparison_constraint(
                         | "float64"
                         | "number"
                         | "decimal"
+                        | "date"
                         | "timestamp"
                 )
             }
@@ -1101,7 +1116,7 @@ fn validate_comparison_constraint(
             field_context: context.to_string(),
             constraint: format!("{operator} constraint"),
             reason: format!(
-                "comparison constraints are only applicable to numeric types, not {}",
+                "comparison constraints require an ordered type, got {}",
                 format_type_expression(base_type)
             ),
         });
@@ -1138,7 +1153,10 @@ fn validate_comparison_constraint(
         (LiteralValue::Text(_), TypeExpression::Builtin(name)) => {
             // A `decimal` bound may be written as exact text ("0.1") to avoid float
             // rounding, and a `timestamp` bound is an RFC3339 string.
-            matches!(name.as_str(), "text" | "tstr" | "decimal" | "timestamp")
+            matches!(
+                name.as_str(),
+                "text" | "tstr" | "decimal" | "date" | "timestamp"
+            )
         }
         _ => false,
     };
@@ -2565,7 +2583,7 @@ mod tests {
         let result = validate_spec(&spec);
         assert!(result.is_err());
         let error_msg = result.unwrap_err().to_string();
-        assert!(error_msg.contains("comparison constraints are only applicable to numeric types"));
+        assert!(error_msg.contains("comparison constraints require an ordered type"));
     }
 
     #[test]
@@ -2600,6 +2618,24 @@ mod tests {
 
         let err = validate_spec(&spec).unwrap_err().to_string();
         assert!(err.contains("not a valid decimal"), "{err}");
+    }
+
+    #[test]
+    fn calendar_date_controls_require_real_full_dates() {
+        for op in ["ge", "le", "gt", "lt", "default"] {
+            for (bound, valid) in [
+                ("\"2000-02-29\"", true),
+                ("\"2026-02-30\"", false),
+                ("\"1900-02-29\"", false),
+                ("\"2026-2-03\"", false),
+                ("\"2026-03-01T00:00:00Z\"", false),
+                ("0", false),
+            ] {
+                let source = format!("Due = date .{op} {bound}");
+                let spec = crate::parse_csil(&source).unwrap();
+                assert_eq!(validate_spec(&spec).is_ok(), valid, "{source}");
+            }
+        }
     }
 
     #[test]

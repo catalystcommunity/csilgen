@@ -963,6 +963,7 @@ fn swift_sample(input: &WasmGeneratorInput, ty: &CsilTypeExpression) -> String {
             "float" => "0.0".to_string(),
             "int" | "uint" => "0".to_string(),
             "bytes" | "bstr" => "[]".to_string(),
+            "date" => "\"1970-01-01\"".to_string(),
             "timestamp" => "\"1970-01-01T00:00:00Z\"".to_string(),
             "decimal" => "\"0\"".to_string(),
             _ => "[]".to_string(),
@@ -1280,6 +1281,7 @@ fn map_type(type_expr: &CsilTypeExpression, optional: bool) -> String {
             "text" | "tstr" => "String".to_string(),
             "bytes" | "bstr" => "[UInt8]".to_string(),
             "bool" => "Bool".to_string(),
+            "date" => "String".to_string(),
             // RFC3339 UTC text on the wire (CBOR tag 0); kept as a String so the
             // generated types stay Foundation-free and portable.
             "timestamp" => "String".to_string(),
@@ -2244,7 +2246,8 @@ fn emit_control_check(
     value_type: &CsilTypeExpression,
     op: &CsilControlOperator,
 ) {
-    let numeric = is_numeric(value_type);
+    let numeric = is_numeric(value_type)
+        || matches!(unwrap_constrained(value_type), CsilTypeExpression::Builtin(n) if n == "date");
     let mut ordered = |swift_op: &str, value: &CsilLiteralValue, phrasing: &str| {
         if numeric {
             let bound = literal_to_swift(value);
@@ -2535,6 +2538,7 @@ fn swift_enc_value(
             "text" | "tstr" => format!(".text({expr})"),
             "bytes" | "bstr" => format!(".bytes({expr})"),
             "bool" => format!(".bool({expr})"),
+            "date" => format!("CsilCbor.encodeDate({expr})"),
             "timestamp" => format!(".tag(0, .text({expr}))"),
             // Swift carries `decimal` as canonical text; the tag-4 form is a follow-up.
             "decimal" => format!(".text({expr})"),
@@ -2622,6 +2626,7 @@ fn swift_dec_value(
             "text" | "tstr" => format!("try CsilCbor.asText({expr})"),
             "bytes" | "bstr" => format!("try CsilCbor.asBytes({expr})"),
             "bool" => format!("try CsilCbor.asBool({expr})"),
+            "date" => format!("try CsilCbor.decodeDate({expr})"),
             "timestamp" => format!("try CsilCbor.asTaggedText({expr}, 0)"),
             "decimal" => format!("try CsilCbor.asText({expr})"),
             _ => format!("try CsilCbor.asText({expr})"),
@@ -4073,6 +4078,32 @@ public enum CsilCbor {
     public static func asMap(_ v: CsilCborValue) throws -> [(CsilCborValue, CsilCborValue)] {
         if case .map(let kvs) = v { return kvs }
         throw CsilCborError.typeMismatch
+    }
+
+    static func validDate(_ text: String) -> Bool {
+        let s = Array(text.utf8)
+        guard s.count == 10, s[4] == 45, s[7] == 45 else { return false }
+        for i in s.indices where i != 4 && i != 7 {
+            guard (48...57).contains(s[i]) else { return false }
+        }
+        func number(_ range: Range<Int>) -> Int {
+            s[range].reduce(0) { $0 * 10 + Int($1 - 48) }
+        }
+        let year = number(0..<4), month = number(5..<7), day = number(8..<10)
+        let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0)
+        let days = [31, leap ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+        return (1...12).contains(month) && (1...days[month - 1]).contains(day)
+    }
+
+    public static func encodeDate(_ text: String) -> CsilCborValue {
+        precondition(validDate(text), "expected YYYY-MM-DD")
+        return .tag(1004, .text(text))
+    }
+
+    public static func decodeDate(_ value: CsilCborValue) throws -> String {
+        let text = try asTaggedText(value, 1004)
+        guard validDate(text) else { throw CsilCborError.typeMismatch }
+        return text
     }
 
     public static func asTaggedText(_ v: CsilCborValue, _ num: UInt64) throws -> String {

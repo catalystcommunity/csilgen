@@ -1428,6 +1428,7 @@ fn money_spec() -> CsilSpecSerialized {
         "Money",
         vec![
             field("amount", builtin("decimal"), false),
+            field("due", builtin("date"), false),
             field("captured_at", builtin("timestamp"), false),
         ],
         vec![],
@@ -3275,12 +3276,9 @@ fn mixed_union_round_trips_and_rejects_literal_mismatch_under_node() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// The tagged core types (`timestamp` -> tag 0 `Date`, `decimal` -> tag 4
-/// `CsilDecimal`) are not exercised by the corndogs round-trip, so type-check a
-/// money record's emitted codec to confirm those paths compile. Compile-only (csil
-/// mapping pulls in no third-party package). Skips when node/npx is unavailable.
+/// Compile the tagged types and check the date wire format with Node.
 #[test]
-fn tagged_types_codec_type_checks() {
+fn tagged_types_codec_round_trips() {
     let have_node = std::process::Command::new("node")
         .arg("--version")
         .output()
@@ -3302,8 +3300,26 @@ fn tagged_types_codec_type_checks() {
     for f in &files {
         std::fs::write(dir.join(&f.path), &f.content).unwrap();
     }
-    std::fs::write(dir.join("tsconfig.json"), CODEC_TSCONFIG_NOEMIT).unwrap();
+    std::fs::write(dir.join("tsconfig.json"), CODEC_TSCONFIG).unwrap();
 
+    std::fs::write(dir.join("driver.ts"), r#"
+import { toMoneyCbor, fromMoneyCbor, encodeDate, decodeDate, encodeValue } from "./codec.gen";
+import { CsilDecimal, validateMoney } from "./types.gen";
+const money = { amount: CsilDecimal.fromString("1"), capturedAt: new Date(0), due: "2000-02-29" };
+const result = fromMoneyCbor(toMoneyCbor(money));
+if (result.due !== money.due || result.capturedAt.getTime() !== 0) throw Error("round trip");
+const bytes = Array.from(encodeValue(encodeDate(money.due)));
+if (bytes.join() !== [217,3,236,106,50,48,48,48,45,48,50,45,50,57].join()) throw Error("date wire bytes");
+function mustReject(f: () => unknown) { try { f(); } catch { return; } throw Error("accepted invalid date"); }
+for (const due of ["1900-02-29", "2026-02-30", "2026-2-01", "2026-01-01T00:00:00Z"]) {
+  mustReject(() => toMoneyCbor({ ...money, due }));
+  mustReject(() => decodeDate({ tag: 1004, value: due }));
+  if (!validateMoney({ ...money, due }).length) throw Error("validator accepted " + due);
+}
+mustReject(() => decodeDate(money.due));
+mustReject(() => decodeDate({ tag: 0, value: money.due }));
+mustReject(() => decodeDate({ tag: 1004, value: new Uint8Array(10) }));
+"#).unwrap();
     let build = std::process::Command::new("npx")
         .args(["-y", "-p", "typescript@5", "tsc", "-p", "tsconfig.json"])
         .current_dir(&dir)
@@ -3314,6 +3330,16 @@ fn tagged_types_codec_type_checks() {
         "tagged-types codec failed to type-check:\n{}{}",
         String::from_utf8_lossy(&build.stdout),
         String::from_utf8_lossy(&build.stderr)
+    );
+    let run = std::process::Command::new("node")
+        .arg("out/driver.js")
+        .current_dir(&dir)
+        .output()
+        .unwrap();
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -3935,22 +3961,6 @@ fn serviceless_package_type_checks_without_client_or_server() {
     }
     typecheck_emitted_package("serviceless", &input);
 }
-
-const CODEC_TSCONFIG_NOEMIT: &str = r#"{
-  "compilerOptions": {
-    "target": "es2020",
-    "module": "commonjs",
-    "moduleResolution": "node",
-    "strict": true,
-    "esModuleInterop": true,
-    "skipLibCheck": true,
-    "rewriteRelativeImportExtensions": true,
-    "lib": ["es2020", "dom"],
-    "noEmit": true
-  },
-  "include": ["*.ts"]
-}
-"#;
 
 const CODEC_TSCONFIG: &str = r#"{
   "compilerOptions": {

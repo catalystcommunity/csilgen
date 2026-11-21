@@ -846,10 +846,10 @@ fn inspect_field_constraints(
                 value_length(&value.value).is_some_and(|length| length as u64 <= *maximum)
             }
             SchemaValidationConstraint::MinValue(minimum) => {
-                compare_numeric(value, minimum).is_some_and(std::cmp::Ordering::is_ge)
+                compare_ordered(value, minimum).is_some_and(std::cmp::Ordering::is_ge)
             }
             SchemaValidationConstraint::MaxValue(maximum) => {
-                compare_numeric(value, maximum).is_some_and(std::cmp::Ordering::is_le)
+                compare_ordered(value, maximum).is_some_and(std::cmp::Ordering::is_le)
             }
             SchemaValidationConstraint::Custom { .. } => true,
         };
@@ -1113,6 +1113,7 @@ fn builtin_matches(name: &str, value: &DiagnosticValue) -> bool {
             })
         ),
         "decimal" => matches!(value, DiagnosticValue::Decimal { .. }),
+        "date" => matches!(value, DiagnosticValue::Date(_)),
         "timestamp" => matches!(value, DiagnosticValue::Timestamp { .. }),
         "any" => true,
         _ => false,
@@ -1156,16 +1157,26 @@ fn inspect_constraints(
                 value_length(&value.value).is_some_and(|length| size_matches(size, length as u64))
             }
             SchemaControl::GreaterEqual(bound) => {
-                compare_numeric(value, bound).is_some_and(std::cmp::Ordering::is_ge)
+                compare_ordered(value, bound).is_some_and(std::cmp::Ordering::is_ge)
             }
             SchemaControl::LessEqual(bound) => {
-                compare_numeric(value, bound).is_some_and(std::cmp::Ordering::is_le)
+                compare_ordered(value, bound).is_some_and(std::cmp::Ordering::is_le)
             }
             SchemaControl::GreaterThan(bound) => {
-                compare_numeric(value, bound).is_some_and(std::cmp::Ordering::is_gt)
+                compare_ordered(value, bound).is_some_and(std::cmp::Ordering::is_gt)
             }
             SchemaControl::LessThan(bound) => {
-                compare_numeric(value, bound).is_some_and(std::cmp::Ordering::is_lt)
+                compare_ordered(value, bound).is_some_and(std::cmp::Ordering::is_lt)
+            }
+            SchemaControl::Equal(SchemaLiteral::Text(bound))
+                if let DiagnosticValue::Date(day) = &value.value =>
+            {
+                day == bound
+            }
+            SchemaControl::NotEqual(SchemaLiteral::Text(bound))
+                if let DiagnosticValue::Date(day) = &value.value =>
+            {
+                day != bound
             }
             SchemaControl::Equal(expected) => literal_matches(expected, &value.value),
             SchemaControl::NotEqual(expected) => !literal_matches(expected, &value.value),
@@ -1219,8 +1230,9 @@ fn size_matches(size: &SchemaSize, length: u64) -> bool {
     }
 }
 
-fn compare_numeric(value: &SpannedValue, bound: &SchemaLiteral) -> Option<std::cmp::Ordering> {
+fn compare_ordered(value: &SpannedValue, bound: &SchemaLiteral) -> Option<std::cmp::Ordering> {
     match (&value.value, bound) {
+        (DiagnosticValue::Date(date), SchemaLiteral::Text(bound)) => Some(date.cmp(bound)),
         (DiagnosticValue::Integer(value), SchemaLiteral::Integer(bound)) => {
             value.partial_cmp(&(*bound as i128))
         }
@@ -1379,6 +1391,45 @@ mod tests {
                 .iter()
                 .any(|issue| issue.message.contains("unknown field"))
         );
+    }
+
+    #[test]
+    fn calendar_date_descriptor_and_wire_bounds_round_trip() {
+        let spec = parse_csil(
+            r#"
+            Due = date .gt "2024-02-27" .ge "2024-02-28" .le "2024-03-01" .lt "2024-03-02"
+            service Tasks { schedule: Due -> null }
+        "#,
+        )
+        .unwrap();
+        let schema = SchemaDescriptor::from_spec("dates", &spec).unwrap();
+        let descriptor = SchemaDescriptor::decode(&schema.encode().unwrap()).unwrap();
+        assert_eq!(descriptor, schema);
+        let route = RouteContext::RpcRequest {
+            service: "Tasks".into(),
+            operation: "schedule".into(),
+            direction: MessageDirection::Received,
+        };
+        for (tag, head, text, valid) in [
+            (&[0xd9, 0x03, 0xec][..], 0x6a, "2024-02-29", true),
+            (&[0xd9, 0x03, 0xec], 0x6a, "2024-02-28", true),
+            (&[0xd9, 0x03, 0xec], 0x6a, "2024-03-01", true),
+            (&[0xd9, 0x03, 0xec], 0x6a, "2024-02-27", false),
+            (&[0xd9, 0x03, 0xec], 0x6a, "2024-03-02", false),
+            (&[0xd9, 0x03, 0xec], 0x6a, "2024-02-30", false),
+            (&[0xc0], 0x6a, "2024-02-29", false),
+            (&[], 0x6a, "2024-02-29", false),
+            (&[0xd9, 0x03, 0xec], 0x4a, "2024-02-29", false),
+        ] {
+            let bytes = [tag, &[head], text.as_bytes()].concat();
+            let result = unmarshal(&descriptor, &route, &bytes);
+            assert_eq!(
+                result.diagnostics.is_empty(),
+                valid,
+                "{bytes:?} {:?}",
+                result.diagnostics
+            );
+        }
     }
 
     #[test]

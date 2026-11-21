@@ -76,6 +76,7 @@ Scalars = {
   t: text,
   raw: bytes,
   flag: bool,
+  due: date,
   when: timestamp,
   amount: decimal,
   ;; mixed-union coverage: a value equal to a literal arm must wire as

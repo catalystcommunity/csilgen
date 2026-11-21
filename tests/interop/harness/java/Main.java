@@ -79,7 +79,7 @@ public final class Main {
         return new Scalars(
             -42L, 42L, -7L, 3.5, "héllo 世界",
             new byte[] {0x01, 0x02, (byte) 0xf0, (byte) 0xff},
-            true, ts(), new BigDecimal("123.45"),
+            true, java.time.LocalDate.of(2000, 2, 29), ts(), new BigDecimal("123.45"),
             new MixedStatus("pending"), new MixedStatus("unlisted"),
             // inline mixed choice (hoisted; literal arm match).
             new ScalarsNote("info"),

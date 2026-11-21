@@ -277,6 +277,10 @@ fn ts_enc_value(
 ) -> String {
     match unwrap_constrained(ty) {
         CsilTypeExpression::Builtin(name) => match name.as_str() {
+            "date" => {
+                imports.insert("encodeDate".into());
+                format!("encodeDate({expr})")
+            }
             "timestamp" => {
                 imports.insert("csilTsToText".to_string());
                 format!("{{ tag: 0, value: csilTsToText({expr}) }}")
@@ -397,6 +401,10 @@ fn ts_dec_value(
             "bool" => {
                 imports.insert("asBool".to_string());
                 format!("asBool({expr})")
+            }
+            "date" => {
+                imports.insert("decodeDate".into());
+                format!("decodeDate({expr})")
             }
             "timestamp" => {
                 imports.insert("asTimestamp".to_string());
@@ -630,6 +638,8 @@ fn ts_variant_predicate(ty: &CsilTypeExpression, expr: &str, ctx: &Ctx) -> Strin
             "int" | "uint" | "nint" | "float" | "float16" | "float32" | "float64" | "double" => {
                 format!("typeof {expr} === \"number\" || typeof {expr} === \"bigint\"")
             }
+            "date" => format!("isCalendarDate({expr})"),
+            "timestamp" => format!("{expr} instanceof Date"),
             "text" | "tstr" => format!("typeof {expr} === \"string\""),
             "bytes" | "bstr" => format!("{expr} instanceof Uint8Array"),
             "bool" => format!("typeof {expr} === \"boolean\""),
@@ -1111,6 +1121,9 @@ pub fn generate(input: &WasmGeneratorInput) -> Option<String> {
 
     let default_types_module = ext.specifier(TYPES_STEM);
     let module = string_option(input, "codec_types_module", &default_types_module);
+    if spec.uses_builtin("date") {
+        out.push_str(&format!("import {{ isCalendarDate }} from \"{module}\";\n"));
+    }
     if uses_decimal && mapping == DecimalMapping::Library {
         out.push_str("import Decimal from \"decimal.js\";\n");
     }
@@ -1133,6 +1146,9 @@ pub fn generate(input: &WasmGeneratorInput) -> Option<String> {
     }
     out.push('\n');
 
+    if spec.uses_builtin("date") {
+        out.push_str(CODEC_DATE_TS);
+    }
     out.push_str(CODEC_RUNTIME_TS);
     out.push('\n');
 
@@ -1212,6 +1228,19 @@ export function csilDecFromTag4(payload: [number | bigint, number | bigint]): De
 /// The self-contained canonical-CBOR (RFC 8949 subset) value model and codec the
 /// generated record (de)serializers build on. `bytes` is a `Uint8Array`, so it
 /// encodes as a CBOR byte string (major type 2) by construction.
+const CODEC_DATE_TS: &str = r#"
+export function encodeDate(value: string): CborTag {
+  if (!isCalendarDate(value)) throw new Error("expected YYYY-MM-DD");
+  return { tag: 1004, value };
+}
+
+export function decodeDate(value: CborValue): string {
+  const text = asTagged(value, 1004);
+  if (!isCalendarDate(text)) throw new Error("expected YYYY-MM-DD");
+  return text;
+}
+"#;
+
 const CODEC_RUNTIME_TS: &str = r#"/** A CBOR semantic tag wrapping an inner value (e.g. tag 0 timestamp, tag 4 decimal). */
 export type CborTag = { readonly tag: number; readonly value: CborValue };
 

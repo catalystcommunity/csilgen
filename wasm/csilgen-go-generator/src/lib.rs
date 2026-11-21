@@ -1006,6 +1006,7 @@ fn go_scalar_sample(
 ) -> Option<String> {
     match codec_unwrap_constrained(ty) {
         CsilTypeExpression::Builtin(name) => match name.as_str() {
+            "date" => Some("\"1970-01-01\"".to_string()),
             "text" | "tstr" => Some("\"example\"".to_string()),
             "bool" => Some("false".to_string()),
             "int" | "nint" | "uint" | "float" | "float64" | "double" => Some("0".to_string()),
@@ -2278,6 +2279,7 @@ fn go_enc_value(
             "text" | "tstr" => format!("cborText({expr})"),
             "bytes" | "bstr" => format!("cborBytes({expr})"),
             "bool" => format!("cborBool({expr})"),
+            "date" => format!("csilEncDate(string({expr}))"),
             "timestamp" => format!("csilEncTimestamp({expr})"),
             "decimal" => format!("csilEncDecimal({expr})"),
             "nil" | "null" => "cborNull{}".to_string(),
@@ -2414,6 +2416,7 @@ fn go_dec_func(
             "text" | "tstr" => "cborAsText".to_string(),
             "bytes" | "bstr" => "cborAsBytes".to_string(),
             "bool" => "cborAsBool".to_string(),
+            "date" => "csilAsDate".to_string(),
             "timestamp" => "csilAsTimestamp".to_string(),
             "decimal" => "csilAsDecimal".to_string(),
             "any" => "cborDecAny".to_string(),
@@ -3336,6 +3339,7 @@ fn generate_codec(input: &WasmGeneratorInput, config: &GoConfig) -> Option<Strin
     }
     let records = record_names(input);
     let aliases = codec_aliases(input);
+    let uses_date = input.csil_spec.uses_builtin("date");
     let uses_timestamp = spec_uses_builtin(input, "timestamp");
     let uses_decimal = spec_uses_builtin(input, "decimal");
 
@@ -3355,7 +3359,7 @@ fn generate_codec(input: &WasmGeneratorInput, config: &GoConfig) -> Option<Strin
     content.push_str(&format!("{}\"fmt\"\n", config.indent_style));
     content.push_str(&format!("{}\"math\"\n", config.indent_style));
     content.push_str(&format!("{}\"unicode/utf8\"\n", config.indent_style));
-    if uses_timestamp {
+    if uses_timestamp || uses_date {
         content.push_str(&format!("{}\"time\"\n", config.indent_style));
     }
     if uses_decimal {
@@ -3376,6 +3380,9 @@ fn generate_codec(input: &WasmGeneratorInput, config: &GoConfig) -> Option<Strin
     if spec_uses_builtin(input, "any") {
         content.push('\n');
         content.push_str(CODEC_ANY_GO);
+    }
+    if uses_date {
+        content.push_str(CODEC_DATE_GO);
     }
     if uses_timestamp {
         content.push('\n');
@@ -3963,6 +3970,30 @@ func cborAsMap(v cborValue) (cborMap, error) {
 		return m, nil
 	}
 	return nil, fmt.Errorf("csil cbor: expected map, got %T", v)
+}
+"#;
+
+const CODEC_DATE_GO: &str = r#"
+func csilEncDate(s string) cborValue {
+	if _, err := time.Parse("2006-01-02", s); err != nil {
+		panic(err)
+	}
+	return cborTag{num: 1004, inner: cborText(s)}
+}
+
+func csilAsDate(v cborValue) (string, error) {
+	tag, ok := v.(cborTag)
+	if !ok || tag.num != 1004 {
+		return "", fmt.Errorf("expected calendar date tag 1004")
+	}
+	s, err := cborAsText(tag.inner)
+	if err != nil {
+		return "", err
+	}
+	if _, err := time.Parse("2006-01-02", s); err != nil {
+		return "", err
+	}
+	return s, nil
 }
 "#;
 
@@ -4983,7 +5014,8 @@ fn emit_ordered_check(
             let mut chk = String::new();
             chk.push_str(&format!("{i}if {access} {go_op} {value_str} {{\n"));
             chk.push_str(&format!(
-                "{i}{i}return fmt.Errorf(\"field '{name}' must be {desc} {value_str}\")\n"
+                "{i}{i}return fmt.Errorf(\"field '{name}' must be {desc} {}\")\n",
+                go_escape(&value_str)
             ));
             chk.push_str(&format!("{i}}}\n"));
             push_optional_guard(content, config, field, &chk);
@@ -5677,6 +5709,7 @@ fn map_csil_type_to_go(
             "text" | "tstr" => "string",
             "bytes" | "bstr" => "[]byte",
             "bool" => "bool",
+            "date" => "string",
             // CBOR tag 0, RFC3339, always UTC per the wire contract; time.Time is
             // kept in UTC so encode/decode round-trips the `Z` offset.
             "timestamp" => "time.Time",

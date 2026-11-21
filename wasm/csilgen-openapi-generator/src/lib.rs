@@ -721,6 +721,7 @@ impl OpenApiGenerator {
             "bool" => json!({
                 "type": "boolean"
             }),
+            "date" => json!({"type":"string", "format":"date"}),
             // CBOR tag 0 (RFC 3339 date/time string); `date-time` is the
             // standard JSON Schema/OpenAPI string format for this.
             "timestamp" => json!({

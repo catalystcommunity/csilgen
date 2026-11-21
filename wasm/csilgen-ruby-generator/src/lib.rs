@@ -818,6 +818,7 @@ fn ruby_sample(spec: &CsilSpecSerialized, ty: &CsilTypeExpression) -> String {
             "text" | "tstr" => "\"example\"".to_string(),
             "bool" => "false".to_string(),
             "bytes" | "bstr" => "\"\".b".to_string(),
+            "date" => "Date.new(1970, 1, 1)".to_string(),
             "timestamp" => "Time.now".to_string(),
             "decimal" => "BigDecimal(\"0\")".to_string(),
             "int" | "uint" => "0".to_string(),
@@ -1210,42 +1211,6 @@ fn finalize(mut content: String) -> String {
     content
 }
 
-/// True when the spec uses the named builtin anywhere, so a `require` is emitted only
-/// when the feature is actually present.
-fn spec_uses_builtin(spec: &CsilSpecSerialized, builtin: &str) -> bool {
-    spec.rules.iter().any(|rule| match &rule.rule_type {
-        CsilRuleType::GroupDef(group) => group
-            .entries
-            .iter()
-            .any(|e| type_uses_builtin(&e.value_type, builtin)),
-        CsilRuleType::TypeDef(type_expr) => type_uses_builtin(type_expr, builtin),
-        CsilRuleType::ServiceDef(service) => service.operations.iter().any(|op| {
-            type_uses_builtin(&op.input_type, builtin)
-                || type_uses_builtin(&op.output_type, builtin)
-        }),
-        _ => false,
-    })
-}
-
-fn type_uses_builtin(type_expr: &CsilTypeExpression, builtin: &str) -> bool {
-    match type_expr {
-        CsilTypeExpression::Builtin(name) => name == builtin,
-        CsilTypeExpression::Array { element_type, .. } => type_uses_builtin(element_type, builtin),
-        CsilTypeExpression::Map { key, value, .. } => {
-            type_uses_builtin(key, builtin) || type_uses_builtin(value, builtin)
-        }
-        CsilTypeExpression::Choice(choices) => {
-            choices.iter().any(|c| type_uses_builtin(c, builtin))
-        }
-        CsilTypeExpression::Constrained { base_type, .. } => type_uses_builtin(base_type, builtin),
-        CsilTypeExpression::Group(group) | CsilTypeExpression::Tuple(group) => group
-            .entries
-            .iter()
-            .any(|e| type_uses_builtin(&e.value_type, builtin)),
-        _ => false,
-    }
-}
-
 fn generate_types_file(spec: &CsilSpecSerialized) -> Option<String> {
     let mut body = String::new();
     let mut has_types = false;
@@ -1317,11 +1282,15 @@ fn generate_types_file(spec: &CsilSpecSerialized) -> Option<String> {
     // Only `require` what mapped/validated types actually use, so a spec of plain
     // scalars never pulls in bigdecimal/time.
     let mut needs_blank = false;
-    if spec_uses_builtin(spec, "decimal") {
+    if spec.uses_builtin("decimal") {
         content.push_str("require \"bigdecimal\"\n");
         needs_blank = true;
     }
-    if spec_uses_builtin(spec, "timestamp") {
+    if spec.uses_builtin("date") {
+        content.push_str("require \"date\"\n");
+        needs_blank = true;
+    }
+    if spec.uses_builtin("timestamp") {
         content.push_str("require \"time\"\n");
         needs_blank = true;
     }
@@ -1544,6 +1513,7 @@ enum OrderedKind {
     Numeric,
     Decimal,
     Timestamp,
+    Date,
 }
 
 fn ordered_field_kind(value_type: &CsilTypeExpression) -> OrderedKind {
@@ -1554,6 +1524,7 @@ fn ordered_field_kind(value_type: &CsilTypeExpression) -> OrderedKind {
     if let CsilTypeExpression::Builtin(name) = base {
         match name.as_str() {
             "decimal" => OrderedKind::Decimal,
+            "date" => OrderedKind::Date,
             "timestamp" => OrderedKind::Timestamp,
             _ => OrderedKind::Numeric,
         }
@@ -1604,6 +1575,18 @@ fn emit_ordered_check(
                 return;
             };
             let bound = format!("BigDecimal({})", ruby_string_literal(&text));
+            let condition = format!("{access} {ruby_op} {bound}");
+            let message = format!("field '{name}' must be {desc} {text}");
+            push_guarded(out, field, &condition, &message);
+        }
+        OrderedKind::Date => {
+            let Some(text) = literal_as_timestamp_text(value) else {
+                return;
+            };
+            let bound = format!(
+                "Date.iso8601({}, Date::GREGORIAN)",
+                ruby_string_literal(&text)
+            );
             let condition = format!("{access} {ruby_op} {bound}");
             let message = format!("field '{name}' must be {desc} {text}");
             push_guarded(out, field, &condition, &message);
@@ -1791,6 +1774,14 @@ fn literal_value_to_ruby_value(
                 return format!("BigDecimal({})", ruby_string_literal(&text));
             }
         }
+        OrderedKind::Date => {
+            if let Some(text) = literal_as_timestamp_text(value) {
+                return format!(
+                    "Date.iso8601({}, Date::GREGORIAN)",
+                    ruby_string_literal(&text)
+                );
+            }
+        }
         OrderedKind::Timestamp => {
             if let Some(text) = literal_as_timestamp_text(value) {
                 return format!("Time.iso8601({})", ruby_string_literal(&text));
@@ -1951,6 +1942,7 @@ fn ruby_union_guard(
             "float" => "Float".to_string(),
             "text" | "tstr" | "bytes" | "bstr" => "String".to_string(),
             "bool" => "TrueClass, FalseClass".to_string(),
+            "date" => "Date".to_string(),
             "timestamp" => "Time".to_string(),
             "decimal" => "BigDecimal".to_string(),
             "nil" | "null" => "NilClass".to_string(),
@@ -2001,6 +1993,7 @@ fn enc_tree(
             "int" | "uint" | "float" | "bool" => expr.to_string(),
             "text" | "tstr" => expr.to_string(),
             "bytes" | "bstr" => format!("({expr}).b"),
+            "date" => format!("CsilCbor.enc_date({expr})"),
             "timestamp" => format!("CsilCbor::Tag.new(0, ({expr}).getutc.iso8601)"),
             "decimal" => format!("CsilCbor::Tag.new(4, CsilCbor.decimal_to_tag({expr}))"),
             "nil" | "null" => "nil".to_string(),
@@ -2102,6 +2095,7 @@ fn dec_tree(
             "int" | "uint" | "float" | "bool" | "text" | "tstr" | "bytes" | "bstr" => {
                 expr.to_string()
             }
+            "date" => format!("CsilCbor.as_date({expr})"),
             "timestamp" => format!("Time.iso8601(({expr}).value)"),
             "decimal" => format!("CsilCbor.tag_to_decimal(({expr}).value)"),
             "nil" | "null" => "nil".to_string(),
@@ -2524,15 +2518,15 @@ fn generate_codec_file(spec: &CsilSpecSerialized) -> Option<String> {
     content.push_str("# Code generated by csilgen; DO NOT EDIT.\n\n");
     // The codec reopens the generated classes, so it needs them loaded first.
     content.push_str("require_relative \"types\"\n");
-    if spec_uses_builtin(spec, "timestamp") {
+    if spec.uses_builtin("timestamp") {
         content.push_str("require \"time\"\n");
     }
-    if spec_uses_builtin(spec, "decimal") {
+    if spec.uses_builtin("decimal") {
         content.push_str("require \"bigdecimal\"\n");
     }
     content.push('\n');
     content.push_str(CODEC_RUNTIME_RUBY);
-    if spec_uses_builtin(spec, "decimal") {
+    if spec.uses_builtin("decimal") {
         content.push_str(CODEC_DECIMAL_RUBY);
     }
     content.push('\n');
@@ -2611,6 +2605,21 @@ module CsilCbor
   Tag = Struct.new(:tag, :value)
 
   module_function
+
+  def enc_date(value)
+    raise ArgumentError, "expected a calendar date" unless value.instance_of?(Date)
+    tag = Tag.new(1004, value.iso8601.encode(Encoding::UTF_8))
+    as_date(tag)
+    tag
+  end
+
+  def as_date(node)
+    unless node.is_a?(Tag) && node.tag == 1004 && node.value.is_a?(String) &&
+           node.value.encoding == Encoding::UTF_8 && /\A[0-9]{4}-[0-9]{2}-[0-9]{2}\z/.match?(node.value)
+      raise ArgumentError, "expected tag 1004 with YYYY-MM-DD text"
+    end
+    Date.iso8601(node.value, Date::GREGORIAN)
+  end
 
   # Canonical-CBOR encode of a Ruby value tree to a binary String.
   def encode(value)
@@ -2796,6 +2805,7 @@ fn map_csil_type_to_ruby(type_expr: &CsilTypeExpression) -> String {
             "text" | "tstr" => "String".to_string(),
             "bytes" | "bstr" => "String".to_string(),
             "bool" => "Boolean".to_string(),
+            "date" => "Date".to_string(),
             "timestamp" => "Time".to_string(),
             "decimal" => "BigDecimal".to_string(),
             "nil" | "null" => "nil".to_string(),

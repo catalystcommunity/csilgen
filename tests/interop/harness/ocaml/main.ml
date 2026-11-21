@@ -24,6 +24,7 @@ let scalars_ok () : T.scalars =
     t = "h\xc3\xa9llo \xe4\xb8\x96\xe7\x95\x8c";
     raw = Bytes.of_string "\x01\x02\xf0\xff";
     flag = true;
+    due = "2000-02-29";
     when_ = "2026-06-29T12:34:56Z";
     amount = "123.45";
     (* mixed-union coverage: a value equal to a literal arm must wire as

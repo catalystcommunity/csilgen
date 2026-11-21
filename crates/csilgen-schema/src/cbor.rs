@@ -54,6 +54,7 @@ pub enum DiagnosticValue {
         exponent: i128,
         mantissa: i128,
     },
+    Date(String),
     Timestamp {
         original_tag: u64,
         value: Box<SpannedValue>,
@@ -75,6 +76,7 @@ impl DiagnosticValue {
             Self::Map(_) => "map",
             Self::Tag { .. } => "semantic tag",
             Self::Decimal { .. } => "decimal fraction",
+            Self::Date(_) => "date",
             Self::Timestamp { .. } => "timestamp",
         }
     }
@@ -369,6 +371,12 @@ impl Decoder<'_> {
 }
 
 fn semantic_tag(tag: u64, value: SpannedValue) -> DiagnosticValue {
+    if tag == 1004
+        && let DiagnosticValue::Text(text) = &value.value
+        && csilgen_core::is_calendar_date(text)
+    {
+        return DiagnosticValue::Date(text.clone());
+    }
     if tag == 4
         && let DiagnosticValue::Array(parts) = &value.value
         && parts.len() == 2
