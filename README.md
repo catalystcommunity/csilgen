@@ -15,7 +15,11 @@ The core architecture is in place and the CLI is functional end-to-end: parsing,
 
 ## Current Usage
 
-From a fresh clone, the minimal commands to generate code from CSIL files:
+When you build from source with rustup, it installs the Rust version and
+targets listed in [rust-toolchain.toml](rust-toolchain.toml). These targets
+support the CLI release builds and the WASM generators.
+
+To build csilgen and generate code from a fresh clone, run these commands.
 
 ```bash
 # Clone and install a development build from the source tree

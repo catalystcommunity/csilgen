@@ -1168,18 +1168,8 @@ fn inspect_constraints(
             SchemaControl::LessThan(bound) => {
                 compare_ordered(value, bound).is_some_and(std::cmp::Ordering::is_lt)
             }
-            SchemaControl::Equal(SchemaLiteral::Text(bound))
-                if let DiagnosticValue::Date(day) = &value.value =>
-            {
-                day == bound
-            }
-            SchemaControl::NotEqual(SchemaLiteral::Text(bound))
-                if let DiagnosticValue::Date(day) = &value.value =>
-            {
-                day != bound
-            }
-            SchemaControl::Equal(expected) => literal_matches(expected, &value.value),
-            SchemaControl::NotEqual(expected) => !literal_matches(expected, &value.value),
+            SchemaControl::Equal(expected) => constraint_value_equals(expected, &value.value),
+            SchemaControl::NotEqual(expected) => !constraint_value_equals(expected, &value.value),
             SchemaControl::Regex(pattern) => match &value.value {
                 DiagnosticValue::Text(text) => {
                     regex::Regex::new(pattern).is_ok_and(|pattern| pattern.is_match(text))
@@ -1227,6 +1217,13 @@ fn size_matches(size: &SchemaSize, length: u64) -> bool {
         SchemaSize::Range { min, max } => (*min..=*max).contains(&length),
         SchemaSize::Min(min) => length >= *min,
         SchemaSize::Max(max) => length <= *max,
+    }
+}
+
+fn constraint_value_equals(bound: &SchemaLiteral, value: &DiagnosticValue) -> bool {
+    match (bound, value) {
+        (SchemaLiteral::Text(bound), DiagnosticValue::Date(day)) => day == bound,
+        _ => literal_matches(bound, value),
     }
 }
 
