@@ -1,3 +1,5 @@
+options { lint_text_enums: "off" }
+
 ; E-commerce API - Real-world online store interface
 
 ; Product catalog types

@@ -1,3 +1,5 @@
+options { lint_text_enums: "off" }
+
 ; Mega API - Large CSIL file for performance testing with many services
 
 ; Common types

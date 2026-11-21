@@ -1013,7 +1013,7 @@ fn rpc_replies(spec: &CsilSpecSerialized, ctx: &Ctx) -> String {
             } else {
                 if exceptions.insert(cls.clone()) {
                     let ty = common::ts_type(arm, ctx.mapping);
-                    out.push_str(&format!("export class {cls} extends Error {{\n  constructor(readonly value: {ty}) {{ super({wire:?}); }}\n}}\n\n"));
+                    out.push_str(&format!("export class {cls} extends Error {{\n  readonly value: {ty};\n\n  constructor(value: {ty}) {{\n    super({wire:?});\n    this.value = value;\n  }}\n}}\n\n"));
                 }
                 let fallback =
                     wire == "ServiceError" && !spec.rules.iter().any(|rule| rule.name == wire);
@@ -1189,7 +1189,7 @@ fn string_option(input: &WasmGeneratorInput, key: &str, default: &str) -> String
 /// `decimal.js` carries no direct tag-4 accessor, so library mode bridges through
 /// the canonical decimal string. Emitted only when a record uses `decimal` and
 /// `decimal_mapping` is `"library"`.
-const DECIMAL_LIBRARY_BRIDGE_TS: &str = r#"function csilDecToTag4(d: Decimal): [number, bigint] {
+const DECIMAL_LIBRARY_BRIDGE_TS: &str = r#"export function csilDecToTag4(d: Decimal): [number, bigint] {
   const match = /^([+-]?)(\d*)(?:\.(\d*))?(?:[eE]([+-]?\d+))?$/.exec(d.toString().trim());
   if (match === null) throw new Error(`invalid decimal: ${d.toString()}`);
   const sign = match[1] === "-" ? -1n : 1n;
@@ -1202,7 +1202,7 @@ const DECIMAL_LIBRARY_BRIDGE_TS: &str = r#"function csilDecToTag4(d: Decimal): [
   return [exponent, mantissa];
 }
 
-function csilDecFromTag4(payload: [number | bigint, number | bigint]): Decimal {
+export function csilDecFromTag4(payload: [number | bigint, number | bigint]): Decimal {
   const exponent = Number(payload[0]);
   const mantissa = BigInt(payload[1]);
   return new Decimal(`${mantissa}e${exponent}`);

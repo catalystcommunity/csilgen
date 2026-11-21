@@ -1,3 +1,5 @@
+options { lint_doc_comments: "off" }
+
 ;; Example CSIL file for exercising the mdsummary example generator.
 
 UserID = text .size (8..16)

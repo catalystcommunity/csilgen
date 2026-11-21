@@ -340,7 +340,7 @@ fn async_twin_emitted_by_default_with_marked_symbols() {
     assert!(twin.contains("export class AuthAsyncClient {"));
     assert!(twin.contains("export class MemberAsyncClient {"));
     assert!(twin.contains("export class AsyncApiClient {"));
-    assert!(twin.contains("constructor(private readonly t: AsyncServiceTransport) {}"));
+    assert!(twin.contains("constructor(t: AsyncServiceTransport)"));
     // Methods are async and Promise-returning, awaiting the byte seam.
     assert!(twin.contains("async login(req: LoginRequest): Promise<LoginResponse> {"));
     assert!(twin.contains(
@@ -3399,7 +3399,6 @@ fn package_json_has_derived_name_and_defaults() {
     // sample_spec's first service alphabetically is AuthService -> auth-client.
     assert_eq!(pkg["name"], "auth-client");
     assert_eq!(pkg["version"], "0.1.0");
-    assert_eq!(pkg["type"], "commonjs");
     assert_eq!(pkg["main"], "dist/index.js");
     assert_eq!(pkg["types"], "dist/index.d.ts");
     assert_eq!(pkg["scripts"]["build"], "tsc");
@@ -3480,7 +3479,7 @@ fn barrel_dedupes_codec_collision_for_aggregate_target() {
     // Server still contributes its unique surface explicitly.
     assert!(index.contains("from \"./server.gen.ts\";"));
     assert!(index.contains("dispatch"));
-    assert!(index.contains("ServerHandlers"));
+    assert!(index.contains("type ServerHandlers"));
 }
 
 /// The fixture set every `import_extension` coverage test below runs over: every

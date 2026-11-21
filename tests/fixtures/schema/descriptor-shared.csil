@@ -1,3 +1,5 @@
+options { lint_rule_names: "off" }
+
 SharedID = uint
 
 shared_fields = (

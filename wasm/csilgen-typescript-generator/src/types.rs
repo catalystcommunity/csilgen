@@ -51,15 +51,18 @@ pub fn generate(input: &WasmGeneratorInput) -> String {
             && let Some(members) = csilgen_common::text_enum_members(arms)
         {
             let name = common::to_pascal(&rule.name);
+            out.push_str(&format!("export const {name} = {{\n"));
+            for (member, wire) in &members {
+                out.push_str(&format!(
+                    "  {member}: {},\n",
+                    serde_json::to_string(wire).expect("string literal")
+                ));
+            }
+            out.push_str("} as const;\n");
             if let Some(numbers) = csilgen_common::enum_numbers(arms) {
-                out.push_str(&format!("export enum {name} {{\n"));
-                for (member, label) in &members {
-                    out.push_str(&format!(
-                        "  {member} = {},\n",
-                        serde_json::to_string(label).unwrap()
-                    ));
-                }
-                out.push_str("}\n\n");
+                out.push_str(&format!(
+                    "export type {name} = (typeof {name})[keyof typeof {name}];\n"
+                ));
                 out.push_str(&format!(
                     "export const {name}Numbers = makeEnumNumbers<{name}>([\n"
                 ));
@@ -69,14 +72,6 @@ pub fn generate(input: &WasmGeneratorInput) -> String {
                 out.push_str("]);\n\n");
                 continue;
             }
-            out.push_str(&format!("export const {name} = {{\n"));
-            for (member, wire) in members {
-                out.push_str(&format!(
-                    "  {member}: {},\n",
-                    serde_json::to_string(wire).expect("string literal")
-                ));
-            }
-            out.push_str("} as const;\n");
         }
         match &rule.rule_type {
             CsilRuleType::TypeDef(CsilTypeExpression::Group(group)) => {
@@ -164,10 +159,13 @@ export class CsilDecimal {
   /** CBOR semantic tag for a decimal fraction. */
   static readonly CBOR_TAG = 4;
 
-  constructor(
-    readonly exponent: number,
-    readonly mantissa: bigint,
-  ) {}
+  readonly exponent: number;
+  readonly mantissa: bigint;
+
+  constructor(exponent: number, mantissa: bigint) {
+    this.exponent = exponent;
+    this.mantissa = mantissa;
+  }
 
   /** Reconstruct from the CBOR tag-4 payload `[exponent, mantissa]`. */
   static fromTag4(payload: readonly [number | bigint, number | bigint]): CsilDecimal {

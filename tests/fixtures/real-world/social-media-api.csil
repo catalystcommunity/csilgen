@@ -1,3 +1,5 @@
+options { lint_text_enums: "off" }
+
 ; Social Media API - Real-world inspired interface
 
 ; Core entity types

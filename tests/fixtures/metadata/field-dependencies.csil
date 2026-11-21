@@ -1,3 +1,5 @@
+options { lint_text_enums: "off" }
+
 ; Field dependencies and conditional requirements test case
 
 ; Payment form with conditional fields

@@ -295,6 +295,11 @@ const number = RpErrorCodeNumbers.numberFromEnum(member); // 42n
 const decoded = RpErrorCodeNumbers.enumFromNumber(number); // same member
 ```
 
+All four TypeScript targets export a constant object and a type with the
+same name. Use `RpErrorCode.APPLICATION_USER_LIMIT` as a value and
+`RpErrorCode` as a type. With the default `.ts` imports, Node 22.18 or
+later can load the generated source directly.
+
 TypeScript returns a `bigint` to preserve all signed 64-bit values. For the
 reverse lookup, pass a `bigint` or a safe integer `number`. The following
 table shows the generated API for an enum named `Code`.
@@ -784,11 +789,6 @@ Common options:
 - `package`: Package/module name for generated code
 - `version`: API version
 - `namespace`: Namespace for generated types
-- `lint_text_enums` sets the severity for quoted text enums in this file.
-  Use `"off"` to skip this check, `"warn"` to report a warning (the default),
-  or `"error"` to make lint fail. Each file uses its own setting.
-  Run `csilgen lint DIR --fail-on-warnings` to make any lint warning return
-  exit status 1.
 - `*_package`: Language-specific package names (`go_package`, `java_package`,
   `kotlin_package`), `go_module` for the Go module path
 - `package_name` / `package_version`: package coordinates (name and version)
@@ -806,6 +806,26 @@ Common options:
 
 Option values may be strings, numbers, booleans, or **arrays** (e.g.
 `emit_packages: ["go", "rust"]`); entries in the block are comma-separated.
+
+### Lint options
+
+Set a lint option to `"off"`, `"warn"`, or `"error"` in the file that
+declares the rule. Each imported file uses its own options.
+`csilgen linted-validate --input FILE --fail-on-warnings` returns exit
+status 1 for a warning or an error.
+
+| Option | Default | What the linter checks |
+| --- | --- | --- |
+| `lint_rule_names` | warn | Type and service names use PascalCase, such as `UserID`. |
+| `lint_field_names` | warn | Bare field names use snake_case, such as `user_id`. |
+| `lint_operation_names` | warn | Operation names use kebab-case, such as `hello` or `get-user`. |
+| `lint_unused_rules` | off | A type has a reference in this file. Services and types can be public entry points. The check skips services. |
+| `lint_text_enums` | warn | An enum sends a text label. |
+| `lint_doc_comments` | warn | A definition uses the CSIL documentation comment extension (`;;;`). |
+| `lint_rule_length` | warn | A rule name exceeds 64 characters. |
+| `lint_zero_minimum` | warn | A minimum length or item count is zero. |
+| `lint_empty_service` | warn | A service has no operations. |
+| `lint_nesting_depth` | warn | A type exceeds five levels of nesting. |
 
 ## Code Generation
 

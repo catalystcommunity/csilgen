@@ -1,3 +1,5 @@
+options { lint_text_enums: "off" }
+
 ; Multiple service definitions in a single file
 
 ; Shared types

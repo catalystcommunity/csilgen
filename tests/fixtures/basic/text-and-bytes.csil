@@ -1,3 +1,5 @@
+options { lint_rule_names: "off" }
+
 ; Text and bytes variations test case
 text_type = text
 tstr_type = tstr

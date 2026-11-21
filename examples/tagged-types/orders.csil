@@ -10,6 +10,7 @@
 ;; Python always uses the stdlib `decimal.Decimal`. The wire form is identical
 ;; either way — only the in-memory type changes.
 options {
+    lint_rule_names: "off",
     decimal_mapping: "csil"
 }
 

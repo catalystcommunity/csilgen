@@ -253,6 +253,10 @@ applies the same check before it writes code.
 Use `linted-validate` (also `linted_validate`) to validate an entry file, then
 lint that file and each imported file once. Each file uses its own lint options.
 Add `--fail-on-warnings` to return exit status 1 for a lint warning.
+Use PascalCase for type and service names, snake_case for fields, and
+kebab-case for operations. A single word such as `hello` is valid.
+A top-level type can be an entry point for application code.
+See the [lint options](docs/csil-spec.md#lint-options) for per-file settings.
 
 The `validate` and `breaking` commands accept file paths. The `format` command
 processes a directory tree. The `lint` command processes CSIL files directly

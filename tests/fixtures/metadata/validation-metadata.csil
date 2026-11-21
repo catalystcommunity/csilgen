@@ -34,7 +34,6 @@ UserRegistration = {
     @description("Receive SMS notifications")
     sms_notifications: bool,
     
-    @min-items(0)
     @max-items(10)
     @description("List of interests")
     interests: [* text],

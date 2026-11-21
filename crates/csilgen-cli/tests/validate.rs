@@ -38,9 +38,9 @@ fn linted_validate_checks_reachable_source_files_with_their_own_options() {
     let input = dir.path().join("api.csil");
     let common = dir.path().join("common.csil");
     fs::write(dir.path().join("unrelated.csil"), "bad = typo").unwrap();
-    fs::write(&input, "include \"common.csil\" as shared\noptions { lint_text_enums: \"off\" }\nuser = shared.record").unwrap();
+    fs::write(&input, "include \"common.csil\" as shared\noptions { lint_text_enums: \"off\" }\nUser = shared.Record").unwrap();
     for (policy, exit) in [("error", 1), ("warn", 0), ("off", 0)] {
-        fs::write(&common, format!("options {{ lint_text_enums: \"{policy}\" }}\nrecord = {{ current: status }}\nstatus = \"busy\" / \"denied\"")).unwrap();
+        fs::write(&common, format!("options {{ lint_text_enums: \"{policy}\" }}\nRecord = {{ current: Status }}\nStatus = \"busy\" / \"denied\"")).unwrap();
         check("validate", &input, &[], 0);
         let output = check("linted-validate", &input, &[], exit);
         assert_eq!(
@@ -51,4 +51,27 @@ fn linted_validate_checks_reachable_source_files_with_their_own_options() {
             check("linted_validate", &input, &["--fail-on-warnings"], 1);
         }
     }
+}
+
+#[test]
+fn naming_policies_are_independent_and_local_to_the_source_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let entry = dir.path().join("api.csil");
+    let shared = dir.path().join("shared.csil");
+    fs::write(&entry, "include \"shared.csil\"\noptions { lint_rule_names: \"off\" }\nservice Api { hello: bad_name -> Root }\nRoot = text").unwrap();
+    let declarations = "bad_name = { userName: text }\nservice Other { getUser: bad_name -> text }";
+    fs::write(&shared, declarations).unwrap();
+    let output = check("linted_validate", &entry, &["--fail-on-warnings"], 1);
+    for diagnostic in [
+        "PascalCase",
+        "Field 'userName'",
+        "Operation 'getUser'",
+        "3 warning(s)",
+    ] {
+        assert!(output.contains(diagnostic), "{output}");
+    }
+    fs::write(&shared, format!("options {{ lint_rule_names: \"off\", lint_field_names: \"off\", lint_operation_names: \"error\" }}\n{declarations}")).unwrap();
+    let output = check("linted_validate", &entry, &[], 1);
+    assert!(output.contains("Operation 'getUser'"), "{output}");
+    assert!(output.contains("1 error(s), 0 warning(s)"), "{output}");
 }
