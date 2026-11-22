@@ -1073,42 +1073,57 @@ fn cbor_as_map(v: &CsilCborValue) -> Result<&[(CsilCborValue, CsilCborValue)], C
     }
 }"#;
 
-const CODEC_DATE_RUST: &str = r#"
-fn csil_enc_date(date: &chrono::NaiveDate) -> CsilCborValue {
+const CODEC_DATE_RUST: &str = r#"fn csil_enc_date(date: &time::Date) -> CsilCborValue {
     let text = date.to_string();
     assert!(text.len() == 10, "CSIL date requires a four-digit year");
     CsilCborValue::Tag(1004, Box::new(CsilCborValue::Text(text)))
 }
 
-fn csil_as_date(v: &CsilCborValue) -> Result<chrono::NaiveDate, CsilCborError> {
+fn csil_as_date(v: &CsilCborValue) -> Result<time::Date, CsilCborError> {
     let CsilCborValue::Tag(1004, inner) = v else {
         return Err(CsilCborError("expected calendar date tag 1004".into()));
     };
     let CsilCborValue::Text(text) = inner.as_ref() else {
         return Err(CsilCborError("expected calendar date text".into()));
     };
-    if text.len() == 10 {
-        if let Ok(date) = text.parse::<chrono::NaiveDate>() {
-            if date.to_string() == *text {
-                return Ok(date);
-            }
-        }
-    }
-    Err(CsilCborError("expected a YYYY-MM-DD date".into()))
-}
-"#;
+    time::Date::parse(text, &time::format_description::well_known::Iso8601::DATE)
+        .ok()
+        .filter(|date| text.len() == 10 && date.to_string() == *text)
+        .ok_or_else(|| CsilCborError("expected a YYYY-MM-DD date".into()))
+}"#;
 
-/// Timestamp (CBOR tag 0, RFC3339, always UTC) codec, emitted only when the spec
-/// uses `timestamp` so `chrono` is never an unused dependency.
-const CODEC_TIMESTAMP_RUST: &str = r#"/// Encode a UTC instant as CBOR tag 0 RFC3339 text in UTC, per the wire contract;
-/// sub-second precision is preserved when present and the `Z` offset is forced.
-fn csil_enc_timestamp(t: &chrono::DateTime<chrono::Utc>) -> CsilCborValue {
-    let text = t.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true);
+/// Timestamp codec for CBOR tag 0.
+const CODEC_TIMESTAMP_RUST: &str = r#"fn csil_enc_timestamp(t: &time::OffsetDateTime) -> CsilCborValue {
+    let utc = t.to_offset(time::UtcOffset::UTC);
+    let mut text = utc
+        .format(&time::format_description::well_known::Rfc3339)
+        .expect("CSIL timestamp requires a four-digit UTC year");
+    // Keep the wire spelling used by earlier Rust releases (3, 6, or 9 fractional digits).
+    if let Some(point) = text.find('.') {
+        let end = text.len() - 1; // final Z
+        let digits = end - point - 1;
+        let padding = (3 - digits % 3) % 3;
+        text.insert_str(end, &"00"[..padding]);
+    }
     CsilCborValue::Tag(0, Box::new(CsilCborValue::Text(text)))
 }
 
-/// Decode a CBOR tag 0 RFC3339 timestamp back to a UTC instant.
-fn csil_as_timestamp(v: &CsilCborValue) -> Result<chrono::DateTime<chrono::Utc>, CsilCborError> {
+pub(super) fn csil_parse_timestamp(s: &str) -> Result<time::OffsetDateTime, CsilCborError> {
+    if !matches!(s.as_bytes().get(10), Some(b'T' | b't' | b' ')) {
+        return Err(CsilCborError("invalid timestamp separator".into()));
+    }
+    // The time crate rounds a leap second down. Reject it to avoid changing the instant.
+    if s.get(17..19) == Some("60") {
+        return Err(CsilCborError("unrepresentable leap second".into()));
+    }
+    let dt = time::OffsetDateTime::parse(s, &time::format_description::well_known::Rfc3339)
+        .map_err(|e| CsilCborError(format!("csil cbor: invalid timestamp: {e}")))?;
+    dt.checked_to_offset(time::UtcOffset::UTC)
+        .filter(|utc| (0..=9999).contains(&utc.year()))
+        .ok_or_else(|| CsilCborError("timestamp outside four-digit UTC year range".into()))
+}
+
+fn csil_as_timestamp(v: &CsilCborValue) -> Result<time::OffsetDateTime, CsilCborError> {
     let CsilCborValue::Tag(0, inner) = v else {
         return Err(CsilCborError(
             "csil cbor: expected CBOR tag 0 timestamp".to_string(),
@@ -1119,9 +1134,7 @@ fn csil_as_timestamp(v: &CsilCborValue) -> Result<chrono::DateTime<chrono::Utc>,
             "csil cbor: timestamp content must be text".to_string(),
         ));
     };
-    chrono::DateTime::parse_from_rfc3339(s)
-        .map(|dt| dt.with_timezone(&chrono::Utc))
-        .map_err(|e| CsilCborError(format!("csil cbor: invalid timestamp: {e}")))
+    csil_parse_timestamp(s)
 }"#;
 
 /// Exact-integer (de)serialization for a decimal mantissa: a CBOR integer when it
@@ -2030,7 +2043,7 @@ impl<'a> RustCodeGenerator<'a> {
     /// Build the `Cargo.toml` for package mode. The crate is kept dependency-free
     /// whenever the spec allows it (the self-contained CBOR codec owns the wire); a
     /// dependency is listed only when the in-memory type for a builtin demands it
-    /// (`chrono` for timestamp, `rust_decimal` only under the library mapping,
+    /// (`time` for dates and timestamps, `rust_decimal` only under the library mapping,
     /// `regex` only when emitted validation needs it). Those versions resolve from
     /// the local cargo cache, so the crate still builds offline.
     fn generate_cargo_toml(&self) -> String {
@@ -2045,26 +2058,27 @@ impl<'a> RustCodeGenerator<'a> {
         let deps = self.crate_dependencies();
         if !deps.is_empty() {
             content.push_str("\n[dependencies]\n");
-            for (crate_name, req) in deps {
-                content.push_str(&format!("{crate_name} = \"{req}\"\n"));
+            for dep in deps {
+                content.push_str(dep);
+                content.push('\n');
             }
         }
         content
     }
 
-    /// The external crates the generated code needs, as `(name, version-req)` pairs.
+    /// The external crates the generated code needs, as TOML entries.
     /// Shared by the package-mode `Cargo.toml` and the non-package dependency note so
     /// the two never drift. Empty for a spec whose codec is fully self-contained.
-    fn crate_dependencies(&self) -> Vec<(&'static str, &'static str)> {
+    fn crate_dependencies(&self) -> Vec<&'static str> {
         let mut deps = Vec::new();
         if self.spec_uses_builtin("timestamp") || self.spec_uses_builtin("date") {
-            deps.push(("chrono", "0.4"));
+            deps.push(r#"time = { version = "0.3.47", features = ["formatting", "parsing"] }"#);
         }
         if self.spec_uses_builtin("decimal") && self.decimal_mapping == DecimalMapping::Library {
-            deps.push(("rust_decimal", "1"));
+            deps.push(r#"rust_decimal = "1""#);
         }
         if self.uses_regex {
-            deps.push(("regex", "1"));
+            deps.push(r#"regex = "1""#);
         }
         deps
     }
@@ -2526,7 +2540,7 @@ fn main() {{
     fn rust_sample(&self, ty: &CsilTypeExpression) -> String {
         match ty {
             CsilTypeExpression::Builtin(name) => match name.as_str() {
-                "date" => "chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap()".to_string(),
+                "date" => "time::OffsetDateTime::UNIX_EPOCH.date()".to_string(),
                 "text" | "tstr" | "string" => "\"example\".to_string()".to_string(),
                 "bool" | "boolean" => "false".to_string(),
                 "bytes" | "bstr" => "Vec::new()".to_string(),
@@ -5010,6 +5024,7 @@ pub fn resolve_rpc_reply(
 
         if self.spec_uses_builtin("date") {
             content.push_str(CODEC_DATE_RUST);
+            content.push_str("\n\n");
         }
         if self.spec_uses_builtin("timestamp") {
             content.push_str(CODEC_TIMESTAMP_RUST);
@@ -5472,14 +5487,14 @@ pub fn resolve_rpc_reply(
         // In the default (non-package) mode this generator emits no Cargo.toml, so
         // the crates the generated code needs are documented here for the consuming
         // crate to add. The self-contained `codec.gen.rs` owns the CBOR wire, so no
-        // CBOR library is required; only the in-memory types for `timestamp`/`decimal`
+        // CBOR library is required; only the in-memory types for `date`, `timestamp`, and `decimal`
         // (and `regex` for validation) pull a dependency. In package mode the same
         // list lands in the emitted `Cargo.toml` instead, so the note is suppressed.
         let deps = self.crate_dependencies();
         if !emit_rust_package(self.input) && !deps.is_empty() {
             content.push_str("//! ## Additional dependencies for the consuming crate\n//!\n");
-            for (crate_name, req) in &deps {
-                content.push_str(&format!("//! {crate_name} = \"{req}\"\n"));
+            for dep in deps {
+                content.push_str(&format!("//! {dep}\n"));
             }
             content.push_str("//!\n");
         }
@@ -5667,9 +5682,9 @@ pub fn resolve_rpc_reply(
             // `nint` through the signed-integer path, so it shares `i64`.
             "nint" => "i64".to_string(),
             "float" | "float16" | "float32" | "float64" => "f64".to_string(),
-            "date" => "chrono::NaiveDate".to_string(),
+            "date" => "time::Date".to_string(),
             // A UTC-typed instant; the tag-0 RFC3339 wire form is the codec's job.
-            "timestamp" => "chrono::DateTime<chrono::Utc>".to_string(),
+            "timestamp" => "time::OffsetDateTime".to_string(),
             // The injected `CsilDecimal` holds the exact tag-4 value by default;
             // `decimal_mapping = "library"` swaps in `rust_decimal::Decimal`.
             "decimal" => match self.decimal_mapping {
@@ -5948,7 +5963,14 @@ pub fn resolve_rpc_reply(
                 return;
             };
             Some(format!(
-                "            if *v {fail_op} {text:?}.parse::<chrono::NaiveDate>().expect(\"valid CSIL date bound\") {{ return Err(ValidationError {{ field: {field:?}.into(), message: {msg:?}.into() }}); }}\n"
+                "            let format = &time::format_description::well_known::Iso8601::DATE;\n\
+                 \x20           let bound = time::Date::parse({text:?}, format).expect(\"valid CSIL date bound\");\n\
+                 \x20           if *v {fail_op} bound {{\n\
+                 \x20               return Err(ValidationError {{\n\
+                 \x20                   field: {field:?}.into(),\n\
+                 \x20                   message: {msg:?}.into(),\n\
+                 \x20               }});\n\
+                 \x20           }}\n"
             ))
         } else if Self::is_timestamp_shape(base) {
             Self::timestamp_compare_check(field, fail_op, bound, msg)
@@ -6024,7 +6046,7 @@ pub fn resolve_rpc_reply(
     }
 
     /// A `timestamp` comparison guard. The bound is an RFC 3339 TEXT literal; it is
-    /// parsed into `chrono::DateTime<chrono::Utc>` and compared chronologically. A
+    /// parsed into `time::OffsetDateTime` and compared chronologically. A
     /// non-text bound yields `None` so nothing broken is emitted.
     fn timestamp_compare_check(
         field: &str,
@@ -6037,12 +6059,11 @@ pub fn resolve_rpc_reply(
         };
         Some(format!(
             "            {{\n\
-             \x20               let bound = chrono::DateTime::parse_from_rfc3339({text:?})\n\
+             \x20               let bound = super::codec::csil_parse_timestamp({text:?})\n\
              \x20                   .map_err(|e| ValidationError {{\n\
              \x20                       field: {field:?}.to_string(),\n\
              \x20                       message: format!(\"invalid timestamp bound: {{e}}\"),\n\
-             \x20                   }})?\n\
-             \x20                   .with_timezone(&chrono::Utc);\n\
+             \x20                   }})?;\n\
              \x20               if *v {fail_op} bound {{\n\
              \x20                   return Err(ValidationError {{\n\
              \x20                       field: {field:?}.to_string(),\n\
@@ -8429,7 +8450,7 @@ mod tests {
     }
 
     #[test]
-    fn timestamp_maps_to_chrono_utc() {
+    fn timestamp_maps_to_time_offset_date_time() {
         let input = single_field_spec(
             "Event",
             CsilTypeExpression::Builtin("timestamp".to_string()),
@@ -8438,13 +8459,14 @@ mod tests {
         );
         let mut generator = RustCodeGenerator::new(&input);
         let types = generator.generate_types().unwrap();
-        assert!(types.contains("pub field: chrono::DateTime<chrono::Utc>"));
+        assert!(types.contains("pub field: time::OffsetDateTime"));
 
         let files = RustCodeGenerator::new(&input).generate().unwrap();
         let root = files.iter().find(|f| f.path == "mod.rs").unwrap();
-        // `chrono` is now a plain in-memory dependency; no serde feature, no codec
-        // library (the generated codec owns the tag-0 wire).
-        assert!(root.content.contains("chrono = \"0.4\""));
+        assert!(
+            root.content
+                .contains(r#"time = { version = "0.3.47", features = ["formatting", "parsing"] }"#)
+        );
         assert!(!root.content.contains("ciborium"));
     }
 
@@ -8468,7 +8490,11 @@ mod tests {
             .expect("codec.gen.rs emitted");
         assert!(codec.content.contains("csil_enc_timestamp"));
         assert!(codec.content.contains("CsilCborValue::Tag(0,"));
-        assert!(codec.content.contains("to_rfc3339_opts"));
+        assert!(
+            codec
+                .content
+                .contains("time::format_description::well_known::Rfc3339")
+        );
         // The field routes through the timestamp codec on both sides.
         assert!(codec.content.contains("csil_enc_timestamp(&csil_v.field)"));
     }
@@ -8486,7 +8512,7 @@ mod tests {
         assert!(
             types
                 .content
-                .contains("pub field: Option<chrono::DateTime<chrono::Utc>>")
+                .contains("pub field: Option<time::OffsetDateTime>")
         );
         assert!(!types.content.contains("#[serde"));
 
@@ -9071,9 +9097,8 @@ mod tests {
         assert!(types.contains("CsilDecimal::from_str(\"0.00\")"));
         assert!(types.contains("if *v < bound {"));
 
-        // timestamp bound: parsed RFC 3339 into chrono UTC and compared.
-        assert!(types.contains("chrono::DateTime::parse_from_rfc3339(\"1970-01-01T00:00:00Z\")"));
-        assert!(types.contains(".with_timezone(&chrono::Utc)"));
+        // timestamp bound: parse the same UTC instant as the codec.
+        assert!(types.contains("super::codec::csil_parse_timestamp(\"1970-01-01T00:00:00Z\")"));
 
         // The bounds are escaped as Rust string literals, so the surrounding source
         // stays balanced: equal count of `"` characters means no quote broke out.

@@ -9,12 +9,12 @@ use std::io::Write;
 use std::net::{TcpListener, TcpStream, UdpSocket};
 use std::time::Duration;
 
-use chrono::{DateTime, Utc};
 use csilgen_transport::carrier::{FrameCarrier, StreamCarrier};
 use csilgen_transport::datagrams::Datagram;
 use csilgen_transport::events::{control, Event, Hello, HelloAck, Profile};
 use csilgen_transport::rpc::{HandlerOutcome, RpcClient, RpcRequest, RpcServer};
 use csilgen_transport::Status;
+use time::{format_description::well_known::Rfc3339, Date, Month, OffsetDateTime};
 
 use interop_api::{
     decode_collections, decode_constrained, decode_nested, decode_scalars,
@@ -33,10 +33,8 @@ const SERVICE: &str = "Interop";
 // Fixed language-neutral test vectors (see README "Fixed test vectors").
 // ---------------------------------------------------------------------------
 
-fn ts() -> DateTime<Utc> {
-    DateTime::parse_from_rfc3339("2026-06-29T12:34:56Z")
-        .unwrap()
-        .with_timezone(&Utc)
+fn ts() -> OffsetDateTime {
+    OffsetDateTime::parse("2026-06-29T12:34:56Z", &Rfc3339).unwrap()
 }
 
 fn scalars_ok() -> Scalars {
@@ -48,7 +46,7 @@ fn scalars_ok() -> Scalars {
         t: "héllo 世界".to_string(),
         raw: vec![0x01, 0x02, 0xf0, 0xff],
         flag: true,
-        due: chrono::NaiveDate::from_ymd_opt(2000, 2, 29).unwrap(),
+        due: Date::from_calendar_date(2000, Month::February, 29).unwrap(),
         when: ts(),
         amount: interop_api::CsilDecimal::from_str("123.45").unwrap(),
         // mixed-union coverage: a value equal to a literal arm must wire as
@@ -764,4 +762,65 @@ fn connect_retry(port: u16) -> TcpStream {
         std::thread::sleep(Duration::from_millis(15));
     }
     TcpStream::connect(("127.0.0.1", port)).expect("connect tcp")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn calendar_date_has_canonical_bytes_and_rejects_an_invalid_day() {
+        let mut wire = encode_scalars(&scalars_ok());
+        let date = b"\xd9\x03\xec\x6a2000-02-29";
+        let start = wire
+            .windows(date.len())
+            .position(|value| value == date)
+            .expect("missing tag 1004 leap-day bytes");
+        wire[start + date.len() - 2..start + date.len()].copy_from_slice(b"30");
+        assert!(decode_scalars(&wire).is_err());
+    }
+
+    #[test]
+    fn timestamp_preserves_the_instant_and_fractional_wire_spelling() {
+        for (fraction, expected) in [
+            ("", ""),
+            (".1", ".100"),
+            (".0012", ".001200"),
+            (".12345678", ".123456780"),
+        ] {
+            let mut sample = scalars_ok();
+            let local = format!("2000-03-01T01:00:00{fraction}+02:00");
+            sample.when = OffsetDateTime::parse(&local, &Rfc3339).unwrap();
+            let wire = encode_scalars(&sample);
+            let utc = format!("2000-02-29T23:00:00{expected}Z");
+            assert!(wire.windows(utc.len()).any(|value| value == utc.as_bytes()));
+            let decoded = decode_scalars(&wire).unwrap().when;
+            assert_eq!(decoded, sample.when);
+            assert_eq!(decoded.offset(), time::UtcOffset::UTC);
+        }
+    }
+
+    #[test]
+    fn timestamp_decoder_normalizes_offsets_and_rejects_unrepresentable_input() {
+        let wire = encode_scalars(&scalars_ok());
+        let tagged = b"\xc0\x742026-06-29T12:34:56Z";
+        let start = wire
+            .windows(tagged.len())
+            .position(|value| value == tagged)
+            .expect("missing tag 0 timestamp");
+        // Each replacement text is 25 bytes, so its CBOR header is 0x78 0x19.
+        let with_offset = |text: &[u8; 25]| {
+            let mut bytes = wire[..start].to_vec();
+            bytes.extend_from_slice(b"\xc0\x78\x19");
+            bytes.extend_from_slice(text);
+            bytes.extend_from_slice(&wire[start + tagged.len()..]);
+            decode_scalars(&bytes)
+        };
+        let seen = with_offset(b"2026-06-29T08:34:56-04:00").unwrap().when;
+        assert_eq!(seen, ts());
+        assert_eq!(seen.offset(), time::UtcOffset::UTC);
+        assert!(with_offset(b"2026-06-29x08:34:56-04:00").is_err());
+        assert!(with_offset(b"2016-12-31T23:59:60+00:00").is_err());
+        assert!(with_offset(b"9999-12-31T23:30:00-01:00").is_err());
+    }
 }

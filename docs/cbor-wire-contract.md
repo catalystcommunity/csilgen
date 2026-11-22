@@ -87,7 +87,7 @@ incorrect text format, or an impossible date. [RFC 8943](https://www.rfc-editor.
 
 | Target | Calendar date type |
 | --- | --- |
-| Rust | `chrono::NaiveDate` |
+| Rust | `time::Date` |
 | Java and Kotlin | `java.time.LocalDate` |
 | C# | `System.DateOnly` |
 | Python | `datetime.date` |
@@ -110,11 +110,15 @@ In-memory mappings (each is a UTC-typed instant where the language allows):
 
 | Target     | Type                                |
 | ---------- | ----------------------------------- |
-| Rust       | `chrono::DateTime<chrono::Utc>`     |
+| Rust       | `time::OffsetDateTime`              |
 | Go         | `time.Time` (kept in UTC)           |
 | TypeScript | `Date` (UTC-based)                  |
 | Python     | `datetime.datetime` (tz-aware, UTC) |
 | JSON/OpenAPI schema | `{"type":"string","format":"date-time"}` |
+
+The Rust decoder converts each timestamp to UTC. It rejects a leap second
+because `time::OffsetDateTime` cannot represent it. The Rust encoder writes
+zero, three, six, or nine fractional digits to preserve nanosecond precision.
 
 ### `decimal` — CBOR tag 4, exact
 
