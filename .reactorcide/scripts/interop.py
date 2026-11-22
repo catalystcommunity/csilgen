@@ -169,6 +169,7 @@ def _build(root: Path, language: Language) -> None:
     generated = _generated(root, language)
     print(f"  building {language.name} harness...", flush=True)
     if language.name == "rust":
+        _run(("cargo", "test", "--quiet"), harness)
         _run(("cargo", "build", "--quiet"), harness)
     elif language.name == "go":
         _run(

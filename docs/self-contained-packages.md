@@ -53,7 +53,11 @@ a separate follow-up.)
 | swift | `Package.swift` | `Sources/<Target>/` | (no swiftc here — unit-tested) |
 | dart | `pubspec.yaml` | sources under `lib/` | `dart pub get` + `analyze` |
 
-Every package is **dependency-free** (the generated codec owns the wire), so it
-builds with no third-party deps beyond what the generated code already uses (e.g.
-`chrono` only when a Rust spec uses `timestamp`). The default (no `emit_packages`)
-output is byte-for-byte unchanged.
+Each generated package contains its own CBOR codec. The Rust generator adds
+the `time` crate when the schema uses `date` or `timestamp`. If you use the
+generated source files directly, add this entry to the `[dependencies]` section
+of your `Cargo.toml`.
+
+```toml
+time = { version = "0.3.47", features = ["formatting", "parsing"] }
+```

@@ -15,4 +15,4 @@ path = "src/main.rs"
 [dependencies]
 interop_api = { path = "gen" }
 csilgen-transport = { path = "../../../../transports/rust" }
-chrono = "0.4"
+time = { version = "0.3.47", features = ["parsing"] }
