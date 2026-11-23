@@ -5,7 +5,6 @@ edition = "2024"
 authors = ["CSIL Team"]
 license = "Apache-2.0"
 description = "Swift code generator WASM module for csilgen"
-homepage = "https://github.com/catalystcommunity/csilgen"
 repository = "https://github.com/catalystcommunity/csilgen"
 
 [lib]

@@ -13,12 +13,3 @@ serde.workspace = true
 serde_json.workspace = true
 csilgen-common.workspace = true
 anyhow.workspace = true
-
-[dependencies.web-sys]
-version = "0.3"
-features = [
-  "console",
-]
-
-[dependencies.wasm-bindgen]
-version = "0.2"
