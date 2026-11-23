@@ -8,7 +8,7 @@ matrix. For local development, `cargo run -p xtask interop` calls the same
 Python implementation. Use `--servers` to run one server-language shard:
 
 ```bash
-cargo run -p xtask interop -- --servers rust,go,python,typescript
+cargo run -p xtask interop --servers rust,go,python,typescript
 ```
 
 ```
@@ -21,8 +21,8 @@ for transport in {rpc, events, datagrams}:
 
 Every selected client talks to every selected server, including itself when
 it is in both sets. The tests use one loopback port for each server on
-`127.0.0.1`. Swift is excluded because the test image does not contain
-`swiftc`.
+`127.0.0.1`. All 14 code-generating languages are in the matrix. PHP has no
+harness, so it runs only the fixtures.
 
 ## Typed RPC replies
 
@@ -50,6 +50,24 @@ for target in c csharp dart elixir java kotlin ocaml php python ruby swift types
 done
 ```
 
+## Repository specs
+
+This check generates every valid `.csil` file in the repository for one
+target. Then it compiles the output with the strict checks of that target. The
+check skips a file that `csilgen validate` refuses, because that file is a
+negative fixture. Rust runs `rustfmt --check` and `cargo clippy -D warnings`
+on one workspace of all packages. Swift runs
+`swiftc -typecheck -warnings-as-errors`. The other targets have no compile
+check yet, and the script skips them.
+
+```bash
+tests/interop/repo-specs/check.sh rust
+tests/interop/repo-specs/check.sh swift
+```
+
+A new fixture spec is part of this check automatically. When a generator
+writes code that does not compile for a valid spec, this check fails.
+
 ## Transports & carriers
 
 The matrix runs over loopback **TCP** and **UDP** (not Unix sockets) — both are in
@@ -74,10 +92,24 @@ rebind). Base `6387`, in registry order:
 
 | rust | go | python | typescript | java | csharp | c | ruby | elixir | dart | ocaml | zig | kotlin | swift |
 |----|----|----|----|----|----|----|----|----|----|----|----|----|----|
-| 6387 | 6388 | 6389 | 6390 | 6391 | 6392 | 6393 | 6394 | 6395 | 6396 | 6397 | 6398 | 6399 | 6400* |
+| 6387 | 6388 | 6389 | 6390 | 6391 | 6392 | 6393 | 6394 | 6395 | 6396 | 6397 | 6398 | 6399 | 6400 |
 
-`*` swift's port `6400` is **reserved** for when a `swiftc` toolchain is available;
-swift is not in the matrix today.
+## Swift harness
+
+The Swift harness builds on Linux with a Swift 6.0 or later toolchain. It does
+not use Foundation. The SwiftPM manifest is in `harness/swift/runner/`, not in
+`harness/swift/`. SwiftPM gives a package the name of its directory, and the
+transport package `transports/swift` already has the name `swift`. The
+orchestrator runs `swift build -c release` in `runner/` and starts
+`runner/.build/release/csil-interop-swift`.
+
+If your computer has no Swift toolchain, put a `swift` script on `PATH` that
+runs `swift` in the `swift:6.0-bookworm` container. The script must:
+
+- Mount the repository at the same path in the container.
+- Use `--network host`.
+- Add `--static-swift-stdlib` to `swift build`, so that the binary runs on
+  the host.
 
 ## Harness CLI contract
 
@@ -116,7 +148,7 @@ Every client constructs these exact logical values so any server can echo them
 and the client can assert structural equality. Bytes are hex; timestamps are
 RFC3339 UTC; decimals are exact strings.
 
-- **Scalars (`SCALARS_OK`)**: `i=-42, u=42, n=-7, f=3.5, t="héllo 世界", raw=0x0102f0ff, flag=true, due="2000-02-29", when="2026-06-29T12:34:56Z", amount="123.45", status_literal="pending" (mixed-union literal arm, wires as [1,"pending"]), status_free="unlisted" (mixed-union general arm, wires as [0,"unlisted"]), note="info" (inline mixed-choice literal arm, hoisted to synthesized `Scalars_note`, wires as [1,"info"]), size="medium" (inline all-literal choice, wires bare, no synthesis), level="high" (named enum `Level` whose last arm is `.default`-constrained; the value used deliberately differs from the declared default "medium"), season="autumn" (named enum `Season` assembled via a base rule + `/=` extension; value comes from the extension arms), ship_text="ground" (named all-literal enum `ShipMode` with MIXED literal kinds — text + int arms — wires bare as text), ship_int=2 (same `ShipMode` type, wires bare as int)`
+- **Scalars (`SCALARS_OK`)**: `i=-42, u=42, n=-7, f=3.5, t="héllo 世界", raw=0x0102f0ff, flag=true, due="2000-02-29", when="2026-06-29T12:34:56Z", seen="2026-06-29T12:34:56.500Z" (cddl_time, wires as tag 1 float 1782736496.5), amount="123.45", status_literal="pending" (mixed-union literal arm, wires as [1,"pending"]), status_free="unlisted" (mixed-union general arm, wires as [0,"unlisted"]), note="info" (inline mixed-choice literal arm, hoisted to synthesized `Scalars_note`, wires as [1,"info"]), size="medium" (inline all-literal choice, wires bare, no synthesis), level="high" (named enum `Level` whose last arm is `.default`-constrained; the value used deliberately differs from the declared default "medium"), season="autumn" (named enum `Season` assembled via a base rule + `/=` extension; value comes from the extension arms), ship_text="ground" (named all-literal enum `ShipMode` with MIXED literal kinds — text + int arms — wires bare as text), ship_int=2 (same `ShipMode` type, wires bare as int)`
 - **Collections (`COLLECTIONS_OK`)**: `names=["a","b"], at_least_one=[1,2,3], bounded=[10,20], exact3=[7,8,9], scores={"x":1,"y":2}, extra={"k":"v"} (any-value=text), pair=["p",5], triple=["t",9,true], color="green", prio=2, who=4242 (uint variant)`
 - **Nested (`NESTED_OK`)**: `inner=SCALARS_OK, maybe=CONSTRAINED_OK, many=[SCALARS_OK]`
 - **Constrained valid (`CONSTRAINED_OK`)**: `code="PRD-AB12CD", qty=10, rate="0.25", password="hunter2hunter2", tags=["one","two"]`
@@ -130,7 +162,7 @@ gaps are being closed.
 
 | transport  | case                          | tier | description |
 |------------|-------------------------------|------|-------------|
-| rpc        | echo-scalars/success          | 1    | round-trip every scalar incl. nint/date/timestamp/decimal |
+| rpc        | echo-scalars/success          | 1    | round-trip every scalar incl. nint/date/timestamp/cddl_time/decimal |
 | rpc        | echo-nested/success           | 1    | nested named records + optional present |
 | rpc        | echo-collections/success      | 2    | arrays (all cardinalities), maps, any-map, tuples, enum, int-enum, union |
 | rpc        | validate-constrained/success  | 2    | valid Constrained echoes (error-variant op) |

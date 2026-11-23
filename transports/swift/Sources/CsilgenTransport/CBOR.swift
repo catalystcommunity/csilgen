@@ -165,7 +165,10 @@ func decodeValue(_ b: [UInt8], _ start: Int, _ depth: Int) throws -> (CBORValue,
         return (.bytes(Array(b[off..<end])), end)
     case 3:
         let end = try sliceEnd(b, off, arg, "text string")
-        guard let text = String(validating: b[off..<end], as: UTF8.self) else {
+        // `String(validating:)` needs macOS 15. A lossy decode puts U+FFFD where the
+        // bytes are invalid, so the round trip differs exactly when they are invalid.
+        let text = String(decoding: b[off..<end], as: UTF8.self)
+        guard text.utf8.elementsEqual(b[off..<end]) else {
             throw TransportError.decode("invalid UTF-8 text string")
         }
         return (.text(text), end)

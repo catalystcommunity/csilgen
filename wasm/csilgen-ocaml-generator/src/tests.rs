@@ -77,6 +77,7 @@ fn builtin_type_mapping() {
     assert_eq!(map_type(&builtin("bool")), "bool");
     assert_eq!(map_type(&builtin("float")), "float");
     assert_eq!(map_type(&builtin("timestamp")), "string");
+    assert_eq!(map_type(&builtin("cddl_time")), "string");
     assert_eq!(map_type(&builtin("decimal")), "string");
     assert_eq!(map_type(&builtin("null")), "unit");
 }
@@ -229,9 +230,11 @@ fn timestamp_and_decimal_get_wire_doc() {
         entries: vec![
             bare_entry("created_at", builtin("timestamp")),
             bare_entry("amount", builtin("decimal")),
+            bare_entry("seen", builtin("cddl_time")),
         ],
     };
     let out = generate_record("Money", &group);
+    assert!(out.contains("CBOR tag 1 epoch seconds, held as RFC3339 UTC timestamp text"));
     assert!(out.contains("CBOR tag 0 RFC3339"));
     assert!(out.contains("CBOR tag 4 exact decimal"));
 }
@@ -323,7 +326,12 @@ fn client_module_emits_typed_calls() {
     assert!(out.contains("type client = {"));
     assert!(out.contains("module Attestation = struct"));
     // The success type drops the ServiceError arm.
-    assert!(out.contains("Codec.decode_attestation_deposit_claim_success bytes"));
+    assert!(out.contains(
+        "Codec.decode_attestation_deposit_claim_success (Codec.resolve_rpc_reply ~service:\"Attestation\" ~op:\"deposit-claim\" ~variant bytes)"
+    ));
+    // The multi-arm reply needs the variant, so the seam gains a required field.
+    assert!(out.contains("match c.call_reply ~service:\"Attestation\""));
+    assert!(out.contains("let make_client ~call ~call_reply = { call; call_reply }"));
     // The wire service/op strings are the CSIL names verbatim; the OCaml fn name is
     // snake_case.
     assert!(out.contains("let deposit_claim (c : client)"));
@@ -647,7 +655,10 @@ fn codec_emitted_with_typed_client() {
     // Typed seam: a typed request in, a typed reply out, codec called internally.
     assert!(client.contains("let submit_task (c : client) (req : submit_task_request) ="));
     assert!(client.contains("Codec.encode_corndogs_service_submit_task_request req"));
-    assert!(client.contains("Codec.decode_corndogs_service_submit_task_success bytes"));
+    assert!(
+        client
+            .contains("Codec.decode_corndogs_service_submit_task_success (Codec.resolve_rpc_reply")
+    );
 }
 
 /// Compile the generated OCaml and round-trip a typed request/response with dune.
@@ -735,7 +746,11 @@ const CODEC_DRIVER_OCAML: &str = r#"let () =
     let in_ = Codec.decode_submit_task_request_bytes payload in
     Ok (Codec.encode_task_bytes in_.task)
   in
-  let c = Client.make_client ~call in
+  (* submit-task replies `Task / ServiceError`, so the client takes [call_reply]. *)
+  let call_reply ~service ~op ~payload =
+    Result.map (fun bytes -> (Some "Task", bytes)) (call ~service ~op ~payload)
+  in
+  let c = Client.make_client ~call ~call_reply in
   (match Client.Corndogs_service.submit_task c req with
    | Ok t ->
      assert (t.uuid = "u-123");
@@ -1660,6 +1675,29 @@ fn transports_spec() -> CsilSpecSerialized {
 /// `genquickstart_carriers_compile_against_lib` proves the same carriers actually
 /// compile against the real package + transport library when a toolchain is present.
 #[test]
+fn single_arm_spec_keeps_the_one_method_seam() {
+    let out = generate_client(&transports_spec());
+    assert!(out.contains("let make_client ~call = { call }"));
+    assert!(!out.contains("call_reply"));
+}
+
+#[test]
+fn timestamp_codec_canonicalizes_both_ways() {
+    let spec = CsilSpecSerialized {
+        rules: vec![group_rule(
+            "Stamp",
+            vec![bare_entry("at", builtin("timestamp"))],
+        )],
+        source_content: None,
+        service_count: 0,
+        fields_with_metadata_count: 0,
+    };
+    let codec = generate_codec(&spec).expect("codec");
+    assert!(codec.contains("(Cbor.Tag (0, Cbor.Text (Cbor.canonical_timestamp v.at)))"));
+    assert!(codec.contains("Cbor.Tag (0, Cbor.Text csil_s) -> Cbor.canonical_timestamp csil_s"));
+}
+
+#[test]
 fn genquickstart_intro_credits_transport_lib() {
     let spec = transports_spec();
     let cfg = package_config("ocaml-client", Some(serde_json::json!(["ocaml"])));
@@ -1693,8 +1731,8 @@ fn genquickstart_rpc_section_uses_lib_envelope_over_http() {
     // It POSTs the canonical mount over the stdlib HTTP carrier.
     assert!(c.contains("/csil/v1/rpc"));
     assert!(c.contains("POST %s HTTP/1.1"));
-    // The typed ServiceError application arm is surfaced distinctly.
-    assert!(c.contains("Codec.resolve_rpc_reply"));
+    // The carrier only moves bytes; the generated client resolves reply arms.
+    assert!(!c.contains("resolve_rpc_reply"));
     // The typed client is constructed over the carrier with a base URL, and the example
     // call passes a generated sample request literal.
     assert!(c.contains("make_rpc_client \"http://localhost:5080\""));
@@ -1977,6 +2015,32 @@ fn ocaml_code_blocks(md: &str) -> Vec<String> {
 /// toolchain or the reference library is absent.
 #[test]
 fn genquickstart_carriers_compile_against_lib() {
+    compile_genquickstart(transports_spec(), "single");
+}
+
+/// The multi-arm variant: the RPC carrier must also supply `call_reply`, which the
+/// generated `Client.make_client` then requires.
+#[test]
+fn genquickstart_multi_arm_carriers_compile_against_lib() {
+    let mut spec = transports_spec();
+    spec.rules.push(record_typedef(
+        "ServiceError",
+        vec![bare_entry("code", builtin("int"))],
+    ));
+    if let CsilRuleType::ServiceDef(service) = &mut spec.rules[2].rule_type {
+        service.operations[0].output_type = CsilTypeExpression::Choice(vec![
+            CsilTypeExpression::Reference("Pong".into()),
+            CsilTypeExpression::Reference("ServiceError".into()),
+        ]);
+    }
+    let cfg = package_config("ocaml", Some(serde_json::json!(["ocaml"])));
+    let md = readme_of(&generate_ocaml(&spec, &cfg).unwrap());
+    assert!(md.contains("~call_reply:(fun ~service ~op ~payload ->"));
+    assert!(!md.contains("resolve_rpc_reply"));
+    compile_genquickstart(spec, "multi");
+}
+
+fn compile_genquickstart(spec: CsilSpecSerialized, tag: &str) {
     if !tool_on_path("dune") || !tool_on_path("ocaml") {
         eprintln!("skipping: no dune/ocaml on PATH");
         return;
@@ -1992,7 +2056,6 @@ fn genquickstart_carriers_compile_against_lib() {
 
     // A spec with a `->` op (drives RPC + Datagrams) AND a record `<->` op (drives the
     // Events router dispatch), so every section emits its full library-based example.
-    let spec = transports_spec();
     let cfg = package_config("ocaml", Some(serde_json::json!(["ocaml"])));
     let files = generate_ocaml(&spec, &cfg).unwrap();
 
@@ -2006,7 +2069,7 @@ fn genquickstart_carriers_compile_against_lib() {
     );
 
     let dir = std::env::temp_dir().join(format!(
-        "csilgen-ocaml-genquickstart-{}",
+        "csilgen-ocaml-genquickstart-{tag}-{}",
         std::process::id()
     ));
     let _ = std::fs::remove_dir_all(&dir);
@@ -2210,4 +2273,100 @@ const MIXED_KIND_LITERAL_CHOICE_DRIVER_OCAML: &str = r#"let () =
      failwith "expected failure for unknown int literal"
    with Failure _ -> ());
   print_string "ok\n"
+"#;
+
+#[test]
+fn cddl_time_codec_uses_the_epoch_helpers() {
+    let spec = CsilSpecSerialized {
+        rules: vec![group_rule(
+            "Moment",
+            vec![bare_entry("at", builtin("cddl_time"))],
+        )],
+        source_content: None,
+        service_count: 0,
+        fields_with_metadata_count: 0,
+    };
+    let codec = generate_codec(&spec).expect("codec");
+    assert!(codec.contains("(Cbor.epoch_to_cbor v.at)"), "{codec}");
+    assert!(codec.contains("(Cbor.epoch_of_cbor "), "{codec}");
+    assert!(!codec.contains("canonical_timestamp v.at"));
+}
+
+/// Runs the epoch helpers of the CBOR runtime through the real compiler:
+/// integer and float encode, half-precision decode, rounding and carry, and
+/// refusal of out-of-range, non-numeric, and untagged values. Skips cleanly when
+/// dune is not on PATH.
+#[test]
+fn cddl_time_runtime_round_trips_through_dune() {
+    let have = std::process::Command::new("dune")
+        .arg("--version")
+        .output()
+        .is_ok();
+    if !have {
+        eprintln!("skipping: no dune on PATH");
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("csilgen-ocaml-cddl-time-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("csil_cbor.ml"), CSIL_CBOR_OCAML).unwrap();
+    std::fs::write(dir.join("dune-project"), "(lang dune 3.0)\n").unwrap();
+    std::fs::write(
+        dir.join("dune"),
+        "(executable (name test) (modules csil_cbor test))\n",
+    )
+    .unwrap();
+    std::fs::write(dir.join("test.ml"), CDDL_TIME_DRIVER_OCAML).unwrap();
+    let run = std::process::Command::new("dune")
+        .arg("exec")
+        .arg("--profile")
+        .arg("release")
+        .arg("--root")
+        .arg(&dir)
+        .arg("./test.exe")
+        .output()
+        .unwrap();
+    assert!(
+        run.status.success(),
+        "ocaml cddl_time proof failed:\n{}{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&run.stdout).trim(), "ok");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+const CDDL_TIME_DRIVER_OCAML: &str = r#"module C = Csil_cbor
+
+let decode_hex h =
+  let b = Bytes.init (String.length h / 2) (fun i -> Char.chr (int_of_string ("0x" ^ String.sub h (i * 2) 2))) in
+  match C.decode b with Ok v -> v | Error e -> failwith e
+
+let hex b = String.concat "" (List.init (Bytes.length b) (fun i -> Printf.sprintf "%02x" (Char.code (Bytes.get b i))))
+
+let expect got want = if got <> want then failwith (Printf.sprintf "got %s, want %s" got want)
+
+let () =
+  (* Whole seconds go out as the shortest integer under tag 1. *)
+  expect (hex (C.encode (C.epoch_to_cbor "2000-02-29T13:00:00+01:00"))) "c11a38bbb4c0";
+  expect (hex (C.encode (C.epoch_to_cbor "2000-02-29T12:00:00.5Z"))) "c1fb41cc5dda60400000";
+  expect (C.epoch_of_cbor (decode_hex "c11a38bbb4c0")) "2000-02-29T12:00:00Z";
+  expect (C.epoch_of_cbor (decode_hex "c1f93c00")) "1970-01-01T00:00:01Z";
+  expect (C.epoch_of_cbor (decode_hex "c1fbbfe0000000000000")) "1969-12-31T23:59:59.500Z";
+  expect (C.epoch_of_cbor (decode_hex "c1fb3feffffffff24190")) "1970-01-01T00:00:01Z";
+  expect (C.epoch_of_cbor (decode_hex "c120")) "1969-12-31T23:59:59Z";
+  List.iter
+    (fun h ->
+      match C.epoch_of_cbor (decode_hex h) with
+      | exception Failure _ -> ()
+      | got -> failwith (Printf.sprintf "accepted %s as %s" h got))
+    [ "c11b0000003afff44180"; "c13b0000000e7791f700"; "c1f97e00"; "c1f97c00"; "c16130"; "c000"; "00" ];
+  (* A huge negative integer must not wrap into range. *)
+  (match C.decode (Bytes.of_string "\xc1\x3b\xff\xff\xff\xff\xff\xff\xff\xff") with
+   | Ok v -> (
+     match C.epoch_of_cbor v with
+     | exception Failure _ -> ()
+     | got -> failwith ("accepted nint64-min as " ^ got))
+   | Error _ -> ());
+  print_endline "ok"
 "#;

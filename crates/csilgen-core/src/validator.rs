@@ -913,7 +913,7 @@ fn validate_default_value(
             // defaults are RFC3339 strings.
             matches!(
                 name.as_str(),
-                "text" | "tstr" | "string" | "decimal" | "date" | "timestamp"
+                "text" | "tstr" | "string" | "decimal" | "date" | "timestamp" | "cddl_time"
             )
         }
         (LiteralValue::Bool(_), TypeExpression::Builtin(name)) => {
@@ -977,9 +977,9 @@ fn check_tagged_bound_well_formed(
         "date" => is_calendar_date(text)
             .then_some(())
             .ok_or_else(|| format!("invalid calendar date {text:?}, expected YYYY-MM-DD")),
-        "timestamp" => chrono::DateTime::parse_from_rfc3339(text)
+        "timestamp" | "cddl_time" => chrono::DateTime::parse_from_rfc3339(text)
             .map(|_| ())
-            .map_err(|e| format!("timestamp bound {text:?} is not a valid RFC3339 instant: {e}")),
+            .map_err(|e| format!("{name} bound {text:?} is not a valid RFC3339 instant: {e}")),
         _ => Ok(()),
     }
 }
@@ -1105,6 +1105,7 @@ fn validate_comparison_constraint(
                         | "decimal"
                         | "date"
                         | "timestamp"
+                        | "cddl_time"
                 )
             }
         }
@@ -1155,7 +1156,7 @@ fn validate_comparison_constraint(
             // rounding, and a `timestamp` bound is an RFC3339 string.
             matches!(
                 name.as_str(),
-                "text" | "tstr" | "decimal" | "date" | "timestamp"
+                "text" | "tstr" | "decimal" | "date" | "timestamp" | "cddl_time"
             )
         }
         _ => false,
@@ -2618,6 +2619,23 @@ mod tests {
 
         let err = validate_spec(&spec).unwrap_err().to_string();
         assert!(err.contains("not a valid decimal"), "{err}");
+    }
+
+    #[test]
+    fn cddl_time_takes_rfc3339_bounds_like_timestamp() {
+        for (source, valid) in [
+            ("Seen = cddl_time", true),
+            ("Seen = cddl_time .ge \"2000-01-01T00:00:00Z\"", true),
+            ("Seen = cddl_time .lt \"2000-01-01\"", false),
+            ("Seen = cddl_time .ge 0", false),
+            (
+                "Reading = { ? at: cddl_time .default \"2000-01-01T00:00:00Z\" }",
+                true,
+            ),
+        ] {
+            let spec = crate::parse_csil(source).unwrap();
+            assert_eq!(validate_spec(&spec).is_ok(), valid, "{source}");
+        }
     }
 
     #[test]

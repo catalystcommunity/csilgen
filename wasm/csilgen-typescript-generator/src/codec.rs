@@ -285,6 +285,10 @@ fn ts_enc_value(
                 imports.insert("csilTsToText".to_string());
                 format!("{{ tag: 0, value: csilTsToText({expr}) }}")
             }
+            "cddl_time" => {
+                imports.insert("csilEpochFromDate".to_string());
+                format!("{{ tag: 1, value: csilEpochFromDate({expr}) }}")
+            }
             "decimal" => match ctx.mapping {
                 DecimalMapping::Csil => format!("{{ tag: 4, value: {expr}.toTag4() }}"),
                 DecimalMapping::Library => {
@@ -328,7 +332,13 @@ fn ts_enc_value(
             } else {
                 imports.insert("CborValue".to_string());
                 let inner = ts_enc_value(element_type, "csilE", ctx, imports);
-                format!("{expr}.map((csilE): CborValue => {inner})")
+                // An arrow body that opens with `{` parses as a block, so a tagged
+                // element (`{ tag: 0, ... }`) must be parenthesized to stay an expression.
+                if inner.starts_with('{') {
+                    format!("{expr}.map((csilE): CborValue => ({inner}))")
+                } else {
+                    format!("{expr}.map((csilE): CborValue => {inner})")
+                }
             }
         }
         CsilTypeExpression::Map { key, value, .. } => {
@@ -409,6 +419,10 @@ fn ts_dec_value(
             "timestamp" => {
                 imports.insert("asTimestamp".to_string());
                 format!("asTimestamp({expr})")
+            }
+            "cddl_time" => {
+                imports.insert("asCddlTime".to_string());
+                format!("asCddlTime({expr})")
             }
             "decimal" => match ctx.mapping {
                 DecimalMapping::Csil => {
@@ -639,7 +653,7 @@ fn ts_variant_predicate(ty: &CsilTypeExpression, expr: &str, ctx: &Ctx) -> Strin
                 format!("typeof {expr} === \"number\" || typeof {expr} === \"bigint\"")
             }
             "date" => format!("isCalendarDate({expr})"),
-            "timestamp" => format!("{expr} instanceof Date"),
+            "timestamp" | "cddl_time" => format!("{expr} instanceof Date"),
             "text" | "tstr" => format!("typeof {expr} === \"string\""),
             "bytes" | "bstr" => format!("{expr} instanceof Uint8Array"),
             "bool" => format!("typeof {expr} === \"boolean\""),
@@ -1369,8 +1383,24 @@ function smallInt(arg: bigint): number | bigint {
   return arg <= BigInt(Number.MAX_SAFE_INTEGER) ? Number(arg) : arg;
 }
 
+/** Widen an IEEE 754 half-precision value (RFC 8949 Appendix D) exactly to binary64. */
+function csilHalfToFloat64(half: number): number {
+  const exp = (half >> 10) & 0x1f;
+  const mant = half & 0x3ff;
+  let magnitude: number;
+  if (exp === 0) magnitude = mant * 2 ** -24;
+  else if (exp === 31) magnitude = mant === 0 ? Infinity : NaN;
+  else magnitude = (mant + 1024) * 2 ** (exp - 25);
+  return half & 0x8000 ? -magnitude : magnitude;
+}
+
 function readFloat(st: Cursor, low: number): number {
   const bits = readArg(st, low);
+  if (low === 25) {
+    const view = new DataView(new ArrayBuffer(2));
+    view.setUint16(0, Number(bits), false);
+    return csilHalfToFloat64(view.getUint16(0, false));
+  }
   if (low === 26) {
     const view = new DataView(new ArrayBuffer(4));
     view.setUint32(0, Number(bits), false);
@@ -1400,7 +1430,7 @@ function decInto(st: Cursor, depth: number): CborValue {
       st.pos += 1;
       return null;
     }
-    if (low === 26 || low === 27) return readFloat(st, low);
+    if (low === 25 || low === 26 || low === 27) return readFloat(st, low);
     throw new Error("malformed CBOR simple value");
   }
   const arg = readArg(st, low);
@@ -1585,7 +1615,92 @@ function asTagged(value: CborValue, tag: number): CborValue {
 
 /** Decode a tag-0 (RFC 3339, UTC) timestamp into a `Date`. */
 export function asTimestamp(value: CborValue): Date {
-  return new Date(asString(asTagged(value, 0)));
+  return csilTsFromText(asString(asTagged(value, 0)));
+}
+
+// `Date` parsing accepts many shapes the wire contract forbids (a space for `T`, no
+// offset, leap seconds rolled over), so the grammar is checked by hand. `[0-9]` stays
+// ASCII-only, and `$` without the `m` flag matches only at the true end of input.
+const CSIL_TS_PATTERN =
+  /^([0-9]{4})-([0-9]{2})-([0-9]{2})[Tt]([0-9]{2}):([0-9]{2}):([0-9]{2})(?:\.([0-9]{1,9}))?(?:[Zz]|([+-])([0-9]{2}):([0-9]{2}))$/;
+
+/** Parse canonical tag-0 text strictly. `Date` holds milliseconds, so a nonzero digit
+ * past the third fraction digit is an error rather than a silent rounding. */
+export function csilTsFromText(text: string): Date {
+  const m = CSIL_TS_PATTERN.exec(text);
+  if (m === null) throw new Error(`invalid RFC 3339 timestamp ${JSON.stringify(text)}`);
+  const [year, month, day, hour, minute, second] = m.slice(1, 7).map(Number);
+  const leap = (year % 4 === 0 && year % 100 !== 0) || year % 400 === 0;
+  const monthDays = [31, leap ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+  if (year < 1 || month < 1 || month > 12 || day < 1 || day > monthDays[month - 1]) {
+    throw new Error(`invalid calendar date in timestamp ${JSON.stringify(text)}`);
+  }
+  if (hour > 23 || minute > 59 || second > 59) {
+    throw new Error(`invalid time of day in timestamp ${JSON.stringify(text)}`);
+  }
+  const fraction = m[7] ?? "";
+  if (/[1-9]/.test(fraction.slice(3))) {
+    throw new Error(`timestamp ${JSON.stringify(text)} is finer than milliseconds`);
+  }
+  let offsetMinutes = 0;
+  if (m[8] !== undefined) {
+    const offsetHour = Number(m[9]);
+    const offsetMinute = Number(m[10]);
+    if (offsetHour > 23 || offsetMinute > 59) {
+      throw new Error(`invalid offset in timestamp ${JSON.stringify(text)}`);
+    }
+    offsetMinutes = (m[8] === "-" ? -1 : 1) * (offsetHour * 60 + offsetMinute);
+  }
+  // `Date.UTC` maps years 0-99 to 1900-1999, so the year is set on its own.
+  const local = new Date(0);
+  local.setUTCFullYear(year, month - 1, day);
+  local.setUTCHours(hour, minute, second, Number(fraction.padEnd(3, "0").slice(0, 3)));
+  const instant = new Date(local.getTime() - offsetMinutes * 60000);
+  const utcYear = instant.getUTCFullYear();
+  if (utcYear < 1 || utcYear > 9999) {
+    throw new Error(`timestamp ${JSON.stringify(text)} is outside years 0001-9999 in UTC`);
+  }
+  return instant;
+}
+
+const CSIL_EPOCH_FIRST = -62135596800;
+const CSIL_EPOCH_LAST = 253402300799;
+
+/** Decode tag-1 epoch seconds (`cddl_time`) into a `Date`. A `Date` holds
+ * milliseconds, so a float fraction is rounded to three digits by the shared rule. */
+export function asCddlTime(value: CborValue): Date {
+  const inner = asTagged(value, 1);
+  // An integer past 2^53 decodes as a `bigint`; every one of those is out of range.
+  if (typeof inner === "bigint") throw new Error("cddl_time is outside years 0001-9999");
+  if (typeof inner !== "number") throw new Error("cddl_time content must be a number");
+  if (!Number.isFinite(inner)) throw new Error("cddl_time must be finite");
+  if (inner < CSIL_EPOCH_FIRST - 1 || inner > CSIL_EPOCH_LAST + 1) {
+    throw new Error("cddl_time is outside years 0001-9999");
+  }
+  // An integer and a float with the same value decode to the same `number`, and the
+  // rule gives an integer a zero fraction, so one path serves both.
+  let seconds = Math.floor(inner);
+  let units = Math.floor((inner - seconds) * 1000 + 0.5);
+  if (units === 1000) {
+    seconds += 1;
+    units = 0;
+  }
+  if (seconds < CSIL_EPOCH_FIRST || seconds > CSIL_EPOCH_LAST) {
+    throw new Error("cddl_time is outside years 0001-9999");
+  }
+  return new Date(seconds * 1000 + units);
+}
+
+/** A `Date` as tag-1 content: whole seconds as an integer, else a binary64 float. */
+export function csilEpochFromDate(d: Date): number {
+  if (!(d instanceof Date) || Number.isNaN(d.getTime())) throw new Error("expected a valid Date");
+  const millis = d.getTime();
+  const seconds = Math.floor(millis / 1000);
+  if (seconds < CSIL_EPOCH_FIRST || seconds > CSIL_EPOCH_LAST) {
+    throw new Error("cddl_time is outside years 0001-9999");
+  }
+  const units = millis - seconds * 1000;
+  return units === 0 ? seconds : seconds + units / 1000;
 }
 
 /** Decode a tag-4 decimal fraction into its `[exponent, mantissa]` payload. */
@@ -1600,6 +1715,11 @@ export function asDecimalPayload(value: CborValue): [number | bigint, number | b
 
 /** A `Date` rendered as the canonical tag-0 text: RFC 3339, UTC, `Z` offset. */
 export function csilTsToText(d: Date): string {
+  // An Invalid Date or a year outside 0001-9999 has no canonical text, and
+  // `toISOString` would write an expanded `+YYYYYY` year for the latter.
+  if (!(d instanceof Date) || Number.isNaN(d.getTime())) throw new Error("expected a valid Date");
+  const year = d.getUTCFullYear();
+  if (year < 1 || year > 9999) throw new Error("timestamp is outside years 0001-9999");
   return d.toISOString().replace(/\.000Z$/, "Z");
 }
 "#;

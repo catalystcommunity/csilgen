@@ -33,6 +33,7 @@ from interop_api import (
     OptBytes,
     Scalars,
     ServiceError,
+    ServiceErrorRefusal,
     Tick,
     encode_interop_duplex,
     encode_interop_on_tick,
@@ -79,6 +80,8 @@ def scalars_ok() -> Scalars:
         flag=True,
         due=date(2000, 2, 29),
         when=ts(),
+        # 2026-06-29T12:34:56.500Z, epoch 1782736496.5 (cddl_time, tag 1).
+        seen=ts().replace(microsecond=500000),
         amount=Decimal("123.45"),
         # mixed-union coverage: a value equal to a literal arm must wire as
         # [1,"pending"]; a value with no literal match must wire as [0,...].
@@ -215,16 +218,15 @@ class RpcTransport:
     def __init__(self, client: RpcClient) -> None:
         self._client = client
 
+    # RpcClient.call raises StatusError on a non-ok transport status. The carrier only
+    # moves bytes: for an op with reply arms it hands the variant to the generated
+    # client, which raises the typed error arm itself.
     def call(self, service: str, method: str, req: bytes) -> bytes:
-        # RpcClient.call raises StatusError on a non-ok transport status. A status-0
-        # reply whose variant is the ServiceError arm is a typed application error;
-        # surface it by raising so the typed client method raises (the carrier owns
-        # this mapping). Otherwise hand back the success payload.
+        return self._client.call(service, method, req).payload
+
+    def call_reply(self, service: str, method: str, req: bytes):
         resp = self._client.call(service, method, req)
-        if resp.variant == "ServiceError":
-            se = ServiceError.from_cbor(resp.payload)
-            raise RuntimeError(f"service error {se.code}: {se.message}")
-        return resp.payload
+        return resp.variant, resp.payload
 
 
 def rpc_server(listener: socket.socket) -> None:
@@ -318,8 +320,12 @@ def rpc_client(stream) -> Cases:
     try:
         client.validate_constrained(constrained_bad())
         cases.fail("validate-constrained/failure", "server accepted invalid input")
-    except Exception:
-        cases.pass_("validate-constrained/failure")
+    except ServiceErrorRefusal as exc:
+        cases.check(
+            "validate-constrained/failure", exc.value.code == 422, f"wrong error: {exc.value!r}"
+        )
+    except Exception as exc:
+        cases.fail("validate-constrained/failure", f"wrong error: {exc!r}")
 
     # Optional-bytes presence: absent, present-empty, and present-non-empty are three
     # distinct states that must each survive the round trip unchanged. `is None` is the

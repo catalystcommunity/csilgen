@@ -417,6 +417,8 @@ fn builtin(name: &str, mapping: DecimalMapping) -> String {
         "date" => "string".to_string(),
         // `timestamp` is CBOR tag 0 on the wire; in TS it is a UTC-based Date.
         "timestamp" => "Date".to_string(),
+        // `cddl_time` is CBOR tag 1 epoch seconds; in memory it is the same Date.
+        "cddl_time" => "Date".to_string(),
         // `decimal` is CBOR tag 4 on the wire; the in-memory type is selectable.
         "decimal" => match mapping {
             DecimalMapping::Csil => "CsilDecimal".to_string(),

@@ -1398,8 +1398,10 @@ fn emit_enc_value(
                 "{indent}if (!csilc_valid_date({expr}) || csilc_w_tag(b, 1004) || csilc_w_text(b, {expr}, 10)) return -1;\n"
             )),
             "timestamp" => out.push_str(&format!(
-                "{indent}if (csilc_w_tag(b, 0)) return -1;\n\
-                 {indent}if (csilc_w_text(b, ({expr}).rfc3339, ({expr}).rfc3339 ? strlen(({expr}).rfc3339) : 0)) return -1;\n"
+                "{indent}if (csilc_w_timestamp(b, ({expr}).rfc3339)) return -1;\n"
+            )),
+            "cddl_time" => out.push_str(&format!(
+                "{indent}if (csilc_w_epoch(b, ({expr}).rfc3339)) return -1;\n"
             )),
             "decimal" => out.push_str(&format!(
                 "{indent}if (csilc_w_tag(b, 4) || csilc_w_array_head(b, 2) ||\n\
@@ -1487,8 +1489,10 @@ fn emit_dec_value(
                 "{indent}if (!csilc_get_date({src}, &({dst}))) return -1;\n"
             )),
             "timestamp" => out.push_str(&format!(
-                "{indent}if (!csilc_get_tagged_text({src}, 0, &({dst}).rfc3339)) return -1;\n\
-                 {indent}({dst}).epoch_seconds = 0;\n"
+                "{indent}if (!csilc_get_timestamp({src}, a, &({dst}).rfc3339, &({dst}).epoch_seconds)) return -1;\n"
+            )),
+            "cddl_time" => out.push_str(&format!(
+                "{indent}if (!csilc_get_epoch({src}, a, &({dst}).rfc3339, &({dst}).epoch_seconds)) return -1;\n"
             )),
             "decimal" => out.push_str(&format!(
                 "{indent}if (!csilc_get_decimal({src}, &({dst}).exponent, &({dst}).mantissa)) return -1;\n"
@@ -3276,7 +3280,7 @@ fn base_c_type(type_expr: &CsilTypeExpression, config: &CConfig) -> String {
             "bytes" | "bstr" => "CsilBytes".to_string(),
             "bool" | "true" | "false" => "bool".to_string(),
             "date" => "const char *".to_string(),
-            "timestamp" => "CsilTimestamp".to_string(),
+            "timestamp" | "cddl_time" => "CsilTimestamp".to_string(),
             "decimal" => config.decimal_c_type().to_string(),
             "null" | "nil" | "undefined" => "void *".to_string(),
             // `any` carries an opaque CBOR value through verbatim, held as the codec's
@@ -3374,7 +3378,11 @@ fn spec_uses_builtin(input: &WasmGeneratorInput, builtin: &str) -> bool {
 
 fn type_uses_builtin(type_expr: &CsilTypeExpression, builtin: &str) -> bool {
     match type_expr {
-        CsilTypeExpression::Builtin(n) => n == builtin,
+        // `cddl_time` shares the `timestamp` in-memory type, so a spec that uses
+        // only `cddl_time` still needs the `CsilTimestamp` helper header.
+        CsilTypeExpression::Builtin(n) => {
+            n == builtin || (builtin == "timestamp" && n == "cddl_time")
+        }
         CsilTypeExpression::Reference(_) => false,
         CsilTypeExpression::Array { element_type, .. } => type_uses_builtin(element_type, builtin),
         CsilTypeExpression::Map { key, value, .. } => {
@@ -5167,6 +5175,225 @@ static inline bool csilc_get_date(const csilc_value *v, const char **out) {
         && csilc_valid_date(*out);
 }
 
+/* The longest canonical timestamp, `YYYY-MM-DDThh:mm:ss.fffffffffZ`, plus its NUL. */
+#define CSILC_TIMESTAMP_CAP 31
+/* `0001-01-01T00:00:00Z` and `9999-12-31T23:59:59Z` as epoch seconds. */
+#define CSILC_EPOCH_FIRST INT64_C(-62135596800)
+#define CSILC_EPOCH_LAST INT64_C(253402300799)
+
+static inline bool csilc_ts_digits(const char *s, size_t n, size_t at, size_t width, int64_t *out) {
+    if (at + width > n) return false;
+    int64_t v = 0;
+    for (size_t i = at; i < at + width; i++) {
+        if (s[i] < '0' || s[i] > '9') return false;
+        v = v * 10 + (s[i] - '0');
+    }
+    *out = v;
+    return true;
+}
+
+/* C division truncates toward zero; the civil-date arithmetic needs floor. */
+static inline int64_t csilc_floor_div(int64_t a, int64_t b) {
+    int64_t q = a / b;
+    return (a % b != 0 && ((a < 0) != (b < 0))) ? q - 1 : q;
+}
+
+static inline int64_t csilc_days_from_civil(int64_t y, int64_t m, int64_t d) {
+    y -= m <= 2;
+    int64_t era = csilc_floor_div(y, 400);
+    int64_t yoe = y - era * 400;
+    int64_t doy = (153 * (m > 2 ? m - 3 : m + 9) + 2) / 5 + d - 1;
+    int64_t doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    return era * 146097 + doe - 719468;
+}
+
+static inline void csilc_ts_put(char *out, size_t at, int64_t v, size_t width) {
+    while (width > 0) {
+        width--;
+        out[at + width] = (char)('0' + v % 10);
+        v /= 10;
+    }
+}
+
+/* Read the strict RFC 3339 form of the wire contract into UTC epoch seconds and
+ * nanoseconds. The year must be 0001 to 9999 after conversion to UTC. */
+static inline bool csilc_timestamp_parse(const char *s, size_t n, int64_t *epoch, int64_t *nanos_out) {
+    int64_t year, month, day, hour, minute, second, nanos = 0, offset = 0;
+    if (n < 20 || s[4] != '-' || s[7] != '-' || (s[10] != 'T' && s[10] != 't') ||
+        s[13] != ':' || s[16] != ':') {
+        return 0;
+    }
+    if (!csilc_ts_digits(s, n, 0, 4, &year) || !csilc_ts_digits(s, n, 5, 2, &month) ||
+        !csilc_ts_digits(s, n, 8, 2, &day) || !csilc_ts_digits(s, n, 11, 2, &hour) ||
+        !csilc_ts_digits(s, n, 14, 2, &minute) || !csilc_ts_digits(s, n, 17, 2, &second)) {
+        return 0;
+    }
+    bool leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    const int64_t days[] = {31, leap ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+    if (year < 1 || month < 1 || month > 12 || day < 1 || day > days[month - 1] || hour > 23 ||
+        minute > 59 || second > 59) {
+        return 0;
+    }
+    size_t i = 19;
+    if (s[i] == '.') {
+        size_t start = ++i;
+        while (i < n && s[i] >= '0' && s[i] <= '9') i++;
+        size_t width = i - start;
+        if (width < 1 || width > 9 || !csilc_ts_digits(s, n, start, width, &nanos)) return 0;
+        for (; width < 9; width++) nanos *= 10;
+    }
+    if (i >= n) return 0;
+    if ((s[i] == 'Z' || s[i] == 'z') && i + 1 == n) {
+        offset = 0;
+    } else if ((s[i] == '+' || s[i] == '-') && i + 6 == n && s[i + 3] == ':') {
+        int64_t oh, om;
+        if (!csilc_ts_digits(s, n, i + 1, 2, &oh) || !csilc_ts_digits(s, n, i + 4, 2, &om) ||
+            oh > 23 || om > 59) {
+            return 0;
+        }
+        offset = (oh * 3600 + om * 60) * (s[i] == '-' ? -1 : 1);
+    } else {
+        return 0;
+    }
+    int64_t utc = csilc_days_from_civil(year, month, day) * 86400 + hour * 3600 + minute * 60 +
+                  second - offset;
+    if (utc < CSILC_EPOCH_FIRST || utc > CSILC_EPOCH_LAST) return false;
+    *epoch = utc;
+    *nanos_out = nanos;
+    return true;
+}
+
+/* Write the canonical UTC text for an instant already known to lie in years
+ * 0001 to 9999, so that both wire forms produce the same text. */
+static inline size_t csilc_timestamp_write(int64_t utc, int64_t nanos, char out[CSILC_TIMESTAMP_CAP]) {
+    int64_t z = csilc_floor_div(utc, 86400) + 719468;
+    int64_t sod = utc - csilc_floor_div(utc, 86400) * 86400;
+    int64_t era = csilc_floor_div(z, 146097);
+    int64_t doe = z - era * 146097;
+    int64_t yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    int64_t doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    int64_t mp = (5 * doy + 2) / 153;
+    int64_t d = doy - (153 * mp + 2) / 5 + 1;
+    int64_t m = mp < 10 ? mp + 3 : mp - 9;
+    int64_t y = yoe + era * 400 + (m <= 2);
+    csilc_ts_put(out, 0, y, 4);
+    out[4] = '-';
+    csilc_ts_put(out, 5, m, 2);
+    out[7] = '-';
+    csilc_ts_put(out, 8, d, 2);
+    out[10] = 'T';
+    csilc_ts_put(out, 11, sod / 3600, 2);
+    out[13] = ':';
+    csilc_ts_put(out, 14, sod / 60 % 60, 2);
+    out[16] = ':';
+    csilc_ts_put(out, 17, sod % 60, 2);
+    size_t len = 19;
+    if (nanos != 0) {
+        /* The fewest of 3, 6, or 9 digits that hold the value exactly, so every
+         * peer writes the same bytes for the same instant. */
+        size_t width = nanos % 1000000 == 0 ? 3 : nanos % 1000 == 0 ? 6 : 9;
+        int64_t scaled = width == 3 ? nanos / 1000000 : width == 6 ? nanos / 1000 : nanos;
+        out[len++] = '.';
+        csilc_ts_put(out, len, scaled, width);
+        len += width;
+    }
+    out[len++] = 'Z';
+    out[len] = 0;
+    return len;
+}
+
+/* Validate the strict RFC 3339 form of the wire contract and write the canonical
+ * UTC spelling to `out`, so equal instants compare equal as text. Returns the
+ * canonical length, or 0 when `s` is not a valid timestamp. */
+static inline size_t csilc_timestamp_canon(const char *s, size_t n, char out[CSILC_TIMESTAMP_CAP],
+                                           int64_t *epoch) {
+    int64_t nanos;
+    if (!csilc_timestamp_parse(s, n, epoch, &nanos)) return 0;
+    return csilc_timestamp_write(*epoch, nanos, out);
+}
+
+/* Decoded text that is already canonical is borrowed as is; only a value that
+ * needs normalizing costs an arena copy. */
+static inline bool csilc_get_timestamp(const csilc_value *v, CsilCodecArena *a, const char **text,
+                                       int64_t *epoch) {
+    const char *raw;
+    if (!csilc_get_tagged_text(v, 0, &raw)) return false;
+    size_t n = v->as.tag.content->as.bytes.len;
+    char buf[CSILC_TIMESTAMP_CAP];
+    size_t len = csilc_timestamp_canon(raw, n, buf, epoch);
+    if (!len) return false;
+    if (len == n && memcmp(buf, raw, n) == 0) {
+        *text = raw;
+        return true;
+    }
+    char *copy = (char *)csilc_arena_alloc(a, len + 1);
+    if (!copy) return false;
+    memcpy(copy, buf, len + 1);
+    *text = copy;
+    return true;
+}
+
+/* A caller-built value is normalized too, so the wire never carries an offset,
+ * lowercase separators, or a non-minimal fraction. */
+static inline int csilc_w_timestamp(csilc_buf *b, const char *text) {
+    char buf[CSILC_TIMESTAMP_CAP];
+    int64_t epoch;
+    size_t len = text ? csilc_timestamp_canon(text, strlen(text), buf, &epoch) : 0;
+    if (!len || csilc_w_tag(b, 0)) return -1;
+    return csilc_w_text(b, buf, len);
+}
+
+/* `cddl_time`: tag 1 around epoch seconds, kept as the same canonical text as a
+ * `timestamp` so both wire forms compare equal for one instant. */
+static inline bool csilc_get_epoch(const csilc_value *v, CsilCodecArena *a, const char **text,
+                                   int64_t *epoch) {
+    if (!v || v->kind != CSILC_TAG || v->as.tag.num != 1) return false;
+    const csilc_value *c = v->as.tag.content;
+    int64_t seconds, units = 0;
+    if (c->kind == CSILC_UINT) {
+        if (c->as.u > (uint64_t)CSILC_EPOCH_LAST) return false;
+        seconds = (int64_t)c->as.u;
+    } else if (c->kind == CSILC_NINT) {
+        seconds = c->as.i;
+    } else if (c->kind == CSILC_FLOAT) {
+        double value = c->as.f;
+        /* The range test also refuses NaN and infinity, and it comes before the
+         * conversion to an integer, which is undefined behavior out of range. */
+        if (!(value >= (double)(CSILC_EPOCH_FIRST - 1) && value <= (double)(CSILC_EPOCH_LAST + 1)))
+            return false;
+        seconds = (int64_t)value;
+        if ((double)seconds > value) seconds--;
+        /* Separate volatile stores keep the compiler from fusing the multiply and
+         * the add into one operation, which can round differently. */
+        volatile double scaled = (value - (double)seconds) * 1e9;
+        volatile double shifted = scaled + 0.5;
+        units = (int64_t)shifted;
+        if (units == 1000000000) {
+            seconds++;
+            units = 0;
+        }
+    } else {
+        return false;
+    }
+    if (seconds < CSILC_EPOCH_FIRST || seconds > CSILC_EPOCH_LAST) return false;
+    char buf[CSILC_TIMESTAMP_CAP];
+    size_t len = csilc_timestamp_write(seconds, units, buf);
+    char *copy = (char *)csilc_arena_alloc(a, len + 1);
+    if (!copy) return false;
+    memcpy(copy, buf, len + 1);
+    *text = copy;
+    *epoch = seconds;
+    return true;
+}
+
+static inline int csilc_w_epoch(csilc_buf *b, const char *text) {
+    int64_t seconds, nanos;
+    if (!text || !csilc_timestamp_parse(text, strlen(text), &seconds, &nanos) || csilc_w_tag(b, 1))
+        return -1;
+    if (nanos == 0) return csilc_w_int(b, seconds);
+    return csilc_w_f64(b, (double)seconds + (double)nanos / 1e9);
+}
+
 static inline bool csilc_get_decimal(const csilc_value *v, int64_t *exp, int64_t *mant) {
     if (!v || v->kind != CSILC_TAG || v->as.tag.num != 4) return false;
     const csilc_value *arr = v->as.tag.content;
@@ -5233,7 +5460,8 @@ typedef struct CsilDecimal {
 #endif /* CSILGEN_CSIL_DECIMAL_GEN_H */
 "#;
 
-/// CsilTimestamp: the `timestamp` core type (CBOR tag 0, RFC3339 UTC text). Kept
+/// CsilTimestamp: the `timestamp` (CBOR tag 0) and `cddl_time` (CBOR tag 1) core
+/// type, held as RFC3339 UTC text. Kept
 /// as the canonical RFC3339 string plus its epoch-seconds value for comparison.
 const CSIL_TIMESTAMP_H: &str = r#"/* Generated CSIL timestamp helper. */
 /* Code generated by csilgen; DO NOT EDIT. */
@@ -5242,9 +5470,14 @@ const CSIL_TIMESTAMP_H: &str = r#"/* Generated CSIL timestamp helper. */
 
 #include <stdint.h>
 
-/* CsilTimestamp is the `timestamp` core type: CBOR tag 0, an RFC3339 UTC string
- * on the wire. The canonical text is retained verbatim (so a round-trip is
- * byte-stable) alongside its epoch-seconds value for ordering comparisons. */
+/* CsilTimestamp is the `timestamp` core type (CBOR tag 0, an RFC3339 UTC string
+ * on the wire) and the `cddl_time` core type (CBOR tag 1, epoch seconds on the
+ * wire). Decode keeps the canonical UTC text (offset applied, uppercase
+ * `T`/`Z`, fraction of 0, 3, 6, or 9 digits) so that equal instants compare equal
+ * with strcmp, and keeps text rather than a struct of fields so that all nine
+ * fraction digits survive. Encode normalizes caller text the same way and fails
+ * on text that is not a strict RFC3339 timestamp. `epoch_seconds` is set on
+ * decode for ordering; encode reads only `rfc3339`. */
 typedef struct CsilTimestamp {
     const char *rfc3339;
     int64_t epoch_seconds;

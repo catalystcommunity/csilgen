@@ -409,7 +409,11 @@ fn emit_readme(gem_name: &str, spec: &CsilSpecSerialized, config: &GeneratorConf
     let unary = first_unary_example(spec);
     let channel = first_channel_example(spec);
     if rpc {
-        out.push_str(&rpc_section(gem_name, unary.as_ref()));
+        out.push_str(&rpc_section(
+            gem_name,
+            unary.as_ref(),
+            spec.rpc_operations().next().is_some(),
+        ));
     }
     if events {
         out.push_str(&events_section(gem_name, channel.as_ref()));
@@ -420,18 +424,25 @@ fn emit_readme(gem_name: &str, spec: &CsilSpecSerialized, config: &GeneratorConf
     finalize(out)
 }
 
-/// CSIL-RPC over HTTP: a carrier implementing the generated `call` byte seam that builds
-/// the envelope with the library's `RpcRequest` and parses the library's `RpcResponse`
-/// (never hand-rolled), POSTing to `{base_url}/csil/v1/rpc` with stdlib `net/http`. A
-/// non-zero transport status (`into_transport_error` raises `StatusError`) and the typed
-/// `ServiceError` application arm are surfaced distinctly; the typed client decodes success.
-fn rpc_section(gem_name: &str, ex: Option<&UnaryExample>) -> String {
+/// CSIL-RPC over HTTP: a carrier implementing the generated `call` byte seam (and
+/// `call_reply` when the spec has a multi-arm reply) that builds the envelope with the
+/// library's `RpcRequest` and parses the library's `RpcResponse` (never hand-rolled),
+/// POSTing to `{base_url}/csil/v1/rpc` with stdlib `net/http`. A non-zero transport
+/// status raises `StatusError`; the generated client picks typed reply arms itself.
+fn rpc_section(gem_name: &str, ex: Option<&UnaryExample>, multi_arm: bool) -> String {
     let mut out = String::from("## CSIL-RPC (HTTP)\n\n");
     out.push_str(
         "Request/response. The library owns the envelope (`RpcRequest`/`RpcResponse`); you\n\
          bring a carrier that moves bytes. The HTTP carrier below is just one example — swap\n\
          `net/http` for any client (it implements the generated `call` byte seam).\n\n",
     );
+    if multi_arm {
+        out.push_str(
+            "Some operations here have more than one reply arm, so the carrier also implements\n\
+             `call_reply`, which returns the envelope `variant` with the payload. The generated\n\
+             client uses it to return the success value or raise the typed error arm.\n\n",
+        );
+    }
     let Some(ex) = ex else {
         out.push_str(
             "This package declares no `->` operations, so there is no RPC call to make.\n\n",
@@ -444,6 +455,10 @@ fn rpc_section(gem_name: &str, ex: Option<&UnaryExample>) -> String {
     out.push_str("require \"uri\"\n");
     out.push_str(&format!("require {}\n\n", ruby_string_literal(gem_name)));
     out.push_str(RPC_CARRIER_RUBY);
+    if multi_arm {
+        out.push_str(RPC_CARRIER_REPLY_RUBY);
+    }
+    out.push_str(RPC_CARRIER_EXCHANGE_RUBY);
     out.push('\n');
     out.push_str(&format!(
         "client = {}.new(HttpRpcTransport.new(\"http://localhost:5080\"))\n",
@@ -474,6 +489,25 @@ class HttpRpcTransport
 
   # The generated client calls this seam with the already-encoded request bytes.
   def call(service, op, req_bytes)
+    exchange(service, op, req_bytes).payload
+  end
+"##;
+
+/// The second seam method, emitted only for a spec with a multi-arm reply: the
+/// generated client needs the envelope `variant` to pick the reply arm.
+const RPC_CARRIER_REPLY_RUBY: &str = r##"
+  # Multi-arm operations call this seam instead: the client needs the reply variant
+  # to pick the success value or the typed error arm.
+  def call_reply(service, op, req_bytes)
+    reply = exchange(service, op, req_bytes)
+    [reply.variant, reply.payload]
+  end
+"##;
+
+const RPC_CARRIER_EXCHANGE_RUBY: &str = r##"
+  private
+
+  def exchange(service, op, req_bytes)
     # The library builds the envelope from the already-encoded request bytes; we never
     # hand-roll the wire form.
     envelope = RPC::RpcRequest.new(service: service, op: op, payload: req_bytes.b).encode
@@ -487,8 +521,7 @@ class HttpRpcTransport
     raise "csil-rpc #{service}/#{op}: http #{res.code}" unless res.code.to_i.between?(200, 299)
 
     # The library parses the envelope and raises StatusError on a non-zero transport status.
-    reply = RPC::RpcResponse.decode((res.body || "").b).into_transport_error
-    CsilCbor.resolve_rpc_reply(service, op, reply.variant, reply.payload)
+    RPC::RpcResponse.decode((res.body || "").b).into_transport_error
   end
 end
 "##;
@@ -819,7 +852,7 @@ fn ruby_sample(spec: &CsilSpecSerialized, ty: &CsilTypeExpression) -> String {
             "bool" => "false".to_string(),
             "bytes" | "bstr" => "\"\".b".to_string(),
             "date" => "Date.new(1970, 1, 1)".to_string(),
-            "timestamp" => "Time.now".to_string(),
+            "timestamp" | "cddl_time" => "Time.now".to_string(),
             "decimal" => "BigDecimal(\"0\")".to_string(),
             "int" | "uint" => "0".to_string(),
             "float" => "0.0".to_string(),
@@ -1290,7 +1323,8 @@ fn generate_types_file(spec: &CsilSpecSerialized) -> Option<String> {
         content.push_str("require \"date\"\n");
         needs_blank = true;
     }
-    if spec.uses_builtin("timestamp") {
+    // `cddl_time` bounds and defaults are RFC 3339 text read by `Time.iso8601`.
+    if spec.uses_builtin("timestamp") || spec.uses_builtin("cddl_time") {
         content.push_str("require \"time\"\n");
         needs_blank = true;
     }
@@ -1525,7 +1559,7 @@ fn ordered_field_kind(value_type: &CsilTypeExpression) -> OrderedKind {
         match name.as_str() {
             "decimal" => OrderedKind::Decimal,
             "date" => OrderedKind::Date,
-            "timestamp" => OrderedKind::Timestamp,
+            "timestamp" | "cddl_time" => OrderedKind::Timestamp,
             _ => OrderedKind::Numeric,
         }
     } else {
@@ -1943,7 +1977,7 @@ fn ruby_union_guard(
             "text" | "tstr" | "bytes" | "bstr" => "String".to_string(),
             "bool" => "TrueClass, FalseClass".to_string(),
             "date" => "Date".to_string(),
-            "timestamp" => "Time".to_string(),
+            "timestamp" | "cddl_time" => "Time".to_string(),
             "decimal" => "BigDecimal".to_string(),
             "nil" | "null" => "NilClass".to_string(),
             _ => "Object".to_string(),
@@ -1994,7 +2028,8 @@ fn enc_tree(
             "text" | "tstr" => expr.to_string(),
             "bytes" | "bstr" => format!("({expr}).b"),
             "date" => format!("CsilCbor.enc_date({expr})"),
-            "timestamp" => format!("CsilCbor::Tag.new(0, ({expr}).getutc.iso8601)"),
+            "timestamp" => format!("CsilCbor.enc_timestamp({expr})"),
+            "cddl_time" => format!("CsilCbor.enc_cddl_time({expr})"),
             "decimal" => format!("CsilCbor::Tag.new(4, CsilCbor.decimal_to_tag({expr}))"),
             "nil" | "null" => "nil".to_string(),
             _ => format!("({expr})"),
@@ -2096,7 +2131,8 @@ fn dec_tree(
                 expr.to_string()
             }
             "date" => format!("CsilCbor.as_date({expr})"),
-            "timestamp" => format!("Time.iso8601(({expr}).value)"),
+            "timestamp" => format!("CsilCbor.as_timestamp({expr})"),
+            "cddl_time" => format!("CsilCbor.as_cddl_time({expr})"),
             "decimal" => format!("CsilCbor.tag_to_decimal(({expr}).value)"),
             "nil" | "null" => "nil".to_string(),
             _ => expr.to_string(),
@@ -2529,6 +2565,12 @@ fn generate_codec_file(spec: &CsilSpecSerialized) -> Option<String> {
     if spec.uses_builtin("decimal") {
         content.push_str(CODEC_DECIMAL_RUBY);
     }
+    if spec.uses_builtin("timestamp") {
+        content.push_str(CODEC_TIMESTAMP_RUBY);
+    }
+    if spec.uses_builtin("cddl_time") {
+        content.push_str(CODEC_CDDL_TIME_RUBY);
+    }
     content.push('\n');
 
     // Union helpers precede the record codecs that call them (resolution is at call
@@ -2715,6 +2757,18 @@ module CsilCbor
     end
   end
 
+  # `unpack` has no half-precision code. Every half value is exact in binary64.
+  def half_to_float(half)
+    exponent = (half >> 10) & 0x1f
+    mantissa = half & 0x3ff
+    value =
+      if exponent.zero? then Math.ldexp(mantissa, -24)
+      elsif exponent == 31 then mantissa.zero? ? Float::INFINITY : Float::NAN
+      else Math.ldexp(mantissa + 1024, exponent - 25)
+      end
+    (half & 0x8000).zero? ? value : -value
+  end
+
   def take(bin, pos, depth)
     raise ArgumentError, "csilgen: nesting limit exceeded" if depth > 64
     raise ArgumentError, "csilgen: unexpected end of input" if pos >= bin.bytesize
@@ -2726,8 +2780,14 @@ module CsilCbor
       when 20 then [false, pos + 1]
       when 21 then [true, pos + 1]
       when 22, 23 then [nil, pos + 1]
-      when 26 then [[bin[pos + 1, 4].unpack1("N")].pack("N").unpack1("g"), pos + 5]
-      when 27 then [bin[pos + 1, 8].unpack1("G"), pos + 9]
+      when 25, 26, 27
+        width = { 25 => 2, 26 => 4, 27 => 8 }[low]
+        raise ArgumentError, "csilgen: truncated float" if bin.bytesize - pos - 1 < width
+        case low
+        when 25 then [half_to_float(bin[pos + 1, 2].unpack1("n")), pos + 3]
+        when 26 then [[bin[pos + 1, 4].unpack1("N")].pack("N").unpack1("g"), pos + 5]
+        else [bin[pos + 1, 8].unpack1("G"), pos + 9]
+        end
       else raise ArgumentError, "csilgen: unsupported simple value"
       end
     else
@@ -2775,6 +2835,128 @@ end
 
 /// The `decimal` core type's tag-4 (de)serializers, appended to `CsilCbor` only when
 /// the spec uses `decimal` so a `bigdecimal` dependency is never pulled in otherwise.
+/// Strict `timestamp` (tag 0) helpers per docs/cbor-wire-contract.md. The shape is
+/// matched by hand because `Time.iso8601`/`Time.parse` accept forms the contract
+/// refuses (a space separator, leap seconds, out-of-range offsets) and would make
+/// this peer weaker than the others. `Time` keeps an exact Rational fraction, so
+/// all nine digits survive and nothing is rounded.
+const CODEC_TIMESTAMP_RUBY: &str = r#"
+module CsilCbor
+  module_function
+
+  TIMESTAMP_SHAPE = /\A([0-9]{4})-([0-9]{2})-([0-9]{2})[Tt]([0-9]{2}):([0-9]{2}):([0-9]{2})(?:\.([0-9]{1,9}))?(?:[Zz]|([+-])([0-9]{2}):([0-9]{2}))\z/
+
+  def timestamp_days_in_month(year, month)
+    return 29 if month == 2 && (year % 4).zero? && (!(year % 100).zero? || (year % 400).zero?)
+
+    [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][month - 1]
+  end
+
+  def as_timestamp(node)
+    text = node.value if node.is_a?(Tag) && node.tag.zero?
+    match = TIMESTAMP_SHAPE.match(text) if text.is_a?(String) && text.encoding == Encoding::UTF_8
+    raise ArgumentError, "expected tag 0 with RFC 3339 timestamp text" unless match
+
+    year, month, day, hour, minute, second = match[1..6].map { |part| Integer(part, 10) }
+    unless year >= 1 && (1..12).cover?(month) && day >= 1 && day <= timestamp_days_in_month(year, month) &&
+           hour <= 23 && minute <= 59 && second <= 59
+      raise ArgumentError, "timestamp field out of range"
+    end
+    offset = 0
+    if match[8]
+      offset_hour = Integer(match[9], 10)
+      offset_minute = Integer(match[10], 10)
+      raise ArgumentError, "timestamp offset out of range" if offset_hour > 23 || offset_minute > 59
+
+      offset = (offset_hour * 3600 + offset_minute * 60) * (match[8] == "-" ? -1 : 1)
+    end
+    nanos = match[7] ? Integer(match[7].ljust(9, "0"), 10) : 0
+    value = Time.utc(year, month, day, hour, minute, second) - offset + Rational(nanos, 1_000_000_000)
+    raise ArgumentError, "timestamp year outside 0001-9999" unless (1..9999).cover?(value.year)
+
+    value
+  end
+
+  def enc_timestamp(value)
+    raise ArgumentError, "expected a Time for a timestamp" unless value.is_a?(Time)
+
+    utc = value.getutc
+    raise ArgumentError, "timestamp year outside 0001-9999" unless (1..9999).cover?(utc.year)
+
+    nanos = utc.subsec * 1_000_000_000
+    raise ArgumentError, "timestamp fraction finer than nanoseconds" unless nanos.denominator == 1
+
+    nanos = nanos.to_i
+    fraction =
+      if nanos.zero? then ""
+      elsif (nanos % 1_000_000).zero? then format(".%03d", nanos / 1_000_000)
+      elsif (nanos % 1000).zero? then format(".%06d", nanos / 1000)
+      else format(".%09d", nanos)
+      end
+    text = format("%04d-%02d-%02dT%02d:%02d:%02d%sZ", utc.year, utc.month, utc.day, utc.hour, utc.min, utc.sec, fraction)
+    Tag.new(0, text.encode(Encoding::UTF_8))
+  end
+end
+"#;
+
+/// `cddl_time` (tag 1, epoch seconds) helpers per docs/cbor-wire-contract.md. The
+/// value is the same `Time` as `timestamp`, which holds nanoseconds, so p = 9. The
+/// float steps use `Float` operands on both sides because an `Integer` or
+/// `Rational` operand would make Ruby do exact arithmetic instead of binary64.
+const CODEC_CDDL_TIME_RUBY: &str = r#"
+module CsilCbor
+  module_function
+
+  CDDL_TIME_FIRST = -62_135_596_800
+  CDDL_TIME_LAST = 253_402_300_799
+
+  def as_cddl_time(node)
+    raise ArgumentError, "expected tag 1 with epoch seconds" unless node.is_a?(Tag) && node.tag == 1
+
+    number = node.value
+    case number
+    when Integer
+      seconds = number
+      nanos = 0
+    when Float
+      # The bounds are checked first so that `to_i` never makes a huge Integer.
+      unless number.finite? && number >= CDDL_TIME_FIRST - 1 && number <= CDDL_TIME_LAST + 1
+        raise ArgumentError, "cddl_time is not finite or outside years 0001-9999"
+      end
+
+      whole = number.floor.to_f
+      scaled = (number - whole) * 1_000_000_000.0
+      nanos = (scaled + 0.5).floor
+      seconds = whole.to_i
+      if nanos == 1_000_000_000
+        seconds += 1
+        nanos = 0
+      end
+    else
+      raise ArgumentError, "cddl_time content must be an integer or a float"
+    end
+    raise ArgumentError, "cddl_time year outside 0001-9999" unless (CDDL_TIME_FIRST..CDDL_TIME_LAST).cover?(seconds)
+
+    Time.at(seconds, nanos, :nsec).getutc
+  end
+
+  def enc_cddl_time(value)
+    raise ArgumentError, "expected a Time for a cddl_time" unless value.is_a?(Time)
+
+    seconds = value.to_i
+    raise ArgumentError, "cddl_time year outside 0001-9999" unless (CDDL_TIME_FIRST..CDDL_TIME_LAST).cover?(seconds)
+
+    nanos = value.subsec * 1_000_000_000
+    raise ArgumentError, "cddl_time fraction finer than nanoseconds" unless nanos.denominator == 1
+
+    nanos = nanos.to_i
+    return Tag.new(1, seconds) if nanos.zero?
+
+    Tag.new(1, seconds.to_f + nanos.to_f / 1_000_000_000.0)
+  end
+end
+"#;
+
 const CODEC_DECIMAL_RUBY: &str = r#"
 module CsilCbor
   module_function
@@ -2806,7 +2988,7 @@ fn map_csil_type_to_ruby(type_expr: &CsilTypeExpression) -> String {
             "bytes" | "bstr" => "String".to_string(),
             "bool" => "Boolean".to_string(),
             "date" => "Date".to_string(),
-            "timestamp" => "Time".to_string(),
+            "timestamp" | "cddl_time" => "Time".to_string(),
             "decimal" => "BigDecimal".to_string(),
             "nil" | "null" => "nil".to_string(),
             other => ruby_class_name(other),
@@ -2976,6 +3158,35 @@ const CLIENT_PRELUDE: &str = "\
 # moves bytes (HTTP, a queue, an in-process loop); it never sees the typed values.
 ";
 
+/// The extra seam a spec with a multi-arm (`A / B`) reply needs. It is required
+/// whenever emitted, and only emitted then, so a spec without such an op keeps the
+/// one-method `call` seam unchanged.
+const CLIENT_REPLY_SEAM: &str = "\
+#
+# This spec has operations with more than one reply arm, so the transport must
+# also respond to `call_reply(service, op, req_bytes) -> [variant, payload]`:
+# `variant` is the CSIL-RPC response envelope's `variant` text (nil when absent)
+# and `payload` the reply bytes. The client picks the arm from `variant`: the
+# success arm returns its value, a declared error arm raises its
+# `CsilCbor::<Arm>Refusal`, and a missing or unknown variant raises ArgumentError.
+";
+
+const CLIENT_REPLY_HELPER: &str = "\
+module CsilCbor
+  module_function
+
+  def rpc_reply_payload(transport, service, op, req_bytes)
+    unless transport.respond_to?(:call_reply)
+      raise NotImplementedError,
+            \"transport must implement call_reply(service, op, req_bytes) -> [variant, payload] for #{service}/#{op}\"
+    end
+    variant, payload = transport.call_reply(service, op, req_bytes)
+    resolve_rpc_reply(service, op, variant, payload)
+  end
+end
+
+";
+
 fn generate_client_file(spec: &CsilSpecSerialized) -> Option<String> {
     let records = codec_record_names(spec);
     let aliases = codec_aliases(spec);
@@ -3007,7 +3218,14 @@ fn generate_client_file(spec: &CsilSpecSerialized) -> Option<String> {
         content.push_str("require_relative \"codec\"\n\n");
     }
     content.push_str(CLIENT_PRELUDE);
+    let multi_arm = spec.rpc_operations().next().is_some();
+    if multi_arm {
+        content.push_str(CLIENT_REPLY_SEAM);
+    }
     content.push('\n');
+    if multi_arm {
+        content.push_str(CLIENT_REPLY_HELPER);
+    }
     content.push_str(&body);
     Some(finalize(content))
 }
@@ -3076,7 +3294,15 @@ fn emit_client_class(
             // A non-record request can't self-serialize; the caller passes ready bytes.
             (true, _) => "req".to_string(),
         };
-        let call = format!("@transport.call(\"{wire_service}\", \"{wire_method}\", {payload})");
+        // A multi-arm reply needs the envelope variant to pick its arm, which the
+        // bytes-only `call` seam cannot carry, so it goes through `call_reply`.
+        let call = if op.rpc_reply_arms().is_some() {
+            format!(
+                "CsilCbor.rpc_reply_payload(@transport, \"{wire_service}\", \"{wire_method}\", {payload})"
+            )
+        } else {
+            format!("@transport.call(\"{wire_service}\", \"{wire_method}\", {payload})")
+        };
         // A reference success type is a generated value class, so decode the reply
         // bytes through its codec; anything else rides back as raw bytes.
         let body = match &success {
@@ -3510,11 +3736,9 @@ mod tests {
         let aliases = std::collections::HashMap::new();
         let unions = std::collections::HashMap::new();
         let out = emit_record_codec("Evt", &group, &records, &aliases, &unions);
-        assert!(
-            out.contains("csil_map[\"when\"] = CsilCbor::Tag.new(0, (self.when).getutc.iso8601)")
-        );
+        assert!(out.contains("csil_map[\"when\"] = CsilCbor.enc_timestamp(self.when)"));
         // The keyword is legal as a constructor keyword label, so decode stays bare.
-        assert!(out.contains("when: Time.iso8601((node[\"when\"]).value)"));
+        assert!(out.contains("when: CsilCbor.as_timestamp(node[\"when\"])"));
     }
 
     #[test]
@@ -3729,9 +3953,87 @@ mod tests {
         // The request self-encodes, the reply self-decodes; the transport only moves
         // bytes over the verbatim CSIL service/op wire strings. The ServiceError arm
         // is dropped from the success type.
+        // The multi-arm reply needs the envelope variant, so it rides `call_reply`
+        // (through the helper that refuses a transport without it).
         assert!(out.contains(
-            "Task.from_cbor(@transport.call(\"CorndogsService\", \"submit-task\", req.to_cbor))"
+            "Task.from_cbor(CsilCbor.rpc_reply_payload(@transport, \"CorndogsService\", \"submit-task\", req.to_cbor))"
         ));
+        assert!(!out.contains("@transport.call("));
+    }
+
+    /// `pingpong_spec`'s `get-user` already replies `user / ServiceError`; the
+    /// single-arm variant drops the error arm so both seam shapes can be compared.
+    fn multi_arm_spec(multi: bool) -> CsilSpecSerialized {
+        let mut spec = three_transport_spec();
+        if !multi {
+            for rule in &mut spec.rules {
+                if let CsilRuleType::ServiceDef(service) = &mut rule.rule_type {
+                    for op in &mut service.operations {
+                        if let CsilTypeExpression::Choice(arms) = &op.output_type {
+                            op.output_type = arms[0].clone();
+                        }
+                    }
+                }
+            }
+        }
+        spec
+    }
+
+    #[test]
+    fn client_reply_seam_only_for_multi_arm_specs() {
+        let multi = generate_client_file(&multi_arm_spec(true)).expect("client");
+        assert!(multi.contains("`call_reply(service, op, req_bytes) -> [variant, payload]`"));
+        assert!(multi.contains("def rpc_reply_payload(transport, service, op, req_bytes)"));
+        assert!(multi.contains("raise NotImplementedError"));
+        assert!(multi.contains("resolve_rpc_reply(service, op, variant, payload)"));
+
+        let single = generate_client_file(&multi_arm_spec(false)).expect("client");
+        assert!(!single.contains("call_reply"));
+        assert!(!single.contains("rpc_reply_payload"));
+    }
+
+    #[test]
+    fn genquickstart_carrier_implements_call_reply_when_needed() {
+        let multi = generate_ruby_code_from_serialized(&multi_arm_spec(true), &package_config())
+            .expect("package generation succeeded");
+        let readme = &multi
+            .iter()
+            .find(|f| f.path == "genquickstart.md")
+            .expect("genquickstart.md")
+            .content;
+        assert!(readme.contains("def call_reply(service, op, req_bytes)"));
+        assert!(readme.contains("[reply.variant, reply.payload]"));
+        assert!(!readme.contains("resolve_rpc_reply"));
+
+        let single = generate_ruby_code_from_serialized(&multi_arm_spec(false), &package_config())
+            .expect("package generation succeeded");
+        let readme = &single
+            .iter()
+            .find(|f| f.path == "genquickstart.md")
+            .expect("genquickstart.md")
+            .content;
+        assert!(!readme.contains("call_reply"));
+    }
+
+    #[test]
+    fn timestamp_codec_is_strict_and_canonical() {
+        let ts = CsilTypeExpression::Builtin("timestamp".to_string());
+        let none = Default::default();
+        let aliases = Default::default();
+        let unions = Default::default();
+        assert_eq!(
+            enc_tree(&ts, "v", &none, &aliases, &unions),
+            "CsilCbor.enc_timestamp(v)"
+        );
+        assert_eq!(
+            dec_tree(&ts, "n", &none, &aliases, &unions),
+            "CsilCbor.as_timestamp(n)"
+        );
+        // The hand-written shape check refuses what `Time.iso8601` would accept.
+        assert!(CODEC_TIMESTAMP_RUBY.contains("[Tt]"));
+        assert!(CODEC_TIMESTAMP_RUBY.contains("(?:[Zz]|([+-])([0-9]{2}):([0-9]{2}))\\z"));
+        assert!(!CODEC_TIMESTAMP_RUBY.contains("Time.iso8601"));
+        assert!(!CODEC_TIMESTAMP_RUBY.contains("Time.parse"));
     }
 
     /// A spec with a record and a unary service, generated in package mode, so the
@@ -3886,9 +4188,9 @@ mod tests {
         assert!(
             body.contains("RPC::RpcResponse.decode((res.body || \"\").b).into_transport_error")
         );
-        assert!(
-            body.contains("CsilCbor.resolve_rpc_reply(service, op, reply.variant, reply.payload)")
-        );
+        // The carrier no longer resolves reply arms; the generated client does.
+        assert!(!body.contains("resolve_rpc_reply"));
+        assert!(body.contains("exchange(service, op, req_bytes).payload"));
         // Typed client + the first `->` call with a generated sample literal.
         assert!(body.contains("UserClient.new(HttpRpcTransport.new(\"http://localhost:5080\"))"));
         assert!(body.contains("resp = client.get_user(User.new(name: \"example\", id: 0))"));

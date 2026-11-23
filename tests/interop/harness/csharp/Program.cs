@@ -40,6 +40,7 @@ internal static class Harness
         Flag = true,
         Due = new DateOnly(2000, 2, 29),
         When = Ts(),
+        Seen = Ts().AddMilliseconds(500),
         Amount = CsilDecimal.Parse("123.45"),
         // mixed-union coverage: a value equal to a literal arm must wire as
         // [1,"pending"]; a value with no literal match must wire as [0,...].
@@ -108,6 +109,7 @@ internal static class Harness
     private static bool ScalarsEq(Scalars a, Scalars b) =>
         a.I == b.I && a.U == b.U && a.N == b.N && a.F.Equals(b.F) && a.T == b.T
         && a.Raw.SequenceEqual(b.Raw) && a.Flag == b.Flag && a.Due == b.Due && a.When == b.When
+        && a.Seen == b.Seen
         && a.Amount.CompareTo(b.Amount) == 0
         && a.StatusLiteral.Equals(b.StatusLiteral) && a.StatusFree.Equals(b.StatusFree)
         && a.Note.Equals(b.Note) && a.Size == b.Size && a.Level == b.Level && a.Season == b.Season
@@ -270,25 +272,20 @@ internal static class Harness
     // RPC
     // -----------------------------------------------------------------------
 
-    // The carrier owns the convention that a status-0 reply whose variant is the
-    // `ServiceError` arm is a typed application error: it surfaces as a client exception so
-    // the typed client's error path fires (mirrors the Rust RpcTransport).
+    // The generated client selects the reply arm from the variant, so the carrier only
+    // hands the lib client's reply on.
     private sealed class RpcTransport : ICsilTransport
     {
         private readonly RpcClient _client;
 
         public RpcTransport(RpcClient client) => _client = client;
 
-        public byte[] Call(string service, string op, byte[] request)
+        public byte[] Call(string service, string op, byte[] request) => _client.Call(service, op, request).Payload;
+
+        public CsilWireReply CallReply(string service, string op, byte[] request)
         {
             RpcResponse resp = _client.Call(service, op, request);
-            if (resp.Variant == "ServiceError")
-            {
-                ServiceError se = Codec.Decode<ServiceError>(resp.Payload);
-                throw new CsilClientException(se.Code, se.Message);
-            }
-
-            return resp.Payload;
+            return new CsilWireReply(resp.Variant, resp.Payload);
         }
     }
 
@@ -450,7 +447,7 @@ internal static class Harness
             client.ValidateConstrained(ConstrainedBad());
             cases.Fail("validate-constrained/failure", "server accepted invalid input");
         }
-        catch (CsilClientException)
+        catch (Codec.ServiceErrorRefusal e) when (e.Value.Code == 422)
         {
             // The typed error arm must surface as a service error, not a transport error.
             cases.Pass("validate-constrained/failure");

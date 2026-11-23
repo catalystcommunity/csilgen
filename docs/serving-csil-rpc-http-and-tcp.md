@@ -112,8 +112,10 @@ use interop_api::*; // generated codec + handler trait
 fn dispatch(h: &Handlers, req: &RpcRequest) -> HandlerOutcome {
     match req.op.as_str() {
         "echo-scalars" => match decode_scalars(&req.payload) {
-            Ok(v) => match h.echo_scalars(&(), v) {
-                Ok(r) => HandlerOutcome::Reply { variant: "Scalars".into(), payload: encode_scalars(&r) },
+            Ok(v) => match h.echo_scalars(&(), v).map(|r| encode_scalars(&r)) {
+                Ok(Ok(payload)) => HandlerOutcome::Reply { variant: "Scalars".into(), payload },
+                // The reply has no wire form: answer with the internal status.
+                Ok(Err(e)) => HandlerOutcome::Transport(Status::Internal, e.to_string()),
                 Err(e) => HandlerOutcome::Transport(Status::Internal, e.message),
             },
             Err(e) => HandlerOutcome::Transport(Status::MalformedEnvelope, e.to_string()),
@@ -170,6 +172,31 @@ fn main() {
 ### Go (`transports/go`) — both carriers on stdlib `net`/`net/http`
 
 ```go
+// dispatch: decode the request, call the handler, encode the reply.
+// Encode returns an error when a value has no wire form. Send status 6
+// (internal) for that error. Do not panic and do not close the connection.
+func dispatch(h ChatHandlers, req *transport.RpcRequest) transport.HandlerOutcome {
+    switch req.Op {
+    case "echo-scalars":
+        in, err := api.DecodeScalars(req.Payload)
+        if err != nil {
+            return transport.Transport(transport.StatusMalformedEnvelope, err.Error())
+        }
+        out, err := h.EchoScalars(context.Background(), in)
+        if err != nil {
+            return transport.Transport(transport.StatusInternal, err.Error())
+        }
+        payload, err := api.EncodeScalars(out)
+        if err != nil {
+            return transport.Transport(transport.StatusInternal, err.Error())
+        }
+        return transport.Reply("Scalars", payload)
+    // ...one case for each operation...
+    default:
+        return transport.Transport(transport.StatusUnknownServiceOrOp, "unknown op "+req.Op)
+    }
+}
+
 // shared: one envelope in, one envelope out
 func handleEnvelope(h ChatHandlers, body []byte) []byte {
     req, err := transport.DecodeRpcRequest(body)
@@ -177,7 +204,7 @@ func handleEnvelope(h ChatHandlers, body []byte) []byte {
         out, _ := transport.NewRpcResponseTransportError(transport.StatusMalformedEnvelope, err.Error()).Encode()
         return out
     }
-    outcome := dispatch(h, &req) // your RpcRequest -> HandlerOutcome (matches req.Op, codec, handler)
+    outcome := dispatch(h, &req)
     var resp transport.RpcResponse
     if outcome.IsReply {
         resp = transport.NewRpcResponseOk(outcome.Variant, outcome.Payload).WithID(req.ID)

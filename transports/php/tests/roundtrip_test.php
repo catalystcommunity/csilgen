@@ -17,6 +17,23 @@ assert_true(bin2hex($encoded) === 'a2616101616202', 'canonical map ordering');
 assert_true(bin2hex(CBOR::encode(CBOR::mapEntries(array(array(1, 'b'), array(0, 'a'))))) === 'a2006161016162', 'enum keys retain their assigned integers in canonical order');
 assert_true(bin2hex(CBOR::encode(CBOR::mapEntries(array()))) === 'a0', 'empty enum map');
 
+// -- Floats: every width decodes to binary64, and encode always writes binary64.
+assert_true(bin2hex(CBOR::encode(1.5)) === 'fb3ff8000000000000', 'float encodes as binary64');
+assert_true(CBOR::decode(hex2bin('fb3ff8000000000000')) === 1.5, 'binary64 decode');
+assert_true(CBOR::decode(hex2bin('fa3fc00000')) === 1.5, 'binary32 decode');
+assert_true(CBOR::decode(hex2bin('f93e00')) === 1.5, 'binary16 decode');
+assert_true(CBOR::decode(hex2bin('f9c400')) === -4.0, 'negative binary16 decode');
+assert_true(CBOR::decode(hex2bin('f90001')) === 2.0 ** -24, 'subnormal binary16 decode');
+assert_true(CBOR::decode(hex2bin('f97c00')) === INF, 'binary16 infinity decode');
+assert_true(is_nan(CBOR::decode(hex2bin('f97e00'))), 'binary16 NaN decode');
+$truncated = false;
+try {
+    CBOR::decode(hex2bin('fb3ff8'));
+} catch (\Csilgen\Transport\CborException $e) {
+    $truncated = true;
+}
+assert_true($truncated, 'truncated float is refused');
+
 // -- CSIL-RPC request: all fields.
 $payload = CBOR::encode($value);
 $req = Rpc::decodeRequest(Rpc::encodeRequest('Attestation', 'deposit-claim', $payload, 7, 'bearer-tok'));

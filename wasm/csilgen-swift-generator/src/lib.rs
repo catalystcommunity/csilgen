@@ -10,11 +10,11 @@
 use convert_case::{Case, Casing};
 use csilgen_common::{
     ChoiceClass, CsilControlOperator, CsilFieldMetadata, CsilGroupEntry, CsilGroupExpression,
-    CsilGroupKey, CsilLiteralValue, CsilOccurrence, CsilRuleType, CsilServiceDefinition,
-    CsilServiceDirection, CsilServiceOperation, CsilSizeConstraint, CsilTypeExpression,
-    CsilValidationConstraint, GeneratedFile, GenerationStats, GeneratorCapability,
-    GeneratorMetadata, GeneratorWarning, WasmGeneratorInput, WasmGeneratorOutput,
-    choice_arm_literal, wasm_interface::*,
+    CsilGroupKey, CsilLiteralValue, CsilOccurrence, CsilRule, CsilRuleType, CsilServiceDefinition,
+    CsilServiceDirection, CsilServiceOperation, CsilSizeConstraint, CsilSpecSerialized,
+    CsilTypeExpression, CsilValidationConstraint, GeneratedFile, GenerationStats,
+    GeneratorCapability, GeneratorMetadata, GeneratorWarning, WasmGeneratorInput,
+    WasmGeneratorOutput, choice_arm_literal, wasm_interface::*,
 };
 
 #[unsafe(no_mangle)]
@@ -220,6 +220,7 @@ fn build_files(input: &WasmGeneratorInput) -> Result<Vec<GeneratedFile>, i32> {
             },
         );
         cloned.csil_spec.supply_implicit_service_error();
+        key_unhashable_maps_by_value(&mut cloned.csil_spec);
         cloned
     };
     let input = &hoisted;
@@ -273,7 +274,7 @@ fn build_files(input: &WasmGeneratorInput) -> Result<Vec<GeneratedFile>, i32> {
             };
             match style {
                 ClientStyle::Sync => {
-                    if let Some(client) = generate_client(input, sync) {
+                    if let Some(client) = generate_client(input, sync, !want_server) {
                         files.push(GeneratedFile {
                             path: "Client.swift".to_string(),
                             content: client,
@@ -281,7 +282,7 @@ fn build_files(input: &WasmGeneratorInput) -> Result<Vec<GeneratedFile>, i32> {
                     }
                 }
                 ClientStyle::Async => {
-                    if let Some(client) = generate_client(input, async_drop_in) {
+                    if let Some(client) = generate_client(input, async_drop_in, !want_server) {
                         files.push(GeneratedFile {
                             path: "Client.swift".to_string(),
                             content: client,
@@ -289,13 +290,13 @@ fn build_files(input: &WasmGeneratorInput) -> Result<Vec<GeneratedFile>, i32> {
                     }
                 }
                 ClientStyle::Both => {
-                    if let Some(client) = generate_client(input, sync) {
+                    if let Some(client) = generate_client(input, sync, !want_server) {
                         files.push(GeneratedFile {
                             path: "Client.swift".to_string(),
                             content: client,
                         });
                     }
-                    if let Some(client) = generate_client(input, async_twin) {
+                    if let Some(client) = generate_client(input, async_twin, !want_server) {
                         files.push(GeneratedFile {
                             path: "ClientAsync.swift".to_string(),
                             content: client,
@@ -331,6 +332,89 @@ fn build_files(input: &WasmGeneratorInput) -> Result<Vec<GeneratedFile>, i32> {
     }
 
     Ok(files)
+}
+
+/// A Swift dictionary key must be `Hashable`. Records, tagged unions, and tuples are
+/// not, so a map keyed by one is keyed by the decoded CBOR value instead (the `any`
+/// core type). Rewriting the spec once keeps every emitter on the same key type.
+fn key_unhashable_maps_by_value(spec: &mut CsilSpecSerialized) {
+    let snapshot = spec.rules.clone();
+    for rule in &mut spec.rules {
+        match &mut rule.rule_type {
+            CsilRuleType::TypeDef(ty) => rekey_maps(ty, &snapshot),
+            CsilRuleType::GroupDef(group) => rekey_group(group, &snapshot),
+            CsilRuleType::TypeChoice(choices) => {
+                choices.iter_mut().for_each(|c| rekey_maps(c, &snapshot))
+            }
+            CsilRuleType::GroupChoice(groups) => {
+                groups.iter_mut().for_each(|g| rekey_group(g, &snapshot))
+            }
+            CsilRuleType::ServiceDef(service) => {
+                for op in &mut service.operations {
+                    rekey_maps(&mut op.input_type, &snapshot);
+                    rekey_maps(&mut op.output_type, &snapshot);
+                }
+            }
+        }
+    }
+}
+
+fn rekey_group(group: &mut CsilGroupExpression, rules: &[CsilRule]) {
+    for entry in &mut group.entries {
+        rekey_maps(&mut entry.value_type, rules);
+    }
+}
+
+fn rekey_maps(ty: &mut CsilTypeExpression, rules: &[CsilRule]) {
+    match ty {
+        CsilTypeExpression::Map { key, value, .. } => {
+            rekey_maps(value, rules);
+            if swift_key_hashable(key, rules, 0) {
+                rekey_maps(key, rules);
+            } else {
+                **key = CsilTypeExpression::Builtin("any".to_string());
+            }
+        }
+        CsilTypeExpression::Array { element_type, .. } => rekey_maps(element_type, rules),
+        CsilTypeExpression::Group(group) | CsilTypeExpression::Tuple(group) => {
+            rekey_group(group, rules)
+        }
+        CsilTypeExpression::Choice(choices) => {
+            choices.iter_mut().for_each(|c| rekey_maps(c, rules))
+        }
+        CsilTypeExpression::Constrained { base_type, .. } => rekey_maps(base_type, rules),
+        _ => {}
+    }
+}
+
+/// Whether the Swift type `map_type` gives `ty` conforms to `Hashable`.
+fn swift_key_hashable(ty: &CsilTypeExpression, rules: &[CsilRule], depth: usize) -> bool {
+    if depth > 32 {
+        return false;
+    }
+    match unwrap_constrained(ty) {
+        CsilTypeExpression::Reference(name) => {
+            match rules.iter().find(|r| &r.name == name).map(|r| &r.rule_type) {
+                Some(CsilRuleType::TypeDef(CsilTypeExpression::Choice(choices)))
+                | Some(CsilRuleType::TypeChoice(choices)) => {
+                    !matches!(swift_choice_shape(choices), SwiftChoiceShape::Union)
+                }
+                Some(CsilRuleType::TypeDef(CsilTypeExpression::Group(_)))
+                | Some(CsilRuleType::GroupDef(_)) => false,
+                Some(CsilRuleType::TypeDef(other)) => swift_key_hashable(other, rules, depth + 1),
+                _ => false,
+            }
+        }
+        CsilTypeExpression::Tuple(group) if group.entries.len() == 1 => {
+            swift_key_hashable(&group.entries[0].value_type, rules, depth + 1)
+        }
+        CsilTypeExpression::Tuple(_) | CsilTypeExpression::Group(_) => false,
+        CsilTypeExpression::Array { element_type, .. } => {
+            swift_key_hashable(element_type, rules, depth + 1)
+        }
+        CsilTypeExpression::Map { value, .. } => swift_key_hashable(value, rules, depth + 1),
+        _ => true,
+    }
 }
 
 /// The resolved coordinates of a self-contained SwiftPM package. Present only when
@@ -406,9 +490,13 @@ fn emit_readme_enabled(options: &std::collections::HashMap<String, serde_json::V
 /// the manifest are left at the package root.
 fn wrap_as_package(files: Vec<GeneratedFile>, pkg: &SwiftPackage) -> Vec<GeneratedFile> {
     let mut out = Vec::with_capacity(files.len() + 1);
+    // Swift `Regex` (a `.regex` constraint) exists only from macOS 13 / iOS 16.
+    // SwiftPM's default floor is lower, so the manifest must declare it, and only
+    // then, so a package without `.regex` keeps the lowest floor for its users.
+    let needs_regex = files.iter().any(|f| f.content.contains("try Regex("));
     out.push(GeneratedFile {
         path: "Package.swift".to_string(),
-        content: package_manifest(pkg),
+        content: package_manifest(pkg, needs_regex),
     });
     for file in files {
         out.push(GeneratedFile {
@@ -421,7 +509,7 @@ fn wrap_as_package(files: Vec<GeneratedFile>, pkg: &SwiftPackage) -> Vec<Generat
 
 /// The `Package.swift` manifest: a single library product and target named for the
 /// package, no dependencies. Pinned to swift-tools-version 5.9.
-fn package_manifest(pkg: &SwiftPackage) -> String {
+fn package_manifest(pkg: &SwiftPackage, needs_regex: bool) -> String {
     let SwiftPackage {
         name,
         target,
@@ -429,6 +517,11 @@ fn package_manifest(pkg: &SwiftPackage) -> String {
     } = pkg;
     let name_lit = swift_string_lit(name);
     let target_lit = swift_string_lit(target);
+    let platforms = if needs_regex {
+        "    platforms: [.macOS(.v13), .iOS(.v16), .tvOS(.v16), .watchOS(.v9)],\n"
+    } else {
+        ""
+    };
     format!(
         "// swift-tools-version:5.9\n\
 // {name} {version} — generated by csilgen; DO NOT EDIT.\n\
@@ -437,13 +530,14 @@ fn package_manifest(pkg: &SwiftPackage) -> String {
 import PackageDescription\n\
 \n\
 let package = Package(\n\
-    name: {name_lit},\n\
-    products: [\n\
-        .library(name: {name_lit}, targets: [{target_lit}]),\n\
-    ],\n\
-    targets: [\n\
-        .target(name: {target_lit}),\n\
-    ]\n\
+\x20   name: {name_lit},\n\
+{platforms}\
+\x20   products: [\n\
+\x20       .library(name: {name_lit}, targets: [{target_lit}]),\n\
+\x20   ],\n\
+\x20   targets: [\n\
+\x20       .target(name: {target_lit}),\n\
+\x20   ]\n\
 )\n"
     )
 }
@@ -510,7 +604,11 @@ fn swift_readme(input: &WasmGeneratorInput, pkg: &SwiftPackage) -> String {
     let unary = first_swift_unary_example(input);
     let channel = first_swift_channel_example(input);
     if rpc {
-        out.push_str(&swift_rpc_section(module, unary.as_ref()));
+        out.push_str(&swift_rpc_section(
+            module,
+            unary.as_ref(),
+            input.csil_spec.rpc_operations().next().is_some(),
+        ));
     }
     if events {
         out.push_str(&swift_events_section(module, channel.as_ref()));
@@ -655,7 +753,7 @@ fn first_swift_channel_example(input: &WasmGeneratorInput) -> Option<SwiftChanne
 /// builds/parses the envelope with the library's `RpcRequest`/`RpcResponse` (never hand-
 /// rolled) and POSTs it to `{baseURL}/csil/v1/rpc`. The typed client decodes the success
 /// payload; a non-zero transport status and the `ServiceError` arm are surfaced distinctly.
-fn swift_rpc_section(module: &str, ex: Option<&SwiftUnaryExample>) -> String {
+fn swift_rpc_section(module: &str, ex: Option<&SwiftUnaryExample>, has_reply: bool) -> String {
     let mut out = String::from("## CSIL-RPC (HTTP)\n\n");
     out.push_str(
         "Request/response. The library owns the envelope (`RpcRequest`/`RpcResponse`); you\n\
@@ -673,7 +771,16 @@ fn swift_rpc_section(module: &str, ex: Option<&SwiftUnaryExample>) -> String {
     out.push_str("import Foundation\n");
     out.push_str(&format!("import {module}\n"));
     out.push_str("import CsilgenTransport\n\n");
-    out.push_str(SWIFT_RPC_CARRIER);
+    // The seam requires `callReply` only for a spec with a multi-arm operation; the
+    // generated client then resolves the variant itself.
+    out.push_str(&SWIFT_RPC_CARRIER.replace(
+        "__CALL_REPLY__",
+        if has_reply {
+            "\n    func callReply(service: String, op: String, request: [UInt8]) throws -> (variant: String?, payload: [UInt8]) {\n        let resp = try roundTrip(service: service, op: op, request: request)\n        return (resp.variant, resp.payload)\n    }\n"
+        } else {
+            ""
+        },
+    ));
     out.push('\n');
     out.push_str(&format!(
         "let client = {}(transport: HttpRpcCarrier(baseURL: \"http://localhost:5080\"))\n",
@@ -732,11 +839,11 @@ fn swift_events_session(ch: &SwiftChannelExample) -> String {
 // {outbound}). The generated router uses it to (de)serialize channel payloads.
 struct ChannelCodec: CsilCodec {{
     func encode<T>(_ value: T) throws -> [UInt8] {{
-        if let v = value as? {outbound} {{ return v.toCbor() }}
+        if let v = value as? {outbound} {{ return try v.toCbor() }}
         throw CsilCborError.typeMismatch
     }}
     func decode<T>(_ data: [UInt8], as type: T.Type) throws -> T {{
-        if type == {inbound}.self {{ return try {inbound}.fromCbor(data) as! T }}
+        if type == {inbound}.self, let v = try {inbound}.fromCbor(data) as? T {{ return v }}
         throw CsilCborError.typeMismatch
     }}
 }}
@@ -791,7 +898,8 @@ func session() throws {{
                 ).encode(profile))
             continue
         }}
-        try {route}(handler, codec: codec, op: ev.event!, data: ev.payload)
+        guard let op = ev.event else {{ continue }}
+        try {route}(handler, codec: codec, op: op, data: ev.payload)
     }}
 }}
 
@@ -890,7 +998,8 @@ func main() throws {{
     // Fire-and-forget: encode the `->` request and send it. seq 0 marks an unsequenced
     // datagram.
     let req: {req_type} = {sample}
-    try carrier.sendDatagram(Datagram(opOrd: opOrd, seq: 0, payload: req.toCbor()).encode())
+    let payload = try req.toCbor()
+    try carrier.sendDatagram(Datagram(opOrd: opOrd, seq: 0, payload: payload).encode())
 
     // Recv path: a datagram of the RESPONSE type MAY arrive later — or never. There is NO
     // synchronous response; the caller must tolerate loss and reordering and handle a reply
@@ -964,7 +1073,7 @@ fn swift_sample(input: &WasmGeneratorInput, ty: &CsilTypeExpression) -> String {
             "int" | "uint" => "0".to_string(),
             "bytes" | "bstr" => "[]".to_string(),
             "date" => "\"1970-01-01\"".to_string(),
-            "timestamp" => "\"1970-01-01T00:00:00Z\"".to_string(),
+            "timestamp" | "cddl_time" => "\"1970-01-01T00:00:00Z\"".to_string(),
             "decimal" => "\"0\"".to_string(),
             _ => "[]".to_string(),
         },
@@ -990,6 +1099,10 @@ struct HttpRpcCarrier: CsilTransport {
     let baseURL: String
 
     func call(service: String, op: String, request: [UInt8]) throws -> [UInt8] {
+        try roundTrip(service: service, op: op, request: request).payload
+    }
+__CALL_REPLY__
+    private func roundTrip(service: String, op: String, request: [UInt8]) throws -> RpcResponse {
         // The library builds the envelope (tag-24 payload, canonical CBOR); never hand-roll it.
         let envelope = RpcRequest(service: service, op: op, payload: request).encode()
         let mount = baseURL.hasSuffix("/") ? baseURL + "csil/v1/rpc" : baseURL + "/csil/v1/rpc"
@@ -1020,7 +1133,7 @@ struct HttpRpcCarrier: CsilTransport {
         // transport status (distinct from a typed application error).
         let resp = try RpcResponse.decode(try outcome.get())
         if let err = resp.asTransportError() { throw err }
-        return try resolveRpcReply(service: service, op: op, variant: resp.variant, payload: resp.payload)
+        return resp
     }
 }
 "#;
@@ -1274,17 +1387,23 @@ fn is_null_input(type_expr: &CsilTypeExpression) -> bool {
 fn map_type(type_expr: &CsilTypeExpression, optional: bool) -> String {
     let base = match type_expr {
         CsilTypeExpression::Builtin(name) => match name.as_str() {
-            "int" => "Int64".to_string(),
+            // `nint` is a negative `int`; the codec checks the sign both ways.
+            "int" | "nint" => "Int64".to_string(),
             "uint" => "UInt64".to_string(),
-            "float" => "Double".to_string(),
+            // Every float width decodes to and encodes as a double (wire contract).
+            "float" | "float16" | "float32" | "float64" | "number" => "Double".to_string(),
+            "true" | "false" => "Bool".to_string(),
+            "null" | "nil" | "undefined" => "AnyCsilValue".to_string(),
             // `tstr`/`bstr` are the CDDL spellings of `text`/`bytes`.
             "text" | "tstr" => "String".to_string(),
             "bytes" | "bstr" => "[UInt8]".to_string(),
             "bool" => "Bool".to_string(),
             "date" => "String".to_string(),
-            // RFC3339 UTC text on the wire (CBOR tag 0); kept as a String so the
-            // generated types stay Foundation-free and portable.
-            "timestamp" => "String".to_string(),
+            // RFC3339 UTC text on the wire (CBOR tag 0); kept as canonical UTC text
+            // so the generated types stay Foundation-free and keep all nine
+            // fraction digits, which a Double-backed `Date` cannot hold exactly.
+            // `cddl_time` (CBOR tag 1) is the same instant with another wire form.
+            "timestamp" | "cddl_time" => "String".to_string(),
             // Exact decimal as canonical decimal text (CBOR tag 4); kept as a String
             // for the same Foundation-free reason.
             "decimal" => "String".to_string(),
@@ -1299,6 +1418,7 @@ fn map_type(type_expr: &CsilTypeExpression, optional: bool) -> String {
             format!("[{}: {}]", map_type(key, false), map_type(value, false))
         }
         CsilTypeExpression::Tuple(group) => map_tuple(group),
+        CsilTypeExpression::Range { .. } => "Int64".to_string(),
         CsilTypeExpression::Literal(lit) => match lit {
             CsilLiteralValue::Integer(_) => "Int64".to_string(),
             CsilLiteralValue::Float(_) => "Double".to_string(),
@@ -1432,6 +1552,7 @@ fn generate_types(input: &WasmGeneratorInput) -> Option<String> {
     let mut body = String::new();
     let mut any = false;
     let mut needs_validation = false;
+    let aliases = swift_codec_aliases(input);
 
     // `input.csil_spec` has already been through `csilgen_common::hoist_inline_composites`
     // (see `build_files`), so every inline choice a field/array-element/map-value/tuple-
@@ -1461,7 +1582,7 @@ fn generate_types(input: &WasmGeneratorInput) -> Option<String> {
                 }
                 CsilTypeExpression::Choice(choices) => {
                     any = true;
-                    body.push_str(&emit_enum(&rule.name, choices));
+                    body.push_str(&emit_enum(&rule.name, choices, &aliases));
                 }
                 other => {
                     any = true;
@@ -1474,7 +1595,7 @@ fn generate_types(input: &WasmGeneratorInput) -> Option<String> {
             },
             CsilRuleType::TypeChoice(choices) => {
                 any = true;
-                body.push_str(&emit_enum(&rule.name, choices));
+                body.push_str(&emit_enum(&rule.name, choices, &aliases));
             }
             _ => {}
         }
@@ -1489,8 +1610,8 @@ fn generate_types(input: &WasmGeneratorInput) -> Option<String> {
         content.push_str(VALIDATION_ERROR_SWIFT);
         content.push('\n');
     }
-    if body.contains("AnyCsilValue") {
-        content.push_str(ANY_VALUE_SWIFT);
+    if body.contains("CsilEq.") {
+        content.push_str(TUPLE_EQ_SWIFT);
         content.push('\n');
     }
     content.push_str(&body);
@@ -1565,6 +1686,31 @@ fn emit_struct(
         out.push_str(&format!("        self.{field} = {field}\n"));
     }
     out.push_str("    }\n");
+
+    let aliases = swift_codec_aliases(input);
+    if fields
+        .iter()
+        .any(|(_, _, entry)| needs_manual_eq(&entry.value_type, &aliases, 0))
+    {
+        let parts: Vec<String> = fields
+            .iter()
+            .map(|(field, _, entry)| {
+                let optional = matches!(entry.occurrence, Some(CsilOccurrence::Optional));
+                eq_expr(
+                    &entry.value_type,
+                    optional,
+                    &format!("lhs.{field}"),
+                    &format!("rhs.{field}"),
+                    &aliases,
+                    0,
+                )
+            })
+            .collect();
+        out.push_str(&format!(
+            "\n    public static func == (lhs: {type_name}, rhs: {type_name}) -> Bool {{\n        {}\n    }}\n",
+            parts.join("\n            && ")
+        ));
+    }
 
     // Validation.
     let validate = emit_validate(&fields);
@@ -1946,7 +2092,11 @@ fn emit_mixed_enum(type_name: &str, lits: &[CsilLiteralValue]) -> String {
 /// everything else (literals, nested shapes) takes a positional case. The enum
 /// case itself is the wire discriminant; see `emit_union_codec` for how that's
 /// encoded/decoded as CBOR.
-fn emit_enum(name: &str, choices: &[CsilTypeExpression]) -> String {
+fn emit_enum(
+    name: &str,
+    choices: &[CsilTypeExpression],
+    aliases: &std::collections::HashMap<String, CsilTypeExpression>,
+) -> String {
     let type_name = swift_type_name(name);
     match swift_choice_shape(choices) {
         SwiftChoiceShape::StringEnum(labels) => {
@@ -1965,10 +2115,159 @@ fn emit_enum(name: &str, choices: &[CsilTypeExpression]) -> String {
     ));
     for (index, choice) in choices.iter().enumerate() {
         let case = enum_case_name(choice, index);
-        out.push_str(&format!("    case {case}({})\n", map_type(choice, false)));
+        if is_null_arm(choice) {
+            out.push_str(&format!("    case {case}\n"));
+        } else {
+            out.push_str(&format!("    case {case}({})\n", map_type(choice, false)));
+        }
+    }
+    if choices
+        .iter()
+        .any(|choice| !is_null_arm(choice) && needs_manual_eq(choice, aliases, 0))
+    {
+        out.push_str(&format!(
+            "\n    public static func == (lhs: {type_name}, rhs: {type_name}) -> Bool {{\n        switch (lhs, rhs) {{\n"
+        ));
+        for (index, choice) in choices.iter().enumerate() {
+            let case = enum_case_name(choice, index);
+            if is_null_arm(choice) {
+                out.push_str(&format!("        case (.{case}, .{case}): return true\n"));
+            } else {
+                let eq = eq_expr(choice, false, "csilL", "csilR", aliases, 0);
+                out.push_str(&format!(
+                    "        case let (.{case}(csilL), .{case}(csilR)): return {eq}\n"
+                ));
+            }
+        }
+        if choices.len() > 1 {
+            out.push_str("        default: return false\n");
+        }
+        out.push_str("        }\n    }\n");
     }
     out.push_str("}\n\n");
     out
+}
+
+/// A bare `null` arm (`text / null`): a payload-less case on both sides of the wire.
+fn is_null_arm(choice: &CsilTypeExpression) -> bool {
+    matches!(
+        unwrap_constrained(choice),
+        CsilTypeExpression::Builtin(name) if matches!(name.as_str(), "null" | "nil" | "undefined")
+    )
+}
+
+/// The literal arms a general arm loses to by value equality (wire contract,
+/// "Choices"): `"pending"` sent through the `text` arm of `text / "pending"` still
+/// wires as the literal arm's index.
+fn literal_arms_won_by<'a>(
+    general: &CsilTypeExpression,
+    choices: &'a [CsilTypeExpression],
+) -> Vec<(usize, &'a CsilLiteralValue)> {
+    let CsilTypeExpression::Builtin(kind) = unwrap_constrained(general) else {
+        return Vec::new();
+    };
+    choices
+        .iter()
+        .enumerate()
+        .filter_map(|(index, choice)| {
+            let lit = choice_arm_literal(choice)?;
+            let same_kind = match (kind.as_str(), lit) {
+                ("text" | "tstr", CsilLiteralValue::Text(_)) => true,
+                ("int", CsilLiteralValue::Integer(_)) => true,
+                ("uint", CsilLiteralValue::Integer(n)) => *n >= 0,
+                ("bool", CsilLiteralValue::Bool(_)) => true,
+                _ => false,
+            };
+            same_kind.then_some((index, lit))
+        })
+        .collect()
+}
+
+/// Whether the Swift type for `ty` holds a tuple, which blocks a synthesized
+/// `Equatable`. Records and unions are `Equatable` themselves, so the walk stops there.
+fn needs_manual_eq(
+    ty: &CsilTypeExpression,
+    aliases: &std::collections::HashMap<String, CsilTypeExpression>,
+    depth: usize,
+) -> bool {
+    if depth > 32 {
+        return false;
+    }
+    match unwrap_constrained(ty) {
+        CsilTypeExpression::Tuple(group) if group.entries.len() == 1 => {
+            needs_manual_eq(&group.entries[0].value_type, aliases, depth + 1)
+        }
+        CsilTypeExpression::Tuple(_) => true,
+        CsilTypeExpression::Array { element_type, .. } => {
+            needs_manual_eq(element_type, aliases, depth + 1)
+        }
+        CsilTypeExpression::Map { value, .. } => needs_manual_eq(value, aliases, depth + 1),
+        CsilTypeExpression::Reference(name) => aliases
+            .get(name)
+            .is_some_and(|target| needs_manual_eq(target, aliases, depth + 1)),
+        _ => false,
+    }
+}
+
+/// A Swift `Bool` expression comparing `a` and `b` of the Swift type for `ty`
+/// (`T?` when `optional`). Closure parameters carry the depth so nested closures
+/// never shadow each other.
+fn eq_expr(
+    ty: &CsilTypeExpression,
+    optional: bool,
+    a: &str,
+    b: &str,
+    aliases: &std::collections::HashMap<String, CsilTypeExpression>,
+    depth: usize,
+) -> String {
+    if !needs_manual_eq(ty, aliases, 0) {
+        return format!("{a} == {b}");
+    }
+    let (l, r) = (format!("csilL{depth}"), format!("csilR{depth}"));
+    if optional {
+        let inner = eq_expr(ty, false, &l, &r, aliases, depth + 1);
+        return format!("CsilEq.optional({a}, {b}) {{ ({l}, {r}) in {inner} }}");
+    }
+    match unwrap_constrained(ty) {
+        CsilTypeExpression::Tuple(group) if group.entries.len() == 1 => {
+            let entry = &group.entries[0];
+            let opt = matches!(entry.occurrence, Some(CsilOccurrence::Optional));
+            eq_expr(&entry.value_type, opt, a, b, aliases, depth)
+        }
+        CsilTypeExpression::Tuple(group) => {
+            let parts: Vec<String> = group
+                .entries
+                .iter()
+                .enumerate()
+                .map(|(index, entry)| {
+                    let label = tuple_field_label(group, index);
+                    let opt = matches!(entry.occurrence, Some(CsilOccurrence::Optional));
+                    eq_expr(
+                        &entry.value_type,
+                        opt,
+                        &format!("{a}.{label}"),
+                        &format!("{b}.{label}"),
+                        aliases,
+                        depth,
+                    )
+                })
+                .collect();
+            format!("({})", parts.join(" && "))
+        }
+        CsilTypeExpression::Array { element_type, .. } => {
+            let inner = eq_expr(element_type, false, &l, &r, aliases, depth + 1);
+            format!("CsilEq.array({a}, {b}) {{ ({l}, {r}) in {inner} }}")
+        }
+        CsilTypeExpression::Map { value, .. } => {
+            let inner = eq_expr(value, false, &l, &r, aliases, depth + 1);
+            format!("CsilEq.map({a}, {b}) {{ ({l}, {r}) in {inner} }}")
+        }
+        CsilTypeExpression::Reference(name) => match aliases.get(name) {
+            Some(target) => eq_expr(target, false, a, b, aliases, depth),
+            None => format!("{a} == {b}"),
+        },
+        _ => format!("{a} == {b}"),
+    }
 }
 
 /// Resolve an enum default with the same case names as the enum declaration.
@@ -2522,7 +2821,19 @@ fn unwrap_constrained(ty: &CsilTypeExpression) -> &CsilTypeExpression {
     }
 }
 
-/// A Swift expression building a `CsilCborValue` from `expr` (a typed value).
+/// `map` only rethrows, so the call needs its own `try` when the closure throws. A
+/// `try` with nothing that throws draws a compiler warning, so it is added only then.
+fn try_mark(closure_body: &str) -> &'static str {
+    if closure_body.contains("try ") {
+        "try "
+    } else {
+        ""
+    }
+}
+
+/// A Swift expression building a `CsilCborValue` from `expr` (a typed value). The
+/// expression carries its own `try` where a part can throw, so a caller places it
+/// anywhere a value goes.
 fn swift_enc_value(
     ty: &CsilTypeExpression,
     expr: &str,
@@ -2532,28 +2843,32 @@ fn swift_enc_value(
 ) -> String {
     match unwrap_constrained(ty) {
         CsilTypeExpression::Builtin(name) => match name.as_str() {
-            "int" | "nint" => format!(".int({expr})"),
+            "int" => format!(".int({expr})"),
+            "nint" => format!("try CsilCbor.encodeNint({expr})"),
             "uint" => format!(".uint({expr})"),
-            "float" | "float64" | "double" => format!(".double({expr})"),
+            "float" | "float16" | "float32" | "float64" | "number" | "double" => {
+                format!(".double({expr})")
+            }
             "text" | "tstr" => format!(".text({expr})"),
             "bytes" | "bstr" => format!(".bytes({expr})"),
-            "bool" => format!(".bool({expr})"),
-            "date" => format!("CsilCbor.encodeDate({expr})"),
-            "timestamp" => format!(".tag(0, .text({expr}))"),
-            // Swift carries `decimal` as canonical text; the tag-4 form is a follow-up.
-            "decimal" => format!(".text({expr})"),
-            "nil" | "null" => ".null".to_string(),
-            _ => ".null".to_string(),
+            "bool" | "true" | "false" => format!(".bool({expr})"),
+            "date" => format!("try CsilCbor.encodeDate({expr})"),
+            "timestamp" => format!("try CsilCbor.encodeTimestamp({expr})"),
+            "cddl_time" => format!("try CsilCbor.encodeEpoch({expr})"),
+            "decimal" => format!("try CsilCbor.encodeDecimal({expr})"),
+            "nil" | "null" | "undefined" => ".null".to_string(),
+            // `any` is the decoded value itself.
+            _ => expr.to_string(),
         },
         CsilTypeExpression::Reference(name) if records.contains(&swift_type_name(name)) => {
-            format!("{expr}.toCborValue()")
+            format!("try {expr}.toCborValue()")
         }
         // A reference to a named choice rule — tagged union (`emit_union_codec`) or
         // closed string-literal enum (`emit_string_enum_codec`) alike, and likewise for
         // a choice hoisted out of an inline field position (`csilgen_common::hoist_inline_composites`) —
         // has its own `toCborValue()`/`init(cborValue:)`, exactly like a record's.
         CsilTypeExpression::Reference(name) if choice_codecs.contains(name) => {
-            format!("{expr}.toCborValue()")
+            format!("try {expr}.toCborValue()")
         }
         // A reference to a transparent alias (`StringInt64Map = {* text => int}`,
         // `Tags = [* text]`, `Uuid = text`) has no codec of its own; the Swift
@@ -2564,24 +2879,23 @@ fn swift_enc_value(
         }
         CsilTypeExpression::Array { element_type, .. } => {
             let inner = swift_enc_value(element_type, "$0", records, aliases, choice_codecs);
-            format!("CsilCborValue.array({expr}.map {{ {inner} }})")
+            let mark = try_mark(&inner);
+            let inner = ignore_unused_arg(inner);
+            format!("CsilCborValue.array({mark}{expr}.map {{ {inner} }})")
         }
         CsilTypeExpression::Map { key, value, .. } => {
             let k = swift_enc_value(key, "$0.key", records, aliases, choice_codecs);
             let v = swift_enc_value(value, "$0.value", records, aliases, choice_codecs);
-            format!("CsilCborValue.map({expr}.map {{ ({k}, {v}) }})")
+            let mark = try_mark(&format!("{k}{v}"));
+            let pair = ignore_unused_arg(format!("({k}, {v})"));
+            format!("CsilCborValue.map({mark}{expr}.map {{ {pair} }})")
         }
         // A tuple is a fixed-shape CBOR array, one element per position; `map_tuple`
         // collapses a single-element tuple to a bare Swift value (no field access), so
         // the encoder must match — `expr` is already that one element's own value.
         CsilTypeExpression::Tuple(group) if group.entries.len() == 1 => {
-            let inner = swift_enc_value(
-                &group.entries[0].value_type,
-                expr,
-                records,
-                aliases,
-                choice_codecs,
-            );
+            let inner =
+                swift_enc_tuple_slot(&group.entries[0], expr, records, aliases, choice_codecs);
             format!("CsilCborValue.array([{inner}])")
         }
         CsilTypeExpression::Tuple(group) => {
@@ -2591,13 +2905,7 @@ fn swift_enc_value(
                 .enumerate()
                 .map(|(index, entry)| {
                     let accessor = format!("{expr}.{}", tuple_field_label(group, index));
-                    swift_enc_value(
-                        &entry.value_type,
-                        &accessor,
-                        records,
-                        aliases,
-                        choice_codecs,
-                    )
+                    swift_enc_tuple_slot(entry, &accessor, records, aliases, choice_codecs)
                 })
                 .collect();
             format!("CsilCborValue.array([{}])", parts.join(", "))
@@ -2605,9 +2913,66 @@ fn swift_enc_value(
         CsilTypeExpression::Choice(choices) if choice_is_stringy(choices) => {
             format!(".text({expr})")
         }
+        CsilTypeExpression::Range { .. } => format!(".int({expr})"),
         CsilTypeExpression::Literal(lit) => swift_literal_cbor_expr(lit),
-        _ => ".null".to_string(),
+        // `map_type` names every other shape `AnyCsilValue`, the CBOR value itself.
+        _ => expr.to_string(),
     }
+}
+
+/// A closure body that does not read its argument must name it `_`, or Swift
+/// rejects the closure (a constant literal or `null` element encodes this way).
+fn ignore_unused_arg(body: String) -> String {
+    if body.contains("$0") {
+        body
+    } else {
+        format!("_ in {body}")
+    }
+}
+
+/// One tuple position. An optional position (`?int`) is null when absent, so the
+/// array keeps its declared length (the Go and Rust codecs do the same).
+fn swift_enc_tuple_slot(
+    entry: &CsilGroupEntry,
+    expr: &str,
+    records: &std::collections::HashSet<String>,
+    aliases: &std::collections::HashMap<String, CsilTypeExpression>,
+    choice_codecs: &std::collections::HashSet<String>,
+) -> String {
+    if !matches!(entry.occurrence, Some(CsilOccurrence::Optional)) {
+        return swift_enc_value(&entry.value_type, expr, records, aliases, choice_codecs);
+    }
+    let inner = swift_enc_value(
+        &entry.value_type,
+        "csilSome",
+        records,
+        aliases,
+        choice_codecs,
+    );
+    let mark = try_mark(&inner);
+    format!("({mark}{expr}.map {{ (csilSome) -> CsilCborValue in {inner} }} ?? CsilCborValue.null)")
+}
+
+/// Decodes one tuple position; see `swift_enc_tuple_slot` for the optional form.
+fn swift_dec_tuple_slot(
+    entry: &CsilGroupEntry,
+    expr: &str,
+    records: &std::collections::HashSet<String>,
+    aliases: &std::collections::HashMap<String, CsilTypeExpression>,
+    choice_codecs: &std::collections::HashSet<String>,
+) -> String {
+    if !matches!(entry.occurrence, Some(CsilOccurrence::Optional)) {
+        return swift_dec_value(&entry.value_type, expr, records, aliases, choice_codecs);
+    }
+    let inner = swift_dec_value(
+        &entry.value_type,
+        "csilSome",
+        records,
+        aliases,
+        choice_codecs,
+    );
+    let mark = try_mark(&inner);
+    format!("{mark}CsilCbor.orNull({expr}) {{ (csilSome) in {inner} }}")
 }
 
 /// A Swift (throwing) expression decoding a typed value from `expr` (a `CsilCborValue`).
@@ -2620,16 +2985,25 @@ fn swift_dec_value(
 ) -> String {
     match unwrap_constrained(ty) {
         CsilTypeExpression::Builtin(name) => match name.as_str() {
-            "int" | "nint" => format!("try CsilCbor.asI64({expr})"),
+            "int" => format!("try CsilCbor.asI64({expr})"),
+            "nint" => format!("try CsilCbor.asNint({expr})"),
             "uint" => format!("try CsilCbor.asU64({expr})"),
-            "float" | "float64" | "double" => format!("try CsilCbor.asDouble({expr})"),
+            "float" | "float16" | "float32" | "float64" | "number" | "double" => {
+                format!("try CsilCbor.asDouble({expr})")
+            }
             "text" | "tstr" => format!("try CsilCbor.asText({expr})"),
             "bytes" | "bstr" => format!("try CsilCbor.asBytes({expr})"),
             "bool" => format!("try CsilCbor.asBool({expr})"),
+            "true" => format!("try CsilCbor.expectLiteral({expr}, .bool(true), true)"),
+            "false" => format!("try CsilCbor.expectLiteral({expr}, .bool(false), false)"),
             "date" => format!("try CsilCbor.decodeDate({expr})"),
-            "timestamp" => format!("try CsilCbor.asTaggedText({expr}, 0)"),
-            "decimal" => format!("try CsilCbor.asText({expr})"),
-            _ => format!("try CsilCbor.asText({expr})"),
+            "timestamp" => format!("try CsilCbor.decodeTimestamp({expr})"),
+            "cddl_time" => format!("try CsilCbor.decodeEpoch({expr})"),
+            "decimal" => format!("try CsilCbor.decodeDecimal({expr})"),
+            "nil" | "null" | "undefined" => {
+                format!("try CsilCbor.expectLiteral({expr}, .null, CsilCborValue.null)")
+            }
+            _ => expr.to_string(),
         },
         CsilTypeExpression::Reference(name) if records.contains(&swift_type_name(name)) => {
             format!("try {}(cborValue: {expr})", swift_type_name(name))
@@ -2648,7 +3022,11 @@ fn swift_dec_value(
         }
         CsilTypeExpression::Array { element_type, .. } => {
             let inner = swift_dec_value(element_type, "$0", records, aliases, choice_codecs);
-            format!("try CsilCbor.asArray({expr}).map {{ {inner} }}")
+            if inner == "$0" {
+                format!("try CsilCbor.asArray({expr})")
+            } else {
+                format!("try CsilCbor.asArray({expr}).map {{ {inner} }}")
+            }
         }
         CsilTypeExpression::Map { key, value, .. } => {
             let kt = map_type(key, false);
@@ -2661,9 +3039,9 @@ fn swift_dec_value(
         // single-element tuple decodes straight to its one element (no field access),
         // matching `map_tuple`'s Swift-side collapse.
         CsilTypeExpression::Tuple(group) if group.entries.len() == 1 => {
-            let elem_access = format!("(try CsilCbor.asArray({expr})[0])");
-            swift_dec_value(
-                &group.entries[0].value_type,
+            let elem_access = format!("(try CsilCbor.item({expr}, 0, of: 1))");
+            swift_dec_tuple_slot(
+                &group.entries[0],
                 &elem_access,
                 records,
                 aliases,
@@ -2671,19 +3049,15 @@ fn swift_dec_value(
             )
         }
         CsilTypeExpression::Tuple(group) => {
+            let count = group.entries.len();
             let parts: Vec<String> = group
                 .entries
                 .iter()
                 .enumerate()
                 .map(|(index, entry)| {
-                    let elem_access = format!("(try CsilCbor.asArray({expr})[{index}])");
-                    let dec = swift_dec_value(
-                        &entry.value_type,
-                        &elem_access,
-                        records,
-                        aliases,
-                        choice_codecs,
-                    );
+                    let elem_access = format!("(try CsilCbor.item({expr}, {index}, of: {count}))");
+                    let dec =
+                        swift_dec_tuple_slot(entry, &elem_access, records, aliases, choice_codecs);
                     format!("{}: {dec}", tuple_field_label(group, index))
                 })
                 .collect();
@@ -2692,12 +3066,13 @@ fn swift_dec_value(
         CsilTypeExpression::Choice(choices) if choice_is_stringy(choices) => {
             format!("try CsilCbor.asText({expr})")
         }
+        CsilTypeExpression::Range { .. } => format!("try CsilCbor.asI64({expr})"),
         CsilTypeExpression::Literal(lit) => {
             let expected = swift_literal_cbor_expr(lit);
             let value = swift_literal_value_expr(lit);
             format!("try CsilCbor.expectLiteral({expr}, {expected}, {value})")
         }
-        _ => format!("try CsilCbor.asText({expr})"),
+        _ => expr.to_string(),
     }
 }
 
@@ -2731,7 +3106,7 @@ fn emit_struct_codec(
     let mut out = String::new();
     out.push_str(&format!("public extension {type_name} {{\n"));
     out.push_str("    /// The CBOR value tree for this record (deep, canonical key order).\n");
-    out.push_str("    func toCborValue() -> CsilCborValue {\n");
+    out.push_str("    func toCborValue() throws -> CsilCborValue {\n");
     out.push_str("        var csilEntries: [(CsilCborValue, CsilCborValue)] = []\n");
     for (member, wire, entry, ty) in &canonical {
         let wire_lit = swift_string_lit(wire);
@@ -2784,7 +3159,7 @@ fn emit_struct_codec(
     out.push_str("    }\n\n");
 
     out.push_str("    /// Encode this record to canonical CSIL CBOR bytes.\n");
-    out.push_str("    func toCbor() -> [UInt8] { CsilCbor.encode(toCborValue()) }\n\n");
+    out.push_str("    func toCbor() throws -> [UInt8] { CsilCbor.encode(try toCborValue()) }\n\n");
     out.push_str("    /// Decode a CSIL CBOR byte payload into this record.\n");
     out.push_str(&format!(
         "    static func fromCbor(_ bytes: [UInt8]) throws -> {type_name} {{ try {type_name}(cborValue: CsilCbor.decode(bytes)) }}\n"
@@ -2814,13 +3189,30 @@ fn emit_union_codec(
     out.push_str(&format!("public extension {type_name} {{\n"));
     out.push_str("    /// The CBOR value tree for this variant: a `[index, payload]` tagged sum\n");
     out.push_str("    /// (0-based declaration order is the wire contract).\n");
-    out.push_str("    func toCborValue() -> CsilCborValue {\n");
+    out.push_str("    func toCborValue() throws -> CsilCborValue {\n");
     out.push_str("        switch self {\n");
     for (index, choice) in choices.iter().enumerate() {
         let case = enum_case_name(choice, index);
+        // A literal arm's payload is its declared literal and a null arm has none, so
+        // neither binds the associated value (an unused binding is a warning).
+        if is_null_arm(choice) || choice_arm_literal(choice).is_some() {
+            let enc = swift_enc_value(choice, "", records, aliases, choice_codecs);
+            out.push_str(&format!(
+                "        case .{case}:\n            return .array([.uint({index}), {enc}])\n"
+            ));
+            continue;
+        }
         let enc = swift_enc_value(choice, "csilV", records, aliases, choice_codecs);
+        out.push_str(&format!("        case .{case}(let csilV):\n"));
+        for (lit_index, lit) in literal_arms_won_by(choice, choices) {
+            let value = swift_literal_value_expr(lit);
+            let lit_enc = swift_literal_cbor_expr(lit);
+            out.push_str(&format!(
+                "            if csilV == {value} {{ return .array([.uint({lit_index}), {lit_enc}]) }}\n"
+            ));
+        }
         out.push_str(&format!(
-            "        case .{case}(let csilV):\n            return .array([.uint({index}), {enc}])\n"
+            "            return .array([.uint({index}), {enc}])\n"
         ));
     }
     out.push_str("        }\n    }\n\n");
@@ -2834,6 +3226,12 @@ fn emit_union_codec(
     out.push_str("        switch csilIndex {\n");
     for (index, choice) in choices.iter().enumerate() {
         let case = enum_case_name(choice, index);
+        if is_null_arm(choice) {
+            out.push_str(&format!(
+                "        case {index}:\n            guard csilPayload == .null else {{ throw CsilCborError.typeMismatch }}\n            self = .{case}\n"
+            ));
+            continue;
+        }
         let dec = swift_dec_value(choice, "csilPayload", records, aliases, choice_codecs);
         out.push_str(&format!("        case {index}: self = .{case}({dec})\n"));
     }
@@ -2841,7 +3239,7 @@ fn emit_union_codec(
     out.push_str("        }\n    }\n\n");
 
     out.push_str("    /// Encode this variant to canonical CSIL CBOR bytes.\n");
-    out.push_str("    func toCbor() -> [UInt8] { CsilCbor.encode(toCborValue()) }\n\n");
+    out.push_str("    func toCbor() throws -> [UInt8] { CsilCbor.encode(try toCborValue()) }\n\n");
     out.push_str("    /// Decode a CSIL CBOR byte payload into this variant.\n");
     out.push_str(&format!(
         "    static func fromCbor(_ bytes: [UInt8]) throws -> {type_name} {{ try {type_name}(cborValue: CsilCbor.decode(bytes)) }}\n"
@@ -2861,7 +3259,7 @@ fn emit_string_enum_codec(type_name: &str) -> String {
     let mut out = String::new();
     out.push_str(&format!("public extension {type_name} {{\n"));
     out.push_str("    /// The CBOR value tree for this enum: its wire string verbatim.\n");
-    out.push_str("    func toCborValue() -> CsilCborValue { .text(self.rawValue) }\n\n");
+    out.push_str("    func toCborValue() throws -> CsilCborValue { .text(self.rawValue) }\n\n");
     out.push_str(
         "    /// Reconstruct this enum from a decoded CBOR value tree, rejecting a wire\n",
     );
@@ -2874,7 +3272,7 @@ fn emit_string_enum_codec(type_name: &str) -> String {
     out.push_str("        self = csilV\n");
     out.push_str("    }\n\n");
     out.push_str("    /// Encode this enum to canonical CSIL CBOR bytes.\n");
-    out.push_str("    func toCbor() -> [UInt8] { CsilCbor.encode(toCborValue()) }\n\n");
+    out.push_str("    func toCbor() throws -> [UInt8] { CsilCbor.encode(try toCborValue()) }\n\n");
     out.push_str("    /// Decode a CSIL CBOR byte payload into this enum.\n");
     out.push_str(&format!(
         "    static func fromCbor(_ bytes: [UInt8]) throws -> {type_name} {{ try {type_name}(cborValue: CsilCbor.decode(bytes)) }}\n"
@@ -2922,12 +3320,14 @@ fn emit_scalar_enum_codec_raw(type_name: &str, is_int: bool) -> String {
     out.push_str(&format!("public extension {type_name} {{\n"));
     out.push_str("    /// The CBOR value tree for this enum: its wire literal verbatim.\n");
     if is_int {
-        out.push_str("    func toCborValue() -> CsilCborValue {\n");
+        out.push_str("    func toCborValue() throws -> CsilCborValue {\n");
         out.push_str("        let csilV = self.rawValue\n");
         out.push_str("        return csilV >= 0 ? .uint(UInt64(csilV)) : .int(csilV)\n");
         out.push_str("    }\n\n");
     } else {
-        out.push_str("    func toCborValue() -> CsilCborValue { .double(self.rawValue) }\n\n");
+        out.push_str(
+            "    func toCborValue() throws -> CsilCborValue { .double(self.rawValue) }\n\n",
+        );
     }
     out.push_str(
         "    /// Reconstruct this enum from a decoded CBOR value tree, rejecting a scalar\n",
@@ -2944,7 +3344,7 @@ fn emit_scalar_enum_codec_raw(type_name: &str, is_int: bool) -> String {
     out.push_str("        self = csilV\n");
     out.push_str("    }\n\n");
     out.push_str("    /// Encode this enum to canonical CSIL CBOR bytes.\n");
-    out.push_str("    func toCbor() -> [UInt8] { CsilCbor.encode(toCborValue()) }\n\n");
+    out.push_str("    func toCbor() throws -> [UInt8] { CsilCbor.encode(try toCborValue()) }\n\n");
     out.push_str("    /// Decode a CSIL CBOR byte payload into this enum.\n");
     out.push_str(&format!(
         "    static func fromCbor(_ bytes: [UInt8]) throws -> {type_name} {{ try {type_name}(cborValue: CsilCbor.decode(bytes)) }}\n"
@@ -2967,7 +3367,7 @@ fn emit_scalar_enum_codec_manual(type_name: &str, lits: &[CsilLiteralValue]) -> 
     let mut out = String::new();
     out.push_str(&format!("public extension {type_name} {{\n"));
     out.push_str("    /// The CBOR value tree for this enum: its wire literal verbatim.\n");
-    out.push_str("    func toCborValue() -> CsilCborValue {\n");
+    out.push_str("    func toCborValue() throws -> CsilCborValue {\n");
     out.push_str("        switch self {\n");
     for (case_name, lit) in names.iter().zip(lits) {
         out.push_str(&format!(
@@ -2994,7 +3394,7 @@ fn emit_scalar_enum_codec_manual(type_name: &str, lits: &[CsilLiteralValue]) -> 
     out.push_str("        default: throw CsilCborError.typeMismatch\n");
     out.push_str("        }\n    }\n\n");
     out.push_str("    /// Encode this enum to canonical CSIL CBOR bytes.\n");
-    out.push_str("    func toCbor() -> [UInt8] { CsilCbor.encode(toCborValue()) }\n\n");
+    out.push_str("    func toCbor() throws -> [UInt8] { CsilCbor.encode(try toCborValue()) }\n\n");
     out.push_str("    /// Decode a CSIL CBOR byte payload into this enum.\n");
     out.push_str(&format!(
         "    static func fromCbor(_ bytes: [UInt8]) throws -> {type_name} {{ try {type_name}(cborValue: CsilCbor.decode(bytes)) }}\n"
@@ -3056,7 +3456,7 @@ fn emit_mixed_enum_codec(type_name: &str, lits: &[CsilLiteralValue]) -> String {
     let mut out = String::new();
     out.push_str(&format!("public extension {type_name} {{\n"));
     out.push_str("    /// The CBOR value tree for this enum: its wire literal verbatim.\n");
-    out.push_str("    func toCborValue() -> CsilCborValue {\n");
+    out.push_str("    func toCborValue() throws -> CsilCborValue {\n");
     out.push_str("        switch self {\n");
     for (case_name, lit) in names.iter().zip(lits) {
         out.push_str(&format!(
@@ -3082,7 +3482,7 @@ fn emit_mixed_enum_codec(type_name: &str, lits: &[CsilLiteralValue]) -> String {
     out.push_str("        default: throw CsilCborError.typeMismatch\n");
     out.push_str("        }\n    }\n\n");
     out.push_str("    /// Encode this enum to canonical CSIL CBOR bytes.\n");
-    out.push_str("    func toCbor() -> [UInt8] { CsilCbor.encode(toCborValue()) }\n\n");
+    out.push_str("    func toCbor() throws -> [UInt8] { CsilCbor.encode(try toCborValue()) }\n\n");
     out.push_str("    /// Decode a CSIL CBOR byte payload into this enum.\n");
     out.push_str(&format!(
         "    static func fromCbor(_ bytes: [UInt8]) throws -> {type_name} {{ try {type_name}(cborValue: CsilCbor.decode(bytes)) }}\n"
@@ -3201,7 +3601,7 @@ fn emit_op_codec_pair(
     let dec = swift_dec_value(ty, "csilRoot", records, aliases, choice_codecs);
     format!(
         "/// Encode the {helper} payload to canonical CSIL CBOR bytes.\n\
-         public func encode{helper}(_ value: {swift_type}) -> [UInt8] {{\n\
+         public func encode{helper}(_ value: {swift_type}) throws -> [UInt8] {{\n\
          {indent}CsilCbor.encode({enc})\n}}\n\n\
          /// Decode canonical CSIL CBOR bytes into the {helper} payload.\n\
          public func decode{helper}(_ bytes: [UInt8]) throws -> {swift_type} {{\n\
@@ -3219,13 +3619,9 @@ fn generate_codec(input: &WasmGeneratorInput) -> Option<String> {
     let string_enums = swift_string_enum_choices(input);
     let scalar_enums = swift_scalar_enum_choices(input);
     let mixed_enums = swift_mixed_enum_choices(input);
-    if records.is_empty()
-        && unions.is_empty()
-        && string_enums.is_empty()
-        && scalar_enums.is_empty()
-        && mixed_enums.is_empty()
-        && input.csil_spec.rpc_operations().next().is_none()
-    {
+    // `Types.swift` names `AnyCsilValue`, which the runtime declares, so any spec with
+    // a type or a service gets the codec.
+    if input.csil_spec.rules.is_empty() {
         return None;
     }
     let aliases = swift_codec_aliases(input);
@@ -3273,7 +3669,7 @@ fn generate_codec(input: &WasmGeneratorInput) -> Option<String> {
         } else if string_enums.contains_key(&rule.name) {
             let ty = swift_type_name(&rule.name);
             if csilgen_common::rule_enum_numbers(rule).is_some() {
-                body.push_str(&format!("public extension {ty} {{\n    func toCborValue() -> CsilCborValue {{ wireNumber >= 0 ? .uint(UInt64(wireNumber)) : .int(wireNumber) }}\n\n    init(cborValue: CsilCborValue) throws {{\n        guard let value = Self(wireNumber: try CsilCbor.asI64(cborValue)) else {{ throw CsilCborError.typeMismatch }}\n        self = value\n    }}\n\n    func toCbor() -> [UInt8] {{ CsilCbor.encode(toCborValue()) }}\n\n    static func fromCbor(_ bytes: [UInt8]) throws -> {ty} {{ try {ty}(cborValue: CsilCbor.decode(bytes)) }}\n}}\n\n"));
+                body.push_str(&format!("public extension {ty} {{\n    func toCborValue() throws -> CsilCborValue {{ wireNumber >= 0 ? .uint(UInt64(wireNumber)) : .int(wireNumber) }}\n\n    init(cborValue: CsilCborValue) throws {{\n        guard let value = Self(wireNumber: try CsilCbor.asI64(cborValue)) else {{ throw CsilCborError.typeMismatch }}\n        self = value\n    }}\n\n    func toCbor() throws -> [UInt8] {{ CsilCbor.encode(try toCborValue()) }}\n\n    static func fromCbor(_ bytes: [UInt8]) throws -> {ty} {{ try {ty}(cborValue: CsilCbor.decode(bytes)) }}\n}}\n\n"));
             } else {
                 body.push_str(&emit_string_enum_codec(&ty));
             }
@@ -3296,7 +3692,7 @@ fn generate_codec(input: &WasmGeneratorInput) -> Option<String> {
             let stem = op_codec_stem(service, op);
             let success = map_type(&arms[0], false);
             let mut encode = format!(
-                "public func encode{stem}Reply(_ handler: () throws -> {success}) throws -> (variant: String, payload: [UInt8]) {{\n    do {{\n        let value = try handler()\n"
+                "/// Runs the handler and encodes the reply arm it chose. A thrown error, from the\n/// handler or from a reply value that cannot be encoded, means there is no typed\n/// reply: answer with transport status 6 (internal).\npublic func encode{stem}Reply(_ handler: () throws -> {success}) throws -> (variant: String, payload: [UInt8]) {{\n    do {{\n        let value = try handler()\n"
             );
             resolve.push_str(&format!("    if service == \"{service}\" && op == \"{method}\" {{\n        switch variant {{\n"));
             for (i, arm) in arms.iter().enumerate() {
@@ -3319,7 +3715,7 @@ fn generate_codec(input: &WasmGeneratorInput) -> Option<String> {
                         &choice_codecs,
                     );
                     if emitted.insert(exception.clone()) {
-                        body.push_str(&format!("public struct {exception}: Error {{\n    public let value: {ty}\n    public init(value: {ty}) {{ self.value = value }}\n}}\n\n"));
+                        body.push_str(&format!("public struct {exception}: Swift.Error {{\n    public let value: {ty}\n    public init(value: {ty}) {{ self.value = value }}\n}}\n\n"));
                     }
                     encode.push_str(&format!("    }} catch let refusal as {exception} {{\n        return (\"{wire}\", CsilCbor.encode({enc}))\n"));
                     resolve.push_str(&format!(
@@ -3353,7 +3749,10 @@ fn is_record_ref(ty: &CsilTypeExpression, records: &std::collections::HashSet<St
 /// is `async throws` for the async shape (it owns the network round-trip); the blocking
 /// shape keeps the plain `throws`. The protocol name is marked (`AsyncCsilTransport`)
 /// only for the twin so it coexists with the blocking `CsilTransport` in one module.
-fn transport_protocol_swift(shape: ClientShape) -> String {
+///
+/// `has_reply` adds `callReply` only when an operation has more than one reply arm:
+/// `call` returns bytes alone, which cannot carry the variant that selects the arm.
+fn transport_protocol_swift(shape: ClientShape, has_reply: bool) -> String {
     let name = shape.transport_name();
     let effects = shape.effects();
     // The carrier note tracks the seam's concurrency model so a reader of the generated
@@ -3363,24 +3762,37 @@ fn transport_protocol_swift(shape: ClientShape) -> String {
     } else {
         "Synchronous and blocking — the host owns the I/O loop."
     };
+    let reply = if has_reply {
+        format!(
+            "    /// Performs a call for an operation with more than one reply arm and returns\n    /// the reply variant (nil when absent) with the payload bytes.\n    func callReply(service: String, op: String, request: [UInt8]) {effects} -> (variant: String?, payload: [UInt8])\n"
+        )
+    } else {
+        String::new()
+    };
     format!(
-        "/// The caller-supplied byte carrier: it performs the call named by (service, op)\n/// with the already-encoded request bytes and returns the response bytes, or\n/// throws. {carrier_note} The generated\n/// client owns (de)serialization; the carrier only moves bytes.\npublic protocol {name} {{\n    func call(service: String, op: String, request: [UInt8]) {effects} -> [UInt8]\n}}\n"
+        "/// The caller-supplied byte carrier: it performs the call named by (service, op)\n/// with the already-encoded request bytes and returns the response bytes, or\n/// throws. {carrier_note} The generated\n/// client owns (de)serialization; the carrier only moves bytes.\npublic protocol {name} {{\n    func call(service: String, op: String, request: [UInt8]) {effects} -> [UInt8]\n{reply}}}\n"
     )
 }
 
 /// Client scaffolding emitted once at the top of the client file: the shared error type
 /// (primary file only) and the caller-supplied transport seam for this shape.
-fn client_prelude_swift(shape: ClientShape) -> String {
+fn client_prelude_swift(shape: ClientShape, has_reply: bool) -> String {
     let mut out = String::new();
     if shape.marker.is_empty() {
         out.push_str(CLIENT_ERROR_SWIFT);
         out.push('\n');
     }
-    out.push_str(&transport_protocol_swift(shape));
+    out.push_str(&transport_protocol_swift(shape, has_reply));
     out
 }
 
-fn generate_client(input: &WasmGeneratorInput, shape: ClientShape) -> Option<String> {
+/// `with_wire_ids` is false when `Services.swift` ships in the same module, because
+/// that file already declares the wire-id enums and Swift refuses a redeclaration.
+fn generate_client(
+    input: &WasmGeneratorInput,
+    shape: ClientShape,
+    with_wire_ids: bool,
+) -> Option<String> {
     let records = swift_record_names(input);
     let aliases = swift_codec_aliases(input);
     let unions = swift_union_choices(input);
@@ -3408,7 +3820,7 @@ fn generate_client(input: &WasmGeneratorInput, shape: ClientShape) -> Option<Str
             ));
             // Wire-id ordinals are a module-level `enum` shared across both client shapes;
             // only the primary file emits them so the twin never redeclares the enum.
-            if shape.marker.is_empty() {
+            if shape.marker.is_empty() && with_wire_ids {
                 body.push_str(&emit_wire_ids(&rule.name, service));
             }
             any = true;
@@ -3418,7 +3830,10 @@ fn generate_client(input: &WasmGeneratorInput, shape: ClientShape) -> Option<Str
         return None;
     }
     let mut content = header("Generated CSIL service clients.");
-    content.push_str(&client_prelude_swift(shape));
+    content.push_str(&client_prelude_swift(
+        shape,
+        input.csil_spec.rpc_operations().next().is_some(),
+    ));
     content.push('\n');
     content.push_str(&body);
     Some(content)
@@ -3483,15 +3898,29 @@ fn emit_client_struct(
         } else {
             format!("decode{stem}Response(csilResp)")
         };
+        let route = format!(
+            "service: {}, op: {}",
+            swift_string_lit(wire_service),
+            swift_string_lit(wire_op)
+        );
+        // A multi-arm reply needs its variant to pick the arm, so it goes through
+        // `callReply` and the generated resolver instead of `call`.
+        let transport_call = |req_bytes: &str| {
+            if op.rpc_reply_arms().is_some() {
+                format!(
+                    "        let csilReply = try {await_kw}transport.callReply({route}, request: {req_bytes})\n        let csilResp = try resolveRpcReply({route}, variant: csilReply.variant, payload: csilReply.payload)\n"
+                )
+            } else {
+                format!(
+                    "        let csilResp = try {await_kw}transport.call({route}, request: {req_bytes})\n"
+                )
+            }
+        };
         if null_input {
             out.push_str(&format!(
                 "    public func {method}() {effects} -> {output} {{\n"
             ));
-            out.push_str(&format!(
-                "        let csilResp = try {await_kw}transport.call(service: {}, op: {}, request: [])\n",
-                swift_string_lit(wire_service),
-                swift_string_lit(wire_op),
-            ));
+            out.push_str(&transport_call("[]"));
         } else {
             let input = map_type(&op.input_type, false);
             // A record request reuses its `toCbor`; any other shape uses the op's per-op encoder.
@@ -3503,11 +3932,9 @@ fn emit_client_struct(
             out.push_str(&format!(
                 "    public func {method}(_ request: {input}) {effects} -> {output} {{\n"
             ));
-            out.push_str(&format!(
-                "        let csilResp = try {await_kw}transport.call(service: {}, op: {}, request: {req_bytes})\n",
-                swift_string_lit(wire_service),
-                swift_string_lit(wire_op),
-            ));
+            // A bad request value throws here, so the transport never sees the call.
+            out.push_str(&format!("        let csilRequest = try {req_bytes}\n"));
+            out.push_str(&transport_call("csilRequest"));
         }
         out.push_str(&format!("        return try {decode_resp}\n"));
         out.push_str("    }\n\n");
@@ -3755,20 +4182,33 @@ fn header(summary: &str) -> String {
 
 const VALIDATION_ERROR_SWIFT: &str = "\
 /// Thrown by a generated type's validate() when a field constraint is violated.
-public struct CsilValidationError: Error, Equatable {
+public struct CsilValidationError: Swift.Error, Equatable {
     public let message: String
     public init(_ message: String) { self.message = message }
 }
 ";
 
-/// Defined independently of validation: a type can reference `AnyCsilValue` (the `any`
-/// core type or a non-stringy inline choice) without carrying any runtime constraint, so
-/// coupling this to the validation prelude would leave it undefined and fail to compile.
-const ANY_VALUE_SWIFT: &str = "\
-/// An opaque CSIL value used where a generated type cannot be named precisely
-/// (a non-stringy inline choice or the `any` core type). The transport carries opaque
-/// payload bytes, so a consumer can refine this as needed.
-public typealias AnyCsilValue = [UInt8]
+/// A Swift tuple cannot conform to `Equatable`, so a record or union that holds one
+/// spells out its `==` with these helpers instead of the synthesized conformance.
+const TUPLE_EQ_SWIFT: &str = "\
+/// Equality for shapes that hold a Swift tuple, which cannot conform to Equatable.
+public enum CsilEq {
+    public static func optional<T>(_ a: T?, _ b: T?, _ eq: (T, T) -> Bool) -> Bool {
+        switch (a, b) {
+        case (nil, nil): return true
+        case let (x?, y?): return eq(x, y)
+        default: return false
+        }
+    }
+
+    public static func array<T>(_ a: [T], _ b: [T], _ eq: (T, T) -> Bool) -> Bool {
+        a.count == b.count && zip(a, b).allSatisfy { eq($0, $1) }
+    }
+
+    public static func map<K, V>(_ a: [K: V], _ b: [K: V], _ eq: (V, V) -> Bool) -> Bool {
+        a.count == b.count && a.allSatisfy { entry in b[entry.key].map { eq(entry.value, $0) } ?? false }
+    }
+}
 ";
 
 /// The `CsilClientError` type, shared by the blocking client and its `async` twin. Only
@@ -3777,7 +4217,7 @@ public typealias AnyCsilValue = [UInt8]
 const CLIENT_ERROR_SWIFT: &str = "\
 /// A structured error from a generated client call: a service-returned error
 /// (code/message), or a transport-level failure.
-public struct CsilClientError: Error, Equatable {
+public struct CsilClientError: Swift.Error, Equatable {
     public let code: Int64
     public let message: String
     public init(code: Int64, message: String) {
@@ -3790,7 +4230,7 @@ public struct CsilClientError: Error, Equatable {
 const SERVER_PRELUDE_SWIFT: &str = "\
 /// Transport-level failures a router can raise (distinct from application errors,
 /// which ride inside the payload as a declared `/ ErrorType` arm).
-public enum CsilTransportError: Error, Equatable {
+public enum CsilTransportError: Swift.Error, Equatable {
     case unknownOperation(String)
     case unknownOrdinal(UInt64)
 }
@@ -3811,7 +4251,7 @@ public protocol CsilCodec {
 /// byte string — major type 2 — by construction rather than relying on a Codable
 /// encoder's behavior).
 const CODEC_RUNTIME_SWIFT: &str = r#"/// A minimal canonical-CBOR (RFC 8949 subset) value model and codec.
-public indirect enum CsilCborValue {
+public indirect enum CsilCborValue: Hashable, Sendable {
     case uint(UInt64)
     case int(Int64)
     case bool(Bool)
@@ -3822,9 +4262,23 @@ public indirect enum CsilCborValue {
     case array([CsilCborValue])
     case map([(CsilCborValue, CsilCborValue)])
     case tag(UInt64, CsilCborValue)
+
+    /// Two values are equal when their canonical encodings are equal, so map entry
+    /// order does not matter and the `any` core type compares the way it travels.
+    public static func == (lhs: CsilCborValue, rhs: CsilCborValue) -> Bool {
+        CsilCbor.encode(lhs) == CsilCbor.encode(rhs)
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(CsilCbor.encode(self))
+    }
 }
 
-public enum CsilCborError: Error {
+/// The `any` core type and an inline shape with no Swift name: the decoded CBOR value
+/// itself, so it survives a round trip unchanged.
+public typealias AnyCsilValue = CsilCborValue
+
+public enum CsilCborError: Swift.Error {
     case malformed
     case trailingBytes
     case missingField(String)
@@ -3884,7 +4338,12 @@ public enum CsilCbor {
             for x in xs { enc(x, &out) }
         case .map(let kvs):
             head(5, UInt64(kvs.count), &out)
-            for (k, val) in kvs { enc(k, &out); enc(val, &out) }
+            // Sorting by encoded key (RFC 8949 section 4.2.1) here, not only at
+            // generation time, keeps a dictionary-backed map canonical whatever its
+            // iteration order.
+            let sorted = kvs.map { (encode($0.0), $0.1) }
+                .sorted { $0.0.lexicographicallyPrecedes($1.0) }
+            for (k, val) in sorted { out.append(contentsOf: k); enc(val, &out) }
         case .tag(let t, let inner):
             head(6, t, &out)
             enc(inner, &out)
@@ -3937,6 +4396,20 @@ public enum CsilCbor {
             case 20: pos += 1; return .bool(false)
             case 21: pos += 1; return .bool(true)
             case 22, 23: pos += 1; return .null
+            case 25:
+                // Built by hand because `Float16` is missing on macOS x86_64.
+                let half = try readArg(b, &pos, low)
+                let sign: FloatingPointSign = half & 0x8000 != 0 ? .minus : .plus
+                let exponent = Int((half >> 10) & 0x1f)
+                let mantissa = Double(half & 0x3ff)
+                if exponent == 31 {
+                    let special = mantissa == 0 ? Double.infinity : Double.nan
+                    return .double(sign == .minus ? -special : special)
+                }
+                if exponent == 0 {
+                    return .double(Double(sign: sign, exponent: -24, significand: mantissa))
+                }
+                return .double(Double(sign: sign, exponent: exponent - 25, significand: mantissa + 1024))
             case 26:
                 let bits = try readArg(b, &pos, low)
                 return .double(Double(Float(bitPattern: UInt32(truncatingIfNeeded: bits))))
@@ -4038,6 +4511,17 @@ public enum CsilCbor {
         }
     }
 
+    /// A `nint` is negative by definition; a non-negative value is a type error.
+    public static func asNint(_ v: CsilCborValue) throws -> Int64 {
+        if case .int(let n) = v, n < 0 { return n }
+        throw CsilCborError.typeMismatch
+    }
+
+    public static func encodeNint(_ n: Int64) throws -> CsilCborValue {
+        guard n < 0 else { throw CsilCborError.typeMismatch }
+        return .int(n)
+    }
+
     public static func asU64(_ v: CsilCborValue) throws -> UInt64 {
         switch v {
         case .uint(let n): return n
@@ -4095,8 +4579,8 @@ public enum CsilCbor {
         return (1...12).contains(month) && (1...days[month - 1]).contains(day)
     }
 
-    public static func encodeDate(_ text: String) -> CsilCborValue {
-        precondition(validDate(text), "expected YYYY-MM-DD")
+    public static func encodeDate(_ text: String) throws -> CsilCborValue {
+        guard validDate(text) else { throw CsilCborError.typeMismatch }
         return .tag(1004, .text(text))
     }
 
@@ -4104,6 +4588,243 @@ public enum CsilCbor {
         let text = try asTaggedText(value, 1004)
         guard validDate(text) else { throw CsilCborError.typeMismatch }
         return text
+    }
+
+    static func daysFromCivil(_ year: Int, _ month: Int, _ day: Int) -> Int {
+        let y = month <= 2 ? year - 1 : year
+        let era = (y >= 0 ? y : y - 399) / 400
+        let yoe = y - era * 400
+        let doy = (153 * ((month + 9) % 12) + 2) / 5 + day - 1
+        return era * 146097 + yoe * 365 + yoe / 4 - yoe / 100 + doy - 719468
+    }
+
+    static func civilFromDays(_ days: Int) -> (Int, Int, Int) {
+        let z = days + 719468
+        let era = (z >= 0 ? z : z - 146096) / 146097
+        let doe = z - era * 146097
+        let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100)
+        let mp = (5 * doy + 2) / 153
+        let month = mp < 10 ? mp + 3 : mp - 9
+        return (yoe + era * 400 + (month <= 2 ? 1 : 0), month, doy - (153 * mp + 2) / 5 + 1)
+    }
+
+    static func pad(_ n: Int, _ width: Int) -> String {
+        let t = String(n)
+        return String(repeating: "0", count: max(0, width - t.count)) + t
+    }
+
+    // ISO8601DateFormatter accepts shapes the wire contract refuses, so the text
+    // is checked by hand and rewritten as the one canonical UTC spelling.
+    static func canonicalTimestamp(_ text: String) -> String? {
+        guard let instant = parseTimestamp(text) else { return nil }
+        return formatTimestamp(instant.seconds, instant.nanos)
+    }
+
+    /// `0001-01-01T00:00:00Z` and `9999-12-31T23:59:59Z` as epoch seconds.
+    static let epochFirst = -62135596800
+    static let epochLast = 253402300799
+
+    /// Reads the strict RFC 3339 form into UTC epoch seconds and nanoseconds. The
+    /// year must be 0001 to 9999 after conversion to UTC.
+    static func parseTimestamp(_ text: String) -> (seconds: Int, nanos: Int)? {
+        let s = Array(text.utf8)
+        func digits(_ r: Range<Int>) -> Bool {
+            r.upperBound <= s.count && s[r].allSatisfy { (48...57).contains($0) }
+        }
+        func number(_ r: Range<Int>) -> Int {
+            s[r].reduce(0) { $0 * 10 + Int($1 - 48) }
+        }
+        guard s.count >= 20, digits(0..<4), s[4] == 45, digits(5..<7), s[7] == 45, digits(8..<10),
+              s[10] == 84 || s[10] == 116, digits(11..<13), s[13] == 58, digits(14..<16),
+              s[16] == 58, digits(17..<19)
+        else { return nil }
+        let year = number(0..<4), month = number(5..<7), day = number(8..<10)
+        let hour = number(11..<13), minute = number(14..<16), second = number(17..<19)
+        let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0)
+        let monthDays = [31, leap ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+        guard year >= 1, (1...12).contains(month), (1...monthDays[month - 1]).contains(day),
+              hour <= 23, minute <= 59, second <= 59
+        else { return nil }
+        var i = 19
+        var nanos = 0
+        if s[i] == 46 {
+            i += 1
+            let start = i
+            while i < s.count, (48...57).contains(s[i]) { i += 1 }
+            guard (1...9).contains(i - start) else { return nil }
+            nanos = number(start..<i)
+            for _ in (i - start)..<9 { nanos *= 10 }
+        }
+        var offset = 0
+        if i == s.count - 1, s[i] == 90 || s[i] == 122 {
+            offset = 0
+        } else if i == s.count - 6, s[i] == 43 || s[i] == 45, digits((i + 1)..<(i + 3)),
+                  s[i + 3] == 58, digits((i + 4)..<(i + 6)) {
+            let oh = number((i + 1)..<(i + 3)), om = number((i + 4)..<(i + 6))
+            guard oh <= 23, om <= 59 else { return nil }
+            offset = (oh * 60 + om) * 60 * (s[i] == 43 ? 1 : -1)
+        } else {
+            return nil
+        }
+        let total = daysFromCivil(year, month, day) * 86400 + hour * 3600 + minute * 60 + second - offset
+        guard (epochFirst...epochLast).contains(total) else { return nil }
+        return (total, nanos)
+    }
+
+    /// The canonical UTC text for an instant already known to lie in years 0001
+    /// to 9999, so that both wire forms produce the same text.
+    static func formatTimestamp(_ total: Int, _ nanos: Int) -> String {
+        var (dayCount, secs) = total.quotientAndRemainder(dividingBy: 86400)
+        if secs < 0 {
+            dayCount -= 1
+            secs += 86400
+        }
+        let (uy, um, ud) = civilFromDays(dayCount)
+        let fraction: String
+        if nanos == 0 {
+            fraction = ""
+        } else if nanos % 1_000_000 == 0 {
+            fraction = "." + pad(nanos / 1_000_000, 3)
+        } else if nanos % 1000 == 0 {
+            fraction = "." + pad(nanos / 1000, 6)
+        } else {
+            fraction = "." + pad(nanos, 9)
+        }
+        return pad(uy, 4) + "-" + pad(um, 2) + "-" + pad(ud, 2) + "T" + pad(secs / 3600, 2) + ":"
+            + pad(secs / 60 % 60, 2) + ":" + pad(secs % 60, 2) + fraction + "Z"
+    }
+
+    public static func encodeTimestamp(_ text: String) throws -> CsilCborValue {
+        guard let canonical = canonicalTimestamp(text) else { throw CsilCborError.typeMismatch }
+        return .tag(0, .text(canonical))
+    }
+
+    public static func decodeTimestamp(_ value: CsilCborValue) throws -> String {
+        let text = try asTaggedText(value, 0)
+        guard let canonical = canonicalTimestamp(text) else {
+            throw CsilCborError.typeMismatch
+        }
+        return canonical
+    }
+
+    public static func encodeEpoch(_ text: String) throws -> CsilCborValue {
+        guard let instant = parseTimestamp(text) else { throw CsilCborError.typeMismatch }
+        if instant.nanos == 0 { return .tag(1, .int(Int64(instant.seconds))) }
+        return .tag(1, .double(Double(instant.seconds) + Double(instant.nanos) / 1e9))
+    }
+
+    /// `cddl_time` arrives as epoch seconds and leaves as the same canonical text
+    /// as a `timestamp`, so both wire forms compare equal for one instant.
+    public static func decodeEpoch(_ value: CsilCborValue) throws -> String {
+        guard case .tag(1, let inner) = value else { throw CsilCborError.typeMismatch }
+        var seconds: Int
+        var units = 0
+        switch inner {
+        case .uint(let n):
+            guard n <= UInt64(epochLast) else { throw CsilCborError.typeMismatch }
+            seconds = Int(n)
+        case .int(let n):
+            seconds = Int(n)
+        case .double(let value):
+            // The range test also refuses NaN and infinity, and it comes before the
+            // conversion to an integer, which traps out of range.
+            guard value >= Double(epochFirst - 1), value <= Double(epochLast + 1) else {
+                throw CsilCborError.typeMismatch
+            }
+            // Floor by hand: `rounded(.down)` needs libm, which a package without
+            // Foundation does not link on Linux. The shifted value below is
+            // positive, so truncation there is already a floor.
+            seconds = Int(value)
+            if Double(seconds) > value { seconds -= 1 }
+            // Two operations, not a fused multiply-add, which can round differently.
+            let scaled = (value - Double(seconds)) * 1e9
+            units = Int(scaled + 0.5)
+            if units == 1_000_000_000 {
+                seconds += 1
+                units = 0
+            }
+        default:
+            throw CsilCborError.typeMismatch
+        }
+        guard (epochFirst...epochLast).contains(seconds) else { throw CsilCborError.typeMismatch }
+        return formatTimestamp(seconds, units)
+    }
+
+    /// One position of a tuple, which a short array from a peer must not trap on.
+    public static func item(_ v: CsilCborValue, _ index: Int) throws -> CsilCborValue {
+        let xs = try asArray(v)
+        guard xs.indices.contains(index) else { throw CsilCborError.malformed }
+        return xs[index]
+    }
+
+    /// One position of a tuple that must have exactly `count` positions: an absent
+    /// optional position travels as null, so the length never varies.
+    public static func item(_ v: CsilCborValue, _ index: Int, of count: Int) throws -> CsilCborValue {
+        guard try asArray(v).count == count else { throw CsilCborError.malformed }
+        return try item(v, index)
+    }
+
+    /// Decodes an optional tuple position, where null means absent.
+    public static func orNull<T>(_ v: CsilCborValue, _ decode: (CsilCborValue) throws -> T) rethrows -> T? {
+        if case .null = v { return nil }
+        return try decode(v)
+    }
+
+    /// The tag 4 decimal fraction `[exponent, mantissa]` for exact decimal text
+    /// (an optional sign, digits, and an optional fraction). The mantissa must fit
+    /// in 64 bits, as in the other text-backed targets.
+    public static func encodeDecimal(_ text: String) throws -> CsilCborValue {
+        var s = Array(text.utf8)[...]
+        var negative = false
+        if let first = s.first, first == 43 || first == 45 {
+            negative = first == 45
+            s = s.dropFirst()
+        }
+        var magnitude: UInt64 = 0
+        var whole = 0
+        var scale = 0
+        var seenPoint = false
+        for c in s {
+            if c == 46, !seenPoint {
+                seenPoint = true
+                continue
+            }
+            guard (48...57).contains(c) else { throw CsilCborError.typeMismatch }
+            let (times, overflowA) = magnitude.multipliedReportingOverflow(by: 10)
+            let (sum, overflowB) = times.addingReportingOverflow(UInt64(c - 48))
+            guard !overflowA, !overflowB else { throw CsilCborError.typeMismatch }
+            magnitude = sum
+            if seenPoint { scale += 1 } else { whole += 1 }
+        }
+        guard whole > 0, !seenPoint || scale > 0 else { throw CsilCborError.typeMismatch }
+        let limit = negative ? UInt64(Int64.max) + 1 : UInt64(Int64.max)
+        guard magnitude <= limit else { throw CsilCborError.typeMismatch }
+        let mantissa = negative ? Int64(truncatingIfNeeded: 0 &- magnitude) : Int64(magnitude)
+        return .tag(4, .array([.int(-Int64(scale)), .int(mantissa)]))
+    }
+
+    /// Exact decimal text for a tag 4 decimal fraction. The exponent is bounded
+    /// because each unit of it becomes one character of text.
+    public static func decodeDecimal(_ value: CsilCborValue) throws -> String {
+        guard case .tag(4, .array(let parts)) = value, parts.count == 2 else {
+            throw CsilCborError.typeMismatch
+        }
+        let exponent = try asI64(parts[0])
+        let mantissa = try asI64(parts[1])
+        guard (-1024...1024).contains(exponent) else { throw CsilCborError.typeMismatch }
+        var digits = String(mantissa.magnitude)
+        if exponent > 0, mantissa != 0 {
+            digits += String(repeating: "0", count: Int(exponent))
+        } else if exponent < 0 {
+            let scale = Int(-exponent)
+            if digits.count <= scale {
+                digits = String(repeating: "0", count: scale - digits.count + 1) + digits
+            }
+            let split = digits.index(digits.endIndex, offsetBy: -scale)
+            digits = digits[..<split] + "." + digits[split...]
+        }
+        return mantissa < 0 ? "-" + digits : digits
     }
 
     public static func asTaggedText(_ v: CsilCborValue, _ num: UInt64) throws -> String {

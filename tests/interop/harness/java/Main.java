@@ -56,6 +56,7 @@ import csilgen.generated.ServiceError;
 import csilgen.generated.ShipMode;
 import csilgen.generated.Tick;
 import csilgen.generated.Transport;
+import csilgen.generated.WireReply;
 
 public final class Main {
     private static final String SERVICE = "Interop";
@@ -79,7 +80,8 @@ public final class Main {
         return new Scalars(
             -42L, 42L, -7L, 3.5, "héllo 世界",
             new byte[] {0x01, 0x02, (byte) 0xf0, (byte) 0xff},
-            true, java.time.LocalDate.of(2000, 2, 29), ts(), new BigDecimal("123.45"),
+            true, java.time.LocalDate.of(2000, 2, 29), ts(),
+            java.time.Instant.parse("2026-06-29T12:34:56.500Z"), new BigDecimal("123.45"),
             new MixedStatus("pending"), new MixedStatus("unlisted"),
             // inline mixed choice (hoisted; literal arm match).
             new ScalarsNote("info"),
@@ -284,14 +286,6 @@ public final class Main {
         }
     }
 
-    // A typed application error surfaced from a status-0 reply whose variant is the
-    // declared `ServiceError` arm (the carrier owns this mapping, per the conventions).
-    private static final class ServiceErrorException extends ClientException {
-        ServiceErrorException(long code, String message) {
-            super("service error code=" + code + " message=" + message);
-        }
-    }
-
     // -----------------------------------------------------------------------
     // RPC
     // -----------------------------------------------------------------------
@@ -305,15 +299,20 @@ public final class Main {
 
         @Override
         public byte[] call(String service, String op, byte[] req) throws ClientException {
+            return exchange(service, op, req).payload();
+        }
+
+        // The generated client selects the reply arm from the variant, so the carrier
+        // only hands it on.
+        @Override
+        public WireReply callReply(String service, String op, byte[] req) throws ClientException {
+            Rpc.Response resp = exchange(service, op, req);
+            return new WireReply(resp.variant(), resp.payload());
+        }
+
+        private Rpc.Response exchange(String service, String op, byte[] req) throws ClientException {
             try {
-                Rpc.Response resp = client.call(service, op, req, null);
-                // A status-0 reply whose variant is the `ServiceError` arm is a typed
-                // application error; surface it on the error path.
-                if ("ServiceError".equals(resp.variant())) {
-                    ServiceError se = CsilCbor.decodeServiceError(resp.payload());
-                    throw new ServiceErrorException(se.code(), se.message());
-                }
-                return resp.payload();
+                return client.call(service, op, req, null);
             } catch (StatusException e) {
                 throw new ClientException("transport status " + e.getMessage(), e);
             } catch (IOException e) {
@@ -423,9 +422,10 @@ public final class Main {
         }
         // The invalid input must surface as a service error, not a transport error.
         try {
-            transport.call(SERVICE, "validate-constrained", constrainedBadBytes());
+            WireReply reply = transport.callReply(SERVICE, "validate-constrained", constrainedBadBytes());
+            CsilCbor.resolveRpcReply(SERVICE, "validate-constrained", reply.variant(), reply.payload());
             cases.fail("validate-constrained/failure", "server accepted invalid input");
-        } catch (ServiceErrorException e) {
+        } catch (CsilCbor.ServiceErrorRefusal e) {
             cases.pass("validate-constrained/failure");
         } catch (RuntimeException e) {
             cases.fail("validate-constrained/failure", "expected service error, got " + e);

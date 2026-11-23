@@ -24,6 +24,7 @@ pub(crate) const BUILTIN_TYPES: &[&str] = &[
     "any",
     "date",
     "timestamp",
+    "cddl_time",
     "decimal",
 ];
 
@@ -959,7 +960,7 @@ mod tests {
 
     #[test]
     fn test_all_builtin_types() {
-        let input = "int uint nint text tstr bytes bstr bool true false null undefined float float16 float32 float64 any date timestamp decimal";
+        let input = "int uint nint text tstr bytes bstr bool true false null undefined float float16 float32 float64 any date timestamp cddl_time decimal";
         let mut lexer = Lexer::new(input);
         let tokens = lexer.tokenize().unwrap();
 
@@ -968,7 +969,7 @@ mod tests {
             .filter(|t| matches!(t.token_type, TokenType::Builtin(_)))
             .collect();
 
-        assert_eq!(builtins.len(), 20);
+        assert_eq!(builtins.len(), 21);
     }
 
     #[test]

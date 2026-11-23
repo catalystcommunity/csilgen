@@ -382,8 +382,9 @@ fn map_type(
             "bytes" | "bstr" => "Uint8List".to_string(),
             "bool" => "bool".to_string(),
             "date" => "String".to_string(),
-            // CBOR tag 0, RFC3339, UTC; Dart's DateTime carries it (kept UTC).
-            "timestamp" => "DateTime".to_string(),
+            // CBOR tag 0, RFC3339, UTC; Dart's DateTime carries it (kept UTC). A
+            // `cddl_time` is the same instant; only its wire form (tag 1) differs.
+            "timestamp" | "cddl_time" => "DateTime".to_string(),
             "decimal" => decimal.to_string(),
             // `any`/`null`/`nil` carry no single static type — `Object?` is Dart's
             // top type and is already nullable, so the occurrence guard below won't
@@ -1221,7 +1222,7 @@ fn dart_sample(
             "bool" => "false".to_string(),
             "bytes" | "bstr" => "Uint8List(0)".to_string(),
             "date" => "'1970-01-01'".to_string(),
-            "timestamp" => "DateTime.now()".to_string(),
+            "timestamp" | "cddl_time" => "DateTime.now()".to_string(),
             "int" | "uint" => "0".to_string(),
             "float" => "0".to_string(),
             "decimal" => match decimal {
@@ -1385,12 +1386,14 @@ fn dart_rpc_section(
     out.push_str(&format!(
         "import 'package:{package_name}/{package_name}.dart';\n\n"
     ));
+    // The seam declares `callReply` only for a spec with a multi-arm operation;
+    // the generated client then passes the reply variant to its own resolver.
     out.push_str(&DART_RPC_CARRIER.replace("__SEAM__", seam).replace(
-        "__RESOLVE__",
+        "__CALL_REPLY__",
         if ex.has_refusals {
-            "return resolveRpcReply(service, op, resp.variant, resp.payload);"
+            "\n  @override\n  Future<(String?, Uint8List)> callReply(String service, String op, List<int> request) async {\n    final resp = await _roundTrip(service, op, request);\n    return (resp.variant, resp.payload);\n  }\n"
         } else {
-            "return resp.payload;"
+            ""
         },
     ));
     out.push('\n');
@@ -1622,15 +1625,17 @@ class HttpRpcCarrier implements __SEAM__ {
   final CsilRpcSender _send;
 
   @override
-  Future<Uint8List> call(String service, String op, List<int> request) async {
+  Future<Uint8List> call(String service, String op, List<int> request) async =>
+      (await _roundTrip(service, op, request)).payload;
+__CALL_REPLY__
+  Future<RpcResponse> _roundTrip(String service, String op, List<int> request) async {
     final uri = Uri.parse('${baseUrl.replaceAll(RegExp(r'/+$'), '')}/csil/v1/rpc');
     // The library builds the request envelope; the carrier never hand-rolls CBOR.
     final envelope = RpcRequest(service, op, Uint8List.fromList(request)).encode();
     final bytes = await _send(uri, envelope);
     // RpcResponse.decode + intoTransportError throws a StatusException for any non-zero
     // transport status, distinct from an application error.
-    final resp = RpcResponse.decode(bytes).intoTransportError();
-    __RESOLVE__
+    return RpcResponse.decode(bytes).intoTransportError();
   }
 
   static Future<Uint8List> _httpSend(Uri uri, Uint8List body) async {
@@ -2689,7 +2694,7 @@ impl DartGenerator {
         };
         if let CsilTypeExpression::Builtin(name) = base {
             match name.as_str() {
-                "timestamp" => {
+                "timestamp" | "cddl_time" => {
                     if let CsilLiteralValue::Text(t) = value {
                         return format!("DateTime.parse({})", dart_string_lit(t));
                     }
@@ -2958,7 +2963,10 @@ impl DartGenerator {
             return None;
         }
         let mut body = String::new();
-        body.push_str(&client_prelude(shape));
+        body.push_str(&client_prelude(
+            shape,
+            spec.rpc_operations().next().is_some(),
+        ));
         body.push('\n');
         body.push_str(&services_code);
         // The clients name the generated request/response types, so the client file
@@ -3051,19 +3059,49 @@ impl DartGenerator {
                 &sig_params,
                 &format!(" {asy}{{"),
             ));
-            out.push_str(&dart_stmt(
-                4,
-                &format!("final csilResp = {aw}"),
-                &DExpr::Call {
-                    callee: "transport.call".to_string(),
-                    args: vec![
-                        DExpr::Atom(wire_service.clone()),
-                        DExpr::Atom(wire_op),
-                        req_bytes,
-                    ],
-                },
-                ";",
-            ));
+            if op.rpc_reply_arms().is_some() {
+                out.push_str(&dart_stmt(
+                    4,
+                    &format!("final (csilVariant, csilPayload) = {aw}"),
+                    &DExpr::Call {
+                        callee: "transport.callReply".to_string(),
+                        args: vec![
+                            DExpr::Atom(wire_service.clone()),
+                            DExpr::Atom(wire_op.clone()),
+                            req_bytes,
+                        ],
+                    },
+                    ";",
+                ));
+                out.push_str(&dart_stmt(
+                    4,
+                    "final csilResp = ",
+                    &DExpr::Call {
+                        callee: "resolveRpcReply".to_string(),
+                        args: vec![
+                            DExpr::Atom(wire_service.clone()),
+                            DExpr::Atom(wire_op),
+                            DExpr::Atom("csilVariant".to_string()),
+                            DExpr::Atom("csilPayload".to_string()),
+                        ],
+                    },
+                    ";",
+                ));
+            } else {
+                out.push_str(&dart_stmt(
+                    4,
+                    &format!("final csilResp = {aw}"),
+                    &DExpr::Call {
+                        callee: "transport.call".to_string(),
+                        args: vec![
+                            DExpr::Atom(wire_service.clone()),
+                            DExpr::Atom(wire_op),
+                            req_bytes,
+                        ],
+                    },
+                    ";",
+                ));
+            }
             out.push_str(&dart_stmt(4, "return ", &out_decode, ";"));
             out.push_str("  }\n\n");
         }
@@ -3743,7 +3781,9 @@ fn contains_record(
     unions: &std::collections::HashMap<String, Vec<CsilTypeExpression>>,
 ) -> bool {
     match ty {
-        CsilTypeExpression::Builtin(name) if name == "date" => true,
+        // A `cddl_time` is a DateTime like a `timestamp`, so the encoder cannot tell
+        // them apart by runtime type; it needs the explicit tag-1 wrapper.
+        CsilTypeExpression::Builtin(name) if name == "date" || name == "cddl_time" => true,
         // A reference is either a record directly, or a transparent alias whose
         // underlying shape (e.g. `M = {* text => SomeRecord}`) may itself carry one.
         CsilTypeExpression::Reference(_) if dart_text_enum(ty, aliases).is_some() => true,
@@ -3784,6 +3824,9 @@ fn dart_to_cbor_expr(
     match ty {
         CsilTypeExpression::Builtin(name) if name == "date" => {
             DExpr::Atom(format!("CsilCbor.dateValue({expr})"))
+        }
+        CsilTypeExpression::Builtin(name) if name == "cddl_time" => {
+            DExpr::Atom(format!("CsilCbor.cddlTimeValue({expr})"))
         }
         CsilTypeExpression::Constrained { base_type, .. } => {
             dart_to_cbor_expr(base_type, expr, records, aliases, unions)
@@ -3945,6 +3988,7 @@ fn dart_from_cbor_expr(
             "bool" => format!("{expr} as bool"),
             "date" => format!("CsilCbor.asDate({expr})"),
             "timestamp" => format!("{expr} as DateTime"),
+            "cddl_time" => format!("CsilCbor.asCddlTime({expr})"),
             "decimal" => format!("{expr} as {decimal}"),
             _ => expr.to_string(),
         }),
@@ -4167,12 +4211,31 @@ fn choice_literal_list(choices: &[CsilTypeExpression]) -> DExpr {
 /// returns a `Future<Uint8List>` (the carrier owns the I/O round-trip); the codec the
 /// client builds on stays synchronous either way. The sync text is byte-for-byte the
 /// pre-async output so a `sync`/pre-existing consumer sees no change.
-fn client_prelude(shape: ClientShape) -> String {
+///
+/// `has_reply` adds `callReply` only when an operation has more than one reply
+/// arm: `call` returns bytes alone, so it cannot carry the reply variant that
+/// selects the arm. A spec without such an operation keeps the one-method seam.
+fn client_prelude(shape: ClientShape, has_reply: bool) -> String {
     let name = shape.transport_name();
     let ret = if shape.is_async {
         "Future<Uint8List>"
     } else {
         "List<int>"
+    };
+    let reply = if !has_reply {
+        String::new()
+    } else {
+        let reply_ret = if shape.is_async {
+            "Future<(String?, Uint8List)>"
+        } else {
+            "(String?, Uint8List)"
+        };
+        format!(
+            "\n  /// Perform the (service, op) call for an operation with more than one reply
+  /// arm and return the reply variant (null when absent) with the payload bytes.
+  {reply_ret} callReply(String service, String op, List<int> request);
+"
+        )
     };
     format!(
         "\
@@ -4183,7 +4246,7 @@ abstract interface class {name} {{
   /// Perform the (service, op) call with the already-encoded request bytes and
   /// return the response bytes.
   {ret} call(String service, String op, List<int> request);
-}}
+{reply}}}
 "
     )
 }
@@ -4395,6 +4458,22 @@ class _CsilDate {
   int get hashCode => text.hashCode;
 }
 
+// Tag 1 decodes to this wrapper, not to a bare DateTime, so that a `timestamp` field
+// still refuses tag 1 and a `cddl_time` field still refuses tag 0. It keeps the raw
+// content unchecked so that tag 1 inside an `any` value round-trips; only a declared
+// `cddl_time` field applies the wire rule, in asCddlTime.
+class _CsilEpoch {
+  final Object? content;
+  const _CsilEpoch(this.content);
+
+  @override
+  bool operator ==(Object other) =>
+      other is _CsilEpoch && CsilCbor._valueEquals(other.content, content);
+
+  @override
+  int get hashCode => content is num ? content.hashCode : 0;
+}
+
 /// A minimal canonical-CBOR (RFC 8949 subset) encoder/decoder over the dynamic
 /// value tree the generated records map to. Scalars, bytes (major type 2),
 /// timestamps (DateTime -> tag 0), lists, and maps are supported; the generated
@@ -4412,9 +4491,173 @@ class CsilCbor {
     throw FormatException('expected YYYY-MM-DD');
   }
 
+  static DateTime timestampValue(Object? text) {
+    final t = text is String ? _parseTimestamp(text) : null;
+    if (t == null) throw FormatException('expected RFC 3339 timestamp');
+    return t;
+  }
+
+  // DateTime.parse accepts a space separator, a missing offset and second 60,
+  // which the wire contract refuses, so the shape is checked by hand.
+  static DateTime? _parseTimestamp(String s) {
+    final c = s.codeUnits;
+    bool digits(int from, int to) {
+      if (to > c.length) return false;
+      for (var i = from; i < to; i++) {
+        if (c[i] < 48 || c[i] > 57) return false;
+      }
+      return true;
+    }
+
+    int value(int from, int to) {
+      var n = 0;
+      for (var i = from; i < to; i++) {
+        n = n * 10 + c[i] - 48;
+      }
+      return n;
+    }
+
+    if (!digits(0, 4) || c.length < 20 || c[4] != 45 || !digits(5, 7) || c[7] != 45 ||
+        !digits(8, 10) || (c[10] != 84 && c[10] != 116) || !digits(11, 13) ||
+        c[13] != 58 || !digits(14, 16) || c[16] != 58 || !digits(17, 19)) {
+      return null;
+    }
+    final y = value(0, 4), mo = value(5, 7), d = value(8, 10);
+    final h = value(11, 13), mi = value(14, 16), sec = value(17, 19);
+    final leap = y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
+    final days = [31, leap ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    if (y < 1 || mo < 1 || mo > 12 || d < 1 || d > days[mo - 1] || h > 23 || mi > 59 || sec > 59) {
+      return null;
+    }
+    var i = 19;
+    var nanos = 0;
+    if (c[i] == 46) {
+      final start = ++i;
+      while (i < c.length && c[i] >= 48 && c[i] <= 57) {
+        i++;
+      }
+      if (i - start < 1 || i - start > 9) return null;
+      nanos = value(start, i);
+      for (var k = i - start; k < 9; k++) {
+        nanos *= 10;
+      }
+    }
+    var offset = 0;
+    if (i == c.length - 1 && (c[i] == 90 || c[i] == 122)) {
+      offset = 0;
+    } else if (i == c.length - 6 && (c[i] == 43 || c[i] == 45) && digits(i + 1, i + 3) &&
+        c[i + 3] == 58 && digits(i + 4, i + 6)) {
+      final oh = value(i + 1, i + 3), om = value(i + 4, i + 6);
+      if (oh > 23 || om > 59) return null;
+      offset = (oh * 60 + om) * (c[i] == 43 ? 1 : -1);
+    } else {
+      return null;
+    }
+    // A fraction finer than DateTime holds must fail, never round.
+    if (nanos % 1000 != 0) return null;
+    final micros = nanos ~/ 1000;
+    final t = DateTime.utc(y, mo, d, h, mi, sec, 0, micros).subtract(Duration(minutes: offset));
+    // Web DateTime keeps only milliseconds, so a lost microsecond shows here.
+    if (t.year < 1 || t.year > 9999 || t.millisecond * 1000 + t.microsecond != micros) {
+      return null;
+    }
+    return t;
+  }
+
+  static String timestampText(DateTime v) {
+    final u = v.toUtc();
+    if (u.year < 1 || u.year > 9999) {
+      throw ArgumentError('timestamp year out of range');
+    }
+    String p(int n, int w) => n.toString().padLeft(w, '0');
+    final micros = u.millisecond * 1000 + u.microsecond;
+    final frac = micros == 0
+        ? ''
+        : micros % 1000 == 0
+        ? '.${p(u.millisecond, 3)}'
+        : '.${p(micros, 6)}';
+    return '${p(u.year, 4)}-${p(u.month, 2)}-${p(u.day, 2)}T'
+        '${p(u.hour, 2)}:${p(u.minute, 2)}:${p(u.second, 2)}${frac}Z';
+  }
+
   static String asDate(Object? value) {
     if (value is _CsilDate) return value.text;
     throw FormatException('expected calendar date tag 1004');
+  }
+
+  static const _cddlTimeFirst = -62135596800;
+  static const _cddlTimeLast = 253402300799;
+
+  static Object cddlTimeValue(DateTime v) => _CsilEpoch(_cddlTimeNumber(v));
+
+  static DateTime asCddlTime(Object? value) {
+    if (value is _CsilEpoch) return _cddlTimeDecode(value.content);
+    throw FormatException('expected CBOR tag 1 cddl_time');
+  }
+
+  // The float split is spelled out step by step because the wire contract fixes
+  // each binary64 operation, so every target lands on the same instant.
+  static DateTime _cddlTimeDecode(Object? content) {
+    int seconds;
+    var units = 0;
+    if (content is int) {
+      seconds = content;
+    } else if (content is double) {
+      if (!content.isFinite) throw FormatException('cddl_time is not finite');
+      // Refused before the integer conversion so that the cast cannot saturate.
+      if (content < (_cddlTimeFirst - 1).toDouble() ||
+          content > (_cddlTimeLast + 1).toDouble()) {
+        throw FormatException('cddl_time year outside 0001-9999');
+      }
+      final whole = content.floorToDouble();
+      final scaled = (content - whole) * 1e6;
+      final rounded = (scaled + 0.5).floorToDouble();
+      seconds = whole.toInt();
+      units = rounded.toInt();
+      if (units == 1000000) {
+        seconds += 1;
+        units = 0;
+      }
+    } else {
+      throw FormatException('cddl_time tag 1 requires a number');
+    }
+    if (seconds < _cddlTimeFirst || seconds > _cddlTimeLast) {
+      throw FormatException('cddl_time year outside 0001-9999');
+    }
+    return DateTime.fromMicrosecondsSinceEpoch(seconds * 1000000 + units, isUtc: true);
+  }
+
+  static num _cddlTimeNumber(DateTime v) {
+    final micros = v.microsecondsSinceEpoch;
+    // `~/` truncates toward zero; the contract splits at the floor.
+    var seconds = micros ~/ 1000000;
+    var units = micros - seconds * 1000000;
+    if (units < 0) {
+      seconds -= 1;
+      units += 1000000;
+    }
+    if (seconds < _cddlTimeFirst || seconds > _cddlTimeLast) {
+      throw ArgumentError('cddl_time year out of range');
+    }
+    if (units == 0) return seconds;
+    return seconds.toDouble() + units.toDouble() / 1e6;
+  }
+
+  static double _halfToDouble(int h) {
+    final exp = (h >> 10) & 0x1f;
+    final mant = h & 0x3ff;
+    final double magnitude;
+    if (exp == 0) {
+      magnitude = mant / 16777216.0;
+    } else if (exp == 31) {
+      magnitude = mant == 0 ? double.infinity : double.nan;
+    } else {
+      // Rebias the exponent into binary64 bits, which is exact for every half.
+      final bits = ByteData(8)
+        ..setUint32(0, ((exp - 15 + 1023) << 20) | (mant << 10), Endian.big);
+      magnitude = bits.getFloat64(0, Endian.big);
+    }
+    return (h & 0x8000) != 0 ? -magnitude : magnitude;
   }
 
   static Uint8List encodeValue(Object? value) {
@@ -4472,16 +4715,12 @@ class CsilCbor {
     } else if (v is _CsilDate) {
       _head(b, 6, 1004);
       _enc(b, v.text);
+    } else if (v is _CsilEpoch) {
+      b.addByte(0xc1);
+      _enc(b, v.content);
     } else if (v is DateTime) {
       b.addByte(0xc0);
-      // Canonical RFC3339 (tag 0): Dart's toIso8601String always emits a
-      // fractional-seconds part (.000); the wire form omits it when it is zero, so
-      // strip an all-zero fraction to match the other languages byte-for-byte.
-      final iso = v.toUtc().toIso8601String().replaceFirst(
-        RegExp(r'\.0+Z$'),
-        'Z',
-      );
-      final u = utf8.encode(iso);
+      final u = utf8.encode(timestampText(v));
       _head(b, 3, u.length);
       b.add(u);
     } else if (v is List) {
@@ -4570,6 +4809,11 @@ class CsilCbor {
       return _CsilRead(v, pos + 5);
     }
     if (low == 27) {
+      // A Dart int holds 64 signed bits, so an argument of 2^63 or more would wrap
+      // to a wrong value; refusing it is the only exact answer.
+      if (b[pos + 1] >= 0x80) {
+        throw FormatException('CsilCbor: argument exceeds 2^63 - 1');
+      }
       var v = 0;
       for (var i = 1; i <= 8; i++) {
         v = (v << 8) | b[pos + i];
@@ -4590,6 +4834,11 @@ class CsilCbor {
       if (low == 20) return _CsilDecoded(false, pos + 1);
       if (low == 21) return _CsilDecoded(true, pos + 1);
       if (low == 22 || low == 23) return _CsilDecoded(null, pos + 1);
+      if (low == 25) {
+        if (b.length - pos < 3)
+          throw ArgumentError('CsilCbor: truncated float');
+        return _CsilDecoded(_halfToDouble((b[pos + 1] << 8) | b[pos + 2]), pos + 3);
+      }
       if (low == 26) {
         if (b.length - pos < 5)
           throw ArgumentError('CsilCbor: truncated float');
@@ -4647,15 +4896,14 @@ class CsilCbor {
         if (arg == 1004 && (p >= b.length || b[p] >> 5 != 3)) {
           throw FormatException('calendar date tag 1004 requires text');
         }
+        if (arg == 0 && (p >= b.length || b[p] >> 5 != 3)) {
+          throw FormatException('timestamp tag 0 requires text');
+        }
         final inner = _dec(b, p, depth + 1);
         if (arg == 1004) return _CsilDecoded(dateValue(inner.value), inner.next);
         if (inner.value is _CsilDate) throw FormatException('unexpected nested date tag');
-        if (arg == 0 && inner.value is String) {
-          return _CsilDecoded(
-            DateTime.parse(inner.value as String).toUtc(),
-            inner.next,
-          );
-        }
+        if (arg == 0) return _CsilDecoded(timestampValue(inner.value), inner.next);
+        if (arg == 1) return _CsilDecoded(_CsilEpoch(inner.value), inner.next);
         return _CsilDecoded(inner.value, inner.next);
       default:
         throw ArgumentError('CsilCbor: unsupported major $major');

@@ -125,6 +125,23 @@ fn timestamp_bound_parses_through_time_iso8601() {
 }
 
 #[test]
+fn cddl_time_bound_parses_through_time_iso8601() {
+    let s = spec(vec![group_rule(
+        "reading",
+        vec![constrained_entry(
+            "at",
+            "cddl_time",
+            vec![CsilControlOperator::GreaterEqual(CsilLiteralValue::Text(
+                "2020-01-01T00:00:00Z".to_string(),
+            ))],
+        )],
+    )]);
+    let types = file(&s, "ruby-typesonly", "types.rb");
+    assert!(types.contains("require \"time\""));
+    assert!(types.contains("if at < Time.iso8601(\"2020-01-01T00:00:00Z\")"));
+}
+
+#[test]
 fn encoding_only_operators_are_comments_not_checks() {
     let s = spec(vec![group_rule(
         "blob",

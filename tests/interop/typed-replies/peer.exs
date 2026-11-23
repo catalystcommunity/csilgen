@@ -12,15 +12,26 @@ defmodule Handler do
   def decrypt_token(_req, _ctx), do: {:ok, %Resp{b: "ok"}}
 end
 
+# Answers like a server: the variant travels beside the payload, and the request
+# text can force a missing or unknown variant.
 defmodule Carrier do
   @behaviour Csilgen.Generated.Transport
   defstruct []
-  def call(_carrier, service, op, bytes) do
+
+  def call(_carrier, _service, _op, _bytes),
+    do: raise("a multi-arm operation must use call_reply")
+
+  def call_reply(_carrier, "Rp", "decrypt-token", bytes) do
     request = Req.from_cbor(bytes)
     if request.a == "unknown", do: raise(RuntimeError, "status 2")
     {variant, payload} = Cbor.encode_rp_decrypt_token_reply(Handler.decrypt_token(request, %{}))
     if variant == "RpError", do: 7 = :binary.at(payload, 6)
-    Cbor.resolve_rpc_reply(service, op, variant, payload)
+
+    case request.a do
+      "other" -> {"Other", payload}
+      "none" -> {nil, payload}
+      _ -> {variant, payload}
+    end
   end
 end
 
@@ -34,9 +45,20 @@ rescue
   e in RpErrorRefusal -> %RpError{code: :application_user_limit} = e.value
 end
 
+for forced <- ["other", "none"] do
+  try do
+    RpClient.decrypt_token(client, %Req{a: forced})
+    raise "accepted variant #{forced}"
+  rescue
+    _ in ArgumentError -> :ok
+  end
+end
+
 try do
   RpClient.decrypt_token(client, %Req{a: "unknown"})
   raise "missing transport error"
 rescue
   e in RuntimeError -> "status 2" = e.message
 end
+
+IO.puts("elixir: typed replies pass")

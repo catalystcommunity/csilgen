@@ -1,0 +1,4 @@
+; A record with one timestamp field. The timestamp vectors decode it in every target.
+Stamp = {
+    at: timestamp,
+}

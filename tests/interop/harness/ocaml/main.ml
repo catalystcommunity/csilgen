@@ -26,6 +26,7 @@ let scalars_ok () : T.scalars =
     flag = true;
     due = "2000-02-29";
     when_ = "2026-06-29T12:34:56Z";
+    seen = "2026-06-29T12:34:56.500Z";
     amount = "123.45";
     (* mixed-union coverage: a value equal to a literal arm must wire as
        [1,"pending"]; a value with no literal match must wire as [0,...]. *)
@@ -248,22 +249,31 @@ let rpc_server listener =
   in
   accept_loop ()
 
-(* The generated client's transport seam over a connected stream. A status-0 reply
-   whose variant is `ServiceError` is the typed application error path; map it to an
-   error string distinct from a transport failure. *)
-let rpc_carrier_call (client : Rpc.client) ~service ~op ~payload =
+(* The generated client's transport seam over a connected stream: [call] for
+   single-arm ops, [call_reply] for multi-arm ops. The generated client maps a
+   status-0 `ServiceError` variant to its typed error arm. *)
+let rpc_exchange (client : Rpc.client) ~service ~op ~payload =
   match Rpc.call client ~service ~op ~payload () with
   | Error e -> Error ("transport: " ^ Conventions.error_message e)
-  | Ok (resp : Rpc.response) ->
-    Ok (C.resolve_rpc_reply ~service ~op ~variant:resp.Rpc.variant resp.Rpc.payload)
+  | Ok (resp : Rpc.response) -> Ok resp
+
+let rpc_carrier_call client ~service ~op ~payload =
+  Result.map (fun (resp : Rpc.response) -> resp.payload) (rpc_exchange client ~service ~op ~payload)
+
+let rpc_carrier_call_reply client ~service ~op ~payload =
+  Result.map
+    (fun (resp : Rpc.response) -> (resp.variant, resp.payload))
+    (rpc_exchange client ~service ~op ~payload)
 
 let rpc_client fd =
   let cs = new_cases "rpc" in
   let carrier = carrier_of_fd fd in
   let rpc = Rpc.new_client carrier false in
   let client =
-    Interop_api.Client.make_client ~call:(fun ~service ~op ~payload ->
-        rpc_carrier_call rpc ~service ~op ~payload)
+    Interop_api.Client.make_client
+      ~call:(fun ~service ~op ~payload -> rpc_carrier_call rpc ~service ~op ~payload)
+      ~call_reply:(fun ~service ~op ~payload ->
+        rpc_carrier_call_reply rpc ~service ~op ~payload)
   in
   (match Interop_api.Client.Interop.echo_scalars client (scalars_ok ()) with
    | Ok r -> check cs "echo-scalars/success" (r = scalars_ok ()) "mismatch"

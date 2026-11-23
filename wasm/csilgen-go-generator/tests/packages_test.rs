@@ -85,6 +85,25 @@ fn echo_service_rules() -> Vec<CsilRule> {
     ]
 }
 
+/// The echo spec plus `check: Ping -> Pong / Refusal`, whose two reply arms make
+/// the generated seam and the Quickstart carrier carry `CallReply`.
+fn echo_reply_rules() -> Vec<CsilRule> {
+    let mut rules = echo_service_rules();
+    if let CsilRuleType::ServiceDef(service) = &mut rules[2].rule_type {
+        let mut check = op(
+            "check",
+            "Ping",
+            "Pong",
+            CsilServiceDirection::Unidirectional,
+        );
+        check.output_type =
+            CsilTypeExpression::Choice(vec![reference("Pong"), reference("Refusal")]);
+        service.operations.push(check);
+    }
+    rules.push(record_rule("Refusal", vec![entry("code", builtin("int"))]));
+    rules
+}
+
 fn opts(pairs: &[(&str, serde_json::Value)]) -> HashMap<String, serde_json::Value> {
     pairs
         .iter()
@@ -398,7 +417,8 @@ fn each_section_names_its_library_imports_and_seam() {
     assert!(rpc.contains("transport.DecodeRpcResponse(body)"));
     assert!(rpc.contains("/csil/v1/rpc"));
     assert!(rpc.contains("resp.AsTransportError()"));
-    assert!(rpc.contains("return resp.Payload, nil"));
+    assert!(rpc.contains("return resp.Payload, err"));
+    assert!(!rpc.contains("ResolveRPCReply"));
     assert!(rpc.contains("api.NewEchoClient(&HTTPRpcCarrier{BaseURL:"));
     assert!(rpc.contains("client.Ping(context.Background(), api.Ping{Msg: \"example\"})"));
     assert!(
@@ -432,7 +452,7 @@ fn each_section_names_its_library_imports_and_seam() {
         "the handler must implement the generated service interface:\n{events}"
     );
     assert!(
-        events.contains("api.DecodePing(data)") && events.contains("api.EncodePong(v)"),
+        events.contains("api.DecodePing(data)") && events.contains("return api.EncodePong(v)\n"),
         "the codec adapter must bridge the per-type codec:\n{events}"
     );
     assert!(
@@ -442,7 +462,13 @@ fn each_section_names_its_library_imports_and_seam() {
 
     // Datagrams: the lib's Datagram + carrier seam, and the no-sync-response warning.
     assert!(datagrams.contains("transport.NewUDPDatagramCarrier(conn)"));
-    assert!(datagrams.contains("transport.NewDatagram(opOrd, 0, api.EncodePing(req)).Encode()"));
+    // The request is encoded first, so an encode failure returns before the send.
+    assert!(
+        datagrams.contains(
+            "payload, err := api.EncodePing(req)\n\tif err != nil {\n\t\treturn err\n\t}"
+        )
+    );
+    assert!(datagrams.contains("transport.NewDatagram(opOrd, 0, payload).Encode()"));
     assert!(datagrams.contains("transport.DecodeDatagram(inbound)"));
     assert!(datagrams.contains("api.DecodePong(dg.Payload)"));
     assert!(datagrams.contains("NO synchronous response"));
@@ -583,15 +609,20 @@ fn transport_lib_dir() -> PathBuf {
 /// Stage the generated go-client package plus the three README programs into a fresh
 /// temp module, repointing the `csilgen-transport` import at the local library via a
 /// `replace` directive. Returns the module dir.
-fn stage_transports_module(module: &str) -> PathBuf {
+fn stage_transports_module(module: &str, reply_arms: bool) -> PathBuf {
     let options = opts(&[
         ("package_name", serde_json::json!(module)),
         ("emit_packages", serde_json::json!(["go"])),
     ]);
-    let files = generate_go_files(input("go-client", options)).unwrap();
+    let mut spec = input("go-client", options);
+    if reply_arms {
+        spec.csil_spec.rules = echo_reply_rules();
+    }
+    let files = generate_go_files(spec).unwrap();
     let readme = find(&files, "genquickstart.md").unwrap().content.clone();
 
-    let dir = std::env::temp_dir().join(format!("csilgen-go-3t-{}", std::process::id()));
+    let dir =
+        std::env::temp_dir().join(format!("csilgen-go-3t-{}-{reply_arms}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     for file in &files {
@@ -622,7 +653,12 @@ fn stage_transports_module(module: &str) -> PathBuf {
     let events = section_go_block(&readme, "## CSIL-Events (TLS)");
     let datagrams = section_go_block(&readme, "## CSIL-Datagrams (UDP)");
 
-    write_cmd(&dir, "rpc", &rpc, Some(&rpc_roundtrip_test_go(module)));
+    let mut rpc_test = rpc_roundtrip_test_go(module);
+    if reply_arms {
+        rpc_test = rpc_test.replacen("\t\"context\"\n", "\t\"context\"\n\t\"errors\"\n", 1);
+        rpc_test.push_str(RPC_REPLY_TEST_GO);
+    }
+    write_cmd(&dir, "rpc", &rpc, Some(&rpc_test));
     write_cmd(&dir, "events", &events, None);
     write_cmd(
         &dir,
@@ -669,7 +705,13 @@ fn genquickstart_sections_compile_and_round_trip() {
         return;
     }
     let module = "github.com/CatalystCommunity/corndogs/gen/corndogsapi";
-    let dir = stage_transports_module(module);
+    for reply_arms in [false, true] {
+        assert_quickstart_passes(module, reply_arms);
+    }
+}
+
+fn assert_quickstart_passes(module: &str, reply_arms: bool) {
+    let dir = stage_transports_module(module, reply_arms);
     let out = run_go_test(&dir);
     let ok = out.status.success();
     if ok {
@@ -683,6 +725,60 @@ fn genquickstart_sections_compile_and_round_trip() {
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+/// Appended to the RPC round-trip test for the multi-arm spec: the echo replies with
+/// the configured variant so one test covers each arm.
+const RPC_REPLY_TEST_GO: &str = r#"
+type variantRoundTripper struct{ variant *string }
+
+func (v variantRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	body, err := io.ReadAll(req.Body)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := transport.DecodeRpcRequest(body); err != nil {
+		return nil, err
+	}
+	var payload []byte
+	if v.variant != nil && *v.variant == "Refusal" {
+		payload, err = api.EncodeRefusal(api.Refusal{Code: 7})
+	} else {
+		payload, err = api.EncodePong(api.Pong{Msg: "ok"})
+	}
+	if err != nil {
+		return nil, err
+	}
+	reply := transport.NewRpcResponseOk("", payload)
+	reply.Variant = v.variant
+	respBytes, err := reply.Encode()
+	if err != nil {
+		return nil, err
+	}
+	return &http.Response{StatusCode: 200, Body: io.NopCloser(bytes.NewReader(respBytes)), Header: make(http.Header)}, nil
+}
+
+func checkWith(variant *string) (api.Pong, error) {
+	carrier := &HTTPRpcCarrier{BaseURL: "http://echo.invalid", HTTP: &http.Client{Transport: variantRoundTripper{variant}}}
+	return api.NewEchoClient(carrier).Check(context.Background(), api.Ping{Msg: "hi"})
+}
+
+func TestRPCReplyVariants(t *testing.T) {
+	pong, refusal, other := "Pong", "Refusal", "Other"
+	if value, err := checkWith(&pong); err != nil || value.Msg != "ok" {
+		t.Fatalf("Pong arm: %+v %v", value, err)
+	}
+	var app *api.RPCApplicationError[api.Refusal]
+	if _, err := checkWith(&refusal); !errors.As(err, &app) || app.Value.Code != 7 {
+		t.Fatalf("Refusal arm: %v", err)
+	}
+	var decode *api.RPCDecodeError
+	for _, variant := range []*string{&other, nil} {
+		if _, err := checkWith(variant); !errors.As(err, &decode) {
+			t.Fatalf("variant %v: want RPCDecodeError, got %v", variant, err)
+		}
+	}
+}
+"#;
 
 /// The hermetic CSIL-RPC round-trip dropped beside the README's RPC `main.go`. It drives
 /// the emitted `HTTPRpcCarrier` through an in-process `http.RoundTripper` echo built on
@@ -760,7 +856,11 @@ import (
 
 func TestDatagramsRoundTrip(t *testing.T) {{
 	lb := transport.NewLoopbackDatagramCarrier()
-	seed, err := transport.NewDatagram(opOrd, 0, api.EncodePong(api.Pong{{Msg: "late"}})).Encode()
+	late, err := api.EncodePong(api.Pong{{Msg: "late"}})
+	if err != nil {{
+		t.Fatalf("payload encode: %v", err)
+	}}
+	seed, err := transport.NewDatagram(opOrd, 0, late).Encode()
 	if err != nil {{
 		t.Fatalf("seed encode: %v", err)
 	}}

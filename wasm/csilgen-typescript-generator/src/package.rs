@@ -168,14 +168,24 @@ fn rpc_section(input: &WasmGeneratorInput, pkg: &str, ex: Option<&UnaryExample>)
     out.push_str(&format!(
         "import {{ {aggregate}, type AsyncServiceTransport }} from \"{pkg}\";\n\n"
     ));
+    // An op with several reply arms makes the seam require `callReply`. The
+    // library's `RpcResponse` already carries `variant` and `payload`, so the
+    // carrier returns it as is and the generated client picks the arm.
     let typed = input.csil_spec.rpc_operations().next().is_some();
     if typed {
-        out.push_str(&format!("import {{ resolveRpcReply }} from \"{pkg}\";\n"));
-    }
-    out.push_str(RPC_CARRIER_TS);
-    if typed {
-        out.push_str("    return resolveRpcReply(service, op, resp.variant, resp.payload);\n");
+        out.push_str(&RPC_CARRIER_TS.replace(
+            "  async call(service: string, op: string, req: Uint8Array): Promise<Uint8Array> {",
+            "  private async exchange(service: string, op: string, req: Uint8Array): Promise<RpcResponse> {",
+        ));
+        out.push_str(
+            "    return resp;\n  }\n\n\
+             \x20 async call(service: string, op: string, req: Uint8Array): Promise<Uint8Array> {\n\
+             \x20   return (await this.exchange(service, op, req)).payload;\n  }\n\n\
+             \x20 callReply(service: string, op: string, req: Uint8Array): Promise<RpcResponse> {\n\
+             \x20   return this.exchange(service, op, req);\n",
+        );
     } else {
+        out.push_str(RPC_CARRIER_TS);
         out.push_str("    return resp.payload;\n");
     }
     out.push_str("  }\n}\n");
@@ -652,7 +662,7 @@ fn ts_sample(input: &WasmGeneratorInput, ty: &CsilTypeExpression) -> String {
             "bool" | "boolean" => "false".to_string(),
             "bytes" | "bstr" => "new Uint8Array()".to_string(),
             "date" => "\"1970-01-01\"".to_string(),
-            "timestamp" => "new Date()".to_string(),
+            "timestamp" | "cddl_time" => "new Date()".to_string(),
             "int" | "uint" | "integer" | "number" | "float" | "float16" | "float32" | "float64"
             | "int8" | "int16" | "int32" | "int64" | "uint8" | "uint16" | "uint32" | "uint64" => {
                 "0".to_string()

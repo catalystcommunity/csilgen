@@ -568,6 +568,68 @@ class TrustedImplementationTests(unittest.TestCase):
 
         self.assertIn("interop summary: 2/2 cells passed", output.getvalue())
 
+    def test_swift_is_a_matrix_language(self) -> None:
+        (swift,) = INTEROP._select_languages(("swift",))
+        self.assertEqual(swift.port, 6400)
+        self.assertNotIn("swift", INTEROP.FIXTURE_ONLY_TARGETS)
+        harness = ROOT / "tests" / "interop" / "harness" / "swift"
+        with mock.patch.object(INTEROP, "_run") as run:
+            with redirect_stdout(io.StringIO()):
+                INTEROP._build(ROOT, swift)
+        run.assert_called_once_with(
+            ("swift", "build", "-c", "release"), harness / "runner"
+        )
+        command, cwd, environment = INTEROP._launch(ROOT, swift)
+        self.assertEqual(
+            command,
+            (str(harness / "runner" / ".build" / "release" / "csil-interop-swift"),),
+        )
+        self.assertEqual((cwd, environment), (harness, {}))
+        self.assertTrue((harness / "runner" / "Package.swift").is_file())
+
+    def test_fixture_only_targets_run_in_exactly_one_pr_shard(self) -> None:
+        workflow = yaml.safe_load(
+            (ROOT / ".reactorcide/workflows/pr.yaml").read_text(
+                encoding="utf-8"
+            )
+        )
+        targets = [
+            target
+            for shard in workflow["jobs"]["test-interop"]["for_each"]
+            for target in INTEROP._fixture_targets(
+                INTEROP._select_languages(tuple(shard.split(",")))
+            )
+        ]
+
+        expected = [language.name for language in INTEROP.LANGUAGES]
+        expected.extend(INTEROP.FIXTURE_ONLY_TARGETS)
+        self.assertEqual(sorted(targets), sorted(expected))
+
+    def test_fixtures_run_each_check_script_per_target(self) -> None:
+        with mock.patch.object(INTEROP, "_run") as run:
+            with redirect_stdout(io.StringIO()):
+                INTEROP._run_fixtures(ROOT, ("rust", "php"))
+
+        commands = [call.args[0] for call in run.call_args_list]
+        self.assertIn("csilgen-php-generator", commands[0])
+        self.assertNotIn("csilgen-rust-generator", commands[0])
+        checks = [command[1:] for command in commands[1:]]
+        self.assertEqual(
+            checks,
+            [
+                (ROOT / "tests/interop" / fixture / "check.sh", target)
+                for fixture in INTEROP.FIXTURES
+                for target in ("rust", "php")
+            ],
+        )
+
+    def test_fixture_failure_fails_the_shard(self) -> None:
+        error = INTEROP.subprocess.CalledProcessError(1, ("bash",))
+        with mock.patch.object(INTEROP, "_run", side_effect=error):
+            with redirect_stdout(io.StringIO()):
+                with self.assertRaisesRegex(RuntimeError, "fixture run"):
+                    INTEROP._run_fixtures(ROOT, ("rust",))
+
     def test_interop_shard_environment_is_parsed(self) -> None:
         with mock.patch.dict(
             os.environ,

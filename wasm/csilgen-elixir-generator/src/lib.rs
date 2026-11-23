@@ -316,7 +316,11 @@ fn readme(input: &WasmGeneratorInput, config: &ElixirConfig) -> String {
     let unary = first_unary_example(input, config);
     let channel = first_channel_example(input, config);
     if rpc {
-        out.push_str(&rpc_section(config, unary.as_ref()));
+        out.push_str(&rpc_section(
+            config,
+            unary.as_ref(),
+            input.csil_spec.rpc_operations().next().is_some(),
+        ));
     }
     if events {
         out.push_str(&events_section(config, channel.as_ref()));
@@ -332,7 +336,7 @@ fn readme(input: &WasmGeneratorInput, config: &ElixirConfig) -> String {
 /// request/response (never hand-rolled) and POSTs it to `{base}/csil/v1/rpc` over
 /// `:gen_tcp`. The typed client decodes the success payload; a non-zero transport status
 /// and the `ServiceError` application arm are surfaced distinctly.
-fn rpc_section(config: &ElixirConfig, ex: Option<&UnaryExample>) -> String {
+fn rpc_section(config: &ElixirConfig, ex: Option<&UnaryExample>, has_reply: bool) -> String {
     let mut out = String::from("## CSIL-RPC (HTTP)\n\n");
     out.push_str(
         "Request/response. The library owns the envelope (`Csilgen.Transport.RPC`\n\
@@ -348,7 +352,7 @@ fn rpc_section(config: &ElixirConfig, ex: Option<&UnaryExample>) -> String {
         return out;
     };
     out.push_str("```elixir\n");
-    out.push_str(&rpc_carrier_elixir(config));
+    out.push_str(&rpc_carrier_elixir(config, has_reply));
     out.push('\n');
     // The example: construct the typed client over the carrier and call the first op.
     out.push_str("transport = CsilRpcHttpCarrier.new(\"http://localhost:5080\")\n");
@@ -375,8 +379,16 @@ fn rpc_section(config: &ElixirConfig, ex: Option<&UnaryExample>) -> String {
 /// — the library owns the envelope, the carrier owns only the transport. A non-zero
 /// transport status (`RPC.as_transport_error`) and the typed `ServiceError` arm are
 /// raised so the generated client decodes success only.
-fn rpc_carrier_elixir(config: &ElixirConfig) -> String {
+///
+/// `has_reply` adds `call_reply/4`, which the seam requires only for a spec with a
+/// multi-arm operation; the generated client resolves the variant itself.
+fn rpc_carrier_elixir(config: &ElixirConfig, has_reply: bool) -> String {
     let root = &config.module_root;
+    let call_reply = if has_reply {
+        "\n  # The generated client calls this seam for an operation with more than one\n  # reply arm; it picks the arm from the variant.\n  @impl true\n  def call_reply(%__MODULE__{} = carrier, service, op, req) when is_binary(req) do\n    resp = round_trip(carrier, service, op, req)\n    {resp.variant, resp.payload}\n  end\n"
+    } else {
+        ""
+    };
     // The behaviour module name is spec-derived (module root), so the carrier is a
     // format! rather than a constant.
     format!(
@@ -395,7 +407,11 @@ fn rpc_carrier_elixir(config: &ElixirConfig) -> String {
 
   # The generated client calls this seam with the already-encoded request bytes.
   @impl true
-  def call(%__MODULE__{{rpc_url: url}}, service, op, req) when is_binary(req) do
+  def call(%__MODULE__{{}} = carrier, service, op, req) when is_binary(req) do
+    round_trip(carrier, service, op, req).payload
+  end
+{call_reply}
+  defp round_trip(%__MODULE__{{rpc_url: url}}, service, op, req) do
     # Encode the request with the library's RPC envelope (never hand-rolled).
     envelope = RPC.encode_request(RPC.new_request(service, op, req))
 
@@ -413,7 +429,7 @@ fn rpc_carrier_elixir(config: &ElixirConfig) -> String {
       {{:error, reason}} -> raise "csil-rpc #{{service}}/#{{op}}: #{{inspect(reason)}}"
     end
 
-    {root}.Cbor.resolve_rpc_reply(service, op, resp.variant, resp.payload)
+    resp
   end
 
   # --- Plain-HTTP POST over :gen_tcp ---
@@ -1675,7 +1691,7 @@ fn union_guard(ty: &CsilTypeExpression, expr: &str) -> String {
         CsilTypeExpression::Builtin(name) => match name.as_str() {
             "int" | "uint" | "nint" => format!("is_integer({expr})"),
             "float" | "double" | "float16" | "float32" | "float64" => format!("is_float({expr})"),
-            "timestamp" => format!("is_struct({expr}, DateTime)"),
+            "timestamp" | "cddl_time" => format!("is_struct({expr}, DateTime)"),
             "date" => format!("is_struct({expr}, Date)"),
             "text" | "tstr" | "bytes" | "bstr" => format!("is_binary({expr})"),
             "bool" | "true" | "false" => format!("is_boolean({expr})"),
@@ -1808,12 +1824,14 @@ fn enc_value(ty: &CsilTypeExpression, expr: &str, cx: &Codec) -> Doc {
             "bytes" | "bstr" => Doc::flat(format!("{{:bytes, {expr}}}")),
             "bool" | "true" | "false" => Doc::flat(format!("{{:bool, {expr}}}")),
             "date" => Doc::flat(format!("{}.Cbor.enc_date({expr})", cx.config.module_root)),
-            // CBOR tag 0 RFC3339 UTC instant; normalize through ISO 8601 text.
-            "timestamp" => Doc::Tuple(vec![
-                Doc::flat(":tag"),
-                Doc::flat("0"),
-                Doc::flat(format!("{{:text, DateTime.to_iso8601({expr})}}")),
-            ]),
+            "timestamp" => Doc::flat(format!(
+                "{}.Cbor.enc_timestamp({expr})",
+                cx.config.module_root
+            )),
+            "cddl_time" => Doc::flat(format!(
+                "{}.Cbor.enc_cddl_time({expr})",
+                cx.config.module_root
+            )),
             // CBOR tag 4 exact decimal fraction `[exponent, mantissa]` against the
             // generated self-contained Decimal struct.
             "decimal" => Doc::Tuple(vec![
@@ -1995,13 +2013,8 @@ fn dec_value(ty: &CsilTypeExpression, expr: &str, cx: &Codec) -> Doc {
             "bytes" | "bstr" => call1(format!("{root}.Cbor.to_bytes"), expr),
             "bool" | "true" | "false" => call1(format!("{root}.Cbor.to_bool"), expr),
             "date" => call1(format!("{root}.Cbor.as_date"), expr),
-            "timestamp" => Doc::Case {
-                subject: expr.to_string(),
-                clauses: vec![(
-                    "{:tag, 0, {:text, csil_s}}".to_string(),
-                    Doc::flat("elem(DateTime.from_iso8601(csil_s), 1)"),
-                )],
-            },
+            "timestamp" => call1(format!("{root}.Cbor.as_timestamp"), expr),
+            "cddl_time" => call1(format!("{root}.Cbor.as_cddl_time"), expr),
             "decimal" => Doc::Case {
                 subject: expr.to_string(),
                 clauses: vec![(
@@ -2344,8 +2357,9 @@ fn spec_uses_decimal(input: &WasmGeneratorInput) -> bool {
 /// The transport seam every generated client delegates to. Defined once at the top
 /// of the client file: a `@behaviour` plus a dispatch helper. The transport is an
 /// opaque host-owned struct whose module implements `call/4` — the generator never
-/// owns the wire.
-fn client_prelude(config: &ElixirConfig) -> String {
+/// owns the wire. `has_reply` adds `call_reply/4` only when an operation has more
+/// than one reply arm, so a spec without one keeps the one-callback seam.
+fn client_prelude(config: &ElixirConfig, has_reply: bool) -> String {
     let root = &config.module_root;
     let mut out = String::new();
     out.push_str(&format!("defmodule {root}.Transport do\n"));
@@ -2360,14 +2374,32 @@ fn client_prelude(config: &ElixirConfig) -> String {
     out.push_str("  @spec call(t(), String.t(), String.t(), binary()) :: binary()\n");
     out.push_str("  def call(%mod{} = transport, service, method, req) do\n");
     out.push_str("    mod.call(transport, service, method, req)\n");
-    out.push_str("  end\nend\n\n");
+    out.push_str("  end\n");
+    if has_reply {
+        out.push_str(
+            "\n  @doc \"\"\"\n  Performs a call for an operation with more than one reply arm and returns\n  `{variant, payload}`; `variant` is `nil` when the reply carries none.\n  \"\"\"\n  @callback call_reply(t(), service :: String.t(), method :: String.t(), req :: binary()) ::\n              {String.t() | nil, binary()}\n\n",
+        );
+        out.push_str(
+            "  @doc \"Dispatches a multi-arm call to the transport struct's implementing module.\"\n",
+        );
+        out.push_str(
+            "  @spec call_reply(t(), String.t(), String.t(), binary()) :: {String.t() | nil, binary()}\n",
+        );
+        out.push_str("  def call_reply(%mod{} = transport, service, method, req) do\n");
+        out.push_str("    mod.call_reply(transport, service, method, req)\n");
+        out.push_str("  end\n");
+    }
+    out.push_str("end\n\n");
     out
 }
 
 fn generate_clients(input: &WasmGeneratorInput, config: &ElixirConfig) -> Option<String> {
     let mut content = String::new();
     content.push_str(GEN_HEADER);
-    content.push_str(&client_prelude(config));
+    content.push_str(&client_prelude(
+        config,
+        input.csil_spec.rpc_operations().next().is_some(),
+    ));
 
     let records = record_csil_names(input);
     let aliases = codec_aliases(input);
@@ -2580,20 +2612,52 @@ fn emit_client_module(
         content.push_str(&attr_spec(2, "@spec", &func, &spec_args, &[out_ty]));
         content.push('\n');
         content.push_str(&def_head);
+        let service_lit = || Doc::flat(format!("\"{wire_service}\""));
+        let method_lit = || Doc::flat(format!("\"{wire_method}\""));
+        // A multi-arm reply needs its variant to pick the arm, which `call/4`'s bare
+        // bytes cannot carry, so those operations go through `call_reply/4`.
+        let (fun, head) = if op.rpc_reply_arms().is_some() {
+            ("call_reply", "{variant, payload} = ")
+        } else {
+            ("call", "resp = ")
+        };
         let call = Doc::Call {
-            fun: format!("{root}.Transport.call"),
+            fun: format!("{root}.Transport.{fun}"),
             args: vec![
                 Doc::flat("transport"),
-                Doc::flat(format!("\"{wire_service}\"")),
-                Doc::flat(format!("\"{wire_method}\"")),
+                service_lit(),
+                method_lit(),
                 Doc::flat(encode_req),
             ],
             tail_fn: None,
         };
-        let assign = render_binding(4, "resp = ", &call, 0);
+        let mut statements = vec![render_binding(4, head, &call, 0)];
+        if op.rpc_reply_arms().is_some() {
+            let resolve = Doc::Call {
+                fun: format!("{root}.Cbor.resolve_rpc_reply"),
+                args: vec![
+                    service_lit(),
+                    method_lit(),
+                    Doc::flat("variant"),
+                    Doc::flat("payload"),
+                ],
+                tail_fn: None,
+            };
+            statements.push(render_binding(4, "resp = ", &resolve, 0));
+        }
+        statements.push(format!("    {decode_resp}"));
         // Mix separates a multi-line expression from the next statement with a blank.
-        let gap = if assign.contains('\n') { "\n" } else { "" };
-        content.push_str(&format!("{assign}\n{gap}    {decode_resp}\n"));
+        for (i, statement) in statements.iter().enumerate() {
+            let multi = statement.contains('\n')
+                || statements
+                    .get(i + 1)
+                    .is_some_and(|next| next.contains('\n'));
+            content.push_str(statement);
+            content.push('\n');
+            if multi && i + 1 < statements.len() {
+                content.push('\n');
+            }
+        }
         content.push_str("  end\n");
     }
     content.push_str(&helpers);
@@ -3463,6 +3527,8 @@ fn map_builtin(name: &str, config: &ElixirConfig) -> String {
         "date" => "Date.t()".to_string(),
         // CBOR tag 0 RFC3339 UTC instant.
         "timestamp" => "DateTime.t()".to_string(),
+        // CBOR tag 1 epoch seconds: the same in-memory type as `timestamp`.
+        "cddl_time" => "DateTime.t()".to_string(),
         // CBOR tag 4 exact decimal. Elixir has no stdlib decimal; the value rides as
         // a host-supplied struct under the transport's Decimal namespace.
         "decimal" => format!("{}.Decimal.t()", config.module_root),
@@ -3725,11 +3791,18 @@ const CODEC_RUNTIME_ELIXIR: &str = r#"  @moduledoc """
   defp dec(<<7::size(3), low::size(5), rest::binary>>, _depth) when low in [22, 23],
     do: {:null, rest}
 
+  defp dec(<<7::size(3), 25::size(5), f::float-size(16), rest::binary>>, _depth),
+    do: {{:float, f}, rest}
+
   defp dec(<<7::size(3), 26::size(5), f::float-size(32), rest::binary>>, _depth),
     do: {{:float, f}, rest}
 
   defp dec(<<7::size(3), 27::size(5), f::float-size(64), rest::binary>>, _depth),
     do: {{:float, f}, rest}
+
+  # A float pattern does not match NaN or an infinity, which the BEAM cannot hold.
+  defp dec(<<7::size(3), low::size(5), _::binary>>, _depth) when low in [25, 26, 27],
+    do: raise(ArgumentError, "csilgen: non-finite or truncated float")
 
   defp dec(<<major::size(3), low::size(5), rest::binary>>, depth) do
     {arg, rest} = read_arg(low, rest)
@@ -3803,6 +3876,161 @@ const CODEC_RUNTIME_ELIXIR: &str = r#"  @moduledoc """
     ^text = Date.to_iso8601(date)
     date
   end
+
+  @doc """
+  Encodes a `DateTime` as CBOR tag 0 RFC 3339 text in UTC, with no fraction when
+  it is zero, else the fewest of 3 or 6 digits that hold it exactly.
+  """
+  @spec enc_timestamp(DateTime.t()) :: value()
+  def enc_timestamp(%DateTime{} = dt) do
+    utc = DateTime.from_unix!(DateTime.to_unix(dt, :microsecond), :microsecond)
+    if utc.year < 1 or utc.year > 9999, do: raise(ArgumentError, "timestamp year out of range")
+    {micro, _} = utc.microsecond
+
+    fraction =
+      cond do
+        micro == 0 -> ""
+        rem(micro, 1000) == 0 -> "." <> pad(div(micro, 1000), 3)
+        true -> "." <> pad(micro, 6)
+      end
+
+    text =
+      pad(utc.year, 4) <>
+        "-" <>
+        pad(utc.month, 2) <>
+        "-" <>
+        pad(utc.day, 2) <>
+        "T" <>
+        pad(utc.hour, 2) <>
+        ":" <> pad(utc.minute, 2) <> ":" <> pad(utc.second, 2) <> fraction <> "Z"
+
+    {:tag, 0, {:text, text}}
+  end
+
+  # The wire contract is stricter than DateTime.from_iso8601 (which accepts a
+  # space separator, comma fractions and leap-second carry), so the shape is
+  # checked byte by byte.
+  @doc "Decodes a CBOR tag 0 RFC 3339 instant into a UTC `DateTime`."
+  @spec as_timestamp(value()) :: DateTime.t()
+  def as_timestamp(
+        {:tag, 0,
+         {:text,
+          <<y::binary-size(4), ?-, mo::binary-size(2), ?-, d::binary-size(2), sep,
+            h::binary-size(2), ?:, mi::binary-size(2), ?:, s::binary-size(2), rest::binary>>}}
+      )
+      when sep in [?T, ?t] do
+    {nanos, zone} = ts_fraction(rest)
+    offset = ts_offset(zone)
+    {hour, minute, second} = {ts_digits(h), ts_digits(mi), ts_digits(s)}
+    if hour > 23 or minute > 59 or second > 59, do: raise(ArgumentError, "bad timestamp time")
+    if rem(nanos, 1000) != 0, do: raise(ArgumentError, "timestamp fraction exceeds microseconds")
+    micro = div(nanos, 1000)
+    year = ts_digits(y)
+    if year < 1, do: raise(ArgumentError, "timestamp year out of range")
+    date = Date.new!(year, ts_digits(mo), ts_digits(d))
+    naive = NaiveDateTime.new!(date, Time.new!(hour, minute, second, {micro, 6}))
+    utc = NaiveDateTime.add(naive, -offset, :second)
+    if utc.year < 1 or utc.year > 9999, do: raise(ArgumentError, "timestamp year out of range")
+
+    precision =
+      cond do
+        micro == 0 -> 0
+        rem(micro, 1000) == 0 -> 3
+        true -> 6
+      end
+
+    DateTime.from_naive!(%{utc | microsecond: {micro, precision}}, "Etc/UTC")
+  end
+
+  defp ts_fraction(<<?., rest::binary>>) do
+    {digits, zone} = ts_take_digits(rest, "")
+    n = byte_size(digits)
+    if n < 1 or n > 9, do: raise(ArgumentError, "bad timestamp fraction")
+    {String.to_integer(digits) * Integer.pow(10, 9 - n), zone}
+  end
+
+  defp ts_fraction(zone), do: {0, zone}
+
+  defp ts_take_digits(<<c, rest::binary>>, acc) when c in ?0..?9,
+    do: ts_take_digits(rest, acc <> <<c>>)
+
+  defp ts_take_digits(rest, acc), do: {acc, rest}
+
+  defp ts_offset(zone) when zone in ["Z", "z"], do: 0
+
+  defp ts_offset(<<sign, hh::binary-size(2), ?:, mm::binary-size(2)>>) when sign in [?+, ?-] do
+    {oh, om} = {ts_digits(hh), ts_digits(mm)}
+    if oh > 23 or om > 59, do: raise(ArgumentError, "bad timestamp offset")
+    if sign == ?+, do: (oh * 60 + om) * 60, else: -(oh * 60 + om) * 60
+  end
+
+  defp ts_digits(s) do
+    if s == "" or not Enum.all?(:binary.bin_to_list(s), &(&1 in ?0..?9)),
+      do: raise(ArgumentError, "bad timestamp digits")
+
+    String.to_integer(s)
+  end
+
+  @cddl_time_first -62_135_596_800
+  @cddl_time_last 253_402_300_799
+
+  @doc """
+  Encodes a `DateTime` as CBOR tag 1 epoch seconds: an integer when the fraction
+  is zero, else a binary64 float.
+  """
+  @spec enc_cddl_time(DateTime.t()) :: value()
+  def enc_cddl_time(%DateTime{} = dt) do
+    micros = DateTime.to_unix(dt, :microsecond)
+    seconds = Integer.floor_div(micros, 1_000_000)
+    micro = Integer.mod(micros, 1_000_000)
+
+    if seconds < @cddl_time_first or seconds > @cddl_time_last,
+      do: raise(ArgumentError, "cddl_time year out of range")
+
+    # `:erlang.float` keeps each step binary64, as the wire contract requires.
+    if micro == 0,
+      do: {:tag, 1, {:int, seconds}},
+      else: {:tag, 1, {:float, :erlang.float(seconds) + :erlang.float(micro) / 1_000_000.0}}
+  end
+
+  @doc "Decodes CBOR tag 1 epoch seconds into a UTC `DateTime`."
+  @spec as_cddl_time(value()) :: DateTime.t()
+  def as_cddl_time({:tag, 1, {:int, seconds}}), do: cddl_time_from(seconds, 0)
+
+  def as_cddl_time({:tag, 1, {:float, f}}) do
+    # The bounds are checked before `trunc` so that it never makes a huge integer.
+    if f < @cddl_time_first - 1.0 or f > @cddl_time_last + 1.0,
+      do: raise(ArgumentError, "cddl_time year out of range")
+
+    whole = Float.floor(f)
+    scaled = (f - whole) * 1_000_000.0
+    units = trunc(Float.floor(scaled + 0.5))
+    seconds = trunc(whole)
+
+    if units == 1_000_000,
+      do: cddl_time_from(seconds + 1, 0),
+      else: cddl_time_from(seconds, units)
+  end
+
+  def as_cddl_time(_), do: raise(ArgumentError, "expected tag 1 with epoch seconds")
+
+  defp cddl_time_from(seconds, micro) do
+    if seconds < @cddl_time_first or seconds > @cddl_time_last,
+      do: raise(ArgumentError, "cddl_time year out of range")
+
+    # The same precision rule as `as_timestamp`, so equal instants compare equal.
+    precision =
+      cond do
+        micro == 0 -> 0
+        rem(micro, 1000) == 0 -> 3
+        true -> 6
+      end
+
+    dt = DateTime.from_unix!(seconds * 1_000_000 + micro, :microsecond)
+    %{dt | microsecond: {micro, precision}}
+  end
+
+  defp pad(n, width), do: String.pad_leading(Integer.to_string(n), width, "0")
 
   def to_text({:text, s}), do: s
 

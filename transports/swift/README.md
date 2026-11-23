@@ -9,13 +9,10 @@ This is the Swift sibling of `transports/{go,python,rust,typescript,c}`. The wir
 fixed by the specs in `docs/` and the byte-exact fixtures in `transports/conformance/`,
 which the test suite checks against.
 
-> **⚠️ Status: UNTESTED.** Unlike every other transport in this repo, this library has **not
-> yet been compiled or run** — no Swift toolchain was available on the development machine
-> (Swift on Linux/Arch is awkward to provision). It has been verified only by hand-tracing
-> the conformance vectors and by static review, so treat it as *unproven* until it is built
-> and `swift test`-ed on a real Swift toolchain — the plan is to validate it on a **Mac once
-> one can be acquired** for the purpose. Any "passes the vectors" claim here is aspirational
-> until then.
+> **Status.** The CI transport job runs `swift test` on Linux. The interop
+> matrix (`tests/interop`) uses this library for the Swift harness over loopback
+> TCP and UDP, against the other 13 languages. No Apple platform runs these
+> tests in CI.
 
 ## Design rules (non-negotiable, inherited from the repo)
 

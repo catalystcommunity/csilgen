@@ -1114,7 +1114,18 @@ fn builtin_matches(name: &str, value: &DiagnosticValue) -> bool {
         ),
         "decimal" => matches!(value, DiagnosticValue::Decimal { .. }),
         "date" => matches!(value, DiagnosticValue::Date(_)),
-        "timestamp" => matches!(value, DiagnosticValue::Timestamp { .. }),
+        "timestamp" => matches!(
+            value,
+            DiagnosticValue::Timestamp {
+                original_tag: 0,
+                ..
+            }
+        ),
+        "cddl_time" => matches!(
+            value,
+            DiagnosticValue::Timestamp { original_tag: 1, value }
+                if !matches!(&value.value, DiagnosticValue::Float(f) if !f.as_f64().is_finite())
+        ),
         "any" => true,
         _ => false,
     }
@@ -1388,6 +1399,50 @@ mod tests {
                 .iter()
                 .any(|issue| issue.message.contains("unknown field"))
         );
+    }
+
+    #[test]
+    fn timestamp_takes_only_tag_zero_and_cddl_time_only_tag_one() {
+        let spec = parse_csil(
+            r#"
+            Reading = { at: timestamp, seen: cddl_time }
+            service Sensors { report: Reading -> null }
+        "#,
+        )
+        .unwrap();
+        let schema = SchemaDescriptor::from_spec("times", &spec).unwrap();
+        let descriptor = SchemaDescriptor::decode(&schema.encode().unwrap()).unwrap();
+        let route = RouteContext::RpcRequest {
+            service: "Sensors".into(),
+            operation: "report".into(),
+            direction: MessageDirection::Received,
+        };
+        let tag0 = [&[0xc0, 0x74][..], b"2000-02-29T12:00:00Z"].concat();
+        let tag1_int = vec![0xc1, 0x1a, 0x38, 0xbb, 0xb4, 0xc0];
+        let tag1_float = vec![0xc1, 0xfb, 0x41, 0xcc, 0x5d, 0xda, 0x60, 0x40, 0x00, 0x00];
+        let tag1_nan = vec![0xc1, 0xf9, 0x7e, 0x00];
+        for (at, seen, valid) in [
+            (&tag0, &tag1_int, true),
+            (&tag0, &tag1_float, true),
+            (&tag1_int, &tag1_int, false),
+            (&tag0, &tag0, false),
+            (&tag0, &tag1_nan, false),
+        ] {
+            let bytes = [
+                &[0xa2, 0x62, b'a', b't'][..],
+                at,
+                &[0x64, b's', b'e', b'e', b'n'],
+                seen,
+            ]
+            .concat();
+            let result = unmarshal(&descriptor, &route, &bytes);
+            assert_eq!(
+                result.diagnostics.is_empty(),
+                valid,
+                "{bytes:02x?} {:?}",
+                result.diagnostics
+            );
+        }
     }
 
     #[test]

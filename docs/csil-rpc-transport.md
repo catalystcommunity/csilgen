@@ -238,20 +238,71 @@ handler/router. CSIL-RPC pins what `call` and the server put on the wire:
 The existing generated client transport seam is defined to produce exactly the
 above. Per `docs/cbor-wire-contract.md` and `csil-spec.md`, generators emit a
 `Transport`/`call(service, op, req)` shape per language; CSIL-RPC pins its
-behavior:
+behavior.
+
+The seam has two methods. Both use the verbatim CSIL service and operation
+names.
 
 - `call(service, op, req)` MUST encode a `CsilRpcRequest` per §1.1, deliver it via
-  the chosen carrier, read a `CsilRpcResponse`, and: on `status == 0` decode and
-  return the payload per `variant`; on non-zero `status` raise a transport error
-  carrying the code and `error` string.
+  the chosen carrier, read a `CsilRpcResponse`, and: on `status == 0` return the
+  payload; on non-zero `status` raise a transport error carrying the code and
+  `error` string.
+- `call_reply(service, op, req)` does the same, but on `status == 0` it returns
+  the `variant` (absent when the response has none) and the payload. The
+  spelling follows the language: `call_reply`, `callReply`, or `CallReply`.
 
-For an operation with declared errors, pass the handler result to the
-generated reply encoder. Use its variant and payload to build the response.
-On receipt, check the transport status first. For status zero, pass the
-service name, operation name, variant, and payload to the generated reply
-decoder. This decoder selects the declared error or returns the success
-payload. The C and Zig clients take the variant through their `call_reply`
-transport callback.
+The generated client uses `call_reply` for each operation with declared error
+arms (`op: Req -> Ok / Err`). It gives the variant and payload to the
+generated reply decoder. The decoder returns the success arm, or it gives the
+declared error arm through the language's error path. A missing or unknown
+variant is a decode error. The client uses `call` for every other operation.
+
+The seam has `call_reply` only when the specification has an operation with
+declared error arms. Then the method is required, so a transport that cannot
+give the variant fails at compile time, where the language permits. A
+specification with no such operation keeps a seam with `call` only. An
+operation `op: Req -> Resp / ServiceError` has a declared error arm, so its
+seam requires `call_reply`.
+
+| Target | Method | Returns |
+| --- | --- | --- |
+| Rust | `call_reply(&self, service, op, req)` (`async fn` in the async client) | `Result<WireReply, ClientError>`; `WireReply { variant: Option<String>, payload: Vec<u8> }` |
+| Go | `CallReply(ctx, service, op, req)` | `(WireReply, error)`; `WireReply{Variant *string; Payload []byte}` |
+| TypeScript | `callReply(service, op, req)` | `{ variant?: string \| null; payload: Uint8Array }` (a `Promise` in the async client) |
+| Python | `call_reply(service, op, req)` | `tuple[Optional[str], bytes]` |
+| Java and Kotlin | `callReply(service, op, req)` | `WireReply(variant, payload)` |
+| C# | `CallReply(service, op, req)` | `CsilWireReply(string? Variant, byte[] Payload)` (a `Task` in the async client) |
+| Swift | `callReply(service:op:request:)` | `(variant: String?, payload: [UInt8])` |
+| Dart | `callReply(service, op, req)` | `(String?, Uint8List)` |
+| Elixir | `call_reply/4` callback | `{String.t() \| nil, binary()}` |
+| Ruby | `call_reply(service, op, req)` | `[variant, payload]` |
+| OCaml | `call_reply` field of the client record (`make_client ~call ~call_reply`) | `(string option * bytes, string) result` |
+| PHP | `CsilReplyTransport::callReply($service, $op, $payload)` | `['variant' => ?string, 'payload' => string]` |
+| C and Zig | `call_reply` callback | `WireReply` |
+
+C and Zig give a runtime error when the `call_reply` callback is not set.
+
+On the server, pass the handler result to the generated reply encoder. Use its
+variant and payload to build the response. If the encoder returns an error
+(for example, a `timestamp` outside UTC years 0001 to 9999), send a response
+with status `6` (internal) and the error text in `error`. Do not stop the
+server, and do not close the connection without a response.
+
+The generated client encodes the request before it calls the seam. If the
+encoder returns an error, the client returns its encode error and does not
+call the transport. In Rust, this error is `ClientError::Encode`.
+
+In Rust, every generated encoder returns
+`Result<_, CsilCborError>`:
+
+| Encoder | Returns |
+| --- | --- |
+| `encode_<type>(&T)` | `Result<Vec<u8>, CsilCborError>` |
+| `encode_<stem>_reply(Result<Ok, Err>)` | `Result<(&'static str, Vec<u8>), CsilCborError>` |
+| `encode_<service>_<op>(&T)` (channel event) | `Result<(String, Vec<u8>), CsilCborError>` |
+
+The generated `resolve_rpc_reply` helper remains for transports that were
+written before `call_reply`. New transports do not need it.
 
 The reference libraries (`transports/<language>/`) provide
 ready implementations of this seam over all three carriers (HTTP, WebSocket,

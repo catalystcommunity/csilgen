@@ -3,6 +3,8 @@
 //! The client owns (de)serialization via the generated codec; the caller-supplied
 //! `ServiceTransport` only moves bytes (`call(service, op, req) -> bytes`). A
 //! unary method encodes its request, calls the transport, and decodes the response.
+//! An op with several reply arms calls `callReply` instead, which also returns the
+//! reply `variant`, so the client can raise a declared error arm itself.
 //! The `ClientShape` selects the seam: a sync client returns the decoded value
 //! directly (the host owns the I/O loop), an async client `await`s a
 //! `Promise`-returning seam and returns a `Promise` (for a `fetch`/WebSocket host).
@@ -45,16 +47,39 @@ const DEFAULT_AGGREGATE: &str = "ApiClient";
 // bytes. The generated client owns (de)serialization via the codec; the carrier only
 // moves bytes. The sync seam returns the bytes directly (the host owns the I/O loop);
 // the async seam returns a `Promise` so a `fetch`/WebSocket carrier fits unchanged.
-fn transport_iface(shape: ClientShape) -> String {
+//
+// `callReply` exists only when some op has several reply arms: bytes alone cannot
+// say which arm a payload holds, and the reply `variant` must not depend on a
+// hand-written carrier remembering to resolve it. Leaving it out otherwise keeps
+// every existing carrier source-compatible.
+fn transport_iface(shape: ClientShape, needs_reply: bool) -> String {
     let name = shape.transport_name();
-    let ret = if shape.is_async {
-        "Promise<Uint8Array>"
-    } else {
-        "Uint8Array"
+    let wrap = |ty: &str| {
+        if shape.is_async {
+            format!("Promise<{ty}>")
+        } else {
+            ty.to_string()
+        }
     };
-    format!(
-        "export interface {name} {{\n  call(service: string, op: string, req: Uint8Array): {ret};\n}}\n"
-    )
+    let ret = wrap("Uint8Array");
+    let mut out = format!(
+        "export interface {name} {{\n  call(service: string, op: string, req: Uint8Array): {ret};\n"
+    );
+    if needs_reply {
+        let reply = wrap("{ readonly variant?: string | null; readonly payload: Uint8Array }");
+        out.push_str(
+            "  /**\n\
+             \x20  * Perform an operation that declares more than one reply arm. Return the\n\
+             \x20  * CSIL-RPC response `variant` (the CSIL name of the arm) with its payload\n\
+             \x20  * bytes; the client decodes the arm that the variant names.\n\
+             \x20  */\n",
+        );
+        out.push_str(&format!(
+            "  callReply(service: string, op: string, req: Uint8Array): {reply};\n"
+        ));
+    }
+    out.push_str("}\n");
+    out
 }
 
 // Connection mode emits a Codec interface so the channel router can decode raw
@@ -162,7 +187,11 @@ pub fn generate(input: &WasmGeneratorInput, shape: ClientShape) -> Result<String
         out.push_str(&format!("export const WS_BASE_URL = {url:?};\n\n"));
     }
 
-    out.push_str(&transport_iface(shape));
+    let needs_reply = services
+        .iter()
+        .flat_map(|(_, def)| &def.operations)
+        .any(|op| op.rpc_reply_arms().is_some());
+    out.push_str(&transport_iface(shape, needs_reply));
     out.push('\n');
 
     if mode == BidiTransport::Connection
@@ -376,9 +405,21 @@ fn unary_method(
     throws.push("@throws transport errors (network, timeout) raised by the transport".into());
     let mut out = common::jsdoc(&op.doc_comments, &throws, "  ");
     out.push_str(&format!("  {async_kw}{method}({req_param}): {ret} {{\n"));
-    out.push_str(&format!(
-        "    const csilResp = {await_kw}this.t.call(\"{wire_service}\", \"{wire_method}\", {req_bytes});\n"
-    ));
+    if op.rpc_reply_arms().is_some() {
+        // `resolveRpcReply` throws the declared error arm's refusal, and rejects a
+        // missing or unknown variant, before the success decoder sees the payload.
+        codec_imports.insert("resolveRpcReply".to_string());
+        out.push_str(&format!(
+            "    const csilReply = {await_kw}this.t.callReply(\"{wire_service}\", \"{wire_method}\", {req_bytes});\n"
+        ));
+        out.push_str(&format!(
+            "    const csilResp = resolveRpcReply(\"{wire_service}\", \"{wire_method}\", csilReply.variant, csilReply.payload);\n"
+        ));
+    } else {
+        out.push_str(&format!(
+            "    const csilResp = {await_kw}this.t.call(\"{wire_service}\", \"{wire_method}\", {req_bytes});\n"
+        ));
+    }
     out.push_str(&format!("    return {decode_resp};\n"));
     out.push_str("  }\n");
     out

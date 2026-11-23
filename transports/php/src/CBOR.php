@@ -67,6 +67,9 @@ final class CBOR
             } else {
                 self::head($out, 0, $value);
             }
+        } elseif (is_float($value)) {
+            // Always binary64, so every float round-trips without a width choice.
+            $out .= chr(0xfb) . pack('E', $value);
         } elseif (is_string($value)) {
             self::head($out, 3, strlen($value));
             $out .= $value;
@@ -162,6 +165,24 @@ final class CBOR
             if ($info === 22) {
                 return null;
             }
+            if ($info === 25) {
+                self::need($bytes, $pos, 2);
+                $half = unpack('n', substr($bytes, $pos, 2))[1];
+                $pos += 2;
+                return self::halfToFloat($half);
+            }
+            if ($info === 26) {
+                self::need($bytes, $pos, 4);
+                $v = unpack('G', substr($bytes, $pos, 4))[1];
+                $pos += 4;
+                return $v;
+            }
+            if ($info === 27) {
+                self::need($bytes, $pos, 8);
+                $v = unpack('E', substr($bytes, $pos, 8))[1];
+                $pos += 8;
+                return $v;
+            }
             throw new CborException('unsupported simple value');
         }
 
@@ -203,12 +224,28 @@ final class CBOR
             return $map;
         }
         if ($major === 6) {
-            if ($arg === 1004 && (!isset($bytes[$pos]) || ord($bytes[$pos]) >> 5 !== 3)) {
-                throw new CborException('calendar date tag 1004 requires text');
+            // PHP holds byte and text strings in one type, so check the content major type here.
+            if (($arg === 0 || $arg === 1004) && (!isset($bytes[$pos]) || ord($bytes[$pos]) >> 5 !== 3)) {
+                throw new CborException('tag ' . $arg . ' requires text');
             }
             return new Tag($arg, self::decodeAt($bytes, $pos, $depth + 1));
         }
         throw new CborException('unsupported CBOR major type ' . $major);
+    }
+
+    // PHP has no half-precision unpack code. Every half value is exact in binary64.
+    private static function halfToFloat($half)
+    {
+        $exponent = ($half >> 10) & 0x1f;
+        $mantissa = $half & 0x3ff;
+        if ($exponent === 0) {
+            $value = $mantissa * (2.0 ** -24);
+        } elseif ($exponent === 31) {
+            $value = $mantissa === 0 ? INF : NAN;
+        } else {
+            $value = ($mantissa + 1024) * (2.0 ** ($exponent - 25));
+        }
+        return ($half & 0x8000) ? -$value : $value;
     }
 
     private static function argument($bytes, &$pos, $info)

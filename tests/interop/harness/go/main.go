@@ -9,6 +9,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -34,17 +35,17 @@ type cborCodec struct{}
 func (cborCodec) Encode(value any) ([]byte, error) {
 	switch v := value.(type) {
 	case interopapi.Tick:
-		return interopapi.EncodeTick(v), nil
+		return interopapi.EncodeTick(v)
 	case interopapi.Scalars:
-		return interopapi.EncodeScalars(v), nil
+		return interopapi.EncodeScalars(v)
 	case interopapi.Collections:
-		return interopapi.EncodeCollections(v), nil
+		return interopapi.EncodeCollections(v)
 	case interopapi.Constrained:
-		return interopapi.EncodeConstrained(v), nil
+		return interopapi.EncodeConstrained(v)
 	case interopapi.Nested:
-		return interopapi.EncodeNested(v), nil
+		return interopapi.EncodeNested(v)
 	case interopapi.EchoNestedResult:
-		return interopapi.EncodeEchoNestedResult(v), nil
+		return interopapi.EncodeEchoNestedResult(v)
 	default:
 		return nil, fmt.Errorf("codec: unsupported encode type %T", value)
 	}
@@ -93,6 +94,15 @@ func ts() time.Time {
 	return t.UTC()
 }
 
+// seenAt is SCALARS_OK.seen: 1782736496.5 on the wire, tag 1 around a float.
+func seenAt() time.Time {
+	t, err := time.Parse(time.RFC3339, "2026-06-29T12:34:56.500Z")
+	if err != nil {
+		panic(err)
+	}
+	return t.UTC()
+}
+
 func mustDecimal(s string) interopapi.CsilDecimal {
 	d, err := interopapi.ParseCsilDecimal(s)
 	if err != nil {
@@ -112,6 +122,7 @@ func scalarsOK() interopapi.Scalars {
 		Flag:   true,
 		Due:    "2000-02-29",
 		When:   ts(),
+		Seen:   seenAt(),
 		Amount: mustDecimal("123.45"),
 		// mixed-union coverage: a value equal to a literal arm must wire as
 		// [1,"pending"]; a value with no literal match must wire as [0,...].
@@ -321,22 +332,29 @@ type rpcTransport struct {
 	client *transport.RpcClient
 }
 
-func (t *rpcTransport) Call(_ context.Context, svc, op string, req []byte) ([]byte, error) {
+func (t *rpcTransport) Call(ctx context.Context, svc, op string, req []byte) ([]byte, error) {
+	reply, err := t.CallReply(ctx, svc, op, req)
+	return reply.Payload, err
+}
+
+// CallReply hands the generated client the reply variant, so the client itself maps
+// a declared error arm (ServiceError here) onto RPCApplicationError.
+func (t *rpcTransport) CallReply(_ context.Context, svc, op string, req []byte) (interopapi.WireReply, error) {
 	resp, err := t.client.Call(svc, op, req, nil)
 	if err != nil {
-		return nil, err
+		return interopapi.WireReply{}, err
 	}
-	// A status-0 reply whose variant is the ServiceError arm is a typed application
-	// error; surface it as an error (the carrier owns this mapping). Otherwise hand
-	// the success payload to the typed client.
-	if resp.Variant != nil && *resp.Variant == "ServiceError" {
-		se, derr := interopapi.DecodeServiceError(resp.Payload)
-		if derr != nil {
-			return nil, derr
-		}
-		return nil, fmt.Errorf("service error %d: %s", se.Code, se.Message)
+	return interopapi.WireReply{Variant: resp.Variant, Payload: resp.Payload}, nil
+}
+
+// replyOutcome turns an encoded handler result into a reply. A result with no
+// valid wire form is a server failure, so the peer gets status 6, not bytes that
+// it would refuse.
+func replyOutcome(variant string, payload []byte, err error) transport.HandlerOutcome {
+	if err != nil {
+		return transport.Transport(transport.StatusInternal, err.Error())
 	}
-	return resp.Payload, nil
+	return transport.Reply(variant, payload)
 }
 
 func rpcServer(ln net.Listener) {
@@ -359,7 +377,8 @@ func rpcServer(ln net.Listener) {
 				if herr != nil {
 					return transport.Transport(transport.StatusInternal, herr.Error())
 				}
-				return transport.Reply("Scalars", interopapi.EncodeScalars(r))
+				payload, eerr := interopapi.EncodeScalars(r)
+				return replyOutcome("Scalars", payload, eerr)
 			case "echo-collections":
 				v, derr := interopapi.DecodeCollections(req.Payload)
 				if derr != nil {
@@ -369,7 +388,8 @@ func rpcServer(ln net.Listener) {
 				if herr != nil {
 					return transport.Transport(transport.StatusInternal, herr.Error())
 				}
-				return transport.Reply("Collections", interopapi.EncodeCollections(r))
+				payload, eerr := interopapi.EncodeCollections(r)
+				return replyOutcome("Collections", payload, eerr)
 			case "echo-nested":
 				v, derr := interopapi.DecodeNested(req.Payload)
 				if derr != nil {
@@ -379,7 +399,8 @@ func rpcServer(ln net.Listener) {
 				if herr != nil {
 					return transport.Transport(transport.StatusInternal, herr.Error())
 				}
-				return transport.Reply("EchoNestedResult", interopapi.EncodeEchoNestedResult(r))
+				payload, eerr := interopapi.EncodeEchoNestedResult(r)
+				return replyOutcome("EchoNestedResult", payload, eerr)
 			case "echo-opt-bytes":
 				v, derr := interopapi.DecodeOptBytes(req.Payload)
 				if derr != nil {
@@ -389,7 +410,8 @@ func rpcServer(ln net.Listener) {
 				if herr != nil {
 					return transport.Transport(transport.StatusInternal, herr.Error())
 				}
-				return transport.Reply("OptBytes", interopapi.EncodeOptBytes(r))
+				payload, eerr := interopapi.EncodeOptBytes(r)
+				return replyOutcome("OptBytes", payload, eerr)
 			case "validate-constrained":
 				v, derr := interopapi.DecodeConstrained(req.Payload)
 				if derr != nil {
@@ -399,9 +421,11 @@ func rpcServer(ln net.Listener) {
 				if herr != nil {
 					// The typed error arm rides as a status-0 ServiceError variant.
 					se := interopapi.ServiceError{Code: 422, Message: herr.Error()}
-					return transport.Reply("ServiceError", interopapi.EncodeServiceError(se))
+					payload, eerr := interopapi.EncodeServiceError(se)
+					return replyOutcome("ServiceError", payload, eerr)
 				}
-				return transport.Reply("Constrained", interopapi.EncodeConstrained(r))
+				payload, eerr := interopapi.EncodeConstrained(r)
+				return replyOutcome("Constrained", payload, eerr)
 			default:
 				return transport.Transport(transport.StatusUnknownServiceOrOp, fmt.Sprintf("unknown op %s", req.Op))
 			}
@@ -445,8 +469,12 @@ func rpcClient(conn net.Conn) *cases {
 		c.check("validate-constrained/success", reflect.DeepEqual(r, constrainedOK()), fmt.Sprintf("mismatch: %+v", r))
 	}
 
-	if _, err := client.ValidateConstrained(ctx, constrainedBad()); err != nil {
+	// The typed error arm must surface as the declared ServiceError, not a transport error.
+	var refusal *interopapi.RPCApplicationError[interopapi.ServiceError]
+	if _, err := client.ValidateConstrained(ctx, constrainedBad()); errors.As(err, &refusal) {
 		c.pass("validate-constrained/failure")
+	} else if err != nil {
+		c.fail("validate-constrained/failure", "expected service error, got "+err.Error())
 	} else {
 		c.fail("validate-constrained/failure", "server accepted invalid input")
 	}
@@ -567,6 +595,34 @@ func eventsServer(ln net.Listener) {
 	}
 }
 
+// duplexCase sends Scalars on the duplex channel and expects the same value back.
+func duplexCase(c *cases, carrier *transport.StreamCarrier, codec cborCodec, svc *string) {
+	m, b, err := interopapi.EncodeInteropDuplex(codec, scalarsOK())
+	if err != nil {
+		c.fail("duplex/success", err.Error())
+		return
+	}
+	sendEvent(carrier, verboseEvent(svc, m, b))
+	f, err := carrier.RecvFrame()
+	if err != nil || f == nil {
+		c.fail("duplex/success", "no echo")
+		return
+	}
+	ev, derr := transport.DecodeEvent(f, transport.ProfileVerbose)
+	switch {
+	case derr != nil:
+		c.fail("duplex/success", derr.Error())
+	case ev.Event == nil || *ev.Event != "duplex":
+		c.fail("duplex/success", fmt.Sprintf("got %v", ev.Event))
+	default:
+		if s, serr := interopapi.DecodeScalars(ev.Payload); serr != nil {
+			c.fail("duplex/success", serr.Error())
+		} else {
+			c.check("duplex/success", reflect.DeepEqual(s, scalarsOK()), "echo mismatch")
+		}
+	}
+}
+
 func eventsClient(conn net.Conn) *cases {
 	c := newCases("events")
 	carrier := transport.NewStreamCarrier(conn)
@@ -626,23 +682,7 @@ func eventsClient(conn net.Conn) *cases {
 	c.check("on-tick/success", tickOK, detail)
 
 	// duplex: send Scalars, expect echo.
-	m, b, _ := interopapi.EncodeInteropDuplex(codec, scalarsOK())
-	sendEvent(carrier, verboseEvent(&svc, m, b))
-	if f, err := carrier.RecvFrame(); err == nil && f != nil {
-		if ev, derr := transport.DecodeEvent(f, transport.ProfileVerbose); derr == nil && ev.Event != nil && *ev.Event == "duplex" {
-			if s, serr := interopapi.DecodeScalars(ev.Payload); serr != nil {
-				c.fail("duplex/success", serr.Error())
-			} else {
-				c.check("duplex/success", reflect.DeepEqual(s, scalarsOK()), "echo mismatch")
-			}
-		} else if derr != nil {
-			c.fail("duplex/success", derr.Error())
-		} else {
-			c.fail("duplex/success", fmt.Sprintf("got %v", ev.Event))
-		}
-	} else {
-		c.fail("duplex/success", "no echo")
-	}
+	duplexCase(c, carrier, codec, &svc)
 
 	// unknown-method: send a bogus channel method, expect $error.
 	sendEvent(carrier, verboseEvent(&svc, "Bogus", []byte{}))
@@ -670,6 +710,17 @@ const (
 	opErrorSentinel   uint64 = 255
 )
 
+// echoDatagram builds the echo reply for one encoded payload. A payload with no
+// valid wire form gets the error sentinel.
+func echoDatagram(op, seq uint64) func([]byte, error) transport.Datagram {
+	return func(payload []byte, err error) transport.Datagram {
+		if err != nil {
+			return transport.NewDatagram(opErrorSentinel, seq, []byte{})
+		}
+		return transport.NewDatagram(op, seq, payload)
+	}
+}
+
 func datagramServer(conn *net.UDPConn) {
 	buf := make([]byte, 65536)
 	for {
@@ -685,13 +736,13 @@ func datagramServer(conn *net.UDPConn) {
 		switch dg.OpOrd {
 		case opEchoScalars:
 			if s, e := interopapi.DecodeScalars(dg.Payload); e == nil {
-				reply = transport.NewDatagram(opEchoScalars, dg.Seq, interopapi.EncodeScalars(s))
+				reply = echoDatagram(opEchoScalars, dg.Seq)(interopapi.EncodeScalars(s))
 			} else {
 				reply = transport.NewDatagram(opErrorSentinel, dg.Seq, []byte{})
 			}
 		case opEchoCollections:
 			if cl, e := interopapi.DecodeCollections(dg.Payload); e == nil {
-				reply = transport.NewDatagram(opEchoCollections, dg.Seq, interopapi.EncodeCollections(cl))
+				reply = echoDatagram(opEchoCollections, dg.Seq)(interopapi.EncodeCollections(cl))
 			} else {
 				reply = transport.NewDatagram(opErrorSentinel, dg.Seq, []byte{})
 			}
@@ -728,7 +779,9 @@ func datagramClient(conn *net.UDPConn) *cases {
 		return transport.DecodeDatagram(buf[:n])
 	}
 
-	if d, err := roundtrip(opEchoScalars, 1, interopapi.EncodeScalars(scalarsOK())); err != nil {
+	if payload, err := interopapi.EncodeScalars(scalarsOK()); err != nil {
+		c.fail("echo-scalars/success", err.Error())
+	} else if d, err := roundtrip(opEchoScalars, 1, payload); err != nil {
 		c.fail("echo-scalars/success", err.Error())
 	} else if d.OpOrd != opEchoScalars {
 		c.fail("echo-scalars/success", fmt.Sprintf("op_ord %d", d.OpOrd))
@@ -738,7 +791,9 @@ func datagramClient(conn *net.UDPConn) *cases {
 		c.check("echo-scalars/success", reflect.DeepEqual(s, scalarsOK()), "payload mismatch")
 	}
 
-	if d, err := roundtrip(opEchoCollections, 2, interopapi.EncodeCollections(collectionsOK())); err != nil {
+	if payload, err := interopapi.EncodeCollections(collectionsOK()); err != nil {
+		c.fail("echo-collections/success", err.Error())
+	} else if d, err := roundtrip(opEchoCollections, 2, payload); err != nil {
 		c.fail("echo-collections/success", err.Error())
 	} else if d.OpOrd != opEchoCollections {
 		c.fail("echo-collections/success", fmt.Sprintf("op_ord %d", d.OpOrd))

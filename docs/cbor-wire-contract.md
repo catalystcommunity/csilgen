@@ -65,12 +65,17 @@ every party encodes the map keys `uuid`, `current_state`, `payload` — never
 | `float*`      | float                                  |
 | `date`        | **tag 1004** + `YYYY-MM-DD` text        |
 | `timestamp`   | **tag 0** + RFC3339 text string, UTC   |
+| `cddl_time`   | **tag 1** + epoch seconds (int or float) |
 | `decimal`     | **tag 4** decimal fraction `[exp, mant]`|
 
 `bytes` MUST encode as a CBOR byte string (major type 2), not an array of
 integers. Rust achieves this with `#[serde(with = "serde_bytes")]` (emitted
 automatically); Go's `[]byte` does this under `fxamacker/cbor` automatically;
 Python `bytes` and TypeScript `Uint8Array` map to the same.
+
+A `float*` field decodes a half, single, or double precision float. Encode
+writes a double precision float. A target that cannot hold NaN or an infinity
+(Elixir) refuses it with a decode error.
 
 ## Tagged core types
 
@@ -100,25 +105,149 @@ C#, use years 0001 through 9999.
 
 ### `timestamp` — CBOR tag 0, always UTC
 
-A `timestamp` encodes as **tag 0** (standard date/time string, RFC 3339) wrapping
-a text string. The instant is **always serialized in UTC** with a `Z` offset
-(e.g. `2024-01-02T03:04:05Z`); a generator MUST normalize any local time to UTC
-before encoding. Sub-second precision is preserved when present. Decoders SHOULD
-also accept tag 1 (epoch) on input but MUST emit tag 0.
+A `timestamp` is an instant. Encode it as **tag 0** around an RFC 3339 text
+string. Every target uses the same strict rules, so a value that one peer
+refuses is refused by all peers.
 
-In-memory mappings (each is a UTC-typed instant where the language allows):
+**Decode.** Accept only tag 0 around a text string with this form:
 
-| Target     | Type                                |
-| ---------- | ----------------------------------- |
-| Rust       | `time::OffsetDateTime`              |
-| Go         | `time.Time` (kept in UTC)           |
-| TypeScript | `Date` (UTC-based)                  |
-| Python     | `datetime.datetime` (tz-aware, UTC) |
-| JSON/OpenAPI schema | `{"type":"string","format":"date-time"}` |
+```text
+YYYY-MM-DD ("T" / "t") hh:mm:ss [ "." 1*9DIGIT ] ( "Z" / "z" / ("+" / "-") hh:mm )
+```
 
-The Rust decoder converts each timestamp to UTC. It rejects a leap second
-because `time::OffsetDateTime` cannot represent it. The Rust encoder writes
-zero, three, six, or nine fractional digits to preserve nanosecond precision.
+- All digits are ASCII. Each field has the exact number of digits shown.
+- The month is 01–12. The day exists in that month of the Gregorian calendar.
+- The hour is 00–23, the minute is 00–59, and the second is 00–59. A leap
+  second (`60`) is an error.
+- An offset hour is 00–23 and an offset minute is 00–59.
+- The year is 0001–9999 as written, and also after conversion to UTC.
+- The fraction has one to nine digits. If the target type cannot hold a
+  digit that is not zero, decoding fails. A decoder never rounds or cuts a
+  fraction.
+
+Any other value is a decode error: no tag, tag 1 (epoch, use `cddl_time`), a different tag,
+content that is not text, a space for `T`, no offset, or extra characters.
+A decoder reports the error through the codec's normal decode error. It
+never returns a sentinel value such as an Invalid Date.
+
+**Encode.** Convert the instant to UTC and write uppercase `T` and `Z`. Write
+no fraction when it is zero. Otherwise write three, six, or nine digits: the
+fewest of these that hold the value exactly. Thus every target writes the
+same bytes for the same instant.
+
+| Instant | Encoded text |
+| --- | --- |
+| 12:00 UTC | `2000-02-29T12:00:00Z` |
+| 12:00 UTC plus 0.5 s | `2000-02-29T12:00:00.500Z` |
+| 12:00 UTC plus 500 µs | `2000-02-29T12:00:00.000500Z` |
+| `2000-02-29T13:30:00+01:30` after decode | `2000-02-29T12:00:00Z` |
+
+The vectors in `tests/interop/timestamp-vectors/vectors.tsv` hold these
+rules. Run `tests/interop/timestamp-vectors/check.sh <target>` to check one
+target.
+
+In-memory mappings and the fraction digits each target holds:
+
+| Target     | Type                                | Digits |
+| ---------- | ----------------------------------- | ------ |
+| Rust       | `time::OffsetDateTime`              | 9      |
+| Go         | `time.Time` (kept in UTC)           | 9      |
+| TypeScript | `Date` (UTC-based)                  | 3      |
+| Python     | `datetime.datetime` (tz-aware, UTC) | 6      |
+| Java and Kotlin | `java.time.Instant`            | 9      |
+| C#         | `System.DateTimeOffset` (UTC ticks) | 7      |
+| Swift      | Canonical UTC RFC 3339 `String` (checked and rewritten on encode and decode) | 9 |
+| Dart       | `DateTime` (UTC)                    | 6 (3 on the web) |
+| Elixir     | `DateTime` (`Etc/UTC`)              | 6      |
+| C          | `CsilTimestamp` (canonical UTC text in `rfc3339`, plus `epoch_seconds`) | 9 |
+| Zig        | `CsilTimestamp` (canonical UTC text in `rfc3339`, plus `epoch_seconds`) | 9 |
+| Ruby       | `Time` (UTC on encode)              | 9      |
+| OCaml      | Canonical UTC RFC 3339 `string` (checked and rewritten on encode and decode) | 9 |
+| PHP        | `\DateTimeImmutable` (UTC on decode; encode also accepts `\DateTime`) | 6 |
+| JSON/OpenAPI schema | `{"type":"string","format":"date-time"}` | — |
+
+C# holds 100 ns ticks, so fraction digits 8 and 9 must be zero. It writes a
+value with seven significant digits as nine digits. Dart on the web holds
+milliseconds and refuses a finer fraction.
+
+C, Zig, OCaml, and Swift keep the timestamp as text. Decode writes the canonical UTC text, so
+equal instants have equal text. In C and Zig, the text is in `rfc3339`, and
+decode also sets `epoch_seconds`. Encode reads only the text. It writes the canonical form of that text, and it fails
+if the text does not obey the decode rules.
+
+### `cddl_time` — CBOR tag 1, epoch seconds
+
+A `cddl_time` is an instant, as in the CDDL prelude `time = #6.1(number)`.
+Use it to exchange data with a peer that sends epoch seconds, for example a
+sensor. Use `timestamp` for all other instants, because a float cannot hold
+all fractions exactly. Each target uses the same in-memory type for
+`cddl_time` and `timestamp`. Only the wire form is different.
+
+**Decode.** Accept only tag 1 around an integer (major type 0 or 1) or a
+float (half, single, or double precision). Any other value is a decode error:
+no tag, tag 0, a different tag, or content that is not a number.
+
+- An integer is a count of whole seconds since `1970-01-01T00:00:00Z`. A
+  decoder must not wrap a large integer. For example, `3b ffffffffffffffff`
+  (−2^64) is a decode error, not 0.
+- A float must be finite. Convert it to binary64 first. Then calculate the
+  seconds and the fraction units with binary64 arithmetic. `p` is the number
+  of fraction digits that the target holds:
+
+  ```text
+  seconds = floor(value)
+  units   = floor((value - seconds) * 10^p + 0.5)
+  if units == 10^p: seconds = seconds + 1, units = 0
+  ```
+
+  Do the multiplication and the addition as two operations. Do not fuse them
+  into one multiply-add, because a fused operation can give a different
+  result. Before the calculation, refuse a value below `FIRST - 1` or above
+  `LAST + 1`, so that the conversion to an integer cannot overflow.
+- After the conversion, `seconds` must be from `FIRST = -62135596800`
+  (`0001-01-01T00:00:00Z`) to `LAST = 253402300799` (`9999-12-31T23:59:59Z`).
+  This check decides the range. The first check only prevents an overflow,
+  so `FIRST - 0.5` passes it and then fails this check.
+
+**Encode.** Write tag 1. If the fraction is zero, write the seconds as the
+shortest integer. Otherwise write a double-precision float (`0xfb`) with the
+value `seconds + units / 10^p`. Calculate the division and then the addition
+in binary64. A target that holds more digits than another can write different
+bytes for the same input, because it keeps more of the fraction.
+Near the present epoch, the step between two binary64 values is about
+1.2e-7 s. Thus, at `p` of 7 or more, a fraction usually changes a little after
+one round trip. For example, `.000500` seconds comes back as `.000499964`
+seconds at `p = 9`. Use `timestamp` when the fraction must be exact.
+
+Encode fails if the instant is outside `FIRST` to `LAST`, or if it has a
+digit that is not zero after digit `p`. Encode returns the codec's normal
+error. The same applies to `timestamp`. A typed JSON helper writes the same
+number that the CBOR encode writes.
+
+| Value on the wire | Decoded at 3 digits | Encoded again |
+| --- | --- | --- |
+| `1(951825600)` | `2000-02-29T12:00:00Z` | `1(951825600)` |
+| `1(951825600.5)` | `2000-02-29T12:00:00.500Z` | `1(951825600.5)` |
+| `1(951825600.0)` | `2000-02-29T12:00:00Z` | `1(951825600)` |
+| `1(1.0005)` | `1970-01-01T00:00:01Z` | `1(1)` |
+
+The binary64 value nearest to 1.0005 is a little less than 1.0005, so it
+rounds down to zero milliseconds.
+
+The `p` value of a target is the "Digits" column of the `timestamp` table.
+Dart on the web uses `p = 3`. A tag 1 inside an `any` value is kept as it
+is, with no check. Only a declared `cddl_time` field applies these rules. TypeScript decodes an integer and a float to
+the same `number`, so it uses the float path for both. The result is the same,
+because an integer has a zero fraction.
+Text-based targets (C, Zig, OCaml, and Swift) use `p = 9`, and decode writes
+the canonical UTC text. Encode reads that text with the `timestamp` decode
+rules. The JSON Schema and OpenAPI view of a `cddl_time` is
+`{"type":"number"}`.
+
+The vectors in `tests/interop/epoch-vectors/vectors.tsv` hold these rules. The
+`digits` column is `*` for a row that applies to all targets. Otherwise the row
+applies only to a target with that `p`. Run
+`tests/interop/epoch-vectors/check.sh <target>` to check one target.
 
 ### `decimal` — CBOR tag 4, exact
 
@@ -146,6 +275,12 @@ options {
 | TypeScript | generated `CsilDecimal`             | `Decimal` (`decimal.js`)            |
 | Python     | `decimal.Decimal` (always)          | `decimal.Decimal` (always)          |
 | JSON/OpenAPI schema | `{"type":"string","format":"decimal"}` (exact text) | same |
+
+OCaml and Swift have no decimal type. They keep a `decimal` as exact text
+(`"123.45"`) and write tag 4 on the wire. Encode accepts an optional sign,
+digits, and an optional fraction. The mantissa must fit in 64 bits. Swift
+decode refuses an exponent outside -1024 to 1024, because each unit of the
+exponent becomes one character of text.
 
 Unknown `decimal_mapping` values are a hard generation error (same validate-early
 idiom as `ts_bidirectional_transport`). The wire form (tag 4) is identical for
@@ -226,6 +361,37 @@ value).
 All code generators must use these rules. Preserve the declared order of the
 arms, including literal arms of different types.
 
+## Group references, sockets and plugs
+
+These rules agree with the schema diagnostic (`csilgen-schema`), which is the
+reference reader. Every generator applies them before it hoists
+(`crates/csilgen-common/src/splice.rs`).
+
+- **Group reference in a record.** A record entry that has no key and names a
+  group rule adds the entries of that group to the record, at that position.
+  `R = { shared_fields, b: bool }` with `shared_fields = (shared_id: uint)` is
+  a map with the keys `shared_id` and `b`. There is no `shared_fields` key.
+- **Optional or repeated group reference.** `? g` and `* g` stay as written,
+  because one record field cannot hold an all-or-nothing group.
+- **Tuple element.** A keyless entry in an array (`[g, M]`) is one positional
+  element. It is not spliced.
+- **Socket and plug.** `$name` and `$$name` refer to the rule `name`. CSIL has
+  no syntax yet to add alternatives to a socket (`$name /= ...`).
+- **Unfilled socket.** A `$name` with no rule `name` accepts any value
+  (`any`). A `$$name` with no rule `name` adds no entries.
+
+### Prelude constants used as types
+
+The CDDL prelude defines some constants as types. A field of one of these
+types holds only that constant.
+
+| CSIL type          | CBOR                          |
+| ------------------ | ----------------------------- |
+| `true`             | simple value 21 (`0xf5`)      |
+| `false`            | simple value 20 (`0xf4`)      |
+| `null` / `nil`     | simple value 22 (`0xf6`)      |
+| `undefined`        | written as `0xf6`; `0xf7` is read as null |
+
 ## Inline composite hoisting (generated-surface naming)
 
 A group or choice written **inline** — directly in a field, array element, map
@@ -271,7 +437,13 @@ ways:
 
 - **Wrong CBOR major type** for the field/type (e.g. a text string where the
   declaration is `bytes`, or a map where an array is expected).
-- **Wrong or missing semantic tag** (`date` requires tag 1004, `timestamp` uses tag 0, and `decimal` requires tag 4).
+- **Integer out of range for the target type.** A decoder never changes an
+  integer into a different value. If the target type cannot hold the value,
+  decoding fails. For example, a signed 64-bit `int` refuses a major type 0
+  argument of 2^63 or more, and a major type 1 argument of 2^63 or more.
+  (Java keeps a `uint` in a `long` as unsigned bits. That is not a wrap,
+  because it encodes back to the same value.)
+- **Wrong or missing semantic tag** (`date` requires tag 1004, `timestamp` requires tag 0, `cddl_time` requires tag 1, and `decimal` requires tag 4).
 - **Enum value not in the declared literal vocabulary** (see "Choices" above).
 - **Union `variant_index` out of range, or a literal arm's payload not equal to
   the literal it is declared to be.**

@@ -83,6 +83,17 @@ final class RoundtripTests: XCTestCase {
             try decodeEnvelope([0x3b, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff]))
     }
 
+    func testTextStringMustBeValidUtf8() throws {
+        // 0xc3 opens a two-byte sequence that 0x28 does not continue.
+        XCTAssertThrowsError(try decodeEnvelope([0x62, 0xc3, 0x28]))
+        // A lone continuation byte, and an overlong encoding of "/".
+        XCTAssertThrowsError(try decodeEnvelope([0x61, 0x80]))
+        XCTAssertThrowsError(try decodeEnvelope([0x62, 0xc0, 0xaf]))
+        // U+FFFD written as real bytes is valid, so the round-trip check must keep it.
+        XCTAssertEqual(try decodeEnvelope([0x63, 0xef, 0xbf, 0xbd]), .text("\u{FFFD}"))
+        XCTAssertEqual(try decodeEnvelope([0x62, 0xc3, 0xa9]), .text("é"))
+    }
+
     func testCanonicalMapOrderingIsIndependentOfAppendOrder() {
         let a = canonMap([
             CBOREntry(key: .text("service"), value: .text("World")),

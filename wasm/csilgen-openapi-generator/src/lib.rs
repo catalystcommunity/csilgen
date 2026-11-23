@@ -728,6 +728,8 @@ impl OpenApiGenerator {
                 "type": "string",
                 "format": "date-time"
             }),
+            // CBOR tag 1 around epoch seconds, so the JSON view is that number.
+            "cddl_time" => json!({"type": "number"}),
             // CBOR tag 4 decimal fraction on the wire, but exact base-10 carried
             // as text in JSON so no float rounding is introduced.
             "decimal" => json!({
@@ -1578,6 +1580,15 @@ mod tests {
         assert_eq!(generator.builtin_type_to_schema("bool")["type"], "boolean");
         assert_eq!(generator.builtin_type_to_schema("bytes")["type"], "string");
         assert_eq!(generator.builtin_type_to_schema("bytes")["format"], "byte");
+    }
+
+    #[test]
+    fn cddl_time_schema_is_epoch_seconds() {
+        let generator = OpenApiGenerator::new(&create_test_config());
+        assert_eq!(
+            generator.builtin_type_to_schema("cddl_time"),
+            json!({"type": "number"})
+        );
     }
 
     #[test]

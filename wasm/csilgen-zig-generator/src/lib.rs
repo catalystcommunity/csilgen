@@ -900,17 +900,19 @@ fn len_check(out: &mut String, field: &str, optional: bool, op: &str, n: u64) {
     }
 }
 
-/// A numeric comparison. The read is cast to `i64` so a negative bound compared
-/// against an unsigned field never trips Zig's signedness mismatch; an optional
-/// field is captured behind a guard.
+/// A numeric comparison. The read widens to `i128`, which holds every `u64` and
+/// `i64`, so a negative bound against an unsigned field never trips Zig's
+/// signedness mismatch. An `@intCast` to `i64` would panic on a `uint` above
+/// `maxInt(i64)` that came from a payload. An optional field is captured behind a
+/// guard.
 fn numeric_check(out: &mut String, field: &str, optional: bool, op: &str, n: i64) {
     if optional {
         out.push_str(&format!(
-            "    if (v.{field}) |x| {{\n        if (@as(i64, @intCast(x)) {op} {n}) return false;\n    }}\n"
+            "    if (v.{field}) |x| {{\n        if (@as(i128, x) {op} {n}) return false;\n    }}\n"
         ));
     } else {
         out.push_str(&format!(
-            "    if (@as(i64, @intCast(v.{field})) {op} {n}) return false;\n"
+            "    if (@as(i128, v.{field}) {op} {n}) return false;\n"
         ));
     }
 }
@@ -1099,7 +1101,10 @@ fn emit_enc_value(
                 "{indent}try w_tag(out, 1004);\n{indent}try w_text(out, try calendar_date({expr}));\n"
             )),
             "timestamp" => out.push_str(&format!(
-                "{indent}try w_tag(out, 0);\n{indent}try w_text(out, ({expr}).rfc3339);\n"
+                "{indent}try csil_w_timestamp(out, ({expr}).rfc3339);\n"
+            )),
+            "cddl_time" => out.push_str(&format!(
+                "{indent}try csil_w_epoch(out, ({expr}).rfc3339);\n"
             )),
             "decimal" => out.push_str(&format!(
                 "{indent}try w_tag(out, 4);\n{indent}try w_array_head(out, 2);\n\
@@ -1223,9 +1228,13 @@ fn emit_dec_value(
             "date" => out.push_str(&format!(
                 "{indent}{dst} = try calendar_date(try as_tagged_text({src}, 1004));\n"
             )),
-            "timestamp" => out.push_str(&format!(
-                "{indent}{dst} = .{{ .rfc3339 = try as_tagged_text({src}, 0), .epoch_seconds = 0 }};\n"
-            )),
+            "timestamp" | "cddl_time" => {
+                let reader = if name == "timestamp" { "timestamp" } else { "epoch" };
+                out.push_str(&format!(
+                    "{indent}{{\n{indent}    const csil_ts = try csil_as_{reader}(alloc, {src});\n\
+                     {indent}    {dst} = .{{ .rfc3339 = csil_ts.rfc3339, .epoch_seconds = csil_ts.epoch_seconds }};\n{indent}}}\n"
+                ))
+            }
             "decimal" => out.push_str(&format!(
                 "{indent}{{\n{indent}    const csil_d = try as_decimal({src});\n\
                  {indent}    {dst} = .{{ .exponent = csil_d.exp, .mantissa = csil_d.mant }};\n{indent}}}\n"
@@ -1662,7 +1671,9 @@ fn emit_dec_field(
                     "        }} else {{\n            out.{member} = null;\n        }}\n    }}\n"
                 ));
             } else {
-                out.push_str(&format!("        const csil_fv = try req(m, \"{key}\");\n"));
+                out.push_str(&format!(
+                    "        const csil_fv = try csil_required_field(m, \"{key}\");\n"
+                ));
                 out.push_str("        if (csil_fv != .array) return error.WrongType;\n");
                 out.push_str(&format!(
                     "        out.{member} = try alloc.alloc({elem}, csil_fv.array.len);\n"
@@ -1705,7 +1716,9 @@ fn emit_dec_field(
                     "        }} else {{\n            out.{member} = null;\n        }}\n    }}\n"
                 ));
             } else {
-                out.push_str(&format!("        const csil_fv = try req(m, \"{key}\");\n"));
+                out.push_str(&format!(
+                    "        const csil_fv = try csil_required_field(m, \"{key}\");\n"
+                ));
                 out.push_str("        if (csil_fv != .map) return error.WrongType;\n");
                 out.push_str(&format!("        out.{member} = .{{}};\n"));
                 out.push_str("        for (csil_fv.map) |csil_kv| {\n");
@@ -1750,7 +1763,9 @@ fn emit_dec_field(
                     "        }} else {{\n            out.{member} = null;\n        }}\n    }}\n"
                 ));
             } else {
-                out.push_str(&format!("        const csil_fv = try req(m, \"{key}\");\n"));
+                out.push_str(&format!(
+                    "        const csil_fv = try csil_required_field(m, \"{key}\");\n"
+                ));
                 emit_dec_value(
                     out,
                     "        ",
@@ -1788,6 +1803,7 @@ fn emit_record_codec(
             resolved,
             CsilTypeExpression::Array { .. } | CsilTypeExpression::Map { .. }
         ) || matches!(resolved, CsilTypeExpression::Reference(n) if has_codec(n, codec_names))
+            || dec_value_uses_alloc(f.value_type, codec_names, aliases)
     });
 
     out.push_str(&format!(
@@ -2038,6 +2054,9 @@ fn dec_value_uses_alloc(
     match resolve_alias(ty, aliases) {
         CsilTypeExpression::Reference(n) => has_codec(n, codec_names),
         CsilTypeExpression::Array { .. } | CsilTypeExpression::Map { .. } => true,
+        // Normalizing a non-canonical timestamp copies its text into the allocator,
+        // and an epoch value always needs its text written there.
+        CsilTypeExpression::Builtin(n) => n == "timestamp" || n == "cddl_time",
         CsilTypeExpression::Tuple(g) => g
             .entries
             .iter()
@@ -2581,7 +2600,7 @@ fn map_zig_type(type_expr: &CsilTypeExpression, type_prefix: &str) -> String {
             "bytes" | "bstr" => "[]const u8".to_string(),
             "bool" | "true" | "false" => "bool".to_string(),
             "date" => "[]const u8".to_string(),
-            "timestamp" => format!("{type_prefix}CsilTimestamp"),
+            "timestamp" | "cddl_time" => format!("{type_prefix}CsilTimestamp"),
             "decimal" => format!("{type_prefix}CsilDecimal"),
             // `any` holds an arbitrary decoded CBOR value (the codec's value tree),
             // passed through unchanged on the wire.
@@ -3609,7 +3628,11 @@ fn type_is_map(type_expr: &CsilTypeExpression) -> bool {
 
 fn type_uses_builtin(type_expr: &CsilTypeExpression, builtin: &str) -> bool {
     match type_expr {
-        CsilTypeExpression::Builtin(n) => n == builtin,
+        // `cddl_time` shares the `timestamp` in-memory type, so a spec that uses
+        // only `cddl_time` still needs the `CsilTimestamp` helper file.
+        CsilTypeExpression::Builtin(n) => {
+            n == builtin || (builtin == "timestamp" && n == "cddl_time")
+        }
         CsilTypeExpression::Reference(_) => false,
         CsilTypeExpression::Array { element_type, .. } => type_uses_builtin(element_type, builtin),
         CsilTypeExpression::Map { key, value, .. } => {
@@ -4168,7 +4191,7 @@ fn mget(m: Value, key: []const u8) ?Value {
     return null;
 }
 
-fn req(m: Value, key: []const u8) CodecError!Value {
+fn csil_required_field(m: Value, key: []const u8) CodecError!Value {
     return mget(m, key) orelse error.MissingField;
 }
 
@@ -4237,6 +4260,200 @@ fn as_tagged_text(v: Value, num: u64) CodecError![]const u8 {
     return v.tag.content.text;
 }
 
+/// The longest canonical timestamp: `YYYY-MM-DDThh:mm:ss.fffffffffZ`.
+const csil_timestamp_max_len = 30;
+
+const CsilTimestampParts = struct { rfc3339: []const u8, epoch_seconds: i64 };
+
+fn csil_timestamp_digits(s: []const u8, at: usize, width: usize) CodecError!i64 {
+    if (at + width > s.len) return error.WrongType;
+    var v: i64 = 0;
+    for (s[at .. at + width]) |c| {
+        if (c < '0' or c > '9') return error.WrongType;
+        v = v * 10 + (c - '0');
+    }
+    return v;
+}
+
+fn csil_days_from_civil(year: i64, month: i64, day: i64) i64 {
+    const y = if (month <= 2) year - 1 else year;
+    const era = @divFloor(y, 400);
+    const yoe = y - era * 400;
+    const doy = @divFloor(153 * @mod(month + 9, 12) + 2, 5) + day - 1;
+    const doe = yoe * 365 + @divFloor(yoe, 4) - @divFloor(yoe, 100) + doy;
+    return era * 146097 + doe - 719468;
+}
+
+fn csil_timestamp_put(buf: []u8, at: usize, value: i64, width: usize) void {
+    var v: u64 = @intCast(value);
+    var k = width;
+    while (k > 0) {
+        k -= 1;
+        buf[at + k] = '0' + @as(u8, @intCast(v % 10));
+        v /= 10;
+    }
+}
+
+/// `0001-01-01T00:00:00Z` and `9999-12-31T23:59:59Z` as epoch seconds.
+const csil_epoch_first: i64 = -62135596800;
+const csil_epoch_last: i64 = 253402300799;
+
+const CsilInstant = struct { seconds: i64, nanos: i64 };
+
+/// Reads the strict RFC 3339 form of the wire contract into UTC epoch seconds and
+/// nanoseconds. The year must be 0001 to 9999 after conversion to UTC.
+fn csil_timestamp_parse(s: []const u8) CodecError!CsilInstant {
+    if (s.len < 20 or s[4] != '-' or s[7] != '-' or (s[10] != 'T' and s[10] != 't') or
+        s[13] != ':' or s[16] != ':') return error.WrongType;
+    const year = try csil_timestamp_digits(s, 0, 4);
+    const month = try csil_timestamp_digits(s, 5, 2);
+    const day = try csil_timestamp_digits(s, 8, 2);
+    const hour = try csil_timestamp_digits(s, 11, 2);
+    const minute = try csil_timestamp_digits(s, 14, 2);
+    const second = try csil_timestamp_digits(s, 17, 2);
+    const leap = @mod(year, 4) == 0 and (@mod(year, 100) != 0 or @mod(year, 400) == 0);
+    const days = [_]i64{ 31, if (leap) 29 else 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 };
+    if (year < 1 or month < 1 or month > 12 or day < 1 or day > days[@intCast(month - 1)]) return error.WrongType;
+    if (hour > 23 or minute > 59 or second > 59) return error.WrongType;
+    var i: usize = 19;
+    var nanos: i64 = 0;
+    if (s[i] == '.') {
+        i += 1;
+        const start = i;
+        while (i < s.len and s[i] >= '0' and s[i] <= '9') : (i += 1) {}
+        var width = i - start;
+        if (width < 1 or width > 9) return error.WrongType;
+        nanos = try csil_timestamp_digits(s, start, width);
+        while (width < 9) : (width += 1) nanos *= 10;
+    }
+    if (i >= s.len) return error.WrongType;
+    var offset: i64 = 0;
+    if ((s[i] == '+' or s[i] == '-') and i + 6 == s.len and s[i + 3] == ':') {
+        const oh = try csil_timestamp_digits(s, i + 1, 2);
+        const om = try csil_timestamp_digits(s, i + 4, 2);
+        if (oh > 23 or om > 59) return error.WrongType;
+        offset = oh * 3600 + om * 60;
+        if (s[i] == '-') offset = -offset;
+    } else if ((s[i] != 'Z' and s[i] != 'z') or i + 1 != s.len) {
+        return error.WrongType;
+    }
+    const utc = csil_days_from_civil(year, month, day) * 86400 + hour * 3600 + minute * 60 + second - offset;
+    if (utc < csil_epoch_first or utc > csil_epoch_last) return error.WrongType;
+    return .{ .seconds = utc, .nanos = nanos };
+}
+
+/// Writes the canonical UTC text for an instant already known to lie in years
+/// 0001 to 9999, so that both wire forms produce the same text.
+fn csil_timestamp_write(utc: i64, nanos: i64, buf: *[csil_timestamp_max_len]u8) []const u8 {
+    const z = @divFloor(utc, 86400) + 719468;
+    const sod = @mod(utc, 86400);
+    const era = @divFloor(z, 146097);
+    const doe = z - era * 146097;
+    const yoe = @divFloor(doe - @divFloor(doe, 1460) + @divFloor(doe, 36524) - @divFloor(doe, 146096), 365);
+    const doy = doe - (365 * yoe + @divFloor(yoe, 4) - @divFloor(yoe, 100));
+    const mp = @divFloor(5 * doy + 2, 153);
+    const d = doy - @divFloor(153 * mp + 2, 5) + 1;
+    const m = if (mp < 10) mp + 3 else mp - 9;
+    const y = yoe + era * 400 + @as(i64, if (m <= 2) 1 else 0);
+    csil_timestamp_put(buf, 0, y, 4);
+    buf[4] = '-';
+    csil_timestamp_put(buf, 5, m, 2);
+    buf[7] = '-';
+    csil_timestamp_put(buf, 8, d, 2);
+    buf[10] = 'T';
+    csil_timestamp_put(buf, 11, @divFloor(sod, 3600), 2);
+    buf[13] = ':';
+    csil_timestamp_put(buf, 14, @mod(@divFloor(sod, 60), 60), 2);
+    buf[16] = ':';
+    csil_timestamp_put(buf, 17, @mod(sod, 60), 2);
+    var len: usize = 19;
+    if (nanos != 0) {
+        // The fewest of 3, 6, or 9 digits that hold the value exactly, so every
+        // peer writes the same bytes for the same instant.
+        const width: usize = if (@mod(nanos, 1_000_000) == 0) 3 else if (@mod(nanos, 1000) == 0) 6 else 9;
+        const scaled = if (width == 3) @divFloor(nanos, 1_000_000) else if (width == 6) @divFloor(nanos, 1000) else nanos;
+        buf[len] = '.';
+        csil_timestamp_put(buf, len + 1, scaled, width);
+        len += 1 + width;
+    }
+    buf[len] = 'Z';
+    return buf[0 .. len + 1];
+}
+
+/// Validates the strict RFC 3339 form of the wire contract and writes the canonical
+/// UTC spelling into `buf`, so equal instants compare equal as text.
+fn csil_timestamp_text(s: []const u8, buf: *[csil_timestamp_max_len]u8, epoch: *i64) CodecError![]const u8 {
+    const instant = try csil_timestamp_parse(s);
+    epoch.* = instant.seconds;
+    return csil_timestamp_write(instant.seconds, instant.nanos, buf);
+}
+
+/// Decoded text that is already canonical is borrowed as is; only a value that
+/// needs normalizing costs an allocation.
+fn csil_as_timestamp(alloc: std.mem.Allocator, v: Value) CodecError!CsilTimestampParts {
+    const raw = try as_tagged_text(v, 0);
+    var buf: [csil_timestamp_max_len]u8 = undefined;
+    var epoch: i64 = 0;
+    const canonical = try csil_timestamp_text(raw, &buf, &epoch);
+    const text = if (std.mem.eql(u8, canonical, raw)) raw else try alloc.dupe(u8, canonical);
+    return .{ .rfc3339 = text, .epoch_seconds = epoch };
+}
+
+/// A caller-built value is normalized too, so the wire never carries an offset,
+/// lowercase separators, or a non-minimal fraction.
+fn csil_w_timestamp(out: *std.ArrayList(u8), text: []const u8) CodecError!void {
+    var buf: [csil_timestamp_max_len]u8 = undefined;
+    var epoch: i64 = 0;
+    const canonical = try csil_timestamp_text(text, &buf, &epoch);
+    try w_tag(out, 0);
+    try w_text(out, canonical);
+}
+
+/// `cddl_time`: tag 1 around epoch seconds, kept as the same canonical text as a
+/// `timestamp` so both wire forms compare equal for one instant.
+fn csil_as_epoch(alloc: std.mem.Allocator, v: Value) CodecError!CsilTimestampParts {
+    if (v != .tag or v.tag.num != 1) return error.WrongType;
+    var seconds: i64 = 0;
+    var units: i64 = 0;
+    switch (v.tag.content.*) {
+        .uint => |n| {
+            if (n > @as(u64, @intCast(csil_epoch_last))) return error.WrongType;
+            seconds = @intCast(n);
+        },
+        .int => |n| seconds = n,
+        .float => |value| {
+            // The range test also refuses NaN and infinity, and it comes before
+            // the conversion to an integer, which panics out of range.
+            const low: f64 = @floatFromInt(csil_epoch_first - 1);
+            const high: f64 = @floatFromInt(csil_epoch_last + 1);
+            if (!(value >= low and value <= high)) return error.WrongType;
+            const whole = @floor(value);
+            seconds = @intFromFloat(whole);
+            // Two operations, not a fused multiply-add, which can round differently.
+            const scaled = (value - whole) * 1e9;
+            units = @intFromFloat(@floor(scaled + 0.5));
+            if (units == 1_000_000_000) {
+                seconds += 1;
+                units = 0;
+            }
+        },
+        else => return error.WrongType,
+    }
+    if (seconds < csil_epoch_first or seconds > csil_epoch_last) return error.WrongType;
+    var buf: [csil_timestamp_max_len]u8 = undefined;
+    const text = try alloc.dupe(u8, csil_timestamp_write(seconds, units, &buf));
+    return .{ .rfc3339 = text, .epoch_seconds = seconds };
+}
+
+fn csil_w_epoch(out: *std.ArrayList(u8), text: []const u8) CodecError!void {
+    const instant = try csil_timestamp_parse(text);
+    try w_tag(out, 1);
+    if (instant.nanos == 0) return w_int(out, instant.seconds);
+    const seconds: f64 = @floatFromInt(instant.seconds);
+    const fraction = @as(f64, @floatFromInt(instant.nanos)) / 1e9;
+    try w_f64(out, seconds + fraction);
+}
+
 const Decimal = struct { exp: i64, mant: i64 };
 
 fn as_decimal(v: Value) CodecError!Decimal {
@@ -4269,15 +4486,21 @@ pub const CsilDecimal = struct {
 };
 ";
 
-/// CsilTimestamp: the `timestamp` core type (CBOR tag 0, RFC3339 UTC text). Kept
+/// CsilTimestamp: the `timestamp` (CBOR tag 0) and `cddl_time` (CBOR tag 1) core
+/// type, held as RFC3339 UTC text. Kept
 /// as the canonical RFC3339 string plus its epoch-seconds value for comparison.
 const CSIL_TIMESTAMP_ZIG: &str = "\
 // Generated CSIL timestamp helper.
 // Code generated by csilgen; DO NOT EDIT.
 
-/// CsilTimestamp is the `timestamp` core type: CBOR tag 0, an RFC3339 UTC string
-/// on the wire. The canonical text is retained verbatim (so a round-trip is
-/// byte-stable) alongside its epoch-seconds value for ordering comparisons.
+/// CsilTimestamp is the `timestamp` core type (CBOR tag 0, an RFC3339 UTC string
+/// on the wire) and the `cddl_time` core type (CBOR tag 1, epoch seconds on the
+/// wire). Decode keeps the canonical UTC text (offset applied, uppercase
+/// `T`/`Z`, fraction of 0, 3, 6, or 9 digits) so that equal instants compare equal
+/// with `std.mem.eql`, and keeps text rather than a struct of fields so that all
+/// nine fraction digits survive. Encode normalizes caller text the same way and
+/// fails on text that is not a strict RFC3339 timestamp. `epoch_seconds` is set
+/// on decode for ordering; encode reads only `rfc3339`.
 pub const CsilTimestamp = struct {
     rfc3339: []const u8,
     epoch_seconds: i64,

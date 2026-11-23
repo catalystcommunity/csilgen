@@ -55,6 +55,7 @@ fn scalarsOk() Scalars {
         .flag = true,
         .due = "2000-02-29",
         .when = .{ .rfc3339 = "2026-06-29T12:34:56Z", .epoch_seconds = 0 },
+        .seen = .{ .rfc3339 = "2026-06-29T12:34:56.500Z", .epoch_seconds = 0 },
         // 123.45 == 12345 * 10^-2.
         .amount = .{ .exponent = -2, .mantissa = 12345 },
         // mixed-union coverage: a value equal to a literal arm must wire as
@@ -178,6 +179,7 @@ fn scalarsEql(a: Scalars, b: Scalars) bool {
         streq(a.t, b.t) and std.mem.eql(u8, a.raw, b.raw) and a.flag == b.flag and
         streq(a.due, b.due) and
         streq(a.when.rfc3339, b.when.rfc3339) and
+        streq(a.seen.rfc3339, b.seen.rfc3339) and
         a.amount.exponent == b.amount.exponent and a.amount.mantissa == b.amount.mantissa and
         mixedStatusEql(a.status_literal, b.status_literal) and
         mixedStatusEql(a.status_free, b.status_free) and

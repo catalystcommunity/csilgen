@@ -59,8 +59,9 @@ EOF
     ruby) cp "$fixture/peer.rb" .; ruby peer.rb ;;
     swift)
         cp "$fixture/peer.swift" main.swift
-        swiftc Types.swift Codec.swift Services.swift Client.swift main.swift -o peer
-        ./peer ;;
+        build='swiftc Types.swift Codec.swift Services.swift Client.swift ClientAsync.swift main.swift -o peer && ./peer'
+        if command -v swiftc >/dev/null; then sh -c "$build"
+        else docker run --rm -u "$(id -u):$(id -g)" -e HOME=/tmp -v "$work:/w" -w /w swift:6.0-bookworm sh -c "$build"; fi ;;
     typescript)
         cp "$fixture/peer.ts" .
         node --test peer.ts
@@ -73,5 +74,6 @@ EOF
         "${tsc_cmd[@]}" --erasableSyntaxOnly --target es2022 --module commonjs --strict --rewriteRelativeImportExtensions --outDir dist *.ts
         node dist/peer.js ;;
     zig) cp "$fixture/peer.zig" .; zig test peer.zig ;;
+    rust | go) bash "$fixture/run.sh" ;;
     *) echo "Unsupported target $lang" >&2; exit 1 ;;
 esac

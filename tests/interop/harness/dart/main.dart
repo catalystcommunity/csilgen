@@ -47,6 +47,7 @@ Scalars scalarsOk() => Scalars(
       flag: true,
       due: '2000-02-29',
       when_: DateTime.parse('2026-06-29T12:34:56Z').toUtc(),
+      seen: DateTime.parse('2026-06-29T12:34:56.500Z').toUtc(),
       amount: CsilDecimal.parse('123.45'),
       // mixed-union coverage: a value equal to a literal arm must wire as
       // [1,"pending"]; a value with no literal match must wire as [0,...].
@@ -335,29 +336,20 @@ final class InboxFrameCarrier implements FrameCarrier {
 // RPC
 // ---------------------------------------------------------------------------
 
-/// Raised by the carrier when a status-0 reply carries the `ServiceError` arm, so
-/// the typed error surfaces as the language error path (not a transport error).
-final class ServiceErrorException implements Exception {
-  final ServiceError error;
-  ServiceErrorException(this.error);
-  @override
-  String toString() => 'service error ${error.code}: ${error.message}';
-}
-
 final class RpcServiceTransport implements CsilTransport {
   final RpcClient client;
   RpcServiceTransport(this.client);
 
   @override
-  List<int> call(String svc, String op, List<int> request) {
+  List<int> call(String svc, String op, List<int> request) =>
+      client.call(svc, op, Uint8List.fromList(request)).payload;
+
+  // A multi-arm operation needs the reply variant; the generated client uses it
+  // to return the success arm or throw the typed error arm.
+  @override
+  (String?, Uint8List) callReply(String svc, String op, List<int> request) {
     final resp = client.call(svc, op, Uint8List.fromList(request));
-    // A status-0 reply whose variant is `ServiceError` is a typed application
-    // error; the carrier maps it to the language error path (the transport
-    // convention). Otherwise hand the success payload to the typed client.
-    if (resp.variant == 'ServiceError') {
-      throw ServiceErrorException(ServiceError.fromCbor(resp.payload));
-    }
-    return resp.payload;
+    return (resp.variant, resp.payload);
   }
 }
 
@@ -446,9 +438,10 @@ Cases rpcClient(SyncStreamFrameCarrier carrier) {
   try {
     client.validateConstrained(constrainedBad());
     cases.fail('validate-constrained/failure', 'server accepted invalid input');
-  } on ServiceErrorException {
+  } on ServiceErrorRefusal catch (e) {
     // The typed error arm must surface as a service error.
-    cases.pass('validate-constrained/failure');
+    cases.check('validate-constrained/failure', e.value.code == 422,
+        'wrong code ${e.value.code}');
   } catch (e) {
     cases.fail(
         'validate-constrained/failure', 'expected service error, got $e');

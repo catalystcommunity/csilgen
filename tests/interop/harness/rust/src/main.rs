@@ -20,9 +20,9 @@ use interop_api::{
     decode_collections, decode_constrained, decode_nested, decode_scalars,
     decode_tick, encode_collections, encode_interop_on_tick, encode_scalars,
     route_interop_channel, ClientError, Collections, Color, Constrained,
-    CsilCborValue, EchoNestedResult, IdOrName, Interop, Level, MixedStatus, Nested, OptBytes,
+    CsilCborError, CsilCborValue, EchoNestedResult, IdOrName, Interop, Level, MixedStatus, Nested, OptBytes,
     Priority,
-    Scalars, Scalars_note, Scalars_size, Season, ServiceError, ShipMode, Tick, Transport,
+    Scalars, Scalars_note, Scalars_size, Season, ServiceError, ShipMode, Tick, Transport, WireReply,
 };
 
 // The wire carries the CSIL service name verbatim as written in interop.csil
@@ -48,6 +48,8 @@ fn scalars_ok() -> Scalars {
         flag: true,
         due: Date::from_calendar_date(2000, Month::February, 29).unwrap(),
         when: ts(),
+        // 1782736496.5 on the wire: tag 1 around a float.
+        seen: OffsetDateTime::parse("2026-06-29T12:34:56.500Z", &Rfc3339).unwrap(),
         amount: interop_api::CsilDecimal::from_str("123.45").unwrap(),
         // mixed-union coverage: a value equal to a literal arm must wire as
         // [1,"pending"]; a value with no literal match must wire as [0,...].
@@ -240,13 +242,85 @@ struct RpcTransport {
 }
 impl Transport for RpcTransport {
     fn call(&self, service: &str, op: &str, req: &[u8]) -> Result<Vec<u8>, ClientError> {
+        Ok(self.call_reply(service, op, req)?.payload)
+    }
+
+    fn call_reply(&self, service: &str, op: &str, req: &[u8]) -> Result<WireReply, ClientError> {
         match self
             .client
             .borrow_mut()
             .call(service, op, req.to_vec(), None)
         {
-            Ok(resp) => interop_api::resolve_rpc_reply(service, op, resp.variant.as_deref(), resp.payload),
+            Ok(resp) => Ok(WireReply {
+                variant: resp.variant,
+                payload: resp.payload,
+            }),
             Err(e) => Err(ClientError::Transport(e.to_string())),
+        }
+    }
+}
+
+// A reply whose payload cannot be encoded (for example a timestamp outside
+// UTC years 0001-9999) is a server-side failure, so it goes back as the
+// transport's internal status (docs/csil-rpc-transport.md section 1.2).
+fn reply(variant: &str, payload: Result<Vec<u8>, CsilCborError>) -> HandlerOutcome {
+    match payload {
+        Ok(payload) => HandlerOutcome::Reply {
+            variant: variant.to_string(),
+            payload,
+        },
+        Err(e) => HandlerOutcome::Transport(Status::Internal, e.to_string()),
+    }
+}
+
+fn dispatch<H: Interop<Context = ()>>(handlers: &H, req: &RpcRequest) -> HandlerOutcome {
+    // Dispatch keys are the CSIL operation names verbatim (kebab-case, as written
+    // in interop.csil) — docs/cbor-wire-contract.md "RPC call naming". The reply
+    // `variant` strings below are output-type arm names, unrelated to wire naming.
+    match req.op.as_str() {
+        "echo-scalars" => match decode_scalars(&req.payload) {
+            Ok(v) => match handlers.echo_scalars(&(), v) {
+                Ok(r) => reply("Scalars", encode_scalars(&r)),
+                Err(e) => HandlerOutcome::Transport(Status::Internal, e.message),
+            },
+            Err(e) => HandlerOutcome::Transport(Status::MalformedEnvelope, e.to_string()),
+        },
+        "echo-collections" => match decode_collections(&req.payload) {
+            Ok(v) => match handlers.echo_collections(&(), v) {
+                Ok(r) => reply("Collections", encode_collections(&r)),
+                Err(e) => HandlerOutcome::Transport(Status::Internal, e.message),
+            },
+            Err(e) => HandlerOutcome::Transport(Status::MalformedEnvelope, e.to_string()),
+        },
+        "echo-nested" => match decode_nested(&req.payload) {
+            Ok(v) => match handlers.echo_nested(&(), v) {
+                Ok(r) => reply(
+                    "EchoNestedResult",
+                    interop_api::encode_echo_nested_result(&r),
+                ),
+                Err(e) => HandlerOutcome::Transport(Status::Internal, e.message),
+            },
+            Err(e) => HandlerOutcome::Transport(Status::MalformedEnvelope, e.to_string()),
+        },
+        "echo-opt-bytes" => match interop_api::decode_opt_bytes(&req.payload) {
+            Ok(v) => match handlers.echo_opt_bytes(&(), v) {
+                Ok(r) => reply("OptBytes", interop_api::encode_opt_bytes(&r)),
+                Err(e) => HandlerOutcome::Transport(Status::Internal, e.message),
+            },
+            Err(e) => HandlerOutcome::Transport(Status::MalformedEnvelope, e.to_string()),
+        },
+        "validate-constrained" => match decode_constrained(&req.payload) {
+            Ok(v) => {
+                let outcome = handlers.validate_constrained(&(), v);
+                match interop_api::encode_interop_validate_constrained_reply(outcome) {
+                    Ok((variant, payload)) => reply(variant, Ok(payload)),
+                    Err(e) => HandlerOutcome::Transport(Status::Internal, e.to_string()),
+                }
+            }
+            Err(e) => HandlerOutcome::Transport(Status::MalformedEnvelope, e.to_string()),
+        },
+        other => {
+            HandlerOutcome::Transport(Status::UnknownServiceOrOp, format!("unknown op {other}"))
         }
     }
 }
@@ -259,62 +333,9 @@ fn rpc_server(listener: TcpListener) {
             Err(_) => continue,
         };
         let mut server = RpcServer::new(StreamCarrier::new(stream));
-        let mut dispatch = |req: &RpcRequest| -> HandlerOutcome {
-            let reply = |variant: &str, payload: Vec<u8>| HandlerOutcome::Reply {
-                variant: variant.to_string(),
-                payload,
-            };
-            // Dispatch keys are the CSIL operation names verbatim (kebab-case, as written
-            // in interop.csil) — docs/cbor-wire-contract.md "RPC call naming". The reply
-            // `variant` strings below are output-type arm names, unrelated to wire naming.
-            match req.op.as_str() {
-                "echo-scalars" => match decode_scalars(&req.payload) {
-                    Ok(v) => match handlers.echo_scalars(&(), v) {
-                        Ok(r) => reply("Scalars", encode_scalars(&r)),
-                        Err(e) => HandlerOutcome::Transport(Status::Internal, e.message),
-                    },
-                    Err(e) => HandlerOutcome::Transport(Status::MalformedEnvelope, e.to_string()),
-                },
-                "echo-collections" => match decode_collections(&req.payload) {
-                    Ok(v) => match handlers.echo_collections(&(), v) {
-                        Ok(r) => reply("Collections", encode_collections(&r)),
-                        Err(e) => HandlerOutcome::Transport(Status::Internal, e.message),
-                    },
-                    Err(e) => HandlerOutcome::Transport(Status::MalformedEnvelope, e.to_string()),
-                },
-                "echo-nested" => match decode_nested(&req.payload) {
-                    Ok(v) => match handlers.echo_nested(&(), v) {
-                        Ok(r) => reply("EchoNestedResult", encode_nested_result(&r)),
-                        Err(e) => HandlerOutcome::Transport(Status::Internal, e.message),
-                    },
-                    Err(e) => HandlerOutcome::Transport(Status::MalformedEnvelope, e.to_string()),
-                },
-                "echo-opt-bytes" => match interop_api::decode_opt_bytes(&req.payload) {
-                    Ok(v) => match handlers.echo_opt_bytes(&(), v) {
-                        Ok(r) => reply("OptBytes", interop_api::encode_opt_bytes(&r)),
-                        Err(e) => HandlerOutcome::Transport(Status::Internal, e.message),
-                    },
-                    Err(e) => HandlerOutcome::Transport(Status::MalformedEnvelope, e.to_string()),
-                },
-                "validate-constrained" => match decode_constrained(&req.payload) {
-                    Ok(v) => {
-                        let (variant, payload) = interop_api::encode_interop_validate_constrained_reply(handlers.validate_constrained(&(), v));
-                        reply(variant, payload)
-                    }
-                    Err(e) => HandlerOutcome::Transport(Status::MalformedEnvelope, e.to_string()),
-                },
-                other => HandlerOutcome::Transport(
-                    Status::UnknownServiceOrOp,
-                    format!("unknown op {other}"),
-                ),
-            }
-        };
-        while let Ok(true) = server.serve_one(&mut dispatch) {}
+        let mut handle = |req: &RpcRequest| dispatch(&handlers, req);
+        while let Ok(true) = server.serve_one(&mut handle) {}
     }
-}
-
-fn encode_nested_result(r: &EchoNestedResult) -> Vec<u8> {
-    interop_api::encode_echo_nested_result(r)
 }
 
 fn rpc_client(stream: TcpStream) -> Cases {
@@ -448,11 +469,11 @@ fn events_server(listener: TcpListener) {
         }
         // Push N ticks (on-tick / server push).
         for seq in 0..TICKS {
-            let (method, bytes) = encode_interop_on_tick(&Tick { seq });
-            send_event(
-                &mut carrier,
-                &Event::verbose(Some(SERVICE.into()), method, bytes),
-            );
+            let event = match encode_interop_on_tick(&Tick { seq }) {
+                Ok((method, bytes)) => Event::verbose(Some(SERVICE.into()), method, bytes),
+                Err(_) => Event::verbose(None, control::ERROR_NAME, vec![]),
+            };
+            send_event(&mut carrier, &event);
         }
         // React loop.
         while let Ok(Some(frame)) = carrier.recv_frame() {
@@ -472,8 +493,11 @@ fn events_server(listener: TcpListener) {
                 "duplex" => {
                     if let Ok(s) = decode_scalars(&ev.payload) {
                         let _ = handlers.duplex(&(), s.clone());
-                        let (m, b) = interop_api::encode_interop_duplex(&s);
-                        send_event(&mut carrier, &Event::verbose(Some(SERVICE.into()), m, b));
+                        let event = match interop_api::encode_interop_duplex(&s) {
+                            Ok((m, b)) => Event::verbose(Some(SERVICE.into()), m, b),
+                            Err(_) => Event::verbose(None, control::ERROR_NAME, vec![]),
+                        };
+                        send_event(&mut carrier, &event);
                     }
                 }
                 other => {
@@ -550,7 +574,7 @@ fn events_client(stream: TcpStream) -> Cases {
     cases.check("on-tick/success", tick_ok, detail);
 
     // duplex: send Scalars, expect echo.
-    let (m, b) = interop_api::encode_interop_duplex(&scalars_ok());
+    let (m, b) = interop_api::encode_interop_duplex(&scalars_ok()).expect("fixed vector encodes");
     send_event(&mut carrier, &Event::verbose(Some(SERVICE.into()), m, b));
     match carrier.recv_frame() {
         Ok(Some(f)) => match Event::decode(&f, Profile::Verbose) {
@@ -608,14 +632,16 @@ fn datagram_server(sock: UdpSocket) {
             Err(_) => continue,
         };
         let reply = match dg.op_ord {
-            OP_ECHO_SCALARS => match decode_scalars(&dg.payload) {
-                Ok(s) => Datagram::new(OP_ECHO_SCALARS, dg.seq, encode_scalars(&s)),
-                Err(_) => Datagram::new(OP_ERROR_SENTINEL, dg.seq, vec![]),
+            OP_ECHO_SCALARS => match decode_scalars(&dg.payload).map(|s| encode_scalars(&s)) {
+                Ok(Ok(b)) => Datagram::new(OP_ECHO_SCALARS, dg.seq, b),
+                _ => Datagram::new(OP_ERROR_SENTINEL, dg.seq, vec![]),
             },
-            OP_ECHO_COLLECTIONS => match decode_collections(&dg.payload) {
-                Ok(c) => Datagram::new(OP_ECHO_COLLECTIONS, dg.seq, encode_collections(&c)),
-                Err(_) => Datagram::new(OP_ERROR_SENTINEL, dg.seq, vec![]),
-            },
+            OP_ECHO_COLLECTIONS => {
+                match decode_collections(&dg.payload).map(|c| encode_collections(&c)) {
+                    Ok(Ok(b)) => Datagram::new(OP_ECHO_COLLECTIONS, dg.seq, b),
+                    _ => Datagram::new(OP_ERROR_SENTINEL, dg.seq, vec![]),
+                }
+            }
             _ => Datagram::new(OP_ERROR_SENTINEL, dg.seq, vec![]),
         };
         let _ = sock.send_to(&reply.encode().unwrap(), addr);
@@ -645,7 +671,7 @@ fn datagram_client(sock: UdpSocket) -> Cases {
         &mut buf,
         OP_ECHO_SCALARS,
         1,
-        encode_scalars(&scalars_ok()),
+        encode_scalars(&scalars_ok()).expect("fixed vector encodes"),
     ) {
         Ok(d) if d.op_ord == OP_ECHO_SCALARS => match decode_scalars(&d.payload) {
             Ok(s) => cases.check(
@@ -663,7 +689,7 @@ fn datagram_client(sock: UdpSocket) -> Cases {
         &mut buf,
         OP_ECHO_COLLECTIONS,
         2,
-        encode_collections(&collections_ok()),
+        encode_collections(&collections_ok()).expect("fixed vector encodes"),
     ) {
         Ok(d) if d.op_ord == OP_ECHO_COLLECTIONS => match decode_collections(&d.payload) {
             Ok(c) => cases.check(
@@ -767,10 +793,110 @@ fn connect_retry(port: u16) -> TcpStream {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use csilgen_transport::carrier::LoopbackFrameCarrier;
+    use csilgen_transport::rpc::RpcResponse;
+    use std::rc::Rc;
+
+    // A handler whose `echo-scalars` reply holds an instant with no wire form.
+    struct BadReplies;
+    impl Interop for BadReplies {
+        type Context = ();
+        fn echo_scalars(&self, _: &(), input: Scalars) -> Result<Scalars, ServiceError> {
+            let year_zero = Date::from_calendar_date(0, Month::December, 31).unwrap();
+            Ok(Scalars {
+                when: year_zero.midnight().assume_utc(),
+                ..input
+            })
+        }
+        fn echo_collections(
+            &self,
+            c: &(),
+            input: Collections,
+        ) -> Result<Collections, ServiceError> {
+            Handlers.echo_collections(c, input)
+        }
+        fn echo_nested(&self, c: &(), input: Nested) -> Result<EchoNestedResult, ServiceError> {
+            Handlers.echo_nested(c, input)
+        }
+        fn echo_opt_bytes(&self, c: &(), input: OptBytes) -> Result<OptBytes, ServiceError> {
+            Handlers.echo_opt_bytes(c, input)
+        }
+        fn validate_constrained(
+            &self,
+            c: &(),
+            input: Constrained,
+        ) -> Result<Constrained, ServiceError> {
+            Handlers.validate_constrained(c, input)
+        }
+        fn duplex(&self, c: &(), msg: Scalars) -> Result<(), ServiceError> {
+            Handlers.duplex(c, msg)
+        }
+    }
+
+    // `RpcServer` owns its carrier, so the test keeps a second handle on the
+    // frame queues to read the response the server wrote.
+    #[derive(Clone, Default)]
+    struct SharedCarrier(Rc<RefCell<LoopbackFrameCarrier>>);
+    impl FrameCarrier for SharedCarrier {
+        fn send_frame(&mut self, bytes: &[u8]) -> csilgen_transport::Result<()> {
+            self.0.borrow_mut().send_frame(bytes)
+        }
+        fn recv_frame(&mut self) -> csilgen_transport::Result<Option<Vec<u8>>> {
+            self.0.borrow_mut().recv_frame()
+        }
+    }
+
+    #[test]
+    fn unencodable_reply_is_an_internal_error_reply() {
+        let payload = encode_scalars(&scalars_ok()).unwrap();
+        let req = RpcRequest::new(SERVICE, "echo-scalars", payload);
+        match dispatch(&BadReplies, &req) {
+            HandlerOutcome::Transport(Status::Internal, message) => {
+                assert!(message.contains("0001-9999"), "{message}");
+            }
+            HandlerOutcome::Transport(status, message) => panic!("status {status:?}: {message}"),
+            HandlerOutcome::Reply { variant, .. } => panic!("unexpected reply {variant}"),
+        }
+
+        // Over the library server, the caller gets one response envelope with
+        // the internal status and the connection stays usable.
+        let carrier = SharedCarrier::default();
+        let mut with_id = req.clone();
+        with_id.id = Some(7);
+        for frame in [with_id.encode().unwrap(), req.encode().unwrap()] {
+            carrier.0.borrow_mut().push_inbound(frame);
+        }
+        let mut server = RpcServer::new(carrier.clone());
+        let mut handle = |req: &RpcRequest| dispatch(&BadReplies, req);
+        assert!(server.serve_one(&mut handle).unwrap());
+        assert!(server.serve_one(&mut handle).unwrap());
+        let first = carrier.0.borrow_mut().take_outbound().unwrap();
+        let resp = RpcResponse::decode(&first).unwrap();
+        assert_eq!(resp.status, Status::Internal);
+        assert_eq!(resp.id, Some(7));
+        assert!(resp.payload.is_empty());
+        assert!(carrier.0.borrow_mut().take_outbound().is_some());
+    }
+
+    #[test]
+    fn valid_reply_still_answers_with_the_typed_payload() {
+        let payload = encode_scalars(&scalars_ok()).unwrap();
+        let req = RpcRequest::new(SERVICE, "echo-scalars", payload.clone());
+        match dispatch(&Handlers, &req) {
+            HandlerOutcome::Reply {
+                variant,
+                payload: reply,
+            } => {
+                assert_eq!(variant, "Scalars");
+                assert_eq!(reply, payload);
+            }
+            HandlerOutcome::Transport(status, message) => panic!("status {status:?}: {message}"),
+        }
+    }
 
     #[test]
     fn calendar_date_has_canonical_bytes_and_rejects_an_invalid_day() {
-        let mut wire = encode_scalars(&scalars_ok());
+        let mut wire = encode_scalars(&scalars_ok()).unwrap();
         let date = b"\xd9\x03\xec\x6a2000-02-29";
         let start = wire
             .windows(date.len())
@@ -791,7 +917,7 @@ mod tests {
             let mut sample = scalars_ok();
             let local = format!("2000-03-01T01:00:00{fraction}+02:00");
             sample.when = OffsetDateTime::parse(&local, &Rfc3339).unwrap();
-            let wire = encode_scalars(&sample);
+            let wire = encode_scalars(&sample).unwrap();
             let utc = format!("2000-02-29T23:00:00{expected}Z");
             assert!(wire.windows(utc.len()).any(|value| value == utc.as_bytes()));
             let decoded = decode_scalars(&wire).unwrap().when;
@@ -801,8 +927,16 @@ mod tests {
     }
 
     #[test]
+    fn cddl_time_wires_as_tag1_float() {
+        let wire = encode_scalars(&scalars_ok()).unwrap();
+        let seen = b"\xc1\xfb\x41\xda\x90\x99\x9c\x20\x00\x00";
+        assert!(wire.windows(seen.len()).any(|value| value == seen));
+        assert_eq!(decode_scalars(&wire).unwrap().seen, scalars_ok().seen);
+    }
+
+    #[test]
     fn timestamp_decoder_normalizes_offsets_and_rejects_unrepresentable_input() {
-        let wire = encode_scalars(&scalars_ok());
+        let wire = encode_scalars(&scalars_ok()).unwrap();
         let tagged = b"\xc0\x742026-06-29T12:34:56Z";
         let start = wire
             .windows(tagged.len())

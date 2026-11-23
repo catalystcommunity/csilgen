@@ -1,0 +1,4 @@
+; A record with one cddl_time field. The epoch vectors decode it in every target.
+Moment = {
+    at: cddl_time,
+}

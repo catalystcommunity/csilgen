@@ -289,3 +289,109 @@ puts \"EVENTS OK\"\n",
 
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// A multi-arm `->` op makes the emitted carrier also implement `call_reply`; run it
+/// against a loopback HTTP server that answers with each reply variant, so the typed
+/// error arm and an unknown variant reach the caller exactly as the client promises.
+#[test]
+fn genquickstart_multi_arm_rpc_carrier_runs_under_ruby() {
+    let Some(ruby) = ruby_bin() else {
+        eprintln!(
+            "skipping genquickstart_multi_arm_rpc_carrier_runs_under_ruby: `ruby` not on PATH"
+        );
+        return;
+    };
+    let spec = spec(vec![
+        group_rule("ping", vec![bare_entry("nonce", builtin("int"))]),
+        group_rule("pong", vec![bare_entry("nonce", builtin("int"))]),
+        group_rule("ServiceError", vec![bare_entry("code", builtin("int"))]),
+        service_rule(
+            "echo_service",
+            vec![op(
+                "do-ping",
+                reference("ping"),
+                CsilTypeExpression::Choice(vec![reference("pong"), reference("ServiceError")]),
+                CsilServiceDirection::Unidirectional,
+            )],
+            None,
+        ),
+    ]);
+    let mut opts = HashMap::new();
+    opts.insert("emit_packages".to_string(), json!(["ruby"]));
+    opts.insert("package_name".to_string(), json!("echo_client"));
+    opts.insert("genquickstart_transports".to_string(), json!(["rpc"]));
+    let cfg = GeneratorConfig {
+        target: "ruby-client".to_string(),
+        output_dir: "/tmp/echo".to_string(),
+        options: opts,
+    };
+    let files = generate_ruby_code_from_serialized(&spec, &cfg).expect("generation succeeded");
+    let root = std::env::temp_dir().join(format!("csilgen-ruby-gqs-multi-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    for f in &files {
+        let p = root.join(&f.path);
+        std::fs::create_dir_all(p.parent().unwrap()).expect("mkdir");
+        std::fs::write(&p, &f.content).expect("write package file");
+    }
+    let md = files
+        .iter()
+        .find(|f| f.path == "genquickstart.md")
+        .expect("genquickstart.md emitted")
+        .content
+        .clone();
+    assert!(md.contains("def call_reply(service, op, req_bytes)"));
+    let preamble = load_path_preamble(&transport_lib_dir(), &root.join("lib"));
+    let rpc_block = ruby_block(&md, "## CSIL-RPC (HTTP)")
+        .replace("\"http://localhost:5080\"", "\"http://127.0.0.1:#{port}\"");
+    let harness = format!(
+        "{preamble}\
+require \"socket\"\n\
+require \"csilgen/transport\"\n\
+RpcSrv = Csilgen::Transport::RPC\n\
+server = TCPServer.new(\"127.0.0.1\", 0)\n\
+port = server.addr[1]\n\
+Thread.new do\n\
+  loop do\n\
+    conn = server.accept\n\
+    len = 0\n\
+    while (line = conn.gets)\n\
+      break if line == \"\\r\\n\"\n\
+      len = $1.to_i if line =~ /\\AContent-Length:\\s*(\\d+)/i\n\
+    end\n\
+    req = RpcSrv::RpcRequest.decode(conn.read(len).b)\n\
+    nonce = Ping.from_cbor(req.payload).nonce\n\
+    resp = case nonce\n\
+           when 13 then RpcSrv::RpcResponse.ok(\"ServiceError\", ServiceError.new(code: 13).to_cbor)\n\
+           when 14 then RpcSrv::RpcResponse.ok(\"Other\", req.payload)\n\
+           else RpcSrv::RpcResponse.ok(\"pong\", req.payload)\n\
+           end.encode\n\
+    conn.write(\"HTTP/1.1 200 OK\\r\\nContent-Length: #{{resp.bytesize}}\\r\\nConnection: close\\r\\n\\r\\n\")\n\
+    conn.write(resp)\n\
+    conn.close\n\
+  end\n\
+rescue IOError, Errno::EBADF\n\
+end\n\n\
+{rpc_block}\n\
+raise \"success arm: #{{resp.inspect}}\" unless resp.is_a?(Pong)\n\
+begin\n\
+  client.do_ping(Ping.new(nonce: 13))\n\
+  raise \"missing refusal\"\n\
+rescue CsilCbor::ServiceErrorRefusal => e\n\
+  raise \"refusal value\" unless e.value.code == 13\n\
+end\n\
+begin\n\
+  client.do_ping(Ping.new(nonce: 14))\n\
+  raise \"accepted unknown variant\"\n\
+rescue ArgumentError\n\
+end\n\
+puts \"RPC OK\"\n",
+    );
+    let path = root.join("rpc_multi_harness.rb");
+    std::fs::write(&path, &harness).expect("write harness");
+    let (ok, stdout, stderr) = run_ruby(&ruby, &path, &[]);
+    assert!(
+        ok && stdout.contains("RPC OK"),
+        "multi-arm CSIL-RPC carrier failed under ruby.\nstdout:\n{stdout}\nstderr:\n{stderr}\nscript:\n{harness}"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}

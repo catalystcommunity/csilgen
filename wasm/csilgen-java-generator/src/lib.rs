@@ -365,7 +365,12 @@ fn generate_readme(input: &WasmGeneratorInput, config: &JavaConfig) -> Generated
     let channel = first_channel_example(input);
     let (rpc, events, datagrams) = java_wanted_transports(input);
     if rpc {
-        out.push_str(&java_rpc_section(config, client_surface, unary.as_ref()));
+        out.push_str(&java_rpc_section(
+            config,
+            client_surface,
+            has_reply_arms(input),
+            unary.as_ref(),
+        ));
     }
     if events {
         out.push_str(&java_events_section(
@@ -393,6 +398,7 @@ fn generate_readme(input: &WasmGeneratorInput, config: &JavaConfig) -> Generated
 fn java_rpc_section(
     config: &JavaConfig,
     client_surface: bool,
+    reply_arms: bool,
     ex: Option<&UnaryExample>,
 ) -> String {
     let mut out = String::from("## CSIL-RPC (HTTP)\n\n");
@@ -426,7 +432,7 @@ fn java_rpc_section(
          import java.net.http.HttpRequest;\n\
          import java.net.http.HttpResponse;\n\n",
     );
-    out.push_str(JAVA_RPC_CARRIER);
+    out.push_str(&java_rpc_carrier(reply_arms));
     out.push('\n');
     out.push_str("public final class RpcExample {\n");
     out.push_str("    public static void main(String[] args) {\n");
@@ -707,12 +713,49 @@ fn java_datagrams_section(config: &JavaConfig, ex: Option<&UnaryExample>) -> Str
     out
 }
 
-/// The HTTP carrier body — spec-independent, so a constant. It encodes the request with
-/// the library's `Rpc.Request`, POSTs it to `{baseUrl}/csil/v1/rpc` with the JDK's blocking
-/// `HttpClient`, and returns the success payload bytes the typed client decodes. A non-zero
-/// transport status (via `Rpc.Response.asTransportError`) or a typed `ServiceError` arm
-/// becomes a `ClientException`.
-const JAVA_RPC_CARRIER: &str = r#"// One example carrier: CSIL-RPC over an HTTP POST. The library owns the envelope
+/// The HTTP carrier body. It encodes the request with the library's `Rpc.Request`, POSTs
+/// it to `{baseUrl}/csil/v1/rpc` with the JDK's blocking `HttpClient`, and hands back the
+/// reply. A non-zero transport status (via `Rpc.Response.asTransportError`) becomes a
+/// `ClientException`. When the spec has an op with several reply arms the seam also
+/// requires `callReply`, which returns the reply variant so the typed client can pick the
+/// arm; the carrier never decodes an arm itself.
+fn java_rpc_carrier(reply_arms: bool) -> String {
+    let mut out = String::from(JAVA_RPC_CARRIER_HEAD);
+    if reply_arms {
+        out.push_str(
+            r#"
+    @Override
+    public byte[] call(String service, String op, byte[] req) throws ClientException {
+        return exchange(service, op, req).payload();
+    }
+
+    @Override
+    public WireReply callReply(String service, String op, byte[] req) throws ClientException {
+        Rpc.Response decoded = exchange(service, op, req);
+        return new WireReply(decoded.variant(), decoded.payload());
+    }
+
+    private Rpc.Response exchange(String service, String op, byte[] req) throws ClientException {
+"#,
+        );
+    } else {
+        out.push_str(
+            r#"
+    @Override
+    public byte[] call(String service, String op, byte[] req) throws ClientException {
+"#,
+        );
+    }
+    out.push_str(JAVA_RPC_CARRIER_EXCHANGE);
+    out.push_str(if reply_arms {
+        "        return decoded;\n    }\n}\n"
+    } else {
+        "        return decoded.payload();\n    }\n}\n"
+    });
+    out
+}
+
+const JAVA_RPC_CARRIER_HEAD: &str = r#"// One example carrier: CSIL-RPC over an HTTP POST. The library owns the envelope
 // (Rpc.Request/Rpc.Response); the carrier owns only the transport.
 final class HttpRpcCarrier implements Transport {
     private final HttpClient http = HttpClient.newHttpClient();
@@ -722,10 +765,9 @@ final class HttpRpcCarrier implements Transport {
         // Trim any trailing slash so the joined path is exactly one "/csil/v1/rpc".
         this.baseUrl = baseUrl.replaceAll("/+$", "");
     }
+"#;
 
-    @Override
-    public byte[] call(String service, String op, byte[] req) throws ClientException {
-        // The library builds the request envelope; the carrier never hand-rolls CBOR.
+const JAVA_RPC_CARRIER_EXCHANGE: &str = r#"        // The library builds the request envelope; the carrier never hand-rolls CBOR.
         byte[] envelope = Rpc.Request.of(service, op, req == null ? new byte[0] : req).encode();
         HttpResponse<byte[]> resp;
         try {
@@ -753,9 +795,6 @@ final class HttpRpcCarrier implements Transport {
         if (te != null) {
             throw new ClientException("csil-rpc " + service + "/" + op + ": " + te.getMessage(), te);
         }
-        return CsilCbor.resolveRpcReply(service, op, decoded.variant(), decoded.payload());
-    }
-}
 "#;
 
 /// The pieces the RPC + Datagram examples need: the client class + method to call, the
@@ -912,7 +951,7 @@ fn java_sample(input: &WasmGeneratorInput, ty: &CsilTypeExpression) -> String {
             "int" | "uint" | "nint" => "0L".to_string(),
             "float" | "float64" | "double" => "0.0".to_string(),
             "date" => "java.time.LocalDate.of(1970, 1, 1)".to_string(),
-            "timestamp" => "java.time.Instant.now()".to_string(),
+            "timestamp" | "cddl_time" => "java.time.Instant.now()".to_string(),
             "decimal" => "java.math.BigDecimal.ZERO".to_string(),
             _ => "null".to_string(),
         },
@@ -1103,7 +1142,11 @@ fn generate_java(input: &WasmGeneratorInput) -> Result<Vec<GeneratedFile>, i32> 
         let records = record_names(input);
         let aliases = codec_aliases(input);
         let choices = codec_choices(input);
-        files.push(generate_transport_iface(&config));
+        let reply_arms = has_reply_arms(input);
+        files.push(generate_transport_iface(&config, reply_arms));
+        if reply_arms {
+            files.push(generate_wire_reply(&config));
+        }
         files.push(generate_client_error(&config));
         for (name, def, doc) in &services {
             files.push(generate_client(
@@ -1905,6 +1948,7 @@ fn java_enc_value(
             "bool" => format!("new CborBool({expr})"),
             "date" => format!("encDate({expr})"),
             "timestamp" => format!("encTimestamp({expr})"),
+            "cddl_time" => format!("encCddlTime({expr})"),
             "decimal" => format!("encDecimal({expr})"),
             // `any` already holds the codec's own value tree; it passes through verbatim.
             "any" => expr.to_string(),
@@ -2019,6 +2063,7 @@ fn java_dec_value(
             "bool" => format!("asBool({expr})"),
             "date" => format!("asDate({expr})"),
             "timestamp" => format!("asTimestamp({expr})"),
+            "cddl_time" => format!("asCddlTime({expr})"),
             "decimal" => format!("asDecimal({expr})"),
             // `any` is the decoded CBOR value tree passed through verbatim.
             "any" => expr.to_string(),
@@ -2782,6 +2827,10 @@ fn generate_codec(input: &WasmGeneratorInput, config: &JavaConfig) -> Option<Gen
         code.push('\n');
         code.push_str(CODEC_TIMESTAMP_JAVA);
     }
+    if body.contains("CddlTime(") {
+        code.push('\n');
+        code.push_str(CODEC_CDDL_TIME_JAVA);
+    }
     if body.contains("Decimal(") {
         code.push('\n');
         code.push_str(CODEC_DECIMAL_JAVA);
@@ -2811,7 +2860,13 @@ fn generate_codec(input: &WasmGeneratorInput, config: &JavaConfig) -> Option<Gen
 // Client surface
 // ---------------------------------------------------------------------------
 
-fn generate_transport_iface(config: &JavaConfig) -> GeneratedFile {
+/// Whether any unary op declares several reply arms. Only then does the seam carry
+/// `callReply`, so a spec without such ops keeps the one-method seam it always had.
+fn has_reply_arms(input: &WasmGeneratorInput) -> bool {
+    input.csil_spec.rpc_operations().next().is_some()
+}
+
+fn generate_transport_iface(config: &JavaConfig, reply_arms: bool) -> GeneratedFile {
     let mut code = config.header();
     code.push_str(
         "/**\n\
@@ -2822,11 +2877,39 @@ fn generate_transport_iface(config: &JavaConfig) -> GeneratedFile {
          \x20* and blocking — no CompletableFuture.\n\
          \x20*/\n\
          public interface Transport {\n\
-         \x20   byte[] call(String service, String op, byte[] req) throws ClientException;\n\
-         }\n",
+         \x20   byte[] call(String service, String op, byte[] req) throws ClientException;\n",
     );
+    if reply_arms {
+        code.push_str(
+            "\n\
+             \x20   /**\n\
+             \x20    * Performs a call to an op with several reply arms and returns the reply\n\
+             \x20    * variant with the payload bytes, as the response carried them. The client\n\
+             \x20    * selects the arm from the variant, so the carrier must not drop it.\n\
+             \x20    */\n\
+             \x20   WireReply callReply(String service, String op, byte[] req) throws ClientException;\n",
+        );
+    }
+    code.push_str("}\n");
     GeneratedFile {
         path: config.path_for("Transport"),
+        content: code,
+    }
+}
+
+fn generate_wire_reply(config: &JavaConfig) -> GeneratedFile {
+    let mut code = config.header();
+    code.push_str(
+        "/**\n\
+         \x20* One RPC reply as the transport received it.\n\
+         \x20*\n\
+         \x20* @param variant the reply variant name, or {@code null} when the reply carried none\n\
+         \x20* @param payload the reply payload bytes\n\
+         \x20*/\n\
+         public record WireReply(String variant, byte[] payload) {}\n",
+    );
+    GeneratedFile {
+        path: config.path_for("WireReply"),
         content: code,
     }
 }
@@ -2930,10 +3013,19 @@ fn generate_client(
         code.push_str(&format!(
             "    public {resp_type} {camel}({params}) throws ClientException {{\n"
         ));
-        code.push_str(&format!(
-            "        return {decode_resp}(transport.call(\"{name}\", \"{op_name}\", {req_bytes}));\n",
-            op_name = op.name
-        ));
+        let op_name = &op.name;
+        if op.rpc_reply_arms().is_some() {
+            // The reply variant picks the arm: the resolver passes the success payload
+            // through, throws the declared error arm, and rejects a missing or unknown one.
+            code.push_str(&format!(
+                "        WireReply reply = transport.callReply(\"{name}\", \"{op_name}\", {req_bytes});\n\
+                 \x20       return {decode_resp}(CsilCbor.resolveRpcReply(\"{name}\", \"{op_name}\", reply.variant(), reply.payload()));\n"
+            ));
+        } else {
+            code.push_str(&format!(
+                "        return {decode_resp}(transport.call(\"{name}\", \"{op_name}\", {req_bytes}));\n"
+            ));
+        }
         code.push_str("    }\n");
     }
     code.push_str("}\n");
@@ -3196,8 +3288,9 @@ fn map_type(type_expr: &CsilTypeExpression) -> String {
             "bytes" | "bstr" => "byte[]".to_string(),
             "bool" => "boolean".to_string(),
             "date" => "java.time.LocalDate".to_string(),
-            // CBOR tag 0, RFC3339, always UTC — Instant is the UTC instant type.
-            "timestamp" => "java.time.Instant".to_string(),
+            // CBOR tag 0, RFC3339, always UTC — Instant is the UTC instant type. A
+            // `cddl_time` is the same instant; only its wire form (tag 1) differs.
+            "timestamp" | "cddl_time" => "java.time.Instant".to_string(),
             // CBOR tag 4 exact decimal fraction — BigDecimal is Java's exact decimal.
             "decimal" => "java.math.BigDecimal".to_string(),
             // `any` is an arbitrary CBOR value passed through verbatim; the codec's own
@@ -3641,6 +3734,21 @@ const CODEC_RUNTIME_JAVA: &str = r#"    /** A minimal canonical-CBOR value tree:
         }
     }
 
+    // Float.float16ToFloat needs JDK 20; the generated code targets JDK 17.
+    private static double halfToDouble(int h) {
+        int exp = (h >> 10) & 0x1f;
+        int mant = h & 0x3ff;
+        double magnitude;
+        if (exp == 0) {
+            magnitude = Math.scalb((double) mant, -24);
+        } else if (exp == 31) {
+            magnitude = mant == 0 ? Double.POSITIVE_INFINITY : Double.NaN;
+        } else {
+            magnitude = Math.scalb((double) (mant | 0x400), exp - 25);
+        }
+        return (h & 0x8000) != 0 ? -magnitude : magnitude;
+    }
+
     private static long readArg(byte[] b, int[] pos, int low) {
         if (low < 24) {
             pos[0] += 1;
@@ -3719,6 +3827,10 @@ const CODEC_RUNTIME_JAVA: &str = r#"    /** A minimal canonical-CBOR value tree:
                 case 23:
                     pos[0] += 1;
                     return new CborNull();
+                case 25: {
+                    long bits = readArg(b, pos, low);
+                    return new CborFloat(halfToDouble((int) bits));
+                }
                 case 26: {
                     long bits = readArg(b, pos, low);
                     return new CborFloat(Float.intBitsToFloat((int) bits));
@@ -3956,17 +4068,200 @@ const CODEC_DATE_JAVA: &str = r#"
 "#;
 
 /// Timestamp (CBOR tag 0, RFC3339, always UTC) codec, appended only when the spec uses
-/// `timestamp` so `java.time.Instant` is never an unused import. `Instant` is the UTC
-/// instant type and its `toString` is RFC3339 with a `Z` offset, sub-second preserved.
+/// `timestamp`. The shape is checked by hand because `Instant.parse` accepts forms the
+/// wire contract rejects (and rejects offsets the contract allows), and `toString` drops
+/// to the fewest fraction digits rather than the contract's 3/6/9 groups.
 const CODEC_TIMESTAMP_JAVA: &str = r#"    public static CborValue encTimestamp(java.time.Instant t) {
-        return new CborTag(0, new CborText(t.toString()));
+        java.time.OffsetDateTime u = t.atOffset(java.time.ZoneOffset.UTC);
+        int year = u.getYear();
+        if (year < 1 || year > 9999) {
+            throw new CsilCborException("csil cbor: timestamp year outside 0001-9999");
+        }
+        StringBuilder b = new StringBuilder(30);
+        timestampDigits(b, year, 4).append('-');
+        timestampDigits(b, u.getMonthValue(), 2).append('-');
+        timestampDigits(b, u.getDayOfMonth(), 2).append('T');
+        timestampDigits(b, u.getHour(), 2).append(':');
+        timestampDigits(b, u.getMinute(), 2).append(':');
+        timestampDigits(b, u.getSecond(), 2);
+        int nano = u.getNano();
+        if (nano != 0) {
+            b.append('.');
+            if (nano % 1_000_000 == 0) {
+                timestampDigits(b, nano / 1_000_000, 3);
+            } else if (nano % 1_000 == 0) {
+                timestampDigits(b, nano / 1_000, 6);
+            } else {
+                timestampDigits(b, nano, 9);
+            }
+        }
+        b.append('Z');
+        return new CborTag(0, new CborText(b.toString()));
+    }
+
+    private static StringBuilder timestampDigits(StringBuilder b, int value, int width) {
+        String text = Integer.toString(value);
+        for (int i = text.length(); i < width; i++) {
+            b.append('0');
+        }
+        return b.append(text);
     }
 
     public static java.time.Instant asTimestamp(CborValue v) {
         if (v instanceof CborTag t && t.num() == 0 && t.inner() instanceof CborText s) {
-            return java.time.Instant.parse(s.value());
+            return parseTimestamp(s.value());
         }
         throw new CsilCborException("csil cbor: expected CBOR tag 0 timestamp");
+    }
+
+    private static int timestampField(String s, int at, int width) {
+        if (at + width > s.length()) {
+            throw new CsilCborException("csil cbor: invalid timestamp text");
+        }
+        int value = 0;
+        for (int i = at; i < at + width; i++) {
+            char c = s.charAt(i);
+            if (c < '0' || c > '9') {
+                throw new CsilCborException("csil cbor: invalid timestamp text");
+            }
+            value = value * 10 + (c - '0');
+        }
+        return value;
+    }
+
+    private static void timestampSeparator(String s, int at, char a, char b) {
+        if (at >= s.length() || (s.charAt(at) != a && s.charAt(at) != b)) {
+            throw new CsilCborException("csil cbor: invalid timestamp text");
+        }
+    }
+
+    private static java.time.Instant parseTimestamp(String s) {
+        int year = timestampField(s, 0, 4);
+        timestampSeparator(s, 4, '-', '-');
+        int month = timestampField(s, 5, 2);
+        timestampSeparator(s, 7, '-', '-');
+        int day = timestampField(s, 8, 2);
+        timestampSeparator(s, 10, 'T', 't');
+        int hour = timestampField(s, 11, 2);
+        timestampSeparator(s, 13, ':', ':');
+        int minute = timestampField(s, 14, 2);
+        timestampSeparator(s, 16, ':', ':');
+        int second = timestampField(s, 17, 2);
+        if (year < 1 || month < 1 || month > 12 || day < 1
+                || day > java.time.YearMonth.of(year, month).lengthOfMonth()
+                || hour > 23 || minute > 59 || second > 59) {
+            throw new CsilCborException("csil cbor: invalid timestamp value");
+        }
+        int at = 19;
+        int nano = 0;
+        if (at < s.length() && s.charAt(at) == '.') {
+            int start = ++at;
+            while (at < s.length() && s.charAt(at) >= '0' && s.charAt(at) <= '9') {
+                at++;
+            }
+            int digits = at - start;
+            if (digits < 1 || digits > 9) {
+                throw new CsilCborException("csil cbor: invalid timestamp fraction");
+            }
+            nano = timestampField(s, start, digits);
+            for (int i = digits; i < 9; i++) {
+                nano *= 10;
+            }
+        }
+        if (at >= s.length()) {
+            throw new CsilCborException("csil cbor: timestamp has no offset");
+        }
+        char zone = s.charAt(at);
+        int offset;
+        if (zone == 'Z' || zone == 'z') {
+            offset = 0;
+            at += 1;
+        } else if (zone == '+' || zone == '-') {
+            int offsetHour = timestampField(s, at + 1, 2);
+            timestampSeparator(s, at + 3, ':', ':');
+            int offsetMinute = timestampField(s, at + 4, 2);
+            if (offsetHour > 23 || offsetMinute > 59) {
+                throw new CsilCborException("csil cbor: invalid timestamp offset");
+            }
+            offset = (zone == '-' ? -1 : 1) * (offsetHour * 3600 + offsetMinute * 60);
+            at += 6;
+        } else {
+            throw new CsilCborException("csil cbor: invalid timestamp offset");
+        }
+        if (at != s.length()) {
+            throw new CsilCborException("csil cbor: trailing timestamp text");
+        }
+        long epoch = java.time.LocalDate.of(year, month, day).toEpochDay() * 86_400L
+            + hour * 3_600L + minute * 60L + second - offset;
+        // The range is checked again after conversion to UTC, because an offset can move
+        // a written year 0001 or 9999 value outside it.
+        if (epoch < TIMESTAMP_MIN_EPOCH || epoch >= TIMESTAMP_END_EPOCH) {
+            throw new CsilCborException("csil cbor: timestamp year outside 0001-9999");
+        }
+        return java.time.Instant.ofEpochSecond(epoch, nano);
+    }
+
+    private static final long TIMESTAMP_MIN_EPOCH = java.time.LocalDate.of(1, 1, 1).toEpochDay() * 86_400L;
+    private static final long TIMESTAMP_END_EPOCH = java.time.LocalDate.of(10000, 1, 1).toEpochDay() * 86_400L;
+"#;
+
+/// `cddl_time` (CBOR tag 1, epoch seconds) codec, appended only when the spec uses
+/// `cddl_time`. The float split is spelled out step by step because the wire contract
+/// fixes each binary64 operation, so every target lands on the same instant.
+const CODEC_CDDL_TIME_JAVA: &str = r#"    private static final long CDDL_TIME_FIRST = -62_135_596_800L;
+    private static final long CDDL_TIME_LAST = 253_402_300_799L;
+
+    public static CborValue encCddlTime(java.time.Instant t) {
+        long seconds = t.getEpochSecond();
+        int nanos = t.getNano();
+        if (seconds < CDDL_TIME_FIRST || seconds > CDDL_TIME_LAST) {
+            throw new CsilCborException("csil cbor: cddl_time year outside 0001-9999");
+        }
+        if (nanos == 0) {
+            return new CborTag(1, new CborInt(seconds));
+        }
+        return new CborTag(1, new CborFloat((double) seconds + (double) nanos / 1e9));
+    }
+
+    public static java.time.Instant asCddlTime(CborValue v) {
+        if (!(v instanceof CborTag t) || t.num() != 1) {
+            throw new CsilCborException("csil cbor: expected CBOR tag 1 cddl_time");
+        }
+        long seconds;
+        long nanos = 0;
+        if (t.inner() instanceof CborUint x) {
+            // A CborUint above 2^63 arrives as a negative long.
+            if (x.value() < 0) {
+                throw new CsilCborException("csil cbor: cddl_time year outside 0001-9999");
+            }
+            seconds = x.value();
+        } else if (t.inner() instanceof CborInt x) {
+            seconds = x.value();
+        } else if (t.inner() instanceof CborFloat x) {
+            double value = x.value();
+            if (!Double.isFinite(value)) {
+                throw new CsilCborException("csil cbor: cddl_time is not finite");
+            }
+            // Refused before the integer conversion so that the cast cannot saturate.
+            if (value < (double) (CDDL_TIME_FIRST - 1) || value > (double) (CDDL_TIME_LAST + 1)) {
+                throw new CsilCborException("csil cbor: cddl_time year outside 0001-9999");
+            }
+            double whole = Math.floor(value);
+            double scaled = (value - whole) * 1e9;
+            double units = Math.floor(scaled + 0.5);
+            seconds = (long) whole;
+            nanos = (long) units;
+            if (nanos == 1_000_000_000L) {
+                seconds += 1;
+                nanos = 0;
+            }
+        } else {
+            throw new CsilCborException("csil cbor: cddl_time tag 1 requires a number");
+        }
+        if (seconds < CDDL_TIME_FIRST || seconds > CDDL_TIME_LAST) {
+            throw new CsilCborException("csil cbor: cddl_time year outside 0001-9999");
+        }
+        return java.time.Instant.ofEpochSecond(seconds, nanos);
     }
 "#;
 
@@ -4311,6 +4606,230 @@ mod tests {
         assert!(!f.content.contains("java.time.Instant createdAt"));
     }
 
+    /// The strict timestamp codec, run under the JDK: accepted forms re-encode to the
+    /// contract's canonical text, and every lenient form `Instant.parse` would take (or
+    /// that the contract forbids) is refused. Skips cleanly when `javac` is absent.
+    #[test]
+    fn timestamp_codec_is_strict_under_javac() {
+        let have = std::process::Command::new("javac")
+            .arg("-version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if !have {
+            eprintln!("skipping: no javac on PATH");
+            return;
+        }
+        let group = CsilGroupExpression {
+            entries: vec![bare("at", builtin("timestamp"), None)],
+        };
+        let files = generate_java(&input_for(
+            vec![rule("Stamp", CsilRuleType::GroupDef(group))],
+            "java",
+        ))
+        .unwrap();
+        let codec = &file(&files, "CsilCbor.java").content;
+        assert!(!codec.contains("Instant.parse"), "no lenient JDK parser");
+        let dir = std::env::temp_dir().join(format!("csilgen-java-ts-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut sources = Vec::new();
+        for f in &files {
+            if !f.path.ends_with(".java") {
+                continue;
+            }
+            let path = dir.join(&f.path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, &f.content).unwrap();
+            sources.push(path);
+        }
+        let driver = dir.join("csilgen/generated/Driver.java");
+        std::fs::write(&driver, JAVA_TIMESTAMP_DRIVER).unwrap();
+        sources.push(driver);
+        let classes = dir.join("classes");
+        let compile = std::process::Command::new("javac")
+            .arg("-d")
+            .arg(&classes)
+            .args(&sources)
+            .output()
+            .unwrap();
+        assert!(
+            compile.status.success(),
+            "javac failed:\n{}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+        let run = std::process::Command::new("java")
+            .arg("-cp")
+            .arg(&classes)
+            .arg("csilgen.generated.Driver")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&run.stdout);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            stdout.trim(),
+            "ok",
+            "{stdout}{}",
+            String::from_utf8_lossy(&run.stderr)
+        );
+    }
+
+    #[test]
+    fn cddl_time_is_an_instant_with_a_tag_1_codec() {
+        let group = CsilGroupExpression {
+            entries: vec![bare("at", builtin("cddl_time"), None)],
+        };
+        let files = generate_java(&input_for(
+            vec![rule("Moment", CsilRuleType::GroupDef(group))],
+            "java",
+        ))
+        .unwrap();
+        let record = &file(&files, "Moment.java").content;
+        assert!(record.contains("Instant at"), "{record}");
+        let codec = &file(&files, "CsilCbor.java").content;
+        assert!(codec.contains("encCddlTime("), "{codec}");
+        assert!(codec.contains("Instant asCddlTime(CborValue v)"), "{codec}");
+        assert!(codec.contains("case 25:"), "half floats decode");
+        // A spec without the type keeps the tag-1 helpers out, like the timestamp ones.
+        assert!(!codec.contains("encTimestamp("));
+        let plain = generate_java(&input_for(
+            vec![rule(
+                "Plain",
+                CsilRuleType::GroupDef(CsilGroupExpression {
+                    entries: vec![bare("n", builtin("int"), None)],
+                }),
+            )],
+            "java",
+        ))
+        .unwrap();
+        assert!(!file(&plain, "CsilCbor.java").content.contains("CddlTime("));
+    }
+
+    /// The tag-1 codec, run under the JDK against the shared epoch vectors with the
+    /// fixture's own peer. Skips cleanly when `javac` is absent.
+    #[test]
+    fn cddl_time_codec_passes_epoch_vectors_under_javac() {
+        let have = std::process::Command::new("javac")
+            .arg("-version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if !have {
+            eprintln!("skipping: no javac on PATH");
+            return;
+        }
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/interop/epoch-vectors");
+        let group = CsilGroupExpression {
+            entries: vec![bare("at", builtin("cddl_time"), None)],
+        };
+        let files = generate_java(&input_for(
+            vec![rule("Moment", CsilRuleType::GroupDef(group))],
+            "java",
+        ))
+        .unwrap();
+        let dir = std::env::temp_dir().join(format!("csilgen-java-epoch-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut sources = Vec::new();
+        for f in &files {
+            if !f.path.ends_with(".java") {
+                continue;
+            }
+            let path = dir.join(&f.path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, &f.content).unwrap();
+            sources.push(path);
+        }
+        let peer = dir.join("csilgen/generated/Peer.java");
+        std::fs::copy(fixture.join("Peer.java"), &peer).unwrap();
+        sources.push(peer);
+        let classes = dir.join("classes");
+        let compile = std::process::Command::new("javac")
+            .arg("-d")
+            .arg(&classes)
+            .args(&sources)
+            .output()
+            .unwrap();
+        assert!(
+            compile.status.success(),
+            "javac failed:\n{}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+        let run = std::process::Command::new("java")
+            .arg("-cp")
+            .arg(&classes)
+            .arg("csilgen.generated.Peer")
+            .arg(fixture.join("vectors.tsv"))
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&run.stdout);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            run.status.success() && stdout.contains("java epoch vectors:"),
+            "{stdout}{}",
+            String::from_utf8_lossy(&run.stderr)
+        );
+    }
+
+    const JAVA_TIMESTAMP_DRIVER: &str = r#"package csilgen.generated;
+
+import static csilgen.generated.CsilCbor.*;
+
+public final class Driver {
+    static String round(String text) {
+        CborValue v = encTimestamp(asTimestamp(new CborTag(0, new CborText(text))));
+        return ((CborText) ((CborTag) v).inner()).value();
+    }
+
+    public static void main(String[] args) {
+        String[][] ok = {
+            {"2000-02-29T12:00:00Z", "2000-02-29T12:00:00Z"},
+            {"2000-02-29t12:00:00.5z", "2000-02-29T12:00:00.500Z"},
+            {"2000-02-29T12:00:00.0005Z", "2000-02-29T12:00:00.000500Z"},
+            {"2000-02-29T12:00:00.000000001Z", "2000-02-29T12:00:00.000000001Z"},
+            {"2000-02-29T12:00:00.000000000Z", "2000-02-29T12:00:00Z"},
+            {"2000-02-29T13:30:00+01:30", "2000-02-29T12:00:00Z"},
+            {"0001-01-01T00:30:00+00:30", "0001-01-01T00:00:00Z"},
+            {"9999-12-31T23:59:59-00:00", "9999-12-31T23:59:59Z"},
+        };
+        for (String[] row : ok) {
+            String got = round(row[0]);
+            if (!got.equals(row[1])) {
+                System.out.println("FAIL " + row[0] + " -> " + got);
+                return;
+            }
+        }
+        String[] bad = {
+            "2000-02-29 12:00:00Z", "2000-02-29T12:00:00", "2001-02-29T12:00:00Z",
+            "2000-02-29T24:00:00Z", "2000-02-29T12:00:60Z", "2000-02-29T12:00:00.Z",
+            "2000-02-29T12:00:00.1234567890Z", "2000-02-29T12:00:00,5Z", "2000-02-29T12:00:00+0100",
+            "2000-02-29T12:00:00+24:00", "2000-02-29T12:00:00+01:60", "0000-12-31T23:00:00-02:00",
+            "0001-01-01T00:00:00+00:01", "9999-12-31T23:59:59-00:01", "2000-02-29T12:00:00Z ",
+            "２000-02-29T12:00:00Z", "+2000-02-29T12:00:00Z",
+        };
+        for (String text : bad) {
+            try {
+                asTimestamp(new CborTag(0, new CborText(text)));
+                System.out.println("FAIL accepted " + text);
+                return;
+            } catch (CsilCborException e) {
+                // expected
+            }
+        }
+        for (CborValue v : new CborValue[] {new CborText("2000-02-29T12:00:00Z"),
+                new CborTag(1, new CborText("2000-02-29T12:00:00Z")), new CborTag(0, new CborUint(0))}) {
+            try {
+                asTimestamp(v);
+                System.out.println("FAIL accepted " + v);
+                return;
+            } catch (CsilCborException e) {
+                // expected
+            }
+        }
+        System.out.println("ok");
+    }
+}
+"#;
+
     #[test]
     fn validation_runs_in_canonical_constructor() {
         let constrained = CsilTypeExpression::Constrained {
@@ -4409,11 +4928,24 @@ mod tests {
         assert!(f.content.contains(
             "public SubmitTaskResponse submitTask(SubmitTaskRequest req) throws ClientException"
         ));
-        // The client encodes the request and decodes the response through the codec over
-        // a dumb byte seam: verbatim CSIL service and op names, matching peers.
+        // The client encodes the request through the codec and, because the op has a
+        // `ServiceError` arm, asks the seam for the reply variant and resolves the arm
+        // before it decodes: verbatim CSIL service and op names, matching peers.
         assert!(f.content.contains(
-            "return CsilCbor.decodeSubmitTaskResponse(transport.call(\"CorndogsService\", \"submit-task\", CsilCbor.encodeSubmitTaskRequest(req)));"
+            "WireReply reply = transport.callReply(\"CorndogsService\", \"submit-task\", CsilCbor.encodeSubmitTaskRequest(req));"
         ));
+        assert!(f.content.contains(
+            "return CsilCbor.decodeSubmitTaskResponse(CsilCbor.resolveRpcReply(\"CorndogsService\", \"submit-task\", reply.variant(), reply.payload()));"
+        ));
+        let seam = file(&files, "Transport.java");
+        assert!(seam.content.contains(
+            "WireReply callReply(String service, String op, byte[] req) throws ClientException;"
+        ));
+        assert!(
+            file(&files, "WireReply.java")
+                .content
+                .contains("public record WireReply(String variant, byte[] payload) {}")
+        );
         // no server interface for the client target.
         assert!(!files.iter().any(|f| f.path.ends_with("Corndogs.java")));
     }
@@ -5070,12 +5602,22 @@ public final class Driver {
     // A loopback "server" on the far side of the dumb byte seam: it decodes the typed
     // request, then encodes its task as the typed response, exercising both directions.
     static final class Loopback implements Transport {
+        private final String variant;
+
+        Loopback(String variant) {
+            this.variant = variant;
+        }
+
         public byte[] call(String service, String op, byte[] req) throws ClientException {
+            throw new ClientException("a multi-arm op must use callReply");
+        }
+
+        public WireReply callReply(String service, String op, byte[] req) throws ClientException {
             if (!service.equals("CorndogsService") || !op.equals("submit-task")) {
                 throw new ClientException("unexpected route " + service + "/" + op);
             }
             SubmitTaskRequest in = CsilCbor.decodeSubmitTaskRequest(req);
-            return CsilCbor.encodeTask(in.task());
+            return new WireReply(variant, CsilCbor.encodeTask(in.task()));
         }
     }
 
@@ -5107,8 +5649,15 @@ public final class Driver {
         check(back2.task().priority() == null, "absent optional null");
 
         // Typed client round-trip over the loopback carrier.
-        CorndogsClient client = new CorndogsClient(new Loopback());
+        CorndogsClient client = new CorndogsClient(new Loopback("Task"));
         Task resp = client.submitTask(req);
+        // A reply without a variant cannot select an arm, so it is a decode error.
+        try {
+            new CorndogsClient(new Loopback(null)).submitTask(req);
+            check(false, "missing variant accepted");
+        } catch (CsilCbor.CsilCborException e) {
+            // expected
+        }
         check(resp.uuid().equals("u-123"), "client uuid");
         check(java.util.Arrays.equals(resp.payload(), payload), "client payload");
         check(resp.priority() != null && resp.priority() == 7L, "client priority");
@@ -6332,6 +6881,12 @@ public final class PomCheck {
     /// so the datagram codec round-trips) and a record-typed `<->` op (`chat: ChatMsg <->
     /// ChatReply`, both records so the channel router exists).
     fn demo_rules() -> Vec<CsilRule> {
+        demo_rules_with(false)
+    }
+
+    /// `demo_rules`, optionally with `ping` replying `Ping / Oops`, so the seam needs the
+    /// reply variant and the quickstart carrier must implement `callReply`.
+    fn demo_rules_with(reply_arm: bool) -> Vec<CsilRule> {
         let ping = rule(
             "Ping",
             CsilRuleType::GroupDef(CsilGroupExpression {
@@ -6358,7 +6913,11 @@ public final class PomCheck {
                 op(
                     "ping",
                     reference("Ping"),
-                    reference("Ping"),
+                    if reply_arm {
+                        CsilTypeExpression::Choice(vec![reference("Ping"), reference("Oops")])
+                    } else {
+                        reference("Ping")
+                    },
                     CsilServiceDirection::Unidirectional,
                     None,
                 ),
@@ -6372,18 +6931,27 @@ public final class PomCheck {
             ],
             wire_id: Some(1),
         };
-        vec![
-            ping,
-            chat_msg,
-            chat_reply,
-            rule("DemoService", CsilRuleType::ServiceDef(svc)),
-        ]
+        let mut rules = vec![ping, chat_msg, chat_reply];
+        if reply_arm {
+            rules.push(rule(
+                "Oops",
+                CsilRuleType::GroupDef(CsilGroupExpression {
+                    entries: vec![bare("reason", builtin("text"), None)],
+                }),
+            ));
+        }
+        rules.push(rule("DemoService", CsilRuleType::ServiceDef(svc)));
+        rules
     }
 
     fn demo_input_pkg(target: &str) -> WasmGeneratorInput {
+        demo_input_pkg_with(target, false)
+    }
+
+    fn demo_input_pkg_with(target: &str, reply_arm: bool) -> WasmGeneratorInput {
         package_input_with(
             target,
-            demo_rules(),
+            demo_rules_with(reply_arm),
             &[
                 ("emit_packages", serde_json::json!(["java"])),
                 ("java_package", serde_json::json!("community.catalyst.demo")),
@@ -6404,6 +6972,26 @@ public final class PomCheck {
             input.config.options.insert((*k).to_string(), v.clone());
         }
         input
+    }
+
+    #[test]
+    fn reply_arm_readme_carrier_implements_call_reply() {
+        let files = generate_java(&demo_input_pkg_with("java-client", true)).unwrap();
+        let c = &file(&files, "genquickstart.md").content;
+        assert!(c.contains(
+            "public WireReply callReply(String service, String op, byte[] req) throws ClientException {"
+        ));
+        assert!(c.contains("return new WireReply(decoded.variant(), decoded.payload());"));
+        assert!(
+            !c.contains("resolveRpcReply"),
+            "carrier never resolves arms"
+        );
+        // The seam requires callReply, and the reply-free demo keeps the old seam.
+        let seam = &file(&files, "Transport.java").content;
+        assert!(seam.contains("WireReply callReply("));
+        let plain = generate_java(&demo_input_pkg("java-client")).unwrap();
+        assert!(!file(&plain, "Transport.java").content.contains("callReply"));
+        assert!(!plain.iter().any(|f| f.path.ends_with("WireReply.java")));
     }
 
     #[test]
@@ -6437,11 +7025,15 @@ public final class PomCheck {
             "response decode via the lib"
         );
         assert!(c.contains("/csil/v1/rpc"), "posts to the path");
+        // Without a multi-arm op the carrier hands the payload on; it never resolves arms.
+        assert!(c.contains("return decoded.payload();"), "payload returned");
         assert!(
-            c.contains(
-                "CsilCbor.resolveRpcReply(service, op, decoded.variant(), decoded.payload())"
-            ),
-            "typed ServiceError arm handled"
+            !c.contains("resolveRpcReply"),
+            "carrier never resolves arms"
+        );
+        assert!(
+            !c.contains("callReply"),
+            "no callReply without a multi-arm op"
         );
         assert!(
             c.contains("import community.catalyst.csilgen.transport.Rpc;"),
@@ -6658,56 +7250,60 @@ public final class PomCheck {
 
         // Compile a generated package plus the named example blocks (extracted by heading)
         // against the transport library. Returns the javac output on failure.
-        let compile_surface =
-            |tag: &str, target: &str, blocks: &[(&str, &str)]| -> Result<(), String> {
-                let files = generate_java(&demo_input_pkg(target)).unwrap();
-                let dir = std::env::temp_dir()
-                    .join(format!("csilgen-java-3t-{tag}-{}", std::process::id()));
-                let _ = std::fs::remove_dir_all(&dir);
-                let mut sources: Vec<std::path::PathBuf> = lib_sources.clone();
-                let mut readme = String::new();
-                for f in &files {
-                    if f.path == "genquickstart.md" {
-                        readme = f.content.clone();
-                        continue;
-                    }
-                    let path = dir.join(&f.path);
-                    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-                    std::fs::write(&path, &f.content).unwrap();
-                    if f.path.starts_with("src/main/java/") && f.path.ends_with(".java") {
-                        sources.push(path);
-                    }
+        let compile_surface = |tag: &str,
+                               target: &str,
+                               reply_arm: bool,
+                               blocks: &[(&str, &str)]|
+         -> Result<(), String> {
+            let files = generate_java(&demo_input_pkg_with(target, reply_arm)).unwrap();
+            let dir =
+                std::env::temp_dir().join(format!("csilgen-java-3t-{tag}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            let mut sources: Vec<std::path::PathBuf> = lib_sources.clone();
+            let mut readme = String::new();
+            for f in &files {
+                if f.path == "genquickstart.md" {
+                    readme = f.content.clone();
+                    continue;
                 }
-                for (heading, class) in blocks {
-                    let block = extract_java_block_after(&readme, heading)
-                        .unwrap_or_else(|| panic!("{tag}: missing {heading} java block"));
-                    let path = dir.join(format!("{src_root}/{class}.java"));
-                    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-                    std::fs::write(&path, block).unwrap();
+                let path = dir.join(&f.path);
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                std::fs::write(&path, &f.content).unwrap();
+                if f.path.starts_with("src/main/java/") && f.path.ends_with(".java") {
                     sources.push(path);
                 }
-                let classes = dir.join("classes");
-                std::fs::create_dir_all(&classes).unwrap();
-                let compile = std::process::Command::new("javac")
-                    .arg("-d")
-                    .arg(&classes)
-                    .args(&sources)
-                    .output()
-                    .unwrap();
-                let result = if compile.status.success() {
-                    Ok(())
-                } else {
-                    Err(String::from_utf8_lossy(&compile.stderr).to_string())
-                };
-                let _ = std::fs::remove_dir_all(&dir);
-                result
+            }
+            for (heading, class) in blocks {
+                let block = extract_java_block_after(&readme, heading)
+                    .unwrap_or_else(|| panic!("{tag}: missing {heading} java block"));
+                let path = dir.join(format!("{src_root}/{class}.java"));
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                std::fs::write(&path, block).unwrap();
+                sources.push(path);
+            }
+            let classes = dir.join("classes");
+            std::fs::create_dir_all(&classes).unwrap();
+            let compile = std::process::Command::new("javac")
+                .arg("-d")
+                .arg(&classes)
+                .args(&sources)
+                .output()
+                .unwrap();
+            let result = if compile.status.success() {
+                Ok(())
+            } else {
+                Err(String::from_utf8_lossy(&compile.stderr).to_string())
             };
+            let _ = std::fs::remove_dir_all(&dir);
+            result
+        };
 
         // The single default `java` package: RPC + Events + Datagrams are ALL live and ALL
         // resolve against the one package (typed client + generated router + codec together).
         compile_surface(
             "single",
             "java",
+            false,
             &[
                 ("## CSIL-RPC (HTTP)", "RpcExample"),
                 ("## CSIL-Events (TLS)", "EventsExample"),
@@ -6715,5 +7311,14 @@ public final class PomCheck {
             ],
         )
         .unwrap_or_else(|e| panic!("single-package javac failed:\n{e}"));
+        // A multi-arm op makes `callReply` a required seam method; the carrier must
+        // implement it for the package to compile.
+        compile_surface(
+            "reply-arms",
+            "java",
+            true,
+            &[("## CSIL-RPC (HTTP)", "RpcExample")],
+        )
+        .unwrap_or_else(|e| panic!("reply-arm javac failed:\n{e}"));
     }
 }

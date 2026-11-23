@@ -3,10 +3,15 @@ require_relative "client"
 raise unless RpErrorCode.to_number(RpErrorCode::ACCOUNT_RATE_LIMITED) == 42
 raise unless RpErrorCode.from_number(42) == RpErrorCode::ACCOUNT_RATE_LIMITED
 
+# A fake transport: the generated client must pick the reply arm from the variant
+# this seam returns, with no help from the resolver.
 class Carrier
-  def call(service, op, payload)
+  def call_reply(_service, _op, payload)
     req = Req.from_cbor(payload)
     raise IOError, "2" if req.a == "unknown"
+    return ["Other", Resp.new(b: "other").to_cbor] if req.a == "other"
+    return [nil, Resp.new(b: "none").to_cbor] if req.a == "none"
+
     variant, reply = CsilCbor.encode_rp_decrypt_token_reply do
       if req.a == "limit"
         raise CsilCbor::RpErrorRefusal.new(RpError.new(code: RpErrorCode::APPLICATION_USER_LIMIT, message: "limit"))
@@ -14,7 +19,7 @@ class Carrier
       Resp.new(b: "ok")
     end
     raise "wrong CBOR error code" if variant == "RpError" && reply.getbyte(6) != 7
-    CsilCbor.resolve_rpc_reply(service, op, variant, reply)
+    [variant, reply]
   end
 end
 
@@ -32,3 +37,21 @@ begin
 rescue IOError => e
   raise unless e.message == "2"
 end
+%w[other none].each do |bad|
+  client.decrypt_token(Req.new(a: bad))
+  raise "accepted reply with #{bad} variant"
+rescue ArgumentError
+  # An unknown or missing variant is a decode error.
+end
+
+# A transport with only the bytes-only `call` seam cannot serve a multi-arm op.
+class BytesOnly
+  def call(_service, _op, _payload) = Resp.new(b: "ok").to_cbor
+end
+begin
+  RpClient.new(BytesOnly.new).decrypt_token(Req.new(a: "ok"))
+  raise "missing NotImplementedError"
+rescue NotImplementedError
+  # expected
+end
+puts "typed replies pass"
