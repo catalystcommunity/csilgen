@@ -23,17 +23,23 @@ func (handler) DecryptToken(_ context.Context, req api.Req) (api.Resp, error) {
 	return api.Resp{B: "yes"}, nil
 }
 
+// carrier is a fake transport: it answers every call with the stored response envelope.
 type carrier []byte
 
-func (wire carrier) Call(_ context.Context, service, op string, _ []byte) ([]byte, error) {
+func (wire carrier) Call(ctx context.Context, service, op string, req []byte) ([]byte, error) {
+	reply, err := wire.CallReply(ctx, service, op, req)
+	return reply.Payload, err
+}
+
+func (wire carrier) CallReply(_ context.Context, _, _ string, _ []byte) (api.WireReply, error) {
 	reply, err := rpc.DecodeRpcResponse(wire)
 	if err != nil {
-		return nil, err
+		return api.WireReply{}, err
 	}
 	if err := reply.AsTransportError(); err != nil {
-		return nil, err
+		return api.WireReply{}, err
 	}
-	return api.ResolveRPCReply(service, op, reply.Variant, reply.Payload)
+	return api.WireReply{Variant: reply.Variant, Payload: reply.Payload}, nil
 }
 
 func run(name string) error {
@@ -112,7 +118,8 @@ func main() {
 		panic("incorrect JSON enum decode")
 	}
 	value := api.RpError{Code: code, Message: "limit"}
-	if !bytes.Equal(api.EncodeRpError(value), []byte("\xa2\x64code\x18\x2a\x67message\x65limit")) {
+	encoded, err := api.EncodeRpError(value)
+	if err != nil || !bytes.Equal(encoded, []byte("\xa2\x64code\x18\x2a\x67message\x65limit")) {
 		panic("incorrect CBOR enum number")
 	}
 

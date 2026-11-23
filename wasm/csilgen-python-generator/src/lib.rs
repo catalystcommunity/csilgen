@@ -171,7 +171,7 @@ fn python_bound_expr(value: &CsilLiteralValue, value_type: &CsilTypeExpression) 
             _ => format!("Decimal({literal})"),
         },
         Some("date") => format!("csil_date.fromisoformat({literal})"),
-        Some("timestamp") => {
+        Some("timestamp" | "cddl_time") => {
             format!("datetime.fromisoformat({literal}.replace(\"Z\", \"+00:00\"))")
         }
         _ => literal,
@@ -193,7 +193,7 @@ fn scan_special_types(
 ) {
     match type_expr {
         CsilTypeExpression::Builtin(name) => match name.as_str() {
-            "timestamp" => *needs_datetime = true,
+            "timestamp" | "cddl_time" => *needs_datetime = true,
             "decimal" => *needs_decimal = true,
             _ => {}
         },
@@ -622,13 +622,24 @@ fn rpc_section(import: &str, ex: Option<&UnaryExample>, typed_rpc: bool) -> Stri
     out.push_str("```python\n");
     out.push_str("from csilgen_transport.rpc import RpcRequest, RpcResponse\n");
     out.push_str(&format!("from {import} import {}\n\n", names.join(", ")));
+    // An op with several reply arms makes the seam require `call_reply`; the
+    // library's `RpcResponse` carries the variant, so the carrier hands it over and
+    // the generated client picks the arm.
     if typed_rpc {
-        out.push_str(&format!("from {import}.codec import resolve_rpc_reply\n"));
-    }
-    out.push_str(RPC_CARRIER_PYTHON);
-    if typed_rpc {
-        out.push_str("        return resolve_rpc_reply(service, op, env.variant, env.payload)\n");
+        out.push_str(&RPC_CARRIER_PYTHON.replace(
+            "    def call(self, service: str, op: str, req: bytes) -> bytes:",
+            "    def _exchange(self, service: str, op: str, req: bytes) -> RpcResponse:",
+        ));
+        out.push_str(
+            "        return env\n\n\
+             \x20   def call(self, service: str, op: str, req: bytes) -> bytes:\n\
+             \x20       return self._exchange(service, op, req).payload\n\n\
+             \x20   def call_reply(self, service: str, op: str, req: bytes):\n\
+             \x20       env = self._exchange(service, op, req)\n\
+             \x20       return env.variant, env.payload\n",
+        );
     } else {
+        out.push_str(RPC_CARRIER_PYTHON);
         out.push_str("        return env.payload\n");
     }
     out.push_str("\n\ndef main() -> None:\n");
@@ -1157,6 +1168,18 @@ struct PythonGenerator {
     // and HashSet iteration order varies between wasm builds of the same source rev, which
     // breaks reproducible-codegen checks that regen + `git diff --exit-code`.
     imports: BTreeSet<String>,
+    // The record and alias names a field `Reference` may name, keyed by
+    // `record_suffix`, so `to_dict`/`from_dict` can convert values by type.
+    json_records: HashSet<String>,
+    json_aliases: HashMap<String, CsilTypeExpression>,
+}
+
+/// What a `Reference` names, for the JSON helpers.
+enum JsonTarget<'a> {
+    Enum,
+    Record,
+    Alias(&'a CsilTypeExpression),
+    Other,
 }
 
 impl PythonGenerator {
@@ -1173,6 +1196,8 @@ impl PythonGenerator {
             generated_types: HashSet::new(),
             enum_choices: HashMap::new(),
             imports: BTreeSet::new(),
+            json_records: HashSet::new(),
+            json_aliases: HashMap::new(),
         }
     }
 
@@ -1234,6 +1259,8 @@ impl PythonGenerator {
         // The codec covers every record (dataclass); the typed client below calls a
         // record's generated `to_cbor`/`from_cbor`, so compute the record set once.
         let records = python_record_names(spec);
+        self.json_records = records.clone();
+        self.json_aliases = codec_aliases(spec);
 
         self.setup_imports();
         self.collect_special_imports(spec);
@@ -1716,24 +1743,103 @@ impl PythonGenerator {
         python_bound_expr(value, ty)
     }
 
-    fn enum_from_json(&self, ty: &CsilTypeExpression, expr: &str) -> Option<String> {
+    /// The record and alias each `Reference` resolves through, so the JSON helpers can
+    /// convert a value by its declared type.
+    fn json_target<'a>(&'a self, name: &str) -> JsonTarget<'a> {
+        let suffix = record_suffix(name);
+        if self.enum_choices.contains_key(name) {
+            JsonTarget::Enum
+        } else if self.json_records.contains(&suffix) {
+            JsonTarget::Record
+        } else if let Some(alias) = self.json_aliases.get(&suffix) {
+            JsonTarget::Alias(alias)
+        } else {
+            JsonTarget::Other
+        }
+    }
+
+    /// The expression that turns `expr` (of CSIL type `ty`) into a JSON-native value,
+    /// or `None` when it already is one. The shapes match the JSON Schema target:
+    /// RFC 3339 text, `YYYY-MM-DD`, exact decimal text, and base64 text.
+    fn json_out(&self, ty: &CsilTypeExpression, expr: &str, depth: usize) -> Option<String> {
         match unwrap_constrained(ty) {
-            CsilTypeExpression::Reference(name) if self.enum_choices.contains_key(name) => {
-                Some(format!("{}({expr})", name.to_case(Case::Pascal)))
+            CsilTypeExpression::Builtin(name) => match name.as_str() {
+                "timestamp" => Some(format!("_csil_json_timestamp_out({expr})")),
+                "cddl_time" => Some(format!("_csil_json_cddl_time_out({expr})")),
+                "date" => Some(format!("_csil_json_date_out({expr})")),
+                "decimal" => Some(format!("_csil_json_decimal_out({expr})")),
+                "bytes" | "bstr" => Some(format!("_csil_json_bytes_out({expr})")),
+                "any" => Some(format!("_csil_json_any_out({expr})")),
+                _ => None,
+            },
+            CsilTypeExpression::Reference(name) => match self.json_target(name) {
+                JsonTarget::Enum => None,
+                JsonTarget::Record => Some(format!("{expr}.to_dict()")),
+                JsonTarget::Alias(alias) => self.json_out(alias, expr, depth),
+                // A union value carries no static type here, so it is converted by
+                // its runtime type instead.
+                JsonTarget::Other => Some(format!("_csil_json_any_out({expr})")),
+            },
+            CsilTypeExpression::Array { element_type, .. } => {
+                let item = format!("item{depth}");
+                self.json_out(element_type, &item, depth + 1)
+                    .map(|inner| format!("[{inner} for {item} in {expr}]"))
             }
-            CsilTypeExpression::Array { element_type, .. } => self
-                .enum_from_json(element_type, "item")
-                .map(|inner| format!("[{inner} for item in {expr}]")),
+            CsilTypeExpression::Map { value, .. } => {
+                let (k, v) = (format!("k{depth}"), format!("v{depth}"));
+                self.json_out(value, &v, depth + 1)
+                    .map(|inner| format!("{{{k}: {inner} for {k}, {v} in {expr}.items()}}"))
+            }
+            CsilTypeExpression::Literal(_) => None,
+            _ => Some(format!("_csil_json_any_out({expr})")),
+        }
+    }
+
+    /// The inverse of `json_out`: the expression that rebuilds the in-memory value of
+    /// CSIL type `ty` from the JSON value `expr`, or `None` when no change is needed.
+    fn json_in(&self, ty: &CsilTypeExpression, expr: &str, depth: usize) -> Option<String> {
+        match unwrap_constrained(ty) {
+            CsilTypeExpression::Builtin(name) => match name.as_str() {
+                "timestamp" => Some(format!("_csil_json_timestamp_in({expr})")),
+                "cddl_time" => Some(format!("_csil_json_cddl_time_in({expr})")),
+                "date" => Some(format!("_csil_json_date_in({expr})")),
+                "decimal" => Some(format!("_csil_json_decimal_in({expr})")),
+                "bytes" | "bstr" => Some(format!("_csil_json_bytes_in({expr})")),
+                _ => None,
+            },
+            CsilTypeExpression::Reference(name) => match self.json_target(name) {
+                JsonTarget::Enum => Some(format!("{}({expr})", name.to_case(Case::Pascal))),
+                JsonTarget::Record => {
+                    Some(format!("{}.from_dict({expr})", name.to_case(Case::Pascal)))
+                }
+                JsonTarget::Alias(alias) => self.json_in(alias, expr, depth),
+                JsonTarget::Other => None,
+            },
+            CsilTypeExpression::Array { element_type, .. } => {
+                let item = format!("item{depth}");
+                self.json_in(element_type, &item, depth + 1)
+                    .map(|inner| format!("[{inner} for {item} in {expr}]"))
+            }
             CsilTypeExpression::Map { key, value, .. } => {
-                let k = self.enum_from_json(key, "k");
-                let v = self.enum_from_json(value, "v");
-                if k.is_none() && v.is_none() {
+                let (k, v) = (format!("k{depth}"), format!("v{depth}"));
+                // JSON object keys are always text, so an integer key comes back as
+                // its decimal text and must be read back as an `int`.
+                let key_in = match unwrap_constrained(key) {
+                    CsilTypeExpression::Builtin(name)
+                        if matches!(name.as_str(), "int" | "uint" | "nint") =>
+                    {
+                        Some(format!("int({k})"))
+                    }
+                    other => self.json_in(other, &k, depth + 1),
+                };
+                let value_in = self.json_in(value, &v, depth + 1);
+                if key_in.is_none() && value_in.is_none() {
                     None
                 } else {
                     Some(format!(
-                        "{{{}: {} for k, v in {expr}.items()}}",
-                        k.as_deref().unwrap_or("k"),
-                        v.as_deref().unwrap_or("v")
+                        "{{{}: {} for {k}, {v} in {expr}.items()}}",
+                        key_in.as_deref().unwrap_or(&k),
+                        value_in.as_deref().unwrap_or(&v)
                     ))
                 }
             }
@@ -1881,9 +1987,9 @@ impl PythonGenerator {
                 }
                 _ => {
                     code.push_str(&format!("        if hasattr(self, '{field_name}') and self.{field_name} is not None:\n"));
-                    code.push_str(&format!(
-                        "            result['{field_name}'] = self.{field_name}\n"
-                    ));
+                    let value = format!("self.{field_name}");
+                    let value = self.json_out(&entry.value_type, &value, 0).unwrap_or(value);
+                    code.push_str(&format!("            result['{field_name}'] = {value}\n"));
                 }
             }
         }
@@ -1912,7 +2018,7 @@ impl PythonGenerator {
                 _ => {
                     let read = format!("data.get('{field_name}')");
                     let converted =
-                        self.enum_from_json(&entry.value_type, &format!("data['{field_name}']"));
+                        self.json_in(&entry.value_type, &format!("data['{field_name}']"), 0);
                     let value = converted
                         .map(|expr| {
                             let default = control_operators(&entry.value_type)
@@ -2539,7 +2645,7 @@ impl PythonGenerator {
     /// Once-per-file preamble for the client module: the `ServiceError`
     /// exception the transport raises, and the `Transport` Protocol every client
     /// delegates to. The generator never owns the wire (CBOR-over-HTTP etc.).
-    fn generate_client_prelude(shape: ClientShape) -> String {
+    fn generate_client_prelude(shape: ClientShape, needs_reply: bool) -> String {
         let transport = shape.transport_name();
         let def_kw = shape.def_kw();
         let mut out = String::new();
@@ -2564,8 +2670,24 @@ impl PythonGenerator {
         // An `async def` seam annotated `-> bytes` is a coroutine the client
         // `await`s for the bytes; the codec it then feeds them to stays synchronous.
         out.push_str(&format!(
-            "    {def_kw} call(self, service: str, method: str, req: bytes) -> bytes: ...\n\n"
+            "    {def_kw} call(self, service: str, method: str, req: bytes) -> bytes: ...\n"
         ));
+        // `call_reply` exists only when some op has several reply arms: bytes alone
+        // cannot say which arm a payload holds, and the reply variant must not depend
+        // on a hand-written carrier remembering to resolve it. Leaving it out
+        // otherwise keeps every existing carrier compatible.
+        if needs_reply {
+            out.push_str(&format!(
+                "\n    {def_kw} call_reply(\n        self, service: str, method: str, req: bytes\n    ) -> \"tuple[Optional[str], bytes]\":\n"
+            ));
+            out.push_str(
+                "        \"\"\"Perform an operation that declares more than one reply arm. Return\n\
+                 \x20       the CSIL-RPC response variant (the CSIL name of the arm, or None) and\n\
+                 \x20       its payload bytes; the client decodes the arm that the variant names.\n\
+                 \x20       \"\"\"\n        ...\n",
+            );
+        }
+        out.push('\n');
         out
     }
 
@@ -2704,9 +2826,20 @@ impl PythonGenerator {
             };
             // Only the transport seam is awaited; the codec decode is synchronous.
             let await_kw = shape.await_kw();
-            let call = format!(
-                "{await_kw}self._transport.call(\"{wire_service}\", \"{wire_method}\", {payload})"
-            );
+            let call = if op.rpc_reply_arms().is_some() {
+                // `resolve_rpc_reply` raises the declared error arm's refusal, and
+                // rejects a missing or unknown variant, before the success decode.
+                out.push_str(&format!(
+                    "        variant, payload = {await_kw}self._transport.call_reply(\"{wire_service}\", \"{wire_method}\", {payload})\n"
+                ));
+                format!(
+                    "resolve_rpc_reply(\"{wire_service}\", \"{wire_method}\", variant, payload)"
+                )
+            } else {
+                format!(
+                    "{await_kw}self._transport.call(\"{wire_service}\", \"{wire_method}\", {payload})"
+                )
+            };
             // A record success reuses its `from_cbor`; any other shape uses the op's
             // per-op response decoder.
             let decoded = if resp_record {
@@ -2744,7 +2877,8 @@ impl PythonGenerator {
         for rule in &spec.rules {
             if let CsilRuleType::ServiceDef(service) = &rule.rule_type {
                 if !prelude_emitted {
-                    body.push_str(&Self::generate_client_prelude(shape));
+                    let needs_reply = spec.rpc_operations().next().is_some();
+                    body.push_str(&Self::generate_client_prelude(shape, needs_reply));
                     prelude_emitted = true;
                 }
                 body.push_str(&self.generate_client_class(
@@ -3074,7 +3208,8 @@ impl PythonGenerator {
             "date" => "csil_date",
             // tag-0 RFC3339 timestamp: a tz-aware UTC `datetime`. The `datetime`
             // import is added by `collect_special_imports` only when used.
-            "timestamp" => "datetime",
+            // tag-1 epoch seconds: the same in-memory type as `timestamp`.
+            "timestamp" | "cddl_time" => "datetime",
             // tag-4 exact decimal: Python has an exact base-10 type in the
             // stdlib, so it always maps to `decimal.Decimal` and emits no
             // `CsilDecimal` helper — the `decimal_mapping` option is a no-op here.
@@ -3099,7 +3234,7 @@ impl PythonGenerator {
         // the in-memory `datetime` must be tz-aware UTC before encoding.
         if self.imports.contains("from datetime import datetime") {
             content.push_str(
-                "# NOTE: `timestamp` fields are tz-aware `datetime` values in UTC (CBOR tag 0).\n",
+                "# NOTE: `timestamp` (CBOR tag 0) and `cddl_time` (CBOR tag 1) fields are tz-aware `datetime` values in UTC.\n",
             );
         }
         content.push('\n');
@@ -3110,6 +3245,14 @@ impl PythonGenerator {
         }
 
         content.push_str("\n\n");
+        // Each JSON helper is emitted only when a `to_dict`/`from_dict` calls it, so a
+        // spec of plain scalars keeps its types module unchanged.
+        for (name, helper) in JSON_HELPERS_PYTHON {
+            if types_code.contains(&format!("{name}(")) {
+                content.push_str(helper);
+                content.push_str("\n\n");
+            }
+        }
         content.push_str(&types_code);
 
         Ok(GeneratedFile {
@@ -3497,6 +3640,7 @@ fn py_enc_value(
         CsilTypeExpression::Builtin(name) => match name.as_str() {
             "date" => format!("CborTag(1004, _csil_date_to_text({expr}))"),
             "timestamp" => format!("CborTag(0, _csil_ts_to_text({expr}))"),
+            "cddl_time" => format!("_csil_epoch_to_tree({expr})"),
             "decimal" => format!("CborTag(4, _csil_decimal_to_pair({expr}))"),
             "null" | "nil" | "undefined" => "None".to_string(),
             _ => expr.to_string(),
@@ -3599,6 +3743,7 @@ fn py_dec_value(
         CsilTypeExpression::Builtin(name) => match name.as_str() {
             "date" => format!("_csil_date_from_tree({expr})"),
             "timestamp" => format!("_csil_ts_from_tree({expr})"),
+            "cddl_time" => format!("_csil_epoch_from_tree({expr})"),
             "decimal" => format!("_csil_decimal_from_tree({expr})"),
             "null" | "nil" | "undefined" => "None".to_string(),
             "int" | "nint" => format!("_csil_expect_int({expr})"),
@@ -4045,7 +4190,7 @@ fn py_isinstance_type(variant: &CsilTypeExpression, records: &HashSet<String>) -
             "text" | "tstr" => "str".to_string(),
             "bytes" | "bstr" => "(bytes, bytearray)".to_string(),
             "date" => "csil_date".to_string(),
-            "timestamp" => "datetime".to_string(),
+            "timestamp" | "cddl_time" => "datetime".to_string(),
             "decimal" => "Decimal".to_string(),
             _ => "object".to_string(),
         },
@@ -4379,8 +4524,12 @@ fn generate_codec_file(
     if spec.uses_builtin("date") {
         content.push_str("from datetime import date as csil_date\n");
     }
-    if needs_datetime {
-        content.push_str("from datetime import datetime, timezone\n");
+    let needs_epoch = body.contains("_csil_epoch_");
+    if needs_epoch {
+        content.push_str("import math\n");
+    }
+    if needs_datetime || needs_epoch {
+        content.push_str("from datetime import datetime, timedelta, timezone\n");
     }
     if needs_decimal {
         content.push_str("from decimal import Decimal\n");
@@ -4390,6 +4539,9 @@ fn generate_codec_file(
     content.push_str(CBOR_RUNTIME_PYTHON);
     if spec.uses_builtin("date") {
         content.push_str(CODEC_DATE_PYTHON);
+    }
+    if needs_epoch {
+        content.push_str(CODEC_EPOCH_PYTHON);
     }
     // The mixed-kind enum gate rides outside the fixed runtime and is emitted only
     // when some generated decode actually calls it (the same emitted-code-driven
@@ -4414,6 +4566,151 @@ fn generate_codec_file(
 /// generated per-record helpers build on. The value tree is native Python plus
 /// `CborTag`, so a record encodes as a map keyed by the verbatim CSIL field names and
 /// `bytes` ride as a CBOR byte string (major type 2) rather than an array of ints.
+/// The JSON forms of the types JSON has no native form for. They match the JSON
+/// Schema target. The timestamp helpers import the codec lazily because the codec
+/// itself imports this module, and they reuse its strict tag-0 text rules.
+const JSON_HELPERS_PYTHON: &[(&str, &str)] = &[
+    (
+        "_csil_json_timestamp_out",
+        r#"def _csil_json_timestamp_out(value: Any) -> str:
+    from .codec import _csil_ts_to_text
+
+    return _csil_ts_to_text(value)
+"#,
+    ),
+    (
+        "_csil_json_timestamp_in",
+        r#"def _csil_json_timestamp_in(value: Any) -> Any:
+    from .codec import _csil_ts_from_text
+
+    return _csil_ts_from_text(value)
+"#,
+    ),
+    (
+        "_csil_json_cddl_time_out",
+        r#"def _csil_json_cddl_time_out(value: Any) -> Any:
+    from .codec import _csil_epoch_to_tree
+
+    # The JSON form is the same epoch-seconds number that CBOR tag 1 holds.
+    return _csil_epoch_to_tree(value).value
+"#,
+    ),
+    (
+        "_csil_json_cddl_time_in",
+        r#"def _csil_json_cddl_time_in(value: Any) -> Any:
+    from .codec import CborTag, _csil_epoch_from_tree
+
+    return _csil_epoch_from_tree(CborTag(1, value))
+"#,
+    ),
+    (
+        "_csil_json_date_out",
+        r#"def _csil_json_date_out(value: Any) -> str:
+    from datetime import date
+
+    # `datetime` is a subclass of `date`, but it is not a calendar date.
+    if type(value) is not date:
+        raise ValueError("expected a calendar date")
+    return value.isoformat()
+"#,
+    ),
+    (
+        "_csil_json_date_in",
+        r#"def _csil_json_date_in(value: Any) -> Any:
+    from datetime import date
+
+    # `fromisoformat` also reads forms such as `20000229`; only `YYYY-MM-DD` is valid.
+    if isinstance(value, str) and len(value) == 10:
+        try:
+            day = date.fromisoformat(value)
+            if day.isoformat() == value:
+                return day
+        except ValueError:
+            pass
+    raise ValueError(f"expected a YYYY-MM-DD calendar date, got {value!r}")
+"#,
+    ),
+    (
+        "_csil_json_decimal_out",
+        r#"def _csil_json_decimal_out(value: Any) -> str:
+    from decimal import Decimal
+
+    # `str` keeps the exponent, so the CBOR tag-4 form survives the round trip.
+    if not isinstance(value, Decimal) or not value.is_finite():
+        raise ValueError("expected a finite Decimal")
+    return str(value)
+"#,
+    ),
+    (
+        "_csil_json_decimal_in",
+        r#"def _csil_json_decimal_in(value: Any) -> Any:
+    import re
+    from decimal import Decimal
+
+    # `Decimal` also reads spaces, underscores, `NaN`, and `Infinity`; none is exact text.
+    if not isinstance(value, str) or not re.fullmatch(
+        r"[+-]?[0-9]+(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?", value, re.ASCII
+    ):
+        raise ValueError(f"expected exact decimal text, got {value!r}")
+    return Decimal(value)
+"#,
+    ),
+    (
+        "_csil_json_bytes_out",
+        r#"def _csil_json_bytes_out(value: Any) -> str:
+    import base64
+
+    return base64.b64encode(bytes(value)).decode("ascii")
+"#,
+    ),
+    (
+        "_csil_json_bytes_in",
+        r#"def _csil_json_bytes_in(value: Any) -> bytes:
+    import base64
+
+    if not isinstance(value, str):
+        raise ValueError(f"expected base64 text, got {type(value).__name__}")
+    return base64.b64decode(value, validate=True)
+"#,
+    ),
+    (
+        "_csil_json_any_out",
+        r#"def _csil_json_any_out(value: Any) -> Any:
+    import base64
+    from datetime import date, datetime
+    from decimal import Decimal
+    from enum import Enum
+
+    # A union or `any` value has no declared type here, so it is converted by its
+    # runtime type. An `Enum` is checked first because a text enum is also a `str`,
+    # and `datetime` before `date` because it is a subclass.
+    if isinstance(value, Enum):
+        return value.value
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, datetime):
+        from .codec import _csil_ts_to_text
+
+        return _csil_ts_to_text(value)
+    if isinstance(value, date):
+        return value.isoformat()
+    if isinstance(value, Decimal):
+        if not value.is_finite():
+            raise ValueError("expected a finite Decimal")
+        return str(value)
+    if isinstance(value, (bytes, bytearray)):
+        return base64.b64encode(bytes(value)).decode("ascii")
+    if isinstance(value, (list, tuple)):
+        return [_csil_json_any_out(item) for item in value]
+    if isinstance(value, dict):
+        return {key: _csil_json_any_out(item) for key, item in value.items()}
+    if hasattr(value, "to_dict"):
+        return value.to_dict()
+    raise ValueError(f"cannot convert {type(value).__name__} to JSON")
+"#,
+    ),
+];
+
 const CODEC_DATE_PYTHON: &str = r#"
 
 def _csil_date_to_text(value: Any) -> str:
@@ -4433,6 +4730,59 @@ def _csil_date_from_tree(node: Any) -> Any:
             pass
     raise CsilDecodeError("expected a YYYY-MM-DD calendar date")
 
+
+"#;
+
+/// The tag-1 epoch-seconds codec for `cddl_time`. The rounding rule is fixed by the
+/// wire contract, so every target turns the same float into the same instant.
+const CODEC_EPOCH_PYTHON: &str = r#"
+
+_CSIL_EPOCH_FIRST = -62135596800
+_CSIL_EPOCH_LAST = 253402300799
+
+
+def _csil_epoch_to_tree(dt: Any) -> CborTag:
+    # A naive datetime has no instant, as for `timestamp`.
+    if not isinstance(dt, datetime) or dt.utcoffset() is None:
+        raise ValueError("csil cbor: a cddl_time must be a tz-aware datetime")
+    # Subtraction of aware datetimes is exact, where `timestamp()` goes through a float.
+    delta = dt - datetime(1970, 1, 1, tzinfo=timezone.utc)
+    seconds = delta.days * 86400 + delta.seconds
+    units = delta.microseconds
+    if not _CSIL_EPOCH_FIRST <= seconds <= _CSIL_EPOCH_LAST:
+        raise ValueError("csil cbor: cddl_time is outside years 0001-9999 in UTC")
+    if units == 0:
+        return CborTag(1, seconds)
+    return CborTag(1, float(seconds) + float(units) / 1000000.0)
+
+
+def _csil_epoch_from_tree(node: Any) -> Any:
+    value = _csil_expect_tag(node, 1)
+    # `bool` is a subclass of `int`, but it is not a CBOR number.
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise CsilDecodeError(
+            f"csil cbor: cddl_time content must be a number, got {type(value).__name__}"
+        )
+    if isinstance(value, int):
+        seconds = value
+        units = 0
+    else:
+        if not math.isfinite(value):
+            raise CsilDecodeError("csil cbor: cddl_time must be finite")
+        # Refused before `floor` so that a huge float never becomes a huge int.
+        if value < _CSIL_EPOCH_FIRST - 1 or value > _CSIL_EPOCH_LAST + 1:
+            raise CsilDecodeError(f"csil cbor: cddl_time {value!r} is outside years 0001-9999")
+        whole = math.floor(value)
+        scaled = (value - whole) * 1000000.0
+        units = math.floor(scaled + 0.5)
+        seconds = whole
+        if units == 1000000:
+            seconds += 1
+            units = 0
+    if not _CSIL_EPOCH_FIRST <= seconds <= _CSIL_EPOCH_LAST:
+        raise CsilDecodeError(f"csil cbor: cddl_time {value!r} is outside years 0001-9999")
+    epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
+    return epoch + timedelta(seconds=seconds, microseconds=units)
 
 "#;
 
@@ -4552,6 +4902,10 @@ def _csil_dec(b: bytes, pos: int, depth: int):
             return True, pos + 1
         if low in (22, 23):
             return None, pos + 1
+        if low in (25, 26, 27) and len(b) - pos - 1 < {25: 2, 26: 4, 27: 8}[low]:
+            raise ValueError("csilgen: truncated float")
+        if low == 25:
+            return struct.unpack(">e", b[pos + 1 : pos + 3])[0], pos + 3
         if low == 26:
             return struct.unpack(">f", b[pos + 1 : pos + 5])[0], pos + 5
         if low == 27:
@@ -4749,18 +5103,100 @@ def _csil_decode_enum(v: Any, members: Any, expect: Any) -> Any:
 
 
 def _csil_ts_to_text(dt: Any) -> str:
-    # The contract pins tag-0 timestamps to RFC3339 UTC with a `Z` offset.
-    text = dt.astimezone(timezone.utc).isoformat()
-    return text.replace("+00:00", "Z")
+    # A naive datetime has no instant: `astimezone` would guess the host's local
+    # zone, so two hosts could write different bytes for the same value.
+    if not isinstance(dt, datetime) or dt.utcoffset() is None:
+        raise ValueError("csil cbor: a timestamp must be a tz-aware datetime")
+    try:
+        utc = dt.astimezone(timezone.utc)
+    except OverflowError:
+        raise ValueError("csil cbor: timestamp is outside years 0001-9999 in UTC") from None
+    text = (
+        f"{utc.year:04d}-{utc.month:02d}-{utc.day:02d}"
+        f"T{utc.hour:02d}:{utc.minute:02d}:{utc.second:02d}"
+    )
+    if utc.microsecond % 1000 == 0 and utc.microsecond:
+        text += f".{utc.microsecond // 1000:03d}"
+    elif utc.microsecond:
+        text += f".{utc.microsecond:06d}"
+    return text + "Z"
 
 
-def _csil_ts_from_tree(node: Any) -> Any:
-    text = _csil_expect_tag(node, 0)
+_CSIL_ASCII_DIGITS = "0123456789"
+_CSIL_MONTH_DAYS = (31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31)
+
+
+# `int()` also reads non-ASCII digits (e.g. full-width), which the contract forbids.
+def _csil_ts_field(text: str, start: int, width: int) -> int:
+    part = text[start:start + width]
+    if len(part) != width or any(c not in _CSIL_ASCII_DIGITS for c in part):
+        raise CsilDecodeError(f"csil cbor: invalid RFC 3339 timestamp {text!r}")
+    return int(part)
+
+
+# `datetime.fromisoformat` accepts shapes the contract forbids (a space for `T`, no
+# offset, week dates), so the grammar is read field by field instead.
+def _csil_ts_from_text(text: Any) -> Any:
     if not isinstance(text, str):
         raise CsilDecodeError(
             f"csil cbor: timestamp content must be text, got {type(text).__name__}"
         )
-    return datetime.fromisoformat(text.replace("Z", "+00:00"))
+    bad = CsilDecodeError(f"csil cbor: invalid RFC 3339 timestamp {text!r}")
+    if len(text) < 20 or text[4] != "-" or text[7] != "-" or text[10] not in "Tt":
+        raise bad
+    if text[13] != ":" or text[16] != ":":
+        raise bad
+    year = _csil_ts_field(text, 0, 4)
+    month = _csil_ts_field(text, 5, 2)
+    day = _csil_ts_field(text, 8, 2)
+    hour = _csil_ts_field(text, 11, 2)
+    minute = _csil_ts_field(text, 14, 2)
+    second = _csil_ts_field(text, 17, 2)
+    pos = 19
+    micros = 0
+    if text[pos] == ".":
+        end = pos + 1
+        while end < len(text) and text[end] in _CSIL_ASCII_DIGITS:
+            end += 1
+        fraction = text[pos + 1:end]
+        if not 1 <= len(fraction) <= 9:
+            raise bad
+        # `datetime` holds microseconds; a decoder never rounds or cuts a digit.
+        if fraction[6:].strip("0"):
+            raise CsilDecodeError(f"csil cbor: timestamp {text!r} is finer than microseconds")
+        micros = int(fraction[:6].ljust(6, "0"))
+        pos = end
+    zone = text[pos:]
+    if zone in ("Z", "z"):
+        offset = 0
+    elif len(zone) == 6 and zone[0] in "+-" and zone[3] == ":":
+        offset_hour = _csil_ts_field(zone, 1, 2)
+        offset_minute = _csil_ts_field(zone, 4, 2)
+        if offset_hour > 23 or offset_minute > 59:
+            raise bad
+        offset = offset_hour * 60 + offset_minute
+        if zone[0] == "-":
+            offset = -offset
+    else:
+        raise bad
+    leap = year % 4 == 0 and (year % 100 != 0 or year % 400 == 0)
+    if not 1 <= month <= 12:
+        raise bad
+    month_days = 29 if month == 2 and leap else _CSIL_MONTH_DAYS[month - 1]
+    if not 1 <= day <= month_days or hour > 23 or minute > 59 or second > 59:
+        raise bad
+    # A written year 0000 is refused by `datetime` itself, as the contract requires.
+    try:
+        local = datetime(year, month, day, hour, minute, second, micros, tzinfo=timezone.utc)
+        return local - timedelta(minutes=offset)
+    except (ValueError, OverflowError):
+        raise CsilDecodeError(
+            f"csil cbor: timestamp {text!r} is outside years 0001-9999"
+        ) from None
+
+
+def _csil_ts_from_tree(node: Any) -> Any:
+    return _csil_ts_from_text(_csil_expect_tag(node, 0))
 
 
 def _csil_decimal_to_pair(d: Any) -> list:
@@ -5578,7 +6014,7 @@ mod tests {
                 .contains("def submit_task(self, req: SubmitTaskRequest) -> SubmitTaskResponse:")
         );
         assert!(client.content.contains(
-            "return SubmitTaskResponse.from_cbor(self._transport.call(\"CorndogsService\", \"SubmitTask\", req.to_cbor()))"
+            "variant, payload = self._transport.call_reply(\"CorndogsService\", \"SubmitTask\", req.to_cbor())\n        return SubmitTaskResponse.from_cbor(resolve_rpc_reply(\"CorndogsService\", \"SubmitTask\", variant, payload))"
         ));
         // The old object-passing seam must not reappear.
         assert!(!client.content.contains("\"SubmitTask\", req)"));
@@ -5632,7 +6068,7 @@ mod tests {
         ));
         // Only the seam is awaited; the codec `from_cbor` stays synchronous.
         assert!(twin.content.contains(
-            "return SubmitTaskResponse.from_cbor(await self._transport.call(\"CorndogsService\", \"SubmitTask\", req.to_cbor()))"
+            "variant, payload = await self._transport.call_reply(\"CorndogsService\", \"SubmitTask\", req.to_cbor())\n        return SubmitTaskResponse.from_cbor(resolve_rpc_reply(\"CorndogsService\", \"SubmitTask\", variant, payload))"
         ));
         // The twin must not redefine the sync names that would shadow on import.
         assert!(!twin.content.contains("class Transport(Protocol):"));
@@ -5679,7 +6115,7 @@ mod tests {
             "async def submit_task(self, req: SubmitTaskRequest) -> SubmitTaskResponse:"
         ));
         assert!(client.content.contains(
-            "return SubmitTaskResponse.from_cbor(await self._transport.call(\"CorndogsService\", \"SubmitTask\", req.to_cbor()))"
+            "variant, payload = await self._transport.call_reply(\"CorndogsService\", \"SubmitTask\", req.to_cbor())\n        return SubmitTaskResponse.from_cbor(resolve_rpc_reply(\"CorndogsService\", \"SubmitTask\", variant, payload))"
         ));
         // No async-marked symbols in drop-in mode.
         assert!(!client.content.contains("AsyncTransport"));
@@ -6573,9 +7009,10 @@ mod tests {
             "keyed field missing from from_dict, got:\n{content}"
         );
         // to_dict must also serialize the spread field so the round-trip carries
-        // its value back into from_dict.
+        // its value back into from_dict. `G` is not declared here, so its value is
+        // converted by its runtime type.
         assert!(
-            content.contains("result['g'] = self.g"),
+            content.contains("result['g'] = _csil_json_any_out(self.g)"),
             "spread field missing from to_dict, got:\n{content}"
         );
     }
@@ -7417,6 +7854,9 @@ class Loopback:
         assert decoded.counts == {"pending": 3, "done": 9}
         assert decoded.by_id["second"].priority == 2
         return decoded.task.to_cbor()
+
+    def call_reply(self, service, method, req):
+        return "Task", self.call(service, method, req)
 
 
 result = CorndogsClient(Loopback()).submit_task(make_req(7))
@@ -8416,6 +8856,9 @@ class AsyncLoopback:
         assert decoded.by_id["second"].priority == 2
         return decoded.task.to_cbor()
 
+    async def call_reply(self, service, method, req):
+        return "Task", await self.call(service, method, req)
+
 
 async def main():
     result = await CorndogsAsyncClient(AsyncLoopback()).submit_task(make_req(7))
@@ -8862,6 +9305,43 @@ print("ok")
     /// round-trip. Hermetic (no sockets). Skips when python3 is unavailable.
     #[test]
     fn genquickstart_rpc_section_round_trips_through_python() {
+        run_rpc_quickstart(&transports_spec(), "rpc");
+    }
+
+    /// `transports_spec` with `ping` declaring a second, error reply arm.
+    fn reply_arms_spec() -> CsilSpecSerialized {
+        let mut spec = transports_spec();
+        spec.rules.push(group_rule_entries(
+            "Refused",
+            vec![bare(
+                "reason",
+                CsilTypeExpression::Builtin("text".to_string()),
+            )],
+        ));
+        for rule in &mut spec.rules {
+            if let CsilRuleType::ServiceDef(def) = &mut rule.rule_type {
+                def.operations[0].output_type = CsilTypeExpression::Choice(vec![
+                    CsilTypeExpression::Reference("Pong".to_string()),
+                    CsilTypeExpression::Reference("Refused".to_string()),
+                ]);
+            }
+        }
+        spec
+    }
+
+    /// With reply arms the quickstart carrier implements `call_reply` over the library
+    /// `RpcResponse` and never tells the reader to call `resolve_rpc_reply`.
+    #[test]
+    fn genquickstart_rpc_section_with_reply_arms_round_trips_through_python() {
+        let readme = transports_readme(&reply_arms_spec(), "python-client");
+        let rpc = section(&readme, "## CSIL-RPC (HTTP)");
+        assert!(rpc.contains("def call_reply(self, service: str, op: str, req: bytes):"));
+        assert!(!rpc.contains("resolve_rpc_reply"));
+        assert!(!transports_readme(&transports_spec(), "python-client").contains("call_reply"));
+        run_rpc_quickstart(&reply_arms_spec(), "rpc-arms");
+    }
+
+    fn run_rpc_quickstart(spec: &CsilSpecSerialized, label: &str) {
         if !have_python3() {
             eprintln!("skipping: no python3 on PATH");
             return;
@@ -8872,7 +9352,7 @@ print("ok")
             .insert("emit_packages".to_string(), serde_json::json!(["python"]));
         cfg.options
             .insert("package_name".to_string(), serde_json::json!("echo-sdk"));
-        let files = generate_python_code_from_serialized(&transports_spec(), &cfg).unwrap();
+        let files = generate_python_code_from_serialized(spec, &cfg).unwrap();
         let readme = files
             .iter()
             .find(|f| f.path == "genquickstart.md")
@@ -8881,7 +9361,7 @@ print("ok")
             .clone();
         let block = section_block(&readme, "## CSIL-RPC (HTTP)");
 
-        let dir = std::env::temp_dir().join(format!("csilgen-py-rpc-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("csilgen-py-{label}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         for f in &files {
             let dest = dir.join(&f.path);
@@ -9202,5 +9682,375 @@ def _seed_loopback():
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Write a generated flat package to `<tmp>/api`, add `driver.py` beside it, and
+    /// run it with python3; the driver must print `ok`. Skips without python3.
+    fn run_api_driver(files: &[GeneratedFile], driver: &str, label: &str) {
+        if !have_python3() {
+            eprintln!("skipping: no python3 on PATH");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("csilgen-py-{label}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let pkg = dir.join("api");
+        std::fs::create_dir_all(&pkg).unwrap();
+        for f in files {
+            std::fs::write(pkg.join(&f.path), &f.content).unwrap();
+        }
+        std::fs::write(dir.join("driver.py"), driver).unwrap();
+        let run = std::process::Command::new("python3")
+            .arg("driver.py")
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        assert!(
+            run.status.success() && String::from_utf8_lossy(&run.stdout).trim() == "ok",
+            "python driver failed:\n{}{}",
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn list_of(ty: CsilTypeExpression) -> CsilTypeExpression {
+        CsilTypeExpression::Array {
+            element_type: Box::new(ty),
+            occurrence: None,
+        }
+    }
+
+    fn builtin(name: &str) -> CsilTypeExpression {
+        CsilTypeExpression::Builtin(name.to_string())
+    }
+
+    fn reference(name: &str) -> CsilTypeExpression {
+        CsilTypeExpression::Reference(name.to_string())
+    }
+
+    /// A Longhouse `TaskListRequest`-shaped record with every type that JSON has no
+    /// native form for, nested in records, lists, and maps.
+    fn json_spec() -> CsilSpecSerialized {
+        CsilSpecSerialized {
+            rules: vec![
+                CsilRule {
+                    name: "Status".to_string(),
+                    rule_type: CsilRuleType::TypeDef(CsilTypeExpression::Choice(vec![
+                        CsilTypeExpression::Literal(CsilLiteralValue::Text("open".to_string())),
+                        CsilTypeExpression::Literal(CsilLiteralValue::Text("done".to_string())),
+                    ])),
+                    position: create_test_position(),
+                    doc_comments: Vec::new(),
+                },
+                CsilRule {
+                    name: "Due".to_string(),
+                    rule_type: CsilRuleType::TypeDef(builtin("timestamp")),
+                    position: create_test_position(),
+                    doc_comments: Vec::new(),
+                },
+                group_rule_entries(
+                    "Owner",
+                    vec![
+                        bare("name", builtin("text")),
+                        bare("avatar", builtin("bytes")),
+                    ],
+                ),
+                group_rule_entries(
+                    "TaskListRequest",
+                    vec![
+                        opt_entry("due_from", builtin("timestamp")),
+                        bare("due_before", list_of(builtin("timestamp"))),
+                        bare("owner", reference("Owner")),
+                        opt_entry("owners", list_of(reference("Owner"))),
+                        opt_entry(
+                            "late",
+                            CsilTypeExpression::Map {
+                                key: Box::new(builtin("int")),
+                                value: Box::new(reference("Due")),
+                                occurrence: None,
+                            },
+                        ),
+                        bare("blob", builtin("bytes")),
+                        bare("amount", builtin("decimal")),
+                        bare("day", builtin("date")),
+                        opt_entry("statuses", list_of(reference("Status"))),
+                    ],
+                ),
+            ],
+            source_content: None,
+            service_count: 0,
+            fields_with_metadata_count: 0,
+        }
+    }
+
+    /// `to_json` writes the JSON Schema forms and `from_json` reads them back to the
+    /// same in-memory values, so the CBOR bytes survive a JSON round trip.
+    #[test]
+    fn json_round_trip_keeps_cbor_bytes() {
+        let files =
+            generate_python_code_from_serialized(&json_spec(), &create_test_config(false)).unwrap();
+        let types = &files.iter().find(|f| f.path == "types.py").unwrap().content;
+        assert!(types.contains(
+            "result['due_before'] = [_csil_json_timestamp_out(item0) for item0 in self.due_before]"
+        ));
+        assert!(types.contains("{int(k0): _csil_json_timestamp_in(v0) for k0, v0 in"));
+        assert!(types.contains("Owner.from_dict(data['owner'])"));
+        assert!(!types.contains("def _csil_json_any_out"));
+        run_api_driver(&files, JSON_ROUND_TRIP_DRIVER_PYTHON, "json");
+
+        let plain = one_field_spec("n", builtin("int"), Vec::new());
+        let files =
+            generate_python_code_from_serialized(&plain, &create_test_config(false)).unwrap();
+        let types = &files.iter().find(|f| f.path == "types.py").unwrap().content;
+        assert!(!types.contains("_csil_json_"));
+    }
+
+    const JSON_ROUND_TRIP_DRIVER_PYTHON: &str = r#"import json
+from datetime import date, datetime, timedelta, timezone
+from decimal import Decimal
+
+import api.codec  # noqa: F401  (binds to_cbor/from_cbor)
+from api.types import Owner, Status, TaskListRequest
+
+at = datetime(2026, 11, 22, 8, 30, 0, 250000, tzinfo=timezone(timedelta(hours=-5)))
+owner = Owner(name="ann", avatar=b"\x00\xff")
+full = TaskListRequest(
+    due_from=at,
+    due_before=[at, at + timedelta(days=1)],
+    owner=owner,
+    owners=[owner],
+    late={3: at},
+    blob=b"hi",
+    amount=Decimal("12.50"),
+    day=date(2000, 2, 29),
+    statuses=[Status("done")],
+)
+bare = TaskListRequest(due_before=[], owner=owner, blob=b"", amount=Decimal("1E+2"), day=date(1, 1, 1))
+for req in (full, bare):
+    text = req.to_json()
+    back = TaskListRequest.from_json(text)
+    assert back.to_cbor() == req.to_cbor(), text
+doc = json.loads(full.to_json())
+assert doc["due_from"] == "2026-11-22T13:30:00.250Z", doc
+assert doc["owner"] == {"name": "ann", "avatar": "AP8="}, doc
+assert doc["late"] == {"3": "2026-11-22T13:30:00.250Z"}, doc
+assert doc["amount"] == "12.50" and doc["day"] == "2000-02-29", doc
+assert "due_from" not in json.loads(bare.to_json())
+for field, bad in (
+    ("due_from", "2026-11-22 13:30:00Z"),
+    ("amount", "NaN"),
+    ("amount", " 1"),
+    ("day", "20000229"),
+    ("blob", "not base64!"),
+):
+    broken = dict(doc)
+    broken[field] = bad
+    try:
+        TaskListRequest.from_dict(broken)
+    except ValueError:
+        continue
+    raise AssertionError(f"{field}={bad!r} must be rejected")
+print("ok")
+"#;
+
+    /// The tag-0 decoder follows the strict grammar of docs/cbor-wire-contract.md and
+    /// the encoder writes the canonical text.
+    #[test]
+    fn timestamp_codec_is_strict_and_canonical() {
+        let spec = one_field_spec("at", builtin("timestamp"), Vec::new());
+        let files =
+            generate_python_code_from_serialized(&spec, &create_test_config(false)).unwrap();
+        let codec = &files.iter().find(|f| f.path == "codec.py").unwrap().content;
+        assert!(codec.contains("def _csil_ts_from_text(text: Any) -> Any:"));
+        assert!(!codec.contains("datetime.fromisoformat("));
+        run_api_driver(&files, TIMESTAMP_DRIVER_PYTHON, "timestamp");
+    }
+
+    const TIMESTAMP_DRIVER_PYTHON: &str = r#"from datetime import datetime, timedelta, timezone
+
+from api.codec import CsilDecodeError, _csil_ts_from_text, _csil_ts_to_text
+
+
+def canonical(text):
+    return _csil_ts_to_text(_csil_ts_from_text(text))
+
+
+for given, want in (
+    ("2000-02-29T12:00:00Z", "2000-02-29T12:00:00Z"),
+    ("2000-02-29t12:00:00.5z", "2000-02-29T12:00:00.500Z"),
+    ("2000-02-29T12:00:00.000500Z", "2000-02-29T12:00:00.000500Z"),
+    ("2000-02-29T12:00:00.123000000Z", "2000-02-29T12:00:00.123Z"),
+    ("2000-02-29T12:00:00.000Z", "2000-02-29T12:00:00Z"),
+    ("2000-02-29T13:30:00+01:30", "2000-02-29T12:00:00Z"),
+    ("0001-01-01T00:00:00Z", "0001-01-01T00:00:00Z"),
+    ("9999-12-31T23:59:59Z", "9999-12-31T23:59:59Z"),
+):
+    got = canonical(given)
+    assert got == want, (given, got, want)
+for bad in (
+    "2000-02-29 12:00:00Z", "2000-02-29T12:00:00", "2001-02-29T12:00:00Z",
+    "2000-02-29T24:00:00Z", "2000-02-29T23:59:60Z", "2000-02-29T12:00:00.Z",
+    "2000-02-29T12:00:00.0000001Z", "2000-02-29T12:00:00.1234567890Z",
+    "2000-02-29T12:00:00+0100", "2000-02-29T12:00:00+24:00", "2000-02-29T12:00:00Z ",
+    "2000-02-29T12:00:00Z\n", "0001-01-01T00:30:00+01:00", "9999-12-31T23:30:00-01:00",
+    "0000-12-31T23:30:00-01:00", "２000-02-29T12:00:00Z", 946728000,
+):
+    try:
+        _csil_ts_from_text(bad)
+    except CsilDecodeError:
+        continue
+    raise AssertionError(f"{bad!r} must be rejected")
+for bad in (datetime(2000, 1, 1), "2000-01-01T00:00:00Z",
+            datetime(1, 1, 1, tzinfo=timezone(timedelta(hours=1)))):
+    try:
+        _csil_ts_to_text(bad)
+    except ValueError:
+        continue
+    raise AssertionError(f"encoding {bad!r} must fail")
+print("ok")
+"#;
+
+    /// `cddl_time` shares `timestamp`'s in-memory `datetime` but rides as tag-1 epoch
+    /// seconds, with the contract's rounding, and its JSON form is that number.
+    #[test]
+    fn cddl_time_codec_is_tag_one_epoch_seconds() {
+        let spec = one_field_spec("at", builtin("cddl_time"), Vec::new());
+        let files =
+            generate_python_code_from_serialized(&spec, &create_test_config(false)).unwrap();
+        let codec = &files.iter().find(|f| f.path == "codec.py").unwrap().content;
+        let types = &files.iter().find(|f| f.path == "types.py").unwrap().content;
+        assert!(types.contains("at: datetime"));
+        assert!(types.contains("from datetime import datetime"));
+        assert!(types.contains("def _csil_json_cddl_time_out("));
+        assert!(!types.contains("_csil_json_timestamp_out("));
+        assert!(codec.contains("def _csil_epoch_from_tree(node: Any) -> Any:"));
+        assert!(codec.contains("import math\n"));
+        assert!(codec.contains("at=_csil_epoch_from_tree(tree[\"at\"])"));
+        run_api_driver(&files, CDDL_TIME_DRIVER_PYTHON, "cddl-time");
+
+        let plain = one_field_spec("at", builtin("timestamp"), Vec::new());
+        let files =
+            generate_python_code_from_serialized(&plain, &create_test_config(false)).unwrap();
+        let codec = &files.iter().find(|f| f.path == "codec.py").unwrap().content;
+        assert!(!codec.contains("_csil_epoch_"));
+    }
+
+    #[test]
+    fn cddl_time_bounds_and_defaults_are_datetimes() {
+        let spec = one_field_spec(
+            "seen",
+            CsilTypeExpression::Constrained {
+                base_type: Box::new(builtin("cddl_time")),
+                constraints: vec![CsilControlOperator::Default(CsilLiteralValue::Text(
+                    "1970-01-01T00:00:00Z".to_string(),
+                ))],
+            },
+            vec![CsilFieldMetadata::Constraint(
+                CsilValidationConstraint::MinValue(CsilLiteralValue::Text(
+                    "1970-01-01T00:00:00Z".to_string(),
+                )),
+            )],
+        );
+        let content = types_content(&spec, &create_test_config(false));
+        assert!(
+            content.contains(
+                "datetime.fromisoformat(\"1970-01-01T00:00:00Z\".replace(\"Z\", \"+00:00\"))"
+            ),
+            "cddl_time bound/default must be a datetime, got:\n{content}"
+        );
+    }
+
+    const CDDL_TIME_DRIVER_PYTHON: &str = r#"import json
+from datetime import datetime, timedelta, timezone
+
+from api.codec import CborTag, CsilDecodeError, cbor_encode
+from api.types import Sample
+
+utc = timezone.utc
+
+
+def hexed(value):
+    return Sample(at=value).to_cbor().hex()
+
+
+# The whole-second form is the shortest integer; a fraction is a binary64 float.
+assert hexed(datetime(2000, 2, 29, 12, tzinfo=utc)) == "a1626174c11a38bbb4c0"
+assert hexed(datetime(2000, 2, 29, 12, 0, 0, 500000, tzinfo=utc)).startswith("a1626174c1fb")
+assert hexed(datetime(1969, 12, 31, 23, 59, 59, tzinfo=utc)).endswith("c120")
+assert hexed(datetime(2000, 2, 29, 13, tzinfo=timezone(timedelta(hours=1)))).endswith("c11a38bbb4c0")
+
+
+def decoded(content):
+    return Sample.from_cbor(cbor_encode({"at": content})).at
+
+
+assert decoded(CborTag(1, 951825600.0)) == datetime(2000, 2, 29, 12, tzinfo=utc)
+assert decoded(CborTag(1, -0.5)) == datetime(1969, 12, 31, 23, 59, 59, 500000, tzinfo=utc)
+# 0.9999996 rounds up to the next whole second.
+assert decoded(CborTag(1, 0.9999996)) == datetime(1970, 1, 1, 0, 0, 1, tzinfo=utc)
+assert decoded(CborTag(1, -62135596800)) == datetime(1, 1, 1, tzinfo=utc)
+assert decoded(CborTag(1, 253402300799)).year == 9999
+# A half-precision float content is accepted (0xf9 3c00 is 1.0).
+assert Sample.from_cbor(bytes.fromhex("a1626174c1f93c00")).at == datetime(1970, 1, 1, 0, 0, 1, tzinfo=utc)
+for bad in (
+    "2000-02-29T12:00:00Z", CborTag(0, "2000-02-29T12:00:00Z"), 951825600,
+    CborTag(2, 1), CborTag(1, True), CborTag(1, None), CborTag(1, "1"), CborTag(1, b"1"),
+    CborTag(1, [1]), CborTag(1, float("nan")), CborTag(1, float("inf")),
+    CborTag(1, -62135596801), CborTag(1, 253402300800), CborTag(1, 2**64 - 1),
+    CborTag(1, -(2**64)), CborTag(1, 1e300), CborTag(1, -62135596800.5),
+):
+    try:
+        decoded(bad)
+    except CsilDecodeError:
+        continue
+    raise AssertionError(f"{bad!r} must be rejected")
+for bad in (datetime(2000, 1, 1), 951825600):
+    try:
+        Sample(at=bad).to_cbor()
+    except ValueError:
+        continue
+    raise AssertionError(f"encoding {bad!r} must fail")
+
+# The JSON form is the epoch-seconds number, not RFC 3339 text.
+half = Sample(at=datetime(2000, 2, 29, 12, 0, 0, 500000, tzinfo=utc))
+assert json.loads(half.to_json()) == {"at": 951825600.5}, half.to_json()
+assert json.loads(Sample(at=datetime(1970, 1, 1, 0, 0, 7, tzinfo=utc)).to_json()) == {"at": 7}
+assert Sample.from_json(half.to_json()) == half
+for bad in ("2000-02-29T12:00:00Z", True, [1]):
+    try:
+        Sample.from_dict({"at": bad})
+    except ValueError:
+        continue
+    raise AssertionError(f"JSON {bad!r} must be rejected")
+print("ok")
+"#;
+
+    /// A spec without multi-arm ops keeps today's seam exactly, so existing carriers
+    /// still satisfy it; a multi-arm op adds `call_reply` and routes through it.
+    #[test]
+    fn reply_seam_is_added_only_for_multi_arm_ops() {
+        let mut cfg = create_test_config(false);
+        cfg.target = "python-client".to_string();
+        let client = |spec: &CsilSpecSerialized, path: &str| {
+            generate_python_code_from_serialized(spec, &cfg)
+                .unwrap()
+                .into_iter()
+                .find(|f| f.path == path)
+                .unwrap()
+                .content
+        };
+        let plain = client(&transports_spec(), "client.py");
+        assert!(plain.contains(
+            "    def call(self, service: str, method: str, req: bytes) -> bytes: ...\n\nclass EchoClient:"
+        ));
+        assert!(!plain.contains("call_reply"));
+        let sync = client(&reply_arms_spec(), "client.py");
+        assert!(sync.contains("    def call_reply(\n        self, service: str, method: str, req: bytes\n    ) -> \"tuple[Optional[str], bytes]\":"));
+        assert!(sync.contains(
+            "        variant, payload = self._transport.call_reply(\"Echo\", \"ping\", req.to_cbor())\n        return Pong.from_cbor(resolve_rpc_reply(\"Echo\", \"ping\", variant, payload))"
+        ));
+        let twin = client(&reply_arms_spec(), "client_async.py");
+        assert!(twin.contains("    async def call_reply("));
+        assert!(twin.contains("variant, payload = await self._transport.call_reply("));
     }
 }

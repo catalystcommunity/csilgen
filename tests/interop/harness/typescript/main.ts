@@ -44,8 +44,8 @@ import {
   fromNestedCbor,
   fromOptBytesCbor,
   fromScalarsCbor,
-  fromServiceErrorCbor,
   fromTickCbor,
+  ServiceErrorRefusal,
   toCollectionsCbor,
   toConstrainedCbor,
   toEchoNestedResultCbor,
@@ -77,6 +77,8 @@ function scalarsOk(): Scalars {
     flag: true,
     due: "2000-02-29",
     when: new Date("2026-06-29T12:34:56Z"),
+    // 1782736496.5 on the wire: tag 1 around a float.
+    seen: new Date("2026-06-29T12:34:56.500Z"),
     amount: CsilDecimal.fromString("123.45"),
     // mixed-union coverage: a value equal to a literal arm must wire as
     // [1,"pending"]; a value with no literal match must wire as [0,...].
@@ -302,15 +304,14 @@ async function rpcServer(server: net.Server): Promise<void> {
 async function rpcClient(sock: net.Socket): Promise<Cases> {
   const cases = new Cases("rpc");
   const rpc = new RpcClient(new StreamFrameCarrier(sock), false);
-  // The carrier maps a status-0 `ServiceError` variant to the language error path.
+  // The carrier only moves bytes. For an op with reply arms it hands the lib's
+  // response (variant + payload) to the generated client, which raises the arm.
   const transport: AsyncServiceTransport = {
     async call(service, op, reqBytes) {
-      const resp = await rpc.call(service, op, reqBytes);
-      if (resp.variant === "ServiceError") {
-        const se = fromServiceErrorCbor(resp.payload);
-        throw new Error(`service error ${se.code}: ${se.message}`);
-      }
-      return resp.payload;
+      return (await rpc.call(service, op, reqBytes)).payload;
+    },
+    callReply(service, op, reqBytes) {
+      return rpc.call(service, op, reqBytes);
     },
   };
   const client = new InteropAsyncClient(transport);
@@ -354,9 +355,13 @@ async function rpcClient(sock: net.Socket): Promise<Cases> {
   try {
     await client.validateConstrained(constrainedBad());
     cases.fail("validate-constrained/failure", "server accepted invalid input");
-  } catch {
-    // The typed error arm surfaces as a thrown service error.
-    cases.pass("validate-constrained/failure");
+  } catch (e) {
+    // The generated client raises the typed error arm itself.
+    cases.check(
+      "validate-constrained/failure",
+      e instanceof ServiceErrorRefusal && e.value.code === 422,
+      `wrong error: ${String(e)}`,
+    );
   }
 
   // Optional-bytes presence: absent, present-empty, and present-non-empty are three

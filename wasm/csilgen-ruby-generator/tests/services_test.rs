@@ -31,9 +31,10 @@ fn client_method_is_snake_case_and_wire_strings_are_verbatim() {
     // snake_case Ruby method name...
     assert!(client.contains("def submit_task(req)"));
     // ...but the verbatim CSIL service/op names on the wire (csil-rpc-transport.md
-    // §1.1), over the dumb byte seam: the request self-encodes, the reply self-decodes.
+    // §1.1). The request self-encodes, the reply self-decodes; the multi-arm reply
+    // rides `call_reply` so the variant picks the arm.
     assert!(client.contains(
-        "SubmitTaskResponse.from_cbor(@transport.call(\"corndogs_service\", \"submit-task\", req.to_cbor))"
+        "SubmitTaskResponse.from_cbor(CsilCbor.rpc_reply_payload(@transport, \"corndogs_service\", \"submit-task\", req.to_cbor))"
     ));
     // The ServiceError arm is stripped from the documented success type.
     assert!(client.contains("-> SubmitTaskResponse"));

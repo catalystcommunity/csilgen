@@ -676,6 +676,11 @@ class Loopback
   def call(_service, _op, req_bytes)
     SubmitTaskRequest.from_cbor(req_bytes).task.to_cbor
   end
+
+  # `submit-task` replies `Task / ServiceError`, so the client takes this seam.
+  def call_reply(service, op, req_bytes)
+    ["Task", call(service, op, req_bytes)]
+  end
 end
 
 payload = "\xde\xad\xbe".b
@@ -851,3 +856,82 @@ raise "check-permission-permission" unless back_cpr.permission == "read"
 
 puts "ok"
 "#;
+
+/// `cddl_time` shares `timestamp`'s `Time` but rides as tag-1 epoch seconds with the
+/// contract's nine-digit rounding.
+#[test]
+fn cddl_time_round_trips_through_ruby() {
+    let s = spec(vec![group_rule(
+        "moment",
+        vec![bare_entry("at", builtin("cddl_time"))],
+    )]);
+    let files = generate_ruby_code_from_serialized(&s, &config("ruby")).expect("generation");
+    let codec = &files.iter().find(|f| f.path == "codec.rb").unwrap().content;
+    assert!(codec.contains("def as_cddl_time(node)"));
+    assert!(codec.contains("CsilCbor.enc_cddl_time(at)"));
+    assert!(!codec.contains("def as_timestamp(node)"));
+    let have = std::process::Command::new("ruby")
+        .arg("--version")
+        .output()
+        .is_ok();
+    if !have {
+        eprintln!("skipping: no ruby on PATH");
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("csilgen-ruby-cddl-time-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    for f in &files {
+        std::fs::write(dir.join(&f.path), &f.content).unwrap();
+    }
+    std::fs::write(dir.join("driver.rb"), CDDL_TIME_DRIVER_RUBY).unwrap();
+    let run = std::process::Command::new("ruby")
+        .arg(dir.join("driver.rb"))
+        .output()
+        .unwrap();
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).trim() == "ok",
+        "ruby cddl_time run failed:\n{}{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+const CDDL_TIME_DRIVER_RUBY: &str = r##"require_relative "codec"
+
+def hexed(time) = Moment.new(at: time).to_cbor.unpack1("H*")
+def decoded(content) = Moment.from_cbor(CsilCbor.encode({ "at" => content })).at
+
+raise "whole" unless hexed(Time.utc(2000, 2, 29, 12)) == "a1626174c11a38bbb4c0"
+raise "offset" unless hexed(Time.new(2000, 2, 29, 13, 0, 0, "+01:00")) == "a1626174c11a38bbb4c0"
+raise "negative" unless hexed(Time.utc(1969, 12, 31, 23, 59, 59, 500_000)) == "a1626174c1fbbfe0000000000000"
+raise "float whole" unless decoded(CsilCbor::Tag.new(1, 951_825_600.0)) == Time.utc(2000, 2, 29, 12)
+raise "half" unless Moment.from_cbor(["a1626174c1f93c00"].pack("H*")).at == Time.utc(1970, 1, 1, 0, 0, 1)
+# 0.9999999996 is within half a nanosecond of 1, so it rounds up to the next second.
+raise "nanos" unless decoded(CsilCbor::Tag.new(1, 0.9999999996)) == Time.utc(1970, 1, 1, 0, 0, 1)
+raise "first" unless decoded(CsilCbor::Tag.new(1, -62_135_596_800)) == Time.utc(1, 1, 1)
+[
+  CsilCbor::Tag.new(0, "2000-02-29T12:00:00Z"), 951_825_600, CsilCbor::Tag.new(2, 1),
+  CsilCbor::Tag.new(1, true), CsilCbor::Tag.new(1, nil), CsilCbor::Tag.new(1, "1"),
+  CsilCbor::Tag.new(1, [1]), CsilCbor::Tag.new(1, -62_135_596_801), CsilCbor::Tag.new(1, 253_402_300_800),
+  CsilCbor::Tag.new(1, 2**64 - 1), CsilCbor::Tag.new(1, -(2**64)), CsilCbor::Tag.new(1, 1e300),
+  CsilCbor::Tag.new(1, Float::NAN), CsilCbor::Tag.new(1, Float::INFINITY)
+].each do |bad|
+  begin
+    decoded(bad)
+  rescue ArgumentError
+    next
+  end
+  raise "#{bad.inspect} must be rejected"
+end
+[Time.utc(2000, 1, 1) + Rational(1, 10**10), 951_825_600].each do |bad|
+  begin
+    Moment.new(at: bad).to_cbor
+  rescue ArgumentError
+    next
+  end
+  raise "encoding #{bad.inspect} must fail"
+end
+puts "ok"
+"##;

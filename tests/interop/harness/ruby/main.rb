@@ -54,6 +54,8 @@ def scalars_ok
     flag: true,
     due: Date.new(2000, 2, 29),
     when: ts,
+    # 2026-06-29T12:34:56.500Z, epoch 1782736496.5 (cddl_time, tag 1).
+    seen: Time.utc(2026, 6, 29, 12, 34, 56, 500_000),
     amount: BigDecimal("123.45"),
     # mixed-union coverage: a value equal to a literal arm must wire as
     # [1,"pending"]; a value with no literal match must wire as [0,...].
@@ -186,21 +188,22 @@ end
 # ---------------------------------------------------------------------------
 
 # Implements the transport seam the generated InteropClient expects:
-# `call(service, op, req_bytes) -> resp_bytes`. A non-zero transport status raises
-# (the lib's into_transport_error); a status-0 reply whose variant is `ServiceError`
-# is a typed application error -- the carrier maps it to the language error path.
+# `call(service, op, req_bytes) -> resp_bytes` for single-arm ops and
+# `call_reply(service, op, req_bytes) -> [variant, payload]` for multi-arm ops. A
+# non-zero transport status raises (the lib's into_transport_error); the generated
+# client maps a status-0 `ServiceError` variant to its typed refusal.
 class RpcTransport
   def initialize(client)
     @client = client
   end
 
   def call(service, op, req)
+    @client.call(service, op, req).payload
+  end
+
+  def call_reply(service, op, req)
     resp = @client.call(service, op, req)
-    if resp.variant == "ServiceError"
-      se = ServiceError.from_cbor(resp.payload)
-      raise "service error #{se.code}: #{se.message}"
-    end
-    resp.payload
+    [resp.variant, resp.payload]
   end
 end
 

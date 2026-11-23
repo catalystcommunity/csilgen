@@ -231,6 +231,9 @@ The generic value keeps these distinctions:
 - tag 1004 calendar dates with valid `YYYY-MM-DD` text
 - tag 0 and tag 1 timestamps with the original tag.
 
+The builtin `timestamp` matches only tag 0 around text. The builtin
+`cddl_time` matches only tag 1 around an integer or a finite float.
+
 The descriptor stores the calendar date as the builtin `date`. Its ordered
 controls store text bounds. The diagnostic decoder compares valid dates in
 calendar order.

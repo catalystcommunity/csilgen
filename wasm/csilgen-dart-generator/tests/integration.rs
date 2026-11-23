@@ -907,6 +907,172 @@ fn corndogs_rules() -> Vec<CsilRule> {
     ]
 }
 
+#[test]
+fn cddl_time_is_a_datetime_with_a_tag_1_codec() {
+    let rules = vec![record_rule(
+        "Moment",
+        vec![
+            entry("at", builtin("cddl_time"), false),
+            entry(
+                "after",
+                CsilTypeExpression::Constrained {
+                    base_type: Box::new(builtin("cddl_time")),
+                    constraints: vec![CsilControlOperator::GreaterEqual(CsilLiteralValue::Text(
+                        "2000-01-01T00:00:00Z".to_string(),
+                    ))],
+                },
+                false,
+            ),
+            entry(
+                "history",
+                CsilTypeExpression::Array {
+                    element_type: Box::new(builtin("cddl_time")),
+                    occurrence: None,
+                },
+                false,
+            ),
+        ],
+    )];
+    let files = generate_dart_code(&spec(rules, 0), &config("dart")).unwrap();
+    let code = types_file(&files);
+    assert!(code.contains("final DateTime at;"), "{code}");
+    // The encoder keys on runtime type, so a DateTime alone would be written as tag 0.
+    assert!(code.contains("CsilCbor.cddlTimeValue(at)"), "{code}");
+    assert!(code.contains("CsilCbor.asCddlTime("), "{code}");
+    assert!(
+        code.contains("CsilCbor.cddlTimeValue(csilE)"),
+        "list elements wrap too: {code}"
+    );
+    // A bound on a cddl_time compares instants, as it does on a timestamp.
+    assert!(
+        code.contains("DateTime.parse('2000-01-01T00:00:00Z')"),
+        "{code}"
+    );
+}
+
+/// The tag-1 codec, run on the Dart VM against the shared epoch vectors with the
+/// fixture's own peer. Skips when `dart` is not on PATH.
+#[test]
+fn cddl_time_codec_passes_epoch_vectors_under_dart() {
+    let have = std::process::Command::new("dart")
+        .arg("--version")
+        .output()
+        .is_ok();
+    if !have {
+        eprintln!("skipping: no dart on PATH");
+        return;
+    }
+    let fixture =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/interop/epoch-vectors");
+    let rules = vec![record_rule(
+        "Moment",
+        vec![entry("at", builtin("cddl_time"), false)],
+    )];
+    let files = generate_dart_code(&spec(rules, 0), &config("dart")).unwrap();
+    let dir = std::env::temp_dir().join(format!("csilgen-dart-epoch-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    for f in &files {
+        let path = dir.join(&f.path);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, &f.content).unwrap();
+    }
+    std::fs::copy(fixture.join("peer.dart"), dir.join("peer.dart")).unwrap();
+    let run = std::process::Command::new("dart")
+        .arg("--enable-asserts")
+        .arg(dir.join("peer.dart"))
+        .arg(fixture.join("vectors.tsv"))
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        run.status.success() && stdout.contains("dart epoch vectors:"),
+        "{stdout}{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+}
+
+/// Tag 1 inside an `any` value round-trips unchecked (only a declared `cddl_time`
+/// applies the wire rule), and an 8-byte integer argument of 2^63 or more is refused
+/// rather than wrapped to a wrong Dart int. Skips when `dart` is not on PATH.
+#[test]
+fn any_keeps_tag_1_and_large_integers_are_refused_under_dart() {
+    let have = std::process::Command::new("dart")
+        .arg("--version")
+        .output()
+        .is_ok();
+    if !have {
+        eprintln!("skipping: no dart on PATH");
+        return;
+    }
+    let rules = vec![record_rule(
+        "Holder",
+        vec![
+            entry("v", builtin("any"), true),
+            entry("n", builtin("int"), true),
+        ],
+    )];
+    let files = generate_dart_code(&spec(rules, 0), &config("dart")).unwrap();
+    let dir = std::env::temp_dir().join(format!("csilgen-dart-anytag-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    for f in &files {
+        let path = dir.join(&f.path);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, &f.content).unwrap();
+    }
+    std::fs::write(dir.join("driver.dart"), ANY_TAG_DRIVER_DART).unwrap();
+    let run = std::process::Command::new("dart")
+        .arg("--enable-asserts")
+        .arg(dir.join("driver.dart"))
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(
+        stdout.trim(),
+        "ok",
+        "{stdout}{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+}
+
+const ANY_TAG_DRIVER_DART: &str = r#"import 'types.gen.dart';
+
+List<int> unhex(String s) => [
+  for (var i = 0; i < s.length; i += 2) int.parse(s.substring(i, i + 2), radix: 16),
+];
+
+String hex(List<int> b) => b.map((x) => x.toRadixString(16).padLeft(2, '0')).join();
+
+void main() {
+  // {"v": 1("abc")}, {"v": 1(-62135596801)}, {"v": 1(NaN as f64)}
+  for (final keep in [
+    'a16176c163616263',
+    'a16176c13b0000000e7791f700',
+    'a16176c1fb7ff8000000000000',
+  ]) {
+    final got = hex(Holder.fromCbor(unhex(keep)).toCbor());
+    if (got != keep) {
+      print('FAIL $keep -> $got');
+      return;
+    }
+  }
+  // {"n": 2^63} and {"n": -2^63 - 1}
+  for (final bad in ['a1616e1b8000000000000000', 'a1616e3b8000000000000000']) {
+    try {
+      Holder.fromCbor(unhex(bad));
+      print('FAIL accepted $bad');
+      return;
+    } on FormatException {
+      // expected
+    }
+  }
+  print('ok');
+}
+"#;
+
 /// Compile and run the generated Dart, round-tripping a typed request/response.
 /// Skips when `dart` is not on PATH so the suite stays portable.
 #[test]
@@ -948,14 +1114,18 @@ import 'models.gen.dart';
 
 class LoopbackTransport implements CsilTransport {
   @override
-  List<int> call(String service, String op, List<int> request) {
+  List<int> call(String service, String op, List<int> request) =>
+      throw StateError('submit-task has two reply arms, so it must use callReply');
+
+  @override
+  (String?, Uint8List) callReply(String service, String op, List<int> request) {
     // The client must route with the verbatim CSIL service and op names.
     if (service != 'CorndogsService' || op != 'submit-task') {
       throw StateError('unexpected route $service/$op');
     }
     // Decode the typed request, then encode its task as the typed response.
     final req = SubmitTaskRequest.fromCbor(request);
-    return req.task.toCbor();
+    return ('Task', req.task.toCbor());
   }
 }
 
@@ -1376,7 +1546,7 @@ fn async_twin_emitted_by_default_with_marked_symbols() {
         "async method returns a Future and is async: {twin}"
     );
     assert!(
-        twin.contains("final csilResp = await transport.call("),
+        twin.contains("final (csilVariant, csilPayload) = await transport.callReply("),
         "async method awaits the seam: {twin}"
     );
     assert!(
@@ -1427,7 +1597,7 @@ fn client_style_async_is_drop_in_at_canonical_path() {
         "drop-in method turns async: {code}"
     );
     assert!(
-        code.contains("final csilResp = await transport.call("),
+        code.contains("final (csilVariant, csilPayload) = await transport.callReply("),
         "drop-in awaits the seam: {code}"
     );
     assert!(
@@ -1458,7 +1628,7 @@ fn client_style_sync_suppresses_the_twin() {
         "sync method stays blocking: {code}"
     );
     assert!(
-        code.contains("final csilResp = transport.call("),
+        code.contains("final (csilVariant, csilPayload) = transport.callReply("),
         "sync method calls the seam directly (no await): {code}"
     );
     assert!(
@@ -1532,14 +1702,18 @@ import 'models.gen.dart';
 /// An async carrier: the seam returns a Future the generated client awaits.
 class AsyncLoopback implements AsyncCsilTransport {
   @override
-  Future<Uint8List> call(String service, String op, List<int> request) async {
+  Future<Uint8List> call(String service, String op, List<int> request) =>
+      throw StateError('submit-task has two reply arms, so it must use callReply');
+
+  @override
+  Future<(String?, Uint8List)> callReply(String service, String op, List<int> request) async {
     // The client must route with the verbatim CSIL service and op names.
     if (service != 'CorndogsService' || op != 'submit-task') {
       throw StateError('unexpected route $service/$op');
     }
     // Decode the typed request, then encode its task as the typed response.
     final req = SubmitTaskRequest.fromCbor(request);
-    return req.task.toCbor();
+    return ('Task', req.task.toCbor());
   }
 }
 
@@ -1959,9 +2133,11 @@ fn client_package_readme_has_rpc_and_datagram_sections() {
         readme.contains("/csil/v1/rpc"),
         "posts to the path: {readme}"
     );
+    // No multi-arm operation, so the carrier needs no callReply.
     assert!(
-        readme.contains("return resp.payload;"),
-        "typed ServiceError arm handled: {readme}"
+        readme.contains("(await _roundTrip(service, op, request)).payload;")
+            && !readme.contains("callReply"),
+        "single-method carrier: {readme}"
     );
     assert!(
         readme.contains("import 'package:csilgen_transport/csilgen_transport.dart';"),
@@ -3294,4 +3470,173 @@ fn case_insensitive_collision_between_existing_and_synthesized_rule_is_disambigu
         user_data_decls, 1,
         "synthesized hoist name collided with UserData and was not disambiguated: {code}"
     );
+}
+
+/// The timestamp codec checks the RFC 3339 shape by hand instead of trusting
+/// `DateTime.parse`, which accepts a space separator, no offset and second 60.
+#[test]
+fn timestamp_codec_is_strict_and_canonical() {
+    let files = generate_dart_code(
+        &spec(
+            vec![record_rule(
+                "Stamp",
+                vec![entry("at", builtin("timestamp"), false)],
+            )],
+            0,
+        ),
+        &config("dart"),
+    )
+    .unwrap();
+    let codec = &files
+        .iter()
+        .find(|f| f.path == "csil_cbor.gen.dart")
+        .expect("codec file")
+        .content;
+    assert!(!codec.contains("DateTime.parse("), "{codec}");
+    assert!(codec.contains("static DateTime timestampValue(Object? text)"));
+    assert!(codec.contains("if (nanos % 1000 != 0) return null;"));
+    assert!(codec.contains("throw FormatException('timestamp tag 0 requires text');"));
+    assert!(codec.contains("final u = utf8.encode(timestampText(v));"));
+
+    let have = std::process::Command::new("dart")
+        .arg("--version")
+        .output()
+        .is_ok();
+    if !have {
+        eprintln!("skipping: no dart on PATH");
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("csilgen-dart-ts-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    for f in &files {
+        std::fs::write(dir.join(&f.path), &f.content).unwrap();
+    }
+    std::fs::write(dir.join("driver.dart"), TIMESTAMP_DRIVER_DART).unwrap();
+    let run = std::process::Command::new("dart")
+        .arg(dir.join("driver.dart"))
+        .output()
+        .unwrap();
+    assert!(
+        run.status.success(),
+        "dart timestamp check failed:\n{}{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&run.stdout).trim(), "ok");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+const TIMESTAMP_DRIVER_DART: &str = r#"import 'dart:convert';
+import 'models.gen.dart';
+
+List<int> stamp(String text) => [
+  0xa1, 0x62, 0x61, 0x74, 0xc0,
+  ...(text.length < 24 ? [0x60 + text.length] : [0x78, text.length]),
+  ...utf8.encode(text),
+];
+
+String round(String text) {
+  final bytes = Stamp.fromCbor(stamp(text)).toCbor();
+  return utf8.decode(bytes.sublist(bytes[5] == 0x78 ? 7 : 6));
+}
+
+void main() {
+  if (round('2000-02-29T13:30:00.5+01:30') != '2000-02-29T12:00:00.500Z') throw 'offset';
+  if (round('2000-02-29t12:00:00.000500z') != '2000-02-29T12:00:00.000500Z') throw 'micros';
+  if (round('2000-02-29T12:00:00.000Z') != '2000-02-29T12:00:00Z') throw 'zero';
+  for (final bad in [
+    '2000-02-29 12:00:00Z',
+    '2000-02-29T23:59:60Z',
+    '2001-02-29T12:00:00Z',
+    '2000-02-29T12:00:00.000000001Z',
+    '2000-02-29T12:00:00',
+    '0001-01-01T00:30:00+01:00',
+  ]) {
+    try {
+      Stamp.fromCbor(stamp(bad));
+      throw 'accepted $bad';
+    } on FormatException {
+      // Refused, as required.
+    }
+  }
+  print('ok');
+}
+"#;
+
+/// `sign: Req -> Resp / Err`: a multi-arm reply whose variant picks the arm.
+fn multi_arm_rules() -> Vec<CsilRule> {
+    vec![
+        record_rule("Req", vec![entry("a", builtin("text"), false)]),
+        record_rule("Resp", vec![entry("b", builtin("text"), false)]),
+        record_rule("Err", vec![entry("code", builtin("int"), false)]),
+        CsilRule {
+            name: "Signer".to_string(),
+            rule_type: CsilRuleType::ServiceDef(CsilServiceDefinition {
+                operations: vec![CsilServiceOperation {
+                    name: "sign".to_string(),
+                    input_type: reference("Req"),
+                    output_type: CsilTypeExpression::Choice(vec![
+                        reference("Resp"),
+                        reference("Err"),
+                    ]),
+                    direction: CsilServiceDirection::Unidirectional,
+                    position: pos(),
+                    doc_comments: Vec::new(),
+                    wire_id: None,
+                }],
+                wire_id: None,
+            }),
+            position: pos(),
+            doc_comments: Vec::new(),
+        },
+    ]
+}
+
+/// `call` returns bytes alone, so a multi-arm operation goes through `callReply`
+/// and the generated resolver; the seam declares `callReply` only for such a spec.
+#[test]
+fn multi_arm_operation_uses_call_reply_in_both_client_shapes() {
+    let files = generate_dart_code(&spec(multi_arm_rules(), 1), &config("dart-client")).unwrap();
+    let sync = services_file(&files);
+    assert!(
+        sync.contains(
+            "  (String?, Uint8List) callReply(String service, String op, List<int> request);"
+        ),
+        "{sync}"
+    );
+    assert!(sync.contains("import 'dart:typed_data';"), "{sync}");
+    assert!(
+        sync.contains("    final (csilVariant, csilPayload) = transport.callReply(\n"),
+        "{sync}"
+    );
+    assert!(
+        sync.contains("    final csilResp = resolveRpcReply(\n      'Signer',\n      'sign',\n      csilVariant,\n      csilPayload,\n    );"),
+        "{sync}"
+    );
+    let asynced = &files
+        .iter()
+        .find(|f| f.path == "services.async.gen.dart")
+        .expect("async twin")
+        .content;
+    assert!(
+        asynced.contains("  Future<(String?, Uint8List)> callReply("),
+        "{asynced}"
+    );
+    assert!(
+        asynced.contains("final (csilVariant, csilPayload) = await transport.callReply("),
+        "{asynced}"
+    );
+
+    let plain = generate_dart_code(&spec(demo_rules(), 1), &config("dart-client")).unwrap();
+    assert!(!services_file(&plain).contains("callReply"));
+
+    let pkg =
+        generate_dart_code(&spec(multi_arm_rules(), 1), &demo_pkg_opts("dart-client")).unwrap();
+    let readme = readme_of(&pkg);
+    assert!(
+        readme.contains("  Future<(String?, Uint8List)> callReply(String service, String op, List<int> request) async {\n    final resp = await _roundTrip(service, op, request);\n    return (resp.variant, resp.payload);"),
+        "{readme}"
+    );
+    assert!(!readme.contains("resolveRpcReply"), "{readme}");
 }

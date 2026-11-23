@@ -877,6 +877,32 @@ fn validation_emits_predicate_for_constraints() {
     assert!(validation.contains("if (v.name.len < 3) return false;"));
 }
 
+/// A `uint` from a payload can exceed `maxInt(i64)`. An `@intCast` to `i64` panics
+/// on it in a safe build, which ends the process, so the check must widen instead.
+#[test]
+fn validation_uint_bound_widens_instead_of_casting() {
+    let entry = bare_entry(
+        "qty",
+        CsilTypeExpression::Constrained {
+            base_type: Box::new(builtin("uint")),
+            constraints: vec![CsilControlOperator::LessEqual(CsilLiteralValue::Integer(
+                1000,
+            ))],
+        },
+    );
+    let input = input_with_rules(
+        vec![group_rule("Order", vec![entry])],
+        "zig",
+        HashMap::new(),
+    );
+    let validation = generate_validation(&input).expect("validation emitted");
+    assert!(
+        validation.contains("if (@as(i128, v.qty) > 1000) return false;"),
+        "{validation}"
+    );
+    assert!(!validation.contains("@intCast"), "{validation}");
+}
+
 #[test]
 fn validation_optional_numeric_is_guarded_and_cast() {
     let mut entry = bare_entry(
@@ -895,9 +921,10 @@ fn validation_optional_numeric_is_guarded_and_cast() {
         HashMap::new(),
     );
     let validation = generate_validation(&input).expect("validation emitted");
-    assert!(validation.contains(
-        "if (v.age) |x| {\n        if (@as(i64, @intCast(x)) < 18) return false;\n    }"
-    ));
+    assert!(
+        validation
+            .contains("if (v.age) |x| {\n        if (@as(i128, x) < 18) return false;\n    }")
+    );
 }
 
 #[test]
@@ -2362,3 +2389,371 @@ fn optional_bytes_encodes_on_presence_not_emptiness() {
         "decode must gate on key presence:\n{codec}"
     );
 }
+
+/// A reply operation whose input is an alias (`HouseID = text`) gets an
+/// `encode_<Reply>Request(alloc, req: ...)` encoder. Its `req` parameter must not
+/// shadow a codec helper, or Zig refuses the file. Compile the client with
+/// `zig test`. Skips when `zig` is not on PATH.
+#[test]
+fn reply_request_encoder_param_does_not_shadow_codec_helpers() {
+    let house_id = CsilRule {
+        name: "HouseID".to_string(),
+        rule_type: CsilRuleType::TypeDef(builtin("text")),
+        position: pos(),
+        doc_comments: vec![],
+    };
+    let house = group_rule("House", vec![bare_entry("name", builtin("text"))]);
+    let err = group_rule("NotFound", vec![bare_entry("message", builtin("text"))]);
+    let svc = service_rule(
+        "HouseService",
+        vec![op(
+            "get-house",
+            CsilTypeExpression::Reference("HouseID".to_string()),
+            CsilTypeExpression::Choice(vec![
+                CsilTypeExpression::Reference("House".to_string()),
+                CsilTypeExpression::Reference("NotFound".to_string()),
+            ]),
+            CsilServiceDirection::Unidirectional,
+            None,
+        )],
+        None,
+    );
+    let input = input_with_rules(
+        vec![house_id, house, err, svc],
+        "zig-client",
+        HashMap::new(),
+    );
+    let out = process_generation(input).unwrap();
+    let codec = &out
+        .files
+        .iter()
+        .find(|f| f.path == "codec.gen.zig")
+        .unwrap()
+        .content;
+    assert!(
+        codec.contains(
+            "pub fn encode_HouseServiceGetHouseReplyRequest(alloc: std.mem.Allocator, req:"
+        )
+    );
+    assert!(!codec.contains("fn req("));
+    let Some(zig) = zig_bin() else {
+        eprintln!("skipping: no zig on PATH");
+        return;
+    };
+    let dir = std::env::temp_dir().join(format!("csilgen-zig-reply-req-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    for file in &out.files {
+        std::fs::write(dir.join(&file.path), &file.content).unwrap();
+    }
+    let run = std::process::Command::new(zig)
+        .arg("test")
+        .arg(dir.join("client.gen.zig"))
+        .arg("--cache-dir")
+        .arg(dir.join("zig-cache"))
+        .output()
+        .unwrap();
+    assert!(
+        run.status.success(),
+        "zig test client.gen.zig failed:\n{}{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A record and a union that hold `timestamp` in every decode position: a
+/// required field, an optional field, an array element, and a union arm.
+fn timestamp_rules() -> Vec<CsilRule> {
+    let mut later = bare_entry("later", builtin("timestamp"));
+    later.occurrence = Some(CsilOccurrence::Optional);
+    let stamp = group_rule(
+        "Stamp",
+        vec![
+            bare_entry("at", builtin("timestamp")),
+            later,
+            bare_entry(
+                "all",
+                CsilTypeExpression::Array {
+                    element_type: Box::new(builtin("timestamp")),
+                    occurrence: None,
+                },
+            ),
+        ],
+    );
+    let when = CsilRule {
+        name: "When".to_string(),
+        rule_type: CsilRuleType::TypeChoice(vec![builtin("timestamp"), builtin("int")]),
+        position: pos(),
+        doc_comments: vec![],
+    };
+    vec![stamp, when]
+}
+
+#[test]
+fn timestamp_codec_validates_and_normalizes() {
+    let input = input_with_rules(timestamp_rules(), "zig", HashMap::new());
+    let out = process_generation(input).unwrap();
+    let codec = &out
+        .files
+        .iter()
+        .find(|f| f.path == "codec.gen.zig")
+        .unwrap()
+        .content;
+    assert!(codec.contains("try csil_w_timestamp(out, (v.at).rfc3339);"));
+    assert!(codec.contains("const csil_ts = try csil_as_timestamp(alloc, "));
+    assert!(!codec.contains(".epoch_seconds = 0"));
+    // A record whose only heap use is timestamp normalization must keep `alloc`.
+    let dec_stamp = codec.split("fn dec_Stamp(").nth(1).unwrap();
+    let dec_stamp = &dec_stamp[..dec_stamp.find("\n}\n").unwrap()];
+    assert!(!dec_stamp.contains("_ = alloc;"));
+}
+
+/// Runs the strict decode and canonical encode through the real compiler: offset
+/// conversion with day and year carry, lowercase separators, short fractions,
+/// epoch seconds, refusal of invalid caller text, and the union arm path.
+#[test]
+fn timestamp_codec_round_trips_through_zig() {
+    let Some(zig) = zig_bin() else {
+        eprintln!("skipping: no zig toolchain");
+        return;
+    };
+    let input = input_with_rules(timestamp_rules(), "zig", HashMap::new());
+    let out = process_generation(input).unwrap();
+    let dir = std::env::temp_dir().join(format!("csilgen-zig-timestamp-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    for file in &out.files {
+        std::fs::write(dir.join(&file.path), &file.content).unwrap();
+    }
+    std::fs::write(dir.join("driver.zig"), TIMESTAMP_DRIVER_ZIG).unwrap();
+    let run = std::process::Command::new(&zig)
+        .arg("run")
+        .arg(dir.join("driver.zig"))
+        .arg("--cache-dir")
+        .arg(dir.join("zig-cache"))
+        .output()
+        .unwrap();
+    assert!(
+        run.status.success(),
+        "zig timestamp proof failed:\n{}{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&run.stdout).trim(), "ok");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+const TIMESTAMP_DRIVER_ZIG: &str = r#"const std = @import("std");
+const types = @import("types.gen.zig");
+const codec = @import("codec.gen.zig");
+
+fn expectText(got: []const u8, want: []const u8) !void {
+    if (!std.mem.eql(u8, got, want)) {
+        std.debug.print("got {s}, want {s}\n", .{ got, want });
+        return error.Mismatch;
+    }
+}
+
+fn ts(text: []const u8) types.CsilTimestamp {
+    return .{ .rfc3339 = text, .epoch_seconds = 0 };
+}
+
+pub fn main() !void {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var all = [_]types.CsilTimestamp{ts("2000-02-29t12:00:00.5z")};
+    const built = types.Stamp{
+        .at = ts("2000-03-01T00:30:00+01:00"),
+        .later = ts("2000-12-31T23:30:00-01:00"),
+        .all = &all,
+    };
+    var back: types.Stamp = undefined;
+    try codec.decode_Stamp(a, try codec.encode_Stamp(a, &built), &back);
+    try expectText(back.at.rfc3339, "2000-02-29T23:30:00Z");
+    if (back.at.epoch_seconds != 951867000) return error.Epoch;
+    try expectText(back.later.?.rfc3339, "2001-01-01T00:30:00Z");
+    if (back.later.?.epoch_seconds != 978309000) return error.Epoch;
+    try expectText(back.all[0].rfc3339, "2000-02-29T12:00:00.500Z");
+
+    var none = [_]types.CsilTimestamp{};
+    for ([_][]const u8{ "2000-02-29 12:00:00Z", "2000-02-29T12:00:00", "9999-12-31T23:30:00-01:00", "0000-12-31T23:30:00-01:00", "2000-02-29T12:00:00.1234567890Z" }) |text| {
+        const bad = types.Stamp{ .at = ts(text), .all = &none };
+        if (codec.encode_Stamp(a, &bad)) |_| {
+            std.debug.print("encoded invalid {s}\n", .{text});
+            return error.AcceptedInvalid;
+        } else |_| {}
+    }
+
+    const when = types.When{ .timestamp = ts("2000-02-29T13:30:00.000500+01:30") };
+    var when_back: types.When = undefined;
+    try codec.decode_When(a, try codec.encode_When(a, &when), &when_back);
+    try expectText(when_back.timestamp.rfc3339, "2000-02-29T12:00:00.000500Z");
+
+    try std.io.getStdOut().writer().print("ok\n", .{});
+}
+"#;
+
+/// A record and a union that hold `cddl_time` in every decode position: a
+/// required field, an optional field, an array element, and a union arm.
+fn cddl_time_rules() -> Vec<CsilRule> {
+    let mut later = bare_entry("later", builtin("cddl_time"));
+    later.occurrence = Some(CsilOccurrence::Optional);
+    let moment = group_rule(
+        "Moment",
+        vec![
+            bare_entry("at", builtin("cddl_time")),
+            later,
+            bare_entry(
+                "all",
+                CsilTypeExpression::Array {
+                    element_type: Box::new(builtin("cddl_time")),
+                    occurrence: None,
+                },
+            ),
+        ],
+    );
+    let seen = CsilRule {
+        name: "Seen".to_string(),
+        rule_type: CsilRuleType::TypeChoice(vec![builtin("cddl_time"), builtin("int")]),
+        position: pos(),
+        doc_comments: vec![],
+    };
+    vec![moment, seen]
+}
+
+#[test]
+fn cddl_time_shares_the_timestamp_type_and_uses_the_epoch_codec() {
+    let input = input_with_rules(cddl_time_rules(), "zig", HashMap::new());
+    let out = process_generation(input).unwrap();
+    let file = |name: &str| {
+        &out.files
+            .iter()
+            .find(|f| f.path == name)
+            .unwrap_or_else(|| panic!("missing {name}"))
+            .content
+    };
+    // A spec that uses only `cddl_time` still gets the shared helper file.
+    assert!(file("csil_timestamp.gen.zig").contains("pub const CsilTimestamp = struct"));
+    let types = file("types.gen.zig");
+    assert!(types.contains("at: CsilTimestamp,"));
+    assert!(types.contains("@import(\"csil_timestamp.gen.zig\").CsilTimestamp"));
+    let codec = file("codec.gen.zig");
+    assert!(codec.contains("try csil_w_epoch(out, (v.at).rfc3339);"));
+    assert!(codec.contains("const csil_ts = try csil_as_epoch(alloc, "));
+    // Decode always writes the epoch text into the allocator.
+    let dec_moment = codec.split("fn dec_Moment(").nth(1).unwrap();
+    let dec_moment = &dec_moment[..dec_moment.find("\n}\n").unwrap()];
+    assert!(!dec_moment.contains("_ = alloc;"));
+}
+
+/// Runs the epoch codec through the real compiler: integer and float encode,
+/// offset text, rounding and carry on decode, refusal of invalid text and of
+/// out-of-range or non-numeric wire values, and the union arm path.
+#[test]
+fn cddl_time_codec_round_trips_through_zig() {
+    let Some(zig) = zig_bin() else {
+        eprintln!("skipping: no zig toolchain");
+        return;
+    };
+    let input = input_with_rules(cddl_time_rules(), "zig", HashMap::new());
+    let out = process_generation(input).unwrap();
+    let dir = std::env::temp_dir().join(format!("csilgen-zig-cddl-time-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    for file in &out.files {
+        std::fs::write(dir.join(&file.path), &file.content).unwrap();
+    }
+    std::fs::write(dir.join("driver.zig"), CDDL_TIME_DRIVER_ZIG).unwrap();
+    let run = std::process::Command::new(&zig)
+        .arg("run")
+        .arg(dir.join("driver.zig"))
+        .arg("--cache-dir")
+        .arg(dir.join("zig-cache"))
+        .output()
+        .unwrap();
+    assert!(
+        run.status.success(),
+        "zig cddl_time proof failed:\n{}{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&run.stdout).trim(), "ok");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+const CDDL_TIME_DRIVER_ZIG: &str = r#"const std = @import("std");
+const types = @import("types.gen.zig");
+const codec = @import("codec.gen.zig");
+
+fn expectText(got: []const u8, want: []const u8) !void {
+    if (!std.mem.eql(u8, got, want)) {
+        std.debug.print("got {s}, want {s}\n", .{ got, want });
+        return error.Mismatch;
+    }
+}
+
+fn ts(text: []const u8) types.CsilTimestamp {
+    return .{ .rfc3339 = text, .epoch_seconds = 0 };
+}
+
+/// Decodes `{"at": 1(<content>), "all": []}` and returns the text.
+fn decodeAt(a: std.mem.Allocator, content: []const u8) ![]const u8 {
+    const bytes = try std.mem.concat(a, u8, &.{ "\xa2\x62at\xc1", content, "\x63all\x80" });
+    var m: types.Moment = undefined;
+    try codec.decode_Moment(a, bytes, &m);
+    return m.at.rfc3339;
+}
+
+pub fn main() !void {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var all = [_]types.CsilTimestamp{ts("1970-01-01t00:00:00.000000001z")};
+    const built = types.Moment{
+        .at = ts("2000-02-29T13:00:00+01:00"),
+        .later = ts("2000-02-29T12:00:00.5Z"),
+        .all = &all,
+    };
+    const bytes = try codec.encode_Moment(a, &built);
+    // Whole seconds go out as the shortest integer under tag 1.
+    if (std.mem.indexOf(u8, bytes, "\xc1\x1a\x38\xbb\xb4\xc0") == null) return error.WholeSeconds;
+    var back: types.Moment = undefined;
+    try codec.decode_Moment(a, bytes, &back);
+    try expectText(back.at.rfc3339, "2000-02-29T12:00:00Z");
+    if (back.at.epoch_seconds != 951825600) return error.Epoch;
+    try expectText(back.later.?.rfc3339, "2000-02-29T12:00:00.500Z");
+    try expectText(back.all[0].rfc3339, "1970-01-01T00:00:00.000000001Z");
+
+    var none = [_]types.CsilTimestamp{};
+    const bad = types.Moment{ .at = ts("2000-02-29 12:00:00Z"), .all = &none };
+    if (codec.encode_Moment(a, &bad)) |_| return error.AcceptedInvalid else |_| {}
+
+    // f16 1.0, f64 -0.5, and f64 0.9999999999 (rounds up and carries).
+    try expectText(try decodeAt(a, "\xf9\x3c\x00"), "1970-01-01T00:00:01Z");
+    try expectText(try decodeAt(a, "\xfb\xbf\xe0\x00\x00\x00\x00\x00\x00"), "1969-12-31T23:59:59.500Z");
+    try expectText(try decodeAt(a, "\xfb\x3f\xef\xff\xff\xff\xf2\x41\x90"), "1970-01-01T00:00:01Z");
+
+    // uint 253402300800, f16 NaN, text, and nint below year 1 are refused.
+    for ([_][]const u8{
+        "\x1b\x00\x00\x00\x3a\xff\xf4\x41\x80",
+        "\xf9\x7e\x00",
+        "\x61\x30",
+        "\x3b\x00\x00\x00\x0e\x77\x91\xf7\x00",
+    }) |content| {
+        if (decodeAt(a, content)) |_| return error.AcceptedRefused else |_| {}
+    }
+
+    // A quarter second is exact in binary64; most fractions near this epoch are
+    // not, so they come back changed by the float.
+    const seen = types.Seen{ .cddl_time = ts("2000-02-29T12:00:00.250Z") };
+    var seen_back: types.Seen = undefined;
+    try codec.decode_Seen(a, try codec.encode_Seen(a, &seen), &seen_back);
+    try expectText(seen_back.cddl_time.rfc3339, "2000-02-29T12:00:00.250Z");
+
+    try std.io.getStdOut().writer().print("ok\n", .{});
+}
+"#;

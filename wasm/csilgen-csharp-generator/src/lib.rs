@@ -579,7 +579,7 @@ fn readme_file(
     let unary = first_readme_example(input, &records, config);
     let channel = first_channel_example(input, &records, config);
     if rpc {
-        out.push_str(&rpc_section(config, unary.as_ref()));
+        out.push_str(&rpc_section(config, has_reply_arms(input), unary.as_ref()));
     }
     if events {
         out.push_str(&events_section(config, channel.as_ref()));
@@ -595,7 +595,7 @@ fn readme_file(
 /// hand-rolled), POSTing to `{baseUrl}/csil/v1/rpc` with the stdlib `HttpClient`. A non-zero
 /// transport status (via `AsTransportError`) and the typed `ServiceError` arm are surfaced
 /// distinctly. Then the typed client calls the first `->` op.
-fn rpc_section(config: &CsharpConfig, ex: Option<&ReadmeExample>) -> String {
+fn rpc_section(config: &CsharpConfig, reply_arms: bool, ex: Option<&ReadmeExample>) -> String {
     let mut out = String::from("## CSIL-RPC (HTTP)\n\n");
     out.push_str(
         "Request/response. The library owns the envelope (`RpcRequest`/`RpcResponse`); you\n\
@@ -608,7 +608,7 @@ fn rpc_section(config: &CsharpConfig, ex: Option<&ReadmeExample>) -> String {
         );
         return out;
     };
-    let carrier = RPC_CARRIER_CSHARP.replace("__NAMESPACE__", &config.namespace);
+    let carrier = rpc_carrier_csharp(reply_arms).replace("__NAMESPACE__", &config.namespace);
     let call = match &ex.sample {
         Some(sample) => format!("client.{}({sample})", ex.method),
         None => format!("client.{}()", ex.method),
@@ -626,12 +626,41 @@ fn rpc_section(config: &CsharpConfig, ex: Option<&ReadmeExample>) -> String {
     out
 }
 
-/// The HTTP carrier body — spec-independent, so a constant with a `__NAMESPACE__` placeholder.
-/// It builds the request envelope with the library's `RpcRequest`, POSTs it to
-/// `{baseUrl}/csil/v1/rpc`, and returns the success payload bytes the typed client decodes.
-/// `RpcResponse.AsTransportError()` surfaces any non-zero transport status; the typed
-/// `ServiceError` arm (a status-0 variant) is surfaced separately.
-const RPC_CARRIER_CSHARP: &str = r#"// One example carrier: CSIL-RPC over an HTTP POST. The library owns the envelope
+/// The HTTP carrier body, with a `__NAMESPACE__` placeholder. It builds the request envelope
+/// with the library's `RpcRequest`, POSTs it to `{baseUrl}/csil/v1/rpc`, and hands back the
+/// reply. `RpcResponse.AsTransportError()` surfaces any non-zero transport status. When the
+/// spec has an op with several reply arms the seam also requires `CallReply`, which returns
+/// the reply variant so the typed client can pick the arm; the carrier never decodes an arm.
+fn rpc_carrier_csharp(reply_arms: bool) -> String {
+    let mut out = String::from(RPC_CARRIER_HEAD_CSHARP);
+    if reply_arms {
+        out.push_str(
+            r#"    public byte[] Call(string service, string op, byte[] request) => Exchange(service, op, request).Payload;
+
+    public CsilWireReply CallReply(string service, string op, byte[] request)
+    {
+        RpcResponse resp = Exchange(service, op, request);
+        return new CsilWireReply(resp.Variant, resp.Payload);
+    }
+
+    private RpcResponse Exchange(string service, string op, byte[] request)
+    {
+"#,
+        );
+    } else {
+        out.push_str("    public byte[] Call(string service, string op, byte[] request)\n    {\n");
+    }
+    out.push_str(RPC_CARRIER_EXCHANGE_CSHARP);
+    out.push_str(if reply_arms {
+        "        return resp;\n"
+    } else {
+        "        return resp.Payload;\n"
+    });
+    out.push_str("    }\n\n    public void Dispose() => _http.Dispose();\n}\n");
+    out
+}
+
+const RPC_CARRIER_HEAD_CSHARP: &str = r#"// One example carrier: CSIL-RPC over an HTTP POST. The library owns the envelope
 // (RpcRequest/RpcResponse); the carrier owns only the transport. Swap HttpClient for any client.
 using System;
 using System.Net.Http;
@@ -654,9 +683,9 @@ public sealed class HttpRpcCarrier : ICsilTransport, IDisposable
         _http = new HttpClient(handler);
     }
 
-    public byte[] Call(string service, string op, byte[] request)
-    {
-        // The library owns the envelope; hand it the already-encoded request bytes.
+"#;
+
+const RPC_CARRIER_EXCHANGE_CSHARP: &str = r#"        // The library owns the envelope; hand it the already-encoded request bytes.
         byte[] envelope = new RpcRequest(service, op, request).Encode();
         using var msg = new HttpRequestMessage(HttpMethod.Post, _url)
         {
@@ -674,13 +703,6 @@ public sealed class HttpRpcCarrier : ICsilTransport, IDisposable
         RpcResponse resp = RpcResponse.Decode(body);
         if (resp.AsTransportError() is StatusException ex)
             throw ex;
-        // A typed application error rides as a status-0 "ServiceError" variant — distinct
-        // from a transport failure. Surface it so the typed client decodes success only.
-        return Codec.ResolveRpcReply(service, op, resp.Variant, resp.Payload);
-    }
-
-    public void Dispose() => _http.Dispose();
-}
 "#;
 
 /// CSIL-Events over TLS: a full session example. Opens a TLS byte stream wrapped as the
@@ -1498,7 +1520,8 @@ fn emit_enum(body: &mut String, name: &str, choices: &[CsilTypeExpression]) {
 // ---------------------------------------------------------------------------
 
 /// The synchronous byte transport seam. Kept byte-identical to its original form so a
-/// `sync` (or default-`both`) client's output never changes.
+/// `sync` (or default-`both`) client's output never changes for a spec without multi-arm
+/// ops; `CallReply` is spliced in before the closing brace only when one exists.
 const CLIENT_TRANSPORT_SYNC: &str = "\
 /// <summary>The caller-supplied dumb byte transport seam. The generated client owns
 /// (de)serialization (canonical CBOR via the generated codec); the transport only
@@ -1509,6 +1532,28 @@ public interface ICsilTransport
     byte[] Call(string service, string op, byte[] request);
 }
 ";
+
+/// The seam member an op with several reply arms needs: the client selects the arm from the
+/// reply variant, which the one-method `Call` seam cannot carry.
+fn call_reply_member(ret: &str) -> String {
+    format!(
+        "\n    /// <summary>Performs a call to an op with several reply arms and returns the reply\n    /// variant with the payload bytes. The client selects the arm from the variant, so\n    /// the carrier must not drop it.</summary>\n    {ret} CallReply(string service, string op, byte[] request);\n"
+    )
+}
+
+/// One RPC reply as the client transport received it. Emitted with the canonical prelude,
+/// like the client exception, so an async twin in the same namespace reuses it.
+const CLIENT_WIRE_REPLY: &str = "\
+/// <summary>One RPC reply as the client transport received it. <c>Variant</c> is null when
+/// the reply carried none.</summary>
+public sealed record CsilWireReply(string? Variant, byte[] Payload);
+";
+
+/// Whether any unary op declares several reply arms, which is when the client seam needs
+/// the reply variant (`CallReply`).
+fn has_reply_arms(input: &WasmGeneratorInput) -> bool {
+    input.csil_spec.rpc_operations().next().is_some()
+}
 
 /// The shared client exception. Emitted only by the canonical (unmarked) prelude so that
 /// when an async twin shares the namespace with the sync client it does not redefine it.
@@ -1537,16 +1582,29 @@ fn client_transport_async(transport: &str) -> String {
 /// The prelude (transport interface + shared exception) for one client file. The exception
 /// rides only with the canonical (unmarked) prelude; the marked twin reuses the sync file's
 /// copy since both compile into one namespace.
-fn client_prelude(shape: &ClientShape) -> String {
-    let mut prelude = String::new();
-    if shape.is_async {
-        prelude.push_str(&client_transport_async(&shape.transport_name()));
+fn client_prelude(shape: &ClientShape, reply_arms: bool) -> String {
+    let mut seam = if shape.is_async {
+        client_transport_async(&shape.transport_name())
     } else {
-        prelude.push_str(CLIENT_TRANSPORT_SYNC);
+        CLIENT_TRANSPORT_SYNC.to_string()
+    };
+    if reply_arms {
+        let ret = if shape.is_async {
+            "System.Threading.Tasks.Task<CsilWireReply>"
+        } else {
+            "CsilWireReply"
+        };
+        let close = seam.rfind("}\n").expect("seam ends with a closing brace");
+        seam.insert_str(close, &call_reply_member(ret));
     }
+    let mut prelude = seam;
     if shape.marker.is_empty() {
         prelude.push('\n');
         prelude.push_str(CLIENT_EXCEPTION);
+        if reply_arms {
+            prelude.push('\n');
+            prelude.push_str(CLIENT_WIRE_REPLY);
+        }
     }
     prelude
 }
@@ -1581,7 +1639,7 @@ fn generate_client(
     content.push_str(FILE_HEADER);
     content.push('\n');
     content.push_str(&format!("namespace {};\n\n", config.namespace));
-    content.push_str(&client_prelude(&shape));
+    content.push_str(&client_prelude(&shape, has_reply_arms(input)));
     content.push('\n');
     content.push_str(&body);
     Some(content)
@@ -1692,10 +1750,17 @@ fn emit_client_class(
         // Wire strings are the verbatim CSIL service and operation names
         // (csil-rpc-transport.md §1.1/§1.3), distinct from the C# identifiers. They
         // never change with the client shape — the async twin rides the same wire.
-        let call = format!(
-            "{await_kw}transport.Call(\"{name}\", \"{wire_op}\", {req_bytes})",
-            wire_op = operation.name
-        );
+        let wire_op = &operation.name;
+        let multi_arm = operation.rpc_reply_arms().is_some();
+        // The reply variant picks the arm: the resolver passes the success payload through,
+        // throws the declared error arm, and rejects a missing or unknown variant.
+        let call = if multi_arm {
+            format!(
+                "Codec.ResolveRpcReply(\"{name}\", \"{wire_op}\", reply.Variant, reply.Payload)"
+            )
+        } else {
+            format!("{await_kw}transport.Call(\"{name}\", \"{wire_op}\", {req_bytes})")
+        };
         // A record success reuses the generic `Codec.Decode<T>`; any other shape uses the
         // op's per-op response decoder.
         let decode = if is_record_ref(&success, records) {
@@ -1703,9 +1768,15 @@ fn emit_client_class(
         } else {
             format!("Codec.Decode{stem}Response({call})")
         };
-        body.push_str(&format!(
-            "    public {async_kw}{ret} {method}({params_sig}) =>\n        {decode};\n"
-        ));
+        if multi_arm {
+            body.push_str(&format!(
+                "    public {async_kw}{ret} {method}({params_sig})\n    {{\n        var reply = {await_kw}transport.CallReply(\"{name}\", \"{wire_op}\", {req_bytes});\n        return {decode};\n    }}\n"
+            ));
+        } else {
+            body.push_str(&format!(
+                "    public {async_kw}{ret} {method}({params_sig}) =>\n        {decode};\n"
+            ));
+        }
     }
 
     body.push_str("}\n\n");
@@ -1947,6 +2018,7 @@ fn csharp_enc_value(
             "bool" => format!("new CborValue.Bool({expr})"),
             "date" => format!("Cbor.EncDate({expr})"),
             "timestamp" => format!("Cbor.EncTimestamp({expr})"),
+            "cddl_time" => format!("Cbor.EncCddlTime({expr})"),
             "decimal" => format!("Cbor.EncDecimal({expr})"),
             // `any` is already a `CborValue`; carry it through verbatim.
             "any" => expr.to_string(),
@@ -2048,6 +2120,7 @@ fn csharp_dec_value(
             "bool" => format!("Cbor.AsBool({expr})"),
             "date" => format!("Cbor.AsDate({expr})"),
             "timestamp" => format!("Cbor.AsTimestamp({expr})"),
+            "cddl_time" => format!("Cbor.AsCddlTime({expr})"),
             "decimal" => format!("Cbor.AsDecimal({expr})"),
             // `any` is carried through as the decoded `CborValue` itself.
             "any" => expr.to_string(),
@@ -2547,6 +2620,10 @@ fn generate_codec(input: &WasmGeneratorInput, config: &CsharpConfig) -> Option<S
     if uses_timestamp {
         content.push('\n');
         content.push_str(CODEC_TIMESTAMP_CSHARP);
+    }
+    if spec_uses_builtin(input, "cddl_time") {
+        content.push('\n');
+        content.push_str(CODEC_CDDL_TIME_CSHARP);
     }
     if uses_decimal {
         content.push('\n');
@@ -3228,7 +3305,7 @@ fn ordered_kind(value_type: &CsilTypeExpression, config: &CsharpConfig) -> Order
                 DecimalMapping::Library => OrderedKind::LibraryDecimal,
             },
             "date" => OrderedKind::Date,
-            "timestamp" => OrderedKind::Timestamp,
+            "timestamp" | "cddl_time" => OrderedKind::Timestamp,
             _ => OrderedKind::Numeric,
         }
     } else {
@@ -3313,8 +3390,9 @@ fn map_csil_type_inner(
             "bytes" | "bstr" => "byte[]".to_string(),
             "bool" => "bool".to_string(),
             "date" => "System.DateOnly".to_string(),
-            // CBOR tag 0, RFC3339, always UTC per the wire contract.
-            "timestamp" => "System.DateTimeOffset".to_string(),
+            // CBOR tag 0, RFC3339, always UTC per the wire contract. A `cddl_time` is
+            // the same instant; only its wire form (tag 1) differs.
+            "timestamp" | "cddl_time" => "System.DateTimeOffset".to_string(),
             // CBOR tag 4 exact decimal; concrete C# type depends on decimal_mapping. Only
             // the generated `CsilDecimal` lives in our namespace and needs qualifying.
             "decimal" => match config.decimal_mapping {
@@ -4002,6 +4080,11 @@ public static partial class Cbor
                 case 21: csilPos += 1; return new CborValue.Bool(true);
                 case 22:
                 case 23: csilPos += 1; return new CborValue.Null();
+                case 25:
+                {
+                    var bits = ReadArg(b, ref csilPos, low);
+                    return new CborValue.Float((double)System.BitConverter.UInt16BitsToHalf((ushort)bits));
+                }
                 case 26:
                 {
                     var bits = ReadArg(b, ref csilPos, low);
@@ -4163,18 +4246,201 @@ public static partial class Cbor
 "#;
 
 /// `timestamp` support, emitted only when the spec uses it: CBOR tag 0 RFC3339 text,
-/// always serialized in UTC with a `Z` offset per the wire contract.
+/// always serialized in UTC with a `Z` offset per the wire contract. The shape is checked
+/// by hand because `DateTimeOffset.Parse` is lenient and culture-driven, and the "o"
+/// format writes seven fraction digits where the contract requires 3, 6, or 9.
+/// `DateTimeOffset` holds 100 ns ticks, so fraction digits 8 and 9 must be zero.
 const CODEC_TIMESTAMP_CSHARP: &str = r#"public static partial class Cbor
 {
-    public static CborValue EncTimestamp(System.DateTimeOffset value) =>
-        new CborValue.Tag(0, new CborValue.Text(
-            value.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.FFFFFFF'Z'", System.Globalization.CultureInfo.InvariantCulture)));
+    public static CborValue EncTimestamp(System.DateTimeOffset value)
+    {
+        var u = value.UtcDateTime;
+        var b = new System.Text.StringBuilder(30);
+        TimestampDigits(b, u.Year, 4).Append('-');
+        TimestampDigits(b, u.Month, 2).Append('-');
+        TimestampDigits(b, u.Day, 2).Append('T');
+        TimestampDigits(b, u.Hour, 2).Append(':');
+        TimestampDigits(b, u.Minute, 2).Append(':');
+        TimestampDigits(b, u.Second, 2);
+        long nano = (u.Ticks % System.TimeSpan.TicksPerSecond) * 100;
+        if (nano != 0)
+        {
+            b.Append('.');
+            if (nano % 1_000_000 == 0) TimestampDigits(b, nano / 1_000_000, 3);
+            else if (nano % 1_000 == 0) TimestampDigits(b, nano / 1_000, 6);
+            else TimestampDigits(b, nano, 9);
+        }
+        b.Append('Z');
+        return new CborValue.Tag(0, new CborValue.Text(b.ToString()));
+    }
+
+    private static System.Text.StringBuilder TimestampDigits(System.Text.StringBuilder b, long value, int width)
+    {
+        var text = value.ToString(System.Globalization.CultureInfo.InvariantCulture);
+        return b.Append('0', System.Math.Max(0, width - text.Length)).Append(text);
+    }
 
     public static System.DateTimeOffset AsTimestamp(CborValue v) =>
-        System.DateTimeOffset.Parse(
-            AsTaggedText(v, 0),
-            System.Globalization.CultureInfo.InvariantCulture,
-            System.Globalization.DateTimeStyles.AdjustToUniversal | System.Globalization.DateTimeStyles.AssumeUniversal);
+        v is CborValue.Tag t && t.Number == 0 && t.Inner is CborValue.Text text
+            ? ParseTimestamp(text.Value)
+            : throw new CborException("expected CBOR tag 0 timestamp");
+
+    private static int TimestampField(string s, int at, int width)
+    {
+        if (at + width > s.Length) throw new CborException("invalid timestamp text");
+        int value = 0;
+        for (int i = at; i < at + width; i++)
+        {
+            char c = s[i];
+            if (c < '0' || c > '9') throw new CborException("invalid timestamp text");
+            value = value * 10 + (c - '0');
+        }
+        return value;
+    }
+
+    private static void TimestampSeparator(string s, int at, char a, char b)
+    {
+        if (at >= s.Length || (s[at] != a && s[at] != b)) throw new CborException("invalid timestamp text");
+    }
+
+    // Days since 0001-01-01 in the proleptic Gregorian calendar. Computed by hand so the
+    // offset is applied in tick arithmetic, where a result outside 0001-9999 UTC is a
+    // range check and not a DateTime constructor exception.
+    private static long TimestampDays(int year, int month, int day)
+    {
+        long y = month <= 2 ? year - 1 : year;
+        long era = (y >= 0 ? y : y - 399) / 400;
+        long yoe = y - era * 400;
+        long doy = (153 * (month > 2 ? month - 3 : month + 9) + 2) / 5 + day - 1;
+        long doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+        return era * 146097 + doe - 306;
+    }
+
+    private static System.DateTimeOffset ParseTimestamp(string s)
+    {
+        int year = TimestampField(s, 0, 4);
+        TimestampSeparator(s, 4, '-', '-');
+        int month = TimestampField(s, 5, 2);
+        TimestampSeparator(s, 7, '-', '-');
+        int day = TimestampField(s, 8, 2);
+        TimestampSeparator(s, 10, 'T', 't');
+        int hour = TimestampField(s, 11, 2);
+        TimestampSeparator(s, 13, ':', ':');
+        int minute = TimestampField(s, 14, 2);
+        TimestampSeparator(s, 16, ':', ':');
+        int second = TimestampField(s, 17, 2);
+        bool leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+        int monthDays = month == 2 ? (leap ? 29 : 28) : (month == 4 || month == 6 || month == 9 || month == 11 ? 30 : 31);
+        if (year < 1 || month < 1 || month > 12 || day < 1 || day > monthDays || hour > 23 || minute > 59 || second > 59)
+            throw new CborException("invalid timestamp value");
+        int at = 19;
+        long fraction = 0;
+        if (at < s.Length && s[at] == '.')
+        {
+            int start = ++at;
+            while (at < s.Length && s[at] >= '0' && s[at] <= '9') at++;
+            int digits = at - start;
+            if (digits < 1 || digits > 9) throw new CborException("invalid timestamp fraction");
+            for (int i = start; i < start + 7; i++) fraction = fraction * 10 + (i < at ? s[i] - '0' : 0);
+            for (int i = start + 7; i < at; i++)
+                if (s[i] != '0') throw new CborException("timestamp fraction finer than 100 ns");
+        }
+        if (at >= s.Length) throw new CborException("timestamp has no offset");
+        char zone = s[at];
+        long offset;
+        if (zone == 'Z' || zone == 'z')
+        {
+            offset = 0;
+            at += 1;
+        }
+        else if (zone == '+' || zone == '-')
+        {
+            int offsetHour = TimestampField(s, at + 1, 2);
+            TimestampSeparator(s, at + 3, ':', ':');
+            int offsetMinute = TimestampField(s, at + 4, 2);
+            if (offsetHour > 23 || offsetMinute > 59) throw new CborException("invalid timestamp offset");
+            offset = (zone == '-' ? -1 : 1) * (offsetHour * 3600L + offsetMinute * 60L);
+            at += 6;
+        }
+        else
+        {
+            throw new CborException("invalid timestamp offset");
+        }
+        if (at != s.Length) throw new CborException("trailing timestamp text");
+        long seconds = TimestampDays(year, month, day) * 86_400L + hour * 3_600L + minute * 60L + second - offset;
+        long ticks = seconds * System.TimeSpan.TicksPerSecond + fraction;
+        // DateTime spans exactly 0001-01-01 through 9999-12-31 UTC, the contract's range.
+        if (ticks < 0 || ticks > System.DateTime.MaxValue.Ticks)
+            throw new CborException("timestamp year outside 0001-9999");
+        return new System.DateTimeOffset(ticks, System.TimeSpan.Zero);
+    }
+}
+"#;
+
+/// `cddl_time` support, emitted only when the spec uses it: CBOR tag 1 epoch seconds.
+/// The float split is spelled out step by step because the wire contract fixes each
+/// binary64 operation, so every target lands on the same instant.
+const CODEC_CDDL_TIME_CSHARP: &str = r#"public static partial class Cbor
+{
+    private const long CddlTimeFirst = -62_135_596_800L;
+    private const long CddlTimeLast = 253_402_300_799L;
+    private const long CddlTimeTicksPerSecond = 10_000_000L;
+
+    public static CborValue EncCddlTime(System.DateTimeOffset value)
+    {
+        long delta = value.UtcTicks - System.DateTime.UnixEpoch.Ticks;
+        long seconds = delta / CddlTimeTicksPerSecond;
+        long units = delta % CddlTimeTicksPerSecond;
+        // Integer division truncates toward zero; the contract splits at the floor.
+        if (units < 0)
+        {
+            seconds -= 1;
+            units += CddlTimeTicksPerSecond;
+        }
+        if (units == 0) return new CborValue.Tag(1, new CborValue.Int(seconds));
+        return new CborValue.Tag(1, new CborValue.Float((double)seconds + (double)units / 1e7));
+    }
+
+    public static System.DateTimeOffset AsCddlTime(CborValue v)
+    {
+        if (v is not CborValue.Tag { Number: 1 } tag) throw new CborException("expected CBOR tag 1 cddl_time");
+        long seconds;
+        long units = 0;
+        switch (tag.Inner)
+        {
+            case CborValue.Uint x:
+                if (x.Value > (ulong)CddlTimeLast) throw new CborException("cddl_time year outside 0001-9999");
+                seconds = (long)x.Value;
+                break;
+            case CborValue.Int x:
+                seconds = x.Value;
+                break;
+            case CborValue.Float x:
+            {
+                double value = x.Value;
+                if (!double.IsFinite(value)) throw new CborException("cddl_time is not finite");
+                // Refused before the integer conversion so that the cast cannot overflow.
+                if (value < (double)(CddlTimeFirst - 1) || value > (double)(CddlTimeLast + 1))
+                    throw new CborException("cddl_time year outside 0001-9999");
+                double whole = System.Math.Floor(value);
+                double scaled = (value - whole) * 1e7;
+                double rounded = System.Math.Floor(scaled + 0.5);
+                seconds = (long)whole;
+                units = (long)rounded;
+                if (units == CddlTimeTicksPerSecond)
+                {
+                    seconds += 1;
+                    units = 0;
+                }
+                break;
+            }
+            default:
+                throw new CborException("cddl_time tag 1 requires a number");
+        }
+        if (seconds < CddlTimeFirst || seconds > CddlTimeLast) throw new CborException("cddl_time year outside 0001-9999");
+        long ticks = (seconds - CddlTimeFirst) * CddlTimeTicksPerSecond + units;
+        return new System.DateTimeOffset(ticks, System.TimeSpan.Zero);
+    }
 }
 "#;
 
@@ -5084,6 +5350,12 @@ System.Console.WriteLine("ok");
     /// record-typed `<->` op (`pulse`), both over `Ping`/`Pong` records, generated under a
     /// distinct namespace so the codec types don't collide with the transport library.
     fn transports_input(target: &str) -> WasmGeneratorInput {
+        transports_input_with(target, false)
+    }
+
+    /// `transports_input`, optionally with `ping` replying `Pong / Oops` so the seam needs
+    /// the reply variant and the quickstart carrier must implement `CallReply`.
+    fn transports_input_with(target: &str, reply_arm: bool) -> WasmGeneratorInput {
         let text = || CsilTypeExpression::Builtin("text".to_string());
         let pos = || CsilPosition {
             line: 1,
@@ -5098,10 +5370,18 @@ System.Console.WriteLine("ok");
         };
         let ping = group_rule("Ping", vec![bare_entry("msg", text())]);
         let pong = group_rule("Pong", vec![bare_entry("msg", text())]);
+        let oops = group_rule("Oops", vec![bare_entry("reason", text())]);
         let op = |name: &str, dir: CsilServiceDirection| CsilServiceOperation {
             name: name.to_string(),
             input_type: CsilTypeExpression::Reference("Ping".to_string()),
-            output_type: CsilTypeExpression::Reference("Pong".to_string()),
+            output_type: if reply_arm && dir == CsilServiceDirection::Unidirectional {
+                CsilTypeExpression::Choice(vec![
+                    CsilTypeExpression::Reference("Pong".to_string()),
+                    CsilTypeExpression::Reference("Oops".to_string()),
+                ])
+            } else {
+                CsilTypeExpression::Reference("Pong".to_string())
+            },
             direction: dir,
             position: pos(),
             doc_comments: Vec::new(),
@@ -5125,7 +5405,11 @@ System.Console.WriteLine("ok");
         options.insert("package_name".to_string(), serde_json::json!("EchoSdk"));
         WasmGeneratorInput {
             csil_spec: CsilSpecSerialized {
-                rules: vec![ping, pong, svc],
+                rules: if reply_arm {
+                    vec![ping, pong, oops, svc]
+                } else {
+                    vec![ping, pong, svc]
+                },
                 source_content: None,
                 service_count: 1,
                 fields_with_metadata_count: 0,
@@ -5190,7 +5474,23 @@ System.Console.WriteLine("ok");
         assert!(rpc.contains("new RpcRequest(service, op, request).Encode()"));
         assert!(rpc.contains("RpcResponse.Decode(body)"));
         assert!(rpc.contains("resp.AsTransportError() is StatusException"));
-        assert!(rpc.contains("Codec.ResolveRpcReply(service, op, resp.Variant, resp.Payload)"));
+        // Without a multi-arm op the carrier hands the payload on and never resolves arms.
+        assert!(rpc.contains("        return resp.Payload;\n"));
+        assert!(!rpc.contains("ResolveRpcReply"));
+        assert!(!rpc.contains("CallReply"));
+        let arms = render(transports_input_with("csharp-client", true)).expect("generation ok");
+        let arm_rpc = section(
+            file_content(&arms, "genquickstart.md"),
+            "## CSIL-RPC (HTTP)",
+        )
+        .to_string();
+        assert!(
+            arm_rpc.contains(
+                "public CsilWireReply CallReply(string service, string op, byte[] request)"
+            )
+        );
+        assert!(arm_rpc.contains("return new CsilWireReply(resp.Variant, resp.Payload);"));
+        assert!(!arm_rpc.contains("ResolveRpcReply"));
         assert!(rpc.contains("new EchoClient(new HttpRpcCarrier("));
         assert!(rpc.contains("client.Ping(new Ping { Msg = \"example\" })"));
 
@@ -5351,7 +5651,7 @@ System.Console.WriteLine("ok");
         // Wire strings are the verbatim CSIL service and op names; round-trip through
         // the generated codec rather than a host-supplied serializer.
         assert!(client.contains(
-            "public Task SubmitTask(SubmitTaskRequest submitTaskRequest) =>\n        Codec.Decode<Task>(transport.Call(\"CorndogsService\", \"submit-task\", Codec.Encode(submitTaskRequest)));"
+            "public Task SubmitTask(SubmitTaskRequest submitTaskRequest)\n    {\n        var reply = transport.CallReply(\"CorndogsService\", \"submit-task\", Codec.Encode(submitTaskRequest));\n        return Codec.Decode<Task>(Codec.ResolveRpcReply(\"CorndogsService\", \"submit-task\", reply.Variant, reply.Payload));\n    }"
         ));
     }
 
@@ -5542,7 +5842,7 @@ System.Console.WriteLine("ok");
             twin.contains("public sealed class CorndogsAsyncClient(ICsilAsyncTransport transport)")
         );
         assert!(twin.contains(
-            "public async System.Threading.Tasks.Task<Task> SubmitTaskAsync(SubmitTaskRequest submitTaskRequest) =>\n        Codec.Decode<Task>(await transport.Call(\"CorndogsService\", \"submit-task\", Codec.Encode(submitTaskRequest)));"
+            "public async System.Threading.Tasks.Task<Task> SubmitTaskAsync(SubmitTaskRequest submitTaskRequest)\n    {\n        var reply = await transport.CallReply(\"CorndogsService\", \"submit-task\", Codec.Encode(submitTaskRequest));\n        return Codec.Decode<Task>(Codec.ResolveRpcReply(\"CorndogsService\", \"submit-task\", reply.Variant, reply.Payload));\n    }"
         ));
         // The shared exception is NOT redefined in the twin (the sync file owns it).
         assert!(!twin.contains("class CsilClientException"));
@@ -5550,7 +5850,7 @@ System.Console.WriteLine("ok");
         // The sync client is untouched: blocking, canonical names, no Task/await.
         let sync = file_content(&output, "Client.gen.cs");
         assert!(sync.contains("public sealed class CorndogsClient(ICsilTransport transport)"));
-        assert!(sync.contains("public Task SubmitTask(SubmitTaskRequest submitTaskRequest) =>"));
+        assert!(sync.contains("public Task SubmitTask(SubmitTaskRequest submitTaskRequest)\n"));
         assert!(!sync.contains("await "));
         assert!(!sync.contains("System.Threading.Tasks.Task<"));
         assert!(sync.contains("class CsilClientException"));
@@ -5580,7 +5880,7 @@ System.Console.WriteLine("ok");
         ));
         assert!(client.contains("public sealed class CorndogsClient(ICsilTransport transport)"));
         assert!(client.contains(
-            "public async System.Threading.Tasks.Task<Task> SubmitTask(SubmitTaskRequest submitTaskRequest) =>\n        Codec.Decode<Task>(await transport.Call(\"CorndogsService\", \"submit-task\", Codec.Encode(submitTaskRequest)));"
+            "public async System.Threading.Tasks.Task<Task> SubmitTask(SubmitTaskRequest submitTaskRequest)\n    {\n        var reply = await transport.CallReply(\"CorndogsService\", \"submit-task\", Codec.Encode(submitTaskRequest));\n        return Codec.Decode<Task>(Codec.ResolveRpcReply(\"CorndogsService\", \"submit-task\", reply.Variant, reply.Payload));\n    }"
         ));
         // A standalone drop-in still defines the shared exception.
         assert!(client.contains("class CsilClientException"));
@@ -6538,7 +6838,208 @@ System.Console.WriteLine("ok");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    fn moment_input(at: CsilTypeExpression) -> WasmGeneratorInput {
+        let mut input = enum_audit_input("csharp");
+        input.csil_spec.rules = vec![CsilRule {
+            name: "Moment".to_string(),
+            rule_type: CsilRuleType::GroupDef(CsilGroupExpression {
+                entries: vec![bare_entry("at", at)],
+            }),
+            position: CsilPosition {
+                line: 1,
+                column: 1,
+                offset: 0,
+            },
+            doc_comments: Vec::new(),
+        }];
+        input
+    }
+
+    #[test]
+    fn cddl_time_is_a_datetimeoffset_with_a_tag_1_codec() {
+        let output = render(moment_input(CsilTypeExpression::Constrained {
+            base_type: Box::new(CsilTypeExpression::Builtin("cddl_time".to_string())),
+            constraints: vec![CsilControlOperator::GreaterEqual(CsilLiteralValue::Text(
+                "2000-01-01T00:00:00Z".to_string(),
+            ))],
+        }))
+        .expect("generation ok");
+        let codec = file_content(&output, "Codec.gen.cs");
+        assert!(codec.contains("Cbor.EncCddlTime("), "{codec}");
+        assert!(codec.contains("Cbor.AsCddlTime("), "{codec}");
+        assert!(codec.contains("public static System.DateTimeOffset AsCddlTime(CborValue v)"));
+        assert!(codec.contains("UInt16BitsToHalf"), "half floats decode");
+        assert!(
+            !codec.contains("EncTimestamp("),
+            "timestamp helpers stay out"
+        );
+        let all: String = output.files.iter().map(|f| f.content.as_str()).collect();
+        assert!(all.contains("System.DateTimeOffset At"), "{all}");
+        // A bound on a cddl_time compares instants, as it does on a timestamp.
+        assert!(all.contains("System.DateTimeOffset.Parse(\"2000-01-01T00:00:00Z\")"));
+    }
+
+    /// The tag-1 codec, run under .NET against the shared epoch vectors with the
+    /// fixture's own peer. Skips without dotnet.
+    #[test]
+    fn cddl_time_codec_passes_epoch_vectors_under_dotnet() {
+        let output = render(moment_input(CsilTypeExpression::Builtin(
+            "cddl_time".to_string(),
+        )))
+        .expect("generation ok");
+        if !have_dotnet() {
+            eprintln!("skipping: no dotnet toolchain on PATH");
+            return;
+        }
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/interop/epoch-vectors");
+        let dir = std::env::temp_dir().join(format!("csilgen-csharp-epoch-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for file in &output.files {
+            if file.path.ends_with(".cs") {
+                std::fs::write(dir.join(&file.path), &file.content).unwrap();
+            }
+        }
+        std::fs::copy(fixture.join("Peer.cs"), dir.join("Peer.cs")).unwrap();
+        std::fs::write(dir.join("roundtrip.csproj"), CSHARP_CSPROJ).unwrap();
+        let mut cmd = std::process::Command::new("dotnet");
+        cmd.arg("run")
+            .arg("--project")
+            .arg(&dir)
+            .arg("--")
+            .arg(fixture.join("vectors.tsv"))
+            .current_dir(&dir)
+            .env("DOTNET_NOLOGO", "1")
+            .env("DOTNET_CLI_TELEMETRY_OPTOUT", "1")
+            .env("DOTNET_SKIP_FIRST_TIME_EXPERIENCE", "1")
+            .env("NUGET_PACKAGES", dir.join(".nuget"));
+        if let Ok(home) = std::env::var("DOTNET_CLI_HOME") {
+            cmd.env("DOTNET_CLI_HOME", home);
+        }
+        let run = cmd.output().unwrap();
+        let stdout = String::from_utf8_lossy(&run.stdout);
+        let stderr = String::from_utf8_lossy(&run.stderr);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            run.status.success() && stdout.contains("csharp epoch vectors:"),
+            "stdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+    }
+
     /// Whether a dotnet toolchain is on PATH (the harness sources it via env.sh).
+    /// The strict timestamp codec, run under .NET: accepted forms re-encode to the
+    /// contract's canonical text (a 7-digit tick value as 9 digits), digits 8 and 9 must be
+    /// zero, and every lenient or forbidden form is refused. Skips without dotnet.
+    #[test]
+    fn timestamp_codec_is_strict_under_dotnet() {
+        let mut input = enum_audit_input("csharp");
+        input.csil_spec.rules = vec![CsilRule {
+            name: "Stamp".to_string(),
+            rule_type: CsilRuleType::GroupDef(CsilGroupExpression {
+                entries: vec![bare_entry(
+                    "at",
+                    CsilTypeExpression::Builtin("timestamp".to_string()),
+                )],
+            }),
+            position: CsilPosition {
+                line: 1,
+                column: 1,
+                offset: 0,
+            },
+            doc_comments: Vec::new(),
+        }];
+        let output = render(input).expect("generation ok");
+        let codec = file_content(&output, "Codec.gen.cs");
+        assert!(!codec.contains("DateTimeOffset.Parse"), "no lenient parser");
+        assert!(!codec.contains("FFFFFFF"), "no culture format string");
+        if !have_dotnet() {
+            eprintln!("skipping: no dotnet toolchain on PATH");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("csilgen-csharp-ts-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for file in &output.files {
+            if file.path.ends_with(".cs") {
+                std::fs::write(dir.join(&file.path), &file.content).unwrap();
+            }
+        }
+        std::fs::write(dir.join("Program.cs"), CSHARP_TIMESTAMP_DRIVER).unwrap();
+        std::fs::write(dir.join("roundtrip.csproj"), CSHARP_CSPROJ).unwrap();
+        let run = run_dotnet(&dir, "run");
+        let stdout = String::from_utf8_lossy(&run.stdout);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            run.status.success() && stdout.trim().ends_with("ok"),
+            "{stdout}{}",
+            String::from_utf8_lossy(&run.stderr)
+        );
+    }
+
+    const CSHARP_TIMESTAMP_DRIVER: &str = r#"using Csilgen.Transport;
+
+internal static class Program
+{
+    private static string Round(string text) =>
+        ((CborValue.Text)((CborValue.Tag)Cbor.EncTimestamp(Cbor.AsTimestamp(new CborValue.Tag(0, new CborValue.Text(text))))).Inner).Value;
+
+    private static void Main()
+    {
+        // A culture with other digits and separators must not change the wire text.
+        System.Globalization.CultureInfo.CurrentCulture = new System.Globalization.CultureInfo("ar-SA");
+        string[][] ok =
+        {
+            new[] { "2000-02-29T12:00:00Z", "2000-02-29T12:00:00Z" },
+            new[] { "2000-02-29t12:00:00.5z", "2000-02-29T12:00:00.500Z" },
+            new[] { "2000-02-29T12:00:00.0005Z", "2000-02-29T12:00:00.000500Z" },
+            new[] { "2000-02-29T12:00:00.1234567Z", "2000-02-29T12:00:00.123456700Z" },
+            new[] { "2000-02-29T12:00:00.123456700Z", "2000-02-29T12:00:00.123456700Z" },
+            new[] { "2000-02-29T13:30:00+01:30", "2000-02-29T12:00:00Z" },
+            new[] { "2000-03-01T00:30:00+23:59", "2000-02-29T00:31:00Z" },
+            new[] { "0001-01-01T00:30:00+00:30", "0001-01-01T00:00:00Z" },
+            new[] { "9999-12-31T23:59:59.9999999Z", "9999-12-31T23:59:59.999999900Z" },
+        };
+        foreach (var row in ok)
+        {
+            var got = Round(row[0]);
+            if (got != row[1]) { System.Console.WriteLine($"FAIL {row[0]} -> {got}"); return; }
+        }
+        string[] bad =
+        {
+            "2000-02-29T12:00:00.000000001Z", "2000-02-29T12:00:00.12345678Z",
+            "2000-02-29 12:00:00Z", "2000-02-29T12:00:00", "2001-02-29T12:00:00Z",
+            "2000-02-29T24:00:00Z", "2000-02-29T12:00:60Z", "2000-02-29T12:00:00.Z",
+            "2000-02-29T12:00:00.1234567890Z", "2000-02-29T12:00:00,5Z", "2000-02-29T12:00:00+0100",
+            "2000-02-29T12:00:00+24:00", "2000-02-29T12:00:00+01:60", "0000-12-31T23:00:00-02:00",
+            "0001-01-01T00:00:00+00:01", "9999-12-31T23:59:59-00:01", "2000-02-29T12:00:00Z ",
+            "２000-02-29T12:00:00Z", "+2000-02-29T12:00:00Z",
+        };
+        foreach (var text in bad)
+        {
+            try
+            {
+                Cbor.AsTimestamp(new CborValue.Tag(0, new CborValue.Text(text)));
+                System.Console.WriteLine($"FAIL accepted {text}");
+                return;
+            }
+            catch (CborException) { }
+        }
+        foreach (var v in new CborValue[] { new CborValue.Text("2000-02-29T12:00:00Z"), new CborValue.Tag(1, new CborValue.Text("2000-02-29T12:00:00Z")), new CborValue.Tag(0, new CborValue.Uint(0)) })
+        {
+            try
+            {
+                Cbor.AsTimestamp(v);
+                System.Console.WriteLine($"FAIL accepted {v}");
+                return;
+            }
+            catch (CborException) { }
+        }
+        System.Console.WriteLine("ok");
+    }
+}
+"#;
+
     fn have_dotnet() -> bool {
         std::process::Command::new("dotnet")
             .arg("--version")
@@ -6576,12 +7077,12 @@ System.Console.WriteLine("ok");
 
     /// Stage a transports package (minus its own `.csproj` and the markdown README) into a
     /// fresh temp dir alongside a project referencing the real transport library.
-    fn stage_transports_package(
+    fn stage_transports_input(
         label: &str,
-        target: &str,
+        input: WasmGeneratorInput,
         output_type: &str,
     ) -> std::path::PathBuf {
-        let output = render(transports_input(target)).expect("generation ok");
+        let output = render(input).expect("generation ok");
         let dir = std::env::temp_dir().join(format!("csilgen-cs-{label}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -6639,32 +7140,37 @@ System.Console.WriteLine("ok");
             eprintln!("skipping: no dotnet toolchain on PATH");
             return;
         }
-        // The package a user publishes: the base `csharp` target in package mode.
-        let output = render(transports_input("csharp")).expect("generation ok");
-        let readme = file_content(&output, "genquickstart.md").to_string();
-        let rpc = section_block(&readme, "## CSIL-RPC (HTTP)");
-        let events = section_block(&readme, "## CSIL-Events (TLS)");
-        // Swap the real UDP carrier for a seeded loopback (sockets are killed in the sandbox;
-        // the lib loopback exercises the same send/recv codec path in-process).
-        let datagrams = section_block(&readme, "## CSIL-Datagrams (UDP)").replace(
-            "IDatagramCarrier carrier = OpenUdpCarrier(\"localhost\", 9000);",
-            "IDatagramCarrier carrier = Seed.Make();",
-        );
+        // The package a user publishes: the base `csharp` target in package mode. The
+        // reply-arm spec makes `CallReply` a required seam member the carrier must implement.
+        for reply_arm in [false, true] {
+            let output = render(transports_input_with("csharp", reply_arm)).expect("generation ok");
+            let readme = file_content(&output, "genquickstart.md").to_string();
+            let rpc = section_block(&readme, "## CSIL-RPC (HTTP)");
+            let events = section_block(&readme, "## CSIL-Events (TLS)");
+            // Swap the real UDP carrier for a seeded loopback (sockets are killed in the sandbox;
+            // the lib loopback exercises the same send/recv codec path in-process).
+            let datagrams = section_block(&readme, "## CSIL-Datagrams (UDP)").replace(
+                "IDatagramCarrier carrier = OpenUdpCarrier(\"localhost\", 9000);",
+                "IDatagramCarrier carrier = Seed.Make();",
+            );
 
-        let dir = stage_transports_package("all", "csharp", "Exe");
-        std::fs::write(dir.join("Rpc.cs"), &rpc).unwrap();
-        std::fs::write(dir.join("Events.cs"), &events).unwrap();
-        std::fs::write(dir.join("Datagrams.cs"), &datagrams).unwrap();
-        std::fs::write(dir.join("Program.cs"), CSHARP_ALL_SECTIONS_DRIVER).unwrap();
+            let label = if reply_arm { "all-reply" } else { "all" };
+            let dir =
+                stage_transports_input(label, transports_input_with("csharp", reply_arm), "Exe");
+            std::fs::write(dir.join("Rpc.cs"), &rpc).unwrap();
+            std::fs::write(dir.join("Events.cs"), &events).unwrap();
+            std::fs::write(dir.join("Datagrams.cs"), &datagrams).unwrap();
+            std::fs::write(dir.join("Program.cs"), CSHARP_ALL_SECTIONS_DRIVER).unwrap();
 
-        let run = run_dotnet(&dir, "run");
-        let stdout = String::from_utf8_lossy(&run.stdout);
-        let stderr = String::from_utf8_lossy(&run.stderr);
-        assert!(
-            run.status.success() && stdout.contains("late response") && stdout.contains("ok"),
-            "dotnet run of the combined genquickstart sections failed:\nstdout:\n{stdout}\nstderr:\n{stderr}"
-        );
-        let _ = std::fs::remove_dir_all(&dir);
+            let run = run_dotnet(&dir, "run");
+            let stdout = String::from_utf8_lossy(&run.stdout);
+            let stderr = String::from_utf8_lossy(&run.stderr);
+            assert!(
+                run.status.success() && stdout.contains("late response") && stdout.contains("ok"),
+                "dotnet run of the combined genquickstart sections failed:\nstdout:\n{stdout}\nstderr:\n{stderr}"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 
     /// Drives the combined single-package check: an in-process `HttpMessageHandler` echoes the
@@ -6746,14 +7252,17 @@ internal static class Program
 // encode across the transport boundary.
 internal sealed class Loopback : ICsilTransport
 {
-    public byte[] Call(string service, string op, byte[] request)
+    public byte[] Call(string service, string op, byte[] request) =>
+        throw new System.Exception("a multi-arm op must use CallReply");
+
+    public CsilWireReply CallReply(string service, string op, byte[] request)
     {
         if (service != "CorndogsService" || op != "submit-task")
         {
             throw new System.Exception($"unexpected route {service}/{op}");
         }
         var req = Codec.Decode<SubmitTaskRequest>(request);
-        return Codec.Encode(req.Task);
+        return new CsilWireReply("Task", Codec.Encode(req.Task));
     }
 }
 
@@ -6821,14 +7330,17 @@ internal static class Program
 // but satisfies the async transport interface by returning a completed Task.
 internal sealed class AsyncLoopback : ICsilAsyncTransport
 {
-    public System.Threading.Tasks.Task<byte[]> Call(string service, string op, byte[] request)
+    public System.Threading.Tasks.Task<byte[]> Call(string service, string op, byte[] request) =>
+        throw new System.Exception("a multi-arm op must use CallReply");
+
+    public System.Threading.Tasks.Task<CsilWireReply> CallReply(string service, string op, byte[] request)
     {
         if (service != "CorndogsService" || op != "submit-task")
         {
             throw new System.Exception($"unexpected route {service}/{op}");
         }
         var req = Codec.Decode<SubmitTaskRequest>(request);
-        return System.Threading.Tasks.Task.FromResult(Codec.Encode(req.Task));
+        return System.Threading.Tasks.Task.FromResult(new CsilWireReply("Task", Codec.Encode(req.Task)));
     }
 }
 
@@ -6870,6 +7382,14 @@ internal static class Program
         var sync = new CorndogsClient(new SyncLoopback());
         var syncResp = sync.SubmitTask(req);
         Check(syncResp.Uuid == "u-123", "sync client uuid");
+        try
+        {
+            sync.SubmitTask(new SubmitTaskRequest { Task = req.Task, Queue = "none", Counts = req.Counts, TasksById = req.TasksById });
+            Check(false, "missing reply variant accepted");
+        }
+        catch (CborException)
+        {
+        }
 
         System.Console.WriteLine("ok");
     }
@@ -6877,10 +7397,15 @@ internal static class Program
 
 internal sealed class SyncLoopback : ICsilTransport
 {
-    public byte[] Call(string service, string op, byte[] request)
+    public byte[] Call(string service, string op, byte[] request) =>
+        throw new System.Exception("a multi-arm op must use CallReply");
+
+    public CsilWireReply CallReply(string service, string op, byte[] request)
     {
         var req = Codec.Decode<SubmitTaskRequest>(request);
-        return Codec.Encode(req.Task);
+        // A reply without a variant cannot select an arm.
+        if (req.Queue == "none") return new CsilWireReply(null, Codec.Encode(req.Task));
+        return new CsilWireReply("Task", Codec.Encode(req.Task));
     }
 }
 "#;

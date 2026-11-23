@@ -317,14 +317,20 @@ fn test_client_target() {
     // Request is encoded to bytes, the reply decoded from bytes; the wire service and
     // op strings are the CSIL names verbatim (csil-rpc-transport.md §1.1). The call
     // overflows 98 cols flat, so mix breaks each argument onto its own line.
+    // The ServiceError arm makes this a multi-arm reply, so the variant travels
+    // through `call_reply/4` and the generated resolver picks the arm.
     assert!(client.contains(concat!(
-        "      Csilgen.Generated.Transport.call(\n",
+        "    {variant, payload} =\n",
+        "      Csilgen.Generated.Transport.call_reply(\n",
         "        transport,\n",
         "        \"Attestation\",\n",
         "        \"deposit-claim\",\n",
         "        Csilgen.Generated.DepositClaimRequest.to_cbor(req)\n",
-        "      )"
-    )));
+        "      )\n\n",
+        "    resp =\n",
+        "      Csilgen.Generated.Cbor.resolve_rpc_reply(\"Attestation\", \"deposit-claim\", variant, payload)\n"
+    )), "{client}");
+    assert!(client.contains("  @callback call_reply(t(), service :: String.t()"));
     assert!(client.contains("Csilgen.Generated.DepositClaimResponse.from_cbor(resp)"));
     // The codec rides alongside; per-struct to_cbor/from_cbor are emitted.
     let codec = file(&out, "codec.gen.ex");
@@ -738,6 +744,10 @@ fn test_type_mapping() {
     );
     assert_eq!(
         map_type(&CsilTypeExpression::Builtin("timestamp".into()), &cfg),
+        "DateTime.t()"
+    );
+    assert_eq!(
+        map_type(&CsilTypeExpression::Builtin("cddl_time".into()), &cfg),
         "DateTime.t()"
     );
     assert_eq!(
@@ -2181,15 +2191,25 @@ defmodule EchoRpc do
   defstruct []
 
   @impl true
-  def call(%__MODULE__{}, service, op, req) when is_binary(req) do
+  def call(%__MODULE__{}, service, op, req) when is_binary(req),
+    do: round_trip(service, op, req).payload
+
+  # get-user has a ServiceError arm, so the typed client asks for the variant.
+  @impl true
+  def call_reply(%__MODULE__{}, service, op, req) when is_binary(req) do
+    resp = round_trip(service, op, req)
+    {resp.variant, resp.payload}
+  end
+
+  defp round_trip(service, op, req) do
     # Build and parse the request through the library envelope the emitted carrier uses,
     # then echo the request payload back as an ok response the typed client decodes.
     envelope = RPC.encode_request(RPC.new_request(service, op, req))
     {:ok, dreq} = RPC.decode_request(envelope)
-    body = RPC.encode_response(RPC.new_response_ok("User", dreq.payload))
+    body = RPC.encode_response(RPC.new_response_ok("user", dreq.payload))
     {:ok, resp} = RPC.decode_response(body)
     :ok = RPC.as_transport_error(resp)
-    resp.payload
+    resp
   end
 end
 
@@ -2255,7 +2275,11 @@ fn genquickstart_rpc_section_uses_lib_envelope_over_http() {
     // The carrier implements the generated transport seam (the behaviour).
     assert!(body.contains("defmodule CsilRpcHttpCarrier do"));
     assert!(body.contains("@behaviour Csilgen.Generated.Transport"));
-    assert!(body.contains("def call(%__MODULE__{rpc_url: url}, service, op, req)"));
+    assert!(body.contains("def call(%__MODULE__{} = carrier, service, op, req)"));
+    // The spec has a ServiceError arm, so the carrier also returns the variant.
+    assert!(body.contains("def call_reply(%__MODULE__{} = carrier, service, op, req)"));
+    assert!(body.contains("{resp.variant, resp.payload}"));
+    assert!(!body.contains("resolve_rpc_reply"));
 
     // The envelope is the library's RPC request/response — never hand-rolled.
     assert!(body.contains("alias Csilgen.Transport.RPC"));
@@ -2270,9 +2294,6 @@ fn genquickstart_rpc_section_uses_lib_envelope_over_http() {
     assert!(body.contains("POST #{path} HTTP/1.1"));
     assert!(!body.contains(":httpc"));
     assert!(!body.contains(":inets"));
-
-    // The typed ServiceError application arm is handled distinctly.
-    assert!(body.contains("Cbor.resolve_rpc_reply(service, op, resp.variant, resp.payload)"));
 
     // Client construction over the carrier + the first unary call with a generated
     // sample struct literal (required fields only, struct field atoms).
@@ -2616,9 +2637,12 @@ defmodule Loopback do
   @moduledoc "A byte-loopback transport: decode the request, re-encode its task."
   defstruct []
 
-  def call(%Loopback{}, _service, _op, req_bytes) do
+  def call(%Loopback{}, _service, _op, _req_bytes),
+    do: raise("submit-task has two reply arms, so it must use call_reply")
+
+  def call_reply(%Loopback{}, _service, _op, req_bytes) do
     req = Csilgen.Generated.SubmitTaskRequest.from_cbor(req_bytes)
-    Csilgen.Generated.Task.to_cbor(req.task)
+    {"Task", Csilgen.Generated.Task.to_cbor(req.task)}
   end
 end
 
@@ -2674,3 +2698,220 @@ true = result.priority == 7
 
 IO.puts("ok")
 "#;
+
+/// `DateTime.from_iso8601` accepts a space separator and a comma fraction, so the
+/// timestamp codec must check the wire shape itself and refuse what it cannot hold.
+#[test]
+fn timestamp_codec_is_strict_and_canonical() {
+    let out = process_generation(group_input(
+        "Stamp",
+        vec![bare_entry(
+            "at",
+            CsilTypeExpression::Builtin("timestamp".into()),
+        )],
+        HashMap::new(),
+    ))
+    .unwrap();
+    let types = file(&out, "types.gen.ex");
+    assert!(
+        types.contains("Csilgen.Generated.Cbor.enc_timestamp(v.at)"),
+        "{types}"
+    );
+    assert!(
+        types.contains("Csilgen.Generated.Cbor.as_timestamp("),
+        "{types}"
+    );
+    let codec = file(&out, "codec.gen.ex");
+    assert!(!codec.contains("DateTime.from_iso8601("));
+    assert!(codec.contains("timestamp fraction exceeds microseconds"));
+
+    let have = std::process::Command::new("elixir")
+        .arg("--version")
+        .output()
+        .is_ok();
+    if !have {
+        eprintln!("skipping: no elixir on PATH");
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("csilgen-elixir-ts-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    for f in &out.files {
+        std::fs::write(dir.join(&f.path), &f.content).unwrap();
+    }
+    std::fs::write(dir.join("driver.exs"), TIMESTAMP_DRIVER_ELIXIR).unwrap();
+    let run = std::process::Command::new("elixir")
+        .arg(dir.join("driver.exs"))
+        .output()
+        .unwrap();
+    assert!(
+        run.status.success(),
+        "elixir timestamp check failed:\n{}{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&run.stdout).trim(), "ok");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+const TIMESTAMP_DRIVER_ELIXIR: &str = r#"Code.require_file("codec.gen.ex", __DIR__)
+Code.require_file("types.gen.ex", __DIR__)
+
+alias Csilgen.Generated.{Cbor, Stamp}
+
+round = fn text ->
+  stamp = Stamp.from_cbor_value({:map, [{{:text, "at"}, {:tag, 0, {:text, text}}}]})
+  {:tag, 0, {:text, out}} = Cbor.enc_timestamp(stamp.at)
+  out
+end
+
+"2000-02-29T12:00:00.500Z" = round.("2000-02-29T13:30:00.5+01:30")
+"2000-02-29T12:00:00.000500Z" = round.("2000-02-29t12:00:00.000500z")
+"2000-02-29T12:00:00Z" = round.("2000-02-29T12:00:00.000Z")
+
+for bad <- [
+      "2000-02-29 12:00:00Z",
+      "2000-02-29T23:59:60Z",
+      "2001-02-29T12:00:00Z",
+      "2000-02-29T12:00:00,5Z",
+      "2000-02-29T12:00:00.000000001Z",
+      "2000-02-29T12:00:00",
+      "0001-01-01T00:30:00+01:00"
+    ] do
+  try do
+    Cbor.as_timestamp({:tag, 0, {:text, bad}})
+    raise "accepted #{bad}"
+  rescue
+    e in RuntimeError -> reraise e, __STACKTRACE__
+    _ -> :ok
+  end
+end
+
+IO.puts("ok")
+"#;
+
+/// `cddl_time` shares `timestamp`'s `DateTime` but rides as tag-1 epoch seconds with
+/// the contract's six-digit rounding.
+#[test]
+fn cddl_time_codec_is_tag_one_epoch_seconds() {
+    let out = process_generation(group_input(
+        "Moment",
+        vec![bare_entry(
+            "at",
+            CsilTypeExpression::Builtin("cddl_time".into()),
+        )],
+        HashMap::new(),
+    ))
+    .unwrap();
+    let types = file(&out, "types.gen.ex");
+    assert!(
+        types.contains("Csilgen.Generated.Cbor.enc_cddl_time(v.at)"),
+        "{types}"
+    );
+    assert!(
+        types.contains("Csilgen.Generated.Cbor.as_cddl_time("),
+        "{types}"
+    );
+    assert!(types.contains("at: DateTime.t()"), "{types}");
+
+    let have = std::process::Command::new("elixir")
+        .arg("--version")
+        .output()
+        .is_ok();
+    if !have {
+        eprintln!("skipping: no elixir on PATH");
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("csilgen-elixir-cddl-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    for f in &out.files {
+        std::fs::write(dir.join(&f.path), &f.content).unwrap();
+    }
+    std::fs::write(dir.join("driver.exs"), CDDL_TIME_DRIVER_ELIXIR).unwrap();
+    let run = std::process::Command::new("elixir")
+        .arg(dir.join("driver.exs"))
+        .output()
+        .unwrap();
+    assert!(
+        run.status.success(),
+        "elixir cddl_time check failed:\n{}{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&run.stdout).trim(), "ok");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+const CDDL_TIME_DRIVER_ELIXIR: &str = r##"Code.require_file("codec.gen.ex", __DIR__)
+Code.require_file("types.gen.ex", __DIR__)
+
+alias Csilgen.Generated.{Cbor, Moment}
+
+hexed = fn dt -> Base.encode16(Cbor.encode(Moment.to_cbor_value(struct(Moment, at: dt))), case: :lower) end
+decoded = fn hex -> Moment.from_cbor(Base.decode16!(hex, case: :lower)).at end
+at = fn text ->
+  {:ok, dt, _} = DateTime.from_iso8601(text)
+  dt
+end
+
+"a1626174c11a38bbb4c0" = hexed.(at.("2000-02-29T13:00:00+01:00"))
+"a1626174c1fbbfe0000000000000" = hexed.(at.("1969-12-31T23:59:59.5Z"))
+"a1626174c120" = hexed.(at.("1969-12-31T23:59:59Z"))
+# A binary64 whole-second float re-encodes as the shortest integer.
+true = decoded.("a1626174c1fb41cc5dda60000000") == at.("2000-02-29T12:00:00Z")
+# Half and single precision content widen to binary64.
+true = decoded.("a1626174c1f93c00") == at.("1970-01-01T00:00:01Z")
+true = decoded.("a1626174c1fa3fc00000") == at.("1970-01-01T00:00:01.500Z")
+true = decoded.("a1626174c1fbbfe0000000000000") == at.("1969-12-31T23:59:59.500Z")
+
+for bad <- [
+      # tag 0 text, no tag, tag 2, true, null, text, bytes, array
+      "a1626174c074323030302d30322d32395431323a30303a30305a",
+      "a16261741a38bbb4c0",
+      "a1626174c21a38bbb4c0",
+      "a1626174c1f5",
+      "a1626174c1f6",
+      "a1626174c16131",
+      "a1626174c14131",
+      "a1626174c18101",
+      # half NaN, binary64 infinity, u64 max, most negative nint, one past the end, 1e300
+      "a1626174c1f97e00",
+      "a1626174c1fb7ff0000000000000",
+      "a1626174c11bffffffffffffffff",
+      "a1626174c13bffffffffffffffff",
+      "a1626174c11b0000003afff44180",
+      "a1626174c1fb7e37e43c8800759c"
+    ] do
+  try do
+    decoded.(bad)
+    raise "accepted #{bad}"
+  rescue
+    e in RuntimeError -> if e.message =~ "accepted", do: reraise(e, __STACKTRACE__), else: :ok
+    _ -> :ok
+  end
+end
+
+IO.puts("ok")
+"##;
+
+/// A spec with no multi-arm operation keeps the one-callback seam unchanged.
+#[test]
+fn single_arm_spec_keeps_the_call_only_seam() {
+    let out = process_generation(service_input(
+        "Echo",
+        vec![make_op(
+            "ping",
+            "Ping",
+            CsilTypeExpression::Builtin("text".into()),
+            CsilServiceDirection::Unidirectional,
+            None,
+        )],
+        None,
+        "elixir-client",
+    ))
+    .unwrap();
+    let client = file(&out, "client.gen.ex");
+    assert!(client.contains("@callback call(t()"), "{client}");
+    assert!(!client.contains("call_reply"), "{client}");
+}

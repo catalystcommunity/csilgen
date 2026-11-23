@@ -78,6 +78,7 @@ Scalars = {
   flag: bool,
   due: date,
   when: timestamp,
+  seen: cddl_time,
   amount: decimal,
   ;; mixed-union coverage: a value equal to a literal arm must wire as
   ;; [1,"pending"]; a value with no literal match must wire as [0,...].

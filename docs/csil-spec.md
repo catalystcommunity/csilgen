@@ -172,6 +172,11 @@ Task = {
 }
 ```
 
+Use `cddl_time` only for a peer that sends CBOR tag 1 epoch seconds, for
+example a sensor. It uses the same in-memory type as `timestamp` and the same
+RFC 3339 text bounds. A float on the wire cannot hold all fractions exactly,
+so use `timestamp` when you control both peers.
+
 ### Grammar Overview
 
 ```ebnf

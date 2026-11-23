@@ -36,8 +36,13 @@ LANGUAGES = (
     Language("ocaml", "ocaml", "interop_api", 6397),
     Language("zig", "zig", "interop_api", 6398),
     Language("kotlin", "kotlin", "interop_api", 6399),
+    Language("swift", "swift", "interop_api", 6400),
 )
 TRANSPORTS = ("rpc", "events", "datagrams")
+FIXTURES = ("timestamp-vectors", "epoch-vectors", "typed-replies", "repo-specs")
+# These targets have per-target fixtures but no matrix harness. One shard runs
+# them, so each PR checks them once.
+FIXTURE_ONLY_TARGETS = ("php",)
 
 
 def _run(
@@ -231,6 +236,8 @@ def _build(root: Path, language: Language) -> None:
         _run(("zig", "build"), harness)
     elif language.name == "kotlin":
         _run(("gradle", "--no-daemon", "-q", "installDist"), harness)
+    elif language.name == "swift":
+        _run(("swift", "build", "-c", "release"), harness / "runner")
     else:
         raise RuntimeError(f"No build command is registered for {language.name}")
     print(f"{language.name} harness built", flush=True)
@@ -304,6 +311,9 @@ def _launch(
             harness,
             {},
         )
+    if language.name == "swift":
+        binary = harness / "runner" / ".build" / "release" / "csil-interop-swift"
+        return ((str(binary),), harness, {})
     raise RuntimeError(f"No launch command is registered for {language.name}")
 
 
@@ -443,6 +453,44 @@ def _report(
         raise RuntimeError(f"interop matrix has {total - passed} failing cell(s)")
 
 
+def _fixture_targets(servers: Sequence[Language]) -> Tuple[str, ...]:
+    names = tuple(language.name for language in servers)
+    if LANGUAGES[0] in servers:
+        names += FIXTURE_ONLY_TARGETS
+    return names
+
+
+def _run_fixtures(root: Path, targets: Sequence[str]) -> None:
+    failures: List[str] = []
+    extra = [target for target in targets if target in FIXTURE_ONLY_TARGETS]
+    if extra:
+        args = ["cargo", "build", "--release", "--quiet", "--target", "wasm32-unknown-unknown"]
+        for target in extra:
+            args.extend(("--package", f"csilgen-{target}-generator"))
+        _run(args, root)
+    for fixture in FIXTURES:
+        check = root / "tests" / "interop" / fixture / "check.sh"
+        # A trusted script on main can test an older branch that lacks a fixture.
+        if not check.is_file():
+            print(f"== fixture {fixture}: not in this tree, skipped ==", flush=True)
+            continue
+        for target in targets:
+            print(f"== fixture {fixture} {target} ==", flush=True)
+            try:
+                _run(("bash", check, target), root, timeout=1200)
+            except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
+                failures.append(f"{fixture} {target}: {error}")
+    for failure in failures:
+        print(f"  FAIL {failure}", flush=True)
+    print(
+        f"== fixture summary: {len(failures)} failing of "
+        f"{len(FIXTURES) * len(targets)} runs ==",
+        flush=True,
+    )
+    if failures:
+        raise RuntimeError(f"{len(failures)} fixture run(s) failed")
+
+
 def _select_languages(names: Sequence[str]) -> Tuple[Language, ...]:
     if not names:
         return LANGUAGES
@@ -518,6 +566,7 @@ def run(
                 process.kill()
                 process.wait()
     _report(clients, servers, transports, results)
+    _run_fixtures(root, _fixture_targets(servers))
 
 
 def _split_values(value: str) -> Tuple[str, ...]:

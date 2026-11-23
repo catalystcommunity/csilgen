@@ -1,6 +1,7 @@
 <?php
 namespace Csilgen\Generated;
 
+require getenv('CSILGEN_ROOT') . '/transports/php/src/Errors.php';
 require getenv('CSILGEN_ROOT') . '/transports/php/src/CBOR.php';
 require 'types.php';
 require 'codec.php';
@@ -21,16 +22,30 @@ class Handler implements RpHandler
     }
 }
 
-class Carrier
+/** A fake transport: the generated client must pick the reply arm from the
+ * variant this seam returns, with no help from the resolver. */
+class Carrier implements CsilReplyTransport
 {
     public function call($service, $op, $payload)
     {
-        if (Codec::decodeReq($payload)->a === 'unknown') {
+        throw new \LogicException('multi-arm ops must use callReply');
+    }
+
+    public function callReply($service, $op, $payload)
+    {
+        $a = Codec::decodeReq($payload)->a;
+        if ($a === 'unknown') {
             throw new \RuntimeException('unknown operation', 2);
+        }
+        if ($a === 'other') {
+            return ['variant' => 'Other', 'payload' => Codec::encodeResp(new Resp(['b' => 'other']))];
+        }
+        if ($a === 'none') {
+            return ['variant' => null, 'payload' => Codec::encodeResp(new Resp(['b' => 'none']))];
         }
         $reply = (new RpRouter(new Handler()))->dispatch($op, $payload);
         if ($reply['variant'] === 'RpError') assert(ord($reply['payload'][6]) === 7);
-        return Codec::resolveRpcReply($service, $op, $reply['variant'], $reply['payload']);
+        return $reply;
     }
 }
 
@@ -48,3 +63,12 @@ try {
 } catch (\RuntimeException $e) {
     assert($e->getCode() === 2);
 }
+foreach (['other', 'none'] as $bad) {
+    try {
+        $client->decryptToken(new Req(['a' => $bad]));
+        throw new \LogicException("accepted reply with $bad variant");
+    } catch (CodecException $e) {
+        // An unknown or missing variant is a decode error.
+    }
+}
+echo "typed replies pass\n";

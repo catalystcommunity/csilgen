@@ -456,7 +456,11 @@ fn readme(spec: &CsilSpecSerialized, pkg: &str, transports: (bool, bool, bool)) 
     let unary = first_unary_example(spec);
     let channel = first_channel_example(spec);
     if rpc {
-        out.push_str(&rpc_section(&root, unary.as_ref()));
+        out.push_str(&rpc_section(
+            &root,
+            unary.as_ref(),
+            spec.rpc_operations().next().is_some(),
+        ));
     }
     if events {
         out.push_str(&events_section(&root, channel.as_ref()));
@@ -535,7 +539,7 @@ fn first_unary_example(spec: &CsilSpecSerialized) -> Option<UnaryExample> {
 /// library. The typed client decodes the success payload; a non-zero transport status
 /// (`Rpc.as_transport_error`) and the `ServiceError` application arm are surfaced
 /// distinctly.
-fn rpc_section(root: &str, ex: Option<&UnaryExample>) -> String {
+fn rpc_section(root: &str, ex: Option<&UnaryExample>, multi_arm: bool) -> String {
     let mut out = String::from("## CSIL-RPC (HTTP)\n\n");
     out.push_str(
         "Request/response. The library owns the envelope (`Rpc.encode_request`/\n\
@@ -543,6 +547,13 @@ fn rpc_section(root: &str, ex: Option<&UnaryExample>) -> String {
          HTTP carrier below is just one example — swap it for any HTTP client (it\n\
          implements the generated `Client` byte seam).\n\n",
     );
+    if multi_arm {
+        out.push_str(
+            "Some operations here have more than one reply arm, so the carrier also supplies\n\
+             `call_reply`, which returns the envelope `variant` with the payload. The generated\n\
+             client uses it to return the success value or the typed error arm.\n\n",
+        );
+    }
     let Some(ex) = ex else {
         out.push_str(
             "This package declares no `->` operations, so there is no RPC call to make.\n\n",
@@ -552,6 +563,11 @@ fn rpc_section(root: &str, ex: Option<&UnaryExample>) -> String {
     out.push_str("```ocaml\n");
     out.push_str(&format!("open {root}\nopen Csilgen_transport\n\n"));
     out.push_str(RPC_CARRIER_OCAML);
+    out.push_str(if multi_arm {
+        RPC_CARRIER_MAKE_REPLY_OCAML
+    } else {
+        RPC_CARRIER_MAKE_OCAML
+    });
     out.push('\n');
     out.push_str("let () =\n");
     out.push_str("  let client = make_rpc_client \"http://localhost:5080\" in\n");
@@ -634,7 +650,7 @@ fn ocaml_sample(spec: &CsilSpecSerialized, ty: &CsilTypeExpression) -> String {
             "float" => "0.0".to_string(),
             "bytes" | "bstr" => "(Bytes.of_string \"\")".to_string(),
             "date" => "\"1970-01-01\"".to_string(),
-            "timestamp" => "\"1970-01-01T00:00:00Z\"".to_string(),
+            "timestamp" | "cddl_time" => "\"1970-01-01T00:00:00Z\"".to_string(),
             "decimal" => "\"0\"".to_string(),
             "int" | "uint" => "0L".to_string(),
             "nil" | "null" => "()".to_string(),
@@ -709,8 +725,8 @@ let http_post ~(base_url : string) ~(path : string) ~(body : bytes) :
          with End_of_file -> ());
         Ok (status, Buffer.to_bytes buf))
 
-(* The generated client's transport seam. *)
-let csil_rpc_call base_url ~service ~op ~(payload : bytes) : (bytes, string) result =
+(* One CSIL-RPC exchange; a non-zero transport status is an [Error]. *)
+let csil_rpc_exchange base_url ~service ~op ~(payload : bytes) : (Rpc.response, string) result =
   (* Encode the request with the library's RPC envelope (never hand-rolled). *)
   let req = Rpc.new_request service op payload in
   match http_post ~base_url ~path:"/csil/v1/rpc" ~body:(Rpc.encode_request req) with
@@ -724,12 +740,38 @@ let csil_rpc_call base_url ~service ~op ~(payload : bytes) : (bytes, string) res
       (* A non-zero transport status is a transport failure: no typed payload. *)
       match Rpc.as_transport_error resp with
       | Some err -> Error (Conventions.error_message err)
-      | None -> Ok (Codec.resolve_rpc_reply ~service ~op ~variant:resp.Rpc.variant resp.Rpc.payload)))
+      | None -> Ok resp))
 
+(* The generated client's transport seam. *)
+let csil_rpc_call base_url ~service ~op ~(payload : bytes) : (bytes, string) result =
+  Result.map (fun (resp : Rpc.response) -> resp.payload) (csil_rpc_exchange base_url ~service ~op ~payload)
+"#;
+
+/// The rest of the RPC carrier for a spec with no multi-arm reply.
+const RPC_CARRIER_MAKE_OCAML: &str = r#"
 (* Build the typed client over the carrier; change the base URL to your server. *)
 let make_rpc_client base_url =
   Client.make_client ~call:(fun ~service ~op ~payload ->
       csil_rpc_call base_url ~service ~op ~payload)
+"#;
+
+/// The rest of the RPC carrier for a spec with a multi-arm reply: the generated
+/// client needs the envelope variant to pick the reply arm.
+const RPC_CARRIER_MAKE_REPLY_OCAML: &str = r#"
+(* Multi-arm operations use this seam: the client needs the reply variant to pick
+   the success value or the typed error arm. *)
+let csil_rpc_call_reply base_url ~service ~op ~(payload : bytes) :
+    (string option * bytes, string) result =
+  Result.map
+    (fun (resp : Rpc.response) -> (resp.variant, resp.payload))
+    (csil_rpc_exchange base_url ~service ~op ~payload)
+
+(* Build the typed client over the carrier; change the base URL to your server. *)
+let make_rpc_client base_url =
+  Client.make_client
+    ~call:(fun ~service ~op ~payload -> csil_rpc_call base_url ~service ~op ~payload)
+    ~call_reply:(fun ~service ~op ~payload ->
+      csil_rpc_call_reply base_url ~service ~op ~payload)
 "#;
 
 /// CSIL-Events over TLS: a full session example. Opens a TLS byte stream wrapped as the
@@ -1224,8 +1266,9 @@ fn map_type(type_expr: &CsilTypeExpression) -> String {
             "date" => "string".to_string(),
             // CBOR tag 0 RFC3339 text and CBOR tag 4 exact decimal: OCaml's stdlib
             // has neither a datetime nor a decimal type, so both are carried as
-            // their exact wire text and documented at the field.
-            "timestamp" => "string".to_string(),
+            // their exact wire text and documented at the field. `cddl_time` (CBOR
+            // tag 1) is the same instant with another wire form, so it shares the text.
+            "timestamp" | "cddl_time" => "string".to_string(),
             "decimal" => "string".to_string(),
             "nil" | "null" => "unit".to_string(),
             // `any` is an arbitrary CBOR value, carried through the codec's own
@@ -1771,7 +1814,7 @@ fn generate_group_choice(name: &str, groups: &[CsilGroupExpression]) -> String {
 }
 
 /// Field documentation: the `@description` text and a wire-form note for the
-/// core types whose OCaml mapping is lossy text (`timestamp`/`decimal`).
+/// core types whose OCaml mapping is lossy text (`timestamp`/`cddl_time`/`decimal`).
 fn field_doc(entry: &CsilGroupEntry) -> Vec<String> {
     let mut out = Vec::new();
     for meta in &entry.metadata {
@@ -1781,6 +1824,9 @@ fn field_doc(entry: &CsilGroupEntry) -> Vec<String> {
     }
     if type_uses_builtin(&entry.value_type, "timestamp") {
         out.push("wire: CBOR tag 0 RFC3339 UTC timestamp text".to_string());
+    }
+    if type_uses_builtin(&entry.value_type, "cddl_time") {
+        out.push("wire: CBOR tag 1 epoch seconds, held as RFC3339 UTC timestamp text".to_string());
     }
     if type_uses_builtin(&entry.value_type, "decimal") {
         out.push("wire: CBOR tag 4 exact decimal text".to_string());
@@ -2205,7 +2251,8 @@ fn enc_value(
             "bytes" | "bstr" => format!("(Cbor.Bytes {expr})"),
             "bool" => format!("(Cbor.Bool {expr})"),
             "date" => format!("(Cbor.Tag (1004, Cbor.Text (Cbor.calendar_date {expr})))"),
-            "timestamp" => format!("(Cbor.Tag (0, Cbor.Text {expr}))"),
+            "timestamp" => format!("(Cbor.Tag (0, Cbor.Text (Cbor.canonical_timestamp {expr})))"),
+            "cddl_time" => format!("(Cbor.epoch_to_cbor {expr})"),
             "decimal" => format!("(Cbor.decimal_to_cbor {expr})"),
             // `any` is already a `Csil_cbor.t` value, so it passes straight through.
             "any" => expr.to_string(),
@@ -2295,8 +2342,9 @@ fn dec_value(
                 "(match {expr} with Cbor.Tag (1004, Cbor.Text s) -> Cbor.calendar_date s | _ -> failwith \"expected calendar date tag 1004\")"
             ),
             "timestamp" => format!(
-                "(match {expr} with Cbor.Tag (0, Cbor.Text csil_s) -> csil_s | _ -> failwith \"csilgen: bad timestamp\")"
+                "(match {expr} with Cbor.Tag (0, Cbor.Text csil_s) -> Cbor.canonical_timestamp csil_s | _ -> failwith \"csilgen: bad timestamp\")"
             ),
+            "cddl_time" => format!("(Cbor.epoch_of_cbor {expr})"),
             "decimal" => format!("(Cbor.decimal_of_cbor {expr})"),
             // `any` is carried as the codec's own value model: hand it back as-is.
             "any" => expr.to_string(),
@@ -2612,6 +2660,7 @@ fn is_primitive_builtin(name: &str) -> bool {
             | "bool"
             | "date"
             | "timestamp"
+            | "cddl_time"
             | "decimal"
             | "nil"
             | "null"
@@ -2669,7 +2718,11 @@ fn generate_client(spec: &CsilSpecSerialized) -> String {
     if client_uses_types(spec) {
         out.push_str("open Types\n\n");
     }
-    out.push_str(CLIENT_PRELUDE);
+    if spec.rpc_operations().next().is_some() {
+        out.push_str(CLIENT_PRELUDE_REPLY);
+    } else {
+        out.push_str(CLIENT_PRELUDE);
+    }
 
     for rule in &spec.rules {
         if let CsilRuleType::ServiceDef(service) = &rule.rule_type {
@@ -2690,6 +2743,32 @@ type client = {
 }
 
 let make_client ~call = { call }
+
+";
+
+/// The seam for a spec with a multi-arm (`A / B`) reply: the client needs the
+/// envelope variant to pick the arm, which the bytes-only [call] cannot carry. The
+/// field is required whenever emitted and only emitted then, so a spec without such
+/// an op keeps [CLIENT_PRELUDE] unchanged.
+const CLIENT_PRELUDE_REPLY: &str = "\
+(* The transport seam is supplied by the consumer: [call] performs the RPC named
+   by (service, op) over its carrier and returns the raw reply payload, or an
+   error string. The generated client owns serialization (it encodes the typed
+   request and decodes the typed reply via [Codec]); the carrier only moves bytes.
+
+   This spec has operations with more than one reply arm, so the seam also needs
+   [call_reply]: it performs the same RPC and returns the CSIL-RPC response
+   envelope's [variant] (None when absent) with the reply payload. The client
+   picks the arm from the variant: the success arm returns [Ok], a declared error
+   arm returns its [Error] tag, and a missing or unknown variant returns
+   [Error (`Decode _)]. *)
+type client = {
+  call : service:string -> op:string -> payload:bytes -> (bytes, string) result;
+  call_reply :
+    service:string -> op:string -> payload:bytes -> (string option * bytes, string) result;
+}
+
+let make_client ~call ~call_reply = { call; call_reply }
 
 ";
 
@@ -2749,7 +2828,8 @@ fn emit_client_module(
                     format!("(Codec.encode_{stem}_request req)"),
                 )
             };
-            out.push_str(&format!("  let {fn_name} (c : client){param} =\n    try\n      match c.call ~service:{name:?} ~op:{:?} ~payload:{payload} with\n      | Ok bytes -> Ok (Codec.decode_{stem}_success bytes)\n      | Error e -> Error (`Transport e)\n    with\n", op.name));
+            let wire_op = &op.name;
+            out.push_str(&format!("  let {fn_name} (c : client){param} =\n    try\n      match c.call_reply ~service:{name:?} ~op:{wire_op:?} ~payload:{payload} with\n      | Ok (variant, bytes) ->\n        Ok (Codec.decode_{stem}_success (Codec.resolve_rpc_reply ~service:{name:?} ~op:{wire_op:?} ~variant bytes))\n      | Error e -> Error (`Transport e)\n    with\n"));
             for arm in &arms[1..] {
                 let tag = ocaml_module_name(arm.rpc_variant_name().unwrap());
                 out.push_str(&format!(
@@ -3176,6 +3256,16 @@ let decode (b : bytes) : (t, string) result =
       | 20 -> (Bool false, pos + 1)
       | 21 -> (Bool true, pos + 1)
       | 22 | 23 -> (Null, pos + 1)
+      | 25 ->
+        let arg, p = read_arg pos low in
+        let half = Int64.to_int arg in
+        let exponent = (half lsr 10) land 0x1f and mantissa = float_of_int (half land 0x3ff) in
+        let magnitude =
+          if exponent = 0 then ldexp mantissa (-24)
+          else if exponent = 31 then (if mantissa = 0.0 then infinity else nan)
+          else ldexp (mantissa +. 1024.0) (exponent - 25)
+        in
+        (Float (if half land 0x8000 <> 0 then -. magnitude else magnitude), p)
       | 26 ->
         let arg, p = read_arg pos low in
         (Float (Int32.float_of_bits (Int64.to_int32 arg)), p)
@@ -3187,7 +3277,11 @@ let decode (b : bytes) : (t, string) result =
       let arg, p = read_arg pos low in
       match major with
       | 0 -> (Uint arg, p)
-      | 1 -> (Nint (Int64.sub (Int64.neg arg) 1L), p)
+      | 1 ->
+        (* An argument of 2^63 or more reads as negative here, and -1 - arg would
+           wrap to a wrong value, so it is out of range for int64. *)
+        if Int64.compare arg 0L < 0 then failwith "csilgen: negative integer out of range";
+        (Nint (Int64.sub (Int64.neg arg) 1L), p)
       | 2 ->
         if arg < 0L || arg > Int64.of_int (len - p) then failwith "csilgen: truncated byte string";
         let n = Int64.to_int arg in (Bytes (Bytes.sub b p n), p + n)
@@ -3241,6 +3335,143 @@ let calendar_date s =
   let days = [|31; (if leap then 29 else 28); 31;30;31;30;31;31;30;31;30;31|] in
   if m < 1 || m > 12 || d < 1 || d > days.(m-1) then bad ();
   s
+
+(* [timestamp] stays RFC 3339 text so the package needs no Unix or time library.
+   Encode and decode both pass it through here so a held value is always the one
+   canonical UTC spelling every other target writes; the shape is matched by hand
+   because the contract refuses forms a lenient parser would accept. *)
+let epoch_first = -62135596800 (* 0001-01-01T00:00:00Z *)
+let epoch_last = 253402300799 (* 9999-12-31T23:59:59Z *)
+
+let fdiv a b = if a >= 0 then a / b else - ((- a + b - 1) / b)
+
+(* Reads the strict RFC 3339 form into UTC epoch seconds and nanoseconds. The year
+   must be 0001 to 9999 after conversion to UTC. *)
+let parse_timestamp s =
+  let bad () = failwith "csilgen: bad timestamp" in
+  let n = String.length s in
+  let digit i =
+    if i >= n then bad ()
+    else match s.[i] with '0' .. '9' as c -> Char.code c - 48 | _ -> bad ()
+  in
+  let number pos len =
+    let r = ref 0 in
+    for i = pos to pos + len - 1 do r := (!r * 10) + digit i done;
+    !r
+  in
+  let expect i c = if i >= n || s.[i] <> c then bad () in
+  let y = number 0 4 in
+  expect 4 '-';
+  let mo = number 5 2 in
+  expect 7 '-';
+  let d = number 8 2 in
+  if n <= 10 || (s.[10] <> 'T' && s.[10] <> 't') then bad ();
+  let h = number 11 2 in
+  expect 13 ':';
+  let mi = number 14 2 in
+  expect 16 ':';
+  let se = number 17 2 in
+  let pos = ref 19 in
+  let nanos = ref 0 in
+  if !pos < n && s.[!pos] = '.' then begin
+    incr pos;
+    let start = !pos in
+    while !pos < n && s.[!pos] >= '0' && s.[!pos] <= '9' do incr pos done;
+    let len = !pos - start in
+    if len < 1 || len > 9 then bad ();
+    nanos := number start len;
+    for _ = len to 8 do nanos := !nanos * 10 done
+  end;
+  if !pos >= n then bad ();
+  let offset =
+    match s.[!pos] with
+    | 'Z' | 'z' -> if !pos + 1 <> n then bad () else 0
+    | ('+' | '-') as sign ->
+      if !pos + 6 <> n then bad ();
+      let oh = number (!pos + 1) 2 in
+      expect (!pos + 3) ':';
+      let om = number (!pos + 4) 2 in
+      if oh > 23 || om > 59 then bad ();
+      (if sign = '-' then -1 else 1) * ((oh * 60) + om)
+    | _ -> bad ()
+  in
+  let leap yr = yr mod 4 = 0 && (yr mod 100 <> 0 || yr mod 400 = 0) in
+  let days = [|31; (if leap y then 29 else 28); 31;30;31;30;31;31;30;31;30;31|] in
+  if y < 1 || mo < 1 || mo > 12 || d < 1 || d > days.(mo-1) || h > 23 || mi > 59 || se > 59 then bad ();
+  (* Days-from-civil arithmetic (proleptic Gregorian) so the offset can move the
+     instant across a day, month, or year boundary without a date library. *)
+  let days_from_civil yr m dd =
+    let yr = if m <= 2 then yr - 1 else yr in
+    let era = fdiv yr 400 in
+    let yoe = yr - (era * 400) in
+    let mp = (m + 9) mod 12 in
+    let doy = (((153 * mp) + 2) / 5) + dd - 1 in
+    let doe = (yoe * 365) + (yoe / 4) - (yoe / 100) + doy in
+    (era * 146097) + doe - 719468
+  in
+  let seconds = (((days_from_civil y mo d * 1440) + (h * 60) + mi - offset) * 60) + se in
+  if seconds < epoch_first || seconds > epoch_last then bad ();
+  (seconds, !nanos)
+
+(* The canonical UTC text for an instant already known to lie in years 0001 to
+   9999, so that both wire forms produce the same text. *)
+let format_timestamp seconds nanos =
+  let day = fdiv seconds 86400 in
+  let second_of_day = seconds - (day * 86400) in
+  let z = day + 719468 in
+  let era = fdiv z 146097 in
+  let doe = z - (era * 146097) in
+  let yoe = (doe - (doe / 1460) + (doe / 36524) - (doe / 146096)) / 365 in
+  let doy = doe - ((365 * yoe) + (yoe / 4) - (yoe / 100)) in
+  let mp = ((5 * doy) + 2) / 153 in
+  let ud = doy - (((153 * mp) + 2) / 5) + 1 in
+  let um = if mp < 10 then mp + 3 else mp - 9 in
+  let uy = yoe + (era * 400) + (if um <= 2 then 1 else 0) in
+  let fraction =
+    if nanos = 0 then ""
+    else if nanos mod 1_000_000 = 0 then Printf.sprintf ".%03d" (nanos / 1_000_000)
+    else if nanos mod 1000 = 0 then Printf.sprintf ".%06d" (nanos / 1000)
+    else Printf.sprintf ".%09d" nanos
+  in
+  Printf.sprintf "%04d-%02d-%02dT%02d:%02d:%02d%sZ" uy um ud (second_of_day / 3600)
+    (second_of_day / 60 mod 60) (second_of_day mod 60) fraction
+
+let canonical_timestamp s =
+  let seconds, nanos = parse_timestamp s in
+  format_timestamp seconds nanos
+
+(* [cddl_time] is CBOR tag 1 around epoch seconds. It is held as the same
+   canonical text as a [timestamp], so both wire forms compare equal for one
+   instant. *)
+let epoch_to_cbor s =
+  let seconds, nanos = parse_timestamp s in
+  if nanos = 0 then Tag (1, int64 (Int64.of_int seconds))
+  else Tag (1, Float (float_of_int seconds +. (float_of_int nanos /. 1e9)))
+
+let epoch_of_cbor v =
+  let bad () = failwith "csilgen: bad cddl_time" in
+  let seconds, units =
+    match v with
+    | Tag (1, Uint n) ->
+      if Int64.unsigned_compare n (Int64.of_int epoch_last) > 0 then bad ();
+      (Int64.to_int n, 0)
+    | Tag (1, Nint n) ->
+      if Int64.compare n (Int64.of_int epoch_first) < 0 then bad ();
+      (Int64.to_int n, 0)
+    | Tag (1, Float value) ->
+      (* The range test also refuses NaN and infinity, and it comes before the
+         conversion to an integer, which is unspecified out of range. *)
+      if not (value >= float_of_int (epoch_first - 1) && value <= float_of_int (epoch_last + 1))
+      then bad ();
+      let whole = Float.floor value in
+      (* Two operations, not a fused multiply-add, which can round differently. *)
+      let scaled = (value -. whole) *. 1e9 in
+      let units = int_of_float (Float.floor (scaled +. 0.5)) in
+      if units = 1_000_000_000 then (int_of_float whole + 1, 0) else (int_of_float whole, units)
+    | _ -> bad ()
+  in
+  if seconds < epoch_first || seconds > epoch_last then bad ();
+  format_timestamp seconds units
 
 let to_text = function Text s -> s | _ -> failwith "csilgen: expected text"
 let to_bytes = function Bytes b -> b | _ -> failwith "csilgen: expected bytes"

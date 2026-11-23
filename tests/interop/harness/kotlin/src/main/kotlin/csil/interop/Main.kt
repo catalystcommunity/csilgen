@@ -45,6 +45,7 @@ private fun scalarsOk() = Scalars(
     flag = true,
     due = java.time.LocalDate.of(2000, 2, 29),
     `when` = java.time.Instant.parse("2026-06-29T12:34:56Z"),
+    seen = java.time.Instant.parse("2026-06-29T12:34:56.500Z"),
     amount = java.math.BigDecimal("123.45"),
     // mixed-union coverage: a value equal to a literal arm must wire as
     // [1,"pending"]; a value with no literal match must wire as [0,...].
@@ -149,17 +150,15 @@ private fun jsonStr(s: String): String {
 // RPC
 // ---------------------------------------------------------------------------
 
-/** Maps a status-0 reply whose variant is `ServiceError` onto the language error path
- *  (a thrown ClientError), per the transport conventions; otherwise hands the success
- *  payload to the typed client. */
+/** Hands the lib client's reply to the typed client. The generated client selects the
+ *  reply arm from the variant, so the carrier only passes it on. */
 private class RpcTransport(private val client: RpcClient) : Transport {
-    override fun call(service: String, op: String, request: ByteArray): ByteArray {
+    override fun call(service: String, op: String, request: ByteArray): ByteArray =
+        client.call(service, op, request).payload
+
+    override fun callReply(service: String, op: String, request: ByteArray): WireReply {
         val resp = client.call(service, op, request)
-        if (resp.variant == "ServiceError") {
-            val se = serviceErrorFromCbor(resp.payload)
-            throw ClientError(se.code, se.message)
-        }
-        return resp.payload
+        return WireReply(resp.variant, resp.payload)
     }
 }
 
@@ -245,9 +244,9 @@ private fun rpcClient(ch: Socket): Cases {
     try {
         client.validateConstrained(constrainedBad())
         cases.fail("validate-constrained/failure", "server accepted invalid input")
-    } catch (e: ClientError) {
+    } catch (e: ServiceErrorRefusal) {
         // The typed error arm must surface as a service error, not a transport error.
-        cases.pass("validate-constrained/failure")
+        cases.check("validate-constrained/failure", e.value.code == 422L, "wrong code ${e.value.code}")
     } catch (e: Exception) {
         cases.fail("validate-constrained/failure", "expected service error, got $e")
     }

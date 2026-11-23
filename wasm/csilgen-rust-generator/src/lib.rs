@@ -238,7 +238,10 @@ impl CsilDecimal {
     /// value lands in the decade `[10^(w-1), 10^w)` for `w = digits + exponent`, so
     /// differing weights settle the order outright and equal weights reduce to a
     /// trailing-zero-padded digit-string compare.
-    fn cmp_magnitude(mut ma: u128, mut ea: i64, mut mb: u128, mut eb: i64) -> std::cmp::Ordering {
+    fn cmp_magnitude(mut ma: u128, ea: i64, mut mb: u128, eb: i64) -> std::cmp::Ordering {
+        // The weights are summed in i128 so an exponent near `i64::MAX` from a
+        // payload cannot overflow.
+        let (mut ea, mut eb) = (i128::from(ea), i128::from(eb));
         while ma.is_multiple_of(10) {
             ma /= 10;
             ea += 1;
@@ -249,8 +252,8 @@ impl CsilDecimal {
         }
         let digits_a = ma.to_string();
         let digits_b = mb.to_string();
-        let weight_a = digits_a.len() as i64 + ea;
-        let weight_b = digits_b.len() as i64 + eb;
+        let weight_a = digits_a.len() as i128 + ea;
+        let weight_b = digits_b.len() as i128 + eb;
         if weight_a != weight_b {
             return weight_a.cmp(&weight_b);
         }
@@ -280,22 +283,22 @@ impl CsilDecimal {
     }
 
     /// Canonical decimal string for the exact value: `(-2, 12345)` renders as
-    /// `123.45`. Round-trips through `from_str` by value.
+    /// `123.45`. Round-trips through `from_str` by value. An exponent outside
+    /// -1000..=1000 renders as `<mantissa>e<exponent>` (the Go target uses the
+    /// same rule), because a payload can carry an exponent near `i64::MAX` and
+    /// padding it out with zeros would exhaust memory.
     pub fn as_str(&self) -> String {
         let digits = self.mantissa.unsigned_abs().to_string();
-        let body = if self.exponent >= 0 {
-            let mut out = digits;
-            out.push_str(&"0".repeat(self.exponent as usize));
-            out
+        let scale = usize::try_from(self.exponent.unsigned_abs()).unwrap_or(usize::MAX);
+        let body = if !(-1000..=1000).contains(&self.exponent) {
+            format!("{digits}e{}", self.exponent)
+        } else if self.exponent >= 0 {
+            format!("{digits}{}", "0".repeat(scale))
+        } else if scale < digits.len() {
+            let (whole, fraction) = digits.split_at(digits.len() - scale);
+            format!("{whole}.{fraction}")
         } else {
-            let scale = (-self.exponent) as usize;
-            if digits.len() > scale {
-                let point = digits.len() - scale;
-                format!("{}.{}", &digits[..point], &digits[point..])
-            } else {
-                let pad = "0".repeat(scale - digits.len());
-                format!("0.{pad}{digits}")
-            }
+            format!("0.{}{digits}", "0".repeat(scale - digits.len()))
         };
         if self.mantissa < 0 {
             format!("-{body}")
@@ -304,12 +307,21 @@ impl CsilDecimal {
         }
     }
 
-    /// Parse a decimal string into the exact `(exponent, mantissa)` pair.
+    /// Parse a decimal string (`123.45`, or `12345e-2`) into the exact
+    /// `(exponent, mantissa)` pair.
     pub fn from_str(s: &str) -> Result<Self, String> {
         let t = s.trim();
         let (negative, rest) = match t.strip_prefix('-') {
             Some(r) => (true, r),
             None => (false, t.strip_prefix('+').unwrap_or(t)),
+        };
+        let (rest, power) = match rest.split_once(['e', 'E']) {
+            Some((m, e)) => (
+                m,
+                e.parse::<i64>()
+                    .map_err(|_| format!("invalid decimal: {s}"))?,
+            ),
+            None => (rest, 0),
         };
         let (int_part, frac_part) = match rest.split_once('.') {
             Some((i, f)) => (i, f),
@@ -328,10 +340,11 @@ impl CsilDecimal {
             .parse()
             .map_err(|e| format!("decimal out of range: {e}"))?;
         let mantissa = if negative { -magnitude } else { magnitude };
-        Ok(Self {
-            exponent: -(frac_part.len() as i64),
-            mantissa,
-        })
+        let exponent = i64::try_from(frac_part.len())
+            .ok()
+            .and_then(|n| power.checked_sub(n))
+            .ok_or_else(|| format!("decimal out of range: {s}"))?;
+        Ok(Self { exponent, mantissa })
     }
 }
 
@@ -371,11 +384,13 @@ impl std::error::Error for ValidationError {}"#;
 /// `call` method differs between the sync and async shapes.
 const CLIENT_ERROR: &str = r#"/// Error from a generated client call: a structured error the service returned,
 /// or a transport-level failure. The caller-supplied `Transport` decides how an
-/// error response maps onto `Service`.
+/// error response maps onto `Service`. `Encode` means the request has no valid
+/// wire form, so the client did not call the transport.
 #[derive(Debug, Clone)]
 pub enum ClientError {
     Service { code: i64, message: String },
     Transport(String),
+    Encode(String),
     Decode(String),
 }
 
@@ -383,6 +398,7 @@ impl std::fmt::Display for ClientError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ClientError::Service { code, message } => write!(f, "service error {code}: {message}"),
+            Self::Encode(msg) => write!(f, "invalid request: {msg}"),
             Self::Decode(msg) => write!(f, "invalid reply: {msg}"),
             ClientError::Transport(msg) => write!(f, "transport error: {msg}"),
         }
@@ -463,8 +479,8 @@ impl HttpRpcCarrier {
     }
 }
 
-impl Transport for HttpRpcCarrier {
-    fn call(&self, service: &str, op: &str, req: &[u8]) -> Result<Vec<u8>, ClientError> {
+impl HttpRpcCarrier {
+    fn exchange(&self, service: &str, op: &str, req: &[u8]) -> Result<RpcResponse, ClientError> {
         let envelope = RpcRequest::new(service, op, req.to_vec())
             .encode()
             .map_err(|e| ClientError::Transport(e.to_string()))?;
@@ -481,10 +497,29 @@ impl Transport for HttpRpcCarrier {
 
         // into_transport_error surfaces any non-zero transport status distinctly from a
         // typed application error.
-        let decoded = RpcResponse::decode(&body)
+        RpcResponse::decode(&body)
             .map_err(|e| ClientError::Transport(e.to_string()))?
             .into_transport_error()
-            .map_err(|e| ClientError::Transport(e.to_string()))?;
+            .map_err(|e| ClientError::Transport(e.to_string()))
+    }
+}
+
+impl Transport for HttpRpcCarrier {
+    fn call(&self, service: &str, op: &str, req: &[u8]) -> Result<Vec<u8>, ClientError> {
+        Ok(self.exchange(service, op, req)?.payload)
+    }
+"#;
+
+/// Appended to the carrier only when the spec has a multi-arm operation: the client
+/// needs the reply `variant` to tell the success arm from a declared error arm.
+const RPC_CARRIER_REPLY_RUST: &str = r#"
+    fn call_reply(&self, service: &str, op: &str, req: &[u8]) -> Result<WireReply, ClientError> {
+        let reply = self.exchange(service, op, req)?;
+        Ok(WireReply {
+            variant: reply.variant,
+            payload: reply.payload,
+        })
+    }
 "#;
 
 /// The TLS `StreamCarrier` opener — spec-independent. std has no TLS, so the example
@@ -620,7 +655,7 @@ impl ClientShape {
 /// clients; the marked twin imports it from the sync module) plus the
 /// caller-supplied byte-carrier trait, whose `call` is `async fn` for the async
 /// shapes. The generator never owns the wire (CBOR-over-HTTP etc.).
-fn client_prelude(shape: ClientShape, variants: &str, displays: &str) -> String {
+fn client_prelude(shape: ClientShape, variants: &str, displays: &str, reply_seam: bool) -> String {
     let mut out = String::new();
     // A marked twin shares the sync module's `ClientError`; redefining it would
     // collide when both clients are re-exported from the module root.
@@ -637,6 +672,9 @@ fn client_prelude(shape: ClientShape, variants: &str, displays: &str) -> String 
                 ),
         );
         out.push_str("\n\n");
+        if reply_seam {
+            out.push_str(WIRE_REPLY_RUST);
+        }
     }
     let trait_name = shape.transport_trait();
     let async_kw = shape.async_kw();
@@ -650,9 +688,50 @@ fn client_prelude(shape: ClientShape, variants: &str, displays: &str) -> String 
     out.push_str(&format!(
         "    {async_kw}fn call(&self, service: &str, op: &str, req: &[u8]) -> Result<Vec<u8>, ClientError>;\n"
     ));
+    if reply_seam {
+        // The twin names the sync module's struct so both clients share one type.
+        let reply = if shape.marker.is_empty() {
+            "WireReply"
+        } else {
+            "super::client::WireReply"
+        };
+        out.push_str(
+            "\n    /// Perform a call whose operation declares several reply arms and return\n\
+             \x20   /// the status-zero reply `variant` with its payload, so the client can\n\
+             \x20   /// return the success arm or the declared error arm.\n",
+        );
+        let line = format!(
+            "    {async_kw}fn call_reply(&self, service: &str, op: &str, req: &[u8]) -> Result<{reply}, ClientError>;"
+        );
+        // Match rustfmt: one line while it fits, else one parameter per line.
+        if line.len() <= 100 {
+            out.push_str(&format!("{line}\n"));
+        } else {
+            out.push_str(&format!(
+                "    {async_kw}fn call_reply(\n\
+                 \x20       &self,\n\
+                 \x20       service: &str,\n\
+                 \x20       op: &str,\n\
+                 \x20       req: &[u8],\n\
+                 \x20   ) -> Result<{reply}, ClientError>;\n"
+            ));
+        }
+    }
     out.push_str("}\n");
     out
 }
+
+/// The reply half of the `call_reply` seam, emitted only for specs with a
+/// multi-arm operation so other specs keep their earlier client surface.
+const WIRE_REPLY_RUST: &str = r#"/// A status-zero CSIL-RPC reply: `variant` names the declared output arm that
+/// `payload` encodes. A transport returns it from `call_reply`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WireReply {
+    pub variant: Option<String>,
+    pub payload: Vec<u8>,
+}
+
+"#;
 
 /// The self-contained canonical-CBOR (RFC 8949 subset) value model, encoder,
 /// decoder, generic composite helpers, and accessors every generated per-type codec
@@ -814,11 +893,12 @@ fn cbor_read_arg(b: &[u8], pos: &mut usize, low: u8) -> Result<u64, CsilCborErro
             )))
         }
     };
-    if *pos >= b.len() || width > b.len() - *pos - 1 {
-        return Err(CsilCborError("csil cbor: truncated argument".to_string()));
-    }
+    let bytes = pos
+        .checked_add(1)
+        .and_then(|start| b.get(start..start.checked_add(width)?))
+        .ok_or_else(|| CsilCborError("csil cbor: truncated argument".to_string()))?;
     let mut v = 0u64;
-    for &byte in &b[*pos + 1..*pos + 1 + width] {
+    for &byte in bytes {
         v = (v << 8) | byte as u64;
     }
     *pos += 1 + width;
@@ -832,18 +912,41 @@ fn cbor_read_arg(b: &[u8], pos: &mut usize, low: u8) -> Result<u64, CsilCborErro
 /// bound, the vector grows only as elements are actually read.
 const CSIL_CBOR_PREALLOC_LIMIT: usize = 1024;
 
+/// The `len` bytes at `start`, or `None` when the input is shorter. `get` is
+/// used instead of indexing so a bad length can never panic.
+fn cbor_take(b: &[u8], start: usize, len: u64) -> Option<&[u8]> {
+    let end = start.checked_add(usize::try_from(len).ok()?)?;
+    b.get(start..end)
+}
+
+/// Widen an IEEE 754 half-precision value (RFC 8949 Appendix D) exactly to binary64.
+fn cbor_half_to_f64(half: u16) -> f64 {
+    let exp = (half >> 10) & 0x1f;
+    let mant = f64::from(half & 0x3ff);
+    let magnitude = match exp {
+        0 => mant * 2f64.powi(-24),
+        31 if mant == 0.0 => f64::INFINITY,
+        31 => f64::NAN,
+        _ => (mant + 1024.0) * 2f64.powi(i32::from(exp) - 25),
+    };
+    if half & 0x8000 != 0 {
+        -magnitude
+    } else {
+        magnitude
+    }
+}
+
 fn cbor_dec(b: &[u8], pos: &mut usize, depth: usize) -> Result<CsilCborValue, CsilCborError> {
     if depth > 64 {
         return Err(CsilCborError(
             "csil cbor: nesting limit exceeded".to_string(),
         ));
     }
-    if *pos >= b.len() {
+    let Some(&ib) = b.get(*pos) else {
         return Err(CsilCborError(
             "csil cbor: unexpected end of input".to_string(),
         ));
-    }
-    let ib = b[*pos];
+    };
     let major = ib >> 5;
     let low = ib & 0x1f;
     if major == 7 {
@@ -859,6 +962,10 @@ fn cbor_dec(b: &[u8], pos: &mut usize, depth: usize) -> Result<CsilCborValue, Cs
             22 | 23 => {
                 *pos += 1;
                 Ok(CsilCborValue::Null)
+            }
+            25 => {
+                let bits = cbor_read_arg(b, pos, low)?;
+                Ok(CsilCborValue::Float(cbor_half_to_f64(bits as u16)))
             }
             26 => {
                 let bits = cbor_read_arg(b, pos, low)?;
@@ -885,31 +992,22 @@ fn cbor_dec(b: &[u8], pos: &mut usize, depth: usize) -> Result<CsilCborValue, Cs
             Ok(CsilCborValue::Int(-1 - arg as i64))
         }
         2 => {
-            if arg > (b.len() - *pos) as u64 {
-                return Err(CsilCborError(
-                    "csil cbor: truncated byte string".to_string(),
-                ));
-            }
-            let n = arg as usize;
-            let slice = b[*pos..*pos + n].to_vec();
-            *pos += n;
-            Ok(CsilCborValue::Bytes(slice))
+            let slice = cbor_take(b, *pos, arg)
+                .ok_or_else(|| CsilCborError("csil cbor: truncated byte string".to_string()))?;
+            *pos += slice.len();
+            Ok(CsilCborValue::Bytes(slice.to_vec()))
         }
         3 => {
-            if arg > (b.len() - *pos) as u64 {
-                return Err(CsilCborError(
-                    "csil cbor: truncated text string".to_string(),
-                ));
-            }
-            let n = arg as usize;
-            let s = std::str::from_utf8(&b[*pos..*pos + n])
+            let slice = cbor_take(b, *pos, arg)
+                .ok_or_else(|| CsilCborError("csil cbor: truncated text string".to_string()))?;
+            let s = std::str::from_utf8(slice)
                 .map_err(|e| CsilCborError(format!("csil cbor: invalid utf-8: {e}")))?
                 .to_string();
-            *pos += n;
+            *pos += slice.len();
             Ok(CsilCborValue::Text(s))
         }
         4 => {
-            if arg > (b.len() - *pos) as u64 {
+            if arg > b.len().saturating_sub(*pos) as u64 {
                 return Err(CsilCborError(
                     "csil cbor: array length exceeds remaining input".to_string(),
                 ));
@@ -922,7 +1020,7 @@ fn cbor_dec(b: &[u8], pos: &mut usize, depth: usize) -> Result<CsilCborValue, Cs
             Ok(CsilCborValue::Array(items))
         }
         5 => {
-            if arg > (b.len() - *pos) as u64 {
+            if arg > b.len().saturating_sub(*pos) as u64 {
                 return Err(CsilCborError(
                     "csil cbor: map length exceeds remaining input".to_string(),
                 ));
@@ -947,8 +1045,14 @@ fn cbor_dec(b: &[u8], pos: &mut usize, depth: usize) -> Result<CsilCborValue, Cs
 }
 
 /// Map a typed slice to a CBOR array via the per-element encoder.
-fn cbor_enc_array<E>(xs: &[E], f: impl Fn(&E) -> CsilCborValue) -> CsilCborValue {
-    CsilCborValue::Array(xs.iter().map(f).collect())
+fn cbor_enc_array<E>(
+    xs: &[E],
+    f: impl Fn(&E) -> Result<CsilCborValue, CsilCborError>,
+) -> Result<CsilCborValue, CsilCborError> {
+    xs.iter()
+        .map(f)
+        .collect::<Result<Vec<_>, _>>()
+        .map(CsilCborValue::Array)
 }
 
 /// Map a typed map to a CBOR map. Rust `HashMap` iteration is unordered, so the inner
@@ -956,10 +1060,13 @@ fn cbor_enc_array<E>(xs: &[E], f: impl Fn(&E) -> CsilCborValue) -> CsilCborValue
 /// generation time) are what the cross-language wire contract pins.
 fn cbor_enc_map<K, V>(
     m: &std::collections::HashMap<K, V>,
-    kf: impl Fn(&K) -> CsilCborValue,
-    vf: impl Fn(&V) -> CsilCborValue,
-) -> CsilCborValue {
-    CsilCborValue::Map(m.iter().map(|(k, v)| (kf(k), vf(v))).collect())
+    kf: impl Fn(&K) -> Result<CsilCborValue, CsilCborError>,
+    vf: impl Fn(&V) -> Result<CsilCborValue, CsilCborError>,
+) -> Result<CsilCborValue, CsilCborError> {
+    m.iter()
+        .map(|(k, v)| Ok((kf(k)?, vf(v)?)))
+        .collect::<Result<Vec<_>, _>>()
+        .map(CsilCborValue::Map)
 }
 
 fn cbor_dec_array<E>(
@@ -1073,10 +1180,17 @@ fn cbor_as_map(v: &CsilCborValue) -> Result<&[(CsilCborValue, CsilCborValue)], C
     }
 }"#;
 
-const CODEC_DATE_RUST: &str = r#"fn csil_enc_date(date: &time::Date) -> CsilCborValue {
+const CODEC_DATE_RUST: &str = r#"fn csil_enc_date(date: &time::Date) -> Result<CsilCborValue, CsilCborError> {
     let text = date.to_string();
-    assert!(text.len() == 10, "CSIL date requires a four-digit year");
-    CsilCborValue::Tag(1004, Box::new(CsilCborValue::Text(text)))
+    if !(1..=9999).contains(&date.year()) || text.len() != 10 {
+        return Err(CsilCborError(
+            "csil cbor: date outside years 0001-9999".to_string(),
+        ));
+    }
+    Ok(CsilCborValue::Tag(
+        1004,
+        Box::new(CsilCborValue::Text(text)),
+    ))
 }
 
 fn csil_as_date(v: &CsilCborValue) -> Result<time::Date, CsilCborError> {
@@ -1093,34 +1207,106 @@ fn csil_as_date(v: &CsilCborValue) -> Result<time::Date, CsilCborError> {
 }"#;
 
 /// Timestamp codec for CBOR tag 0.
-const CODEC_TIMESTAMP_RUST: &str = r#"fn csil_enc_timestamp(t: &time::OffsetDateTime) -> CsilCborValue {
-    let utc = t.to_offset(time::UtcOffset::UTC);
+const CODEC_TIMESTAMP_RUST: &str = r#"fn csil_enc_timestamp(t: &time::OffsetDateTime) -> Result<CsilCborValue, CsilCborError> {
+    let out_of_range = || CsilCborError("csil cbor: timestamp outside UTC years 0001-9999".into());
+    // `to_offset` panics when the shifted instant leaves the `time` range.
+    let utc = t
+        .checked_to_offset(time::UtcOffset::UTC)
+        .filter(|utc| (1..=9999).contains(&utc.year()))
+        .ok_or_else(out_of_range)?;
     let mut text = utc
         .format(&time::format_description::well_known::Rfc3339)
-        .expect("CSIL timestamp requires a four-digit UTC year");
+        .map_err(|_| out_of_range())?;
     // Keep the wire spelling used by earlier Rust releases (3, 6, or 9 fractional digits).
     if let Some(point) = text.find('.') {
-        let end = text.len() - 1; // final Z
-        let digits = end - point - 1;
-        let padding = (3 - digits % 3) % 3;
-        text.insert_str(end, &"00"[..padding]);
+        let end = text.len().saturating_sub(1); // final Z
+        let digits = end.saturating_sub(point + 1);
+        let padding = match digits % 3 {
+            1 => "00",
+            2 => "0",
+            _ => "",
+        };
+        text.insert_str(end, padding);
     }
-    CsilCborValue::Tag(0, Box::new(CsilCborValue::Text(text)))
+    Ok(CsilCborValue::Tag(0, Box::new(CsilCborValue::Text(text))))
 }
 
 pub(super) fn csil_parse_timestamp(s: &str) -> Result<time::OffsetDateTime, CsilCborError> {
-    if !matches!(s.as_bytes().get(10), Some(b'T' | b't' | b' ')) {
-        return Err(CsilCborError("invalid timestamp separator".into()));
+    let invalid = || CsilCborError(format!("csil cbor: invalid timestamp {s:?}"));
+    let b = s.as_bytes();
+    // Every field is read by position so that no parser leniency (space separator,
+    // offsets without a colon, rounding of a leap second) can widen the wire form.
+    let field = |from: usize, len: usize| -> Result<u32, CsilCborError> {
+        b.get(from..from + len)
+            .and_then(|part| {
+                part.iter().try_fold(0u32, |n, c| {
+                    c.is_ascii_digit().then(|| n * 10 + u32::from(c - b'0'))
+                })
+            })
+            .ok_or_else(invalid)
+    };
+    let at = |i: usize| b.get(i).copied();
+    if b.len() < 20
+        || at(4) != Some(b'-')
+        || at(7) != Some(b'-')
+        || !matches!(at(10), Some(b'T' | b't'))
+        || at(13) != Some(b':')
+        || at(16) != Some(b':')
+    {
+        return Err(invalid());
     }
-    // The time crate rounds a leap second down. Reject it to avoid changing the instant.
-    if s.get(17..19) == Some("60") {
-        return Err(CsilCborError("unrepresentable leap second".into()));
+    let (year, month, day) = (field(0, 4)?, field(5, 2)?, field(8, 2)?);
+    // A written year 0000 is refused even when the offset carries it into 0001.
+    if year == 0 {
+        return Err(invalid());
     }
-    let dt = time::OffsetDateTime::parse(s, &time::format_description::well_known::Rfc3339)
-        .map_err(|e| CsilCborError(format!("csil cbor: invalid timestamp: {e}")))?;
-    dt.checked_to_offset(time::UtcOffset::UTC)
-        .filter(|utc| (0..=9999).contains(&utc.year()))
-        .ok_or_else(|| CsilCborError("timestamp outside four-digit UTC year range".into()))
+    let (hour, minute, second) = (field(11, 2)?, field(14, 2)?, field(17, 2)?);
+    let mut pos = 19;
+    let mut nanos = 0;
+    if at(pos) == Some(b'.') {
+        let digits = b
+            .get(pos + 1..)
+            .unwrap_or_default()
+            .iter()
+            .take_while(|c| c.is_ascii_digit())
+            .count();
+        if !(1..=9).contains(&digits) {
+            return Err(invalid());
+        }
+        nanos = field(pos + 1, digits)? * 10u32.pow(9 - digits as u32);
+        pos += 1 + digits;
+    }
+    let offset = match b.get(pos..).unwrap_or_default() {
+        [b'Z' | b'z'] => 0,
+        [sign @ (b'+' | b'-'), _, _, b':', _, _] => {
+            let (h, m) = (field(pos + 1, 2)?, field(pos + 4, 2)?);
+            if h > 23 || m > 59 {
+                return Err(invalid());
+            }
+            let total = (h * 3600 + m * 60) as i32;
+            if *sign == b'-' {
+                -total
+            } else {
+                total
+            }
+        }
+        _ => return Err(invalid()),
+    };
+    let month = u8::try_from(month)
+        .ok()
+        .and_then(|m| time::Month::try_from(m).ok())
+        .ok_or_else(invalid)?;
+    let date =
+        time::Date::from_calendar_date(year as i32, month, day as u8).map_err(|_| invalid())?;
+    // `Time` refuses hour 24, minute 60, and second 60, so a leap second is an error.
+    let clock = time::Time::from_hms_nano(hour as u8, minute as u8, second as u8, nanos)
+        .map_err(|_| invalid())?;
+    let offset = time::UtcOffset::from_whole_seconds(offset).map_err(|_| invalid())?;
+    time::PrimitiveDateTime::new(date, clock)
+        .assume_offset(offset)
+        .checked_to_offset(time::UtcOffset::UTC)
+        .filter(|utc| (1..=9999).contains(&utc.year()))
+        .ok_or_else(|| CsilCborError("timestamp outside UTC years 0001-9999".into()))
 }
 
 fn csil_as_timestamp(v: &CsilCborValue) -> Result<time::OffsetDateTime, CsilCborError> {
@@ -1135,6 +1321,76 @@ fn csil_as_timestamp(v: &CsilCborValue) -> Result<time::OffsetDateTime, CsilCbor
         ));
     };
     csil_parse_timestamp(s)
+}"#;
+
+/// `cddl_time` codec for CBOR tag 1 (epoch seconds). The in-memory type is the
+/// same `time::OffsetDateTime` as `timestamp`; only the wire form differs.
+const CODEC_CDDL_TIME_RUST: &str = r#"const CSIL_EPOCH_FIRST: i64 = -62_135_596_800;
+const CSIL_EPOCH_LAST: i64 = 253_402_300_799;
+const CSIL_EPOCH_UNITS: i64 = 1_000_000_000;
+
+fn csil_enc_cddl_time(t: &time::OffsetDateTime) -> Result<CsilCborValue, CsilCborError> {
+    let seconds = t.unix_timestamp();
+    if !(CSIL_EPOCH_FIRST..=CSIL_EPOCH_LAST).contains(&seconds) {
+        return Err(CsilCborError(
+            "csil cbor: cddl_time outside UTC years 0001-9999".to_string(),
+        ));
+    }
+    let units = i64::from(t.nanosecond());
+    let inner = if units == 0 {
+        CsilCborValue::Int(seconds)
+    } else {
+        CsilCborValue::Float(seconds as f64 + units as f64 / CSIL_EPOCH_UNITS as f64)
+    };
+    Ok(CsilCborValue::Tag(1, Box::new(inner)))
+}
+
+fn csil_as_cddl_time(v: &CsilCborValue) -> Result<time::OffsetDateTime, CsilCborError> {
+    let out_of_range = || CsilCborError("csil cbor: cddl_time outside years 0001-9999".to_string());
+    let CsilCborValue::Tag(1, inner) = v else {
+        return Err(CsilCborError(
+            "csil cbor: expected CBOR tag 1 epoch time".to_string(),
+        ));
+    };
+    let (seconds, units) = match inner.as_ref() {
+        CsilCborValue::Uint(n) => (i64::try_from(*n).map_err(|_| out_of_range())?, 0),
+        CsilCborValue::Int(n) => (*n, 0),
+        CsilCborValue::Float(x) => {
+            let x = *x;
+            if !x.is_finite() {
+                return Err(CsilCborError(
+                    "csil cbor: cddl_time must be finite".to_string(),
+                ));
+            }
+            // The range check comes before any float-to-integer conversion so that
+            // conversion can never saturate a huge value into an in-range one.
+            if x < (CSIL_EPOCH_FIRST - 1) as f64 || x > (CSIL_EPOCH_LAST + 1) as f64 {
+                return Err(out_of_range());
+            }
+            let whole = x.floor();
+            // Rust never contracts `a * b + c` into a fused multiply-add, so the two
+            // roundings the wire contract requires both happen.
+            let scaled = (x - whole) * CSIL_EPOCH_UNITS as f64;
+            let units = (scaled + 0.5).floor() as i64;
+            if units == CSIL_EPOCH_UNITS {
+                (whole as i64 + 1, 0)
+            } else {
+                (whole as i64, units)
+            }
+        }
+        _ => {
+            return Err(CsilCborError(
+                "csil cbor: cddl_time content must be a number".to_string(),
+            ))
+        }
+    };
+    if !(CSIL_EPOCH_FIRST..=CSIL_EPOCH_LAST).contains(&seconds) {
+        return Err(out_of_range());
+    }
+    time::OffsetDateTime::from_unix_timestamp(seconds)
+        .ok()
+        .and_then(|t| t.replace_nanosecond(units as u32).ok())
+        .ok_or_else(out_of_range)
 }"#;
 
 /// Exact-integer (de)serialization for a decimal mantissa: a CBOR integer when it
@@ -1221,14 +1477,14 @@ fn csil_dec_bigint(v: &CsilCborValue) -> Result<i128, CsilCborError> {
 /// Decimal codec under the default `csil` mapping: the generated `CsilDecimal`
 /// (exponent + i128 mantissa) maps straight onto CBOR tag 4 `[exponent, mantissa]`.
 const CODEC_DECIMAL_CSIL_RUST: &str = r#"/// Encode a `CsilDecimal` as CBOR tag 4: `[exponent, mantissa]`.
-fn csil_enc_decimal(d: &CsilDecimal) -> CsilCborValue {
-    CsilCborValue::Tag(
+fn csil_enc_decimal(d: &CsilDecimal) -> Result<CsilCborValue, CsilCborError> {
+    Ok(CsilCborValue::Tag(
         4,
         Box::new(CsilCborValue::Array(vec![
             CsilCborValue::Int(d.exponent),
             csil_enc_bigint(d.mantissa),
         ])),
-    )
+    ))
 }
 
 /// Decode a CBOR tag 4 decimal fraction into an exact `CsilDecimal`.
@@ -1243,28 +1499,28 @@ fn csil_as_decimal(v: &CsilCborValue) -> Result<CsilDecimal, CsilCborError> {
             "csil cbor: tag 4 content must be [exponent, mantissa]".to_string(),
         ));
     };
-    if arr.len() != 2 {
+    let [exponent, mantissa] = arr.as_slice() else {
         return Err(CsilCborError(
             "csil cbor: tag 4 content must be [exponent, mantissa]".to_string(),
         ));
-    }
-    let exponent = cbor_as_i64(&arr[0])?;
-    let mantissa = csil_dec_bigint(&arr[1])?;
+    };
+    let exponent = cbor_as_i64(exponent)?;
+    let mantissa = csil_dec_bigint(mantissa)?;
     Ok(CsilDecimal { exponent, mantissa })
 }"#;
 
 /// Decimal codec under the `library` mapping: `rust_decimal::Decimal` carries the same
 /// exact value (mantissa * 10^-scale), so it maps onto CBOR tag 4 directly.
 const CODEC_DECIMAL_LIBRARY_RUST: &str = r#"/// Encode a `rust_decimal::Decimal` as CBOR tag 4: `[exponent, mantissa]`.
-fn csil_enc_decimal(d: &rust_decimal::Decimal) -> CsilCborValue {
-    let exponent = -(d.scale() as i64);
-    CsilCborValue::Tag(
+fn csil_enc_decimal(d: &rust_decimal::Decimal) -> Result<CsilCborValue, CsilCborError> {
+    let exponent = -i64::from(d.scale());
+    Ok(CsilCborValue::Tag(
         4,
         Box::new(CsilCborValue::Array(vec![
             CsilCborValue::Int(exponent),
             csil_enc_bigint(d.mantissa()),
         ])),
-    )
+    ))
 }
 
 /// Decode a CBOR tag 4 decimal fraction into a `rust_decimal::Decimal`.
@@ -1279,28 +1535,31 @@ fn csil_as_decimal(v: &CsilCborValue) -> Result<rust_decimal::Decimal, CsilCborE
             "csil cbor: tag 4 content must be [exponent, mantissa]".to_string(),
         ));
     };
-    if arr.len() != 2 {
+    let [exponent, mantissa] = arr.as_slice() else {
         return Err(CsilCborError(
             "csil cbor: tag 4 content must be [exponent, mantissa]".to_string(),
         ));
-    }
-    let exponent = cbor_as_i64(&arr[0])?;
-    let mantissa = csil_dec_bigint(&arr[1])?;
+    };
+    let exponent = cbor_as_i64(exponent)?;
+    let mantissa = csil_dec_bigint(mantissa)?;
+    let too_large = || CsilCborError("csil cbor: decimal outside rust_decimal range".to_string());
     // `rust_decimal`'s scale is non-negative, so a non-negative wire exponent
     // (trailing-zero magnitude) is folded into the mantissa rather than the scale.
+    // The `try_` constructor is used because `from_i128_with_scale` panics on a
+    // mantissa past 96 bits or a scale past 28.
     if exponent >= 0 {
-        let pow = 10i128
-            .checked_pow(exponent as u32)
-            .ok_or_else(|| CsilCborError("csil cbor: decimal exponent too large".to_string()))?;
-        let scaled = mantissa
-            .checked_mul(pow)
-            .ok_or_else(|| CsilCborError("csil cbor: decimal mantissa overflow".to_string()))?;
-        Ok(rust_decimal::Decimal::from_i128_with_scale(scaled, 0))
+        let pow = u32::try_from(exponent)
+            .ok()
+            .and_then(|e| 10i128.checked_pow(e))
+            .ok_or_else(too_large)?;
+        let scaled = mantissa.checked_mul(pow).ok_or_else(too_large)?;
+        rust_decimal::Decimal::try_from_i128_with_scale(scaled, 0).map_err(|_| too_large())
     } else {
-        Ok(rust_decimal::Decimal::from_i128_with_scale(
-            mantissa,
-            (-exponent) as u32,
-        ))
+        let scale = exponent
+            .checked_neg()
+            .and_then(|e| u32::try_from(e).ok())
+            .ok_or_else(too_large)?;
+        rust_decimal::Decimal::try_from_i128_with_scale(mantissa, scale).map_err(|_| too_large())
     }
 }"#;
 
@@ -1333,6 +1592,8 @@ enum RustExpr {
     },
     /// The literal decoder's two-statement closure body.
     LitDec { expected: String, value: String },
+    /// `inner?`: a fallible encoder whose error the enclosing function returns.
+    Try(Box<RustExpr>),
 }
 
 impl RustExpr {
@@ -1348,6 +1609,46 @@ impl RustExpr {
         RustExpr::Closure {
             params: params.to_string(),
             body: Box::new(body),
+        }
+    }
+
+    fn try_(inner: RustExpr) -> RustExpr {
+        RustExpr::Try(Box::new(inner))
+    }
+
+    /// A closure whose body is the value expression `value`. The collection
+    /// helpers take encoders that return `Result`, so a trailing `?` is dropped
+    /// (clippy rejects `Ok(x?)`) and an infallible body is wrapped in `Ok`.
+    fn enc_closure(params: &str, value: RustExpr) -> RustExpr {
+        let body = match value {
+            RustExpr::Try(inner) => *inner,
+            other => RustExpr::call("Ok", vec![other]),
+        };
+        RustExpr::closure(params, body)
+    }
+
+    /// Whether the rendered expression names `ident`. A union arm whose value
+    /// ignores its binding (a `nil` arm) must bind `_`, or the arm warns.
+    fn mentions(&self, ident: &str) -> bool {
+        let in_text = |text: &str| {
+            text.match_indices(ident).any(|(at, _)| {
+                let word = |c: char| c.is_ascii_alphanumeric() || c == '_';
+                let before = text[..at].chars().next_back();
+                let after = text[at + ident.len()..].chars().next();
+                !before.is_some_and(word) && !after.is_some_and(word)
+            })
+        };
+        match self {
+            RustExpr::Atom(s) => in_text(s),
+            RustExpr::Call { head, args, .. } => {
+                in_text(head) || args.iter().any(|a| a.mentions(ident))
+            }
+            RustExpr::Closure { params, body } => in_text(params) || body.mentions(ident),
+            RustExpr::ArrayVec(elems) => elems.iter().any(|e| e.mentions(ident)),
+            RustExpr::MatchOpt { place, inner } => in_text(place) || inner.mentions(ident),
+            RustExpr::TupleDec { elems, .. } => elems.iter().any(|(e, _)| e.mentions(ident)),
+            RustExpr::LitDec { expected, value } => in_text(expected) || in_text(value),
+            RustExpr::Try(inner) => inner.mentions(ident),
         }
     }
 
@@ -1380,6 +1681,7 @@ impl RustExpr {
                     None
                 }
             }
+            RustExpr::Try(inner) => Some(format!("{}?", inner.flat()?)),
             _ => None,
         }
     }
@@ -1545,12 +1847,31 @@ struct RustCodeGenerator<'a> {
     /// Set when emitted validation references `regex`, so the dependency note in
     /// the module root lists it only when actually required.
     uses_regex: bool,
+    /// The declared name of each rule renamed to a legal Rust identifier. An RPC
+    /// reply variant carries the declared name on the wire, so it reads it here.
+    declared_names: HashMap<String, String>,
 }
 
 impl<'a> RustCodeGenerator<'a> {
     fn new(input: &'a WasmGeneratorInput) -> Self {
+        // `hoist_inline` runs the shared hoister one rule at a time over name
+        // stand-ins, so it cannot see the group rules a splice reads; splice first.
+        let spliced = csilgen_common::splice_group_references(&input.csil_spec);
+        let renames = csilgen_common::rule_renames(&spliced, Self::is_rust_ident, |name| {
+            let fixed: String = name
+                .chars()
+                .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+                .collect();
+            if fixed.starts_with(|c: char| c.is_ascii_digit()) || fixed.is_empty() {
+                format!("_{fixed}")
+            } else {
+                fixed
+            }
+        });
+        let renamed = csilgen_common::rename_rules(&spliced, &renames);
         Self {
-            spec: Self::hoist_inline(&input.csil_spec),
+            spec: Self::hoist_inline(&renamed),
+            declared_names: renames.into_iter().map(|(from, to)| (to, from)).collect(),
             input,
             warnings: Vec::new(),
             type_definitions: HashSet::new(),
@@ -1558,6 +1879,20 @@ impl<'a> RustCodeGenerator<'a> {
             needs_validation_error: false,
             uses_regex: false,
         }
+    }
+
+    fn is_rust_ident(name: &str) -> bool {
+        !name.is_empty()
+            && !name.starts_with(|c: char| c.is_ascii_digit())
+            && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+    }
+
+    /// The name a rule was declared with, before any rename to a Rust identifier.
+    fn declared_name<'n>(&'n self, name: &'n str) -> &'n str {
+        self.declared_names
+            .get(name)
+            .map(String::as_str)
+            .unwrap_or(name)
     }
 
     /// Hoist every inline (anonymous) composite in the spec to a synthesized named
@@ -2071,7 +2406,10 @@ impl<'a> RustCodeGenerator<'a> {
     /// the two never drift. Empty for a spec whose codec is fully self-contained.
     fn crate_dependencies(&self) -> Vec<&'static str> {
         let mut deps = Vec::new();
-        if self.spec_uses_builtin("timestamp") || self.spec_uses_builtin("date") {
+        if self.spec_uses_builtin("timestamp")
+            || self.spec_uses_builtin("cddl_time")
+            || self.spec_uses_builtin("date")
+        {
             deps.push(r#"time = { version = "0.3.47", features = ["formatting", "parsing"] }"#);
         }
         if self.spec_uses_builtin("decimal") && self.decimal_mapping == DecimalMapping::Library {
@@ -2159,12 +2497,10 @@ impl<'a> RustCodeGenerator<'a> {
             "use {krate}::*;\nuse csilgen_transport::rpc::{{RpcRequest, RpcResponse}};\nuse std::io::Read;\n\n"
         ));
         out.push_str(RPC_CARRIER_RUST);
-        if self.spec.rpc_operations().next().is_some() {
-            out.push_str("        resolve_rpc_reply(service, op, decoded.variant.as_deref(), decoded.payload)\n");
-        } else {
-            out.push_str("        Ok(decoded.payload)\n");
+        if self.spec_has_reply_seam() {
+            out.push_str(RPC_CARRIER_REPLY_RUST);
         }
-        out.push_str("    }\n}\n");
+        out.push_str("}\n");
         out.push('\n');
         out.push_str("fn main() {\n");
         out.push_str(&format!(
@@ -2335,8 +2671,8 @@ fn session(carrier: &mut impl FrameCarrier) -> Result<(), Box<dyn std::error::Er
         Profile::parse(&HelloAck::decode(&ack_frame)?.profile).ok_or_else(|| "unsupported profile".to_string())?;
 
     // Send one outbound event: the generated encoder serializes the typed payload, the
-    // library frames it as a verbose Event.
-    let (method, payload) = encode_{service_snake}_{op_snake}(&{outbound_sample});
+    // library frames it as a verbose Event. A value with no wire form is an error here.
+    let (method, payload) = encode_{service_snake}_{op_snake}(&{outbound_sample})?;
     carrier.send_frame(&Event::verbose(Some(service.to_string()), method, payload).encode(profile)?)?;
 
     // Recv loop: decode each frame to an Event, answer $ping with $pong (the library
@@ -2422,8 +2758,8 @@ const OP_ORD: u64 = {op_ord};
 // reordering.
 fn run_datagrams(carrier: &mut impl DatagramCarrier) -> Result<(), Box<dyn std::error::Error>> {{
     let req = {req_sample};
-    // seq 0 marks an unsequenced datagram.
-    carrier.send_datagram(&Datagram::new(OP_ORD, 0, encode_{req_snake}(&req)).encode()?)?;
+    // seq 0 marks an unsequenced datagram. A value with no wire form is an error here.
+    carrier.send_datagram(&Datagram::new(OP_ORD, 0, encode_{req_snake}(&req)?).encode()?)?;
 
     if let Some(inbound) = carrier.recv_datagram()? {{
         let dg = Datagram::decode(&inbound)?;
@@ -2995,6 +3331,9 @@ fn main() {{
                 let p = Self::to_pascal_case(s);
                 if p.is_empty() || p.chars().next().is_some_and(|c| c.is_ascii_digit()) {
                     String::new()
+                } else if p == "Self" {
+                    // `Self` is the one PascalCase keyword, and it cannot be a raw identifier.
+                    "Self_".to_string()
                 } else {
                     p
                 }
@@ -3033,14 +3372,21 @@ fn main() {{
     ) -> Result<String, String> {
         let mut content = String::new();
 
+        let literals = Self::enum_literals(choices);
         content.push_str(&format!("/// {name} variants\n"));
-        content.push_str("#[derive(Debug, Clone, PartialEq)]\n");
+        // A C-like enum is used as a map key and passed by value like the
+        // hand-written enums it replaces; a union can hold non-Copy, non-Hash payloads.
+        content.push_str(if literals.is_some() {
+            "#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]\n"
+        } else {
+            "#[derive(Debug, Clone, PartialEq)]\n"
+        });
         content.push_str(&format!("pub enum {name} {{\n"));
 
         // A literal-only choice is an enum (unit variants, bare-literal wire); a
         // choice with type-bearing variants is a union (a tagged sum, payload per
         // variant). Both share this declaration; their codecs differ.
-        if let Some(lits) = Self::enum_literals(choices) {
+        if let Some(lits) = literals {
             for ident in Self::enum_variant_idents(&lits) {
                 content.push_str(&format!("    {ident},\n"));
             }
@@ -3068,7 +3414,7 @@ fn main() {{
                     content.push_str(&format!("            {label:?} => Some(Self::{id}),\n"));
                 }
             }
-            content.push_str("            _ => None,\n        }\n    }\n\n    pub fn to_number(&self) -> i64 {\n        match self {\n");
+            content.push_str("            _ => None,\n        }\n    }\n\n    pub fn to_number(self) -> i64 {\n        match self {\n");
             for (id, number) in idents.iter().zip(&numbers) {
                 content.push_str(&format!("            Self::{id} => {number},\n"));
             }
@@ -3133,13 +3479,14 @@ fn main() {{
                 "pub ",
                 &format!("encode_{stem}_reply"),
                 &format!("reply: Result<{success}, {error}>"),
-                "(&'static str, Vec<u8>)",
+                "Result<(&'static str, Vec<u8>), CsilCborError>",
             );
-            let mut encoder = format!("{header}    match reply {{\n");
+            let mut encoder = format!("{header}    Ok(match reply {{\n");
             for (index, arm) in arms.iter().enumerate() {
-                let wire = arm.rpc_variant_name().unwrap();
+                let ident = arm.rpc_variant_name().unwrap();
+                let wire = self.declared_name(ident).to_string();
                 let helper = if Self::is_record_ref(arm, records) {
-                    Self::to_snake_case(wire)
+                    Self::to_snake_case(ident)
                 } else if index == 0 {
                     format!("{stem}_response")
                 } else {
@@ -3152,11 +3499,18 @@ fn main() {{
                 } else if arms.len() == 2 {
                     "Err(value)".into()
                 } else {
-                    format!("Err({error}::{}(value))", Self::to_pascal_case(wire))
+                    format!("Err({error}::{}(value))", Self::to_pascal_case(ident))
                 };
-                let expr = format!("({wire:?}, encode_{helper}(&value))");
+                let item = format!("encode_{helper}(&value)?");
+                let inner = format!("{wire:?}, {item}");
+                let expr = format!("({inner})");
                 let line = format!("        {pattern} => {expr},");
-                if line.len() <= 100 {
+                // rustfmt stacks a tuple whose items pass `fn_call_width` (60).
+                if inner.len() > 60 {
+                    encoder.push_str(&format!(
+                        "        {pattern} => (\n            {wire:?},\n            {item},\n        ),\n"
+                    ));
+                } else if line.len() <= 100 {
                     encoder.push_str(&format!("{line}\n"));
                 } else {
                     encoder.push_str(&format!(
@@ -3165,9 +3519,20 @@ fn main() {{
                 }
             }
             out.push_str(&encoder);
-            out.push_str("    }\n}\n\n");
+            out.push_str("    })\n}\n\n");
         }
         Ok(out)
+    }
+
+    /// Whether the client seam carries `call_reply`: some operation has several
+    /// reply arms that the codec can decode.
+    fn spec_has_reply_seam(&self) -> bool {
+        let records = self.record_names();
+        let aliases = self.codec_aliases();
+        self.spec.rpc_operations().any(|(_, _, arms)| {
+            arms.iter()
+                .all(|arm| self.op_boundary_expressible(arm, &records, &aliases))
+        })
     }
 
     fn rpc_client_dispatch(&mut self) -> Result<(String, String, String), String> {
@@ -3189,14 +3554,15 @@ fn main() {{
                 op.name
             ));
             for (i, arm) in arms.iter().enumerate() {
-                let wire = arm.rpc_variant_name().unwrap();
+                let ident = arm.rpc_variant_name().unwrap();
+                let wire = self.declared_name(ident).to_string();
                 if i == 0 {
                     body.push_str(&format!("            Some({wire:?}) => Ok(payload),\n"));
                 } else {
-                    let var = format!("Application{}", Self::to_pascal_case(wire));
+                    let var = format!("Application{}", Self::to_pascal_case(ident));
                     enums.insert(var.clone(), self.map_type_to_rust(arm, &None)?);
                     let suffix = if Self::is_record_ref(arm, &records) {
-                        Self::to_snake_case(wire)
+                        Self::to_snake_case(ident)
                     } else {
                         format!("{stem}_error_{i}")
                     };
@@ -3225,7 +3591,8 @@ fn main() {{
     }}
 }}
 
-/// Resolve a status-zero RPC reply before returning its payload to the client.
+/// Resolve a status-zero RPC reply into its success payload or its declared error
+/// arm. Generated clients call it with the reply from `Transport::call_reply`.
 pub fn resolve_rpc_reply(
     service: &str,
     op: &str,
@@ -3338,8 +3705,9 @@ pub fn resolve_rpc_reply(
         // `Transport` trait boilerplate) never references it either.
         let mut body = String::new();
         let (variants, displays, dispatch) = self.rpc_client_dispatch()?;
-        body.push_str(&client_prelude(shape, &variants, &displays));
-        if shape.marker.is_empty() {
+        let reply_seam = !dispatch.is_empty();
+        body.push_str(&client_prelude(shape, &variants, &displays, reply_seam));
+        if shape.marker.is_empty() && !dispatch.is_empty() {
             body.push_str(dispatch.trim_end());
             body.push('\n');
         }
@@ -3458,6 +3826,10 @@ pub fn resolve_rpc_reply(
             }
             let method = Self::to_snake_case(&operation.name);
             let wire_method = &operation.name;
+            let reply_seam = operation.rpc_reply_arms().is_some_and(|arms| {
+                arms.iter()
+                    .all(|arm| self.op_boundary_expressible(arm, &records, &aliases))
+            });
             let output_type = self.map_type_to_rust(&success, &None)?;
             let stem = self.op_codec_stem(name, &operation.name);
             // A record success reuses its `decode_<t>` wrapper; any other shape uses the
@@ -3488,6 +3860,7 @@ pub fn resolve_rpc_reply(
                     wire_method,
                     "&[]",
                     dot_await,
+                    reply_seam,
                 ));
             } else {
                 let input_type = self.map_type_to_rust(&operation.input_type, &None)?;
@@ -3507,11 +3880,27 @@ pub fn resolve_rpc_reply(
                     Some(&input_type),
                     &output_type,
                 ));
+                // The request is encoded before the transport call, so a value
+                // with no wire form never reaches the carrier.
+                content.push_str(&format!(
+                    "        let csil_req = match {req_enc}(&req) {{\n\
+                     \x20           Ok(csil_bytes) => csil_bytes,\n\
+                     \x20           Err(e) => return Err(ClientError::Encode(e.to_string())),\n\
+                     \x20       }};\n"
+                ));
                 content.push_str(&Self::rust_client_call(
                     wire_service,
                     wire_method,
-                    &format!("&{req_enc}(&req)"),
+                    "&csil_req",
                     dot_await,
+                    reply_seam,
+                ));
+            }
+            if reply_seam {
+                content.push_str(&Self::rust_resolve_reply(
+                    wire_service,
+                    wire_method,
+                    !shape.marker.is_empty(),
                 ));
             }
             let error_kind = if operation.rpc_reply_arms().is_some() {
@@ -3678,7 +4067,25 @@ pub fn resolve_rpc_reply(
     /// field's mapped type). `by_ref` marks `expr` as already a `&T` reference (a
     /// closure binding); otherwise it is an owned place (`csil_v.field`) the scalar
     /// constructors copy and the reference constructors borrow. Composites recurse
-    /// through the generic `cbor_enc_array`/`cbor_enc_map` runtime helpers.
+    /// through the generic `cbor_enc_array`/`cbor_enc_map` runtime helpers. A
+    /// fallible part ends in `?`, so the caller must emit the expression inside a
+    /// function that returns `Result<_, CsilCborError>`.
+    /// The CDDL prelude names a few constants as types (`true = #7.21`). Each one
+    /// goes through the literal codec, so `literal_true: true` writes 0xf5 and not
+    /// null. `undefined` reads and writes as null, the same as every other target.
+    fn prelude_literal(ty: &CsilTypeExpression) -> Option<CsilTypeExpression> {
+        let CsilTypeExpression::Builtin(name) = Self::value_base(ty) else {
+            return None;
+        };
+        let literal = match name.as_str() {
+            "true" => CsilLiteralValue::Bool(true),
+            "false" => CsilLiteralValue::Bool(false),
+            "null" | "nil" | "undefined" => CsilLiteralValue::Null,
+            _ => return None,
+        };
+        Some(CsilTypeExpression::Literal(literal))
+    }
+
     fn rust_enc_value(
         &self,
         ty: &CsilTypeExpression,
@@ -3711,6 +4118,9 @@ pub fn resolve_rpc_reply(
                 RustExpr::Atom(format!("&{expr}"))
             }
         };
+        if let Some(literal) = Self::prelude_literal(ty) {
+            return self.rust_enc_value(&literal, expr, by_ref, records, aliases);
+        }
         match Self::value_base(ty) {
             CsilTypeExpression::Builtin(name) => match name.as_str() {
                 "int" | "nint" => scalar("cbor_int"),
@@ -3719,16 +4129,17 @@ pub fn resolve_rpc_reply(
                 "bool" => scalar("cbor_bool"),
                 "text" | "tstr" => refed("cbor_text"),
                 "bytes" | "bstr" => refed("cbor_bytes"),
-                "date" => refed("csil_enc_date"),
-                "timestamp" => refed("csil_enc_timestamp"),
-                "decimal" => refed("csil_enc_decimal"),
+                "date" => RustExpr::try_(refed("csil_enc_date")),
+                "timestamp" => RustExpr::try_(refed("csil_enc_timestamp")),
+                "cddl_time" => RustExpr::try_(refed("csil_enc_cddl_time")),
+                "decimal" => RustExpr::try_(refed("csil_enc_decimal")),
                 "null" | "nil" => RustExpr::Atom("CsilCborValue::Null".to_string()),
                 // `any` already is a CBOR value tree; carry it through by clone.
                 "any" => RustExpr::Atom(format!("{expr}.clone()")),
                 _ => RustExpr::Atom("CsilCborValue::Null".to_string()),
             },
             CsilTypeExpression::Reference(name) if records.contains(name) => {
-                refed(&format!("csil_enc_{}", Self::to_snake_case(name)))
+                RustExpr::try_(refed(&format!("csil_enc_{}", Self::to_snake_case(name))))
             }
             // A reference to a transparent alias (`StringInt64Map = {* text => int}`,
             // `Tags = [* text]`, `Uuid = text`) has no codec of its own; encode it as
@@ -3739,7 +4150,7 @@ pub fn resolve_rpc_reply(
             }
             // A named type-choice (enum or union) has its own value-tree codec.
             CsilTypeExpression::Reference(name) if self.type_choice(name).is_some() => {
-                refed(&format!("csil_enc_{}", Self::to_snake_case(name)))
+                RustExpr::try_(refed(&format!("csil_enc_{}", Self::to_snake_case(name))))
             }
             CsilTypeExpression::Array { element_type, .. } => {
                 let elem = match self.rust_enc_func(element_type, records, aliases) {
@@ -3747,27 +4158,27 @@ pub fn resolve_rpc_reply(
                     None => {
                         let inner =
                             self.rust_enc_value(element_type, "csil_elem", true, records, aliases);
-                        RustExpr::closure("|csil_elem|", inner)
+                        RustExpr::enc_closure("|csil_elem|", inner)
                     }
                 };
-                RustExpr::call("cbor_enc_array", vec![as_ref(), elem])
+                RustExpr::try_(RustExpr::call("cbor_enc_array", vec![as_ref(), elem]))
             }
             CsilTypeExpression::Map { key, value, .. } => {
                 let kenc = match self.rust_enc_func(key, records, aliases) {
                     Some(func) => RustExpr::Atom(func),
                     None => {
                         let inner = self.rust_enc_value(key, "csil_mk", true, records, aliases);
-                        RustExpr::closure("|csil_mk|", inner)
+                        RustExpr::enc_closure("|csil_mk|", inner)
                     }
                 };
                 let venc = match self.rust_enc_func(value, records, aliases) {
                     Some(func) => RustExpr::Atom(func),
                     None => {
                         let inner = self.rust_enc_value(value, "csil_mv", true, records, aliases);
-                        RustExpr::closure("|csil_mv|", inner)
+                        RustExpr::enc_closure("|csil_mv|", inner)
                     }
                 };
-                RustExpr::call("cbor_enc_map", vec![as_ref(), kenc, venc])
+                RustExpr::try_(RustExpr::call("cbor_enc_map", vec![as_ref(), kenc, venc]))
             }
             // A fixed-shape tuple maps to a Rust tuple; encode positionally into a CBOR
             // array. An absent optional element is held in place as null so the array
@@ -3832,6 +4243,7 @@ pub fn resolve_rpc_reply(
             CsilTypeExpression::Builtin(name) => match name.as_str() {
                 "date" => Some("csil_enc_date".to_string()),
                 "timestamp" => Some("csil_enc_timestamp".to_string()),
+                "cddl_time" => Some("csil_enc_cddl_time".to_string()),
                 "decimal" => Some("csil_enc_decimal".to_string()),
                 _ => None,
             },
@@ -3895,6 +4307,9 @@ pub fn resolve_rpc_reply(
             RustExpr::LitDec { expected, value } => {
                 format!("cbor_expect_value(csil_v, &{expected})?;\n{pad}Ok({value})")
             }
+            RustExpr::Try(inner) => {
+                format!("{}?", Self::render_expr(inner, indent, col, tail + 1))
+            }
         }
     }
 
@@ -3954,6 +4369,17 @@ pub fn resolve_rpc_reply(
                     out.push_str(&format!("{pad}){closing}"));
                     return out;
                 }
+                // rustfmt folds a trailing `vec![` into the head chain like a call.
+                RustExpr::ArrayVec(elems) => {
+                    let mut out = format!("{heads}CsilCborValue::Array(vec![\n");
+                    for elem in elems {
+                        out.push_str(&pad4);
+                        out.push_str(&Self::render_expr(elem, indent + 4, indent + 4, 1));
+                        out.push_str(",\n");
+                    }
+                    out.push_str(&format!("{pad}]){closing}"));
+                    return out;
+                }
                 other => {
                     let rendered = Self::render_expr(other, indent + 4, indent + 4, 1);
                     return format!("{heads}\n{pad4}{rendered},\n{pad}{closing}");
@@ -4010,36 +4436,43 @@ pub fn resolve_rpc_reply(
         let pad4 = " ".repeat(indent + 4);
         let pad8 = " ".repeat(indent + 8);
         let pad12 = " ".repeat(indent + 12);
+        // A slice pattern, not indexing, takes the elements, so the decoder has
+        // no index that could go out of bounds.
+        let names: Vec<String> = (0..arity).map(|i| format!("csil_e{i}")).collect();
+        let flat_pattern = format!("let [{}] = csil_arr.as_slice() else {{", names.join(", "));
+        let pattern = if indent + flat_pattern.len() <= 100 {
+            flat_pattern
+        } else {
+            let stacked: String = names.iter().map(|n| format!("{pad4}{n},\n")).collect();
+            format!("let [\n{stacked}{pad}] = csil_arr.as_slice() else {{")
+        };
         let mut out = format!(
-            "let csil_arr = match csil_v {{\n\
-             {pad4}CsilCborValue::Array(csil_a) => csil_a,\n\
-             {pad4}_ => {{\n\
-             {pad8}return Err(CsilCborError(\n\
-             {pad12}\"csil cbor: tuple expects an array\".to_string(),\n\
-             {pad8}))\n\
-             {pad4}}}\n\
+            "let CsilCborValue::Array(csil_arr) = csil_v else {{\n\
+             {pad4}return Err(CsilCborError(\n\
+             {pad8}\"csil cbor: tuple expects an array\".to_string(),\n\
+             {pad4}));\n\
              {pad}}};\n\
-             {pad}if csil_arr.len() != {arity} {{\n\
+             {pad}{pattern}\n\
              {pad4}return Err(CsilCborError(format!(\n\
              {pad8}\"csil cbor: tuple expects {arity} elements, got {{}}\",\n\
              {pad8}csil_arr.len()\n\
              {pad4})));\n\
-             {pad}}}\n\
+             {pad}}};\n\
              {pad}Ok((\n"
         );
         for (i, (dec, optional)) in elems.iter().enumerate() {
             out.push_str(&format!("{pad4}{{\n"));
             if *optional {
                 out.push_str(&format!(
-                    "{pad8}if matches!(csil_arr[{i}], CsilCborValue::Null) {{\n\
+                    "{pad8}if matches!(csil_e{i}, CsilCborValue::Null) {{\n\
                      {pad12}None\n\
                      {pad8}}} else {{\n"
                 ));
                 out.push_str(&Self::render_let(indent + 12, "csil_d", dec));
-                out.push_str(&format!("{pad12}Some(csil_d(&csil_arr[{i}])?)\n{pad8}}}\n"));
+                out.push_str(&format!("{pad12}Some(csil_d(csil_e{i})?)\n{pad8}}}\n"));
             } else {
                 out.push_str(&Self::render_let(indent + 8, "csil_d", dec));
-                out.push_str(&format!("{pad8}csil_d(&csil_arr[{i}])?\n"));
+                out.push_str(&format!("{pad8}csil_d(csil_e{i})?\n"));
             }
             out.push_str(&format!("{pad4}}},\n"));
         }
@@ -4076,6 +4509,9 @@ pub fn resolve_rpc_reply(
         records: &HashSet<String>,
         aliases: &HashMap<String, CsilTypeExpression>,
     ) -> RustExpr {
+        if let Some(literal) = Self::prelude_literal(ty) {
+            return self.rust_dec_func(&literal, records, aliases);
+        }
         match Self::value_base(ty) {
             CsilTypeExpression::Builtin(name) => match name.as_str() {
                 "int" | "nint" => RustExpr::Atom("cbor_as_i64".to_string()),
@@ -4088,6 +4524,7 @@ pub fn resolve_rpc_reply(
                 "bytes" | "bstr" => RustExpr::Atom("cbor_as_bytes".to_string()),
                 "date" => RustExpr::Atom("csil_as_date".to_string()),
                 "timestamp" => RustExpr::Atom("csil_as_timestamp".to_string()),
+                "cddl_time" => RustExpr::Atom("csil_as_cddl_time".to_string()),
                 "decimal" => RustExpr::Atom("csil_as_decimal".to_string()),
                 // `any` is the CBOR value tree itself; clone it through.
                 "any" => RustExpr::closure(
@@ -4267,6 +4704,16 @@ pub fn resolve_rpc_reply(
             return one_line;
         }
 
+        // Probed against rustfmt: from a 59-character name on, the struct
+        // literal no longer hangs off `Ok(` and moves to its own lines.
+        if name.len() >= 59 {
+            let mut out = format!("    Ok(\n        {name} {{\n");
+            for member in members {
+                out.push_str(&format!("            {member},\n"));
+            }
+            out.push_str("        },\n    )\n");
+            return out;
+        }
         let mut out = format!("    Ok({name} {{\n");
         for member in members {
             out.push_str(&format!("        {member},\n"));
@@ -4286,15 +4733,12 @@ pub fn resolve_rpc_reply(
         format!("        {pat} => {{\n            {value}\n        }}\n")
     }
 
-    /// The `cbor_encode(&<enc>(<arg>))` wrapper body. Past rustfmt's call width the
-    /// nested single-argument calls flatten into one combined head and only the
-    /// innermost argument drops to its own line.
-    fn rust_encode_wrapper_body(call_head: &str, call_arg: &str) -> String {
-        let one_line = format!("    cbor_encode(&{call_head}({call_arg}))\n");
-        if format!("&{call_head}({call_arg})").len() <= 60 && one_line.trim_end().len() <= 100 {
-            return one_line;
-        }
-        format!("    cbor_encode(&{call_head}(\n        {call_arg},\n    ))\n")
+    /// The body of a public `encode_*` wrapper: the value tree is bound first so
+    /// the `?` of a fallible encoder returns its error before any bytes exist.
+    fn rust_encode_wrapper_body(tree: &RustExpr) -> String {
+        let mut out = Self::render_let(4, "csil_tree", tree);
+        out.push_str("    Ok(cbor_encode(&csil_tree))\n");
+        out
     }
 
     /// A single-parameter fn signature, wrapped param-on-its-own-line once the
@@ -4393,29 +4837,42 @@ pub fn resolve_rpc_reply(
         wire_method: &str,
         request_expr: &str,
         dot_await: &str,
+        reply_seam: bool,
     ) -> String {
+        let (binding, call) = if reply_seam {
+            ("csil_reply", "call_reply")
+        } else {
+            ("csil_resp", "call")
+        };
+        // Widest argument list for each layout, probed against rustfmt per seam:
+        // (sync one line, sync chain, sync visual, async one line).
+        let (one, chain, visual, async_one) = if reply_seam {
+            (31, 44, 57, 25)
+        } else {
+            (37, 51, 60, 31)
+        };
         let args = format!("\"{wire_service}\", \"{wire_method}\", {request_expr}");
         let arg_width = args.len();
         if dot_await.is_empty() {
-            if arg_width + 22 <= 60 {
-                return format!("        let csil_resp = self.transport.call({args})?;\n");
+            if arg_width <= one {
+                return format!("        let {binding} = self.transport.{call}({args})?;\n");
             }
-            if arg_width + 9 <= 60 {
+            if arg_width <= chain {
                 return format!(
-                    "        let csil_resp = self\n\
+                    "        let {binding} = self\n\
                      \x20           .transport\n\
-                     \x20           .call({args})?;\n"
+                     \x20           .{call}({args})?;\n"
                 );
             }
-            if arg_width <= 60 {
+            if arg_width <= visual {
                 return format!(
-                    "        let csil_resp =\n\
+                    "        let {binding} =\n\
                      \x20           self.transport\n\
-                     \x20               .call({args})?;\n"
+                     \x20               .{call}({args})?;\n"
                 );
             }
             return format!(
-                "        let csil_resp = self.transport.call(\n\
+                "        let {binding} = self.transport.{call}(\n\
                  \x20           \"{wire_service}\",\n\
                  \x20           \"{wire_method}\",\n\
                  \x20           {request_expr},\n\
@@ -4423,26 +4880,51 @@ pub fn resolve_rpc_reply(
             );
         }
 
-        if arg_width + 29 <= 60 {
-            return format!("        let csil_resp = self.transport.call({args}).await?;\n");
+        if arg_width <= async_one {
+            return format!("        let {binding} = self.transport.{call}({args}).await?;\n");
         }
         if arg_width <= 60 {
             return format!(
-                "        let csil_resp = self\n\
+                "        let {binding} = self\n\
                  \x20           .transport\n\
-                 \x20           .call({args})\n\
+                 \x20           .{call}({args})\n\
                  \x20           .await?;\n"
             );
         }
         format!(
-            "        let csil_resp = self\n\
+            "        let {binding} = self\n\
              \x20           .transport\n\
-             \x20           .call(\n\
+             \x20           .{call}(\n\
              \x20               \"{wire_service}\",\n\
              \x20               \"{wire_method}\",\n\
              \x20               {request_expr},\n\
              \x20           )\n\
              \x20           .await?;\n"
+        )
+    }
+
+    /// The statement that turns a `call_reply` result into the success payload or
+    /// the declared error arm, laid out as rustfmt lays out the call.
+    fn rust_resolve_reply(wire_service: &str, wire_method: &str, twin: bool) -> String {
+        let func = if twin {
+            "super::client::resolve_rpc_reply"
+        } else {
+            "resolve_rpc_reply"
+        };
+        let args = format!(
+            "\"{wire_service}\", \"{wire_method}\", csil_reply.variant.as_deref(), csil_reply.payload"
+        );
+        let line = format!("        let csil_resp = {func}({args})?;");
+        if args.len() <= 60 && line.len() <= 100 {
+            return format!("{line}\n");
+        }
+        format!(
+            "        let csil_resp = {func}(\n\
+             \x20           \"{wire_service}\",\n\
+             \x20           \"{wire_method}\",\n\
+             \x20           csil_reply.variant.as_deref(),\n\
+             \x20           csil_reply.payload,\n\
+             \x20       )?;\n"
         )
     }
 
@@ -4498,10 +4980,10 @@ pub fn resolve_rpc_reply(
             "",
             &format!("csil_enc_{snake}"),
             &format!("{value_param}: &{name}"),
-            "CsilCborValue",
+            "Result<CsilCborValue, CsilCborError>",
         ));
         if named.is_empty() {
-            out.push_str("    CsilCborValue::Map(Vec::new())\n}\n\n");
+            out.push_str("    Ok(CsilCborValue::Map(Vec::new()))\n}\n\n");
         } else {
             out.push_str(&format!(
                 "    let mut csil_entries: Vec<(CsilCborValue, CsilCborValue)> = Vec::with_capacity({});\n",
@@ -4530,7 +5012,7 @@ pub fn resolve_rpc_reply(
                     out.push_str(&Self::rust_push_entry(4, &wire_lit, &enc));
                 }
             }
-            out.push_str("    CsilCborValue::Map(csil_entries)\n}\n\n");
+            out.push_str("    Ok(CsilCborValue::Map(csil_entries))\n}\n\n");
         }
 
         out.push_str(&format!(
@@ -4599,12 +5081,14 @@ pub fn resolve_rpc_reply(
             "pub ",
             &format!("encode_{snake}"),
             &format!("csil_v: &{name}"),
-            "Vec<u8>",
+            "Result<Vec<u8>, CsilCborError>",
         ));
-        out.push_str(&Self::rust_encode_wrapper_body(
-            &format!("csil_enc_{snake}"),
-            "csil_v",
-        ));
+        out.push_str(&Self::rust_encode_wrapper_body(&RustExpr::try_(
+            RustExpr::call(
+                &format!("csil_enc_{snake}"),
+                vec![RustExpr::Atom("csil_v".into())],
+            ),
+        )));
         out.push_str("}\n\n");
         out.push_str(&format!(
             "/// Decode canonical CSIL CBOR bytes into a {name}.\n"
@@ -4685,13 +5169,21 @@ pub fn resolve_rpc_reply(
         out.push_str(&format!(
             "/// Encode the {helper} payload to canonical CSIL CBOR bytes.\n"
         ));
+        // clippy's `ptr_arg` rejects `&Vec<T>`; `&Vec<T>` callers coerce to a slice.
+        let param = match rust_type
+            .strip_prefix("Vec<")
+            .and_then(|rest| rest.strip_suffix('>'))
+        {
+            Some(element) => format!("csil_v: &[{element}]"),
+            None => format!("csil_v: &{rust_type}"),
+        };
         out.push_str(&Self::rust_sig(
             "pub ",
             &format!("encode_{helper}"),
-            &format!("csil_v: &{rust_type}"),
-            "Vec<u8>",
+            &param,
+            "Result<Vec<u8>, CsilCborError>",
         ));
-        out.push_str(&Self::rust_op_encode_body(&enc));
+        out.push_str(&Self::rust_encode_wrapper_body(&enc));
         out.push_str("}\n\n");
         out.push_str(&format!(
             "/// Decode canonical CSIL CBOR bytes into the {helper} payload.\n"
@@ -4704,28 +5196,6 @@ pub fn resolve_rpc_reply(
         out.push_str(&decode_binding);
         out.push_str("    csil_decode(&csil_root)\n}\n\n");
         Ok(out)
-    }
-
-    /// The op-codec `cbor_encode(&<enc>)` body: the borrow rides the encoder's
-    /// head so the nested single-argument flattening sees one chain.
-    fn rust_op_encode_body(enc: &RustExpr) -> String {
-        let borrowed = match enc.clone() {
-            RustExpr::Call {
-                head,
-                args,
-                macro_like,
-            } => RustExpr::Call {
-                head: format!("&{head}"),
-                args,
-                macro_like,
-            },
-            RustExpr::Atom(s) => RustExpr::Atom(format!("&{s}")),
-            // An op-boundary encoder root is always a call or an atom.
-            other => other,
-        };
-        let whole = RustExpr::call("cbor_encode", vec![borrowed]);
-        let rendered = Self::render_expr(&whole, 4, 4, 0);
-        format!("    {rendered}\n")
     }
 
     /// Emit the value-tree codec (`csil_enc_<t>`/`csil_dec_<t>`) for a named
@@ -4759,10 +5229,10 @@ pub fn resolve_rpc_reply(
                 "",
                 &format!("csil_enc_{snake}"),
                 &format!("csil_v: &{name}"),
-                "CsilCborValue",
+                "Result<CsilCborValue, CsilCborError>",
             ));
             if csilgen_common::enum_numbers(choices).is_some() {
-                out.push_str("    cbor_int(csil_v.to_number())\n}\n\n");
+                out.push_str("    Ok(cbor_int(csil_v.to_number()))\n}\n\n");
                 out.push_str(&Self::rust_fn_header(
                     &format!("csil_dec_{snake}"),
                     "csil_v",
@@ -4771,7 +5241,7 @@ pub fn resolve_rpc_reply(
                 out.push_str(&format!("    let number = cbor_as_i64(csil_v)?;\n    {name}::from_number(number)\n        .ok_or_else(|| CsilCborError(format!(\"csil cbor: unknown {name} value {{number}}\")))\n}}\n\n"));
                 return out;
             }
-            out.push_str("    match csil_v {\n");
+            out.push_str("    Ok(match csil_v {\n");
             let all_text = lits
                 .iter()
                 .all(|lit| matches!(lit, CsilLiteralValue::Text(_)));
@@ -4779,7 +5249,7 @@ pub fn resolve_rpc_reply(
                 let value = Self::rust_literal_cbor_expr(lit);
                 out.push_str(&Self::rust_match_arm(&format!("{name}::{ident}"), &value));
             }
-            out.push_str("    }\n}\n\n");
+            out.push_str("    })\n}\n\n");
 
             // Decode: read the bare scalar and match it back to the variant. A
             // uniform-kind vocabulary (all-text or all-int — the overwhelming
@@ -4853,11 +5323,12 @@ pub fn resolve_rpc_reply(
             "",
             &format!("csil_enc_{snake}"),
             &format!("csil_v: &{name}"),
-            "CsilCborValue",
+            "Result<CsilCborValue, CsilCborError>",
         ));
-        out.push_str("    match csil_v {\n");
+        out.push_str("    Ok(match csil_v {\n");
         for (i, choice) in choices.iter().enumerate() {
             let enc = self.rust_enc_value(choice, "csil_x", true, records, aliases);
+            let binds = enc.mentions("csil_x");
             let value = RustExpr::ArrayVec(vec![
                 RustExpr::Atom(format!("CsilCborValue::Uint({i})")),
                 enc,
@@ -4866,7 +5337,7 @@ pub fn resolve_rpc_reply(
             // see `choice_arm_literal`) encodes its constant, never the binding —
             // bind `_` so the generated match arm carries no unused-variable
             // warning.
-            let binding = if choice_arm_literal(choice).is_some() {
+            let binding = if choice_arm_literal(choice).is_some() || !binds {
                 "_"
             } else {
                 "csil_x"
@@ -4923,7 +5394,7 @@ pub fn resolve_rpc_reply(
                 }
             }
         }
-        out.push_str("    }\n}\n\n");
+        out.push_str("    })\n}\n\n");
 
         out.push_str(&format!(
             "/// Decode a tagged sum `[variant_index, value]` into a {name} union.\n"
@@ -4933,22 +5404,21 @@ pub fn resolve_rpc_reply(
             "csil_v",
             name,
         ));
+        // A slice pattern, not indexing, takes the two elements, so the decoder
+        // has no index that could go out of bounds.
         out.push_str(
-            "    let csil_arr = match csil_v {\n\
-             \x20       CsilCborValue::Array(csil_a) => csil_a,\n\
-             \x20       _ => {\n\
-             \x20           return Err(CsilCborError(\n\
-             \x20               \"csil cbor: union expects a 2-element array\".to_string(),\n\
-             \x20           ))\n\
-             \x20       }\n\
+            "    let CsilCborValue::Array(csil_arr) = csil_v else {\n\
+             \x20       return Err(CsilCborError(\n\
+             \x20           \"csil cbor: union expects a 2-element array\".to_string(),\n\
+             \x20       ));\n\
              \x20   };\n\
-             \x20   if csil_arr.len() != 2 {\n\
+             \x20   let [csil_tag, csil_payload] = csil_arr.as_slice() else {\n\
              \x20       return Err(CsilCborError(format!(\n\
              \x20           \"csil cbor: union array has {} elements, expected 2\",\n\
              \x20           csil_arr.len()\n\
              \x20       )));\n\
-             \x20   }\n\
-             \x20   let csil_idx = cbor_as_u64(&csil_arr[0])?;\n\
+             \x20   };\n\
+             \x20   let csil_idx = cbor_as_u64(csil_tag)?;\n\
              \x20   match csil_idx {\n",
         );
         for (i, choice) in choices.iter().enumerate() {
@@ -4964,20 +5434,20 @@ pub fn resolve_rpc_reply(
             // name lengths — it is not simply `max_width`(100) or
             // `fn_call_width`(60), so the two breakpoints below (76, 90) are
             // empirical for this one shape, not general-purpose constants.
-            let flat = format!("            Ok({name}::Variant{i}(csil_decode(&csil_arr[1])?))\n");
+            let flat = format!("            Ok({name}::Variant{i}(csil_decode(csil_payload)?))\n");
             let flat_len = flat.trim_end().len();
             if flat_len <= 76 {
                 out.push_str(&flat);
             } else if flat_len <= 90 {
                 out.push_str(&format!(
                     "            Ok({name}::Variant{i}(csil_decode(\n\
-                     \x20               &csil_arr[1],\n\
+                     \x20               csil_payload,\n\
                      \x20           )?))\n"
                 ));
             } else {
                 out.push_str(&format!(
                     "            Ok({name}::Variant{i}(\n\
-                     \x20               csil_decode(&csil_arr[1])?,\n\
+                     \x20               csil_decode(csil_payload)?,\n\
                      \x20           ))\n"
                 ));
             }
@@ -4996,7 +5466,12 @@ pub fn resolve_rpc_reply(
     /// the codec can model.
     fn generate_codec(&mut self) -> Result<Option<String>, String> {
         let records = self.record_names();
-        if records.is_empty() && self.spec.rpc_operations().next().is_none() {
+        // `any` maps to `crate::codec::CsilCborValue`, so an alias-only spec that
+        // mentions it still needs the codec module for `types.rs` to compile.
+        if records.is_empty()
+            && self.spec.rpc_operations().next().is_none()
+            && !self.spec_uses_builtin("any")
+        {
             return Ok(None);
         }
         let aliases = self.codec_aliases();
@@ -5016,8 +5491,12 @@ pub fn resolve_rpc_reply(
         // calls after a sized `Vec` (capacity matches the field count); the
         // optional-field case interleaves conditional pushes, so one canonical shape
         // is kept rather than special-casing each record.
-        content.push_str("#![allow(dead_code, clippy::vec_init_then_push)]\n\n");
-        content.push_str("use super::types::*;\n\n");
+        // A `null` field has the unit type, and the record decoder binds every
+        // field with the same `let`, so clippy's `let_unit_value` is expected.
+        content.push_str(
+            "#![allow(dead_code, clippy::vec_init_then_push, clippy::let_unit_value)]\n\n",
+        );
+        let use_at = content.len();
 
         content.push_str(CODEC_RUNTIME_RUST);
         content.push_str("\n\n");
@@ -5026,8 +5505,14 @@ pub fn resolve_rpc_reply(
             content.push_str(CODEC_DATE_RUST);
             content.push_str("\n\n");
         }
-        if self.spec_uses_builtin("timestamp") {
+        // A `cddl_time` bound is RFC 3339 text, so its validation needs the
+        // timestamp parser even when the spec has no `timestamp` field.
+        if self.spec_uses_builtin("timestamp") || self.spec_uses_builtin("cddl_time") {
             content.push_str(CODEC_TIMESTAMP_RUST);
+            content.push_str("\n\n");
+        }
+        if self.spec_uses_builtin("cddl_time") {
+            content.push_str(CODEC_CDDL_TIME_RUST);
             content.push_str("\n\n");
         }
         if self.spec_uses_builtin("decimal") {
@@ -5040,6 +5525,7 @@ pub fn resolve_rpc_reply(
             content.push_str("\n\n");
         }
 
+        let typed_at = content.len();
         for rule in &self.spec.rules {
             let group = match &rule.rule_type {
                 CsilRuleType::GroupDef(g) => Some(g),
@@ -5069,6 +5555,11 @@ pub fn resolve_rpc_reply(
         content.push_str(&self.emit_op_codecs(&records, &aliases)?);
 
         content.push_str(&self.rpc_codecs(&records, &aliases)?);
+        // A spec of aliases only gets the runtime for `any` and no per-type codec,
+        // so the import would be unused.
+        if content.len() > typed_at {
+            content.insert_str(use_at, "use super::types::*;\n\n");
+        }
         Ok(Some(content))
     }
 
@@ -5442,7 +5933,9 @@ pub fn resolve_rpc_reply(
             );
             if is_null_input(&op.output_type) {
                 content.push_str(&doc);
-                content.push_str(&format!("pub fn {fn_name}() -> (String, Vec<u8>) {{\n"));
+                content.push_str(&format!(
+                    "pub fn {fn_name}() -> Result<(String, Vec<u8>), CsilCborError> {{\n"
+                ));
                 content.push_str(&Self::rust_wire_tuple(wire, "Vec::new()"));
                 content.push_str("}\n");
                 continue;
@@ -5460,23 +5953,23 @@ pub fn resolve_rpc_reply(
                 "pub ",
                 &fn_name,
                 &format!("msg: &{output_type}"),
-                "(String, Vec<u8>)",
+                "Result<(String, Vec<u8>), CsilCborError>",
             ));
-            content.push_str(&Self::rust_wire_tuple(wire, &format!("{encode_fn}(msg)")));
+            content.push_str(&Self::rust_wire_tuple(wire, &format!("{encode_fn}(msg)?")));
             content.push_str("}\n");
         }
         Ok(content)
     }
 
-    /// The `("Wire".to_string(), <bytes expr>)` body of a channel encoder; the
-    /// tuple stacks one element per line past rustfmt's width.
+    /// The `Ok(("Wire".to_string(), <bytes expr>))` body of a channel encoder;
+    /// the tuple stacks one element per line past rustfmt's width.
     fn rust_wire_tuple(wire: &str, bytes_expr: &str) -> String {
         let inner = format!("\"{wire}\".to_string(), {bytes_expr}");
-        let one_line = format!("    ({inner})\n");
+        let one_line = format!("    Ok(({inner}))\n");
         if inner.len() <= 60 && one_line.trim_end().len() <= 100 {
             return one_line;
         }
-        format!("    (\n        \"{wire}\".to_string(),\n        {bytes_expr},\n    )\n")
+        format!("    Ok((\n        \"{wire}\".to_string(),\n        {bytes_expr},\n    ))\n")
     }
 
     fn generate_lib_file(&mut self, files: &[GeneratedFile]) -> Result<String, String> {
@@ -5685,13 +6178,16 @@ pub fn resolve_rpc_reply(
             "date" => "time::Date".to_string(),
             // A UTC-typed instant; the tag-0 RFC3339 wire form is the codec's job.
             "timestamp" => "time::OffsetDateTime".to_string(),
+            // The same instant type as `timestamp`; only the tag-1 wire form differs.
+            "cddl_time" => "time::OffsetDateTime".to_string(),
             // The injected `CsilDecimal` holds the exact tag-4 value by default;
             // `decimal_mapping = "library"` swaps in `rust_decimal::Decimal`.
             "decimal" => match self.decimal_mapping {
                 DecimalMapping::Csil => "CsilDecimal".to_string(),
                 DecimalMapping::Library => "rust_decimal::Decimal".to_string(),
             },
-            "null" => "()".to_string(),
+            "true" | "false" => "bool".to_string(),
+            "null" | "nil" | "undefined" => "()".to_string(),
             // `any` is carried as the codec's own CBOR value tree so it round-trips
             // losslessly without a serde dependency.
             "any" => "crate::codec::CsilCborValue".to_string(),
@@ -6059,11 +6555,12 @@ pub fn resolve_rpc_reply(
         };
         Some(format!(
             "            {{\n\
-             \x20               let bound = super::codec::csil_parse_timestamp({text:?})\n\
-             \x20                   .map_err(|e| ValidationError {{\n\
-             \x20                       field: {field:?}.to_string(),\n\
-             \x20                       message: format!(\"invalid timestamp bound: {{e}}\"),\n\
-             \x20                   }})?;\n\
+             \x20               let text = {text:?};\n\
+             \x20               let bound = super::codec::csil_parse_timestamp(text);\n\
+             \x20               let bound = bound.map_err(|e| ValidationError {{\n\
+             \x20                   field: {field:?}.to_string(),\n\
+             \x20                   message: format!(\"invalid timestamp bound: {{e}}\"),\n\
+             \x20               }})?;\n\
              \x20               if *v {fail_op} bound {{\n\
              \x20                   return Err(ValidationError {{\n\
              \x20                       field: {field:?}.to_string(),\n\
@@ -6247,7 +6744,7 @@ pub fn resolve_rpc_reply(
     }
 
     fn is_timestamp_shape(base: &CsilTypeExpression) -> bool {
-        matches!(base, CsilTypeExpression::Builtin(n) if n == "timestamp")
+        matches!(base, CsilTypeExpression::Builtin(n) if n == "timestamp" || n == "cddl_time")
     }
 
     /// Whether any rule in the spec references the named builtin anywhere in its
@@ -6381,11 +6878,19 @@ mod tests {
 
     #[test]
     fn decoder_checks_declared_lengths_before_conversion_or_allocation() {
+        // Byte and text strings take their bytes through the bounds-checked
+        // `cbor_take`; arrays and maps check the declared length first.
         assert_eq!(
             CODEC_RUNTIME_RUST
-                .matches("if arg > (b.len() - *pos) as u64 {")
+                .matches("if arg > b.len().saturating_sub(*pos) as u64 {")
                 .count(),
-            4
+            2
+        );
+        assert_eq!(
+            CODEC_RUNTIME_RUST
+                .matches("cbor_take(b, *pos, arg)")
+                .count(),
+            2
         );
         assert_eq!(
             CODEC_RUNTIME_RUST
@@ -6773,11 +7278,13 @@ mod tests {
         ));
         // The client encodes the request, calls over the byte seam, then decodes.
         // service/op are the verbatim CSIL names (docs/cbor-wire-contract.md
-        // "RPC call naming") — no suffix stripping, no case change. The longer
-        // "CorndogsService" pushes past the flat-arg width, so rustfmt's ladder
-        // stacks each argument on its own line.
+        // "RPC call naming") — no suffix stripping, no case change. The request is
+        // encoded first; an encode error returns before the transport call.
         assert!(client.content.contains(
-            "let csil_resp = self.transport.call(\n            \"CorndogsService\",\n            \"SubmitTask\",\n            &encode_submit_task_request(&req),\n        )?;"
+            "let csil_req = match encode_submit_task_request(&req) {\n            Ok(csil_bytes) => csil_bytes,\n            Err(e) => return Err(ClientError::Encode(e.to_string())),\n        };"
+        ));
+        assert!(client.content.contains(
+            "let csil_resp = self\n            .transport\n            .call(\"CorndogsService\", \"SubmitTask\", &csil_req)?;"
         ));
         assert!(
             client
@@ -6922,12 +7429,12 @@ mod tests {
         assert!(!client.content.contains("handle it manually"));
 
         // The record boundary keeps its `encode_<t>`/`decode_<t>` wrapper byte-for-byte.
-        assert!(client.content.contains("&encode_member(&req)"));
+        assert!(client.content.contains("match encode_member(&req) {"));
         // Non-record boundaries ride the op's per-op helpers.
         assert!(
             client
                 .content
-                .contains("&encode_member_get_member_request(&req)")
+                .contains("match encode_member_get_member_request(&req) {")
         );
         assert!(
             client
@@ -6951,15 +7458,15 @@ mod tests {
             "pub fn decode_member_get_member_request(csil_data: &[u8]) -> Result<MemberID, CsilCborError>"
         ));
         assert!(codec.content.contains(
-            "pub fn encode_member_list_members_response(csil_v: &Vec<Member>) -> Vec<u8>"
+            "pub fn encode_member_list_members_response(csil_v: &[Member]) -> Result<Vec<u8>, CsilCborError>"
         ));
         assert!(
             codec
                 .content
-                .contains("pub fn encode_member_delete_task_response(csil_v: &bool) -> Vec<u8>")
+                .contains("pub fn encode_member_delete_task_response(csil_v: &bool) -> Result<Vec<u8>, CsilCborError>")
         );
         assert!(codec.content.contains(
-            "pub fn encode_member_member_names_response(\n    csil_v: &std::collections::HashMap<String, String>,\n) -> Vec<u8> {"
+            "pub fn encode_member_member_names_response(\n    csil_v: &std::collections::HashMap<String, String>,\n) -> Result<Vec<u8>, CsilCborError> {"
         ));
         // The record op needs no per-op helper (its record codec already covers it).
         assert!(
@@ -7010,12 +7517,14 @@ mod tests {
         assert!(twin.content.contains(
             "pub async fn submit_task(\n        &self,\n        req: SubmitTaskRequest,\n    ) -> Result<SubmitTaskResponse, ClientError> {"
         ));
-        // The seam is awaited before its `?`. service/op are verbatim CSIL names;
-        // the longer "CorndogsService" pushes past the flat-arg width so
-        // rustfmt's ladder stacks each argument on its own line.
+        // The seam is awaited before its `?`. service/op are verbatim CSIL names.
         assert!(twin.content.contains(
-            ".call(\n                \"CorndogsService\",\n                \"SubmitTask\",\n                &encode_submit_task_request(&req),\n            )\n            .await?;"
+            ".call(\"CorndogsService\", \"SubmitTask\", &csil_req)\n            .await?;"
         ));
+        assert!(
+            twin.content
+                .contains("let csil_req = match encode_submit_task_request(&req) {")
+        );
         // The twin must not redefine the shared error type.
         assert!(!twin.content.contains("pub enum ClientError"));
 
@@ -7026,6 +7535,65 @@ mod tests {
             .expect("mod.rs emitted");
         assert!(root.content.contains("pub mod client;"));
         assert!(root.content.contains("pub mod client_async;"));
+    }
+
+    #[test]
+    fn multi_arm_ops_ride_the_call_reply_seam_in_both_clients() {
+        // `submit-task` declares `SubmitTaskResponse / ServiceError`, so the client
+        // needs the reply variant to tell the arms apart once the codec models both.
+        let mut input = make_unary_service_input("rust-client");
+        input
+            .csil_spec
+            .rules
+            .push(group_rule("ServiceError", "message", "text"));
+        let files = RustCodeGenerator::new(&input).generate().unwrap();
+        let file = |path: &str| {
+            files
+                .iter()
+                .find(|f| f.path == path)
+                .unwrap_or_else(|| panic!("{path} emitted"))
+                .content
+                .clone()
+        };
+        let sync = file("client.rs");
+        assert!(sync.contains("pub struct WireReply {"));
+        assert!(sync.contains(
+            "    fn call_reply(&self, service: &str, op: &str, req: &[u8]) -> Result<WireReply, ClientError>;"
+        ));
+        assert!(sync.contains(".call_reply("));
+        assert!(sync.contains("let csil_resp = resolve_rpc_reply(\n"));
+        assert!(sync.contains("csil_reply.variant.as_deref(),"));
+        assert!(!sync.contains(".call("));
+
+        let twin = file("client_async.rs");
+        assert!(!twin.contains("pub struct WireReply"));
+        assert!(twin.contains("    async fn call_reply(\n"));
+        assert!(twin.contains(") -> Result<super::client::WireReply, ClientError>;"));
+        assert!(twin.contains("let csil_resp = super::client::resolve_rpc_reply(\n"));
+        assert!(twin.contains(".call_reply("));
+    }
+
+    #[test]
+    fn single_arm_specs_keep_the_plain_call_seam() {
+        let files = RustCodeGenerator::new(&transports_input())
+            .generate()
+            .unwrap();
+        for path in ["src/client.rs", "src/client_async.rs"] {
+            let client = &files
+                .iter()
+                .find(|f| f.path == path)
+                .unwrap_or_else(|| panic!("{path} emitted"))
+                .content;
+            assert!(!client.contains("call_reply"), "{path}:\n{client}");
+            assert!(!client.contains("WireReply"), "{path}:\n{client}");
+            assert!(!client.contains("resolve_rpc_reply"), "{path}:\n{client}");
+        }
+        let readme = &files
+            .iter()
+            .find(|f| f.path == "genquickstart.md")
+            .expect("genquickstart.md emitted")
+            .content;
+        assert!(!readme.contains("call_reply"));
     }
 
     #[test]
@@ -7287,13 +7855,13 @@ mod tests {
             codec.contains(
                 "NotificationAPI_delete_notification_response::Variant0(csil_x) => {\n            \
                  CsilCborValue::Array(vec![\n                CsilCborValue::Uint(0),\n                \
-                 csil_enc_delete_response(csil_x),\n            ])\n        }\n"
+                 csil_enc_delete_response(csil_x)?,\n            ])\n        }\n"
             ),
             "long hoisted-choice union arm should render the array fully multi-line:\n{codec}"
         );
         assert!(
             !codec.contains(
-                "CsilCborValue::Array(vec![CsilCborValue::Uint(0), csil_enc_delete_response(csil_x)])"
+                "CsilCborValue::Array(vec![CsilCborValue::Uint(0), csil_enc_delete_response(csil_x)?])"
             ),
             "must not fall back to the flat single-line array inside the braces"
         );
@@ -7445,8 +8013,10 @@ mod tests {
 
         // Outbound encoder for the bidirectional op, over the per-type codec. The
         // wire event name is the CSIL operation name verbatim, not PascalCased.
-        assert!(services.contains("pub fn encode_match_play(msg: &User) -> (String, Vec<u8>)"));
-        assert!(services.contains("(\"play\".to_string(), encode_user(msg))"));
+        assert!(services.contains(
+            "pub fn encode_match_play(msg: &User) -> Result<(String, Vec<u8>), CsilCborError>"
+        ));
+        assert!(services.contains("Ok((\"play\".to_string(), encode_user(msg)?))"));
     }
 
     #[test]
@@ -7474,9 +8044,9 @@ mod tests {
         assert!(!router_block.contains("\"notify\" =>"));
 
         // The encoder for the reverse op (server pushes Output to the client).
-        assert!(
-            services.contains("pub fn encode_callbacks_notify(msg: &User) -> (String, Vec<u8>)")
-        );
+        assert!(services.contains(
+            "pub fn encode_callbacks_notify(msg: &User) -> Result<(String, Vec<u8>), CsilCborError>"
+        ));
     }
 
     #[test]
@@ -7888,7 +8458,11 @@ mod tests {
         // Nested positions: element/value/tuple-slot codecs exist under their
         // synthesized names.
         assert!(codec.contains("fn csil_enc_widget_codes_item(csil_v: &Widget_codes_item)"));
-        assert!(codec.contains("fn csil_enc_widget_labels_value(csil_v: &Widget_labels_value)"));
+        // The fallible return type pushes this signature past rustfmt's width.
+        assert!(
+            codec
+                .contains("fn csil_enc_widget_labels_value(\n    csil_v: &Widget_labels_value,\n)")
+        );
         assert!(codec.contains("fn csil_enc_widget_pair_0(csil_v: &Widget_pair_0)"));
     }
 
@@ -7930,6 +8504,12 @@ mod tests {
     }
 
     #[test]
+    fn self_literal_gets_a_legal_variant_identifier() {
+        let lit = CsilLiteralValue::Text("self".to_string());
+        assert_eq!(RustCodeGenerator::enum_variant_ident(&lit, 0), "Self_");
+    }
+
+    #[test]
     fn mixed_kind_literal_choice_hoists_to_unit_variant_enum() {
         let input = mixed_kind_choice_input();
         let mut generator = RustCodeGenerator::new(&input);
@@ -7947,6 +8527,12 @@ mod tests {
         assert!(types_content.contains("Shipped,"));
         assert!(types_content.contains("V0,"));
         assert!(types_content.contains("V1,"));
+        assert!(
+            types_content.contains(
+                "#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]\npub enum Order_status"
+            ),
+            "a unit-only enum must derive Copy, Eq, and Hash:\n{types_content}"
+        );
         assert!(!types_content.contains("Order_status::Variant"));
         assert!(!types_content.contains("Variant0(String)"));
     }
@@ -7994,12 +8580,10 @@ mod tests {
     }
 
     #[test]
-    fn test_keyless_group_spread_emits_named_field() {
-        // `r = { g, b: bool }` has a keyless entry that spreads group `g`. Rust
-        // cannot inline another struct's fields, so the spread must surface as a
-        // constructible field named after the referenced type rather than being
-        // dropped (which would leave `r` missing the spread) or emitted with a
-        // garbage/empty field name (which would not compile).
+    fn test_keyless_group_spread_splices_the_group_fields() {
+        // `r = { g, b: bool }` has a keyless entry that spreads group `g`. The
+        // schema diagnostic reads `x` as a field of `r` itself, so the shared
+        // splice puts `x` into `r` rather than nesting it under a `g` field.
         let mut input = create_test_input();
         input.csil_spec.rules = vec![
             CsilRule {
@@ -8053,9 +8637,11 @@ mod tests {
         let types_content = generator.generate_types().unwrap();
 
         assert!(types_content.contains("pub struct r {"));
+        let r = &types_content[types_content.find("pub struct r {").unwrap()..];
+        let r = &r[..r.find('}').unwrap()];
         assert!(
-            types_content.contains("pub g: g,"),
-            "group spread must surface as a named field, got:\n{types_content}"
+            r.contains("pub x: i64,") && !r.contains("pub g:"),
+            "the spread must splice `g`'s fields into `r`, got:\n{r}"
         );
         assert!(types_content.contains("pub b: bool,"));
         // A dropped or unnamed spread would leave an empty/garbage field; guard
@@ -8280,6 +8866,200 @@ mod tests {
         input
     }
 
+    fn spec_input(rules: Vec<CsilRule>) -> WasmGeneratorInput {
+        let mut input = create_test_input();
+        input.csil_spec.service_count = rules
+            .iter()
+            .filter(|r| matches!(r.rule_type, CsilRuleType::ServiceDef(_)))
+            .count();
+        input.csil_spec.rules = rules;
+        input
+    }
+
+    fn typedef_rule(name: &str, ty: CsilTypeExpression) -> CsilRule {
+        CsilRule {
+            rule_type: CsilRuleType::TypeDef(ty),
+            ..group_rule(name, "unused", "text")
+        }
+    }
+
+    fn entry(key: Option<&str>, ty: CsilTypeExpression) -> CsilGroupEntry {
+        CsilGroupEntry {
+            key: key.map(|k| CsilGroupKey::Bare(k.to_string())),
+            value_type: ty,
+            occurrence: None,
+            metadata: vec![],
+            doc_comments: Vec::new(),
+        }
+    }
+
+    fn record(entries: Vec<CsilGroupEntry>) -> CsilTypeExpression {
+        CsilTypeExpression::Group(CsilGroupExpression { entries })
+    }
+
+    fn builtin(name: &str) -> CsilTypeExpression {
+        CsilTypeExpression::Builtin(name.to_string())
+    }
+
+    fn generated(input: &WasmGeneratorInput, path: &str) -> String {
+        let files = RustCodeGenerator::new(input).generate().unwrap();
+        files
+            .into_iter()
+            .find(|f| f.path == path)
+            .unwrap_or_else(|| panic!("{path} not generated"))
+            .content
+    }
+
+    /// `arrays-and-maps.csil`: `any` maps to `crate::codec::CsilCborValue`, so a
+    /// spec of aliases only must still get the codec module, without an unused
+    /// `use super::types::*`.
+    #[test]
+    fn alias_only_spec_with_any_gets_the_codec_module() {
+        let input = spec_input(vec![typedef_rule(
+            "metadata",
+            CsilTypeExpression::Map {
+                key: Box::new(builtin("text")),
+                value: Box::new(builtin("any")),
+                occurrence: None,
+            },
+        )]);
+        let codec = generated(&input, "codec.gen.rs");
+        assert!(codec.contains("pub enum CsilCborValue"));
+        assert!(!codec.contains("use super::types::*;"));
+        assert!(generated(&input, "mod.rs").contains("pub mod codec;"));
+    }
+
+    /// `choices-and-unions.csil`: a `nil` union arm writes null and ignores its
+    /// binding, so the arm binds `_` or `-D warnings` fails.
+    #[test]
+    fn nil_union_arm_binds_underscore() {
+        let input = spec_input(vec![
+            typedef_rule(
+                "optional_value",
+                CsilTypeExpression::Choice(vec![builtin("nil"), builtin("text")]),
+            ),
+            typedef_rule(
+                "Holder",
+                record(vec![entry(
+                    Some("value"),
+                    CsilTypeExpression::Reference("optional_value".to_string()),
+                )]),
+            ),
+        ]);
+        let codec = generated(&input, "codec.gen.rs");
+        assert!(codec.contains("optional_value::Variant0(_) =>"), "{codec}");
+        assert!(codec.contains("optional_value::Variant1(csil_x) =>"));
+    }
+
+    /// `descriptor-all-types.csil`: a CDDL rule name like `open-group` becomes a
+    /// legal Rust identifier, but an RPC reply variant keeps the declared name,
+    /// because the wire carries it.
+    #[test]
+    fn hyphenated_rule_names_become_identifiers_but_keep_their_wire_variant() {
+        let mut input = make_unary_service_input("rust");
+        let bad = group_rule("bad-thing", "reason", "text");
+        input.csil_spec.rules.insert(0, bad);
+        let service = input
+            .csil_spec
+            .rules
+            .iter_mut()
+            .find_map(|r| match &mut r.rule_type {
+                CsilRuleType::ServiceDef(service) => Some(service),
+                _ => None,
+            });
+        if let Some(service) = service {
+            service.operations[0].output_type = CsilTypeExpression::Choice(vec![
+                CsilTypeExpression::Reference("SubmitTaskResponse".to_string()),
+                CsilTypeExpression::Reference("bad-thing".to_string()),
+            ]);
+        }
+        let all: String = RustCodeGenerator::new(&input)
+            .generate()
+            .unwrap()
+            .iter()
+            .map(|f| f.content.clone())
+            .collect();
+        assert!(
+            !all.contains("bad-thing {"),
+            "a hyphen reached an identifier"
+        );
+        assert!(all.contains("pub struct bad_thing"));
+        assert!(
+            all.contains("\"bad-thing\""),
+            "the wire variant must stay as declared"
+        );
+    }
+
+    /// `descriptor-all-types.csil`: `{ shared_fields, ... }` splices the group's
+    /// entries, and `$$open-group` reads as the rule `open-group`, the same as
+    /// the schema diagnostic reads them.
+    #[test]
+    fn group_references_and_plugs_splice_into_the_record() {
+        let input = spec_input(vec![
+            typedef_rule(
+                "shared",
+                record(vec![entry(Some("shared_id"), builtin("uint"))]),
+            ),
+            typedef_rule(
+                "open-group",
+                record(vec![entry(Some("open_value"), builtin("uint"))]),
+            ),
+            typedef_rule(
+                "Holder",
+                record(vec![
+                    entry(None, CsilTypeExpression::Reference("shared".to_string())),
+                    entry(None, CsilTypeExpression::Plug("open-group".to_string())),
+                    entry(Some("own"), builtin("text")),
+                ]),
+            ),
+        ]);
+        let types = generated(&input, "types.rs");
+        let holder = &types[types.find("pub struct Holder").unwrap()..];
+        let holder = &holder[..holder.find('}').unwrap()];
+        assert!(holder.contains("pub shared_id: u64"), "{holder}");
+        assert!(holder.contains("pub open_value: u64"), "{holder}");
+        assert!(!holder.contains("pub shared:"), "{holder}");
+        let codec = generated(&input, "codec.gen.rs");
+        assert!(codec.contains("cbor_require(csil_root, \"open_value\")"));
+    }
+
+    /// `descriptor-all-types.csil`: the prelude constants `true`, `false` and
+    /// `undefined` used as types write their CBOR values, not a blind null.
+    #[test]
+    fn prelude_constant_types_use_the_literal_codec() {
+        let input = spec_input(vec![typedef_rule(
+            "Flags",
+            record(vec![
+                entry(Some("yes"), builtin("true")),
+                entry(Some("no"), builtin("false")),
+                entry(Some("gone"), builtin("undefined")),
+            ]),
+        )]);
+        let types = generated(&input, "types.rs");
+        assert!(types.contains("pub yes: bool"));
+        assert!(types.contains("pub gone: ()"));
+        assert!(!types.contains("serde_json"));
+        let codec = generated(&input, "codec.gen.rs");
+        assert!(codec.contains("CsilCborValue::Bool(true)"));
+        assert!(codec.contains("CsilCborValue::Bool(false)"));
+    }
+
+    /// rustfmt folds a trailing `vec![` into a single-argument call chain.
+    #[test]
+    fn single_argument_chain_folds_a_trailing_vec_like_rustfmt() {
+        let expr = RustExpr::call(
+            "Ok",
+            vec![RustExpr::ArrayVec(vec![
+                RustExpr::Atom("cbor_uint(csil_mk.0)".to_string()),
+                RustExpr::Atom("cbor_text(&csil_mk.1)".to_string()),
+            ])],
+        );
+        assert_eq!(
+            RustCodeGenerator::render_expr(&expr, 16, 70, 0),
+            "Ok(CsilCborValue::Array(vec![\n                    cbor_uint(csil_mk.0),\n                    cbor_text(&csil_mk.1),\n                ]))"
+        );
+    }
+
     #[test]
     fn overlong_codec_signatures_wrap_like_rustfmt() {
         // The linkkeys regression: `SignedLocalRpCallbackPayload` pushes the
@@ -8300,7 +9080,7 @@ mod tests {
         assert!(codec.content.contains(
             "fn csil_enc_signed_local_rp_callback_payload(\n\
              \x20   csil_v: &SignedLocalRpCallbackPayload,\n\
-             ) -> CsilCborValue {"
+             ) -> Result<CsilCborValue, CsilCborError> {"
         ));
 
         // A short record name keeps the one-line signature rustfmt would keep.
@@ -8316,9 +9096,9 @@ mod tests {
             .find(|f| f.path == "codec.gen.rs")
             .expect("codec.gen.rs emitted");
         assert!(
-            codec
-                .content
-                .contains("fn csil_enc_user(csil_v: &User) -> CsilCborValue {")
+            codec.content.contains(
+                "fn csil_enc_user(csil_v: &User) -> Result<CsilCborValue, CsilCborError> {"
+            )
         );
     }
 
@@ -8468,6 +9248,444 @@ mod tests {
                 .contains(r#"time = { version = "0.3.47", features = ["formatting", "parsing"] }"#)
         );
         assert!(!root.content.contains("ciborium"));
+    }
+
+    /// Run the shared timestamp vectors through the generated Rust codec with the
+    /// fixture's own peer, so the unit tests and `check.sh rust` hold one rule set.
+    #[test]
+    fn timestamp_codec_passes_shared_vectors() {
+        let probe = std::process::Command::new("cargo")
+            .arg("--version")
+            .output();
+        if probe.map(|o| !o.status.success()).unwrap_or(true) {
+            eprintln!("skipping: no cargo toolchain on PATH");
+            return;
+        }
+        let mut input = single_field_spec(
+            "Stamp",
+            CsilTypeExpression::Builtin("timestamp".to_string()),
+            vec![],
+            None,
+        );
+        if let CsilRuleType::GroupDef(group) = &mut input.csil_spec.rules[0].rule_type {
+            group.entries[0].key = Some(CsilGroupKey::Bare("at".to_string()));
+        }
+        let files = RustCodeGenerator::new(&input).generate().unwrap();
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/interop/timestamp-vectors")
+            .canonicalize()
+            .expect("timestamp fixture exists");
+
+        let dir = std::env::temp_dir().join(format!("csilgen-rust-stamp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let src = dir.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        for file in files.iter().filter(|f| f.path.ends_with(".rs")) {
+            std::fs::write(src.join(&file.path), &file.content).unwrap();
+        }
+        std::fs::copy(fixture.join("peer.rs"), src.join("main.rs")).unwrap();
+        std::fs::write(
+            dir.join("Cargo.toml"),
+            "[package]\nname = \"stamp-check\"\nedition = \"2024\"\nversion = \"0.0.0\"\n\n\
+             [workspace]\n\n[dependencies]\n\
+             time = { version = \"0.3.47\", features = [\"formatting\", \"parsing\"] }\n",
+        )
+        .unwrap();
+        let run = std::process::Command::new("cargo")
+            .args(["run", "--quiet", "--"])
+            .arg(fixture.join("vectors.tsv"))
+            .current_dir(&dir)
+            .env("CARGO_TARGET_DIR", dir.join("target"))
+            .env("CARGO_NET_OFFLINE", "true")
+            .output()
+            .unwrap();
+        assert!(
+            run.status.success(),
+            "timestamp vectors failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Run the shared epoch vectors through the generated Rust codec with the
+    /// fixture's own peer, so the unit tests and `check.sh rust` hold one rule set.
+    #[test]
+    fn cddl_time_codec_passes_shared_vectors() {
+        let probe = std::process::Command::new("cargo")
+            .arg("--version")
+            .output();
+        if probe.map(|o| !o.status.success()).unwrap_or(true) {
+            eprintln!("skipping: no cargo toolchain on PATH");
+            return;
+        }
+        let mut input = single_field_spec(
+            "Moment",
+            CsilTypeExpression::Builtin("cddl_time".to_string()),
+            vec![],
+            None,
+        );
+        if let CsilRuleType::GroupDef(group) = &mut input.csil_spec.rules[0].rule_type {
+            group.entries[0].key = Some(CsilGroupKey::Bare("at".to_string()));
+        }
+        let files = RustCodeGenerator::new(&input).generate().unwrap();
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/interop/epoch-vectors")
+            .canonicalize()
+            .expect("epoch fixture exists");
+
+        let dir = std::env::temp_dir().join(format!("csilgen-rust-epoch-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let src = dir.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        for file in files.iter().filter(|f| f.path.ends_with(".rs")) {
+            std::fs::write(src.join(&file.path), &file.content).unwrap();
+        }
+        std::fs::copy(fixture.join("peer.rs"), src.join("main.rs")).unwrap();
+        std::fs::write(
+            dir.join("Cargo.toml"),
+            "[package]\nname = \"epoch-check\"\nedition = \"2024\"\nversion = \"0.0.0\"\n\n\
+             [workspace]\n\n[dependencies]\n\
+             time = { version = \"0.3.47\", features = [\"formatting\", \"parsing\"] }\n",
+        )
+        .unwrap();
+        let run = std::process::Command::new("cargo")
+            .args(["run", "--quiet", "--"])
+            .arg(fixture.join("vectors.tsv"))
+            .current_dir(&dir)
+            .env("CARGO_TARGET_DIR", dir.join("target"))
+            .env("CARGO_NET_OFFLINE", "true")
+            .output()
+            .unwrap();
+        assert!(
+            run.status.success(),
+            "epoch vectors failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An instant outside UTC years 0001-9999 has no wire form, so encode must
+    /// return `Err` (never panic) for `timestamp`, `cddl_time`, and `date`.
+    /// Runs the generated codec under `cargo test` so the checks hit real code.
+    #[test]
+    fn out_of_range_instants_fail_to_encode() {
+        let probe = std::process::Command::new("cargo")
+            .arg("--version")
+            .output();
+        if probe.map(|o| !o.status.success()).unwrap_or(true) {
+            eprintln!("skipping: no cargo toolchain on PATH");
+            return;
+        }
+        let mut input = single_field_spec(
+            "Stamp",
+            CsilTypeExpression::Builtin("timestamp".to_string()),
+            vec![],
+            None,
+        );
+        for (name, builtin) in [("Moment", "cddl_time"), ("Day", "date")] {
+            let extra = single_field_spec(
+                name,
+                CsilTypeExpression::Builtin(builtin.to_string()),
+                vec![],
+                None,
+            );
+            input.csil_spec.rules.extend(extra.csil_spec.rules);
+        }
+        let files = RustCodeGenerator::new(&input).generate().unwrap();
+        let dir = std::env::temp_dir().join(format!("csilgen-rust-range-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let src = dir.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        for file in files.iter().filter(|f| f.path.ends_with(".rs")) {
+            std::fs::write(src.join(&file.path), &file.content).unwrap();
+        }
+        std::fs::write(src.join("main.rs"), RANGE_ERROR_TESTS_RS).unwrap();
+        std::fs::write(
+            dir.join("Cargo.toml"),
+            "[package]\nname = \"range-check\"\nedition = \"2024\"\nversion = \"0.0.0\"\n\n\
+             [workspace]\n\n[dependencies]\n\
+             time = { version = \"0.3.47\", features = [\"formatting\", \"parsing\"] }\n",
+        )
+        .unwrap();
+        let run = std::process::Command::new("cargo")
+            .args(["test", "--quiet"])
+            .current_dir(&dir)
+            .env("CARGO_TARGET_DIR", dir.join("target"))
+            .env("CARGO_NET_OFFLINE", "true")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&run.stdout);
+        assert!(
+            run.status.success() && stdout.contains("8 passed"),
+            "range error tests failed:\nstdout:\n{stdout}\nstderr:\n{}",
+            String::from_utf8_lossy(&run.stderr)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    const RANGE_ERROR_TESTS_RS: &str = r#"#[path = "mod.rs"]
+mod api;
+
+fn main() {}
+
+#[cfg(test)]
+mod tests {
+    use super::api::*;
+
+    // Year 0000 is the nearest instant before 0001 that `time` can hold without
+    // its large-dates feature.
+    fn day_zero() -> time::Date {
+        time::Date::from_calendar_date(0, time::Month::December, 31).unwrap()
+    }
+
+    fn day_one() -> time::Date {
+        time::Date::from_calendar_date(1, time::Month::January, 1).unwrap()
+    }
+
+    #[test]
+    fn timestamp_before_year_one_is_an_error() {
+        let field = day_zero().midnight().assume_utc();
+        let err = encode_stamp(&Stamp { field }).unwrap_err();
+        assert!(err.0.contains("0001-9999"), "{err}");
+    }
+
+    // 9999-12-31T23:00-05:00 is a valid `time` value whose UTC form is in
+    // year 10000; converting it to UTC used to panic inside `time`.
+    #[test]
+    fn timestamp_whose_utc_form_passes_year_9999_is_an_error() {
+        let field = time::Date::from_calendar_date(9999, time::Month::December, 31)
+            .unwrap()
+            .with_hms(23, 0, 0)
+            .unwrap()
+            .assume_offset(time::UtcOffset::from_hms(-5, 0, 0).unwrap());
+        assert!(encode_stamp(&Stamp { field }).is_err());
+    }
+
+    #[test]
+    fn cddl_time_before_year_one_is_an_error() {
+        let field = day_zero().midnight().assume_utc();
+        let err = encode_moment(&Moment { field }).unwrap_err();
+        assert!(err.0.contains("0001-9999"), "{err}");
+    }
+
+    #[test]
+    fn date_before_year_one_is_an_error() {
+        let err = encode_day(&Day { field: day_zero() }).unwrap_err();
+        assert!(err.0.contains("0001-9999"), "{err}");
+    }
+
+    #[test]
+    fn timestamp_at_year_one_encodes() {
+        let field = day_one().midnight().assume_utc();
+        let wire = encode_stamp(&Stamp { field }).unwrap();
+        assert_eq!(decode_stamp(&wire).unwrap().field, field);
+    }
+
+    #[test]
+    fn cddl_time_at_year_one_encodes() {
+        let field = day_one().midnight().assume_utc();
+        let wire = encode_moment(&Moment { field }).unwrap();
+        assert_eq!(decode_moment(&wire).unwrap().field, field);
+    }
+
+    #[test]
+    fn date_at_year_one_encodes() {
+        let wire = encode_day(&Day { field: day_one() }).unwrap();
+        assert_eq!(decode_day(&wire).unwrap().field, day_one());
+    }
+
+    // Every truncation and every one-byte change of valid input must decode
+    // to `Ok` or `Err`; a panic fails the test.
+    #[test]
+    fn truncated_and_corrupted_input_never_panics() {
+        let field = day_one().midnight().assume_utc();
+        let inputs = [
+            encode_stamp(&Stamp { field }).unwrap(),
+            encode_moment(&Moment { field }).unwrap(),
+            encode_day(&Day { field: day_one() }).unwrap(),
+        ];
+        for wire in &inputs {
+            for end in 0..wire.len() {
+                let _ = decode_stamp(&wire[..end]);
+                let _ = decode_moment(&wire[..end]);
+                let _ = decode_day(&wire[..end]);
+            }
+            for i in 0..wire.len() {
+                for byte in 0..=255u8 {
+                    let mut bad = wire.clone();
+                    bad[i] = byte;
+                    let _ = decode_stamp(&bad);
+                    let _ = decode_moment(&bad);
+                    let _ = decode_day(&bad);
+                }
+            }
+        }
+    }
+}
+"#;
+
+    /// A value with no wire form must surface as an error at every encode
+    /// boundary: the typed client returns `ClientError::Encode` without calling
+    /// its transport, the RPC reply encoder returns `Err` (so a server can send
+    /// its internal-failure status), and the event encoder returns `Err`.
+    #[test]
+    fn unencodable_values_are_errors_at_client_reply_and_event_boundaries() {
+        let probe = std::process::Command::new("cargo")
+            .arg("--version")
+            .output();
+        if probe.map(|o| !o.status.success()).unwrap_or(true) {
+            eprintln!("skipping: no cargo toolchain on PATH");
+            return;
+        }
+        let mut input = make_unary_service_input("rust");
+        input
+            .csil_spec
+            .rules
+            .retain(|r| r.name != "SubmitTaskRequest" && r.name != "SubmitTaskResponse");
+        input
+            .csil_spec
+            .rules
+            .push(group_rule("SubmitTaskRequest", "at", "timestamp"));
+        input
+            .csil_spec
+            .rules
+            .push(group_rule("SubmitTaskResponse", "at", "timestamp"));
+        // A declared `ServiceError` record makes the op's reply arms encodable,
+        // so the codec emits the reply encoder.
+        input
+            .csil_spec
+            .rules
+            .push(group_rule("ServiceError", "message", "text"));
+        input.csil_spec.rules.push(service_with_directions(
+            "Feed",
+            &[(
+                "push",
+                "SubmitTaskResponse",
+                "SubmitTaskResponse",
+                CsilServiceDirection::Reverse,
+            )],
+        ));
+        input.csil_spec.service_count = 2;
+        input
+            .config
+            .options
+            .insert("emit_packages".to_string(), serde_json::json!(["rust"]));
+        let files = RustCodeGenerator::new(&input).generate().unwrap();
+        let dir = std::env::temp_dir().join(format!("csilgen-rust-encerr-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        for file in &files {
+            let path = dir.join(&file.path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let mut content = file.content.clone();
+            if file.path == "src/lib.rs" {
+                content.push_str("\n#[cfg(test)]\nmod encode_error_tests;\n");
+            }
+            std::fs::write(&path, content).unwrap();
+        }
+        std::fs::write(dir.join("src/encode_error_tests.rs"), ENCODE_ERROR_TESTS_RS).unwrap();
+        let run = std::process::Command::new("cargo")
+            .args(["test", "--quiet"])
+            .current_dir(&dir)
+            .env("CARGO_TARGET_DIR", dir.join("target"))
+            .env("CARGO_NET_OFFLINE", "true")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&run.stdout);
+        assert!(
+            run.status.success() && stdout.contains("3 passed"),
+            "encode error tests failed:\nstdout:\n{stdout}\nstderr:\n{}",
+            String::from_utf8_lossy(&run.stderr)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    const ENCODE_ERROR_TESTS_RS: &str = r#"use super::*;
+use std::cell::Cell;
+use std::rc::Rc;
+
+// Counts transport calls so the test can prove an encode error stops the call.
+struct Counting(Rc<Cell<u32>>);
+
+impl Transport for Counting {
+    fn call(&self, _: &str, _: &str, _: &[u8]) -> Result<Vec<u8>, ClientError> {
+        self.0.set(self.0.get() + 1);
+        Err(ClientError::Transport("not reached".into()))
+    }
+
+    fn call_reply(&self, _: &str, _: &str, _: &[u8]) -> Result<WireReply, ClientError> {
+        self.0.set(self.0.get() + 1);
+        Err(ClientError::Transport("not reached".into()))
+    }
+}
+
+fn year_zero() -> time::OffsetDateTime {
+    time::Date::from_calendar_date(0, time::Month::December, 31)
+        .unwrap()
+        .midnight()
+        .assume_utc()
+}
+
+#[test]
+fn client_request_encode_error_skips_the_transport() {
+    let calls = Rc::new(Cell::new(0));
+    let client = CorndogsClient::new(Counting(calls.clone()));
+    let result = client.submit_task(SubmitTaskRequest { at: year_zero() });
+    assert!(matches!(result, Err(ClientError::Encode(_))), "{result:?}");
+    assert_eq!(calls.get(), 0);
+}
+
+#[test]
+fn reply_encode_error_is_returned_to_the_server() {
+    let reply = Ok(SubmitTaskResponse { at: year_zero() });
+    assert!(encode_corndogs_submit_task_reply(reply).is_err());
+}
+
+#[test]
+fn event_encode_error_is_returned_to_the_caller() {
+    assert!(encode_feed_push(&SubmitTaskResponse { at: year_zero() }).is_err());
+}
+"#;
+
+    #[test]
+    fn cddl_time_field_shares_timestamp_type_with_tag1_codec() {
+        let mut input = single_field_spec(
+            "Reading",
+            CsilTypeExpression::Constrained {
+                base_type: Box::new(CsilTypeExpression::Builtin("cddl_time".to_string())),
+                constraints: vec![CsilControlOperator::GreaterEqual(CsilLiteralValue::Text(
+                    "1970-01-01T00:00:00Z".to_string(),
+                ))],
+            },
+            vec![],
+            None,
+        );
+        if let CsilRuleType::GroupDef(group) = &mut input.csil_spec.rules[0].rule_type {
+            group.entries[0].key = Some(CsilGroupKey::Bare("at".to_string()));
+        }
+        let files = RustCodeGenerator::new(&input).generate().unwrap();
+        let types = files.iter().find(|f| f.path == "types.rs").unwrap();
+        assert!(types.content.contains("pub at: time::OffsetDateTime"));
+        // The RFC 3339 bound is parsed by the timestamp parser, which must be emitted.
+        assert!(
+            types
+                .content
+                .contains("let text = \"1970-01-01T00:00:00Z\";\n                let bound = super::codec::csil_parse_timestamp(text);")
+        );
+        let codec = files.iter().find(|f| f.path == "codec.gen.rs").unwrap();
+        assert!(codec.content.contains("pub(super) fn csil_parse_timestamp"));
+        assert!(
+            codec
+                .content
+                .contains("CsilCborValue::Tag(1, Box::new(inner))")
+        );
+        assert!(codec.content.contains("csil_enc_cddl_time(&csil_v.at)"));
+        assert!(codec.content.contains("csil_as_cddl_time"));
+        // Half-precision floats must decode, because a tag-1 sender may use them.
+        assert!(codec.content.contains("cbor_half_to_f64"));
+        let cargo = RustCodeGenerator::new(&input).crate_dependencies();
+        assert!(cargo.iter().any(|dep| dep.starts_with("time = ")));
     }
 
     #[test]
@@ -8886,19 +10104,16 @@ mod tests {
     mod csil_decimal_algo {
         pub fn as_str(exponent: i64, mantissa: i128) -> String {
             let digits = mantissa.unsigned_abs().to_string();
-            let body = if exponent >= 0 {
-                let mut out = digits;
-                out.push_str(&"0".repeat(exponent as usize));
-                out
+            let scale = usize::try_from(exponent.unsigned_abs()).unwrap_or(usize::MAX);
+            let body = if !(-1000..=1000).contains(&exponent) {
+                format!("{digits}e{exponent}")
+            } else if exponent >= 0 {
+                format!("{digits}{}", "0".repeat(scale))
+            } else if scale < digits.len() {
+                let (whole, fraction) = digits.split_at(digits.len() - scale);
+                format!("{whole}.{fraction}")
             } else {
-                let scale = (-exponent) as usize;
-                if digits.len() > scale {
-                    let point = digits.len() - scale;
-                    format!("{}.{}", &digits[..point], &digits[point..])
-                } else {
-                    let pad = "0".repeat(scale - digits.len());
-                    format!("0.{pad}{digits}")
-                }
+                format!("0.{}{digits}", "0".repeat(scale - digits.len()))
             };
             if mantissa < 0 {
                 format!("-{body}")
@@ -8912,6 +10127,14 @@ mod tests {
             let (negative, rest) = match t.strip_prefix('-') {
                 Some(r) => (true, r),
                 None => (false, t.strip_prefix('+').unwrap_or(t)),
+            };
+            let (rest, power) = match rest.split_once(['e', 'E']) {
+                Some((m, e)) => (
+                    m,
+                    e.parse::<i64>()
+                        .map_err(|_| format!("invalid decimal: {s}"))?,
+                ),
+                None => (rest, 0),
             };
             let (int_part, frac_part) = match rest.split_once('.') {
                 Some((i, f)) => (i, f),
@@ -8930,7 +10153,11 @@ mod tests {
                 .parse()
                 .map_err(|e| format!("decimal out of range: {e}"))?;
             let mantissa = if negative { -magnitude } else { magnitude };
-            Ok((-(frac_part.len() as i64), mantissa))
+            let exponent = i64::try_from(frac_part.len())
+                .ok()
+                .and_then(|n| power.checked_sub(n))
+                .ok_or_else(|| format!("decimal out of range: {s}"))?;
+            Ok((exponent, mantissa))
         }
 
         /// Mirrors the injected `CsilDecimal::cmp` so the by-value ordering is
@@ -8956,12 +10183,8 @@ mod tests {
             }
         }
 
-        fn cmp_magnitude(
-            mut ma: u128,
-            mut ea: i64,
-            mut mb: u128,
-            mut eb: i64,
-        ) -> std::cmp::Ordering {
+        fn cmp_magnitude(mut ma: u128, ea: i64, mut mb: u128, eb: i64) -> std::cmp::Ordering {
+            let (mut ea, mut eb) = (i128::from(ea), i128::from(eb));
             while ma.is_multiple_of(10) {
                 ma /= 10;
                 ea += 1;
@@ -8972,8 +10195,8 @@ mod tests {
             }
             let digits_a = ma.to_string();
             let digits_b = mb.to_string();
-            let weight_a = digits_a.len() as i64 + ea;
-            let weight_b = digits_b.len() as i64 + eb;
+            let weight_a = digits_a.len() as i128 + ea;
+            let weight_b = digits_b.len() as i128 + eb;
             if weight_a != weight_b {
                 return weight_a.cmp(&weight_b);
             }
@@ -9014,6 +10237,18 @@ mod tests {
         assert!(from_str("1.2.3").is_err());
         assert!(from_str("abc").is_err());
         assert!(from_str("-").is_err());
+
+        // A payload exponent at the i64 edge renders in exponent form instead
+        // of padding zeros out of memory, and parses back exactly.
+        for (e, m) in [(i64::MAX, 7i128), (i64::MIN, -7), (1001, 1), (-1001, 3)] {
+            let text = as_str(e, m);
+            assert!(text.len() < 64, "{text}");
+            assert_eq!(from_str(&text).unwrap(), (e, m));
+        }
+        assert_eq!(as_str(1000, 1).len(), 1001);
+        assert_eq!(as_str(-1000, 1).len(), 1002);
+        assert!(from_str("1e9223372036854775808").is_err());
+        assert!(from_str("1.5e-9223372036854775808").is_err());
     }
 
     #[test]
@@ -9035,6 +10270,10 @@ mod tests {
         assert_eq!(cmp((-2, -1), (-2, 1)), Ordering::Less); // -0.01 < 0.01
         assert_eq!(cmp((-2, -1), (-3, -1)), Ordering::Less); // -0.01 < -0.001
         assert_eq!(cmp((0, 0), (5, 0)), Ordering::Equal); // zero is zero at any exponent
+
+        // Exponents at the i64 edge from a payload must not overflow.
+        assert_eq!(cmp((i64::MAX, 10), (i64::MAX, 1)), Ordering::Greater);
+        assert_eq!(cmp((i64::MIN, 1), (i64::MAX, 1)), Ordering::Less);
 
         // Consistent with the canonical parse of literal bounds.
         let zero = from_str("0.00").unwrap();
@@ -9098,7 +10337,7 @@ mod tests {
         assert!(types.contains("if *v < bound {"));
 
         // timestamp bound: parse the same UTC instant as the codec.
-        assert!(types.contains("super::codec::csil_parse_timestamp(\"1970-01-01T00:00:00Z\")"));
+        assert!(types.contains("let text = \"1970-01-01T00:00:00Z\";\n                let bound = super::codec::csil_parse_timestamp(text);"));
 
         // The bounds are escaped as Rust string literals, so the surrounding source
         // stays balanced: equal count of `"` characters means no quote broke out.
@@ -9981,7 +11220,7 @@ mod tests {
         assert!(
             codec
                 .content
-                .contains("pub fn encode_task(csil_v: &Task) -> Vec<u8>")
+                .contains("pub fn encode_task(csil_v: &Task) -> Result<Vec<u8>, CsilCborError>")
         );
         assert!(
             codec
@@ -9990,7 +11229,7 @@ mod tests {
         );
         assert!(
             codec.content.contains(
-                "pub fn encode_submit_task_request(csil_v: &SubmitTaskRequest) -> Vec<u8>"
+                "pub fn encode_submit_task_request(csil_v: &SubmitTaskRequest) -> Result<Vec<u8>, CsilCborError>"
             )
         );
         // bytes -> CBOR byte string (major type 2) via the runtime's cbor_bytes.
@@ -10208,6 +11447,36 @@ mod tests {
             name: "ConstraintProbe".to_string(),
             rule_type: CsilRuleType::GroupDef(CsilGroupExpression {
                 entries: vec![
+                    // Both instant types pull in the timestamp parser and their codecs,
+                    // so their emitted runtime text is held to rustfmt and clippy too.
+                    CsilGroupEntry {
+                        key: Some(CsilGroupKey::Bare("created_at".to_string())),
+                        value_type: CsilTypeExpression::Constrained {
+                            base_type: Box::new(CsilTypeExpression::Builtin(
+                                "timestamp".to_string(),
+                            )),
+                            constraints: vec![CsilControlOperator::GreaterEqual(
+                                CsilLiteralValue::Text("1970-01-01T00:00:00Z".to_string()),
+                            )],
+                        },
+                        occurrence: None,
+                        metadata: vec![],
+                        doc_comments: Vec::new(),
+                    },
+                    CsilGroupEntry {
+                        key: Some(CsilGroupKey::Bare("seen_at".to_string())),
+                        value_type: CsilTypeExpression::Constrained {
+                            base_type: Box::new(CsilTypeExpression::Builtin(
+                                "cddl_time".to_string(),
+                            )),
+                            constraints: vec![CsilControlOperator::LessEqual(
+                                CsilLiteralValue::Text("9999-12-31T23:59:59Z".to_string()),
+                            )],
+                        },
+                        occurrence: Some(CsilOccurrence::Optional),
+                        metadata: vec![],
+                        doc_comments: Vec::new(),
+                    },
                     CsilGroupEntry {
                         key: Some(CsilGroupKey::Bare("unit_price".to_string())),
                         value_type: CsilTypeExpression::Constrained {
@@ -10457,7 +11726,8 @@ mod tests {
         }
         std::fs::write(
             dir.join("Cargo.toml"),
-            "[package]\nname = \"csiltoolingclean\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\n[workspace]\n\n[dependencies]\n",
+            "[package]\nname = \"csiltoolingclean\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\n[workspace]\n\n[dependencies]\n\
+             time = { version = \"0.3.47\", features = [\"formatting\", \"parsing\"] }\n",
         )
         .unwrap();
 
@@ -10553,7 +11823,8 @@ mod tests {
         }
         std::fs::write(
             dir.join("Cargo.toml"),
-            "[package]\nname = \"csilservertoolingclean\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\n[workspace]\n\n[dependencies]\n",
+            "[package]\nname = \"csilservertoolingclean\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\n[workspace]\n\n[dependencies]\n\
+             time = { version = \"0.3.47\", features = [\"formatting\", \"parsing\"] }\n",
         )
         .unwrap();
 
@@ -11224,7 +12495,8 @@ fn main() {
         assert!(rpc.contains("RpcResponse::decode(&body)"));
         assert!(rpc.contains("/csil/v1/rpc"));
         assert!(rpc.contains("into_transport_error()"));
-        assert!(rpc.contains("Ok(decoded.payload)") || rpc.contains("resolve_rpc_reply("));
+        assert!(rpc.contains("Ok(self.exchange(service, op, req)?.payload)"));
+        assert!(!rpc.contains("resolve_rpc_reply("));
         assert!(rpc.contains("impl Transport for HttpRpcCarrier"));
         assert!(rpc.contains("EchoClient::new(HttpRpcCarrier::new("));
         assert!(rpc.contains("client.ping(Ping { msg: \"example\".to_string() })"));
@@ -11265,7 +12537,7 @@ fn main() {
 
         // Datagrams: the lib's Datagram + carrier seam, and the no-sync-response warning.
         assert!(datagrams.contains("use csilgen_transport::datagrams::Datagram;"));
-        assert!(datagrams.contains("Datagram::new(OP_ORD, 0, encode_ping(&req)).encode()"));
+        assert!(datagrams.contains("Datagram::new(OP_ORD, 0, encode_ping(&req)?).encode()"));
         assert!(datagrams.contains("Datagram::decode(&inbound)"));
         assert!(datagrams.contains("decode_pong(&dg.payload)"));
         assert!(datagrams.contains("NO synchronous response"));
@@ -11443,7 +12715,8 @@ impl Transport for RpcEcho {
             .map_err(|e| ClientError::Transport(e.to_string()))?;
         let ping = decode_ping(&decoded.payload).map_err(|e| ClientError::Transport(e.to_string()))?;
         let pong = Pong { msg: ping.msg };
-        let resp = RpcResponse::ok("Pong", encode_pong(&pong))
+        let payload = encode_pong(&pong).map_err(|e| ClientError::Transport(e.to_string()))?;
+        let resp = RpcResponse::ok("Pong", payload)
             .encode()
             .map_err(|e| ClientError::Transport(e.to_string()))?;
         let parsed = RpcResponse::decode(&resp)
@@ -11472,10 +12745,10 @@ fn main() {
     let mut carrier = LoopbackDatagramCarrier::new();
     let req = Ping { msg: "example".to_string() };
     carrier
-        .send_datagram(&Datagram::new(1, 0, encode_ping(&req)).encode().unwrap())
+        .send_datagram(&Datagram::new(1, 0, encode_ping(&req).unwrap()).encode().unwrap())
         .unwrap();
     carrier.push_inbound(
-        Datagram::new(1, 0, encode_pong(&Pong { msg: "late".to_string() }))
+        Datagram::new(1, 0, encode_pong(&Pong { msg: "late".to_string() }).unwrap())
             .encode()
             .unwrap(),
     );
@@ -11511,7 +12784,15 @@ impl Transport for Loopback {
         }
         let in_req = decode_submit_task_request(req)
             .map_err(|e| ClientError::Transport(e.to_string()))?;
-        Ok(encode_task(&in_req.task))
+        encode_task(&in_req.task).map_err(|e| ClientError::Transport(e.to_string()))
+    }
+
+    // `submit-task` declares a `ServiceError` arm, so the client asks for the variant.
+    fn call_reply(&self, service: &str, op: &str, req: &[u8]) -> Result<WireReply, ClientError> {
+        Ok(WireReply {
+            variant: Some("Task".to_string()),
+            payload: self.call(service, op, req)?,
+        })
     }
 }
 
@@ -11550,7 +12831,7 @@ fn main() {
     let req = SubmitTaskRequest { task: task.clone(), queue: "default".to_string() };
 
     // Direct codec round-trip through the nested record.
-    let back = decode_submit_task_request(&encode_submit_task_request(&req)).expect("decode req");
+    let back = decode_submit_task_request(&encode_submit_task_request(&req).expect("encode req")).expect("decode req");
     check(back.task.uuid == "u-123", "uuid");
     check(back.task.payload == vec![0xde, 0xad, 0xbe], "payload");
     check(back.task.priority == Some(7), "priority");
@@ -11574,7 +12855,7 @@ fn main() {
     let mut task2 = task.clone();
     task2.priority = None;
     let req2 = SubmitTaskRequest { task: task2, queue: "q".to_string() };
-    let back2 = decode_submit_task_request(&encode_submit_task_request(&req2)).expect("decode req2");
+    let back2 = decode_submit_task_request(&encode_submit_task_request(&req2).expect("encode req2")).expect("decode req2");
     check(back2.task.priority.is_none(), "absent optional None");
 
     // Typed client round-trip over the loopback carrier.
@@ -11613,11 +12894,17 @@ fn main() {
         (Order_status::V0, "v0"),
         (Order_status::V1, "v1"),
     ] {
-        let order = Order { status: status.clone() };
-        let bytes = encode_order(&order);
+        let order = Order { status };
+        let bytes = encode_order(&order).expect("encode order");
         let back = decode_order(&bytes).unwrap_or_else(|e| panic!("decode {label}: {e}"));
         check(back.status == status, &format!("round-trip {label}"));
     }
+
+    // A unit-only enum is Copy + Eq + Hash: reuse after a move, and use as a set key.
+    fn takes(s: Order_status) -> Order_status { s }
+    let s = Order_status::Pending;
+    let set: std::collections::HashSet<Order_status> = [takes(s), takes(s)].into_iter().collect();
+    check(set.len() == 1, "unit enum is Copy + Hash");
 
     // Out-of-vocabulary membership check: an unrecognized value of a DECLARED
     // kind (a text that is not "pending"/"shipped", an int that is not 0/1) must
@@ -11626,7 +12913,7 @@ fn main() {
     // map-header + key-header + key-bytes prefix from a valid encode (map(1) +
     // text key "status", 8 bytes) rather than hand-deriving that prefix's byte
     // layout independently, and swap in a hand-written CBOR value after it.
-    let good = encode_order(&Order { status: Order_status::Pending });
+    let good = encode_order(&Order { status: Order_status::Pending }).expect("encode order");
     let prefix = &good[..8];
 
     let mut bad_text = prefix.to_vec();
@@ -11690,7 +12977,15 @@ impl AsyncTransport for Loopback {
         }
         let in_req = decode_submit_task_request(req)
             .map_err(|e| ClientError::Transport(e.to_string()))?;
-        Ok(encode_task(&in_req.task))
+        encode_task(&in_req.task).map_err(|e| ClientError::Transport(e.to_string()))
+    }
+
+    // `submit-task` declares a `ServiceError` arm, so the client asks for the variant.
+    async fn call_reply(&self, service: &str, op: &str, req: &[u8]) -> Result<WireReply, ClientError> {
+        Ok(WireReply {
+            variant: Some("Task".to_string()),
+            payload: self.call(service, op, req).await?,
+        })
     }
 }
 

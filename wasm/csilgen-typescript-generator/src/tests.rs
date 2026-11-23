@@ -982,7 +982,14 @@ fn copy_transport_lib(dir: &std::path::Path) {
 /// dir. The example specifiers `csilgen-transport`/`echo-client` are repointed at
 /// the local `./lib/index`/`./index` so everything compiles as one program.
 fn stage_transports_package(label: &str) -> (std::path::PathBuf, String) {
-    let mut input = input_with_spec("typescript", transports_spec());
+    stage_transports_package_for(label, transports_spec())
+}
+
+fn stage_transports_package_for(
+    label: &str,
+    spec: CsilSpecSerialized,
+) -> (std::path::PathBuf, String) {
+    let mut input = input_with_spec("typescript", spec);
     input.config.options.insert(
         "emit_packages".to_string(),
         serde_json::json!(["typescript"]),
@@ -3684,6 +3691,9 @@ class Loopback implements ServiceTransport {{
     const reqObj = fromSubmitTaskRequestCbor(req);
     return toTaskCbor(reqObj.task);
   }}
+  callReply(service: string, op: string, req: Uint8Array): {{ variant: string; payload: Uint8Array }} {{
+    return {{ variant: "Task", payload: this.call(service, op, req) }};
+  }}
 }}
 
 function check(ok: boolean, what: string): void {{
@@ -4075,6 +4085,9 @@ class AsyncLoopback implements AsyncServiceTransport {
     const reqObj = fromSubmitTaskRequestCbor(req);
     return toTaskCbor(reqObj.task);
   }
+  async callReply(service: string, op: string, req: Uint8Array): Promise<{ variant: string; payload: Uint8Array }> {
+    return { variant: "Task", payload: await this.call(service, op, req) };
+  }
 }
 
 function check(ok: boolean, what: string): void {
@@ -4125,6 +4138,9 @@ class Loopback implements ServiceTransport {
     // Decode the typed request, then echo its task back as the typed response.
     const reqObj = fromSubmitTaskRequestCbor(req);
     return toTaskCbor(reqObj.task);
+  }
+  callReply(service: string, op: string, req: Uint8Array): { variant: string; payload: Uint8Array } {
+    return { variant: "Task", payload: this.call(service, op, req) };
   }
 }
 
@@ -4838,3 +4854,301 @@ check(threwInt, "decode rejects an out-of-set int value for a mixed-kind enum");
 
 console.log("ok");
 "#;
+
+/// `[* timestamp]` and `[* decimal]` elements are tagged object literals; as an
+/// arrow body they must be parenthesized or TypeScript parses a block. Run the
+/// emitted codec under node to round-trip one element of each and check the tags.
+#[test]
+fn tagged_array_elements_encode_as_expressions() {
+    let spec = spec_of(vec![group_rule(
+        "Window",
+        vec![
+            field("due_before", list_ty("timestamp"), false),
+            field("amounts", list_ty("decimal"), false),
+        ],
+        vec![],
+    )]);
+    let files = generate_files(&input_with_spec("typescript-typesonly", spec)).expect("generate");
+    let codec = file(&files, "codec.gen.ts").to_string();
+    assert!(codec.contains("CborValue => ({ tag: 0, value: csilTsToText(csilE) })"));
+    assert!(codec.contains("CborValue => ({ tag: 4, value: csilE.toTag4() })"));
+    if !have_node_npx() {
+        eprintln!("skipping: node not on PATH");
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("csilgen-ts-tagged-array-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    for f in &files {
+        std::fs::write(dir.join(&f.path), &f.content).unwrap();
+    }
+    std::fs::write(
+        dir.join("driver.ts"),
+        r#"import { CsilDecimal } from "./types.gen.ts";
+import { decode, fromWindowCbor, toWindowCbor } from "./codec.gen.ts";
+const at = new Date("2000-02-29T12:00:00.123Z");
+const bytes = toWindowCbor({ dueBefore: [at], amounts: [CsilDecimal.fromString("1.5")] });
+const tree = decode(bytes) as Map<unknown, any>;
+if (tree.get("due_before")[0].tag !== 0) throw new Error("timestamp element lacks tag 0");
+if (tree.get("amounts")[0].tag !== 4) throw new Error("decimal element lacks tag 4");
+const back = fromWindowCbor(bytes);
+if (back.dueBefore[0].getTime() !== at.getTime()) throw new Error("instant changed");
+console.log("ok");
+"#,
+    )
+    .unwrap();
+    let run = std::process::Command::new("node")
+        .arg("driver.ts")
+        .current_dir(&dir)
+        .output()
+        .unwrap();
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).trim() == "ok",
+        "node run failed:\n{}{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `transports_spec` with `ping` declaring a second, error reply arm.
+fn reply_arms_spec() -> CsilSpecSerialized {
+    let mut spec = transports_spec();
+    spec.rules.push(record_typedef(
+        "Refused",
+        vec![field("reason", builtin("text"), false)],
+    ));
+    for rule in &mut spec.rules {
+        if let CsilRuleType::ServiceDef(def) = &mut rule.rule_type {
+            def.operations[0].output_type =
+                CsilTypeExpression::Choice(vec![reference("Pong"), reference("Refused")]);
+        }
+    }
+    spec
+}
+
+/// Specs with no multi-arm op must keep today's seam exactly, so existing carriers
+/// still satisfy it; a multi-arm op adds a required `callReply` and routes through it.
+#[test]
+fn reply_seam_is_added_only_for_multi_arm_ops() {
+    let files = generate_files(&input_with_spec("typescript-client", pingpong_spec())).unwrap();
+    assert!(file(&files, "client.gen.ts").contains(
+        "export interface ServiceTransport {\n  call(service: string, op: string, req: Uint8Array): Uint8Array;\n}\n"
+    ));
+    assert!(file(&files, "client.async.gen.ts").contains(
+        "export interface AsyncServiceTransport {\n  call(service: string, op: string, req: Uint8Array): Promise<Uint8Array>;\n}\n"
+    ));
+    assert!(!file(&files, "client.gen.ts").contains("callReply"));
+
+    let files = generate_files(&input_with_spec("typescript-client", reply_arms_spec())).unwrap();
+    let sync = file(&files, "client.gen.ts");
+    assert!(sync.contains(
+        "  callReply(service: string, op: string, req: Uint8Array): { readonly variant?: string | null; readonly payload: Uint8Array };\n"
+    ));
+    assert!(
+        sync.contains("const csilReply = this.t.callReply(\"Echo\", \"ping\", toPingCbor(req));")
+    );
+    assert!(sync.contains(
+        "const csilResp = resolveRpcReply(\"Echo\", \"ping\", csilReply.variant, csilReply.payload);"
+    ));
+    let twin = file(&files, "client.async.gen.ts");
+    assert!(twin.contains(
+        "  callReply(service: string, op: string, req: Uint8Array): Promise<{ readonly variant?: string | null; readonly payload: Uint8Array }>;\n"
+    ));
+    assert!(twin.contains(
+        "const csilReply = await this.t.callReply(\"Echo\", \"ping\", toPingCbor(req));"
+    ));
+}
+
+/// The quickstart carrier for a spec with reply arms implements `callReply` over the
+/// library's `RpcResponse` and never tells the reader to call `resolveRpcReply`.
+#[test]
+fn genquickstart_rpc_section_with_reply_arms_round_trips_under_node() {
+    let readme = transports_readme(reply_arms_spec());
+    let block = section_ts_block(&readme, "## CSIL-RPC (HTTP)");
+    assert!(
+        block.contains(
+            "callReply(service: string, op: string, req: Uint8Array): Promise<RpcResponse>"
+        )
+    );
+    assert!(!block.contains("resolveRpcReply"));
+    assert!(!transports_readme(transports_spec()).contains("callReply"));
+    if !have_node_npx() {
+        eprintln!("skipping: node/npx not on PATH");
+        return;
+    }
+    let (dir, readme) = stage_transports_package_for("rpc-arms", reply_arms_spec());
+    let block = local_specifiers(&section_ts_block(&readme, "## CSIL-RPC (HTTP)"));
+    std::fs::write(
+        dir.join("driver.ts"),
+        format!("{RPC_ECHO_STUB_TS}\n{block}"),
+    )
+    .unwrap();
+    std::fs::write(dir.join("tsconfig.json"), TRANSPORTS_TSCONFIG).unwrap();
+    let build = run_tsc(&dir, &[]);
+    assert!(
+        build.status.success(),
+        "tsc failed on the RPC example:\n{}{}",
+        String::from_utf8_lossy(&build.stdout),
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let run = std::process::Command::new("node")
+        .arg(dir.join("out").join("driver.js"))
+        .current_dir(&dir)
+        .output()
+        .unwrap();
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("example"),
+        "node run of the RPC example failed:\n{}{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The tag-0 decoder follows the strict grammar of docs/cbor-wire-contract.md and
+/// the encoder writes the canonical text. Runs the emitted runtime under node.
+#[test]
+fn timestamp_codec_is_strict_and_canonical() {
+    let spec = spec_of(vec![group_rule(
+        "Stamp",
+        vec![field("at", builtin("timestamp"), false)],
+        vec![],
+    )]);
+    let files = generate_files(&input_with_spec("typescript-typesonly", spec)).expect("generate");
+    let codec = file(&files, "codec.gen.ts");
+    assert!(codec.contains("export function csilTsFromText(text: string): Date {"));
+    assert!(!codec.contains("new Date(asString("));
+    if !have_node_npx() {
+        eprintln!("skipping: node not on PATH");
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("csilgen-ts-timestamp-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    for f in &files {
+        std::fs::write(dir.join(&f.path), &f.content).unwrap();
+    }
+    std::fs::write(dir.join("driver.ts"), TIMESTAMP_DRIVER_TS).unwrap();
+    let run = std::process::Command::new("node")
+        .arg("driver.ts")
+        .current_dir(&dir)
+        .output()
+        .unwrap();
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).trim() == "ok",
+        "node run failed:\n{}{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+const TIMESTAMP_DRIVER_TS: &str = r#"import { csilTsFromText, csilTsToText } from "./codec.gen.ts";
+
+const canonical = (text: string): string => csilTsToText(csilTsFromText(text));
+const accepted: Array<[string, string]> = [
+  ["2000-02-29T12:00:00Z", "2000-02-29T12:00:00Z"],
+  ["2000-02-29t12:00:00.5z", "2000-02-29T12:00:00.500Z"],
+  ["2000-02-29T12:00:00.123000000Z", "2000-02-29T12:00:00.123Z"],
+  ["2000-02-29T12:00:00.000Z", "2000-02-29T12:00:00Z"],
+  ["2000-02-29T13:30:00+01:30", "2000-02-29T12:00:00Z"],
+  ["0001-01-01T00:00:00Z", "0001-01-01T00:00:00Z"],
+  ["0050-06-01T00:00:00Z", "0050-06-01T00:00:00Z"],
+  ["9999-12-31T23:59:59Z", "9999-12-31T23:59:59Z"],
+];
+for (const [input, want] of accepted) {
+  const got = canonical(input);
+  if (got !== want) throw new Error(`${input}: got ${got}, want ${want}`);
+}
+const rejected = [
+  "2000-02-29 12:00:00Z", "2000-02-29T12:00:00", "2001-02-29T12:00:00Z",
+  "2000-02-29T24:00:00Z", "2000-02-29T23:59:60Z", "2000-02-29T12:00:00.Z",
+  "2000-02-29T12:00:00.0001Z", "2000-02-29T12:00:00.1234567890Z",
+  "2000-02-29T12:00:00+0100", "2000-02-29T12:00:00+24:00", "2000-02-29T12:00:00Z ",
+  "0001-01-01T00:30:00+01:00", "9999-12-31T23:30:00-01:00", "0000-12-31T23:30:00-01:00", "２000-02-29T12:00:00Z",
+];
+for (const input of rejected) {
+  let threw = false;
+  try { csilTsFromText(input); } catch { threw = true; }
+  if (!threw) throw new Error(`${JSON.stringify(input)} must be rejected`);
+}
+for (const bad of [new Date(Number.NaN), new Date(Date.UTC(10000, 0, 1))]) {
+  let threw = false;
+  try { csilTsToText(bad); } catch { threw = true; }
+  if (!threw) throw new Error(`encoding ${bad.getTime()} must fail`);
+}
+console.log("ok");
+"#;
+
+/// `cddl_time` shares the `Date` type and RFC 3339 bound of `timestamp`, and its
+/// codec routes through the tag-1 helpers.
+#[test]
+fn cddl_time_maps_to_date_with_tag1_codec() {
+    let spec = spec_of(vec![group_rule(
+        "Reading",
+        vec![field(
+            "seen_at",
+            constrained(
+                builtin("cddl_time"),
+                vec![CsilControlOperator::GreaterEqual(CsilLiteralValue::Text(
+                    "1970-01-01T00:00:00Z".to_string(),
+                ))],
+            ),
+            false,
+        )],
+        vec![],
+    )]);
+    let files = generate_files(&input_with_spec("typescript-typesonly", spec)).expect("generate");
+    let types = file(&files, "types.gen.ts");
+    assert!(types.contains("seenAt: Date;"));
+    assert!(
+        types
+            .contains("if (value.seenAt.getTime() < new Date(\"1970-01-01T00:00:00Z\").getTime())")
+    );
+    let codec = file(&files, "codec.gen.ts");
+    assert!(codec.contains("{ tag: 1, value: csilEpochFromDate("));
+    assert!(codec.contains("asCddlTime("));
+    assert!(codec.contains("export function asCddlTime(value: CborValue): Date {"));
+    assert!(codec.contains("if (low === 25 || low === 26 || low === 27)"));
+}
+
+/// Run the shared epoch vectors through the generated codec with the fixture's own
+/// peer, so the unit tests and `check.sh typescript` hold one rule set.
+#[test]
+fn cddl_time_codec_passes_shared_vectors() {
+    if !have_node_npx() {
+        eprintln!("skipping: node not on PATH");
+        return;
+    }
+    let spec = spec_of(vec![group_rule(
+        "Moment",
+        vec![field("at", builtin("cddl_time"), false)],
+        vec![],
+    )]);
+    let files = generate_files(&input_with_spec("typescript-typesonly", spec)).expect("generate");
+    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/interop/epoch-vectors")
+        .canonicalize()
+        .expect("epoch fixture exists");
+    let dir = std::env::temp_dir().join(format!("csilgen-ts-epoch-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    for f in &files {
+        std::fs::write(dir.join(&f.path), &f.content).unwrap();
+    }
+    std::fs::copy(fixture.join("peer.ts"), dir.join("peer.ts")).unwrap();
+    let run = std::process::Command::new("node")
+        .arg("peer.ts")
+        .arg(fixture.join("vectors.tsv"))
+        .current_dir(&dir)
+        .output()
+        .unwrap();
+    assert!(
+        run.status.success(),
+        "epoch vectors failed:\n{}{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

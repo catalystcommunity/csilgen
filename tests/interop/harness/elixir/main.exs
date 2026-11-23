@@ -30,6 +30,11 @@ defmodule Vectors do
     dt
   end
 
+  def seen do
+    {:ok, dt, _} = DateTime.from_iso8601("2026-06-29T12:34:56.500Z")
+    dt
+  end
+
   def scalars_ok do
     %G.Scalars{
       i: -42,
@@ -41,6 +46,8 @@ defmodule Vectors do
       flag: true,
       due: ~D[2000-02-29],
       when: ts(),
+      # epoch 1782736496.5 (cddl_time, tag 1).
+      seen: seen(),
       amount: G.Decimal.from_string("123.45"),
       # mixed-union coverage: a value equal to a literal arm must wire as
       # [1,"pending"]; a value with no literal match must wire as [0,...].
@@ -216,31 +223,34 @@ end
 # RPC
 # ---------------------------------------------------------------------------
 
-# Implements the transport seam the generated InteropClient expects: `call/4` takes the
-# already-encoded request bytes and returns the response payload bytes. A status-0 reply
-# whose variant is `ServiceError` is a typed application error -- the carrier maps it to
-# the language error path (a raised error); a non-ok transport status also raises.
+# Implements the transport seam the generated InteropClient expects: `call/4` returns
+# the response payload bytes, and `call_reply/4` returns `{variant, payload}` for an
+# operation with more than one reply arm, so the generated client can raise the typed
+# error arm itself. A non-ok transport status raises.
 defmodule RpcCarrier do
+  @behaviour G.Transport
   defstruct [:sock]
 
-  def call(%__MODULE__{sock: sock}, service, op, req) do
+  @impl true
+  def call(carrier, service, op, req), do: round_trip(carrier, service, op, req).payload
+
+  @impl true
+  def call_reply(carrier, service, op, req) do
+    resp = round_trip(carrier, service, op, req)
+    {resp.variant, resp.payload}
+  end
+
+  defp round_trip(%__MODULE__{sock: sock}, service, op, req) do
     frame = RPC.encode_request(RPC.new_request(service, op, req))
     :ok = FrameSock.send_frame(sock, frame)
     resp_frame = FrameSock.recv_frame(sock, 5000)
     if resp_frame == nil, do: raise("rpc: no response")
     {:ok, resp} = RPC.decode_response(resp_frame)
 
-    cond do
-      resp.variant == "ServiceError" ->
-        se = G.ServiceError.from_cbor(resp.payload)
-        raise "service error #{se.code}: #{se.message}"
+    if resp.status != Status.ok(),
+      do: raise("transport status #{resp.status}: #{resp.error || ""}")
 
-      resp.status != Status.ok() ->
-        raise "transport status #{resp.status}: #{resp.error || ""}"
-
-      true ->
-        resp.payload
-    end
+    resp
   end
 end
 
@@ -366,8 +376,17 @@ defmodule Rpc do
         _ = G.InteropClient.validate_constrained(client, Vectors.constrained_bad())
         Cases.fail(cases, "validate-constrained/failure", "server accepted invalid input")
       rescue
-        # The typed error arm surfaces as a raised error -- the failure-case path.
-        _ -> Cases.pass(cases, "validate-constrained/failure")
+        # The typed error arm surfaces as the generated refusal exception.
+        e in G.ServiceErrorRefusal ->
+          Cases.check(
+            cases,
+            "validate-constrained/failure",
+            e.value.code == 422,
+            "wrong code #{e.value.code}"
+          )
+
+        e ->
+          Cases.fail(cases, "validate-constrained/failure", "expected refusal, got #{inspect(e)}")
       end
 
     # Optional-bytes presence: absent, present-empty, and present-non-empty are three

@@ -34,7 +34,7 @@ jobs:
       - rust,go,python,typescript
       - java,csharp,c
       - ruby,elixir,dart
-      - ocaml,zig,kotlin
+      - ocaml,zig,kotlin,swift
     item_var: CSILGEN_INTEROP_SERVERS
 
   asset-prepare:

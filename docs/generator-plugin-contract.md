@@ -367,7 +367,7 @@ bytes.
 *runtime codec* — code that claims to encode/decode CSIL types as CBOR bytes
 interoperable with other CSIL implementations — MUST additionally conform to
 [`docs/cbor-wire-contract.md`](cbor-wire-contract.md): map keying by verbatim CSIL
-field name, the scalar/tag encodings (including `date`/tag 1004, `timestamp`/tag 0, and
+field name, the scalar/tag encodings (including `date`/tag 1004, `timestamp`/tag 0, `cddl_time`/tag 1, and
 `decimal`/tag 4), enum-vs-union choice classification, hoisted-name conventions for
 synthesized types, and decoder strictness. A generator that also emits clients
 and/or servers over that codec MUST further conform to whichever transport
@@ -381,7 +381,9 @@ this codec actually round-trip against everyone else's."
 **Convenience machinery is not part of the contract.** The in-repo Rust generators
 share classification/hoisting logic from `csilgen-common`
 (`csilgen_common::choice::classify_choice` for enum-vs-union classification,
-`csilgen_common::hoist` for literal-choice hoisting) so that every Rust-authored
+`csilgen_common::hoist` for literal-choice hoisting, `csilgen_common::splice` for
+group references, sockets and plugs, and `csilgen_common::rename` for rule names
+that are not identifiers in the target) so that every Rust-authored
 generator in this repo applies the wire contract identically instead of
 re-deriving it. That is a convenience implementation available to Rust generators
 built against `csilgen-common`, not a requirement of either tier above. A

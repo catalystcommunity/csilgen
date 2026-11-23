@@ -509,7 +509,7 @@ fn generate_readme(input: &WasmGeneratorInput, config: &KotlinConfig) -> String 
     let unary = first_unary_example(input);
     let channel = first_channel_example(input);
     if rpc {
-        out.push_str(&rpc_section(config, unary.as_ref()));
+        out.push_str(&rpc_section(config, has_reply_arms(input), unary.as_ref()));
     }
     if events {
         out.push_str(&events_section(config, channel.as_ref()));
@@ -525,7 +525,7 @@ fn generate_readme(input: &WasmGeneratorInput, config: &KotlinConfig) -> String 
 /// `RpcResponse` (never hand-rolled), POSTing to `{baseUrl}/csil/v1/rpc` with the JDK's
 /// blocking `HttpClient`. A non-zero transport status (`asTransportError`) and the typed
 /// `ServiceError` application arm are surfaced distinctly; the typed client decodes success.
-fn rpc_section(config: &KotlinConfig, ex: Option<&UnaryExample>) -> String {
+fn rpc_section(config: &KotlinConfig, reply_arms: bool, ex: Option<&UnaryExample>) -> String {
     let mut out = String::from("## CSIL-RPC (HTTP)\n\n");
     out.push_str(
         "Request/response. The library owns the envelope (`RpcRequest`/`RpcResponse`); you\n\
@@ -548,7 +548,7 @@ fn rpc_section(config: &KotlinConfig, ex: Option<&UnaryExample>) -> String {
          import java.net.http.HttpRequest\n\
          import java.net.http.HttpResponse\n\n",
     );
-    out.push_str(RPC_CARRIER_KT);
+    out.push_str(&rpc_carrier_kt(reply_arms));
     out.push('\n');
     out.push_str("fun main() {\n");
     out.push_str(&format!(
@@ -568,12 +568,41 @@ fn rpc_section(config: &KotlinConfig, ex: Option<&UnaryExample>) -> String {
     out
 }
 
-/// The HTTP carrier body — spec-independent, so a constant. It encodes the request with the
-/// library's `RpcRequest`, POSTs it to `{baseUrl}/csil/v1/rpc`, and returns the success
-/// payload bytes the typed client decodes. `RpcResponse.asTransportError()` raises on a
-/// non-zero transport status; the typed `ServiceError` arm (a status-0 variant) is surfaced
-/// separately so the typed client only ever decodes a success payload.
-const RPC_CARRIER_KT: &str = r#"// One example carrier: CSIL-RPC over an HTTP POST. The library owns the RpcRequest/
+/// The HTTP carrier body. It encodes the request with the library's `RpcRequest`, POSTs it
+/// to `{baseUrl}/csil/v1/rpc`, and hands back the reply. `RpcResponse.asTransportError()`
+/// raises on a non-zero transport status. When the spec has an op with several reply arms
+/// the seam also requires `callReply`, which returns the reply variant so the typed client
+/// can pick the arm; the carrier never decodes an arm itself.
+fn rpc_carrier_kt(reply_arms: bool) -> String {
+    let mut out = String::from(RPC_CARRIER_HEAD_KT);
+    if reply_arms {
+        out.push_str(
+            r#"    override fun call(service: String, op: String, request: ByteArray): ByteArray =
+        exchange(service, op, request).payload
+
+    override fun callReply(service: String, op: String, request: ByteArray): WireReply {
+        val resp = exchange(service, op, request)
+        return WireReply(resp.variant, resp.payload)
+    }
+
+    private fun exchange(service: String, op: String, request: ByteArray): RpcResponse {
+"#,
+        );
+    } else {
+        out.push_str(
+            "    override fun call(service: String, op: String, request: ByteArray): ByteArray {\n",
+        );
+    }
+    out.push_str(RPC_CARRIER_EXCHANGE_KT);
+    out.push_str(if reply_arms {
+        "        return resp\n    }\n}\n"
+    } else {
+        "        return resp.payload\n    }\n}\n"
+    });
+    out
+}
+
+const RPC_CARRIER_HEAD_KT: &str = r#"// One example carrier: CSIL-RPC over an HTTP POST. The library owns the RpcRequest/
 // RpcResponse envelope; the carrier owns only the transport. Swap HttpClient for any client.
 class HttpRpcTransport(baseUrl: String) : Transport {
     private val http: HttpClient = HttpClient.newHttpClient()
@@ -581,8 +610,9 @@ class HttpRpcTransport(baseUrl: String) : Transport {
     // Trim any trailing slash so the joined path is exactly one "/csil/v1/rpc".
     private val baseUrl: String = baseUrl.trimEnd('/')
 
-    override fun call(service: String, op: String, request: ByteArray): ByteArray {
-        // The library builds the envelope from the already-encoded request bytes; we never
+"#;
+
+const RPC_CARRIER_EXCHANGE_KT: &str = r#"        // The library builds the envelope from the already-encoded request bytes; we never
         // hand-roll the wire form.
         val envelope = RpcRequest(service, op, request).encode()
         val httpReq = HttpRequest.newBuilder()
@@ -599,9 +629,6 @@ class HttpRpcTransport(baseUrl: String) : Transport {
         val resp = RpcResponse.decode(httpResp.body())
         // A non-zero transport status is a StatusException, distinct from an application error.
         resp.asTransportError()?.let { throw ClientError(message = "csil-rpc $service/$op: ${it.message}") }
-        return resolveRpcReply(service, op, resp.variant, resp.payload)
-    }
-}
 "#;
 
 /// CSIL-Events over TLS: a full session example. Opens a TLS byte stream wrapped as the
@@ -976,7 +1003,7 @@ fn kotlin_sample(input: &WasmGeneratorInput, ty: &CsilTypeExpression) -> String 
             "uint" => "0uL".to_string(),
             "float" => "0.0".to_string(),
             "date" => "java.time.LocalDate.of(1970, 1, 1)".to_string(),
-            "timestamp" => "java.time.Instant.now()".to_string(),
+            "timestamp" | "cddl_time" => "java.time.Instant.now()".to_string(),
             "decimal" => "java.math.BigDecimal.ZERO".to_string(),
             _ => "TODO()".to_string(),
         },
@@ -1376,7 +1403,7 @@ class ClientError(
 /// `suspend fun` for the async shape (it owns the network round-trip); the blocking shape
 /// keeps the plain `fun`. The interface name is marked (`AsyncTransport`) only for the
 /// twin so it coexists with the blocking `Transport` in one package.
-fn transport_interface_kt(shape: ClientShape) -> String {
+fn transport_interface_kt(shape: ClientShape, reply_arms: bool) -> String {
     let name = shape.transport_name();
     let suspend = shape.suspend_kw();
     // The carrier note tracks the seam's concurrency model so a reader of the generated
@@ -1386,21 +1413,36 @@ fn transport_interface_kt(shape: ClientShape) -> String {
     } else {
         "Synchronous by design — no coroutines; the host owns its own threads."
     };
+    // Only a spec with a multi-arm op needs the variant, so other specs keep the one-method
+    // seam (and every carrier written against it) unchanged.
+    let reply = if reply_arms {
+        format!(
+            "\n    /**\n     * Performs a call to an op with several reply arms and returns the reply variant\n     * with the payload bytes. The client selects the arm from the variant, so the\n     * carrier must not drop it.\n     */\n    {suspend}fun callReply(service: String, op: String, request: ByteArray): WireReply\n"
+        )
+    } else {
+        String::new()
+    };
     format!(
-        "/**\n * {name} is the caller-supplied byte carrier: it performs the call named by\n * (service, op) with the already-encoded request bytes and returns the response\n * bytes, or throws. The generated client owns (de)serialization; the carrier only\n * moves bytes. {carrier_note}\n */\ninterface {name} {{\n    {suspend}fun call(service: String, op: String, request: ByteArray): ByteArray\n}}\n"
+        "/**\n * {name} is the caller-supplied byte carrier: it performs the call named by\n * (service, op) with the already-encoded request bytes and returns the response\n * bytes, or throws. The generated client owns (de)serialization; the carrier only\n * moves bytes. {carrier_note}\n */\ninterface {name} {{\n    {suspend}fun call(service: String, op: String, request: ByteArray): ByteArray\n{reply}}}\n"
     )
 }
 
 /// Client scaffolding emitted once at the top of the client file: the shared error type
 /// (primary file only) and the caller-supplied transport seam for this shape.
-fn client_prelude_kt(shape: ClientShape) -> String {
+fn client_prelude_kt(shape: ClientShape, reply_arms: bool) -> String {
     let mut out = String::new();
     if shape.marker.is_empty() {
         out.push_str(CLIENT_ERROR_KT);
         out.push('\n');
     }
-    out.push_str(&transport_interface_kt(shape));
+    out.push_str(&transport_interface_kt(shape, reply_arms));
     out
+}
+
+/// Whether any unary op declares several reply arms, which is when the client seam needs
+/// the reply variant (`callReply`).
+fn has_reply_arms(input: &WasmGeneratorInput) -> bool {
+    input.csil_spec.rpc_operations().next().is_some()
 }
 
 fn generate_client(
@@ -1415,7 +1457,7 @@ fn generate_client(
     let named = kotlin_codec_named(input);
     let aliases = codec_aliases(input);
     let mut body = String::new();
-    body.push_str(&client_prelude_kt(shape));
+    body.push_str(&client_prelude_kt(shape, has_reply_arms(input)));
     body.push('\n');
 
     let mut emitted = false;
@@ -1492,10 +1534,15 @@ fn emit_client_class(
         };
         // Wire strings are the verbatim CSIL service and operation names
         // (csil-rpc-transport.md §1.1/§1.3), distinct from the Kotlin identifiers.
-        let call = format!(
-            "transport.call(\"{name}\", \"{wire_op}\", {req_bytes})",
-            wire_op = operation.name
-        );
+        let wire_op = &operation.name;
+        let multi_arm = operation.rpc_reply_arms().is_some();
+        // The reply variant picks the arm: the resolver passes the success payload through,
+        // throws the declared error arm, and rejects a missing or unknown variant.
+        let call = if multi_arm {
+            format!("resolveRpcReply(\"{name}\", \"{wire_op}\", reply.variant, reply.payload)")
+        } else {
+            format!("transport.call(\"{name}\", \"{wire_op}\", {req_bytes})")
+        };
         // A record success reuses the generic reified `decode`; any other shape uses the
         // op's per-op response decoder.
         let decode_resp = if is_record_ref(&success, records) {
@@ -1509,6 +1556,11 @@ fn emit_client_class(
             let input_type = map_csil_type_to_kotlin(&operation.input_type, &None);
             body.push_str(&format!(
                 "    {suspend}fun {method}(request: {input_type}): {output_type} {{\n"
+            ));
+        }
+        if multi_arm {
+            body.push_str(&format!(
+                "        val reply = transport.callReply(\"{name}\", \"{wire_op}\", {req_bytes})\n"
             ));
         }
         body.push_str(&format!("        return {decode_resp}\n"));
@@ -1864,8 +1916,8 @@ fn kotlin_enc_value(
             "bytes" | "bstr" => format!("CborValue.CBytes({expr})"),
             "bool" => format!("CborValue.CBool({expr})"),
             "date" => format!("CsilCbor.encDate({expr})"),
-            // timestamp is tag 0 + RFC3339 UTC text; Instant.toString() is RFC3339 with `Z`.
-            "timestamp" => format!("CborValue.CTag(0uL, CborValue.CText(({expr}).toString()))"),
+            "timestamp" => format!("CsilCbor.encTimestamp({expr})"),
+            "cddl_time" => format!("CsilCbor.encCddlTime({expr})"),
             // decimal is tag 4 [exponent, mantissa]; BigDecimal = unscaled * 10^-scale.
             "decimal" => format!(
                 "CborValue.CTag(4uL, CborValue.CArray(listOf(CborValue.CInt((-({expr}).scale()).toLong()), CborValue.CInt(({expr}).unscaledValue().longValueExact()))))"
@@ -1944,7 +1996,8 @@ fn kotlin_dec_value(
             "bytes" | "bstr" => format!("CsilCbor.asBytes({expr})"),
             "bool" => format!("CsilCbor.asBoolean({expr})"),
             "date" => format!("CsilCbor.asDate({expr})"),
-            "timestamp" => format!("java.time.Instant.parse(CsilCbor.asTaggedText({expr}, 0uL))"),
+            "timestamp" => format!("CsilCbor.asTimestamp({expr})"),
+            "cddl_time" => format!("CsilCbor.asCddlTime({expr})"),
             "decimal" => format!("CsilCbor.asDecimal({expr})"),
             // `any` keeps the decoded CBOR value verbatim (passes through unchanged).
             "any" => expr.to_string(),
@@ -2599,6 +2652,12 @@ fn generate_codec(input: &WasmGeneratorInput, config: &KotlinConfig) -> Option<S
             "fun resolveRpcReply(service: String, op: String, variant: String?, payload: ByteArray): ByteArray {\n",
         );
         body.push_str("data class RpcReply(val variant: String, val payload: ByteArray)\n\n");
+        if has_reply_arms(input) {
+            body.push_str(
+                "/** One RPC reply as the client transport received it; [variant] is null when the reply carried none. */\n\
+                 class WireReply(val variant: String?, val payload: ByteArray)\n\n",
+            );
+        }
         for (service, op, arms) in input.csil_spec.rpc_operations() {
             let method = &op.name;
             let stem = op_codec_stem(service, op);
@@ -2771,6 +2830,18 @@ object CsilCbor {
         return v
     }
 
+    // Float.float16ToFloat needs JDK 20; the generated package targets JDK 17.
+    private fun halfToDouble(h: Int): Double {
+        val exp = (h shr 10) and 0x1f
+        val mant = h and 0x3ff
+        val magnitude = when (exp) {
+            0 -> Math.scalb(mant.toDouble(), -24)
+            31 -> if (mant == 0) Double.POSITIVE_INFINITY else Double.NaN
+            else -> Math.scalb((mant or 0x400).toDouble(), exp - 25)
+        }
+        return if ((h and 0x8000) != 0) -magnitude else magnitude
+    }
+
     private fun readArg(cur: Cursor, low: Int): ULong {
         if (low < 24) {
             cur.pos += 1
@@ -2841,6 +2912,10 @@ object CsilCbor {
                 22, 23 -> {
                     cur.pos += 1
                     CborValue.CNull
+                }
+                25 -> {
+                    val bits = readArg(cur, low)
+                    CborValue.CFloat(halfToDouble(bits.toInt()))
                 }
                 26 -> {
                     val bits = readArg(cur, low)
@@ -2964,6 +3039,155 @@ object CsilCbor {
         val text = asTaggedText(v, 1004uL)
         require(text.length == 10) { "expected YYYY-MM-DD" }
         return java.time.LocalDate.parse(text)
+    }
+
+    // The timestamp shape is checked by hand because Instant.parse accepts forms the
+    // wire contract rejects, and Instant.toString picks fraction widths the contract does
+    // not allow (it requires 3, 6, or 9 digits).
+    fun encTimestamp(t: java.time.Instant): CborValue {
+        val u = t.atOffset(java.time.ZoneOffset.UTC)
+        if (u.year < 1 || u.year > 9999) throw CborError("timestamp year outside 0001-9999")
+        val b = StringBuilder(30)
+        b.append(tsDigits(u.year, 4)).append('-').append(tsDigits(u.monthValue, 2)).append('-')
+            .append(tsDigits(u.dayOfMonth, 2)).append('T').append(tsDigits(u.hour, 2)).append(':')
+            .append(tsDigits(u.minute, 2)).append(':').append(tsDigits(u.second, 2))
+        val nano = u.nano
+        if (nano != 0) {
+            b.append('.')
+            when {
+                nano % 1_000_000 == 0 -> b.append(tsDigits(nano / 1_000_000, 3))
+                nano % 1_000 == 0 -> b.append(tsDigits(nano / 1_000, 6))
+                else -> b.append(tsDigits(nano, 9))
+            }
+        }
+        b.append('Z')
+        return CborValue.CTag(0uL, CborValue.CText(b.toString()))
+    }
+
+    private fun tsDigits(value: Int, width: Int): String = value.toString().padStart(width, '0')
+
+    fun asTimestamp(v: CborValue): java.time.Instant {
+        if (v is CborValue.CTag && v.tag == 0uL && v.value is CborValue.CText) {
+            return parseTimestamp(v.value.value)
+        }
+        throw CborError("expected CBOR tag 0 timestamp")
+    }
+
+    private fun tsField(s: String, at: Int, width: Int): Int {
+        if (at + width > s.length) throw CborError("invalid timestamp text")
+        var value = 0
+        for (i in at until at + width) {
+            val c = s[i]
+            if (c < '0' || c > '9') throw CborError("invalid timestamp text")
+            value = value * 10 + (c - '0')
+        }
+        return value
+    }
+
+    private fun tsSeparator(s: String, at: Int, a: Char, b: Char) {
+        if (at >= s.length || (s[at] != a && s[at] != b)) throw CborError("invalid timestamp text")
+    }
+
+    private val tsMinEpoch = java.time.LocalDate.of(1, 1, 1).toEpochDay() * 86_400L
+    private val tsEndEpoch = java.time.LocalDate.of(10000, 1, 1).toEpochDay() * 86_400L
+
+    private fun parseTimestamp(s: String): java.time.Instant {
+        val year = tsField(s, 0, 4)
+        tsSeparator(s, 4, '-', '-')
+        val month = tsField(s, 5, 2)
+        tsSeparator(s, 7, '-', '-')
+        val day = tsField(s, 8, 2)
+        tsSeparator(s, 10, 'T', 't')
+        val hour = tsField(s, 11, 2)
+        tsSeparator(s, 13, ':', ':')
+        val minute = tsField(s, 14, 2)
+        tsSeparator(s, 16, ':', ':')
+        val second = tsField(s, 17, 2)
+        if (year < 1 || month < 1 || month > 12 || day < 1 ||
+            day > java.time.YearMonth.of(year, month).lengthOfMonth() ||
+            hour > 23 || minute > 59 || second > 59
+        ) {
+            throw CborError("invalid timestamp value")
+        }
+        var at = 19
+        var nano = 0
+        if (at < s.length && s[at] == '.') {
+            val start = ++at
+            while (at < s.length && s[at] >= '0' && s[at] <= '9') at++
+            val digits = at - start
+            if (digits < 1 || digits > 9) throw CborError("invalid timestamp fraction")
+            nano = tsField(s, start, digits)
+            repeat(9 - digits) { nano *= 10 }
+        }
+        if (at >= s.length) throw CborError("timestamp has no offset")
+        val zone = s[at]
+        val offset: Int
+        if (zone == 'Z' || zone == 'z') {
+            offset = 0
+            at += 1
+        } else if (zone == '+' || zone == '-') {
+            val offsetHour = tsField(s, at + 1, 2)
+            tsSeparator(s, at + 3, ':', ':')
+            val offsetMinute = tsField(s, at + 4, 2)
+            if (offsetHour > 23 || offsetMinute > 59) throw CborError("invalid timestamp offset")
+            offset = (if (zone == '-') -1 else 1) * (offsetHour * 3600 + offsetMinute * 60)
+            at += 6
+        } else {
+            throw CborError("invalid timestamp offset")
+        }
+        if (at != s.length) throw CborError("trailing timestamp text")
+        val epoch = java.time.LocalDate.of(year, month, day).toEpochDay() * 86_400L +
+            hour * 3_600L + minute * 60L + second - offset
+        // The range is checked again after conversion to UTC, because an offset can move
+        // a written year 0001 or 9999 value outside it.
+        if (epoch < tsMinEpoch || epoch >= tsEndEpoch) throw CborError("timestamp year outside 0001-9999")
+        return java.time.Instant.ofEpochSecond(epoch, nano.toLong())
+    }
+
+    private const val CDDL_TIME_FIRST = -62_135_596_800L
+    private const val CDDL_TIME_LAST = 253_402_300_799L
+
+    fun encCddlTime(t: java.time.Instant): CborValue {
+        val seconds = t.epochSecond
+        val nanos = t.nano
+        if (seconds < CDDL_TIME_FIRST || seconds > CDDL_TIME_LAST) throw CborError("cddl_time year outside 0001-9999")
+        if (nanos == 0) return CborValue.CTag(1uL, CborValue.CInt(seconds))
+        return CborValue.CTag(1uL, CborValue.CFloat(seconds.toDouble() + nanos.toDouble() / 1e9))
+    }
+
+    // The float split is spelled out step by step because the wire contract fixes each
+    // binary64 operation, so every target lands on the same instant.
+    fun asCddlTime(v: CborValue): java.time.Instant {
+        if (v !is CborValue.CTag || v.tag != 1uL) throw CborError("expected CBOR tag 1 cddl_time")
+        var seconds: Long
+        var nanos = 0L
+        when (val inner = v.value) {
+            is CborValue.CUint -> {
+                if (inner.value > CDDL_TIME_LAST.toULong()) throw CborError("cddl_time year outside 0001-9999")
+                seconds = inner.value.toLong()
+            }
+            is CborValue.CInt -> seconds = inner.value
+            is CborValue.CFloat -> {
+                val value = inner.value
+                if (!value.isFinite()) throw CborError("cddl_time is not finite")
+                // Refused before the integer conversion so that the cast cannot saturate.
+                if (value < (CDDL_TIME_FIRST - 1).toDouble() || value > (CDDL_TIME_LAST + 1).toDouble()) {
+                    throw CborError("cddl_time year outside 0001-9999")
+                }
+                val whole = kotlin.math.floor(value)
+                val scaled = (value - whole) * 1e9
+                val units = kotlin.math.floor(scaled + 0.5)
+                seconds = whole.toLong()
+                nanos = units.toLong()
+                if (nanos == 1_000_000_000L) {
+                    seconds += 1
+                    nanos = 0
+                }
+            }
+            else -> throw CborError("cddl_time tag 1 requires a number")
+        }
+        if (seconds < CDDL_TIME_FIRST || seconds > CDDL_TIME_LAST) throw CborError("cddl_time year outside 0001-9999")
+        return java.time.Instant.ofEpochSecond(seconds, nanos)
     }
 
     fun asTaggedText(v: CborValue, tag: ULong): String {
@@ -3373,7 +3597,7 @@ fn ordered_field_kind(value_type: &CsilTypeExpression) -> OrderedKind {
         match name.as_str() {
             "decimal" => OrderedKind::Decimal,
             "date" => OrderedKind::Date,
-            "timestamp" => OrderedKind::Timestamp,
+            "timestamp" | "cddl_time" => OrderedKind::Timestamp,
             _ => OrderedKind::Numeric,
         }
     } else {
@@ -3418,8 +3642,9 @@ fn map_csil_type_to_kotlin(
             "bytes" | "bstr" => "ByteArray".to_string(),
             "bool" => "Boolean".to_string(),
             "date" => "java.time.LocalDate".to_string(),
-            // CBOR tag 0 RFC3339 instant; java.time.Instant is exact and stdlib.
-            "timestamp" => "java.time.Instant".to_string(),
+            // CBOR tag 0 RFC3339 instant; java.time.Instant is exact and stdlib. A
+            // `cddl_time` is the same instant; only its wire form (tag 1) differs.
+            "timestamp" | "cddl_time" => "java.time.Instant".to_string(),
             // CBOR tag 4 exact decimal; BigDecimal is the JVM-idiomatic exact type.
             "decimal" => "java.math.BigDecimal".to_string(),
             "nil" | "null" => "Unit".to_string(),
@@ -4443,13 +4668,89 @@ mod tests {
         // Typed byte seam: the request serializes itself, the carrier moves bytes, the
         // response decodes back. Wire strings are the verbatim CSIL service and op names
         // so a Kotlin client reaches the same endpoint as its peers.
+        // The op has a ServiceError arm, so the client takes the reply variant from the seam
+        // and resolves the arm before it decodes.
+        assert!(
+            client.contains(
+                "fun callReply(service: String, op: String, request: ByteArray): WireReply"
+            )
+        );
         assert!(client.contains(
-            "decode<SubmitTaskResponse>(transport.call(\"CorndogsService\", \"submit-task\", encode(request)))"
+            "val reply = transport.callReply(\"CorndogsService\", \"submit-task\", encode(request))"
+        ));
+        assert!(client.contains(
+            "decode<SubmitTaskResponse>(resolveRpcReply(\"CorndogsService\", \"submit-task\", reply.variant, reply.payload))"
         ));
         assert!(!client.contains(" as SubmitTaskResponse"));
         assert!(!client.contains("\"corndogs\""));
         assert!(!client.contains("\"SubmitTask\""));
         assert!(!out.files.iter().any(|f| f.path.ends_with("Services.kt")));
+    }
+
+    /// A spec with no multi-arm op keeps the one-method seams and emits no WireReply, and
+    /// its quickstart carrier hands the payload on without resolving arms.
+    #[test]
+    fn single_arm_spec_keeps_one_method_seams() {
+        let ping = CsilGroupExpression {
+            entries: vec![entry("message", builtin("text"), None)],
+        };
+        let service = CsilServiceDefinition {
+            operations: vec![op(
+                "ping",
+                reference("Ping"),
+                reference("Ping"),
+                CsilServiceDirection::Unidirectional,
+                None,
+            )],
+            wire_id: None,
+        };
+        let mut input = spec(
+            "kotlin-client",
+            vec![
+                rule("Ping", CsilRuleType::GroupDef(ping)),
+                rule("PingService", CsilRuleType::ServiceDef(service)),
+            ],
+        );
+        input
+            .config
+            .options
+            .insert("emit_packages".to_string(), serde_json::json!(["kotlin"]));
+        let out = process_generation(input).unwrap();
+        for file in [
+            "Client.kt",
+            "ClientAsync.kt",
+            "Codec.kt",
+            "genquickstart.md",
+        ] {
+            let c = content(&out, file);
+            assert!(!c.contains("callReply"), "{file} has callReply");
+            assert!(!c.contains("WireReply"), "{file} has WireReply");
+        }
+        let client = content(&out, "Client.kt");
+        assert!(
+            client.contains(
+                "decode<Ping>(transport.call(\"PingService\", \"ping\", encode(request)))"
+            )
+        );
+        let quickstart = content(&out, "genquickstart.md");
+        assert!(quickstart.contains("        return resp.payload\n"));
+        assert!(!quickstart.contains("resolveRpcReply"));
+    }
+
+    /// The strict timestamp helpers are emitted in place of the lenient JDK parser.
+    #[test]
+    fn timestamp_helpers_are_strict() {
+        for needle in [
+            "fun asTimestamp(v: CborValue): java.time.Instant",
+            "if (zone == 'Z' || zone == 'z')",
+            "if (year < 1 || month < 1",
+            "throw CborError(\"invalid timestamp fraction\")",
+            "if (epoch < tsMinEpoch || epoch >= tsEndEpoch)",
+            "nano % 1_000_000 == 0 -> b.append(tsDigits(nano / 1_000_000, 3))",
+        ] {
+            assert!(CODEC_RUNTIME_KT.contains(needle), "missing {needle}");
+        }
+        assert!(!CODEC_RUNTIME_KT.contains("Instant.parse("));
     }
 
     #[test]
@@ -4705,8 +5006,12 @@ mod tests {
         let client = content(&out, "Client.kt");
         assert!(client.contains("fun submitTask(request: SubmitTaskRequest): Task"));
         assert!(client.contains(
-            "decode<Task>(transport.call(\"CorndogsService\", \"submit-task\", encode(request)))"
+            "decode<Task>(resolveRpcReply(\"CorndogsService\", \"submit-task\", reply.variant, reply.payload))"
         ));
+        assert!(
+            content(&out, "Codec.kt")
+                .contains("class WireReply(val variant: String?, val payload: ByteArray)")
+        );
         assert!(
             client.contains("fun call(service: String, op: String, request: ByteArray): ByteArray")
         );
@@ -4730,8 +5035,15 @@ mod tests {
         );
         // Methods suspend and route through the byte seam (no `await` in Kotlin coroutines).
         assert!(twin.contains("suspend fun submitTask(request: SubmitTaskRequest): Task {"));
+        // The op has a ServiceError arm, so the suspending seam returns the reply variant.
         assert!(twin.contains(
-            "decode<Task>(transport.call(\"CorndogsService\", \"submit-task\", encode(request)))"
+            "suspend fun callReply(service: String, op: String, request: ByteArray): WireReply"
+        ));
+        assert!(twin.contains(
+            "val reply = transport.callReply(\"CorndogsService\", \"submit-task\", encode(request))"
+        ));
+        assert!(twin.contains(
+            "decode<Task>(resolveRpcReply(\"CorndogsService\", \"submit-task\", reply.variant, reply.payload))"
         ));
         // The twin reuses the package's ClientError (declared in Client.kt), never redeclares it.
         assert!(!twin.contains("class ClientError("));
@@ -4869,14 +5181,65 @@ mod tests {
         ))
         .unwrap();
         let codec = content(&out, "Codec.kt");
-        // timestamp -> tag 0 RFC3339 text (Instant.toString() is RFC3339 UTC).
-        assert!(codec.contains("CborValue.CTag(0uL, CborValue.CText((this.at).toString()))"));
-        assert!(codec.contains(
-            "java.time.Instant.parse(CsilCbor.asTaggedText(CsilCbor.require(cbor, \"at\"), 0uL))"
-        ));
+        // timestamp -> tag 0 RFC3339 text through the strict runtime helpers.
+        assert!(codec.contains("CsilCbor.encTimestamp(this.at)"));
+        assert!(codec.contains("CsilCbor.asTimestamp(CsilCbor.require(cbor, \"at\"))"));
+        assert!(!codec.contains("Instant.parse("));
         // decimal -> tag 4 [exponent, mantissa].
         assert!(codec.contains("CborValue.CTag(4uL, CborValue.CArray(listOf(CborValue.CInt((-(this.amount).scale()).toLong()), CborValue.CInt((this.amount).unscaledValue().longValueExact()))))"));
         assert!(codec.contains("CsilCbor.asDecimal(CsilCbor.require(cbor, \"amount\"))"));
+    }
+
+    #[test]
+    fn codec_handles_cddl_time_as_tag_1_instant() {
+        let group = CsilGroupExpression {
+            entries: vec![
+                entry("at", builtin("cddl_time"), None),
+                entry(
+                    "after",
+                    CsilTypeExpression::Constrained {
+                        base_type: Box::new(builtin("cddl_time")),
+                        constraints: vec![CsilControlOperator::GreaterEqual(
+                            CsilLiteralValue::Text("2000-01-01T00:00:00Z".to_string()),
+                        )],
+                    },
+                    None,
+                ),
+            ],
+        };
+        let out = process_generation(spec(
+            "kotlin",
+            vec![rule("Moment", CsilRuleType::GroupDef(group))],
+        ))
+        .unwrap();
+        let types = content(&out, "Types.kt");
+        assert!(types.contains("val at: java.time.Instant"), "{types}");
+        // A bound on a cddl_time compares instants, as it does on a timestamp.
+        let validation = content(&out, "Validation.kt");
+        assert!(
+            validation.contains("java.time.Instant.parse(\"2000-01-01T00:00:00Z\")"),
+            "{validation}"
+        );
+        let codec = content(&out, "Codec.kt");
+        assert!(codec.contains("CsilCbor.encCddlTime(this.at)"), "{codec}");
+        assert!(codec.contains("CsilCbor.asCddlTime(CsilCbor.require(cbor, \"at\"))"));
+        assert!(!codec.contains("CsilCbor.encTimestamp(this.at)"));
+    }
+
+    #[test]
+    fn cddl_time_helpers_follow_the_wire_rule() {
+        for needle in [
+            "fun asCddlTime(v: CborValue): java.time.Instant",
+            "if (v !is CborValue.CTag || v.tag != 1uL)",
+            "if (!value.isFinite())",
+            "val scaled = (value - whole) * 1e9",
+            "val units = kotlin.math.floor(scaled + 0.5)",
+            "if (nanos == 1_000_000_000L)",
+            "seconds.toDouble() + nanos.toDouble() / 1e9",
+            "CborValue.CFloat(halfToDouble(bits.toInt()))",
+        ] {
+            assert!(CODEC_RUNTIME_KT.contains(needle), "missing {needle}");
+        }
     }
 
     #[test]
@@ -5427,7 +5790,13 @@ mod tests {
         // Non-zero transport status + typed ServiceError arm handled distinctly.
         assert!(c.contains("val resp = RpcResponse.decode(httpResp.body())"));
         assert!(c.contains("resp.asTransportError()?.let"));
-        assert!(c.contains("resolveRpcReply(service, op, resp.variant, resp.payload)"));
+        // The spec has a ServiceError arm, so the carrier implements callReply and hands the
+        // variant on; the typed client resolves the arm, never the carrier.
+        assert!(c.contains(
+            "override fun callReply(service: String, op: String, request: ByteArray): WireReply {"
+        ));
+        assert!(c.contains("return WireReply(resp.variant, resp.payload)"));
+        assert!(!c.contains("resolveRpcReply"));
         // Typed client + the first `->` call with a generated sample literal.
         assert!(c.contains("val client = CorndogsClient(HttpRpcTransport("));
         assert!(c.contains("client.submitTask(SubmitTaskRequest(task = Task("));

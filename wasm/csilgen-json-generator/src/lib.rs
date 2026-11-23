@@ -605,6 +605,9 @@ impl<'a> JsonSchemaGenerator<'a> {
                     // timestamp is CBOR tag 0 (RFC 3339 UTC) on the wire; the
                     // JSON-Schema view of that instant is a date-time string.
                     "timestamp" => json_string_format("date-time"),
+                    // cddl_time is CBOR tag 1 around epoch seconds, so its JSON view is
+                    // the same number, not a date-time string.
+                    "cddl_time" => json_type("number"),
                     // decimal is CBOR tag 4 (exact base-10) on the wire; JSON has
                     // no exact-decimal number type, so the schema models it as the
                     // exact value carried as text.
@@ -1657,6 +1660,13 @@ mod tests {
             base_type: Box::new(base),
             constraints,
         })
+    }
+
+    #[test]
+    fn cddl_time_schema_is_epoch_seconds() {
+        let obj = schema_for(CsilTypeExpression::Builtin("cddl_time".to_string()));
+        assert_eq!(obj["type"], "number");
+        assert!(obj.get("format").is_none());
     }
 
     #[test]

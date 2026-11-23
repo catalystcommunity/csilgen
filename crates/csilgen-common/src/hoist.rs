@@ -66,6 +66,10 @@ pub fn hoist_inline_named_numbers(spec: &CsilSpecSerialized) -> CsilSpecSerializ
 }
 
 fn hoist(spec: &CsilSpecSerialized, options: Option<HoistOptions>) -> CsilSpecSerialized {
+    // Splice first, so a spliced group's inline composites are hoisted under the
+    // record that now owns them.
+    let spliced = crate::splice_group_references(spec);
+    let spec = &spliced;
     let mut hoister = Hoister {
         synth: Vec::new(),
         // Reserve a case-insensitive, separator-stripped canonical key for every

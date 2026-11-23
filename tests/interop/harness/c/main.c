@@ -50,6 +50,8 @@ static Scalars scalars_ok(void) {
     s.due = "2000-02-29";
     s.when.rfc3339 = "2026-06-29T12:34:56Z";
     s.when.epoch_seconds = 0;
+    s.seen.rfc3339 = "2026-06-29T12:34:56.500Z";
+    s.seen.epoch_seconds = 0;
     s.amount.exponent = -2; /* 123.45 = 12345 * 10^-2 */
     s.amount.mantissa = 12345;
     /* mixed-union coverage: a value equal to a literal arm must wire as
@@ -204,6 +206,7 @@ static bool scalars_eq(const Scalars *a, const Scalars *b) {
     if (a->flag != b->flag) return false;
     if (!streq(a->due, b->due)) return false;
     if (!streq(a->when.rfc3339, b->when.rfc3339)) return false;
+    if (!streq(a->seen.rfc3339, b->seen.rfc3339)) return false;
     if (a->amount.exponent != b->amount.exponent || a->amount.mantissa != b->amount.mantissa)
         return false;
     if (!mixed_status_eq(&a->status_literal, &b->status_literal)) return false;

@@ -26,14 +26,22 @@ impl Rp for Handler {
     }
 }
 
+// A fake transport: it answers every call with the stored response envelope.
 struct Carrier(Vec<u8>);
 impl Transport for Carrier {
-    fn call(&self, service: &str, op: &str, _: &[u8]) -> Result<Vec<u8>, ClientError> {
+    fn call(&self, service: &str, op: &str, req: &[u8]) -> Result<Vec<u8>, ClientError> {
+        Ok(self.call_reply(service, op, req)?.payload)
+    }
+
+    fn call_reply(&self, _: &str, _: &str, _: &[u8]) -> Result<WireReply, ClientError> {
         let reply = RpcResponse::decode(&self.0).map_err(|e| ClientError::Decode(e.to_string()))?;
         let reply = reply
             .into_transport_error()
             .map_err(|e| ClientError::Transport(e.to_string()))?;
-        resolve_rpc_reply(service, op, reply.variant.as_deref(), reply.payload)
+        Ok(WireReply {
+            variant: reply.variant,
+            payload: reply.payload,
+        })
     }
 }
 
@@ -44,22 +52,22 @@ fn main() {
     assert_eq!(RpErrorCode::from_number(1), None);
     let retry = choices::Retry { delay: 3 };
     let (variant, payload) =
-        choices::encode_api_submit_reply(Err(choices::ApiSubmitError::Retry(retry)));
+        choices::encode_api_submit_reply(Err(choices::ApiSubmitError::Retry(retry))).unwrap();
     assert!(matches!(
         choices::resolve_rpc_reply("Api", "submit", Some(variant), payload),
         Err(choices::ClientError::ApplicationRetry(e)) if e.delay == 3
     ));
     let value = choices::Reply::Variant1(choices::Other { c: 7 });
-    let plain = choices::encode_api_fetch_response(&value);
+    let plain = choices::encode_api_fetch_response(&value).unwrap();
     assert_eq!(plain[0..2], [0x82, 1]);
-    let (variant, payload) = choices::encode_api_poll_reply(Ok(value));
+    let (variant, payload) = choices::encode_api_poll_reply(Ok(value)).unwrap();
     assert_eq!(variant, "Reply");
     assert_eq!(payload, plain);
     let read_peer = env::args().nth(1).is_some();
     for name in ["ok", "app", "transport", "unknown", "missing", "malformed"] {
         let req = Req { a: name.into() };
         let (variant, payload) =
-            encode_rp_decrypt_token_reply(Handler.decrypt_token(&(), req.clone()));
+            encode_rp_decrypt_token_reply(Handler.decrypt_token(&(), req.clone())).unwrap();
         if name == "app" {
             assert_eq!(payload, b"\xa2\x64code\x07\x67message\x65limit");
         }

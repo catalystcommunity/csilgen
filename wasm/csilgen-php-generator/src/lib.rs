@@ -153,7 +153,12 @@ pub fn generate_php_code_from_serialized(
     }
 
     if pkg_mode {
-        Ok(wrap_as_composer_package(files, config, &namespace))
+        let rpc = files
+            .iter()
+            .any(|f| f.path == "client.php")
+            .then(|| first_unary_client(spec))
+            .flatten();
+        Ok(wrap_as_composer_package(files, config, &namespace, rpc))
     } else {
         Ok(files)
     }
@@ -214,6 +219,7 @@ fn wrap_as_composer_package(
     files: GeneratedFiles,
     config: &GeneratorConfig,
     namespace: &str,
+    rpc: Option<RpcExample>,
 ) -> GeneratedFiles {
     let name = package_name(config);
     let version = option_str(config, "package_version").unwrap_or("0.1.0");
@@ -236,15 +242,88 @@ fn wrap_as_composer_package(
     }
     out.push(GeneratedFile {
         path: "genquickstart.md".to_string(),
-        content: php_quickstart(&composer_name, namespace),
+        content: php_quickstart(&composer_name, namespace, rpc.as_ref()),
     });
     out
 }
 
-fn php_quickstart(package: &str, namespace: &str) -> String {
-    format!(
+/// The client call a package quickstart demonstrates: the first `->` operation.
+struct RpcExample {
+    client_class: String,
+    method: String,
+    /// Whether that client's service has a multi-arm reply, so the adapter must
+    /// implement `CsilReplyTransport::callReply`.
+    multi_arm: bool,
+}
+
+fn first_unary_client(spec: &CsilSpecSerialized) -> Option<RpcExample> {
+    spec.rules.iter().find_map(|rule| match &rule.rule_type {
+        CsilRuleType::ServiceDef(service) => {
+            let op = service
+                .operations
+                .iter()
+                .find(|op| op.direction == CsilServiceDirection::Unidirectional)?;
+            Some(RpcExample {
+                client_class: format!("{}Client", service_base(&rule.name)),
+                method: php_method(&op.name),
+                multi_arm: service
+                    .operations
+                    .iter()
+                    .any(|op| op.rpc_reply_arms().is_some()),
+            })
+        }
+        _ => None,
+    })
+}
+
+fn php_quickstart(package: &str, namespace: &str, rpc: Option<&RpcExample>) -> String {
+    let mut out = format!(
         "# {package}\n\nInstall with Composer from a git checkout or Packagist once published.\n\n```bash\ncomposer require {package}\n```\n\nGenerated classes live under `{namespace}` and use `csilgen/transport` for CSIL-RPC, CSIL-Events, CSIL-Datagrams, and canonical CBOR bytes.\n"
-    )
+    );
+    if let Some(rpc) = rpc {
+        out.push_str(&php_rpc_section(namespace, rpc));
+    }
+    out
+}
+
+/// A CSIL-RPC adapter over any `ByteCarrier`. The library owns the envelope
+/// (`Rpc::encodeRequest`/`decodeResponse`/`checkStatus`); the adapter only moves
+/// bytes. It implements `callReply` only when the client requires it, and never
+/// resolves reply arms itself: the generated client does that.
+fn php_rpc_section(namespace: &str, rpc: &RpcExample) -> String {
+    let client = &rpc.client_class;
+    let method = &rpc.method;
+    let mut out = String::from("\n## CSIL-RPC\n\n");
+    out.push_str(
+        "The generated client encodes the request and decodes the reply; you supply an adapter\n\
+         that moves bytes. The adapter below uses the library's envelope over any `ByteCarrier`\n\
+         (here a TCP stream with CSIL length-prefix framing).\n\n",
+    );
+    if rpc.multi_arm {
+        out.push_str(
+            "Some operations here have more than one reply arm, so the adapter implements\n\
+             `CsilReplyTransport`. Its `callReply` returns the envelope `variant` with the payload,\n\
+             and the generated client uses it to return the success value or throw the typed\n\
+             error arm.\n\n",
+        );
+    }
+    let implements = if rpc.multi_arm {
+        format!(" implements \\{namespace}\\CsilReplyTransport")
+    } else {
+        String::new()
+    };
+    out.push_str("```php\n<?php\n\nuse Csilgen\\Transport\\ByteCarrier;\nuse Csilgen\\Transport\\Rpc;\nuse Csilgen\\Transport\\StreamCarrier;\n\n");
+    out.push_str(&format!(
+        "final class RpcAdapter{implements}\n{{\n    private $carrier;\n\n    public function __construct(ByteCarrier $carrier)\n    {{\n        $this->carrier = $carrier;\n    }}\n\n    public function call($service, $op, $payload)\n    {{\n        return $this->exchange($service, $op, $payload)['payload'];\n    }}\n\n"
+    ));
+    if rpc.multi_arm {
+        out.push_str("    public function callReply($service, $op, $payload)\n    {\n        $response = $this->exchange($service, $op, $payload);\n        return array('variant' => $response['variant'], 'payload' => $response['payload']);\n    }\n\n");
+    }
+    out.push_str("    private function exchange($service, $op, $payload)\n    {\n        $this->carrier->send(Rpc::encodeRequest($service, $op, $payload));\n        // A non-zero transport status throws StatusException.\n        return Rpc::checkStatus(Rpc::decodeResponse($this->carrier->receive()));\n    }\n}\n\n");
+    out.push_str(&format!(
+        "$carrier = new StreamCarrier(stream_socket_client('tcp://localhost:5080'));\n$client = new \\{namespace}\\{client}(new RpcAdapter($carrier));\n// $request is a value of the operation's request type.\n$response = $client->{method}($request);\n```\n"
+    ));
+    out
 }
 
 fn generate_types_file(spec: &CsilSpecSerialized, namespace: &str) -> String {
@@ -375,6 +454,12 @@ fn generate_codec_file(spec: &CsilSpecSerialized, namespace: &str) -> String {
 "#,
         );
     }
+    if spec.uses_builtin("timestamp") {
+        out.push_str(PHP_TIMESTAMP_CODEC);
+    }
+    if spec.uses_builtin("cddl_time") {
+        out.push_str(PHP_CDDL_TIME_CODEC);
+    }
     let class_names: HashSet<String> = spec
         .rules
         .iter()
@@ -487,6 +572,157 @@ fn generate_codec_file(spec: &CsilSpecSerialized, namespace: &str) -> String {
     out.push_str("}\n");
     out
 }
+
+/// Strict `timestamp` (tag 0) codec per docs/cbor-wire-contract.md. The value type
+/// is `\DateTimeImmutable` because it is PHP's standard instant type and holds
+/// microseconds; digits 7-9 must be zero, since the contract forbids rounding. The
+/// text shape is checked by hand because `DateTime`'s own parser accepts a space
+/// separator, a missing offset, and out-of-range fields.
+const PHP_TIMESTAMP_CODEC: &str = r#"    public static function encode_timestamp($value)
+    {
+        return CBOR::encode(self::timestampToCbor($value));
+    }
+
+    public static function decode_timestamp($bytes)
+    {
+        return self::timestampFromCbor(CBOR::decode($bytes));
+    }
+
+    private static function timestampToCbor($value)
+    {
+        if ($value instanceof \DateTime) {
+            $value = \DateTimeImmutable::createFromMutable($value);
+        }
+        if (!($value instanceof \DateTimeImmutable)) {
+            throw new CodecException('expected a DateTimeImmutable for a timestamp');
+        }
+        $utc = $value->setTimezone(new \DateTimeZone('UTC'));
+        $year = (int)$utc->format('Y');
+        if ($year < 1 || $year > 9999) {
+            throw new CodecException('timestamp year outside 0001-9999');
+        }
+        $micros = (int)$utc->format('u');
+        if ($micros === 0) {
+            $fraction = '';
+        } elseif ($micros % 1000 === 0) {
+            $fraction = sprintf('.%03d', intdiv($micros, 1000));
+        } else {
+            $fraction = sprintf('.%06d', $micros);
+        }
+        return new \Csilgen\Transport\Tag(0, sprintf('%04d', $year) . $utc->format('-m-d\TH:i:s') . $fraction . 'Z');
+    }
+
+    private static function timestampFromCbor($value)
+    {
+        if (!($value instanceof \Csilgen\Transport\Tag) || $value->tag !== 0 || !is_string($value->value)
+            || !preg_match('/\A([0-9]{4})-([0-9]{2})-([0-9]{2})[Tt]([0-9]{2}):([0-9]{2}):([0-9]{2})(?:\.([0-9]{1,9}))?(?:[Zz]|([+-])([0-9]{2}):([0-9]{2}))\z/', $value->value, $p)) {
+            throw new CodecException('expected tag 0 with RFC 3339 timestamp text');
+        }
+        $year = (int)$p[1];
+        $month = (int)$p[2];
+        $day = (int)$p[3];
+        $hour = (int)$p[4];
+        $minute = (int)$p[5];
+        $second = (int)$p[6];
+        if ($year < 1 || !checkdate($month, $day, $year) || $hour > 23 || $minute > 59 || $second > 59) {
+            throw new CodecException('timestamp field out of range');
+        }
+        $digits = isset($p[7]) ? str_pad($p[7], 9, '0') : '000000000';
+        if (substr($digits, 6) !== '000') {
+            throw new CodecException('timestamp fraction finer than microseconds');
+        }
+        $offset = 0;
+        if (isset($p[8]) && $p[8] !== '') {
+            $offsetHour = (int)$p[9];
+            $offsetMinute = (int)$p[10];
+            if ($offsetHour > 23 || $offsetMinute > 59) {
+                throw new CodecException('timestamp offset out of range');
+            }
+            $offset = ($offsetHour * 60 + $offsetMinute) * ($p[8] === '-' ? -1 : 1);
+        }
+        $utc = new \DateTimeZone('UTC');
+        $instant = (new \DateTimeImmutable('@0'))->setTimezone($utc)
+            ->setDate($year, $month, $day)
+            ->setTime($hour, $minute, $second, (int)substr($digits, 0, 6));
+        if ($offset !== 0) {
+            $instant = $instant->modify(sprintf('%+d minutes', -$offset));
+        }
+        $utcYear = (int)$instant->format('Y');
+        if ($utcYear < 1 || $utcYear > 9999) {
+            throw new CodecException('timestamp year outside 0001-9999');
+        }
+        return $instant;
+    }
+
+"#;
+
+/// `cddl_time` (tag 1, epoch seconds) codec per docs/cbor-wire-contract.md. It uses
+/// the same `\DateTimeImmutable` as `timestamp`, so p = 6 fraction digits. The
+/// seconds and microseconds are read as integers because `getTimestamp()` alone
+/// drops the fraction and a float sum would lose microseconds far from 1970.
+const PHP_CDDL_TIME_CODEC: &str = r#"    public static function encode_cddl_time($value)
+    {
+        return CBOR::encode(self::cddlTimeToCbor($value));
+    }
+
+    public static function decode_cddl_time($bytes)
+    {
+        return self::cddlTimeFromCbor(CBOR::decode($bytes));
+    }
+
+    private static function cddlTimeToCbor($value)
+    {
+        if ($value instanceof \DateTime) {
+            $value = \DateTimeImmutable::createFromMutable($value);
+        }
+        if (!($value instanceof \DateTimeImmutable)) {
+            throw new CodecException('expected a DateTimeImmutable for a cddl_time');
+        }
+        $seconds = $value->getTimestamp();
+        $micros = (int)$value->format('u');
+        if ($seconds < -62135596800 || $seconds > 253402300799) {
+            throw new CodecException('cddl_time year outside 0001-9999');
+        }
+        if ($micros === 0) {
+            return new \Csilgen\Transport\Tag(1, $seconds);
+        }
+        return new \Csilgen\Transport\Tag(1, (float)$seconds + (float)$micros / 1000000.0);
+    }
+
+    private static function cddlTimeFromCbor($value)
+    {
+        if (!($value instanceof \Csilgen\Transport\Tag) || $value->tag !== 1) {
+            throw new CodecException('expected tag 1 with epoch seconds');
+        }
+        $number = $value->value;
+        if (is_int($number)) {
+            $seconds = $number;
+            $micros = 0;
+        } elseif (is_float($number)) {
+            // The bounds are checked before the int cast so that it cannot overflow.
+            if (!is_finite($number) || $number < -62135596801.0 || $number > 253402300800.0) {
+                throw new CodecException('cddl_time is not finite or outside years 0001-9999');
+            }
+            $whole = floor($number);
+            $scaled = ($number - $whole) * 1000000.0;
+            $units = floor($scaled + 0.5);
+            $seconds = (int)$whole;
+            $micros = (int)$units;
+            if ($micros === 1000000) {
+                $seconds++;
+                $micros = 0;
+            }
+        } else {
+            throw new CodecException('cddl_time content must be an integer or a float');
+        }
+        if ($seconds < -62135596800 || $seconds > 253402300799) {
+            throw new CodecException('cddl_time year outside 0001-9999');
+        }
+        $instant = (new \DateTimeImmutable('@' . $seconds))->setTimezone(new \DateTimeZone('UTC'));
+        return $instant->setTime((int)$instant->format('G'), (int)$instant->format('i'), (int)$instant->format('s'), $micros);
+    }
+
+"#;
 
 /// Whether every variant of a named type-choice is a literal — ANY literal kind,
 /// mixed kinds included (`"a" / 1`) — the CSIL wire contract's "ALL-literal choice"
@@ -650,6 +886,7 @@ fn php_union_dispatch_key(variant: &CsilTypeExpression, class_names: &HashSet<St
             "int" | "uint" | "nint" => "int".to_string(),
             "float" | "float16" | "float32" | "float64" | "double" => "float".to_string(),
             "null" | "nil" => "null".to_string(),
+            "timestamp" | "cddl_time" => "object:\\DateTimeInterface".to_string(),
             _ => "string".to_string(),
         },
         CsilTypeExpression::Reference(name) if class_names.contains(name) => {
@@ -1011,6 +1248,12 @@ fn to_cbor_expr(
         CsilTypeExpression::Builtin(name) if name == "date" => {
             format!(r"new \Csilgen\Transport\Tag(1004, self::calendarDate({var}))")
         }
+        CsilTypeExpression::Builtin(name) if name == "timestamp" => {
+            format!("self::timestampToCbor({var})")
+        }
+        CsilTypeExpression::Builtin(name) if name == "cddl_time" => {
+            format!("self::cddlTimeToCbor({var})")
+        }
         CsilTypeExpression::Builtin(name) if name == "bytes" || name == "bstr" => {
             format!("CBOR::bytes({var})")
         }
@@ -1106,6 +1349,12 @@ fn from_cbor_expr(
 ) -> String {
     match expr {
         CsilTypeExpression::Builtin(name) if name == "date" => format!("self::readDate({var})"),
+        CsilTypeExpression::Builtin(name) if name == "timestamp" => {
+            format!("self::timestampFromCbor({var})")
+        }
+        CsilTypeExpression::Builtin(name) if name == "cddl_time" => {
+            format!("self::cddlTimeFromCbor({var})")
+        }
         CsilTypeExpression::Reference(name)
             if class_names.contains(name) || unions.contains(name) || enums.contains(name) =>
         {
@@ -1198,6 +1447,9 @@ fn from_cbor_expr(
 fn generate_client_file(spec: &CsilSpecSerialized, namespace: &str) -> String {
     let mut out = php_header(namespace);
     out.push_str("class ClientError extends \\RuntimeException {}\n\n");
+    if spec.rpc_operations().next().is_some() {
+        out.push_str(PHP_REPLY_TRANSPORT);
+    }
     for rule in &spec.rules {
         if let CsilRuleType::ServiceDef(service) = &rule.rule_type {
             emit_client_class(&mut out, &rule.name, service);
@@ -1208,9 +1460,21 @@ fn generate_client_file(spec: &CsilSpecSerialized, namespace: &str) -> String {
 
 fn emit_client_class(out: &mut String, service_name: &str, service: &CsilServiceDefinition) {
     let class = format!("{}Client", service_base(service_name));
-    out.push_str(&format!(
-        "/**\n * The injected transport must expose call($service, $op, $payload) and return\n * the reply payload bytes. $service and $op are the CSIL names exactly as\n * written in the source and map verbatim onto the CSIL-RPC v1 envelope's\n * service/op fields.\n */\nclass {class}\n{{\n    private $transport;\n\n    public function __construct($transport)\n    {{\n        $this->transport = $transport;\n    }}\n\n"
-    ));
+    // Only a service with a multi-arm reply needs the variant, so only it requires
+    // the interface; every other client keeps today's duck-typed `call` seam.
+    let multi_arm = service
+        .operations
+        .iter()
+        .any(|op| op.rpc_reply_arms().is_some());
+    if multi_arm {
+        out.push_str(&format!(
+            "/**\n * The injected transport implements CsilReplyTransport: call() for single-arm\n * operations and callReply() for operations with more than one reply arm.\n * $service and $op are the CSIL names exactly as written in the source and map\n * verbatim onto the CSIL-RPC v1 envelope's service/op fields.\n */\nclass {class}\n{{\n    private $transport;\n\n    public function __construct(CsilReplyTransport $transport)\n    {{\n        $this->transport = $transport;\n    }}\n\n"
+        ));
+    } else {
+        out.push_str(&format!(
+            "/**\n * The injected transport must expose call($service, $op, $payload) and return\n * the reply payload bytes. $service and $op are the CSIL names exactly as\n * written in the source and map verbatim onto the CSIL-RPC v1 envelope's\n * service/op fields.\n */\nclass {class}\n{{\n    private $transport;\n\n    public function __construct($transport)\n    {{\n        $this->transport = $transport;\n    }}\n\n"
+        ));
+    }
     for op in &service.operations {
         if op.direction == CsilServiceDirection::Reverse {
             continue;
@@ -1220,6 +1484,14 @@ fn emit_client_class(out: &mut String, service_name: &str, service: &CsilService
         let out_suffix = codec_suffix(op.success_output());
         // The wire pair is the verbatim CSIL service/op names (cbor-wire-contract.md
         // "RPC call naming"): any case transform is lossy at the transport seam.
+        if op.rpc_reply_arms().is_some() {
+            let wire_service = php_string(service_name);
+            let wire_op = php_string(&op.name);
+            out.push_str(&format!(
+                "    public function {method}($request)\n    {{\n        $payload = Codec::encode{in_suffix}($request);\n        $reply = $this->transport->callReply({wire_service}, {wire_op}, $payload);\n        if (!is_array($reply) || !array_key_exists('variant', $reply) || !array_key_exists('payload', $reply)) {{\n            throw new CodecException('callReply must return array(\\'variant\\' => ?string, \\'payload\\' => string)');\n        }}\n        return Codec::decode{out_suffix}(Codec::resolveRpcReply({wire_service}, {wire_op}, $reply['variant'], $reply['payload']));\n    }}\n\n"
+            ));
+            continue;
+        }
         out.push_str(&format!(
             "    public function {method}($request)\n    {{\n        $payload = Codec::encode{in_suffix}($request);\n        $reply = $this->transport->call({}, {}, $payload);\n        return Codec::decode{out_suffix}($reply);\n    }}\n\n",
             php_string(service_name),
@@ -1228,6 +1500,28 @@ fn emit_client_class(out: &mut String, service_name: &str, service: &CsilService
     }
     out.push_str("}\n\n");
 }
+
+/// The seam for a spec with a multi-arm (`A / B`) reply. The client needs the
+/// envelope variant to pick the arm, which the bytes-only `call` cannot carry; the
+/// array shape matches `Csilgen\Transport\Rpc::decodeResponse`.
+const PHP_REPLY_TRANSPORT: &str = r#"/**
+ * Transport seam for clients whose service has an operation with more than one
+ * reply arm. callReply() performs the same RPC as call() and returns the CSIL-RPC
+ * response envelope's variant (null when absent) with the reply payload. The
+ * client picks the arm from the variant: the success arm returns its value, a
+ * declared error arm throws its <Arm>Refusal, and a missing or unknown variant
+ * throws CodecException.
+ */
+interface CsilReplyTransport
+{
+    /** @return string the reply payload bytes */
+    public function call($service, $op, $payload);
+
+    /** @return array{variant: ?string, payload: string} */
+    public function callReply($service, $op, $payload);
+}
+
+"#;
 
 fn generate_server_file(spec: &CsilSpecSerialized, namespace: &str) -> String {
     let mut out = php_header(namespace);
@@ -1282,6 +1576,8 @@ fn emit_server_class(out: &mut String, service_name: &str, service: &CsilService
 fn codec_suffix(expr: &CsilTypeExpression) -> String {
     match expr {
         CsilTypeExpression::Builtin(name) if name == "date" => "_calendar_date".into(),
+        CsilTypeExpression::Builtin(name) if name == "timestamp" => "_timestamp".into(),
+        CsilTypeExpression::Builtin(name) if name == "cddl_time" => "_cddl_time".into(),
         CsilTypeExpression::Reference(name) => php_class(name),
         _ => "Value".to_string(),
     }

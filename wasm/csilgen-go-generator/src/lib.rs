@@ -607,9 +607,7 @@ fn go_rpc_section(import_path: &str, ex: Option<&GoExample>, typed_rpc: bool) ->
     ));
     out.push_str(RPC_CARRIER_GO);
     if typed_rpc {
-        out.push_str("\treturn api.ResolveRPCReply(service, op, resp.Variant, resp.Payload)\n}\n");
-    } else {
-        out.push_str("\treturn resp.Payload, nil\n}\n");
+        out.push_str(RPC_CARRIER_REPLY_GO);
     }
     out.push('\n');
     out.push_str("func main() {\n");
@@ -693,7 +691,7 @@ type channelCodec struct{{}}
 func (channelCodec) Encode(value any) ([]byte, error) {{
 	switch v := value.(type) {{
 	case api.{outbound}:
-		return api.Encode{outbound}(v), nil
+		return api.Encode{outbound}(v)
 	default:
 		return nil, fmt.Errorf("unsupported channel type %T", value)
 	}}
@@ -900,8 +898,12 @@ func openUDPCarrier(addr string) (transport.DatagramCarrier, error) {{
 // reordering.
 func runDatagrams(carrier transport.DatagramCarrier) error {{
 	req := {req_sample}
+	payload, err := api.Encode{req_type}(req)
+	if err != nil {{
+		return err
+	}}
 	// seq 0 marks an unsequenced datagram.
-	datagram, err := transport.NewDatagram(opOrd, 0, api.Encode{req_type}(req)).Encode()
+	datagram, err := transport.NewDatagram(opOrd, 0, payload).Encode()
 	if err != nil {{
 		return err
 	}}
@@ -1016,6 +1018,30 @@ fn go_scalar_sample(
         CsilTypeExpression::Reference(rname) if records.contains(rname) => {
             find_record(input, rname).map(|g| go_record_literal(input, rname, g, records, config))
         }
+        // An enum field needs a declared member: its zero value is not one, and the
+        // encoder refuses a value outside the declared set.
+        CsilTypeExpression::Reference(rname) => match codec_aliases(input).get(rname) {
+            Some(CsilTypeExpression::Choice(arms))
+                if csilgen_common::enum_numbers(arms).is_some() =>
+            {
+                csilgen_common::enum_numbers(arms)?
+                    .first()
+                    .map(i64::to_string)
+            }
+            Some(target @ CsilTypeExpression::Choice(_)) => {
+                go_scalar_sample(input, target, records, config)
+            }
+            _ => None,
+        },
+        CsilTypeExpression::Choice(choices) if choice_all_literal(choices) => {
+            let uniform = enum_scalar_builtin(choices).is_some();
+            match choices.iter().find_map(choice_arm_literal)? {
+                CsilLiteralValue::Text(text) => Some(go_string_lit(text)),
+                CsilLiteralValue::Integer(i) if uniform => Some(i.to_string()),
+                CsilLiteralValue::Bool(b) if uniform => Some(b.to_string()),
+                _ => None,
+            }
+        }
         _ => None,
     }
 }
@@ -1049,15 +1075,16 @@ type HTTPRpcCarrier struct {
 	HTTP    *http.Client // optional; defaults to http.DefaultClient
 }
 
-func (t *HTTPRpcCarrier) Call(ctx context.Context, service, op string, req []byte) ([]byte, error) {
+func (t *HTTPRpcCarrier) exchange(ctx context.Context, service, op string, req []byte) (transport.RpcResponse, error) {
+	var none transport.RpcResponse
 	envelope, err := transport.NewRpcRequest(service, op, req).Encode()
 	if err != nil {
-		return nil, err
+		return none, err
 	}
 	url := strings.TrimRight(t.BaseURL, "/") + "/csil/v1/rpc"
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(envelope))
 	if err != nil {
-		return nil, err
+		return none, err
 	}
 	httpReq.Header.Set("Content-Type", "application/cbor")
 	httpReq.Header.Set("Accept", "application/cbor")
@@ -1067,24 +1094,40 @@ func (t *HTTPRpcCarrier) Call(ctx context.Context, service, op string, req []byt
 	}
 	httpResp, err := client.Do(httpReq)
 	if err != nil {
-		return nil, err
+		return none, err
 	}
 	defer httpResp.Body.Close()
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
-		return nil, fmt.Errorf("csil-rpc %s/%s: http %d", service, op, httpResp.StatusCode)
+		return none, fmt.Errorf("csil-rpc %s/%s: http %d", service, op, httpResp.StatusCode)
 	}
 	body, err := io.ReadAll(httpResp.Body)
 	if err != nil {
-		return nil, err
+		return none, err
 	}
 	resp, err := transport.DecodeRpcResponse(body)
 	if err != nil {
-		return nil, err
+		return none, err
 	}
 	// AsTransportError returns a StatusError for any non-zero transport status.
 	if err := resp.AsTransportError(); err != nil {
-		return nil, err
+		return none, err
 	}
+	return resp, nil
+}
+
+func (t *HTTPRpcCarrier) Call(ctx context.Context, service, op string, req []byte) ([]byte, error) {
+	resp, err := t.exchange(ctx, service, op, req)
+	return resp.Payload, err
+}
+"#;
+
+/// Appended to the carrier only when the spec has a multi-arm operation: the client
+/// needs the reply variant to tell the success arm from a declared error arm.
+const RPC_CARRIER_REPLY_GO: &str = r#"
+func (t *HTTPRpcCarrier) CallReply(ctx context.Context, service, op string, req []byte) (api.WireReply, error) {
+	resp, err := t.exchange(ctx, service, op, req)
+	return api.WireReply{Variant: resp.Variant, Payload: resp.Payload}, err
+}
 "#;
 
 /// The TLS `StreamCarrier` opener — spec-independent. It dials a TLS byte stream and
@@ -1354,7 +1397,7 @@ fn generate_types(
     {
         imports.push("fmt".to_string());
     }
-    if spec_uses_builtin(input, "timestamp") {
+    if spec_uses_builtin(input, "timestamp") || spec_uses_builtin(input, "cddl_time") {
         imports.push("time".to_string());
     }
     if config.decimal_mapping == DecimalMapping::Library && spec_uses_builtin(input, "decimal") {
@@ -1598,6 +1641,30 @@ type Transport interface {
 }
 ";
 
+/// The `CallReply` seam, emitted in place of the plain `Transport` interface only
+/// when the spec has a multi-arm operation, so other specs keep their earlier seam.
+const CLIENT_REPLY_SEAM_GO: &str = "\
+// WireReply is a status-zero CSIL-RPC reply: Variant names the declared output arm
+// that Payload encodes. A transport returns it from CallReply.
+type WireReply struct {
+\tVariant *string
+\tPayload []byte
+}
+
+// Transport is the caller-supplied byte carrier: it performs the call named by
+// (service, op) with the already-encoded request bytes and returns the response
+// bytes, or an error. Both names are the verbatim CSIL names (service as written,
+// op in kebab-case as written), ready to go on the wire unmodified. The generated
+// client owns (de)serialization via the codec; the carrier only moves bytes, so
+// it can be HTTP, a queue, or an in-process loop. CallReply serves operations
+// that declare several reply arms: it also returns the reply variant, so the
+// client can return the success arm or the declared error arm.
+type Transport interface {
+\tCall(ctx context.Context, service string, op string, req []byte) ([]byte, error)
+\tCallReply(ctx context.Context, service string, op string, req []byte) (WireReply, error)
+}
+";
+
 /// The body of the self-contained `CsilDecimal` helper, injected as its own file
 /// only when the spec uses `decimal` under the default mapping. It holds the exact
 /// value (int exponent + big.Int mantissa); the generated `codec.gen.go` owns its
@@ -1623,12 +1690,20 @@ func (d CsilDecimal) mantissa() *big.Int {
 	return d.Mantissa
 }
 
+// csilDecimalPlainLimit bounds the zeros String writes. A decoded exponent can be
+// any int64, and plain text for a large one needs memory in proportion to it.
+const csilDecimalPlainLimit = 1000
+
 // String renders the exact value as canonical decimal text. This is the lossless
 // bridge to other decimal libraries, e.g. shopspring.NewFromString(d.String()).
+// An exponent beyond csilDecimalPlainLimit renders as <mantissa>e<exponent>.
 func (d CsilDecimal) String() string {
 	m := d.mantissa()
 	if d.Exponent == 0 {
 		return m.String()
+	}
+	if d.Exponent > csilDecimalPlainLimit || d.Exponent < -csilDecimalPlainLimit {
+		return m.String() + "e" + strconv.FormatInt(d.Exponent, 10)
 	}
 	if d.Exponent > 0 {
 		scale := new(big.Int).Exp(big.NewInt(10), big.NewInt(d.Exponent), nil)
@@ -1650,7 +1725,16 @@ func (d CsilDecimal) String() string {
 // ParseCsilDecimal parses canonical decimal text (what String produces, and what
 // shopspring.Decimal.String emits) into an exact CsilDecimal.
 func ParseCsilDecimal(s string) (CsilDecimal, error) {
+	bad := fmt.Errorf("CsilDecimal: invalid decimal string %q", s)
 	s = strings.TrimSpace(s)
+	var exp int64
+	if i := strings.IndexAny(s, "eE"); i >= 0 {
+		e, err := strconv.ParseInt(s[i+1:], 10, 64)
+		if err != nil {
+			return CsilDecimal{}, bad
+		}
+		s, exp = s[:i], e
+	}
 	neg := false
 	switch {
 	case strings.HasPrefix(s, "-"):
@@ -1667,14 +1751,24 @@ func ParseCsilDecimal(s string) (CsilDecimal, error) {
 	if digits == "" {
 		digits = "0"
 	}
+	// big.Int.SetString also accepts a sign, which would allow a second sign here.
+	for _, c := range digits {
+		if c < '0' || c > '9' {
+			return CsilDecimal{}, bad
+		}
+	}
 	m, ok := new(big.Int).SetString(digits, 10)
 	if !ok {
-		return CsilDecimal{}, fmt.Errorf("CsilDecimal: invalid decimal string %q", s)
+		return CsilDecimal{}, bad
 	}
 	if neg {
 		m.Neg(m)
 	}
-	return CsilDecimal{Exponent: -int64(len(fracPart)), Mantissa: m}, nil
+	frac := int64(len(fracPart))
+	if exp < math.MinInt64+frac {
+		return CsilDecimal{}, bad
+	}
+	return CsilDecimal{Exponent: exp - frac, Mantissa: m}, nil
 }
 
 // mustParseCsilDecimal parses a bound literal embedded at generation time. The text
@@ -1688,20 +1782,46 @@ func mustParseCsilDecimal(s string) CsilDecimal {
 }
 
 // Cmp returns -1, 0, or +1 as d is less than, equal to, or greater than other.
-// The comparison is exact: both values are scaled to a common exponent and their
-// integer mantissas compared, so no float rounding can flip the result.
+// The comparison is exact: no float rounding can flip the result.
 func (d CsilDecimal) Cmp(other CsilDecimal) int {
-	dm := new(big.Int).Set(d.mantissa())
-	om := new(big.Int).Set(other.mantissa())
+	dm, om := d.mantissa(), other.mantissa()
+	dSign, oSign := dm.Sign(), om.Sign()
 	switch {
-	case d.Exponent > other.Exponent:
-		scale := new(big.Int).Exp(big.NewInt(10), big.NewInt(d.Exponent-other.Exponent), nil)
-		dm.Mul(dm, scale)
-	case other.Exponent > d.Exponent:
-		scale := new(big.Int).Exp(big.NewInt(10), big.NewInt(other.Exponent-d.Exponent), nil)
-		om.Mul(om, scale)
+	case dSign < oSign:
+		return -1
+	case dSign > oSign:
+		return 1
+	case dSign == 0:
+		return 0
 	}
-	return dm.Cmp(om)
+	c := csilDecimalCmpAbs(dm, d.Exponent, om, other.Exponent)
+	if dSign < 0 {
+		return -c
+	}
+	return c
+}
+
+// csilDecimalCmpAbs compares |a|*10^ea with |b|*10^eb. It compares the decimal
+// orders first, so it scales a mantissa only by a digit-count difference and
+// never by an exponent difference, which a payload chooses.
+func csilDecimalCmpAbs(a *big.Int, ea int64, b *big.Int, eb int64) int {
+	aa, ab := new(big.Int).Abs(a), new(big.Int).Abs(b)
+	da, db := int64(len(aa.String())), int64(len(ab.String()))
+	// The sums are big.Int values because an int64 exponent plus a digit count can
+	// overflow.
+	oa := new(big.Int).Add(big.NewInt(da), big.NewInt(ea))
+	ob := new(big.Int).Add(big.NewInt(db), big.NewInt(eb))
+	if c := oa.Cmp(ob); c != 0 {
+		return c
+	}
+	shift := db - da
+	switch {
+	case shift > 0:
+		aa.Mul(aa, new(big.Int).Exp(big.NewInt(10), big.NewInt(shift), nil))
+	case shift < 0:
+		ab.Mul(ab, new(big.Int).Exp(big.NewInt(10), big.NewInt(-shift), nil))
+	}
+	return aa.Cmp(ab)
 }
 "#;
 
@@ -1718,7 +1838,9 @@ fn csil_decimal_file(config: &GoConfig) -> String {
     content.push_str(&format!("package {}\n\n", config.package_name));
     content.push_str("import (\n");
     content.push_str(&format!("{}\"fmt\"\n", config.indent_style));
+    content.push_str(&format!("{}\"math\"\n", config.indent_style));
     content.push_str(&format!("{}\"math/big\"\n", config.indent_style));
+    content.push_str(&format!("{}\"strconv\"\n", config.indent_style));
     content.push_str(&format!("{}\"strings\"\n", config.indent_style));
     content.push_str(")\n\n");
     content.push_str(CSIL_DECIMAL_GO);
@@ -2258,8 +2380,80 @@ fn gofmt_finish(content: String) -> String {
     format!("{trimmed}\n")
 }
 
-/// A Go expression building a `cborValue` from `expr` (a typed Go value of the
-/// field's mapped type). Composite types map via the generic `cborEncArray`/
+/// One rendered encode expression. `Value` is one `cborValue` expression; a failure
+/// inside it goes to the `csilE` latch of the enclosing function. `Pair` is a call
+/// that returns `(cborValue, error)`.
+enum GoEnc {
+    Value(String),
+    Pair(String),
+}
+
+impl GoEnc {
+    /// The expression as one `cborValue`. Go accepts a two-result call only as the
+    /// sole argument of another call, so a pair goes through the latch. That keeps
+    /// the value tree one nested expression instead of one statement per field.
+    fn value(self) -> String {
+        match self {
+            GoEnc::Value(v) => v,
+            GoEnc::Pair(p) => format!("csilE.val({p})"),
+        }
+    }
+
+    /// The operands of a `return` in a function that returns `(cborValue, error)`.
+    fn ret(self) -> String {
+        match self {
+            GoEnc::Value(v) if go_uses_enc_latch(&v) => format!("csilE.result({v})"),
+            GoEnc::Value(v) => format!("{v}, nil"),
+            GoEnc::Pair(p) => p,
+        }
+    }
+}
+
+/// Whether rendered Go reads the `csilE` latch, so its function must declare it.
+fn go_uses_enc_latch(code: &str) -> bool {
+    code.contains("csilE.")
+}
+
+/// The latch declaration a top-level encode function needs, or nothing: Go rejects
+/// a declared local that is never used.
+fn go_enc_latch_decl(body: &str, indent: &str) -> String {
+    if go_uses_enc_latch(body) {
+        format!("{indent}var csilE csilEncErr\n")
+    } else {
+        String::new()
+    }
+}
+
+/// The locals an entry-point encoder (one with no `csilDepth` parameter) needs.
+fn go_enc_entry_decls(body: &str, indent: &str) -> String {
+    let mut out = go_enc_latch_decl(body, indent);
+    if body.contains("csilDepth") {
+        out.push_str(&format!("{indent}csilDepth := 0\n"));
+    }
+    out
+}
+
+/// The guard at the top of a record or union encoder. A value can refer to itself
+/// through a pointer, and without the guard its encoder recurses until the stack
+/// overflows, which Go cannot recover from.
+fn go_enc_depth_guard(indent: &str) -> String {
+    format!(
+        "{indent}if csilDepth > csilEncDepthLimit {{\n{indent}{indent}return nil, fmt.Errorf(\"csil cbor: nesting limit exceeded\")\n{indent}}}\n"
+    )
+}
+
+/// The declared members of an all-literal choice, as Go constants for `csilEncMember`.
+fn go_enum_member_list(choices: &[CsilTypeExpression]) -> String {
+    choices
+        .iter()
+        .filter_map(choice_arm_literal)
+        .map(literal_value_to_go_string)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// A Go encode expression building a `cborValue` from `expr` (a typed Go value of
+/// the field's mapped type). Composite types map via the generic `cborEncArray`/
 /// `cborEncMap` runtime helpers so nesting composes cleanly. `indent` is the tab
 /// depth of the line the expression is embedded on, so any func literal it opens
 /// can land on gofmt's fixpoint.
@@ -2270,24 +2464,27 @@ fn go_enc_value(
     aliases: &std::collections::HashMap<String, CsilTypeExpression>,
     config: &GoConfig,
     indent: usize,
-) -> String {
+) -> GoEnc {
     match codec_unwrap_constrained(ty) {
         CsilTypeExpression::Builtin(name) => match name.as_str() {
-            "int" | "nint" => format!("cborInt({expr})"),
-            "uint" => format!("cborUint({expr})"),
-            "float" | "float64" | "double" => format!("cborFloat({expr})"),
-            "text" | "tstr" => format!("cborText({expr})"),
-            "bytes" | "bstr" => format!("cborBytes({expr})"),
-            "bool" => format!("cborBool({expr})"),
-            "date" => format!("csilEncDate(string({expr}))"),
-            "timestamp" => format!("csilEncTimestamp({expr})"),
-            "decimal" => format!("csilEncDecimal({expr})"),
-            "nil" | "null" => "cborNull{}".to_string(),
-            "any" => format!("cborEncAny({expr})"),
-            _ => "cborNull{}".to_string(),
+            "int" | "nint" => GoEnc::Value(format!("cborInt({expr})")),
+            "uint" => GoEnc::Value(format!("cborUint({expr})")),
+            "float" | "float64" | "double" => GoEnc::Value(format!("cborFloat({expr})")),
+            "text" | "tstr" => GoEnc::Value(format!("cborText({expr})")),
+            "bytes" | "bstr" => GoEnc::Value(format!("cborBytes({expr})")),
+            "bool" => GoEnc::Value(format!("cborBool({expr})")),
+            "date" => GoEnc::Pair(format!("csilEncDate(string({expr}))")),
+            "timestamp" => GoEnc::Pair(format!("csilEncTimestamp({expr})")),
+            "cddl_time" => GoEnc::Pair(format!("csilEncCddlTime({expr})")),
+            // Every CsilDecimal and shopspring value has a tag 4 form, so this
+            // encoder has no failure to report.
+            "decimal" => GoEnc::Value(format!("csilEncDecimal({expr})")),
+            "nil" | "null" => GoEnc::Value("cborNull{}".to_string()),
+            "any" => GoEnc::Pair(format!("cborEncAny({expr})")),
+            _ => GoEnc::Value("cborNull{}".to_string()),
         },
         CsilTypeExpression::Reference(name) if records.contains(name) => {
-            format!("csilEnc{name}({expr})")
+            GoEnc::Pair(format!("csilEnc{name}({expr}, csilDepth+1)"))
         }
         // A reference to a transparent alias (`StringInt64Map = {* text => int}`,
         // `Tags = [* text]`, `Uuid = text`) has no codec of its own; encode it as its
@@ -2300,13 +2497,24 @@ fn go_enc_value(
         // conversion must be made explicit at the alias boundary before recursing.
         CsilTypeExpression::Reference(name) if matches!(aliases.get(name), Some(CsilTypeExpression::Choice(arms)) if csilgen_common::enum_numbers(arms).is_some()) =>
         {
-            format!("cborInt({expr})")
+            let numbers = match aliases.get(name) {
+                Some(CsilTypeExpression::Choice(arms)) => {
+                    csilgen_common::enum_numbers(arms).unwrap_or_default()
+                }
+                _ => Vec::new(),
+            };
+            let members = numbers
+                .iter()
+                .map(i64::to_string)
+                .collect::<Vec<_>>()
+                .join(", ");
+            GoEnc::Pair(format!("csilEncMember({expr}, cborInt({expr}), {members})"))
         }
         CsilTypeExpression::Reference(name) if aliases.contains_key(name) => {
             let target = &aliases[name];
             let unwrapped = codec_unwrap_constrained(target);
             let owned_expr;
-            let expr = if matches!(unwrapped, CsilTypeExpression::Builtin(b) if b == "decimal" || b == "timestamp")
+            let expr = if matches!(unwrapped, CsilTypeExpression::Builtin(b) if b == "decimal" || b == "timestamp" || b == "cddl_time")
             {
                 let go_type = map_csil_type_to_go(unwrapped, &None, config.decimal_go_type());
                 owned_expr = format!("{go_type}({expr})");
@@ -2318,7 +2526,7 @@ fn go_enc_value(
         }
         // A union (non-literal type-choice) has its own tagged-sum codec helper.
         CsilTypeExpression::Reference(name) if config.union_names.contains(name) => {
-            format!("csilEnc{name}({expr})")
+            GoEnc::Pair(format!("csilEnc{name}({expr}, csilDepth+1)"))
         }
         CsilTypeExpression::Array { element_type, .. } => {
             let elem_ty = reflow_go_type(
@@ -2332,13 +2540,14 @@ fn go_enc_value(
                 aliases,
                 config,
                 indent + 1,
-            );
+            )
+            .ret();
             let f = go_closure(
-                &format!("func(csilElem {elem_ty}) cborValue"),
+                &format!("func(csilElem {elem_ty}) (cborValue, error)"),
                 &[format!("return {inner}")],
                 indent,
             );
-            format!("cborEncArray({expr}, {f})")
+            GoEnc::Pair(format!("cborEncArray({expr}, {f})"))
         }
         CsilTypeExpression::Map { key, value, .. } => {
             let key_ty = reflow_go_type(
@@ -2349,24 +2558,24 @@ fn go_enc_value(
                 &map_csil_type_to_go(value, &None, config.decimal_go_type()),
                 indent,
             );
-            let kenc = go_enc_value(key, "csilK", records, aliases, config, indent + 1);
-            let venc = go_enc_value(value, "csilV", records, aliases, config, indent + 1);
+            let kenc = go_enc_value(key, "csilK", records, aliases, config, indent + 1).ret();
+            let venc = go_enc_value(value, "csilV", records, aliases, config, indent + 1).ret();
             let kf = go_closure(
-                &format!("func(csilK {key_ty}) cborValue"),
+                &format!("func(csilK {key_ty}) (cborValue, error)"),
                 &[format!("return {kenc}")],
                 indent,
             );
             let vf = go_closure(
-                &format!("func(csilV {val_ty}) cborValue"),
+                &format!("func(csilV {val_ty}) (cborValue, error)"),
                 &[format!("return {venc}")],
                 indent,
             );
-            format!("cborEncMap({expr}, {kf}, {vf})")
+            GoEnc::Pair(format!("cborEncMap({expr}, {kf}, {vf})"))
         }
         CsilTypeExpression::Tuple(group) => {
-            go_tuple_enc(group, expr, records, aliases, config, indent)
+            GoEnc::Value(go_tuple_enc(group, expr, records, aliases, config, indent))
         }
-        CsilTypeExpression::Literal(lit) => go_literal_cbor_expr(lit),
+        CsilTypeExpression::Literal(lit) => GoEnc::Value(go_literal_cbor_expr(lit)),
         // An inline (anonymous) choice — a record field, array element, map value,
         // or tuple element typed directly as `a / b / c` rather than through a
         // named rule — gets exactly the wire shape a reference to an equivalent
@@ -2378,22 +2587,32 @@ fn go_enc_value(
         // spanning the mix (`go_mixed_enum_enc_expr`); a choice with at least one
         // non-literal arm is a union (tagged sum, matching `emit_union_codec`).
         // Named and inline choices share this classification so the two stay
-        // identical for the same arms.
+        // identical for the same arms. An enum value outside the declared set is an
+        // encode error, because every decoder refuses it.
         CsilTypeExpression::Choice(choices) => match enum_scalar_builtin(choices) {
-            Some(builtin) => go_enc_value(
-                &CsilTypeExpression::Builtin(builtin),
-                expr,
-                records,
-                aliases,
-                config,
-                indent,
-            ),
-            None if choice_all_literal(choices) => go_mixed_enum_enc_expr(choices, expr, indent),
-            None => go_choice_enc_iife(choices, expr, records, aliases, config, indent),
+            Some(builtin) => {
+                let scalar = go_enc_value(
+                    &CsilTypeExpression::Builtin(builtin),
+                    expr,
+                    records,
+                    aliases,
+                    config,
+                    indent,
+                )
+                .value();
+                let members = go_enum_member_list(choices);
+                GoEnc::Pair(format!("csilEncMember({expr}, {scalar}, {members})"))
+            }
+            None if choice_all_literal(choices) => {
+                GoEnc::Pair(go_mixed_enum_enc_expr(choices, expr, indent))
+            }
+            None => GoEnc::Pair(go_choice_enc_iife(
+                choices, expr, records, aliases, config, indent,
+            )),
         },
         // A type the codec cannot model precisely (`any`, an unmodeled reference) is
         // carried as null rather than emitting uncompilable code.
-        _ => "cborNull{}".to_string(),
+        _ => GoEnc::Value("cborNull{}".to_string()),
     }
 }
 
@@ -2418,6 +2637,7 @@ fn go_dec_func(
             "bool" => "cborAsBool".to_string(),
             "date" => "csilAsDate".to_string(),
             "timestamp" => "csilAsTimestamp".to_string(),
+            "cddl_time" => "csilAsCddlTime".to_string(),
             "decimal" => "csilAsDecimal".to_string(),
             "any" => "cborDecAny".to_string(),
             other => codec_zero_decoder(&map_csil_type_to_go(
@@ -2481,7 +2701,12 @@ fn go_dec_func(
                 &map_csil_type_to_go(value, &None, config.decimal_go_type()),
                 indent,
             );
-            let kf = go_dec_func(key, records, aliases, config, indent + 1);
+            let mut kf = go_dec_func(key, records, aliases, config, indent + 1);
+            // A key held in an interface can carry a slice or a map at run time, and
+            // Go panics when it inserts an unhashable key, so such a key is checked.
+            if go_key_is_interface(key, aliases, config) {
+                kf = format!("cborHashableKey({kf})");
+            }
             let vf = go_dec_func(value, records, aliases, config, indent + 1);
             go_closure(
                 &format!("func(csilV cborValue) (map[{key_ty}]{val_ty}, error)"),
@@ -2531,6 +2756,24 @@ fn go_dec_func(
         // The codec cannot reconstruct this shape; yield its zero value so the
         // generated decoder still compiles against the field's Go type.
         other => codec_zero_decoder(&map_csil_type_to_go(other, &None, config.decimal_go_type())),
+    }
+}
+
+/// Whether a map key decodes into a Go interface (`any`, a union, or a mixed
+/// choice), whose dynamic value a payload chooses.
+fn go_key_is_interface(
+    key: &CsilTypeExpression,
+    aliases: &std::collections::HashMap<String, CsilTypeExpression>,
+    config: &GoConfig,
+) -> bool {
+    match codec_unwrap_constrained(key) {
+        CsilTypeExpression::Builtin(name) => name == "any",
+        CsilTypeExpression::Reference(name) if config.union_names.contains(name) => true,
+        CsilTypeExpression::Reference(name) => aliases
+            .get(name)
+            .is_some_and(|target| go_key_is_interface(target, aliases, config)),
+        CsilTypeExpression::Choice(choices) => enum_scalar_builtin(choices).is_none(),
+        _ => false,
     }
 }
 
@@ -2596,8 +2839,19 @@ fn go_enum_dec_func(
     )
 }
 
+/// The `return` operands of one tagged-sum arm `[index, value]`.
+fn go_tagged_arm(index: usize, enc: GoEnc) -> String {
+    GoEnc::Value(format!("cborArray{{cborUint({index}), {}}}", enc.value())).ret()
+}
+
+/// The `return` operands for a Go value that matches no arm of a choice. A value
+/// of the wrong Go type is an encode error: null would be bytes every peer refuses.
+fn go_not_a_member(expr: &str) -> String {
+    format!("nil, fmt.Errorf(\"csil cbor: %T matches no arm of the declared choice\", {expr})")
+}
+
 /// The encoded value of an inline (mixed, non-enum) choice, as an immediately-
-/// invoked function literal (`func() cborValue { ... }()`). An inline choice has
+/// invoked function literal (`func() (cborValue, error) { ... }()`). An inline choice has
 /// no declared name to hang a package-level `csilEnc<Name>` helper off of the way
 /// a named union does (`emit_union_codec`), so the same type-switch/literal-first
 /// shape is built as a closure over `expr` at the call site instead. `indent` is
@@ -2648,10 +2902,9 @@ fn go_choice_enc_iife(
         if idxs.len() == 1 {
             let i = idxs[0];
             let enc = go_enc_value(&choices[i], "csilX", records, aliases, config, base + 1);
-            uses_csil_x = uses_csil_x || enc.contains("csilX");
-            body.push_str(&format!(
-                "{tb}case {go_type}:\n{tb1}return cborArray{{cborUint({i}), {enc}}}\n"
-            ));
+            let ret = go_tagged_arm(i, enc);
+            uses_csil_x = uses_csil_x || ret.contains("csilX");
+            body.push_str(&format!("{tb}case {go_type}:\n{tb1}return {ret}\n"));
             continue;
         }
         uses_csil_x = true; // the grouped case's own `switch csilX { ... }` uses it.
@@ -2678,23 +2931,24 @@ fn go_choice_enc_iife(
                 .expect("filtered to literal-carrying variants above");
             let lit_value = literal_value_to_go_string(lit);
             let enc = go_enc_value(&choices[i], "csilX", records, aliases, config, base + 2);
-            body.push_str(&format!(
-                "{tb1}case {lit_value}:\n{tb2}return cborArray{{cborUint({i}), {enc}}}\n"
-            ));
+            let ret = go_tagged_arm(i, enc);
+            body.push_str(&format!("{tb1}case {lit_value}:\n{tb2}return {ret}\n"));
         }
         body.push_str(&format!("{tb1}default:\n"));
         match general_idx {
             Some(gi) => {
                 let enc = go_enc_value(&choices[gi], "csilX", records, aliases, config, base + 2);
-                body.push_str(&format!("{tb2}return cborArray{{cborUint({gi}), {enc}}}\n"));
+                let ret = go_tagged_arm(gi, enc);
+                body.push_str(&format!("{tb2}return {ret}\n"));
             }
-            // No general arm to fall back to; matches the outer switch's own
-            // unmatched-value behavior rather than inventing a new failure mode.
-            None => body.push_str(&format!("{tb2}return cborNull{{}}\n")),
+            None => body.push_str(&format!("{tb2}return {}\n", go_not_a_member(expr))),
         }
         body.push_str(&format!("{tb1}}}\n"));
     }
-    body.push_str(&format!("{tb}default:\n{tb1}return cborNull{{}}\n{tb}}}"));
+    body.push_str(&format!(
+        "{tb}default:\n{tb1}return {}\n{tb}}}",
+        go_not_a_member(expr)
+    ));
     let header = if uses_csil_x {
         format!("switch csilX := {expr}.(type) {{\n")
     } else {
@@ -2702,7 +2956,7 @@ fn go_choice_enc_iife(
     };
     format!(
         "{}()",
-        go_closure("func() cborValue", &[header + &body], indent)
+        go_closure("func() (cborValue, error)", &[header + &body], indent)
     )
 }
 
@@ -2842,11 +3096,11 @@ fn emit_record_codec(
     out.push_str(&format!(
         "// csilEnc{name} builds the canonical CBOR value tree for a {name}.\n"
     ));
-    out.push_str(&format!("func csilEnc{name}(csilV {name}) cborValue {{\n"));
     out.push_str(&format!(
-        "{i}csilEntries := make(cborMap, 0, {})\n",
-        named.len()
+        "func csilEnc{name}(csilV {name}, csilDepth int) (cborValue, error) {{\n"
     ));
+    out.push_str(&go_enc_depth_guard(i));
+    let mut body = format!("{i}csilEntries := make(cborMap, 0, {})\n", named.len());
     for (member, wire, entry) in &canonical {
         let wire_lit = go_string_lit(wire);
         if matches!(entry.occurrence, Some(CsilOccurrence::Optional)) {
@@ -2858,8 +3112,8 @@ fn emit_record_codec(
             } else {
                 format!("csilV.{member}")
             };
-            let enc = go_enc_value(&entry.value_type, &read, records, aliases, config, 2);
-            out.push_str(&format!(
+            let enc = go_enc_value(&entry.value_type, &read, records, aliases, config, 2).value();
+            body.push_str(&format!(
                 "{i}if csilV.{member} != nil {{\n{i}{i}csilEntries = append(csilEntries, cborEntry{{cborText({wire_lit}), {enc}}})\n{i}}}\n"
             ));
         } else {
@@ -2870,13 +3124,21 @@ fn emit_record_codec(
                 aliases,
                 config,
                 1,
-            );
-            out.push_str(&format!(
+            )
+            .value();
+            body.push_str(&format!(
                 "{i}csilEntries = append(csilEntries, cborEntry{{cborText({wire_lit}), {enc}}})\n"
             ));
         }
     }
-    out.push_str(&format!("{i}return csilEntries\n}}\n\n"));
+    out.push_str(&go_enc_latch_decl(&body, i));
+    out.push_str(&body);
+    let result = if go_uses_enc_latch(&body) {
+        "csilE.result(csilEntries)"
+    } else {
+        "csilEntries, nil"
+    };
+    out.push_str(&format!("{i}return {result}\n}}\n\n"));
 
     out.push_str(&format!(
         "// csilDec{name} reconstructs a {name} from a decoded CBOR value tree.\n"
@@ -2923,7 +3185,7 @@ fn emit_record_codec(
         "// Encode{name} encodes a {name} to canonical CSIL CBOR bytes.\n"
     ));
     out.push_str(&format!(
-        "func Encode{name}(csilV {name}) []byte {{\n{i}return cborEncode(csilEnc{name}(csilV))\n}}\n\n"
+        "func Encode{name}(csilV {name}) ([]byte, error) {{\n{i}return cborEncodeE(csilEnc{name}(csilV, 0))\n}}\n\n"
     ));
     out.push_str(&format!(
         "// Decode{name} decodes canonical CSIL CBOR bytes into a {name}.\n"
@@ -2999,7 +3261,10 @@ fn emit_union_codec(
     out.push_str(&format!(
         "// csilEnc{name} encodes a {name} union as a tagged sum [variant_index, value].\n"
     ));
-    out.push_str(&format!("func csilEnc{name}(csilV {name}) cborValue {{\n"));
+    out.push_str(&format!(
+        "func csilEnc{name}(csilV {name}, csilDepth int) (cborValue, error) {{\n"
+    ));
+    out.push_str(&go_enc_depth_guard("\t"));
     // A mixed union (`text / "pending" / "confirmed" / ...`) has a general arm and
     // several literal arms that all share one Go type (`string`); Go's type switch
     // forbids two `case string:` clauses, so arms are grouped by Go type first and
@@ -3041,10 +3306,9 @@ fn emit_union_codec(
         if idxs.len() == 1 {
             let i = idxs[0];
             let enc = go_enc_value(&variants[i], "csilX", records, aliases, config, 2);
-            uses_csil_x = uses_csil_x || enc.contains("csilX");
-            switch_body.push_str(&format!(
-                "\tcase {go_type}:\n\t\treturn cborArray{{cborUint({i}), {enc}}}\n"
-            ));
+            let ret = go_tagged_arm(i, enc);
+            uses_csil_x = uses_csil_x || ret.contains("csilX");
+            switch_body.push_str(&format!("\tcase {go_type}:\n\t\treturn {ret}\n"));
             continue;
         }
         uses_csil_x = true; // the grouped case's own `switch csilX { ... }` uses it.
@@ -3076,31 +3340,31 @@ fn emit_union_codec(
                 .expect("filtered to literal-carrying variants above");
             let lit_value = literal_value_to_go_string(lit);
             let enc = go_enc_value(&variants[i], "csilX", records, aliases, config, 3);
-            switch_body.push_str(&format!(
-                "\t\tcase {lit_value}:\n\t\t\treturn cborArray{{cborUint({i}), {enc}}}\n"
-            ));
+            let ret = go_tagged_arm(i, enc);
+            switch_body.push_str(&format!("\t\tcase {lit_value}:\n\t\t\treturn {ret}\n"));
         }
         switch_body.push_str("\t\tdefault:\n");
         match general_idx {
             Some(gi) => {
                 let enc = go_enc_value(&variants[gi], "csilX", records, aliases, config, 3);
-                switch_body.push_str(&format!(
-                    "\t\t\treturn cborArray{{cborUint({gi}), {enc}}}\n"
-                ));
+                let ret = go_tagged_arm(gi, enc);
+                switch_body.push_str(&format!("\t\t\treturn {ret}\n"));
             }
-            // No general arm to fall back to; matches the outer switch's own
-            // unmatched-value behavior rather than inventing a new failure mode.
-            None => switch_body.push_str("\t\t\treturn cborNull{}\n"),
+            None => switch_body.push_str(&format!("\t\t\treturn {}\n", go_not_a_member("csilV"))),
         }
         switch_body.push_str("\t\t}\n");
     }
+    out.push_str(&go_enc_latch_decl(&switch_body, "\t"));
     out.push_str(if uses_csil_x {
         "\tswitch csilX := csilV.(type) {\n"
     } else {
         "\tswitch csilV.(type) {\n"
     });
     out.push_str(&switch_body);
-    out.push_str("\tdefault:\n\t\treturn cborNull{}\n\t}\n}\n\n");
+    out.push_str(&format!(
+        "\tdefault:\n\t\treturn {}\n\t}}\n}}\n\n",
+        go_not_a_member("csilV")
+    ));
 
     out.push_str(&format!(
         "// csilDec{name} decodes a tagged sum [variant_index, value] into a {name} union.\n"
@@ -3254,12 +3518,13 @@ fn emit_op_codec_pair(
     // one tab in) and in the `var csilZero` statement (fields two tabs in).
     let go_type = reflow_go_type(&one_line, 0);
     let go_type_stmt = reflow_go_type(&one_line, 1);
-    let enc = go_enc_value(ty, "csilV", records, aliases, config, 1);
+    let enc = go_enc_value(ty, "csilV", records, aliases, config, 1).ret();
     let dec = go_dec_func(ty, records, aliases, config, 1);
     let i = config.indent_style.as_str();
+    let latch = go_enc_entry_decls(&enc, i);
     format!(
         "// Encode{helper} encodes the {helper} payload to canonical CSIL CBOR bytes.\n\
-         func Encode{helper}(csilV {go_type}) []byte {{\n{i}return cborEncode({enc})\n}}\n\n\
+         func Encode{helper}(csilV {go_type}) ([]byte, error) {{\n{latch}{i}return cborEncodeE({enc})\n}}\n\n\
          // Decode{helper} decodes canonical CSIL CBOR bytes into the {helper} payload.\n\
          func Decode{helper}(csilData []byte) ({go_type}, error) {{\n\
          {i}var csilZero {go_type_stmt}\n\
@@ -3283,6 +3548,13 @@ type RPCDecodeError struct{ Err error }
 func (e *RPCDecodeError) Error() string { return e.Err.Error() }
 func (e *RPCDecodeError) Unwrap() error { return e.Err }
 
+// RPCEncodeError reports a handler result that has no valid wire form. The server
+// answers it with a transport failure, because no reply payload exists.
+type RPCEncodeError struct{ Err error }
+
+func (e *RPCEncodeError) Error() string { return e.Err.Error() }
+func (e *RPCEncodeError) Unwrap() error { return e.Err }
+
 // RPCApplicationError carries the declared value of an application refusal.
 type RPCApplicationError[T any] struct{ Value T }
 
@@ -3291,7 +3563,7 @@ func (e *RPCApplicationError[T]) Error() string { return fmt.Sprintf("applicatio
 "#,
     );
     let mut dispatch = String::from(
-        "func ResolveRPCReply(service, op string, variant *string, payload []byte) ([]byte, error) {\n\tswitch {\n",
+        "// ResolveRPCReply turns a status-zero reply into its success payload or the declared\n// error arm. Generated clients call it with the reply from Transport.CallReply.\nfunc ResolveRPCReply(service, op string, variant *string, payload []byte) ([]byte, error) {\n\tswitch {\n",
     );
     for (service, op, arms) in input.csil_spec.rpc_operations() {
         let stem = op_codec_stem(service, op);
@@ -3314,12 +3586,12 @@ func (e *RPCApplicationError[T]) Error() string { return fmt.Sprintf("applicatio
             dispatch.push_str(&format!("\t\tcase {wire:?}:\n"));
             if i == 0 {
                 encoder.push_str(&format!(
-                    "\tif err == nil {{\n\t\treturn {wire:?}, Encode{helper}(value), nil\n\t}}\n"
+"\tif err == nil {{\n\t\tpayload, encErr := Encode{helper}(value)\n\t\tif encErr != nil {{\n\t\t\treturn \"\", nil, &RPCEncodeError{{encErr}}\n\t\t}}\n\t\treturn {wire:?}, payload, nil\n\t}}\n"
                 ));
                 dispatch.push_str("\t\t\treturn payload, nil\n");
             } else {
                 let ty = map_csil_type_to_go(arm, &None, config.decimal_go_type());
-                encoder.push_str(&format!("\tvar refusal{i} *RPCApplicationError[{ty}]\n\tif errors.As(err, &refusal{i}) && refusal{i} != nil {{\n\t\treturn {wire:?}, Encode{helper}(refusal{i}.Value), nil\n\t}}\n"));
+                encoder.push_str(&format!("\tvar refusal{i} *RPCApplicationError[{ty}]\n\tif errors.As(err, &refusal{i}) && refusal{i} != nil {{\n\t\tpayload, encErr := Encode{helper}(refusal{i}.Value)\n\t\tif encErr != nil {{\n\t\t\treturn \"\", nil, &RPCEncodeError{{encErr}}\n\t\t}}\n\t\treturn {wire:?}, payload, nil\n\t}}\n"));
                 dispatch.push_str(&format!("\t\t\tvalue, err := Decode{helper}(payload)\n\t\t\tif err != nil {{\n\t\t\t\treturn nil, &RPCDecodeError{{err}}\n\t\t\t}}\n\t\t\treturn nil, &RPCApplicationError[{ty}]{{Value: value}}\n"));
             }
         }
@@ -3341,6 +3613,7 @@ fn generate_codec(input: &WasmGeneratorInput, config: &GoConfig) -> Option<Strin
     let aliases = codec_aliases(input);
     let uses_date = input.csil_spec.uses_builtin("date");
     let uses_timestamp = spec_uses_builtin(input, "timestamp");
+    let uses_cddl_time = spec_uses_builtin(input, "cddl_time");
     let uses_decimal = spec_uses_builtin(input, "decimal");
 
     let mut content = String::new();
@@ -3359,7 +3632,7 @@ fn generate_codec(input: &WasmGeneratorInput, config: &GoConfig) -> Option<Strin
     content.push_str(&format!("{}\"fmt\"\n", config.indent_style));
     content.push_str(&format!("{}\"math\"\n", config.indent_style));
     content.push_str(&format!("{}\"unicode/utf8\"\n", config.indent_style));
-    if uses_timestamp || uses_date {
+    if uses_timestamp || uses_cddl_time || uses_date {
         content.push_str(&format!("{}\"time\"\n", config.indent_style));
     }
     if uses_decimal {
@@ -3387,6 +3660,10 @@ fn generate_codec(input: &WasmGeneratorInput, config: &GoConfig) -> Option<Strin
     if uses_timestamp {
         content.push('\n');
         content.push_str(CODEC_TIMESTAMP_GO);
+    }
+    if uses_cddl_time {
+        content.push('\n');
+        content.push_str(CODEC_CDDL_TIME_GO);
     }
     if uses_decimal {
         content.push('\n');
@@ -3423,8 +3700,35 @@ fn generate_codec(input: &WasmGeneratorInput, config: &GoConfig) -> Option<Strin
     if typed_rpc {
         content.push_str(&emit_rpc_replies(input, &records, &aliases, config));
     }
+    if content.contains("cborHashableKey(") {
+        let math = format!("{}\"math\"\n", config.indent_style);
+        content = content.replacen(
+            &math,
+            &format!("{math}{}\"reflect\"\n", config.indent_style),
+            1,
+        );
+        content.push_str(CODEC_HASHABLE_KEY_GO);
+    }
     Some(content)
 }
+
+/// Map-key guard, emitted only when a map key decodes into an interface.
+const CODEC_HASHABLE_KEY_GO: &str = r#"// cborHashableKey refuses a decoded map key that Go cannot hash, because a map
+// insert of such a key panics.
+func cborHashableKey[K any](f func(cborValue) (K, error)) func(cborValue) (K, error) {
+	return func(v cborValue) (K, error) {
+		k, err := f(v)
+		if err != nil {
+			return k, err
+		}
+		if !reflect.ValueOf(&k).Elem().Comparable() {
+			var zero K
+			return zero, fmt.Errorf("csil cbor: a map key of type %T cannot be hashed", k)
+		}
+		return k, nil
+	}
+}
+"#;
 
 /// The self-contained canonical-CBOR (RFC 8949 subset) value model, encoder,
 /// decoder, generic composite helpers, and accessors every generated codec builds
@@ -3433,29 +3737,30 @@ fn generate_codec(input: &WasmGeneratorInput, config: &GoConfig) -> Option<Strin
 /// Dynamic codec for `any`: map a Go native value to/from the CBOR value tree.
 /// Emitted only when the spec uses `any`. Round-trips the scalar shapes the value
 /// tree models; an already-`cborValue` passes through on encode.
-const CODEC_ANY_GO: &str = r#"// cborEncAny encodes an untyped Go value (`any`) into the CBOR value tree.
-func cborEncAny(v interface{}) cborValue {
+const CODEC_ANY_GO: &str = r#"// cborEncAny encodes an untyped Go value (`any`) into the CBOR value tree. A Go
+// type the tree does not model is an error, so no value turns into null silently.
+func cborEncAny(v interface{}) (cborValue, error) {
 	switch x := v.(type) {
 	case nil:
-		return cborNull{}
+		return cborNull{}, nil
 	case cborValue:
-		return x
+		return x, nil
 	case bool:
-		return cborBool(x)
+		return cborBool(x), nil
 	case string:
-		return cborText(x)
+		return cborText(x), nil
 	case []byte:
-		return cborBytes(x)
+		return cborBytes(x), nil
 	case int:
-		return cborInt(int64(x))
+		return cborInt(int64(x)), nil
 	case int64:
-		return cborInt(x)
+		return cborInt(x), nil
 	case uint64:
-		return cborUint(x)
+		return cborUint(x), nil
 	case float64:
-		return cborFloat(x)
+		return cborFloat(x), nil
 	default:
-		return cborNull{}
+		return nil, fmt.Errorf("csil cbor: cannot encode %T as any", v)
 	}
 }
 
@@ -3570,6 +3875,50 @@ func cborEncode(v cborValue) []byte {
 	var out []byte
 	cborEnc(v, &out)
 	return out
+}
+
+// cborEncodeE serializes the tree an encoder returned, or passes its error on.
+func cborEncodeE(v cborValue, err error) ([]byte, error) {
+	if err != nil {
+		return nil, err
+	}
+	return cborEncode(v), nil
+}
+
+// csilEncDepthLimit is the nesting limit every decoder enforces.
+const csilEncDepthLimit = 64
+
+// csilEncErr keeps the first failure of one encode call. Go accepts a two-result
+// call only as the sole argument of another call, so the latch lets a fallible
+// encoder sit inside a composite literal of the value tree.
+type csilEncErr struct{ err error }
+
+func (e *csilEncErr) val(v cborValue, err error) cborValue {
+	if err != nil {
+		if e.err == nil {
+			e.err = err
+		}
+		return cborNull{}
+	}
+	return v
+}
+
+func (e *csilEncErr) result(v cborValue) (cborValue, error) {
+	if e.err != nil {
+		return nil, e.err
+	}
+	return v, nil
+}
+
+// csilEncMember refuses an enum value outside the declared set, because every
+// decoder refuses it.
+func csilEncMember[T comparable](v T, enc cborValue, members ...T) (cborValue, error) {
+	for _, m := range members {
+		if v == m {
+			return enc, nil
+		}
+	}
+	return nil, fmt.Errorf("csil cbor: value %v is not a member of the declared enum", v)
 }
 
 func cborHead(major byte, n uint64, out *[]byte) {
@@ -3702,6 +4051,28 @@ func cborReadArg(b []byte, pos *int, low byte) (uint64, error) {
 // lets a small frame reserve a large multiple of its size at every nesting level.
 const csilCborPreallocLimit = 1024
 
+// cborHalfToFloat64 widens an IEEE 754 half-precision value (RFC 8949 Appendix D)
+// exactly to binary64.
+func cborHalfToFloat64(half uint16) float64 {
+	exp := int(half>>10) & 0x1f
+	mant := float64(half & 0x3ff)
+	var magnitude float64
+	switch {
+	case exp == 0:
+		magnitude = math.Ldexp(mant, -24)
+	case exp == 31 && mant == 0:
+		magnitude = math.Inf(1)
+	case exp == 31:
+		magnitude = math.NaN()
+	default:
+		magnitude = math.Ldexp(mant+1024, exp-25)
+	}
+	if half&0x8000 != 0 {
+		return -magnitude
+	}
+	return magnitude
+}
+
 func cborDec(b []byte, pos *int, depth int) (cborValue, error) {
 	if depth > 64 {
 		return nil, fmt.Errorf("csil cbor: nesting limit exceeded")
@@ -3723,6 +4094,12 @@ func cborDec(b []byte, pos *int, depth int) (cborValue, error) {
 		case 22, 23:
 			*pos++
 			return cborNull{}, nil
+		case 25:
+			bits, err := cborReadArg(b, pos, low)
+			if err != nil {
+				return nil, err
+			}
+			return cborFloat(cborHalfToFloat64(uint16(bits))), nil
 		case 26:
 			bits, err := cborReadArg(b, pos, low)
 			if err != nil {
@@ -3823,23 +4200,35 @@ func cborDec(b []byte, pos *int, depth int) (cborValue, error) {
 }
 
 // cborEncArray maps a typed slice to a CBOR array via the per-element encoder.
-func cborEncArray[E any](xs []E, f func(E) cborValue) cborValue {
+func cborEncArray[E any](xs []E, f func(E) (cborValue, error)) (cborValue, error) {
 	items := make(cborArray, 0, len(xs))
 	for _, x := range xs {
-		items = append(items, f(x))
+		item, err := f(x)
+		if err != nil {
+			return nil, err
+		}
+		items = append(items, item)
 	}
-	return items
+	return items, nil
 }
 
 // cborEncMap maps a typed map to a CBOR map. Go map iteration is unordered, so the
 // inner map's entry order is not canonicalized; the record's own keys (laid down at
 // generation time) are what the cross-language wire contract pins.
-func cborEncMap[K comparable, V any](m map[K]V, kf func(K) cborValue, vf func(V) cborValue) cborValue {
+func cborEncMap[K comparable, V any](m map[K]V, kf func(K) (cborValue, error), vf func(V) (cborValue, error)) (cborValue, error) {
 	entries := make(cborMap, 0, len(m))
 	for k, v := range m {
-		entries = append(entries, cborEntry{kf(k), vf(v)})
+		key, err := kf(k)
+		if err != nil {
+			return nil, err
+		}
+		val, err := vf(v)
+		if err != nil {
+			return nil, err
+		}
+		entries = append(entries, cborEntry{key, val})
 	}
-	return entries
+	return entries, nil
 }
 
 func cborDecArray[E any](v cborValue, f func(cborValue) (E, error)) ([]E, error) {
@@ -3974,11 +4363,26 @@ func cborAsMap(v cborValue) (cborMap, error) {
 "#;
 
 const CODEC_DATE_GO: &str = r#"
-func csilEncDate(s string) cborValue {
-	if _, err := time.Parse("2006-01-02", s); err != nil {
-		panic(err)
+// csilCheckDate accepts only YYYY-MM-DD text for a real day in years 0001-9999.
+// time.Parse also accepts year 0000, which the native date types of other targets
+// cannot hold.
+func csilCheckDate(s string) error {
+	d, err := time.Parse("2006-01-02", s)
+	if err != nil {
+		return fmt.Errorf("csil cbor: invalid date %q: %w", s, err)
 	}
-	return cborTag{num: 1004, inner: cborText(s)}
+	if d.Year() < 1 {
+		return fmt.Errorf("csil cbor: date %q is outside years 0001-9999", s)
+	}
+	return nil
+}
+
+// csilEncDate encodes YYYY-MM-DD text as CBOR tag 1004.
+func csilEncDate(s string) (cborValue, error) {
+	if err := csilCheckDate(s); err != nil {
+		return nil, err
+	}
+	return cborTag{num: 1004, inner: cborText(s)}, nil
 }
 
 func csilAsDate(v cborValue) (string, error) {
@@ -3990,19 +4394,174 @@ func csilAsDate(v cborValue) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if _, err := time.Parse("2006-01-02", s); err != nil {
+	if err := csilCheckDate(s); err != nil {
 		return "", err
 	}
 	return s, nil
 }
 "#;
 
+/// `cddl_time` (CBOR tag 1, epoch seconds) codec. It shares `time.Time` with
+/// `timestamp`; only the wire form differs.
+const CODEC_CDDL_TIME_GO: &str = r#"const (
+	csilEpochFirst int64 = -62135596800
+	csilEpochLast  int64 = 253402300799
+	csilEpochUnits int64 = 1000000000
+)
+
+// csilEncCddlTime encodes a time.Time as CBOR tag 1 epoch seconds: an integer
+// when the instant has no fraction, else a binary64 float.
+func csilEncCddlTime(t time.Time) (cborValue, error) {
+	seconds, units := t.Unix(), int64(t.Nanosecond())
+	// An instant with no valid wire form is an error, not bytes every peer refuses.
+	if seconds < csilEpochFirst || seconds > csilEpochLast {
+		return nil, fmt.Errorf("csil cbor: cddl_time requires a UTC year from 0001 to 9999")
+	}
+	if units == 0 {
+		return cborTag{num: 1, inner: cborInt(seconds)}, nil
+	}
+	return cborTag{num: 1, inner: cborFloat(float64(seconds) + float64(units)/float64(csilEpochUnits))}, nil
+}
+
+// csilAsCddlTime decodes CBOR tag 1 epoch seconds back to a UTC time.Time.
+func csilAsCddlTime(v cborValue) (time.Time, error) {
+	outOfRange := fmt.Errorf("csil cbor: cddl_time outside years 0001-9999")
+	t, ok := v.(cborTag)
+	if !ok || t.num != 1 {
+		return time.Time{}, fmt.Errorf("csil cbor: expected CBOR tag 1 epoch time")
+	}
+	var seconds, units int64
+	switch x := t.inner.(type) {
+	case cborUint:
+		if uint64(x) > uint64(csilEpochLast) {
+			return time.Time{}, outOfRange
+		}
+		seconds = int64(x)
+	case cborInt:
+		seconds = int64(x)
+	case cborFloat:
+		f := float64(x)
+		if math.IsNaN(f) || math.IsInf(f, 0) {
+			return time.Time{}, fmt.Errorf("csil cbor: cddl_time must be finite")
+		}
+		// The range check comes before the int64 conversion, whose result is
+		// implementation-defined for an out-of-range float.
+		if f < float64(csilEpochFirst-1) || f > float64(csilEpochLast+1) {
+			return time.Time{}, outOfRange
+		}
+		whole := math.Floor(f)
+		// The explicit float64 conversion forbids fusing the product into the
+		// addition, so the two roundings the wire contract requires both happen.
+		scaled := float64((f - whole) * float64(csilEpochUnits))
+		seconds, units = int64(whole), int64(math.Floor(scaled+0.5))
+		if units == csilEpochUnits {
+			seconds, units = seconds+1, 0
+		}
+	default:
+		return time.Time{}, fmt.Errorf("csil cbor: cddl_time content must be a number")
+	}
+	if seconds < csilEpochFirst || seconds > csilEpochLast {
+		return time.Time{}, outOfRange
+	}
+	return time.Unix(seconds, units).UTC(), nil
+}
+"#;
+
 /// Timestamp (CBOR tag 0, RFC3339, always UTC) codec, emitted only when the spec
 /// uses `timestamp` so `time` is never an unused import.
-const CODEC_TIMESTAMP_GO: &str = r#"// csilEncTimestamp encodes a time.Time as CBOR tag 0 RFC3339 text in UTC, per the
-// wire contract; sub-second precision is preserved when present.
-func csilEncTimestamp(t time.Time) cborValue {
-	return cborTag{num: 0, inner: cborText(t.UTC().Format(time.RFC3339Nano))}
+const CODEC_TIMESTAMP_GO: &str = r#"// csilEncTimestamp encodes a time.Time as CBOR tag 0 RFC3339 text in UTC. The
+// fraction uses 3, 6, or 9 digits (never RFC3339Nano's shortest form) so every
+// target writes the same bytes for one instant.
+func csilEncTimestamp(t time.Time) (cborValue, error) {
+	u := t.UTC()
+	// An instant with no valid wire form is an error, not bytes every peer refuses.
+	if u.Year() < 1 || u.Year() > 9999 {
+		return nil, fmt.Errorf("csil cbor: timestamp requires a UTC year from 0001 to 9999")
+	}
+	text := u.Format("2006-01-02T15:04:05")
+	switch ns := u.Nanosecond(); {
+	case ns == 0:
+	case ns%1000000 == 0:
+		text += fmt.Sprintf(".%03d", ns/1000000)
+	case ns%1000 == 0:
+		text += fmt.Sprintf(".%06d", ns/1000)
+	default:
+		text += fmt.Sprintf(".%09d", ns)
+	}
+	return cborTag{num: 0, inner: cborText(text + "Z")}, nil
+}
+
+// csilParseTimestamp reads the strict CSIL timestamp form by position. time.Parse
+// is not used because its RFC3339 handling accepts forms other targets refuse.
+func csilParseTimestamp(s string) (time.Time, error) {
+	bad := fmt.Errorf("csil cbor: invalid timestamp %q", s)
+	num := func(from, n int) (int, bool) {
+		if from+n > len(s) {
+			return 0, false
+		}
+		v := 0
+		for i := from; i < from+n; i++ {
+			if s[i] < '0' || s[i] > '9' {
+				return 0, false
+			}
+			v = v*10 + int(s[i]-'0')
+		}
+		return v, true
+	}
+	if len(s) < 20 || s[4] != '-' || s[7] != '-' || (s[10] != 'T' && s[10] != 't') || s[13] != ':' || s[16] != ':' {
+		return time.Time{}, bad
+	}
+	year, okYear := num(0, 4)
+	month, okMonth := num(5, 2)
+	day, okDay := num(8, 2)
+	hour, okHour := num(11, 2)
+	minute, okMinute := num(14, 2)
+	second, okSecond := num(17, 2)
+	if !okYear || !okMonth || !okDay || !okHour || !okMinute || !okSecond ||
+		year < 1 || month < 1 || month > 12 || day < 1 || hour > 23 || minute > 59 || second > 59 {
+		return time.Time{}, bad
+	}
+	pos, nanos := 19, 0
+	if s[pos] == '.' {
+		n := 0
+		for pos+1+n < len(s) && s[pos+1+n] >= '0' && s[pos+1+n] <= '9' {
+			n++
+		}
+		if n < 1 || n > 9 {
+			return time.Time{}, bad
+		}
+		nanos, _ = num(pos+1, n)
+		for i := n; i < 9; i++ {
+			nanos *= 10
+		}
+		pos += 1 + n
+	}
+	offset := 0
+	switch rest := s[pos:]; {
+	case rest == "Z" || rest == "z":
+	case len(rest) == 6 && (rest[0] == '+' || rest[0] == '-') && rest[3] == ':':
+		offsetHour, okH := num(pos+1, 2)
+		offsetMinute, okM := num(pos+4, 2)
+		if !okH || !okM || offsetHour > 23 || offsetMinute > 59 {
+			return time.Time{}, bad
+		}
+		offset = offsetHour*3600 + offsetMinute*60
+		if rest[0] == '-' {
+			offset = -offset
+		}
+	default:
+		return time.Time{}, bad
+	}
+	local := time.Date(year, time.Month(month), day, hour, minute, second, nanos, time.UTC)
+	// time.Date normalizes a day past the month end, so a changed day means it was invalid.
+	if local.Day() != day {
+		return time.Time{}, bad
+	}
+	utc := local.Add(-time.Duration(offset) * time.Second)
+	if utc.Year() < 1 || utc.Year() > 9999 {
+		return time.Time{}, fmt.Errorf("csil cbor: timestamp %q is outside UTC years 0001-9999", s)
+	}
+	return utc, nil
 }
 
 // csilAsTimestamp decodes a CBOR tag 0 RFC3339 timestamp back to a UTC time.Time.
@@ -4015,11 +4574,7 @@ func csilAsTimestamp(v cborValue) (time.Time, error) {
 	if !ok {
 		return time.Time{}, fmt.Errorf("csil cbor: timestamp content must be text")
 	}
-	parsed, err := time.Parse(time.RFC3339, string(s))
-	if err != nil {
-		return time.Time{}, err
-	}
-	return parsed.UTC(), nil
+	return csilParseTimestamp(string(s))
 }
 "#;
 
@@ -4123,6 +4678,10 @@ func csilAsDecimal(v cborValue) (decimal.Decimal, error) {
 	if err != nil {
 		return decimal.Decimal{}, err
 	}
+	// shopspring keeps an int32 exponent; a wider one would wrap to another value.
+	if exp < math.MinInt32 || exp > math.MaxInt32 {
+		return decimal.Decimal{}, fmt.Errorf("csil cbor: decimal exponent %d is outside the int32 range", exp)
+	}
 	return decimal.NewFromBigInt(mant, int32(exp)), nil
 }
 "#;
@@ -4205,7 +4764,15 @@ fn generate_client(
     content.push_str(&format!("{}\"fmt\"\n", config.indent_style));
     content.push_str(")\n\n");
 
-    content.push_str(CLIENT_PRELUDE_GO);
+    if input.csil_spec.rpc_operations().next().is_some() {
+        let plain = CLIENT_PRELUDE_GO
+            .find("// Transport is the caller-supplied")
+            .expect("prelude declares Transport");
+        content.push_str(&CLIENT_PRELUDE_GO[..plain]);
+        content.push_str(CLIENT_REPLY_SEAM_GO);
+    } else {
+        content.push_str(CLIENT_PRELUDE_GO);
+    }
     content.push('\n');
 
     let records = record_names(input);
@@ -4318,17 +4885,34 @@ fn emit_client_struct(
         ));
         // A null input carries no request body (nil payload); a record reuses its
         // `Encode<T>` wrapper; any other shape uses the op's per-op request encoder.
+        // A request that cannot be encoded never reaches the transport.
         let req_bytes = if null_input {
             "nil".to_string()
-        } else if is_record_ref(&operation.input_type, records) {
-            format!("Encode{}(req)", type_ref_name(&operation.input_type))
         } else {
-            format!("Encode{stem}Request(req)")
+            let encoder = if is_record_ref(&operation.input_type, records) {
+                format!("Encode{}(req)", type_ref_name(&operation.input_type))
+            } else {
+                format!("Encode{stem}Request(req)")
+            };
+            content.push_str(&format!(
+                "{i}csilReq, csilErr := {encoder}\n{i}if csilErr != nil {{\n{i}{i}return csilZero, csilErr\n{i}}}\n",
+                i = config.indent_style
+            ));
+            "csilReq".to_string()
         };
-        content.push_str(&format!(
-            "{}csilResp, csilErr := c.transport.Call(ctx, \"{wire_service}\", \"{wire_op}\", {req_bytes})\n",
-            config.indent_style
-        ));
+        if operation.rpc_reply_arms().is_some() {
+            content.push_str(&format!(
+                "{i}csilReply, csilErr := c.transport.CallReply(ctx, \"{wire_service}\", \"{wire_op}\", {req_bytes})\n\
+                 {i}if csilErr != nil {{\n{i}{i}return csilZero, csilErr\n{i}}}\n\
+                 {i}csilResp, csilErr := ResolveRPCReply(\"{wire_service}\", \"{wire_op}\", csilReply.Variant, csilReply.Payload)\n",
+                i = config.indent_style
+            ));
+        } else {
+            content.push_str(&format!(
+                "{}csilResp, csilErr := c.transport.Call(ctx, \"{wire_service}\", \"{wire_op}\", {req_bytes})\n",
+                config.indent_style
+            ));
+        }
         content.push_str(&format!(
             "{i}if csilErr != nil {{\n{i}{i}return csilZero, csilErr\n{i}}}\n",
             i = config.indent_style
@@ -4726,6 +5310,11 @@ fn generate_validation(
                 rule.name
             ));
             body.push_str(&format!("func (v *{}) Validate() error {{\n", rule.name));
+            // A nil receiver is a valid method call in Go; reading a field of it panics.
+            body.push_str(&format!(
+                "\tif v == nil {{\n\t\treturn fmt.Errorf(\"{} is nil\")\n\t}}\n",
+                rule.name
+            ));
 
             for entry in &group.entries {
                 if let Some(key) = &entry.key {
@@ -4864,7 +5453,7 @@ fn ordered_field_kind(value_type: &CsilTypeExpression) -> OrderedKind {
     if let CsilTypeExpression::Builtin(name) = base {
         match name.as_str() {
             "decimal" => OrderedKind::Decimal,
-            "timestamp" => OrderedKind::Timestamp,
+            "timestamp" | "cddl_time" => OrderedKind::Timestamp,
             _ => OrderedKind::Numeric,
         }
     } else {
@@ -5598,11 +6187,12 @@ fn choice_all_literal(choices: &[CsilTypeExpression]) -> bool {
 /// `enum_scalar_builtin` returned `None` because the literal kinds aren't uniform):
 /// the CBOR wire value is just the literal itself, so this only needs to know which
 /// Go dynamic type is boxed inside the field's `interface{}` at encode time (a type
-/// switch), not which specific literal it is — same "no membership check on encode"
-/// posture every other enum encode path in this generator has (a value that reached
-/// here is trusted to already be one of the declared literals).
+/// switch) and then checks membership in the declared literals of that kind, as
+/// every other enum encode path does.
 fn go_mixed_enum_enc_expr(choices: &[CsilTypeExpression], expr: &str, indent: usize) -> String {
     let mut kinds: Vec<&'static str> = Vec::new();
+    let mut members: std::collections::HashMap<&'static str, Vec<String>> =
+        std::collections::HashMap::new();
     for c in choices {
         let lit =
             choice_arm_literal(c).expect("choice_all_literal guarantees every arm is literal");
@@ -5611,6 +6201,10 @@ fn go_mixed_enum_enc_expr(choices: &[CsilTypeExpression], expr: &str, indent: us
         if !kinds.contains(&kind) {
             kinds.push(kind);
         }
+        members
+            .entry(kind)
+            .or_default()
+            .push(literal_value_to_go_string(lit));
     }
     let base = indent + 1;
     let tb = "\t".repeat(base);
@@ -5623,10 +6217,16 @@ fn go_mixed_enum_enc_expr(choices: &[CsilTypeExpression], expr: &str, indent: us
             "bool" => ("bool", "cborBool(csilX)"),
             _ => unreachable!("mixed_enum_literal_kind only yields text/int/float/bool"),
         };
-        body.push_str(&format!("{tb}case {go_type}:\n{tb}\treturn {cbor_ctor}\n"));
+        let list = members[kind].join(", ");
+        body.push_str(&format!(
+            "{tb}case {go_type}:\n{tb}\treturn csilEncMember(csilX, {cbor_ctor}, {list})\n"
+        ));
     }
-    body.push_str(&format!("{tb}}}\n{tb}return cborNull{{}}"));
-    format!("{}()", go_closure("func() cborValue", &[body], indent))
+    body.push_str(&format!("{tb}}}\n{tb}return {}", go_not_a_member(expr)));
+    format!(
+        "{}()",
+        go_closure("func() (cborValue, error)", &[body], indent)
+    )
 }
 
 /// Bare-wire decode for a MIXED-kind all-literal choice (`choice_all_literal`), the
@@ -5712,7 +6312,7 @@ fn map_csil_type_to_go(
             "date" => "string",
             // CBOR tag 0, RFC3339, always UTC per the wire contract; time.Time is
             // kept in UTC so encode/decode round-trips the `Z` offset.
-            "timestamp" => "time.Time",
+            "timestamp" | "cddl_time" => "time.Time",
             // CBOR tag 4 exact decimal; the concrete Go type depends on the
             // decimal_mapping option (generated CsilDecimal vs. shopspring).
             "decimal" => decimal_type,
@@ -5805,7 +6405,8 @@ fn go_tuple_enc(
                 aliases,
                 config,
                 indent + 2,
-            );
+            )
+            .value();
             let deref = go_closure(
                 "func() cborValue",
                 &[
@@ -5828,7 +6429,8 @@ fn go_tuple_enc(
                 aliases,
                 config,
                 indent + 1,
-            );
+            )
+            .value();
             parts.push(inner);
         }
     }
@@ -6895,8 +7497,21 @@ mod tests {
         assert!(client.content.contains(
             "func (c *CorndogsClient) SubmitTask(ctx context.Context, req SubmitTaskRequest) (Task, error)"
         ));
+        // `submit-task` declares a `ServiceError` arm, so it rides the variant seam.
         assert!(client.content.contains(
-            "csilResp, csilErr := c.transport.Call(ctx, \"CorndogsService\", \"submit-task\", EncodeSubmitTaskRequest(req))"
+            "CallReply(ctx context.Context, service string, op string, req []byte) (WireReply, error)"
+        ));
+        // The request is encoded before the transport call; a failure returns early.
+        assert!(
+            client
+                .content
+                .contains("csilReq, csilErr := EncodeSubmitTaskRequest(req)\n\tif csilErr != nil {\n\t\treturn csilZero, csilErr\n\t}\n")
+        );
+        assert!(client.content.contains(
+            "csilReply, csilErr := c.transport.CallReply(ctx, \"CorndogsService\", \"submit-task\", csilReq)"
+        ));
+        assert!(client.content.contains(
+            "csilResp, csilErr := ResolveRPCReply(\"CorndogsService\", \"submit-task\", csilReply.Variant, csilReply.Payload)"
         ));
         assert!(
             client
@@ -6921,7 +7536,7 @@ mod tests {
         assert!(
             codec
                 .content
-                .contains("func EncodeSubmitTaskRequest(csilV SubmitTaskRequest) []byte")
+                .contains("func EncodeSubmitTaskRequest(csilV SubmitTaskRequest) ([]byte, error)")
         );
         assert!(
             codec
@@ -6931,7 +7546,7 @@ mod tests {
         assert!(
             codec
                 .content
-                .contains("func csilEncTask(csilV Task) cborValue")
+                .contains("func csilEncTask(csilV Task, csilDepth int) (cborValue, error)")
         );
         // bytes -> CBOR byte string (major type 2), via the runtime's cborBytes.
         assert!(
@@ -6940,7 +7555,11 @@ mod tests {
                 .contains("cborText(\"payload\"), cborBytes(csilV.Payload)")
         );
         // A nested record reference recurses into its codec.
-        assert!(codec.content.contains("csilEncTask(csilV.Task)"));
+        assert!(
+            codec
+                .content
+                .contains("csilE.val(csilEncTask(csilV.Task, csilDepth+1))")
+        );
         // Optional int is a pointer: guarded on encode, deref'd into the map.
         assert!(codec.content.contains("if csilV.Priority != nil"));
         assert!(codec.content.contains("cborInt((*csilV.Priority))"));
@@ -7137,6 +7756,56 @@ mod tests {
     }
 
     #[test]
+    fn cddl_time_shares_time_type_and_bound_with_tag1_codec() {
+        let input = group_input(
+            "Reading",
+            vec![constrained_entry(
+                "seen_at",
+                "cddl_time",
+                vec![CsilControlOperator::GreaterEqual(CsilLiteralValue::Text(
+                    "1970-01-01T00:00:00Z".to_string(),
+                ))],
+            )],
+            HashMap::new(),
+        );
+        let config = GoConfig::from_options(&input.config.options).unwrap();
+        let types = super::generate_types(&input, &config, &mut Vec::new())
+            .unwrap()
+            .expect("types emitted");
+        assert!(types.contains("SeenAt time.Time"));
+        assert!(types.contains("import (\n\t\"time\"\n)"));
+        let validation = super::generate_validation(&input, &config, &mut Vec::new())
+            .unwrap()
+            .expect("validation emitted");
+        assert!(
+            validation
+                .contains("if v.SeenAt.Before(mustParseTimestamp(\"1970-01-01T00:00:00Z\")) {")
+        );
+        let output = super::process_generation(input).expect("generation ok");
+        let codec = output
+            .files
+            .iter()
+            .find(|f| f.path == "codec.gen.go")
+            .expect("codec emitted");
+        assert!(codec.content.contains("\t\"time\"\n"));
+        assert!(codec.content.contains("csilEncCddlTime(csilV.SeenAt)"));
+        assert!(codec.content.contains("csilAsCddlTime"));
+        assert!(
+            codec
+                .content
+                .contains("cborTag{num: 1, inner: cborInt(seconds)}")
+        );
+        // The product is wrapped in float64(...) so Go may not fuse it into an FMA.
+        assert!(
+            codec
+                .content
+                .contains("scaled := float64((f - whole) * float64(csilEpochUnits))")
+        );
+        assert!(codec.content.contains("func cborHalfToFloat64"));
+        assert!(!codec.content.contains("func csilAsTimestamp"));
+    }
+
+    #[test]
     fn decimal_csil_mode_emits_self_contained_helper() {
         let input = group_input(
             "Money",
@@ -7215,6 +7884,22 @@ mod tests {
         assert!(types.content.contains("\"github.com/shopspring/decimal\""));
         // The library type stands alone; no generated helper.
         assert!(!output.files.iter().any(|f| f.path == "csil_decimal.gen.go"));
+        // shopspring keeps an int32 exponent, so a wider wire exponent is refused
+        // before the conversion, which would otherwise wrap to another value.
+        let codec = output
+            .files
+            .iter()
+            .find(|f| f.path == "codec.gen.go")
+            .expect("codec emitted");
+        let range = codec
+            .content
+            .find("if exp < math.MinInt32 || exp > math.MaxInt32 {")
+            .expect("exponent range check");
+        let conversion = codec
+            .content
+            .find("decimal.NewFromBigInt(mant, int32(exp))")
+            .expect("exponent conversion");
+        assert!(range < conversion);
     }
 
     #[test]
@@ -7483,11 +8168,9 @@ mod tests {
             .find(|f| f.path == "codec.gen.go")
             .expect("codec emitted");
 
-        assert!(
-            codec
-                .content
-                .contains("func csilEncMixedLitNull(csilV MixedLitNull) cborValue {")
-        );
+        assert!(codec.content.contains(
+            "func csilEncMixedLitNull(csilV MixedLitNull, csilDepth int) (cborValue, error) {"
+        ));
         // No case body references `csilX` for this all-single-arm union (every
         // arm is a hardcoded literal or the value-ignoring `null` builtin), so the
         // switch must not bind it -- `switch csilV.(type) {`, not
@@ -7675,6 +8358,10 @@ mod tests {
             .expect("validation emitted");
 
         assert!(validation.contains("func (v *Account) Validate() error"));
+        // A nil receiver returns an error before any field read.
+        assert!(validation.contains(
+            "func (v *Account) Validate() error {\n\tif v == nil {\n\t\treturn fmt.Errorf(\"Account is nil\")\n\t}\n"
+        ));
         assert!(validation.contains("if len(v.Username) < 3 {"));
         assert!(validation.contains("if len(v.Username) > 20 {"));
         assert!(validation.contains("regexp.MatchString(`^[a-z]+$`, v.Username)"));
@@ -8589,6 +9276,9 @@ mod tests {
         // response bytes decode through the codec.
         assert!(client.contains("c.transport.Call(ctx, \"HealthService\", \"ping\", nil)"));
         assert!(client.contains("return DecodePong(csilResp)"));
+        // No operation declares several reply arms, so the seam keeps only Call.
+        assert!(!client.contains("CallReply"));
+        assert!(!client.contains("WireReply"));
     }
 
     fn wire_id_input() -> WasmGeneratorInput {
@@ -8807,6 +9497,591 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Run the shared timestamp vectors through the generated Go codec with the
+    /// fixture's own peer, so the unit tests and `check.sh go` hold one rule set.
+    #[test]
+    fn timestamp_codec_passes_shared_vectors() {
+        let probe = std::process::Command::new("go").arg("version").output();
+        if probe.map(|o| !o.status.success()).unwrap_or(true) {
+            eprintln!("skipping: no go toolchain on PATH");
+            return;
+        }
+        let mut input = input_with_service("Unused", vec![]);
+        input.csil_spec.service_count = 0;
+        input.csil_spec.rules = vec![CsilRule {
+            name: "Stamp".to_string(),
+            rule_type: CsilRuleType::GroupDef(CsilGroupExpression {
+                entries: vec![bare_entry(
+                    "at",
+                    CsilTypeExpression::Builtin("timestamp".to_string()),
+                )],
+            }),
+            position: CsilPosition {
+                line: 1,
+                column: 1,
+                offset: 0,
+            },
+            doc_comments: Vec::new(),
+        }];
+        let output = super::process_generation(input).expect("generation ok");
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/interop/timestamp-vectors")
+            .canonicalize()
+            .expect("timestamp fixture exists");
+
+        let dir = std::env::temp_dir().join(format!("csilgen-go-stamp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let api_dir = dir.join("api");
+        std::fs::create_dir_all(&api_dir).unwrap();
+        for file in output.files.iter().filter(|f| f.path.ends_with(".go")) {
+            std::fs::write(api_dir.join(&file.path), &file.content).unwrap();
+        }
+        std::fs::write(dir.join("go.mod"), "module stampcheck\n\ngo 1.18\n").unwrap();
+        std::fs::copy(fixture.join("peer.go"), dir.join("main.go")).unwrap();
+        let run = std::process::Command::new("go")
+            .arg("run")
+            .arg(".")
+            .arg(fixture.join("vectors.tsv"))
+            .current_dir(&dir)
+            .env("GOTOOLCHAIN", "local")
+            .env("GOFLAGS", "-mod=mod")
+            .env("GOPROXY", "off")
+            .env("GO111MODULE", "on")
+            .env("GOCACHE", dir.join(".gocache"))
+            .output()
+            .unwrap();
+        assert!(
+            run.status.success(),
+            "timestamp vectors failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Run the shared epoch vectors through the generated Go codec with the
+    /// fixture's own peer, so the unit tests and `check.sh go` hold one rule set.
+    #[test]
+    fn cddl_time_codec_passes_shared_vectors() {
+        let probe = std::process::Command::new("go").arg("version").output();
+        if probe.map(|o| !o.status.success()).unwrap_or(true) {
+            eprintln!("skipping: no go toolchain on PATH");
+            return;
+        }
+        let mut input = input_with_service("Unused", vec![]);
+        input.csil_spec.service_count = 0;
+        input.csil_spec.rules = vec![CsilRule {
+            name: "Moment".to_string(),
+            rule_type: CsilRuleType::GroupDef(CsilGroupExpression {
+                entries: vec![bare_entry(
+                    "at",
+                    CsilTypeExpression::Builtin("cddl_time".to_string()),
+                )],
+            }),
+            position: CsilPosition {
+                line: 1,
+                column: 1,
+                offset: 0,
+            },
+            doc_comments: Vec::new(),
+        }];
+        let output = super::process_generation(input).expect("generation ok");
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/interop/epoch-vectors")
+            .canonicalize()
+            .expect("epoch fixture exists");
+
+        let dir = std::env::temp_dir().join(format!("csilgen-go-epoch-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let api_dir = dir.join("api");
+        std::fs::create_dir_all(&api_dir).unwrap();
+        for file in output.files.iter().filter(|f| f.path.ends_with(".go")) {
+            std::fs::write(api_dir.join(&file.path), &file.content).unwrap();
+        }
+        std::fs::write(dir.join("go.mod"), "module momentcheck\n\ngo 1.18\n").unwrap();
+        std::fs::copy(fixture.join("peer.go"), dir.join("main.go")).unwrap();
+        let run = std::process::Command::new("go")
+            .arg("run")
+            .arg(".")
+            .arg(fixture.join("vectors.tsv"))
+            .current_dir(&dir)
+            .env("GOTOOLCHAIN", "local")
+            .env("GOFLAGS", "-mod=mod")
+            .env("GOPROXY", "off")
+            .env("GO111MODULE", "on")
+            .env("GOCACHE", dir.join(".gocache"))
+            .output()
+            .unwrap();
+        assert!(
+            run.status.success(),
+            "epoch vectors failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A timestamp, cddl_time, or date outside years 0001-9999 has no wire form.
+    /// Encode must return an error, also through a slice, and must not panic. A
+    /// value that refers to itself must stop at the nesting limit. The driver has
+    /// no recover, so a panic or a stack overflow fails the run.
+    #[test]
+    fn out_of_range_instants_error_on_encode() {
+        let probe = std::process::Command::new("go").arg("version").output();
+        if probe.map(|o| !o.status.success()).unwrap_or(true) {
+            eprintln!("skipping: no go toolchain on PATH");
+            return;
+        }
+        let rule = |name: &str, ty: &str| CsilRule {
+            name: name.to_string(),
+            rule_type: CsilRuleType::GroupDef(CsilGroupExpression {
+                entries: vec![bare_entry(
+                    "at",
+                    CsilTypeExpression::Builtin(ty.to_string()),
+                )],
+            }),
+            position: CsilPosition {
+                line: 1,
+                column: 1,
+                offset: 0,
+            },
+            doc_comments: Vec::new(),
+        };
+        let mut input = input_with_service("Unused", vec![]);
+        input.csil_spec.service_count = 0;
+        let mut log = rule("Log", "timestamp");
+        log.rule_type = CsilRuleType::GroupDef(CsilGroupExpression {
+            entries: vec![bare_entry(
+                "at",
+                CsilTypeExpression::Array {
+                    element_type: Box::new(CsilTypeExpression::Builtin("timestamp".to_string())),
+                    occurrence: None,
+                },
+            )],
+        });
+        let mut node = rule("Node", "int");
+        node.rule_type = CsilRuleType::GroupDef(CsilGroupExpression {
+            entries: vec![optional_entry(
+                "next",
+                CsilTypeExpression::Reference("Node".to_string()),
+            )],
+        });
+        input.csil_spec.rules = vec![
+            rule("Stamp", "timestamp"),
+            rule("Moment", "cddl_time"),
+            rule("Day", "date"),
+            log,
+            node,
+        ];
+        let output = super::process_generation(input).expect("generation ok");
+        let dir = std::env::temp_dir().join(format!("csilgen-go-range-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let api_dir = dir.join("api");
+        std::fs::create_dir_all(&api_dir).unwrap();
+        for file in output.files.iter().filter(|f| f.path.ends_with(".go")) {
+            std::fs::write(api_dir.join(&file.path), &file.content).unwrap();
+        }
+        std::fs::write(dir.join("go.mod"), "module rangecheck\n\ngo 1.18\n").unwrap();
+        std::fs::write(dir.join("main.go"), GO_RANGE_ERROR_DRIVER).unwrap();
+        let run = std::process::Command::new("go")
+            .arg("run")
+            .arg(".")
+            .current_dir(&dir)
+            .env("GOTOOLCHAIN", "local")
+            .env("GOFLAGS", "-mod=mod")
+            .env("GOPROXY", "off")
+            .env("GO111MODULE", "on")
+            .env("GOCACHE", dir.join(".gocache"))
+            .output()
+            .unwrap();
+        assert!(
+            run.status.success() && String::from_utf8_lossy(&run.stdout).trim() == "ok",
+            "range error driver failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    const GO_RANGE_ERROR_DRIVER: &str = r#"package main
+
+import (
+	"fmt"
+	"os"
+	"strings"
+	"time"
+
+	api "rangecheck/api"
+)
+
+func main() {
+	before := time.Date(0, time.December, 31, 23, 59, 59, 0, time.UTC)
+	after := time.Date(10000, time.January, 1, 0, 0, 0, 0, time.UTC)
+	edge := time.Date(9999, time.December, 31, 23, 59, 59, 0, time.UTC)
+	first := time.Date(1, time.January, 1, 0, 0, 0, 0, time.UTC)
+	encode := func(data []byte, err error) error {
+		if err == nil && len(data) == 0 {
+			return fmt.Errorf("no bytes and no error")
+		}
+		return err
+	}
+	cases := []struct {
+		name, want string
+		err        error
+	}{
+		{"timestamp in year 0000", "timestamp requires a UTC year from 0001 to 9999", encode(api.EncodeStamp(api.Stamp{At: before}))},
+		{"timestamp in year 10000", "timestamp requires a UTC year from 0001 to 9999", encode(api.EncodeStamp(api.Stamp{At: after}))},
+		{"cddl_time in year 0000", "cddl_time requires a UTC year from 0001 to 9999", encode(api.EncodeMoment(api.Moment{At: before}))},
+		{"cddl_time in year 10000", "cddl_time requires a UTC year from 0001 to 9999", encode(api.EncodeMoment(api.Moment{At: after}))},
+		{"date in year 0000", "outside years 0001-9999", encode(api.EncodeDay(api.Day{At: "0000-12-31"}))},
+		{"date in year 10000", "invalid date", encode(api.EncodeDay(api.Day{At: "10000-01-01"}))},
+		{"date that does not exist", "invalid date", encode(api.EncodeDay(api.Day{At: "2023-02-29"}))},
+		{"timestamp in a slice", "timestamp requires a UTC year from 0001 to 9999", encode(api.EncodeLog(api.Log{At: []time.Time{edge, after}}))},
+		{"timestamp at 9999", "", encode(api.EncodeStamp(api.Stamp{At: edge}))},
+		{"cddl_time at 9999", "", encode(api.EncodeMoment(api.Moment{At: edge}))},
+		{"cddl_time at 0001", "", encode(api.EncodeMoment(api.Moment{At: first}))},
+		{"date at 0001", "", encode(api.EncodeDay(api.Day{At: "0001-01-01"}))},
+		{"date at 9999", "", encode(api.EncodeDay(api.Day{At: "9999-12-31"}))},
+		{"timestamps in a slice", "", encode(api.EncodeLog(api.Log{At: []time.Time{first, edge}}))},
+	}
+	failed := false
+	for _, c := range cases {
+		switch {
+		case c.want == "" && c.err != nil:
+			fmt.Printf("FAIL %s: unexpected error %v\n", c.name, c.err)
+			failed = true
+		case c.want != "" && (c.err == nil || !strings.Contains(c.err.Error(), c.want)):
+			fmt.Printf("FAIL %s: error %v, want %q\n", c.name, c.err, c.want)
+			failed = true
+		}
+	}
+	loop := api.Node{}
+	loop.Next = &loop
+	if _, err := api.EncodeNode(loop); err == nil || !strings.Contains(err.Error(), "nesting limit") {
+		fmt.Printf("FAIL cyclic value: error %v, want the nesting limit\n", err)
+		failed = true
+	}
+	if _, err := api.DecodeDay([]byte("\xd9\x03\xec\x6a0000-12-31")); err == nil {
+		fmt.Println("FAIL decode accepted the date 0000-12-31")
+		failed = true
+	}
+	if failed {
+		os.Exit(1)
+	}
+	fmt.Println("ok")
+}
+"#;
+
+    /// A handler reply that has no wire form must reach the peer as an internal
+    /// failure (status 6), not as a panic or a dropped connection. The server side
+    /// is the dispatch the generated reply encoder feeds, over the real transport
+    /// library. The typed client must also refuse a request it cannot encode before
+    /// it calls the transport.
+    #[test]
+    fn unencodable_reply_becomes_internal_failure() {
+        let probe = std::process::Command::new("go").arg("version").output();
+        if probe.map(|o| !o.status.success()).unwrap_or(true) {
+            eprintln!("skipping: no go toolchain on PATH");
+            return;
+        }
+        let record = |name: &str, field: &str, ty: &str| CsilRule {
+            name: name.to_string(),
+            rule_type: CsilRuleType::GroupDef(CsilGroupExpression {
+                entries: vec![bare_entry(
+                    field,
+                    CsilTypeExpression::Builtin(ty.to_string()),
+                )],
+            }),
+            position: CsilPosition {
+                line: 1,
+                column: 1,
+                offset: 0,
+            },
+            doc_comments: Vec::new(),
+        };
+        let mut op = make_op(
+            "now",
+            "Stamp",
+            "Stamp",
+            CsilServiceDirection::Unidirectional,
+        );
+        op.output_type = CsilTypeExpression::Choice(vec![
+            CsilTypeExpression::Reference("Stamp".to_string()),
+            CsilTypeExpression::Reference("Refusal".to_string()),
+        ]);
+        let mut input = input_with_service("Clock", vec![op]);
+        input.config.target = "go-client".to_string();
+        input
+            .csil_spec
+            .rules
+            .push(record("Stamp", "at", "timestamp"));
+        input.csil_spec.rules.push(record("Refusal", "code", "int"));
+        let output = super::process_generation(input).expect("generation ok");
+        let dir = std::env::temp_dir().join(format!("csilgen-go-router-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let api_dir = dir.join("api");
+        std::fs::create_dir_all(&api_dir).unwrap();
+        for file in output.files.iter().filter(|f| f.path.ends_with(".go")) {
+            std::fs::write(api_dir.join(&file.path), &file.content).unwrap();
+        }
+        let transports = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../transports/go")
+            .canonicalize()
+            .unwrap();
+        std::fs::write(
+            dir.join("go.mod"),
+            format!(
+                "module routercheck\n\ngo 1.26.3\n\n\
+                 require github.com/catalystcommunity/csilgen/transports/go v0.0.0\n\n\
+                 replace github.com/catalystcommunity/csilgen/transports/go => {}\n",
+                transports.display()
+            ),
+        )
+        .unwrap();
+        std::fs::write(dir.join("main.go"), GO_ROUTER_FAILURE_DRIVER).unwrap();
+        let run = std::process::Command::new("go")
+            .arg("run")
+            .arg(".")
+            .current_dir(&dir)
+            .env("GOTOOLCHAIN", "local")
+            .env("GOFLAGS", "-mod=mod")
+            .env("GOPROXY", "off")
+            .env("GO111MODULE", "on")
+            .env("GOCACHE", dir.join(".gocache"))
+            .output()
+            .unwrap();
+        assert!(
+            run.status.success() && String::from_utf8_lossy(&run.stdout).trim() == "ok",
+            "router failure driver failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    const GO_ROUTER_FAILURE_DRIVER: &str = r#"package main
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"os"
+	"strings"
+	"time"
+
+	transport "github.com/catalystcommunity/csilgen/transports/go"
+	api "routercheck/api"
+)
+
+// now is a handler whose reply has no timestamp wire form.
+func now(context.Context, api.Stamp) (api.Stamp, error) {
+	return api.Stamp{At: time.Date(10000, time.January, 1, 0, 0, 0, 0, time.UTC)}, nil
+}
+
+// dispatch is the server router: a reply that cannot be encoded is an internal failure.
+func dispatch(req *transport.RpcRequest) transport.HandlerOutcome {
+	in, err := api.DecodeStamp(req.Payload)
+	if err != nil {
+		return transport.Transport(transport.StatusMalformedEnvelope, err.Error())
+	}
+	variant, payload, err := api.EncodeClockNowReply(now(context.Background(), in))
+	if err != nil {
+		return transport.Transport(transport.StatusInternal, err.Error())
+	}
+	return transport.Reply(variant, payload)
+}
+
+// wire runs one server exchange in memory for each call.
+type wire struct {
+	calls  int
+	server *transport.LoopbackFrameCarrier
+}
+
+func (w *wire) Call(ctx context.Context, service, op string, req []byte) ([]byte, error) {
+	reply, err := w.CallReply(ctx, service, op, req)
+	return reply.Payload, err
+}
+
+func (w *wire) CallReply(_ context.Context, service, op string, req []byte) (api.WireReply, error) {
+	w.calls++
+	envelope, err := transport.NewRpcRequest(service, op, req).Encode()
+	if err != nil {
+		return api.WireReply{}, err
+	}
+	w.server.PushInbound(envelope)
+	served, err := transport.NewRpcServer(w.server).ServeOne(dispatch)
+	if err != nil || !served {
+		return api.WireReply{}, fmt.Errorf("server did not answer: %v", err)
+	}
+	reply, err := transport.DecodeRpcResponse(w.server.TakeOutbound())
+	if err != nil {
+		return api.WireReply{}, err
+	}
+	if err := reply.AsTransportError(); err != nil {
+		return api.WireReply{}, err
+	}
+	return api.WireReply{Variant: reply.Variant, Payload: reply.Payload}, nil
+}
+
+func fail(msg string, args ...any) {
+	fmt.Printf("FAIL: "+msg+"\n", args...)
+	os.Exit(1)
+}
+
+func main() {
+	ctx := context.Background()
+	if _, _, err := api.EncodeClockNowReply(now(ctx, api.Stamp{})); err == nil {
+		fail("the reply encoder accepted year 10000")
+	} else {
+		var encodeErr *api.RPCEncodeError
+		if !errors.As(err, &encodeErr) {
+			fail("reply encode error is %T, want *RPCEncodeError", err)
+		}
+	}
+
+	w := &wire{server: transport.NewLoopbackFrameCarrier()}
+	client := api.NewClockClient(w)
+	_, err := client.Now(ctx, api.Stamp{At: time.Date(2026, time.June, 29, 12, 0, 0, 0, time.UTC)})
+	var status transport.StatusError
+	if !errors.As(err, &status) {
+		fail("client error %v, want a transport status", err)
+	}
+	if status.Code != transport.StatusInternal.Code() || !strings.Contains(status.Message, "timestamp") {
+		fail("transport status %d %q, want an internal failure about the timestamp", status.Code, status.Message)
+	}
+
+	calls := w.calls
+	if _, err := client.Now(ctx, api.Stamp{At: time.Date(0, time.June, 1, 0, 0, 0, 0, time.UTC)}); err == nil {
+		fail("the client sent a request with year 0000")
+	}
+	if w.calls != calls {
+		fail("the client called the transport with a request it could not encode")
+	}
+	fmt.Println("ok")
+}
+"#;
+
+    /// Values a payload chooses must never make generated code panic or allocate
+    /// without bound: a decimal exponent at the int64 limits (String, Cmp) and a
+    /// byte-string key in a map whose Go key type is an interface.
+    #[test]
+    fn payload_chosen_values_never_panic() {
+        let probe = std::process::Command::new("go").arg("version").output();
+        if probe.map(|o| !o.status.success()).unwrap_or(true) {
+            eprintln!("skipping: no go toolchain on PATH");
+            return;
+        }
+        let input = group_input(
+            "Bag",
+            vec![
+                bare_entry("d", CsilTypeExpression::Builtin("decimal".to_string())),
+                bare_entry(
+                    "m",
+                    CsilTypeExpression::Map {
+                        key: Box::new(CsilTypeExpression::Builtin("any".to_string())),
+                        value: Box::new(CsilTypeExpression::Builtin("int".to_string())),
+                        occurrence: None,
+                    },
+                ),
+            ],
+            HashMap::new(),
+        );
+        let output = super::process_generation(input).expect("generation ok");
+        let dir = std::env::temp_dir().join(format!("csilgen-go-hostile-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let api_dir = dir.join("api");
+        std::fs::create_dir_all(&api_dir).unwrap();
+        for file in output.files.iter().filter(|f| f.path.ends_with(".go")) {
+            std::fs::write(api_dir.join(&file.path), &file.content).unwrap();
+        }
+        std::fs::write(dir.join("go.mod"), "module hostilecheck\n\ngo 1.21\n").unwrap();
+        std::fs::write(dir.join("main.go"), GO_HOSTILE_VALUES_DRIVER).unwrap();
+        let run = std::process::Command::new("go")
+            .arg("run")
+            .arg(".")
+            .current_dir(&dir)
+            .env("GOTOOLCHAIN", "local")
+            .env("GOFLAGS", "-mod=mod")
+            .env("GOPROXY", "off")
+            .env("GO111MODULE", "on")
+            .env("GOCACHE", dir.join(".gocache"))
+            .output()
+            .unwrap();
+        assert!(
+            run.status.success() && String::from_utf8_lossy(&run.stdout).trim() == "ok",
+            "hostile values driver failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    const GO_HOSTILE_VALUES_DRIVER: &str = r#"package main
+
+import (
+	"bytes"
+	"fmt"
+	"math"
+	"math/big"
+	"os"
+
+	api "hostilecheck/api"
+)
+
+var failed bool
+
+func check(cond bool, msg string, args ...any) {
+	if !cond {
+		fmt.Printf("FAIL: "+msg+"\n", args...)
+		failed = true
+	}
+}
+
+func dec(s string) api.CsilDecimal {
+	d, err := api.ParseCsilDecimal(s)
+	check(err == nil, "parse %q: %v", s, err)
+	return d
+}
+
+func main() {
+	low := api.CsilDecimal{Exponent: math.MinInt64, Mantissa: big.NewInt(5)}
+	high := api.CsilDecimal{Exponent: math.MaxInt64, Mantissa: big.NewInt(5)}
+	data, err := api.EncodeBag(api.Bag{D: low, M: map[any]int64{"k": 1}})
+	check(err == nil, "encode: %v", err)
+	back, err := api.DecodeBag(data)
+	check(err == nil, "decode: %v", err)
+	check(back.D.Exponent == math.MinInt64, "exponent %d", back.D.Exponent)
+
+	check(back.D.String() == "5e-9223372036854775808", "String %q", back.D.String())
+	check(high.String() == "5e9223372036854775807", "String %q", high.String())
+	check(dec("5e-9223372036854775808").Cmp(low) == 0, "exponent form does not round-trip")
+	check(low.Cmp(high) == -1 && high.Cmp(low) == 1, "extreme exponents compare")
+	check(high.Cmp(api.CsilDecimal{Exponent: math.MaxInt64, Mantissa: big.NewInt(-5)}) == 1, "sign wins")
+	check(dec("1.50").Cmp(dec("1.5")) == 0, "1.50 == 1.5")
+	check(dec("10").Cmp(api.CsilDecimal{Exponent: 1, Mantissa: big.NewInt(1)}) == 0, "10 == 1e1")
+	check(dec("0.999").Cmp(dec("1")) == -1, "0.999 < 1")
+	check(dec("-2").Cmp(dec("1")) == -1, "-2 < 1")
+	check(dec("-0.5").Cmp(dec("-0.25")) == -1, "-0.5 < -0.25")
+	check(dec("0").Cmp(api.CsilDecimal{}) == 0, "0 == zero value")
+	check(dec("12.5e3").Cmp(dec("12500")) == 0, "12.5e3 == 12500")
+	for _, bad := range []string{"+-5", "1.2.3", "5e", "5e99999999999999999999", "1-2"} {
+		_, err := api.ParseCsilDecimal(bad)
+		check(err != nil, "parse accepted %q", bad)
+	}
+
+	// A text key "k" becomes the byte string h'6b', which Go cannot hash as any.
+	hostile := bytes.Replace(data, []byte("\x61k"), []byte("\x41k"), 1)
+	check(!bytes.Equal(hostile, data), "map key not found in the encoded bytes")
+	_, err = api.DecodeBag(hostile)
+	check(err != nil, "decode accepted a byte-string key of type any")
+
+	if failed {
+		os.Exit(1)
+	}
+	fmt.Println("ok")
+}
+"#;
+
     const GO_CODEC_DRIVER: &str = r#"package main
 
 import (
@@ -8831,7 +10106,14 @@ func (loopback) Call(ctx context.Context, service, op string, req []byte) ([]byt
 	if err != nil {
 		return nil, err
 	}
-	return api.EncodeTask(in.Task), nil
+	return api.EncodeTask(in.Task)
+}
+
+// submit-task declares a ServiceError arm, so the client asks for the variant.
+func (l loopback) CallReply(ctx context.Context, service, op string, req []byte) (api.WireReply, error) {
+	payload, err := l.Call(ctx, service, op, req)
+	variant := "Task"
+	return api.WireReply{Variant: &variant, Payload: payload}, err
 }
 
 func check(cond bool, msg string) {
@@ -8846,6 +10128,11 @@ func must(err error) {
 		fmt.Println("ERR:", err)
 		os.Exit(1)
 	}
+}
+
+func enc(data []byte, err error) []byte {
+	must(err)
+	return data
 }
 
 func main() {
@@ -8863,7 +10150,7 @@ func main() {
 	req := api.SubmitTaskRequest{Task: task, Queue: "default"}
 
 	// Direct codec round-trip through the nested record.
-	back, err := api.DecodeSubmitTaskRequest(api.EncodeSubmitTaskRequest(req))
+	back, err := api.DecodeSubmitTaskRequest(enc(api.EncodeSubmitTaskRequest(req)))
 	must(err)
 	check(back.Task.Uuid == "u-123", "uuid")
 	check(bytes.Equal(back.Task.Payload, []byte{0xde, 0xad, 0xbe}), "payload")
@@ -8878,7 +10165,7 @@ func main() {
 	// An absent optional must round-trip to nil, not a zero value.
 	task2 := task
 	task2.Priority = nil
-	back2, err := api.DecodeSubmitTaskRequest(api.EncodeSubmitTaskRequest(api.SubmitTaskRequest{Task: task2, Queue: "q"}))
+	back2, err := api.DecodeSubmitTaskRequest(enc(api.EncodeSubmitTaskRequest(api.SubmitTaskRequest{Task: task2, Queue: "q"})))
 	must(err)
 	check(back2.Task.Priority == nil, "absent optional nil")
 
@@ -9081,13 +10368,18 @@ func must(err error) {
 	}
 }
 
+func enc(data []byte, err error) []byte {
+	must(err)
+	return data
+}
+
 func main() {
 	// A literal arm ("not_found") wins over the general `text` arm on encode
 	// (literal-first precedence) and must still round-trip byte-for-byte — the
 	// confirmed bug silently replaced this field with `cborNull{}` on encode,
 	// which would surface here as a decode failure or an empty string.
 	t1 := api.Torture{MixedChoice: "not_found", EnumChoice: "red", Grade: "low", Priority: "low"}
-	back1, err := api.DecodeTorture(api.EncodeTorture(t1))
+	back1, err := api.DecodeTorture(enc(api.EncodeTorture(t1)))
 	must(err)
 	check(back1.MixedChoice == "not_found", "mixed_choice literal round-trip")
 	check(back1.EnumChoice == "red", "enum_choice round-trip")
@@ -9097,7 +10389,7 @@ func main() {
 	// A value matching no literal arm falls back to the general `text` arm, for
 	// both the inline mixed_choice field and the named Grade union.
 	t2 := api.Torture{MixedChoice: "some other reason", EnumChoice: "blue", Grade: "something_else", Priority: "high"}
-	back2, err := api.DecodeTorture(api.EncodeTorture(t2))
+	back2, err := api.DecodeTorture(enc(api.EncodeTorture(t2)))
 	must(err)
 	check(back2.MixedChoice == "some other reason", "mixed_choice general-arm round-trip")
 	check(back2.EnumChoice == "blue", "enum_choice round-trip 2")
@@ -9113,7 +10405,7 @@ func main() {
 	// literal arm: its own declared index, not folded into (or shadowed by) the
 	// general arm.
 	t3 := api.Torture{MixedChoice: "permission_denied", EnumChoice: "green", Grade: "high", Priority: "low"}
-	back3, err := api.DecodeTorture(api.EncodeTorture(t3))
+	back3, err := api.DecodeTorture(enc(api.EncodeTorture(t3)))
 	must(err)
 	check(back3.MixedChoice == "permission_denied", "mixed_choice default-constrained literal arm round-trip")
 	check(back3.EnumChoice == "green", "enum bare-wire round-trip")
@@ -9178,6 +10470,7 @@ func main() {
     const GO_ENUM_MEMBERSHIP_DRIVER: &str = r#"package main
 
 import (
+	"bytes"
 	"fmt"
 	"os"
 
@@ -9205,24 +10498,40 @@ func must(err error) {
 	}
 }
 
+func enc(data []byte, err error) []byte {
+	must(err)
+	return data
+}
+
 func main() {
-	valid := api.Torture{MixedChoice: "not_found", EnumChoice: "red", Grade: "low", Priority: "low"}
-	back, err := api.DecodeTorture(api.EncodeTorture(valid))
+	valid := api.Torture{MixedChoice: "not_found", EnumChoice: "red", Grade: "low", Priority: "high"}
+	data, err := api.EncodeTorture(valid)
+	must(err)
+	back, err := api.DecodeTorture(data)
 	must(err)
 	check(back.EnumChoice == "red", "valid enum_choice member round-trips")
-	check(back.Priority == "low", "valid named-enum (Priority) member round-trips")
+	check(back.Priority == "high", "valid named-enum (Priority) member round-trips")
+
+	// Encode refuses an out-of-set value, so no peer gets bytes it must refuse.
+	_, err = api.EncodeTorture(api.Torture{MixedChoice: "not_found", EnumChoice: "red", Grade: "low", Priority: api.Priority("medium")})
+	mustFail(err, "out-of-set Priority value \"medium\" must fail encode")
+	_, err = api.EncodeTorture(api.Torture{MixedChoice: "not_found", EnumChoice: "purple", Grade: "low", Priority: "high"})
+	mustFail(err, "out-of-set enum_choice value \"purple\" must fail encode")
 
 	// A named enum (Priority) reached through the codec_aliases alias path: a
 	// well-typed string that is NOT one of "low"/"high" must fail decode rather
-	// than pass through unchecked.
-	badPriority := api.Torture{MixedChoice: "not_found", EnumChoice: "red", Grade: "low", Priority: api.Priority("medium")}
-	_, err = api.DecodeTorture(api.EncodeTorture(badPriority))
-	mustFail(err, "out-of-set Priority value \"medium\" must fail decode")
+	// than pass through unchecked. The bytes come from a valid encode with the
+	// member text replaced, because the encoder refuses the value itself.
+	badPriority := bytes.Replace(data, []byte("\x64high"), []byte("\x64huge"), 1)
+	check(!bytes.Equal(badPriority, data), "Priority member text found in the encoded bytes")
+	_, err = api.DecodeTorture(badPriority)
+	mustFail(err, "out-of-set Priority value \"huge\" must fail decode")
 
 	// An inline (hoisted) enum field: same contract, no named alias involved.
-	badEnumChoice := api.Torture{MixedChoice: "not_found", EnumChoice: "purple", Grade: "low", Priority: "low"}
-	_, err = api.DecodeTorture(api.EncodeTorture(badEnumChoice))
-	mustFail(err, "out-of-set enum_choice value \"purple\" must fail decode")
+	badEnumChoice := bytes.Replace(data, []byte("\x63red"), []byte("\x63tan"), 1)
+	check(!bytes.Equal(badEnumChoice, data), "enum_choice member text found in the encoded bytes")
+	_, err = api.DecodeTorture(badEnumChoice)
+	mustFail(err, "out-of-set enum_choice value \"tan\" must fail decode")
 
 	fmt.Println("ok")
 }
@@ -9420,6 +10729,11 @@ func must(err error) {
 	}
 }
 
+func enc(data []byte, err error) []byte {
+	must(err)
+	return data
+}
+
 func main() {
 	w := api.Widget{
 		Name: "gizmo",
@@ -9432,7 +10746,7 @@ func main() {
 			{Key: "size", Count: 7},
 		},
 	}
-	back, err := api.DecodeWidget(api.EncodeWidget(w))
+	back, err := api.DecodeWidget(enc(api.EncodeWidget(w)))
 	must(err)
 	// The confirmed bug: these fields silently decoded to their zero value
 	// (Detail == WidgetDetail{}, Tags == nil) before the inline-group hoist fix.
@@ -9630,8 +10944,8 @@ func main() {
         // No op is dropped with a note anymore.
         assert!(!client.contains("handle it manually"));
         // Record boundary keeps its `Encode<T>`/`Decode<T>` wrapper; non-record rides per-op helpers.
-        assert!(client.contains("EncodeMember(req)"));
-        assert!(client.contains("EncodeMemberGetMemberRequest(req)"));
+        assert!(client.contains("csilReq, csilErr := EncodeMember(req)"));
+        assert!(client.contains("csilReq, csilErr := EncodeMemberGetMemberRequest(req)"));
         assert!(client.contains("DecodeMemberListMembersResponse(csilResp)"));
 
         let codec = super::generate_codec(&input, &config).expect("codec emitted");
@@ -9640,8 +10954,10 @@ func main() {
         assert!(
             codec.contains("func DecodeMemberGetMemberRequest(csilData []byte) (MemberID, error)")
         );
-        assert!(codec.contains("func EncodeMemberListMembersResponse(csilV []Member) []byte"));
-        assert!(codec.contains("func EncodeMemberDeleteTaskResponse(csilV bool) []byte"));
+        assert!(
+            codec.contains("func EncodeMemberListMembersResponse(csilV []Member) ([]byte, error)")
+        );
+        assert!(codec.contains("func EncodeMemberDeleteTaskResponse(csilV bool) ([]byte, error)"));
     }
 
     // ---- gofmt-fixpoint rendering ----

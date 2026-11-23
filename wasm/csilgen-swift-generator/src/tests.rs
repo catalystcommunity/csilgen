@@ -617,32 +617,33 @@ fn order_status_union_gets_a_full_codec() {
     // `text` arm carries its wrapped value through; each literal arm's payload is the
     // literal constant itself (the enum case is already the discriminant, so the
     // wrapped associated value is irrelevant on encode).
+    // The general `text` arm checks the literal arms first (literal wins).
+    assert!(body.contains("case .text(let csilV):\n            if csilV == "));
+    assert!(body.contains("            return .array([.uint(0), .text(csilV)])"));
     assert!(
-        body.contains(
-            "case .text(let csilV):\n            return .array([.uint(0), .text(csilV)])"
-        )
+        body.contains("case .case1:\n            return .array([.uint(1), .text(\"pending\")])")
     );
     assert!(body.contains(
-        "case .case1(let csilV):\n            return .array([.uint(1), .text(\"pending\")])"
+        "            if csilV == \"refunded\" { return .array([.uint(7), .text(\"refunded\")]) }\n"
     ));
-    assert!(body.contains(
-        "case .case2(let csilV):\n            return .array([.uint(2), .text(\"confirmed\")])"
-    ));
-    assert!(body.contains(
-        "case .case3(let csilV):\n            return .array([.uint(3), .text(\"processing\")])"
-    ));
-    assert!(body.contains(
-        "case .case4(let csilV):\n            return .array([.uint(4), .text(\"shipped\")])"
-    ));
-    assert!(body.contains(
-        "case .case5(let csilV):\n            return .array([.uint(5), .text(\"delivered\")])"
-    ));
-    assert!(body.contains(
-        "case .case6(let csilV):\n            return .array([.uint(6), .text(\"cancelled\")])"
-    ));
-    assert!(body.contains(
-        "case .case7(let csilV):\n            return .array([.uint(7), .text(\"refunded\")])"
-    ));
+    assert!(
+        body.contains("case .case2:\n            return .array([.uint(2), .text(\"confirmed\")])")
+    );
+    assert!(
+        body.contains("case .case3:\n            return .array([.uint(3), .text(\"processing\")])")
+    );
+    assert!(
+        body.contains("case .case4:\n            return .array([.uint(4), .text(\"shipped\")])")
+    );
+    assert!(
+        body.contains("case .case5:\n            return .array([.uint(5), .text(\"delivered\")])")
+    );
+    assert!(
+        body.contains("case .case6:\n            return .array([.uint(6), .text(\"cancelled\")])")
+    );
+    assert!(
+        body.contains("case .case7:\n            return .array([.uint(7), .text(\"refunded\")])")
+    );
 
     // Decode: dispatches on the 2-element array's index; the `text` arm reads through
     // as plain text, each literal arm validates the payload against its declared
@@ -656,7 +657,9 @@ fn order_status_union_gets_a_full_codec() {
         "case 7: self = .case7(try CsilCbor.expectLiteral(csilPayload, .text(\"refunded\"), \"refunded\"))"
     ));
     assert!(body.contains("default: throw CsilCborError.typeMismatch"));
-    assert!(body.contains("func toCbor() -> [UInt8] { CsilCbor.encode(toCborValue()) }"));
+    assert!(
+        body.contains("func toCbor() throws -> [UInt8] { CsilCbor.encode(try toCborValue()) }")
+    );
     assert!(body.contains(
         "static func fromCbor(_ bytes: [UInt8]) throws -> OrderStatus { try OrderStatus(cborValue: CsilCbor.decode(bytes)) }"
     ));
@@ -688,7 +691,9 @@ fn struct_field_referencing_a_union_round_trips_through_its_own_codec() {
     assert!(!body.contains("\"status\", .null"));
     assert!(!body.contains("CsilCbor.asText((try CsilCbor.require(cborValue, \"status\"))"));
     // Encode/decode delegate to OrderStatus's own codec.
-    assert!(body.contains("csilEntries.append((.text(\"status\"), self.status.toCborValue()))"));
+    assert!(
+        body.contains("csilEntries.append((.text(\"status\"), try self.status.toCborValue()))")
+    );
     assert!(body.contains(
         "let status = try OrderStatus(cborValue: (try CsilCbor.require(cborValue, \"status\")))"
     ));
@@ -742,12 +747,12 @@ fn default_suffixed_literal_arm_does_not_fall_out_of_the_union_shape() {
         .split("extension TortureConstrainedArmInline {")
         .nth(1)
         .expect("hoisted union codec emitted");
-    assert!(union_body.contains(
-        "case .case1(let csilV):\n            return .array([.uint(1), .text(\"low\")])"
-    ));
-    assert!(union_body.contains(
-        "case .case2(let csilV):\n            return .array([.uint(2), .text(\"high\")])"
-    ));
+    assert!(
+        union_body.contains("case .case1:\n            return .array([.uint(1), .text(\"low\")])")
+    );
+    assert!(
+        union_body.contains("case .case2:\n            return .array([.uint(2), .text(\"high\")])")
+    );
     assert!(union_body.contains(
         "case 1: self = .case1(try CsilCbor.expectLiteral(csilPayload, .text(\"low\"), \"low\"))"
     ));
@@ -796,7 +801,9 @@ fn pure_literal_inline_choice_field_hoists_to_a_string_enum_with_membership_vali
         .nth(1)
         .expect("hoisted string enum codec emitted");
     // Bare wire text, not an `[index, value]` tagged array.
-    assert!(enum_body.contains("func toCborValue() -> CsilCborValue { .text(self.rawValue) }"));
+    assert!(
+        enum_body.contains("func toCborValue() throws -> CsilCborValue { .text(self.rawValue) }")
+    );
     // Decode rejects a string outside the declared closed set instead of accepting it.
     assert!(enum_body.contains("guard let csilV = TorturePureLiteralInline(rawValue: csilS)"));
     assert!(enum_body.contains("throw CsilCborError.typeMismatch"));
@@ -842,20 +849,20 @@ fn mixed_inline_choice_field_hoists_to_a_tagged_union_with_literal_first_precede
         .split("extension TortureMixedInline {")
         .nth(1)
         .expect("hoisted union codec emitted");
+    // The general `text` arm checks the literal arms first (literal wins).
+    assert!(body.contains("case .text(let csilV):\n            if csilV == "));
+    assert!(body.contains("            return .array([.uint(0), .text(csilV)])"));
     assert!(
-        body.contains(
-            "case .text(let csilV):\n            return .array([.uint(0), .text(csilV)])"
-        )
+        body.contains("case .case1:\n            return .array([.uint(1), .text(\"not_found\")])")
     );
     assert!(body.contains(
-        "case .case1(let csilV):\n            return .array([.uint(1), .text(\"not_found\")])"
+        "case .case2:\n            return .array([.uint(2), .text(\"permission_denied\")])"
     ));
-    assert!(body.contains(
-        "case .case2(let csilV):\n            return .array([.uint(2), .text(\"permission_denied\")])"
-    ));
-    assert!(body.contains(
-        "case .case3(let csilV):\n            return .array([.uint(3), .text(\"invalid_input\")])"
-    ));
+    assert!(
+        body.contains(
+            "case .case3:\n            return .array([.uint(3), .text(\"invalid_input\")])"
+        )
+    );
     assert!(body.contains("case 0: self = .text(try CsilCbor.asText(csilPayload))"));
     assert!(body.contains(
         "case 1: self = .case1(try CsilCbor.expectLiteral(csilPayload, .text(\"not_found\"), \"not_found\"))"
@@ -895,7 +902,7 @@ fn inline_choice_as_array_element_hoists_to_a_synthesized_type() {
         .split("extension Torture {")
         .nth(1)
         .expect("Torture codec extension emitted");
-    assert!(struct_body.contains("self.tagList.map { $0.toCborValue() }"));
+    assert!(struct_body.contains("try self.tagList.map { try $0.toCborValue() }"));
     assert!(struct_body.contains("try TortureTagListItem(cborValue: $0)"));
     assert!(codec.contains("extension TortureTagListItem {"));
 }
@@ -928,7 +935,7 @@ fn inline_choice_as_map_value_hoists_to_a_synthesized_type() {
         .split("extension Torture {")
         .nth(1)
         .expect("Torture codec extension emitted");
-    assert!(struct_body.contains("$0.value.toCborValue()"));
+    assert!(struct_body.contains("try $0.value.toCborValue()"));
     assert!(struct_body.contains("try TortureLabelMapValue(cborValue: $1.1)"));
 }
 
@@ -973,7 +980,7 @@ fn inline_choice_as_tuple_element_hoists_to_a_synthesized_type() {
         .expect("Torture codec extension emitted");
     // Encode: a 2-element CBOR array, first element via the hoisted type's own codec.
     assert!(struct_body.contains(
-        "CsilCborValue.array([self.coord.latOrLon.toCborValue(), .int(self.coord.value)])"
+        "CsilCborValue.array([try self.coord.latOrLon.toCborValue(), .int(self.coord.value)])"
     ));
     // Decode: positional array access, first element through the hoisted type's
     // `init(cborValue:)`, second through the plain int decoder.
@@ -1008,8 +1015,8 @@ fn single_element_tuple_with_an_inline_choice_collapses_to_the_bare_hoisted_type
         .split("extension Torture {")
         .nth(1)
         .expect("Torture codec extension emitted");
-    assert!(struct_body.contains("CsilCborValue.array([self.solo.toCborValue()])"));
-    assert!(struct_body.contains("try TortureSoloOnly(cborValue: (try CsilCbor.asArray("));
+    assert!(struct_body.contains("CsilCborValue.array([try self.solo.toCborValue()])"));
+    assert!(struct_body.contains("try TortureSoloOnly(cborValue: (try CsilCbor.item("));
 }
 
 #[test]
@@ -1112,13 +1119,22 @@ fn zero_minimum_length_check_is_not_emitted() {
 }
 
 #[test]
-fn any_value_typealias_emitted_without_any_validation() {
+fn any_value_is_the_cbor_value_and_round_trips_unchanged() {
     // A field of core type `any` with no constraints still needs AnyCsilValue defined.
     let rule = group_rule("Envelope", vec![bare_entry("body", builtin("any"))]);
     let input = input_from_rules("swift", vec![rule], 0);
     let types = generate_types(&input).expect("types emitted");
-    assert!(types.contains("public typealias AnyCsilValue = [UInt8]"));
+    // The codec runtime declares `AnyCsilValue` as the decoded CBOR value, so the
+    // codec ships with any spec that has a type.
+    assert!(!types.contains("public typealias AnyCsilValue"));
     assert!(types.contains("public let body: AnyCsilValue"));
+    let codec = generate_codec(&input).expect("codec emitted");
+    assert!(codec.contains("public typealias AnyCsilValue = CsilCborValue"));
+    assert!(codec.contains("(.text(\"body\"), self.body)"), "{codec}");
+    assert!(
+        codec.contains("let body = (try CsilCbor.require(cborValue, \"body\"))"),
+        "{codec}"
+    );
     // No validation machinery when there are no constraints.
     assert!(!types.contains("CsilValidationError"));
 }
@@ -1231,7 +1247,11 @@ fn client_target_emits_typed_client_with_canonical_wire_strings() {
         "public func depositClaim(_ request: DepositClaimRequest) throws -> DepositClaimResponse"
     ));
     // Typed seam: request serializes itself, the carrier moves bytes.
-    assert!(client.content.contains("request: request.toCbor()"));
+    assert!(
+        client
+            .content
+            .contains("let csilRequest = try request.toCbor()\n")
+    );
     assert!(
         client
             .content
@@ -1376,7 +1396,7 @@ fn codec_emitted_with_typed_client() {
         .expect("Codec.swift emitted");
     assert!(codec.content.contains("public enum CsilCbor"));
     assert!(codec.content.contains("public extension Task {"));
-    assert!(codec.content.contains("func toCbor() -> [UInt8]"));
+    assert!(codec.content.contains("func toCbor() throws -> [UInt8]"));
     assert!(
         codec
             .content
@@ -1404,7 +1424,11 @@ fn codec_emitted_with_typed_client() {
             .content
             .contains("public func submitTask(_ request: SubmitTaskRequest) throws -> Task")
     );
-    assert!(client.content.contains("request: request.toCbor()"));
+    assert!(
+        client
+            .content
+            .contains("let csilRequest = try request.toCbor()\n")
+    );
     assert!(client.content.contains("Task.fromCbor(csilResp)"));
     // The carrier seam is raw bytes.
     assert!(
@@ -1507,7 +1531,11 @@ fn non_record_op_boundaries_get_client_methods_and_per_op_codecs() {
         "public func memberNames(_ request: ListMembersRequest) throws -> [String: String]"
     ));
     // Record boundary keeps its `toCbor`/`fromCbor`; non-record rides the per-op helpers.
-    assert!(client.content.contains("request: request.toCbor()"));
+    assert!(
+        client
+            .content
+            .contains("let csilRequest = try request.toCbor()\n")
+    );
     assert!(
         client
             .content
@@ -1535,15 +1563,13 @@ fn non_record_op_boundaries_get_client_methods_and_per_op_codecs() {
             "public func decodeMemberGetMemberRequest(_ bytes: [UInt8]) throws -> MemberId"
         )
     );
+    assert!(codec.content.contains(
+        "public func encodeMemberListMembersResponse(_ value: [Member]) throws -> [UInt8]"
+    ));
     assert!(
-        codec
-            .content
-            .contains("public func encodeMemberListMembersResponse(_ value: [Member]) -> [UInt8]")
-    );
-    assert!(
-        codec
-            .content
-            .contains("public func encodeMemberDeleteTaskResponse(_ value: Bool) -> [UInt8]")
+        codec.content.contains(
+            "public func encodeMemberDeleteTaskResponse(_ value: Bool) throws -> [UInt8]"
+        )
     );
     // The array response decodes through the Member record codec, not a `.null` stub.
     assert!(
@@ -1589,7 +1615,8 @@ fn async_twin_emitted_by_default_with_marked_symbols() {
         twin.content
             .contains("public func submitTask(_ request: SubmitTaskRequest) async throws -> Task")
     );
-    assert!(twin.content.contains("try await transport.call("));
+    // submit-task has a ServiceError arm, so it needs the reply variant.
+    assert!(twin.content.contains("try await transport.callReply("));
     assert!(twin.content.contains("Task.fromCbor(csilResp)"));
     // The twin reuses the module's CsilClientError (declared in Client.swift).
     assert!(!twin.content.contains("public struct CsilClientError"));
@@ -1642,7 +1669,7 @@ fn client_style_async_is_drop_in_at_canonical_path() {
             .content
             .contains("public func submitTask(_ request: SubmitTaskRequest) async throws -> Task")
     );
-    assert!(client.content.contains("try await transport.call("));
+    assert!(client.content.contains("try await transport.callReply("));
     // The drop-in is the primary file, so it still declares the shared error.
     assert!(client.content.contains("public struct CsilClientError"));
 }
@@ -1740,8 +1767,8 @@ fn named_map_of_record_alias_recurses_into_the_record_codec() {
     let codec = generate_codec(&input).expect("codec emitted");
     let body = codec.split("extension Holder").nth(1).unwrap();
     // Encode recurses to the record value's codec inside a map builder.
-    assert!(body.contains("CsilCborValue.map(self.items.map {"));
-    assert!(body.contains("$0.value.toCborValue()"));
+    assert!(body.contains("CsilCborValue.map(try self.items.map {"));
+    assert!(body.contains("try $0.value.toCborValue()"));
     // Decode reads a map and reconstructs each record value.
     assert!(body.contains("try CsilCbor.asMap"));
     assert!(body.contains("try SomeRecord(cborValue: $1.1)"));
@@ -1807,6 +1834,47 @@ fn one_record_rules() -> Vec<CsilRule> {
         "Task",
         vec![bare_entry("uuid", builtin("text"))],
     )]
+}
+
+/// Swift `Regex` needs macOS 13 / iOS 16, above SwiftPM's default floor, so a
+/// package with a `.regex` field must declare it or it fails to build on macOS.
+/// A package without one keeps the default floor for its users.
+#[test]
+fn package_manifest_declares_a_platform_floor_only_for_regex() {
+    let manifest = |rules: Vec<CsilRule>| {
+        let input = input_with_options(
+            "swift",
+            rules,
+            0,
+            vec![("emit_packages", serde_json::json!(["swift"]))],
+        );
+        build_files(&input)
+            .expect("ok")
+            .into_iter()
+            .find(|f| f.path == "Package.swift")
+            .expect("Package.swift emitted")
+            .content
+    };
+    let plain = manifest(one_record_rules());
+    assert!(!plain.contains("platforms:"), "{plain}");
+    let regex = manifest(vec![group_rule(
+        "Slug",
+        vec![bare_entry(
+            "value",
+            CsilTypeExpression::Constrained {
+                base_type: Box::new(builtin("text")),
+                constraints: vec![CsilControlOperator::Regex("^[a-z]+$".to_string())],
+            },
+        )],
+    )]);
+    assert!(
+        regex.contains("    platforms: [.macOS(.v13), .iOS(.v16), .tvOS(.v16), .watchOS(.v9)],\n"),
+        "{regex}"
+    );
+    assert!(
+        regex.contains("\n    products: [\n"),
+        "the manifest keeps its indentation"
+    );
 }
 
 #[test]
@@ -2025,9 +2093,10 @@ fn readme_rpc_section_uses_lib_envelope_and_example_call() {
     // Decode + both error arms via the lib: non-zero transport status and the ServiceError arm.
     assert!(c.contains("RpcResponse.decode(try outcome.get())"));
     assert!(c.contains("resp.asTransportError()"));
-    assert!(c.contains(
-        "resolveRpcReply(service: service, op: op, variant: resp.variant, payload: resp.payload)"
-    ));
+    // The generated client resolves reply variants; the carrier never does.
+    assert!(!c.contains("resolveRpcReply("));
+    assert!(!c.contains("func callReply("));
+    assert!(c.contains("try roundTrip(service: service, op: op, request: request).payload"));
     // The typed client is built over the carrier and the example calls the first `->` op.
     assert!(
         c.contains("EchoClient(transport: HttpRpcCarrier(baseURL: \"http://localhost:5080\"))")
@@ -2060,9 +2129,12 @@ fn readme_events_section_handshake_heartbeat_and_router_dispatch() {
     assert!(c.contains("Heartbeat(nonce: ping.nonce)"));
     // One outbound event via the generated encoder, dispatch into the generated router.
     assert!(c.contains("struct Handler: Echo"));
+    // A frame from the peer must not trap the sample session.
+    assert!(!c.contains("as! T") && !c.contains("ev.event!"), "{c}");
+    assert!(c.contains("if let v = value as? ChatEvent { return try v.toCbor() }"));
     assert!(c.contains("encodeEchoChat(codec: codec, msg: ChatEvent(body: \"example\"))"));
     assert!(
-        c.contains("try routeEchoChannel(handler, codec: codec, op: ev.event!, data: ev.payload)")
+        c.contains("guard let op = ev.event else { continue }\n        try routeEchoChannel(handler, codec: codec, op: op, data: ev.payload)")
     );
 }
 
@@ -2073,7 +2145,7 @@ fn readme_datagrams_section_send_and_late_arrival_note() {
     assert!(c.contains("final class UdpDatagramCarrier: DatagramCarrier"));
     // Encode a `->` request via the generated codec, wrap in the lib Datagram, fire-and-forget.
     assert!(c.contains("let req: Ping = Ping(msg: \"example\")"));
-    assert!(c.contains("Datagram(opOrd: opOrd, seq: 0, payload: req.toCbor()).encode()"));
+    assert!(c.contains("let payload = try req.toCbor()\n    try carrier.sendDatagram(Datagram(opOrd: opOrd, seq: 0, payload: payload).encode())"));
     // The op's datagram ordinal (ping op has no @wire-id → placeholder 1).
     assert!(c.contains("let opOrd: UInt64 = 1"));
     // Recv path decodes an inbound Datagram into the RESPONSE type, with the loss note.
@@ -2250,7 +2322,7 @@ fn package_mode_is_self_contained_with_client_router_and_codec() {
     let quickstart = files.iter().find(|f| f.path == "genquickstart.md").unwrap();
     assert!(
         quickstart.content.contains(
-            "try routeEchoChannel(handler, codec: codec, op: ev.event!, data: ev.payload)"
+            "guard let op = ev.event else { continue }\n        try routeEchoChannel(handler, codec: codec, op: op, data: ev.payload)"
         )
     );
     assert!(
@@ -2350,6 +2422,8 @@ fn compile_regression_input() -> WasmGeneratorInput {
                 doc_comments: vec![],
             },
             group_rule("Deadline", vec![bare_entry("due", builtin("date"))]),
+            group_rule("Stamp", vec![bare_entry("at", builtin("timestamp"))]),
+            group_rule("Moment", vec![bare_entry("seen", builtin("cddl_time"))]),
             group_rule(
                 "NodeReport",
                 vec![bare_entry("query", builtin("text")), event],
@@ -2450,9 +2524,9 @@ fn enum_defaults_use_the_declared_case_names() {
     );
 }
 
-/// Compile the client and check the CBOR wire format with a Swift compiler.
-#[test]
-fn generated_client_compiles_and_preserves_cbor() {
+/// The Swift compiler from `SWIFTC` (default `swiftc`), or `None` to skip when it
+/// is absent and `CSILGEN_REQUIRE_SWIFTC` is unset.
+fn swift_compiler() -> Option<String> {
     let swiftc = std::env::var("SWIFTC").unwrap_or_else(|_| "swiftc".into());
     match std::process::Command::new(&swiftc)
         .arg("--version")
@@ -2464,12 +2538,21 @@ fn generated_client_compiles_and_preserves_cbor() {
                 && std::env::var_os("CSILGEN_REQUIRE_SWIFTC").is_none() =>
         {
             eprintln!("skipping Swift compiler test: install swiftc or set SWIFTC");
-            return;
+            return None;
         }
         Err(error) => panic!("Swift compiler is required: {error}"),
     }
+    Some(swiftc)
+}
+
+/// Compile the client and check the CBOR wire format with a Swift compiler.
+#[test]
+fn generated_client_compiles_and_preserves_cbor() {
+    let Some(swiftc) = swift_compiler() else {
+        return;
+    };
     let dir = tempfile::tempdir().unwrap();
-    let files = build_files(&compile_regression_input()).unwrap();
+    let files = build_files(&compile_driver_input()).unwrap();
     let mut sources = Vec::new();
     for file in files {
         if file.path.ends_with(".swift") {
@@ -2531,13 +2614,34 @@ fn generated_client_compiles_and_preserves_cbor() {
     }
 }
 
+/// The regression spec plus a multi-arm operation whose request and reply hold a
+/// timestamp, so the driver reaches the client and reply-helper encode failures.
+fn compile_driver_input() -> WasmGeneratorInput {
+    let mut input = compile_regression_input();
+    input.csil_spec.rules.extend([
+        group_rule("StampError", vec![bare_entry("code", builtin("int"))]),
+        service_rule(
+            "Clock",
+            vec![make_op(
+                "stamp",
+                reference("Stamp"),
+                CsilTypeExpression::Choice(vec![reference("Stamp"), reference("StampError")]),
+                CsilServiceDirection::Unidirectional,
+            )],
+            None,
+        ),
+    ]);
+    input
+}
+
 const SWIFT_COMPILE_DRIVER: &str = r#"
 import Foundation
 
 let deadline = Deadline(due: "2000-02-29")
 let dateBytes: [UInt8] = [0xa1, 0x63, 0x64, 0x75, 0x65, 0xd9, 0x03, 0xec, 0x6a]
     + Array("2000-02-29".utf8)
-precondition(deadline.toCbor() == dateBytes)
+let deadlineBytes = try deadline.toCbor()
+precondition(deadlineBytes == dateBytes)
 let decodedDate = try Deadline.fromCbor(dateBytes)
 precondition(decodedDate == deadline)
 for text in ["2026-02-30", "1900-02-29", "2026-1-01"] {
@@ -2546,17 +2650,57 @@ for text in ["2026-02-30", "1900-02-29", "2026-1-01"] {
         fatalError("invalid date was accepted")
     } catch CsilCborError.typeMismatch {}
 }
+let stamp = try Stamp(cborValue: .map([(.text("at"), .tag(0, .text("2000-02-29t13:30:00.5+01:30")))]))
+precondition(stamp.at == "2000-02-29T12:00:00.500Z")
+let stampBytes = try stamp.toCbor()
+precondition(stampBytes
+    == CsilCbor.encode(.map([(.text("at"), .tag(0, .text("2000-02-29T12:00:00.500Z")))])))
+let nanos = try CsilCbor.decodeTimestamp(.tag(0, .text("2000-02-29T12:00:00.000000500Z")))
+precondition(nanos == "2000-02-29T12:00:00.000000500Z")
+for text in ["2000-02-29 12:00:00Z", "2000-02-29T23:59:60Z", "2000-02-29T12:00:00",
+             "0001-01-01T00:30:00+01:00", "9999-12-31T23:30:00-01:00", "2000-02-29T12:00:00.Z"] {
+    do {
+        _ = try CsilCbor.decodeTimestamp(.tag(0, .text(text)))
+        fatalError("invalid timestamp was accepted")
+    } catch CsilCborError.typeMismatch {}
+}
+let epochHalf: CsilCborValue = .map([(.text("seen"), .tag(1, .double(951825600.5)))])
+let moment = try Moment(cborValue: epochHalf)
+precondition(moment.seen == "2000-02-29T12:00:00.500Z")
+let momentBytes = try moment.toCbor()
+precondition(momentBytes == CsilCbor.encode(epochHalf))
+let epochBytes = CsilCbor.encode(try CsilCbor.encodeEpoch("2000-02-29T13:00:00+01:00"))
+precondition(epochBytes == [0xc1, 0x1a, 0x38, 0xbb, 0xb4, 0xc0])
+let epochCases: [(CsilCborValue, String)] = [
+    (.tag(1, .int(-1)), "1969-12-31T23:59:59Z"),
+    (try CsilCbor.decode([0xc1, 0xf9, 0x3c, 0x00]), "1970-01-01T00:00:01Z"),
+    (.tag(1, .double(0.9999999999)), "1970-01-01T00:00:01Z"),
+    (.tag(1, .double(-0.5)), "1969-12-31T23:59:59.500Z"),
+]
+for (value, want) in epochCases {
+    let got = try CsilCbor.decodeEpoch(value)
+    precondition(got == want, "decoded \(got), want \(want)")
+}
+let refusedEpochs: [CsilCborValue] = [.tag(1, .uint(253402300800)), .tag(1, .int(-62135596801)),
+    .tag(1, .double(.nan)), .tag(1, .double(.infinity)), .tag(1, .text("0")), .tag(0, .int(0)), .int(0)]
+for value in refusedEpochs {
+    do {
+        _ = try CsilCbor.decodeEpoch(value)
+        fatalError("invalid cddl_time was accepted")
+    } catch CsilCborError.typeMismatch {}
+}
 let report = NodeReport(query: "ok")
 precondition(report.event == .state)
 // {"event": "state", "query": "ok"}, in canonical CBOR key order.
 let expected: [UInt8] = [0xa2, 0x65, 0x65, 0x76, 0x65, 0x6e, 0x74,
     0x65, 0x73, 0x74, 0x61, 0x74, 0x65, 0x65, 0x71, 0x75, 0x65, 0x72, 0x79,
     0x62, 0x6f, 0x6b]
-precondition(CsilCbor.encode(report.toCborValue()) == expected)
+let reportBytes = try report.toCbor()
+precondition(reportBytes == expected)
 let decoded = try NodeReport(cborValue: CsilCbor.decode(expected))
 precondition(decoded == report)
 let absent = NodeReport(query: "ok", event: nil)
-let absentBytes = CsilCbor.encode(absent.toCborValue())
+let absentBytes = try absent.toCbor()
 precondition(absentBytes == [0xa1, 0x65, 0x71, 0x75, 0x65, 0x72, 0x79, 0x62, 0x6f, 0x6b])
 let decodedAbsent = try NodeReport(cborValue: CsilCbor.decode(absentBytes))
 precondition(decodedAbsent == absent)
@@ -2571,4 +2715,637 @@ for invalid: [UInt8] in [[0x61, 0xff], [0x62, 0xc0, 0xaf], [0x63, 0xed, 0xa0, 0x
         fatalError("invalid UTF-8 was accepted")
     } catch CsilCborError.malformed {}
 }
+// Bad text and an instant outside years 0001 to 9999 make encode throw, not trap.
+for text in ["2000-02-30T00:00:00Z", "0001-01-01T00:30:00+01:00", "9999-12-31T23:30:00-01:00",
+             "10000-01-01T00:00:00Z", "not a time", ""] {
+    do {
+        _ = try Stamp(at: text).toCbor()
+        fatalError("timestamp encode accepted \(text)")
+    } catch CsilCborError.typeMismatch {}
+    do {
+        _ = try Moment(seen: text).toCbor()
+        fatalError("cddl_time encode accepted \(text)")
+    } catch CsilCborError.typeMismatch {}
+}
+do {
+    _ = try Deadline(due: "2026-02-30").toCbor()
+    fatalError("date encode accepted 2026-02-30")
+} catch CsilCborError.typeMismatch {}
+// A short tuple array from a peer throws instead of indexing out of range.
+let second = try CsilCbor.item(.array([.text("a"), .int(1)]), 1)
+precondition(CsilCbor.valueEquals(second, .int(1)))
+for index in [1, -1] {
+    do {
+        _ = try CsilCbor.item(.array([.text("a")]), index)
+        fatalError("tuple position \(index) was read")
+    } catch CsilCborError.malformed {}
+}
+
+final class CountingCarrier: CsilTransport {
+    var calls = 0
+    func call(service: String, op: String, request: [UInt8]) throws -> [UInt8] {
+        calls += 1
+        return request
+    }
+    func callReply(service: String, op: String, request: [UInt8]) throws -> (variant: String?, payload: [UInt8]) {
+        calls += 1
+        return ("Stamp", request)
+    }
+}
+let carrier = CountingCarrier()
+let clock = ClockClient(transport: carrier)
+let echoed = try clock.stamp(Stamp(at: "2000-02-29T12:00:00Z"))
+precondition(echoed.at == "2000-02-29T12:00:00Z" && carrier.calls == 1)
+do {
+    _ = try clock.stamp(Stamp(at: "2000-02-29T24:00:00Z"))
+    fatalError("client sent an unencodable request")
+} catch CsilCborError.typeMismatch {}
+precondition(carrier.calls == 1, "the transport saw a request that failed to encode")
+// The reply helper throws for a reply it cannot encode, so the host answers status 6.
+let reply = try encodeClockStampReply { Stamp(at: "2000-02-29T12:00:00Z") }
+precondition(reply.variant == "Stamp")
+do {
+    _ = try encodeClockStampReply { Stamp(at: "2000-02-29T12:00:60Z") }
+    fatalError("reply helper encoded an invalid timestamp")
+} catch CsilCborError.typeMismatch {}
+do {
+    _ = try encodeClockStampReply { throw StampErrorRefusal(value: StampError(code: 1)) }
+} catch {
+    fatalError("a declared refusal must encode as its arm")
+}
+"#;
+
+/// `Date` is a Double and `ISO8601DateFormatter` is lenient, so a timestamp stays
+/// canonical UTC text that the codec checks and rewrites by hand.
+#[test]
+fn timestamp_codec_is_strict_and_canonical() {
+    let files = build_files(&compile_regression_input()).unwrap();
+    let codec = &files
+        .iter()
+        .find(|file| file.path == "Codec.swift")
+        .unwrap()
+        .content;
+    assert!(
+        codec.contains("CsilCbor.encodeTimestamp(self.at)"),
+        "{codec}"
+    );
+    assert!(codec.contains("try CsilCbor.decodeTimestamp("), "{codec}");
+    assert!(codec.contains("static func canonicalTimestamp(_ text: String) -> String?"));
+    assert!(codec.contains("guard (epochFirst...epochLast).contains(total) else { return nil }"));
+    assert!(!codec.contains("ISO8601DateFormatter()"));
+}
+
+/// `call` returns bytes alone, so a multi-arm operation goes through `callReply`
+/// and the generated resolver; the seam declares `callReply` only for such a spec.
+#[test]
+fn multi_arm_operation_uses_call_reply_in_both_client_shapes() {
+    let rules = vec![
+        group_rule("Req", vec![bare_entry("a", builtin("text"))]),
+        group_rule("Resp", vec![bare_entry("b", builtin("text"))]),
+        group_rule("Err", vec![bare_entry("code", builtin("int"))]),
+        service_rule(
+            "Signer",
+            vec![make_op(
+                "sign",
+                reference("Req"),
+                CsilTypeExpression::Choice(vec![reference("Resp"), reference("Err")]),
+                CsilServiceDirection::Unidirectional,
+            )],
+            None,
+        ),
+    ];
+    let files = build_files(&input_from_rules("swift-client", rules, 1)).unwrap();
+    let content = |path: &str| {
+        files
+            .iter()
+            .find(|file| file.path == path)
+            .unwrap()
+            .content
+            .clone()
+    };
+    let sync = content("Client.swift");
+    assert!(sync.contains(
+        "    func callReply(service: String, op: String, request: [UInt8]) throws -> (variant: String?, payload: [UInt8])\n"
+    ), "{sync}");
+    assert!(sync.contains(
+        "        let csilReply = try transport.callReply(service: \"Signer\", op: \"sign\", request: csilRequest)\n        let csilResp = try resolveRpcReply(service: \"Signer\", op: \"sign\", variant: csilReply.variant, payload: csilReply.payload)\n"
+    ), "{sync}");
+    let twin = content("ClientAsync.swift");
+    assert!(
+        twin.contains("async throws -> (variant: String?, payload: [UInt8])"),
+        "{twin}"
+    );
+    assert!(
+        twin.contains("let csilReply = try await transport.callReply("),
+        "{twin}"
+    );
+
+    let plain = build_files(&compile_regression_input()).unwrap();
+    assert!(plain.iter().all(|file| !file.content.contains("callReply")));
+}
+
+/// `cddl_time` shares the canonical `String` of `timestamp` and only swaps the
+/// wire form, so it goes through the epoch codec and not the tag-0 one.
+#[test]
+fn cddl_time_is_a_string_with_the_epoch_codec() {
+    let files = build_files(&compile_regression_input()).unwrap();
+    let file = |name: &str| {
+        &files
+            .iter()
+            .find(|file| file.path == name)
+            .unwrap_or_else(|| panic!("missing {name}"))
+            .content
+    };
+    assert!(
+        file("Types.swift").contains("public let seen: String"),
+        "{}",
+        file("Types.swift")
+    );
+    let codec = file("Codec.swift");
+    assert!(codec.contains("CsilCbor.encodeEpoch(self.seen)"), "{codec}");
+    assert!(codec.contains("try CsilCbor.decodeEpoch("), "{codec}");
+    assert!(
+        codec.contains("public static func decodeEpoch(_ value: CsilCborValue) throws -> String")
+    );
+    // The epoch form may arrive as a half-precision float.
+    assert!(
+        codec.contains("Double(sign: sign, exponent: exponent - 25, significand: mantissa + 1024)")
+    );
+}
+
+/// A bad value from a payload or from the caller must reach the caller as a thrown
+/// error. A trap ends the whole process, so no generated source may hold one.
+#[test]
+fn encode_paths_throw_instead_of_trapping() {
+    let files = build_files(&compile_driver_input()).unwrap();
+    let file = |name: &str| {
+        files
+            .iter()
+            .find(|file| file.path == name)
+            .unwrap_or_else(|| panic!("missing {name}"))
+            .content
+            .clone()
+    };
+    let codec = file("Codec.swift");
+    for signature in [
+        "public static func encodeDate(_ text: String) throws -> CsilCborValue",
+        "public static func encodeTimestamp(_ text: String) throws -> CsilCborValue",
+        "public static func encodeEpoch(_ text: String) throws -> CsilCborValue",
+        "func toCborValue() throws -> CsilCborValue",
+        "func toCbor() throws -> [UInt8] { CsilCbor.encode(try toCborValue()) }",
+        "public static func item(_ v: CsilCborValue, _ index: Int) throws -> CsilCborValue",
+    ] {
+        assert!(codec.contains(signature), "missing {signature}");
+    }
+    assert!(
+        codec
+            .contains("csilEntries.append((.text(\"at\"), try CsilCbor.encodeTimestamp(self.at)))")
+    );
+    assert!(
+        codec
+            .contains("csilEntries.append((.text(\"seen\"), try CsilCbor.encodeEpoch(self.seen)))")
+    );
+    assert!(
+        codec.contains("        return (\"Stamp\", CsilCbor.encode(try value.toCborValue()))\n")
+    );
+    assert!(codec.contains("answer with transport status 6 (internal)"));
+    let client = file("Client.swift");
+    assert!(client.contains(
+        "        let csilRequest = try request.toCbor()\n        let csilReply = try transport.callReply(service: \"Clock\", op: \"stamp\", request: csilRequest)\n"
+    ), "{client}");
+    let twin = file("ClientAsync.swift");
+    assert!(twin.contains(
+        "        let csilRequest = try request.toCbor()\n        let csilReply = try await transport.callReply("
+    ), "{twin}");
+    for file in files.iter().filter(|file| file.path.ends_with(".swift")) {
+        for trap in [
+            "precondition(",
+            "preconditionFailure(",
+            "fatalError(",
+            "try!",
+            "as!",
+            "!)",
+        ] {
+            assert!(
+                !file.content.contains(trap),
+                "{} holds the trap {trap}",
+                file.path
+            );
+        }
+    }
+}
+
+fn positional(value_type: CsilTypeExpression, optional: bool) -> CsilGroupEntry {
+    CsilGroupEntry {
+        key: None,
+        value_type,
+        occurrence: optional.then_some(CsilOccurrence::Optional),
+        metadata: vec![],
+        doc_comments: Vec::new(),
+    }
+}
+
+fn tuple(entries: Vec<CsilGroupEntry>) -> CsilTypeExpression {
+    CsilTypeExpression::Tuple(CsilGroupExpression { entries })
+}
+
+/// Every shape that once made generated Swift fail to compile or lose data: tuple
+/// fields and tuple union arms (no synthesized `Equatable`), `nint`, `decimal`,
+/// narrow floats, a `null` union arm, a union map key (not `Hashable`), `any`, a
+/// constant array element, a spec type named `Error`, and a package that ships the
+/// client and the services together (wire ids declared twice).
+fn shapes_input() -> WasmGeneratorInput {
+    let shapes = group_rule(
+        "Shapes",
+        vec![
+            bare_entry("n", builtin("nint")),
+            bare_entry("amount", builtin("decimal")),
+            bare_entry("single", builtin("float32")),
+            bare_entry(
+                "pair",
+                tuple(vec![
+                    positional(builtin("text"), false),
+                    positional(builtin("int"), false),
+                ]),
+            ),
+            bare_entry(
+                "triple",
+                tuple(vec![
+                    positional(builtin("text"), false),
+                    positional(builtin("int"), true),
+                    positional(builtin("bool"), true),
+                ]),
+            ),
+            bare_entry("outcome", reference("Outcome")),
+            bare_entry(
+                "by_id",
+                CsilTypeExpression::Map {
+                    key: Box::new(reference("IdOrName")),
+                    value: Box::new(builtin("int")),
+                    occurrence: None,
+                },
+            ),
+            bare_entry(
+                "extra",
+                CsilTypeExpression::Map {
+                    key: Box::new(builtin("text")),
+                    value: Box::new(builtin("any")),
+                    occurrence: None,
+                },
+            ),
+            bare_entry("status", reference("MixedStatus")),
+            bare_entry(
+                "nulls",
+                CsilTypeExpression::Array {
+                    element_type: Box::new(builtin("null")),
+                    occurrence: None,
+                },
+            ),
+            opt_entry(
+                "maybe_pair",
+                tuple(vec![
+                    positional(builtin("text"), false),
+                    positional(builtin("int"), false),
+                ]),
+            ),
+        ],
+    );
+    let mut success = tuple(vec![
+        positional(builtin("text"), false),
+        positional(builtin("any"), false),
+    ]);
+    if let CsilTypeExpression::Tuple(group) = &mut success {
+        group.entries[0].key = Some(CsilGroupKey::Bare("tag".into()));
+        group.entries[1].key = Some(CsilGroupKey::Bare("data".into()));
+    }
+    let mut op = make_op(
+        "reshape",
+        reference("Shapes"),
+        CsilTypeExpression::Choice(vec![reference("Shapes"), reference("Error")]),
+        CsilServiceDirection::Unidirectional,
+    );
+    op.wire_id = Some(0);
+    let mut input = input_from_rules(
+        "swift",
+        vec![
+            typedef_rule(
+                "MixedStatus",
+                CsilTypeExpression::Choice(vec![
+                    builtin("text"),
+                    text_literal("pending"),
+                    text_literal("confirmed"),
+                ]),
+            ),
+            typedef_rule(
+                "IdOrName",
+                CsilTypeExpression::Choice(vec![builtin("uint"), builtin("text")]),
+            ),
+            typedef_rule("Success", success),
+            typedef_rule(
+                "Outcome",
+                CsilTypeExpression::Choice(vec![reference("Success"), builtin("null")]),
+            ),
+            group_rule(
+                "Error",
+                vec![
+                    bare_entry("code", builtin("int")),
+                    bare_entry("message", builtin("text")),
+                ],
+            ),
+            shapes,
+            service_rule("Shaper", vec![op], Some(3)),
+        ],
+        1,
+    );
+    input
+        .config
+        .options
+        .insert("emit_packages".into(), serde_json::json!(["swift"]));
+    input
+        .config
+        .options
+        .insert("package_name".into(), serde_json::json!("shapes"));
+    input
+        .config
+        .options
+        .insert("package_version".into(), serde_json::json!("0.1.0"));
+    input
+}
+
+fn shapes_file(name: &str) -> String {
+    build_files(&shapes_input())
+        .unwrap()
+        .into_iter()
+        .find(|file| file.path.ends_with(name))
+        .unwrap_or_else(|| panic!("missing {name}"))
+        .content
+}
+
+#[test]
+fn nint_is_int64_with_a_sign_check_both_ways() {
+    assert!(shapes_file("Types.swift").contains("public let n: Int64"));
+    let codec = shapes_file("Codec.swift");
+    assert!(codec.contains("try CsilCbor.encodeNint(self.n)"), "{codec}");
+    assert!(codec.contains("try CsilCbor.asNint((try CsilCbor.require(cborValue, \"n\")))"));
+}
+
+#[test]
+fn decimal_travels_as_tag_4_not_text() {
+    let codec = shapes_file("Codec.swift");
+    assert!(
+        codec.contains("try CsilCbor.encodeDecimal(self.amount)"),
+        "{codec}"
+    );
+    assert!(codec.contains("try CsilCbor.decodeDecimal("), "{codec}");
+    assert!(codec.contains("return .tag(4, .array([.int(-Int64(scale)), .int(mantissa)]))"));
+}
+
+#[test]
+fn narrow_floats_are_doubles() {
+    assert!(shapes_file("Types.swift").contains("public let single: Double"));
+    assert!(shapes_file("Codec.swift").contains("(.text(\"single\"), .double(self.single))"));
+}
+
+#[test]
+fn records_and_unions_with_tuples_spell_out_equality() {
+    let types = shapes_file("Types.swift");
+    assert!(types.contains("public enum CsilEq {"), "{types}");
+    assert!(
+        types.contains("public static func == (lhs: Shapes, rhs: Shapes) -> Bool {"),
+        "{types}"
+    );
+    assert!(types.contains(
+        "(lhs.triple.field0 == rhs.triple.field0 && lhs.triple.field1 == rhs.triple.field1 && lhs.triple.field2 == rhs.triple.field2)"
+    ), "{types}");
+    assert!(types.contains("CsilEq.optional(lhs.maybePair, rhs.maybePair) { (csilL0, csilR0) in"));
+    assert!(
+        types.contains("public static func == (lhs: Outcome, rhs: Outcome) -> Bool {"),
+        "{types}"
+    );
+    assert!(
+        types.contains("case (.null, .null): return true"),
+        "{types}"
+    );
+    // A record without a tuple keeps the synthesized conformance.
+    assert!(!types.contains("lhs: Error, rhs: Error"), "{types}");
+}
+
+#[test]
+fn optional_tuple_positions_travel_as_null_and_keep_the_length() {
+    let codec = shapes_file("Codec.swift");
+    assert!(codec.contains(
+        "(self.triple.field1.map { (csilSome) -> CsilCborValue in .int(csilSome) } ?? CsilCborValue.null)"
+    ), "{codec}");
+    assert!(codec.contains(
+        "field1: try CsilCbor.orNull((try CsilCbor.item((try CsilCbor.require(cborValue, \"triple\")), 1, of: 3))) { (csilSome) in try CsilCbor.asI64(csilSome) }"
+    ), "{codec}");
+    assert!(codec.contains(", 2, of: 3))"), "{codec}");
+}
+
+#[test]
+fn a_null_union_arm_has_no_payload() {
+    let types = shapes_file("Types.swift");
+    assert!(types.contains("    case null\n"), "{types}");
+    let codec = shapes_file("Codec.swift");
+    assert!(codec.contains("case .null:\n            return .array([.uint(1), .null])"));
+    assert!(codec.contains("guard csilPayload == .null else { throw CsilCborError.typeMismatch }"));
+}
+
+#[test]
+fn a_map_keyed_by_a_union_is_keyed_by_the_cbor_value() {
+    let types = shapes_file("Types.swift");
+    assert!(
+        types.contains("public let byId: [AnyCsilValue: Int64]"),
+        "{types}"
+    );
+    let codec = shapes_file("Codec.swift");
+    assert!(codec.contains("public indirect enum CsilCborValue: Hashable, Sendable {"));
+    assert!(codec.contains(".sorted { $0.0.lexicographicallyPrecedes($1.0) }"));
+}
+
+#[test]
+fn constant_array_elements_ignore_the_closure_argument() {
+    let codec = shapes_file("Codec.swift");
+    assert!(
+        codec.contains("CsilCborValue.array(self.nulls.map { _ in .null })"),
+        "{codec}"
+    );
+}
+
+#[test]
+fn a_spec_type_named_error_does_not_shadow_swift_error() {
+    let files = build_files(&shapes_input()).unwrap();
+    for file in files.iter().filter(|file| file.path.ends_with(".swift")) {
+        assert!(
+            !file.content.contains(": Error {") && !file.content.contains(": Error,"),
+            "{} conforms to the spec's Error type:\n{}",
+            file.path,
+            file.content
+        );
+    }
+    assert!(shapes_file("Codec.swift").contains("public struct ErrorRefusal: Swift.Error {"));
+}
+
+#[test]
+fn wire_ids_are_declared_once_when_client_and_services_ship_together() {
+    let files = build_files(&shapes_input()).unwrap();
+    let count: usize = files
+        .iter()
+        .map(|file| file.content.matches("public enum ShaperWireID {").count())
+        .sum();
+    assert_eq!(count, 1);
+    // The client target alone still declares them.
+    let mut client = shapes_input();
+    client.config.target = "swift-client".into();
+    client.config.options.clear();
+    let files = build_files(&client).unwrap();
+    let client_file = files
+        .iter()
+        .find(|file| file.path == "Client.swift")
+        .unwrap();
+    assert!(client_file.content.contains("public enum ShaperWireID {"));
+}
+
+/// Compiles the shapes package with Swift 6 language mode and warnings as errors,
+/// then runs a driver that checks the wire bytes.
+#[test]
+fn regression_shapes_compile_warning_free_and_round_trip() {
+    let Some(swiftc) = swift_compiler() else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let mut sources = Vec::new();
+    for file in build_files(&shapes_input()).unwrap() {
+        if file.path.ends_with(".swift") && file.path.starts_with("Sources/") {
+            let name = file.path.rsplit('/').next().unwrap().to_string();
+            std::fs::write(dir.path().join(&name), file.content).unwrap();
+            sources.push(name);
+        }
+    }
+    let typecheck = std::process::Command::new(&swiftc)
+        .current_dir(dir.path())
+        .args(["-typecheck", "-swift-version", "6", "-warnings-as-errors"])
+        .args(&sources)
+        .output()
+        .unwrap();
+    assert!(
+        typecheck.status.success(),
+        "Swift 6 typecheck failed:\n{}",
+        String::from_utf8_lossy(&typecheck.stderr)
+    );
+    std::fs::write(dir.path().join("main.swift"), SHAPES_DRIVER).unwrap();
+    sources.push("main.swift".into());
+    let output = std::process::Command::new(&swiftc)
+        .current_dir(dir.path())
+        .args(["-swift-version", "5"])
+        .args(&sources)
+        .args(["-o", "shapes"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "Swift compile failed:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let run = std::process::Command::new(dir.path().join("shapes"))
+        .output()
+        .unwrap();
+    assert!(
+        run.status.success(),
+        "Swift runtime check failed:\n{}\n{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+}
+
+const SHAPES_DRIVER: &str = r#"
+// `precondition` takes an autoclosure, which cannot hold `try`.
+func expect(_ condition: Bool, _ message: String = "check failed") {
+    if !condition { fatalError(message) }
+}
+
+func shapes(pair: Int64 = 5) -> Shapes {
+    Shapes(
+        n: -7, amount: "123.45", single: 1.5,
+        pair: (field0: "p", field1: pair), triple: (field0: "t", field1: nil, field2: true),
+        outcome: .success((tag: "ok", data: .text("v"))),
+        byId: [.array([.uint(0), .uint(7)]): 1],
+        extra: ["k": .text("v"), "a": .map([(.text("z"), .uint(1)), (.text("b"), .null)])],
+        status: .text("free"), nulls: [.null, .null], maybePair: (field0: "m", field1: 1))
+}
+
+let value = shapes()
+let back = try Shapes.fromCbor(try value.toCbor())
+expect(back == value, "round trip changed the value")
+expect(shapes(pair: 6) != value, "tuple equality ignored a position")
+let tree = try value.toCborValue()
+expect(CsilCbor.mapGet(tree, "triple") == .array([.text("t"), .null, .bool(true)]))
+expect(CsilCbor.encode(CsilCbor.mapGet(tree, "single")!) == [0xfb, 0x3f, 0xf8, 0, 0, 0, 0, 0, 0])
+expect(try CsilCbor.asDouble(CsilCbor.decode([0xfa, 0x3f, 0xc0, 0x00, 0x00])) == 1.5)
+
+// nint: negative only, both ways.
+expect(CsilCbor.encode(CsilCbor.mapGet(tree, "n")!) == [0x26])
+for bad: Int64 in [0, 1] {
+    do {
+        _ = try CsilCbor.encodeNint(bad)
+        fatalError("nint encode accepted \(bad)")
+    } catch CsilCborError.typeMismatch {}
+}
+do {
+    _ = try CsilCbor.asNint(.uint(1))
+    fatalError("nint decode accepted 1")
+} catch CsilCborError.typeMismatch {}
+
+// decimal: tag 4 [exponent, mantissa], exact both ways.
+expect(CsilCbor.encode(try CsilCbor.encodeDecimal("123.45")) == [0xc4, 0x82, 0x21, 0x19, 0x30, 0x39])
+expect(CsilCbor.encode(try CsilCbor.encodeDecimal("-0.5")) == [0xc4, 0x82, 0x20, 0x24])
+expect(CsilCbor.encode(try CsilCbor.encodeDecimal("-9223372036854775808"))
+    == [0xc4, 0x82, 0x00, 0x3b, 0x7f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff])
+let decimals: [(CsilCborValue, String)] = [
+    (.tag(4, .array([.uint(3), .uint(7)])), "7000"),
+    (.tag(4, .array([.int(-3), .uint(5)])), "0.005"),
+    (.tag(4, .array([.int(-1), .uint(0)])), "0.0"),
+    (.tag(4, .array([.int(-2), .int(-12345)])), "-123.45"),
+]
+for (wire, text) in decimals {
+    let got = try CsilCbor.decodeDecimal(wire)
+    expect(got == text, "decoded \(got), want \(text)")
+}
+for text in ["", "-", "1.", ".5", "1.2.3", "1e5", "abc", "9223372036854775808"] {
+    do {
+        _ = try CsilCbor.encodeDecimal(text)
+        fatalError("decimal encode accepted \(text)")
+    } catch CsilCborError.typeMismatch {}
+}
+for wire: CsilCborValue in [.tag(4, .array([.uint(5000), .uint(1)])), .tag(5, .array([.uint(0), .uint(1)])),
+                            .tag(4, .array([.uint(0)])), .text("1.5")] {
+    do {
+        _ = try CsilCbor.decodeDecimal(wire)
+        fatalError("decimal decode accepted \(wire)")
+    } catch CsilCborError.typeMismatch {}
+}
+
+// Tuples keep their declared length.
+do {
+    _ = try CsilCbor.item(.array([.text("t")]), 0, of: 3)
+    fatalError("a short tuple was read")
+} catch CsilCborError.malformed {}
+
+// A literal arm wins over the general arm by value; a null arm has no payload.
+expect(try MixedStatus.text("pending").toCborValue() == .array([.uint(1), .text("pending")]))
+expect(try MixedStatus.text("free").toCborValue() == .array([.uint(0), .text("free")]))
+expect(CsilCbor.encode(try Outcome.null.toCborValue()) == [0x82, 0x01, 0xf6])
+expect(try Outcome(cborValue: .array([.uint(1), .null])) == .null)
+expect(Outcome.success((tag: "ok", data: .uint(1))) != .success((tag: "ok", data: .uint(2))))
+
+// Maps encode in canonical key order whatever the entry order, and compare that way.
+expect(CsilCbor.encode(.map([(.text("b"), .uint(1)), (.text("a"), .uint(2))]))
+    == [0xa2, 0x61, 0x61, 0x02, 0x61, 0x62, 0x01])
+expect(CsilCborValue.map([(.text("a"), .uint(1)), (.text("b"), .uint(2))])
+    == .map([(.text("b"), .uint(2)), (.text("a"), .uint(1))]))
+
+// A spec type named `Error` rides as the declared error arm.
+let refused = try encodeShaperReshapeReply { throw ErrorRefusal(value: Error(code: 7, message: "no")) }
+expect(refused.variant == "Error")
+expect(ShaperWireID.service == 3 && ShaperWireID.reshape == 0)
 "#;

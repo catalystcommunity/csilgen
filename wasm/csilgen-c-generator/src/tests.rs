@@ -2602,3 +2602,389 @@ fn decoder_checks_collection_lengths_before_allocation() {
     assert!(!CODEC_RUNTIME_C.contains("(size_t)arg * sizeof(*items)"));
     assert!(!CODEC_RUNTIME_C.contains("(size_t)arg * sizeof(*pairs)"));
 }
+
+/// A record and a union that hold `timestamp` in every decode position: a
+/// required field, an optional field, an array element, and a union arm.
+fn timestamp_rules() -> Vec<CsilRule> {
+    let mut later = bare_entry("later", builtin("timestamp"));
+    later.occurrence = Some(CsilOccurrence::Optional);
+    let stamp = group_rule(
+        "Stamp",
+        vec![
+            bare_entry("at", builtin("timestamp")),
+            later,
+            bare_entry(
+                "all",
+                CsilTypeExpression::Array {
+                    element_type: Box::new(builtin("timestamp")),
+                    occurrence: None,
+                },
+            ),
+        ],
+    );
+    let when = CsilRule {
+        name: "When".to_string(),
+        rule_type: CsilRuleType::TypeChoice(vec![builtin("timestamp"), builtin("int")]),
+        position: pos(),
+        doc_comments: vec![],
+    };
+    vec![stamp, when]
+}
+
+#[test]
+fn timestamp_codec_validates_and_normalizes() {
+    let input = input_with_rules(timestamp_rules(), "c", HashMap::new());
+    let out = process_generation(input).unwrap();
+    let codec = &out
+        .files
+        .iter()
+        .find(|f| f.path == "codec.gen.h")
+        .unwrap()
+        .content;
+    assert!(codec.contains("if (csilc_w_timestamp(b, (v->at).rfc3339)) return -1;"));
+    assert!(codec.contains("csilc_get_timestamp("));
+    assert!(!codec.contains(".epoch_seconds = 0"));
+}
+
+/// Runs the strict decode and canonical encode through a real C compiler,
+/// warning-clean: offset conversion with day and year carry, lowercase
+/// separators, short fractions, epoch seconds, refusal of invalid caller text,
+/// and the union arm path. Skips when no C compiler is on PATH.
+#[test]
+fn timestamp_codec_round_trips_through_cc() {
+    let cc = ["cc", "gcc", "clang"].into_iter().find(|c| {
+        std::process::Command::new(c)
+            .arg("--version")
+            .output()
+            .is_ok()
+    });
+    let Some(cc) = cc else {
+        eprintln!("skipping: no C compiler on PATH");
+        return;
+    };
+    let input = input_with_rules(timestamp_rules(), "c", HashMap::new());
+    let out = process_generation(input).unwrap();
+    let dir = std::env::temp_dir().join(format!("csilgen-c-timestamp-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    for file in &out.files {
+        std::fs::write(dir.join(&file.path), &file.content).unwrap();
+    }
+    std::fs::write(dir.join("driver.c"), TIMESTAMP_DRIVER_C).unwrap();
+    let bin = dir.join("driver");
+    let compile = std::process::Command::new(cc)
+        .args(["-std=c11", "-Wall", "-Wextra", "-O1"])
+        .arg("-I")
+        .arg(&dir)
+        .arg(dir.join("driver.c"))
+        .arg("-o")
+        .arg(&bin)
+        .output()
+        .unwrap();
+    assert!(
+        compile.status.success(),
+        "compile failed:\n{}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let warnings = String::from_utf8_lossy(&compile.stderr);
+    assert!(warnings.is_empty(), "compiler warnings:\n{warnings}");
+    let run = std::process::Command::new(&bin).output().unwrap();
+    assert!(
+        run.status.success(),
+        "timestamp proof failed:\n{}{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+const TIMESTAMP_DRIVER_C: &str = r#"#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include "codec.gen.h"
+
+static int check(const char *got, const char *want) {
+    if (strcmp(got, want) == 0) return 0;
+    printf("got %s, want %s\n", got, want);
+    return 1;
+}
+
+static CsilTimestamp ts(const char *text) {
+    CsilTimestamp t;
+    t.rfc3339 = text;
+    t.epoch_seconds = 0;
+    return t;
+}
+
+int main(void) {
+    int fails = 0;
+    CsilTimestamp later = ts("2000-12-31T23:30:00-01:00");
+    CsilTimestamp all[1];
+    all[0] = ts("2000-02-29t12:00:00.5z");
+    Stamp built;
+    built.at = ts("2000-03-01T00:30:00+01:00");
+    built.later = &later;
+    built.all = all;
+    built.all_count = 1;
+    uint8_t *bytes = NULL;
+    size_t len = 0;
+    if (csil_encode_Stamp(&built, &bytes, &len)) { printf("encode failed\n"); return 1; }
+    Stamp back;
+    CsilCodecArena *owner = NULL;
+    if (csil_decode_Stamp(bytes, len, &back, &owner)) { printf("decode failed\n"); return 1; }
+    fails += check(back.at.rfc3339, "2000-02-29T23:30:00Z");
+    fails += back.at.epoch_seconds != 951867000;
+    fails += check(back.later->rfc3339, "2001-01-01T00:30:00Z");
+    fails += back.later->epoch_seconds != 978309000;
+    fails += check(back.all[0].rfc3339, "2000-02-29T12:00:00.500Z");
+    csil_codec_arena_free(owner);
+    free(bytes);
+
+    const char *invalid[] = {"2000-02-29 12:00:00Z", "2000-02-29T12:00:00",
+                             "9999-12-31T23:30:00-01:00", "0000-12-31T23:30:00-01:00", "2000-02-29T12:00:00.1234567890Z"};
+    for (size_t i = 0; i < sizeof invalid / sizeof invalid[0]; i++) {
+        Stamp bad;
+        bad.at = ts(invalid[i]);
+        bad.later = NULL;
+        bad.all = NULL;
+        bad.all_count = 0;
+        bytes = NULL;
+        if (csil_encode_Stamp(&bad, &bytes, &len) == 0) {
+            printf("encoded invalid %s\n", invalid[i]);
+            free(bytes);
+            fails++;
+        }
+    }
+
+    When when;
+    when.tag = WHEN_TIMESTAMP;
+    when.u.timestamp = ts("2000-02-29T13:30:00.000500+01:30");
+    if (csil_encode_When(&when, &bytes, &len)) { printf("union encode failed\n"); return 1; }
+    When when_back;
+    if (csil_decode_When(bytes, len, &when_back, &owner)) { printf("union decode failed\n"); return 1; }
+    fails += check(when_back.u.timestamp.rfc3339, "2000-02-29T12:00:00.000500Z");
+    csil_codec_arena_free(owner);
+    free(bytes);
+    return fails ? 1 : 0;
+}
+"#;
+
+/// A record and a union that hold `cddl_time` in every decode position: a
+/// required field, an optional field, an array element, and a union arm.
+fn cddl_time_rules() -> Vec<CsilRule> {
+    let mut later = bare_entry("later", builtin("cddl_time"));
+    later.occurrence = Some(CsilOccurrence::Optional);
+    let moment = group_rule(
+        "Moment",
+        vec![
+            bare_entry("at", builtin("cddl_time")),
+            later,
+            bare_entry(
+                "all",
+                CsilTypeExpression::Array {
+                    element_type: Box::new(builtin("cddl_time")),
+                    occurrence: None,
+                },
+            ),
+        ],
+    );
+    let seen = CsilRule {
+        name: "Seen".to_string(),
+        rule_type: CsilRuleType::TypeChoice(vec![builtin("cddl_time"), builtin("int")]),
+        position: pos(),
+        doc_comments: vec![],
+    };
+    vec![moment, seen]
+}
+
+#[test]
+fn cddl_time_shares_the_timestamp_type_and_uses_the_epoch_codec() {
+    let input = input_with_rules(cddl_time_rules(), "c", HashMap::new());
+    let out = process_generation(input).unwrap();
+    let file = |name: &str| {
+        &out.files
+            .iter()
+            .find(|f| f.path == name)
+            .unwrap_or_else(|| panic!("missing {name}"))
+            .content
+    };
+    // A spec that uses only `cddl_time` still gets the shared helper header.
+    assert!(file("csil_timestamp.gen.h").contains("typedef struct CsilTimestamp"));
+    let types = file("types.gen.h");
+    assert!(types.contains("CsilTimestamp at;"));
+    assert!(types.contains("#include \"csil_timestamp.gen.h\""));
+    let codec = file("codec.gen.h");
+    assert!(codec.contains("if (csilc_w_epoch(b, (v->at).rfc3339)) return -1;"));
+    assert!(codec.contains("csilc_get_epoch("));
+    assert!(!codec.contains("csilc_w_timestamp(b, (v->at)"));
+}
+
+/// Runs the epoch codec through a real C compiler, warning-clean: integer and
+/// float encode, offset text, rounding and carry on decode, refusal of invalid
+/// text and of out-of-range or non-numeric wire values, and the union arm path.
+/// Skips when no C compiler is on PATH.
+#[test]
+fn cddl_time_codec_round_trips_through_cc() {
+    let cc = ["cc", "gcc", "clang"].into_iter().find(|c| {
+        std::process::Command::new(c)
+            .arg("--version")
+            .output()
+            .is_ok()
+    });
+    let Some(cc) = cc else {
+        eprintln!("skipping: no C compiler on PATH");
+        return;
+    };
+    let input = input_with_rules(cddl_time_rules(), "c", HashMap::new());
+    let out = process_generation(input).unwrap();
+    let dir = std::env::temp_dir().join(format!("csilgen-c-cddl-time-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    for file in &out.files {
+        std::fs::write(dir.join(&file.path), &file.content).unwrap();
+    }
+    std::fs::write(dir.join("driver.c"), CDDL_TIME_DRIVER_C).unwrap();
+    let bin = dir.join("driver");
+    let compile = std::process::Command::new(cc)
+        .args(["-std=c11", "-Wall", "-Wextra", "-O2"])
+        .arg("-I")
+        .arg(&dir)
+        .arg(dir.join("driver.c"))
+        .arg("-o")
+        .arg(&bin)
+        .output()
+        .unwrap();
+    assert!(
+        compile.status.success(),
+        "compile failed:\n{}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let warnings = String::from_utf8_lossy(&compile.stderr);
+    assert!(warnings.is_empty(), "compiler warnings:\n{warnings}");
+    let run = std::process::Command::new(&bin).output().unwrap();
+    assert!(
+        run.status.success(),
+        "cddl_time proof failed:\n{}{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+const CDDL_TIME_DRIVER_C: &str = r#"#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include "codec.gen.h"
+
+static int check(const char *got, const char *want) {
+    if (strcmp(got, want) == 0) return 0;
+    printf("got %s, want %s\n", got, want);
+    return 1;
+}
+
+static CsilTimestamp ts(const char *text) {
+    CsilTimestamp t;
+    t.rfc3339 = text;
+    t.epoch_seconds = 0;
+    return t;
+}
+
+/* Decode `{"at": 1(<content>)}` and return the text, or NULL on refusal. */
+static const char *decode_at(const uint8_t *content, size_t n, CsilCodecArena **owner) {
+    uint8_t buf[32] = {0xa1, 0x62, 'a', 't', 0xc1};
+    memcpy(buf + 5, content, n);
+    /* `later` is optional; `all` is required, so append an empty array. */
+    buf[0] = 0xa2;
+    buf[5 + n] = 0x63;
+    memcpy(buf + 6 + n, "all", 3);
+    buf[9 + n] = 0x80;
+    static Moment m;
+    *owner = NULL;
+    if (csil_decode_Moment(buf, 10 + n, &m, owner)) return NULL;
+    return m.at.rfc3339;
+}
+
+int main(void) {
+    int fails = 0;
+    CsilTimestamp later = ts("2000-02-29T12:00:00.5Z");
+    CsilTimestamp all[1];
+    all[0] = ts("1970-01-01t00:00:00.000000001z");
+    Moment built;
+    built.at = ts("2000-02-29T13:00:00+01:00");
+    built.later = &later;
+    built.all = all;
+    built.all_count = 1;
+    uint8_t *bytes = NULL;
+    size_t len = 0;
+    if (csil_encode_Moment(&built, &bytes, &len)) { printf("encode failed\n"); return 1; }
+    /* Whole seconds go out as the shortest integer under tag 1. */
+    const uint8_t whole[] = {0xc1, 0x1a, 0x38, 0xbb, 0xb4, 0xc0};
+    int found = 0;
+    for (size_t i = 0; i + sizeof whole <= len; i++)
+        if (memcmp(bytes + i, whole, sizeof whole) == 0) found = 1;
+    fails += !found;
+    Moment back;
+    CsilCodecArena *owner = NULL;
+    if (csil_decode_Moment(bytes, len, &back, &owner)) { printf("decode failed\n"); return 1; }
+    fails += check(back.at.rfc3339, "2000-02-29T12:00:00Z");
+    fails += back.at.epoch_seconds != 951825600;
+    fails += check(back.later->rfc3339, "2000-02-29T12:00:00.500Z");
+    fails += check(back.all[0].rfc3339, "1970-01-01T00:00:00.000000001Z");
+    csil_codec_arena_free(owner);
+    free(bytes);
+
+    Moment bad;
+    bad.at = ts("2000-02-29 12:00:00Z");
+    bad.later = NULL;
+    bad.all = NULL;
+    bad.all_count = 0;
+    bytes = NULL;
+    if (csil_encode_Moment(&bad, &bytes, &len) == 0) {
+        printf("encoded invalid text\n");
+        free(bytes);
+        fails++;
+    }
+
+    /* f16 1.0, f64 -0.5, and f64 0.9999999999 (rounds up and carries). */
+    const uint8_t half_one[] = {0xf9, 0x3c, 0x00};
+    const uint8_t minus_half[] = {0xfb, 0xbf, 0xe0, 0, 0, 0, 0, 0, 0};
+    const uint8_t near_one[] = {0xfb, 0x3f, 0xef, 0xff, 0xff, 0xff, 0xf2, 0x41, 0x90};
+    const char *got = decode_at(half_one, sizeof half_one, &owner);
+    fails += got ? check(got, "1970-01-01T00:00:01Z") : 1;
+    if (owner) csil_codec_arena_free(owner);
+    got = decode_at(minus_half, sizeof minus_half, &owner);
+    fails += got ? check(got, "1969-12-31T23:59:59.500Z") : 1;
+    if (owner) csil_codec_arena_free(owner);
+    got = decode_at(near_one, sizeof near_one, &owner);
+    fails += got ? check(got, "1970-01-01T00:00:01Z") : 1;
+    if (owner) csil_codec_arena_free(owner);
+
+    /* uint 253402300800, f16 NaN, text, and nint below year 1 are refused. */
+    const uint8_t after_last[] = {0x1b, 0, 0, 0, 0x3a, 0xff, 0xf4, 0x41, 0x80};
+    const uint8_t nan16[] = {0xf9, 0x7e, 0x00};
+    const uint8_t text[] = {0x61, '0'};
+    const uint8_t before_first[] = {0x3b, 0, 0, 0, 0x0e, 0x77, 0x91, 0xf7, 0x00};
+    const uint8_t *refused[] = {after_last, nan16, text, before_first};
+    const size_t refused_len[] = {sizeof after_last, sizeof nan16, sizeof text, sizeof before_first};
+    for (size_t i = 0; i < 4; i++) {
+        if (decode_at(refused[i], refused_len[i], &owner)) {
+            printf("accepted refused value %zu\n", i);
+            fails++;
+        }
+        if (owner) csil_codec_arena_free(owner);
+    }
+
+    Seen seen;
+    seen.tag = SEEN_CDDL_TIME;
+    /* A quarter second is exact in binary64; most fractions near this epoch
+     * are not, so they come back changed by the float. */
+    seen.u.cddl_time = ts("2000-02-29T12:00:00.250Z");
+    if (csil_encode_Seen(&seen, &bytes, &len)) { printf("union encode failed\n"); return 1; }
+    Seen seen_back;
+    if (csil_decode_Seen(bytes, len, &seen_back, &owner)) { printf("union decode failed\n"); return 1; }
+    fails += check(seen_back.u.cddl_time.rfc3339, "2000-02-29T12:00:00.250Z");
+    csil_codec_arena_free(owner);
+    free(bytes);
+    return fails ? 1 : 0;
+}
+"#;

@@ -569,7 +569,7 @@ fn compare_kind(type_expr: &CsilTypeExpression) -> CompareKind {
         CsilTypeExpression::Builtin(name) => match name.as_str() {
             "decimal" => CompareKind::Decimal,
             "date" => CompareKind::Date,
-            "timestamp" => CompareKind::Timestamp,
+            "timestamp" | "cddl_time" => CompareKind::Timestamp,
             "int" | "uint" | "integer" | "float" | "float16" | "float32" | "float64" | "number" => {
                 CompareKind::Numeric
             }

@@ -151,7 +151,7 @@ composes with the control operators above; both are honored by every generator.
 
 ### ✅ Core CDDL Syntax Support
 - Basic types (`int`, `text`, `bool`, `bytes`, `float`, etc.)
-- Tagged core types include `date` (CBOR tag 1004, Gregorian calendar day), `timestamp` (CBOR tag 0, RFC3339, always UTC) and `decimal`
+- Tagged core types include `date` (CBOR tag 1004, Gregorian calendar day), `timestamp` (CBOR tag 0, RFC3339, always UTC), `cddl_time` (CBOR tag 1, epoch seconds) and `decimal`
   (CBOR tag 4, exact). `decimal` maps to a generated, dependency-free
   `CsilDecimal` by default, or to the language's decimal library via
   `options { decimal_mapping: "library" }`. See `docs/cbor-wire-contract.md` and
@@ -185,7 +185,7 @@ composes with the control operators above; both are honored by every generator.
 - **CLI tools** include `validate`, `linted-validate`, `generate`, `format`, `lint`, and `breaking`.
 - **Plugin runtime**: Dynamic generator discovery from `~/.csilgen/generators/`, `./.generators/`, and `target/wasm32-unknown-unknown/release/` — first-write-wins precedence. Generators are conforming `csilgen_<target>_generator.wasm` cdylibs; no CLI map to edit.
 - **Generators**: Rust, Go, TypeScript, Python, PHP (each with `-typesonly` / `-client` / `-server` sub-targets, e.g. `rust-client`, `go-typesonly`, `php-client`), Java, C#, C, Swift, Kotlin, Zig, OCaml, Elixir, Ruby, Dart, plus JSON Schema and OpenAPI — 18 targets total (`noop` included, a test fixture). Service directions `->`, `<->`, `<-` all emit consistently (handler + router + outbound encoders).
-- **Constraints & tagged types**: the full RFC 8610 control-operator set and the `@`-annotation constraints are honored across every generator; the `date` (tag 1004), `timestamp` (tag 0), and `decimal` (tag 4) core types emit per the CBOR wire contract.
+- **Constraints & tagged types**: the full RFC 8610 control-operator set and the `@`-annotation constraints are honored across every generator; the `date` (tag 1004), `timestamp` (tag 0), `cddl_time` (tag 1), and `decimal` (tag 4) core types emit per the CBOR wire contract.
 - **Testing**: 1,481 tests across the workspace.
 
 ### 🔄 Deferred / partial
