@@ -65,7 +65,7 @@ EOF
     typescript)
         cp "$fixture/peer.ts" .
         node --test peer.ts
-        if command -v tsc >/dev/null; then tsc_cmd=(tsc); else tsc_cmd=(npx --offline --package=typescript@5 tsc); fi
+        if command -v tsc >/dev/null; then tsc_cmd=(tsc); else tsc_cmd=(npx --yes --package=typescript@5 tsc); fi
         for surface in typescript typescript-typesonly typescript-client typescript-server; do
             (cd "$root" && "$compiler" generate -q -i "$fixture/strip-types.csil" -t "$surface" -o "$work/$surface")
             cp "$fixture/strip-types.ts" "$surface/"

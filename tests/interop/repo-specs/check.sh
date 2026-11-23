@@ -14,7 +14,12 @@ mkdir -p "$work"
 work=$(cd "$work" && pwd)
 
 case "$lang" in
-    rust | swift) ;;
+    rust)
+        # The packages live outside the repository, where rustup does not see
+        # `rust-toolchain.toml`. Use the pinned toolchain, which has rustfmt and clippy.
+        RUSTUP_TOOLCHAIN=$(rustup show active-toolchain | cut -d' ' -f1)
+        export RUSTUP_TOOLCHAIN ;;
+    swift) ;;
     *)
         echo "repo-specs: no compile check for $lang yet, skipped"
         exit 0 ;;
@@ -59,8 +64,9 @@ case "$lang" in
             echo ']'
         } > Cargo.toml
         for package in "${generated[@]}"; do
-            if ! rustfmt --check --edition 2021 "$package"/src/*.rs >/dev/null 2>&1; then
+            if ! out=$(rustfmt --check --edition 2021 "$package"/src/*.rs 2>&1); then
                 echo "FAIL rustfmt $(cat "$package/ORIGIN")"
+                printf '%s\n' "$out" | head -20 | sed 's/^/    /'
                 failed=$((failed + 1))
             fi
         done
