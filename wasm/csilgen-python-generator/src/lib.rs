@@ -373,8 +373,71 @@ pub fn generate_python_code_from_serialized(
     spec: &CsilSpecSerialized,
     config: &GeneratorConfig,
 ) -> Result<GeneratedFiles> {
+    let spec = rename_reserved_python_names(spec);
     let mut generator = PythonGenerator::new(config);
-    generator.generate(&csilgen_common::hoist_inline_named_numbers(spec))
+    generator.generate(&csilgen_common::hoist_inline_named_numbers(&spec))
+}
+
+/// Class names the generated modules declare themselves, import unqualified, or
+/// refer to as built-ins. Each module star-imports `types.py`, so a record of one
+/// of these names hides the real one there (a `Decimal` record makes the codec
+/// build records for every decimal field), or a later definition hides the record
+/// (`Transport`, `CborTag`). Python raises nothing at load in either case, and
+/// `None`/`True`/`False` are not legal class names at all. `ServiceError` is not
+/// here: it is the conventional error record, its codec never refers to the
+/// framework exception, and the package root re-exports the record.
+const RESERVED_TYPE_NAMES: &[&str] = &[
+    "Any",
+    "AsyncTransport",
+    "BaseModel",
+    "CborTag",
+    "CsilDecodeError",
+    "Decimal",
+    "Dict",
+    "Exception",
+    "False",
+    "Field",
+    "List",
+    "None",
+    "Optional",
+    "OverflowError",
+    "Protocol",
+    "Transport",
+    "True",
+    "Tuple",
+    "Union",
+    "ValueError",
+];
+
+/// Rename each rule whose class name is reserved, or equals a class the
+/// generator derives from a service or an RPC error arm (`<Base>Client`,
+/// `<Base>AsyncClient`, `<Service>Handlers`, `<Arm>Refusal`), because those are
+/// defined after the star import of `types.py` and hide the record.
+fn rename_reserved_python_names(spec: &CsilSpecSerialized) -> CsilSpecSerialized {
+    let mut derived = HashSet::new();
+    for rule in &spec.rules {
+        if matches!(rule.rule_type, CsilRuleType::ServiceDef(_)) {
+            let service_class = rule.name.to_case(Case::Pascal);
+            let base = service_class
+                .strip_suffix("Service")
+                .filter(|s| !s.is_empty())
+                .unwrap_or(&service_class);
+            derived.insert(format!("{base}Client"));
+            derived.insert(format!("{base}AsyncClient"));
+            derived.insert(format!("{service_class}Handlers"));
+        }
+    }
+    for (_, _, arms) in spec.rpc_operations() {
+        for arm in &arms[1..] {
+            if let Some(name) = arm.rpc_variant_name() {
+                derived.insert(format!("{}Refusal", name.to_case(Case::Pascal)));
+            }
+        }
+    }
+    csilgen_common::rename_reserved(spec, |name| {
+        let class = name.to_case(Case::Pascal);
+        RESERVED_TYPE_NAMES.contains(&class.as_str()) || derived.contains(&class)
+    })
 }
 
 /// Reduce an operation output to its success type by dropping a top-level
@@ -4004,7 +4067,7 @@ fn emit_record_codec(
     out.push_str(&format!(
         "def _decode_{suffix}_value(tree: Any) -> \"{class_name}\":\n"
     ));
-    out.push_str("    tree = _csil_expect_map(tree)\n");
+    out.push_str("    tree = _CsilMap(_csil_expect_map(tree))\n");
     if fields.is_empty() {
         out.push_str(&format!("    return {class_name}()\n\n\n"));
     } else {
@@ -4382,8 +4445,9 @@ fn emit_rpc_replies(
             op.name
         ));
         for (index, arm) in arms.iter().enumerate() {
-            let wire = arm.rpc_variant_name().unwrap();
-            let exception = format!("{}Refusal", wire.to_case(Case::Pascal));
+            let name = arm.rpc_variant_name().unwrap();
+            let wire = spec.declared_name(name);
+            let exception = format!("{}Refusal", name.to_case(Case::Pascal));
             resolve.push_str(&format!("        if variant == {wire:?}:\n"));
             if index == 0 {
                 resolve.push_str("            return payload\n");
@@ -4397,7 +4461,7 @@ fn emit_rpc_replies(
                 encode.push_str(&format!("    except {exception} as refusal:\n        return {wire:?}, cbor_encode({encoded})\n"));
             }
         }
-        let wire = arms[0].rpc_variant_name().unwrap();
+        let wire = spec.declared_name(arms[0].rpc_variant_name().unwrap());
         let value = py_enc_value(&arms[0], "value", records, aliases, unions);
         encode.push_str(&format!("    return {wire:?}, cbor_encode({value})\n\n\n"));
         out.push_str(&encode);
@@ -4870,12 +4934,24 @@ def cbor_encode(value: Any) -> bytes:
     return bytes(out)
 
 
+class CsilDecodeError(ValueError):
+    """Bytes that do not decode to the CSIL-declared value: malformed CBOR
+    (truncated input, a bad head byte, too deep nesting) or a well-formed value
+    of the wrong shape.
+
+    Subclasses ValueError so existing `except ValueError` call sites still
+    catch it; the distinct type lets a caller narrow on decode failures.
+    """
+
+
 def _csil_read_arg(b: bytes, pos: int, low: int):
     if low < 24:
         return low, pos + 1
     width = {24: 1, 25: 2, 26: 4, 27: 8}.get(low)
-    if width is None or len(b) - pos - 1 < width:
-        raise ValueError("csilgen: truncated argument")
+    if width is None:
+        raise CsilDecodeError("csilgen: bad head")
+    if len(b) - pos - 1 < width:
+        raise CsilDecodeError("csilgen: truncated argument")
     if low == 24:
         return b[pos + 1], pos + 2
     if low == 25:
@@ -4884,14 +4960,14 @@ def _csil_read_arg(b: bytes, pos: int, low: int):
         return int.from_bytes(b[pos + 1 : pos + 5], "big"), pos + 5
     if low == 27:
         return int.from_bytes(b[pos + 1 : pos + 9], "big"), pos + 9
-    raise ValueError("csilgen: bad head")
+    raise CsilDecodeError("csilgen: bad head")
 
 
 def _csil_dec(b: bytes, pos: int, depth: int):
     if depth > 64:
-        raise ValueError("csilgen: nesting limit exceeded")
+        raise CsilDecodeError("csilgen: nesting limit exceeded")
     if pos >= len(b):
-        raise ValueError("csilgen: unexpected end of input")
+        raise CsilDecodeError("csilgen: unexpected end of input")
     ib = b[pos]
     major = ib >> 5
     low = ib & 0x1F
@@ -4903,14 +4979,14 @@ def _csil_dec(b: bytes, pos: int, depth: int):
         if low in (22, 23):
             return None, pos + 1
         if low in (25, 26, 27) and len(b) - pos - 1 < {25: 2, 26: 4, 27: 8}[low]:
-            raise ValueError("csilgen: truncated float")
+            raise CsilDecodeError("csilgen: truncated float")
         if low == 25:
             return struct.unpack(">e", b[pos + 1 : pos + 3])[0], pos + 3
         if low == 26:
             return struct.unpack(">f", b[pos + 1 : pos + 5])[0], pos + 5
         if low == 27:
             return struct.unpack(">d", b[pos + 1 : pos + 9])[0], pos + 9
-        raise ValueError("csilgen: unsupported simple value")
+        raise CsilDecodeError("csilgen: unsupported simple value")
     arg, pos = _csil_read_arg(b, pos, low)
     if major == 0:
         return arg, pos
@@ -4918,15 +4994,18 @@ def _csil_dec(b: bytes, pos: int, depth: int):
         return -1 - arg, pos
     if major == 2:
         if arg > len(b) - pos:
-            raise ValueError("csilgen: truncated byte string")
+            raise CsilDecodeError("csilgen: truncated byte string")
         return bytes(b[pos : pos + arg]), pos + arg
     if major == 3:
         if arg > len(b) - pos:
-            raise ValueError("csilgen: truncated text string")
-        return b[pos : pos + arg].decode("utf-8"), pos + arg
+            raise CsilDecodeError("csilgen: truncated text string")
+        try:
+            return b[pos : pos + arg].decode("utf-8"), pos + arg
+        except UnicodeDecodeError:
+            raise CsilDecodeError("csilgen: invalid UTF-8 in text string") from None
     if major == 4:
         if arg > len(b) - pos:
-            raise ValueError("csilgen: array length exceeds remaining input")
+            raise CsilDecodeError("csilgen: array length exceeds remaining input")
         items = []
         for _ in range(arg):
             item, pos = _csil_dec(b, pos, depth + 1)
@@ -4934,33 +5013,28 @@ def _csil_dec(b: bytes, pos: int, depth: int):
         return items, pos
     if major == 5:
         if arg > len(b) - pos:
-            raise ValueError("csilgen: map length exceeds remaining input")
+            raise CsilDecodeError("csilgen: map length exceeds remaining input")
         result: Dict[Any, Any] = {}
         for _ in range(arg):
             key, pos = _csil_dec(b, pos, depth + 1)
             val, pos = _csil_dec(b, pos, depth + 1)
-            result[key] = val
+            try:
+                result[key] = val
+            except TypeError:
+                raise CsilDecodeError("csilgen: map key is not hashable") from None
         return result, pos
     if major == 6:
         inner, pos = _csil_dec(b, pos, depth + 1)
         return CborTag(arg, inner), pos
-    raise ValueError("csilgen: bad major type")
+    raise CsilDecodeError("csilgen: bad major type")
 
 
 def cbor_decode(data: bytes) -> Any:
     """Decode canonical CBOR bytes into a value tree."""
     value, pos = _csil_dec(data, 0, 0)
     if pos != len(data):
-        raise ValueError("csilgen: trailing bytes")
+        raise CsilDecodeError("csilgen: trailing bytes")
     return value
-
-
-class CsilDecodeError(ValueError):
-    """A decoded CBOR value's major type does not match its CSIL-declared type.
-
-    Subclasses ValueError so existing `except ValueError` call sites still
-    catch it; the distinct type lets a caller narrow on schema violations.
-    """
 
 
 # The value-tree type-check gate every scalar field decode passes through: the
@@ -5010,6 +5084,13 @@ def _csil_expect_array(v: Any) -> list:
     if not isinstance(v, list):
         raise CsilDecodeError(f"csil cbor: expected array, got {type(v).__name__}")
     return v
+
+
+class _CsilMap(dict):
+    # A record decoder reads required fields as `tree["key"]`; a missing key must
+    # fail as a decode error, not as a bare KeyError.
+    def __missing__(self, key: Any) -> Any:
+        raise CsilDecodeError(f"csil cbor: missing field {key!r}")
 
 
 def _csil_expect_map(v: Any) -> dict:
@@ -5319,6 +5400,7 @@ mod tests {
             source_content: None,
             service_count: 0,
             fields_with_metadata_count: 0,
+            declared_names: Default::default(),
         };
 
         let result =
@@ -5387,6 +5469,7 @@ mod tests {
             source_content: None,
             service_count: 0,
             fields_with_metadata_count: 0,
+            declared_names: Default::default(),
         };
 
         let config = create_test_config(false);
@@ -5426,6 +5509,7 @@ mod tests {
             source_content: None,
             service_count: 0,
             fields_with_metadata_count: 1,
+            declared_names: Default::default(),
         };
 
         let config = create_test_config(true);
@@ -5470,6 +5554,7 @@ mod tests {
             source_content: None,
             service_count: 1,
             fields_with_metadata_count: 0,
+            declared_names: Default::default(),
         };
 
         let config = create_test_config(false);
@@ -5529,6 +5614,7 @@ mod tests {
             source_content: None,
             service_count: 1,
             fields_with_metadata_count: 0,
+            declared_names: Default::default(),
         };
 
         let result =
@@ -5591,6 +5677,7 @@ mod tests {
             source_content: None,
             service_count: 1,
             fields_with_metadata_count: 0,
+            declared_names: Default::default(),
         };
 
         let result =
@@ -5655,6 +5742,7 @@ mod tests {
             source_content: None,
             service_count: 0,
             fields_with_metadata_count: 2,
+            declared_names: Default::default(),
         };
 
         let config = create_test_config(false);
@@ -5699,6 +5787,7 @@ mod tests {
             source_content: None,
             service_count: 0,
             fields_with_metadata_count: 1,
+            declared_names: Default::default(),
         };
 
         let config = create_test_config(false);
@@ -5754,6 +5843,7 @@ mod tests {
             source_content: None,
             service_count: 0,
             fields_with_metadata_count: 0,
+            declared_names: Default::default(),
         };
 
         let config = create_test_config(false);
@@ -5779,6 +5869,7 @@ mod tests {
             source_content: None,
             service_count: 0,
             fields_with_metadata_count: 0,
+            declared_names: Default::default(),
         };
 
         let config = create_test_config(false);
@@ -5812,6 +5903,7 @@ mod tests {
             source_content: None,
             service_count: 0,
             fields_with_metadata_count: 0,
+            declared_names: Default::default(),
         };
 
         let config = create_test_config(false);
@@ -5829,6 +5921,7 @@ mod tests {
             source_content: None,
             service_count: 0,
             fields_with_metadata_count: 0,
+            declared_names: Default::default(),
         };
 
         let config = create_test_config(false);
@@ -5860,6 +5953,7 @@ mod tests {
             source_content: None,
             service_count: 1,
             fields_with_metadata_count: 0,
+            declared_names: Default::default(),
         };
 
         let config = create_test_config(false);
@@ -5911,6 +6005,7 @@ mod tests {
             source_content: None,
             service_count: 0,
             fields_with_metadata_count: 0,
+            declared_names: Default::default(),
         };
 
         let result =
@@ -5982,6 +6077,7 @@ mod tests {
             source_content: None,
             service_count: 1,
             fields_with_metadata_count: 0,
+            declared_names: Default::default(),
         }
     }
 
@@ -6214,6 +6310,7 @@ mod tests {
             source_content: None,
             service_count: 0,
             fields_with_metadata_count: 0,
+            declared_names: Default::default(),
         }
     }
 
@@ -6286,6 +6383,7 @@ mod tests {
             source_content: None,
             service_count: 0,
             fields_with_metadata_count: 0,
+            declared_names: Default::default(),
         };
 
         let content = types_content(&spec, &create_test_config(false));
@@ -6517,6 +6615,7 @@ mod tests {
             source_content: None,
             service_count: 0,
             fields_with_metadata_count: 0,
+            declared_names: Default::default(),
         };
 
         let content = types_content(&spec, &create_test_config(false));
@@ -6566,6 +6665,7 @@ mod tests {
             source_content: None,
             service_count: 0,
             fields_with_metadata_count: 0,
+            declared_names: Default::default(),
         };
 
         let content = types_content(&spec, &create_test_config(false));
@@ -6604,6 +6704,7 @@ mod tests {
             source_content: None,
             service_count: 0,
             fields_with_metadata_count: 0,
+            declared_names: Default::default(),
         };
 
         let content = types_content(&spec, &create_test_config(false));
@@ -6658,6 +6759,7 @@ mod tests {
             source_content: None,
             service_count: 0,
             fields_with_metadata_count: 0,
+            declared_names: Default::default(),
         };
 
         let content = types_content(&spec, &create_test_config(true));
@@ -6897,6 +6999,7 @@ mod tests {
             source_content: None,
             service_count: 0,
             fields_with_metadata_count: 1,
+            declared_names: Default::default(),
         };
         let content = types_content(&spec, &create_test_config(false));
         assert!(content.contains("def validate(self)"));
@@ -6985,6 +7088,7 @@ mod tests {
             source_content: None,
             service_count: 0,
             fields_with_metadata_count: 0,
+            declared_names: Default::default(),
         };
         let content = types_content(&spec, &create_test_config(false));
 
@@ -7064,6 +7168,7 @@ mod tests {
             source_content: None,
             service_count: 0,
             fields_with_metadata_count: 2,
+            declared_names: Default::default(),
         };
 
         // Dataclass path: both the simple equality guard and the boolean `!=`
@@ -7120,6 +7225,7 @@ mod tests {
                 source_content: None,
                 service_count: 1,
                 fields_with_metadata_count: 0,
+                declared_names: Default::default(),
             }
         }
 
@@ -7245,6 +7351,7 @@ mod tests {
             source_content: None,
             service_count: 1,
             fields_with_metadata_count: 0,
+            declared_names: Default::default(),
         }
     }
 
@@ -7335,6 +7442,7 @@ mod tests {
             source_content: None,
             service_count: 1,
             fields_with_metadata_count: 0,
+            declared_names: Default::default(),
         };
         let mut config = create_test_config(false);
         config.target = "python-client".to_string();
@@ -7379,6 +7487,7 @@ mod tests {
             source_content: None,
             service_count: 1,
             fields_with_metadata_count: 0,
+            declared_names: Default::default(),
         }
     }
 
@@ -7487,6 +7596,7 @@ mod tests {
             source_content: None,
             service_count: 1,
             fields_with_metadata_count: 0,
+            declared_names: Default::default(),
         }
     }
 
@@ -7680,6 +7790,7 @@ mod tests {
             source_content: None,
             service_count: 1,
             fields_with_metadata_count: 0,
+            declared_names: Default::default(),
         }
     }
 
@@ -7943,6 +8054,7 @@ print("ok")
             source_content: None,
             service_count: 0,
             fields_with_metadata_count: 0,
+            declared_names: Default::default(),
         }
     }
 
@@ -8145,6 +8257,7 @@ print("ok")
             source_content: None,
             service_count: 0,
             fields_with_metadata_count: 0,
+            declared_names: Default::default(),
         }
     }
 
@@ -8370,6 +8483,7 @@ print("ok")
             source_content: None,
             service_count: 0,
             fields_with_metadata_count: 0,
+            declared_names: Default::default(),
         }
     }
 
@@ -8497,6 +8611,7 @@ print("ok")
             source_content: None,
             service_count: 0,
             fields_with_metadata_count: 0,
+            declared_names: Default::default(),
         }
     }
 
@@ -8629,6 +8744,7 @@ print("ok")
             source_content: None,
             service_count: 0,
             fields_with_metadata_count: 0,
+            declared_names: Default::default(),
         }
     }
 
@@ -9089,6 +9205,7 @@ print("ok")
             source_content: None,
             service_count: 1,
             fields_with_metadata_count: 0,
+            declared_names: Default::default(),
         }
     }
 
@@ -9125,6 +9242,7 @@ print("ok")
             source_content: None,
             service_count: 1,
             fields_with_metadata_count: 0,
+            declared_names: Default::default(),
         }
     }
 
@@ -9780,6 +9898,7 @@ def _seed_loopback():
             source_content: None,
             service_count: 0,
             fields_with_metadata_count: 0,
+            declared_names: Default::default(),
         }
     }
 
@@ -10052,5 +10171,133 @@ print("ok")
         let twin = client(&reply_arms_spec(), "client_async.py");
         assert!(twin.contains("    async def call_reply("));
         assert!(twin.contains("variant, payload = await self._transport.call_reply("));
+    }
+
+    /// Write `files` as package `pk` beside `driver`, run it with python3, and
+    /// require it to print `ok`. Skips when python3 is not on PATH.
+    fn run_python_driver(files: &[GeneratedFile], label: &str, driver: &str) {
+        if !have_python3() {
+            eprintln!("skipping: no python3 on PATH");
+            return;
+        }
+        let dir =
+            std::env::temp_dir().join(format!("csilgen-python-{label}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let pkg = dir.join("pk");
+        std::fs::create_dir_all(&pkg).unwrap();
+        for f in files {
+            std::fs::write(pkg.join(&f.path), &f.content).unwrap();
+        }
+        std::fs::write(dir.join("driver.py"), driver).unwrap();
+        let run = std::process::Command::new("python3")
+            .arg("driver.py")
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            run.status.success() && String::from_utf8_lossy(&run.stdout).trim() == "ok",
+            "python driver failed:\n{}{}",
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
+        );
+    }
+
+    /// A `Transport` record used as an RPC error arm would be hidden by the client's
+    /// `Transport` Protocol; it is renamed, while the wire variant keeps the name
+    /// from the CSIL source.
+    #[test]
+    fn reserved_name_error_arm_is_renamed_but_keeps_its_wire_variant() {
+        let mut spec = reply_arms_spec();
+        for rule in &mut spec.rules {
+            if rule.name == "Refused" {
+                rule.name = "Transport".to_string();
+            }
+            if let CsilRuleType::ServiceDef(def) = &mut rule.rule_type {
+                def.operations[0].output_type = CsilTypeExpression::Choice(vec![
+                    CsilTypeExpression::Reference("Pong".to_string()),
+                    CsilTypeExpression::Reference("Transport".to_string()),
+                ]);
+            }
+        }
+        let mut cfg = create_test_config(false);
+        cfg.target = "python-client".to_string();
+        let files = generate_python_code_from_serialized(&spec, &cfg).unwrap();
+        let file = |path: &str| &files.iter().find(|f| f.path == path).unwrap().content;
+        assert!(file("types.py").contains("class TransportType:"));
+        assert!(!file("types.py").contains("class Transport:"));
+        let codec = file("codec.py");
+        assert!(codec.contains("class TransportTypeRefusal(Exception):"));
+        assert!(codec.contains(
+            "    except TransportTypeRefusal as refusal:\n        return \"Transport\", cbor_encode(_encode_transport_type_value(refusal.value))"
+        ));
+        assert!(codec.contains(
+            "        if variant == \"Transport\":\n            tree = cbor_decode(payload)\n            raise TransportTypeRefusal("
+        ));
+        assert!(file("client.py").contains("class Transport(Protocol):"));
+        run_python_driver(
+            &files,
+            "reserved",
+            r#"import pk
+from pk.codec import encode_echo_ping_reply, resolve_rpc_reply, TransportTypeRefusal
+from pk.types import TransportType
+
+value = TransportType(reason="no")
+def refuse():
+    raise TransportTypeRefusal(value)
+variant, payload = encode_echo_ping_reply(refuse)
+assert variant == "Transport", variant
+try:
+    resolve_rpc_reply("Echo", "ping", variant, payload)
+    raise AssertionError("expected a refusal")
+except TransportTypeRefusal as refusal:
+    assert refusal.value == value
+assert pk.TransportType is TransportType
+print("ok")
+"#,
+        );
+    }
+
+    /// Malformed CBOR and a well-formed value of the wrong shape both fail with
+    /// `CsilDecodeError`, so one `except` clause catches every decode failure.
+    #[test]
+    fn every_decode_failure_raises_csil_decode_error() {
+        assert!(!CBOR_RUNTIME_PYTHON.contains("raise ValueError(\"csilgen:"));
+        let mut cfg = create_test_config(false);
+        cfg.target = "python-client".to_string();
+        let files = generate_python_code_from_serialized(&reply_arms_spec(), &cfg).unwrap();
+        run_python_driver(
+            &files,
+            "decode-errors",
+            r#"from pk.codec import CsilDecodeError, cbor_decode
+from pk.types import Refused
+
+cases = {
+    "truncated": b"\x18",
+    "truncated text": b"\x63ab",
+    "bad head": b"\x1c",
+    "bad simple": b"\xfc",
+    "nesting": b"\x81" * 70,
+    "bad utf-8": b"\x62\xff\xfe",
+    "unhashable key": b"\xa1\x80\x01",
+    "trailing": b"\x01\x02",
+    "missing field": b"\xa0",
+    "wrong shape": b"\x01",
+}
+for name, data in cases.items():
+    try:
+        Refused.from_cbor(data)
+    except CsilDecodeError:
+        pass
+    else:
+        raise AssertionError(f"{name}: no error")
+try:
+    cbor_decode(b"\x18")
+    raise AssertionError("cbor_decode accepted truncated input")
+except CsilDecodeError:
+    pass
+print("ok")
+"#,
+        );
     }
 }

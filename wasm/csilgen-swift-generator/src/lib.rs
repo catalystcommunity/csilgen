@@ -190,6 +190,73 @@ impl ClientShape {
     }
 }
 
+/// Top-level names the package declares itself, plus standard-library types the
+/// generated code names unqualified. Every generated declaration shares one module
+/// namespace with the schema's types, so a rule of one of these names either
+/// redeclares the type or makes the unqualified use refer to the schema's type.
+/// `Any` and `Self` are keywords and cannot name a type at all.
+const RESERVED_TYPE_NAMES: &[&str] = &[
+    "CsilCbor",
+    "CsilCborError",
+    "CsilCborValue",
+    "AnyCsilValue",
+    "CsilTransport",
+    "AsyncCsilTransport",
+    "CsilTransportError",
+    "CsilClientError",
+    "CsilCodec",
+    "CsilEq",
+    "CsilValidationError",
+    "Swift",
+    "Any",
+    "Self",
+    "Sendable",
+    "Equatable",
+    "Hashable",
+    "Array",
+    "String",
+    "Bool",
+    "Int",
+    "Int64",
+    "UInt64",
+    "UInt8",
+    "Double",
+    "Float",
+    "UInt32",
+    "Range",
+    "Hasher",
+    "CaseIterable",
+    "FloatingPointSign",
+    "UTF8",
+    "Regex",
+];
+
+/// Besides the fixed names, the package derives `<Service>Client`,
+/// `<Service>AsyncClient`, `<Service>WireID` and `<ErrorArm>Refusal` from schema
+/// names, so a rule that spells one of those out would be a redeclaration.
+fn reserved_type_name(spec: &CsilSpecSerialized) -> impl Fn(&str) -> bool {
+    let mut derived = std::collections::HashSet::new();
+    for rule in &spec.rules {
+        if matches!(rule.rule_type, CsilRuleType::ServiceDef(_)) {
+            let base = service_base(&rule.name);
+            derived.insert(format!("{base}Client"));
+            derived.insert(format!("{base}AsyncClient"));
+            derived.insert(format!("{}WireID", swift_type_name(&rule.name)));
+        }
+    }
+    for (_, _, arms) in spec.rpc_operations() {
+        for arm in &arms[1..] {
+            if let Some(variant) = arm.rpc_variant_name() {
+                derived.insert(format!("{}Refusal", swift_type_name(variant)));
+            }
+        }
+    }
+    move |name| {
+        let ty = swift_type_name(name);
+        RESERVED_TYPE_NAMES.contains(&ty.as_str()) || derived.contains(&ty)
+    }
+}
+
 fn build_files(input: &WasmGeneratorInput) -> Result<Vec<GeneratedFile>, i32> {
     let surface = match input.config.target.as_str() {
         "swift" | "swift-server" => Surface::Server,
@@ -213,8 +280,10 @@ fn build_files(input: &WasmGeneratorInput) -> Result<Vec<GeneratedFile>, i32> {
     // `csilgen_common::hoist_inline_composites`.
     let hoisted = {
         let mut cloned = input.clone();
+        let renamed =
+            csilgen_common::rename_reserved(&input.csil_spec, reserved_type_name(&input.csil_spec));
         cloned.csil_spec = csilgen_common::hoist_inline_composites(
-            &input.csil_spec,
+            &renamed,
             csilgen_common::HoistOptions {
                 hoist_all_literal_choices: true,
             },
@@ -3696,9 +3765,10 @@ fn generate_codec(input: &WasmGeneratorInput) -> Option<String> {
             );
             resolve.push_str(&format!("    if service == \"{service}\" && op == \"{method}\" {{\n        switch variant {{\n"));
             for (i, arm) in arms.iter().enumerate() {
-                let wire = arm.rpc_variant_name().unwrap();
+                let variant = arm.rpc_variant_name().unwrap();
+                let wire = input.csil_spec.declared_name(variant);
                 let ty = map_type(arm, false);
-                let exception = format!("{}Refusal", swift_type_name(wire));
+                let exception = format!("{}Refusal", swift_type_name(variant));
                 let source = if i == 0 { "value" } else { "refusal.value" };
                 let enc = swift_enc_value(arm, source, &records, &aliases, &choice_codecs);
                 if i == 0 {

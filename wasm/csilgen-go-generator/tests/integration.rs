@@ -62,6 +62,7 @@ fn create_simple_test_input() -> WasmGeneratorInput {
         source_content: None,
         service_count: 0,
         fields_with_metadata_count: 0,
+        declared_names: Default::default(),
     };
 
     WasmGeneratorInput {

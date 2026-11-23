@@ -3,8 +3,9 @@
 //! CDDL allows rule names such as `open-group` that are not identifiers in most
 //! target languages. A generator that needs other names renames the rules up
 //! front, so the rest of the generator works on legal names only. The caller
-//! keeps the map, because an RPC reply variant puts the declared name on the
-//! wire, and that name must not change.
+//! records each declared name in `CsilSpecSerialized::declared_names`, because
+//! an RPC reply variant puts the declared name on the wire, and that name must
+//! not change.
 
 use crate::{
     CsilGroupEntry, CsilGroupExpression, CsilGroupKey, CsilRule, CsilRuleType, CsilSpecSerialized,
@@ -47,12 +48,43 @@ pub fn rename_rules(
         return spec.clone();
     }
     let renamer = Renamer { renames };
+    let mut declared_names = spec.declared_names.clone();
+    for (from, to) in renames {
+        let declared = declared_names.remove(from).unwrap_or_else(|| from.clone());
+        declared_names.insert(to.clone(), declared);
+    }
     CsilSpecSerialized {
         rules: spec.rules.iter().map(|rule| renamer.rule(rule)).collect(),
         source_content: spec.source_content.clone(),
         service_count: spec.service_count,
         fields_with_metadata_count: spec.fields_with_metadata_count,
+        declared_names,
     }
+}
+
+/// Return `spec` with each non-service rule that `reserved` refuses renamed to a
+/// free name with a `Type` suffix (`Transport` becomes `TransportType`). A
+/// generator passes the names it declares itself, and the language names its
+/// output refers to, so a schema type cannot hide or redeclare them. The spec
+/// keeps each declared name for the wire.
+pub fn rename_reserved(
+    spec: &CsilSpecSerialized,
+    reserved: impl Fn(&str) -> bool,
+) -> CsilSpecSerialized {
+    let mut taken: HashSet<String> = spec.rules.iter().map(|rule| rule.name.clone()).collect();
+    let mut renames = HashMap::new();
+    for rule in &spec.rules {
+        if matches!(rule.rule_type, CsilRuleType::ServiceDef(_)) || !reserved(&rule.name) {
+            continue;
+        }
+        let mut candidate = format!("{}Type", rule.name);
+        while taken.contains(&candidate) || reserved(&candidate) {
+            candidate.push_str("Type");
+        }
+        taken.insert(candidate.clone());
+        renames.insert(rule.name.clone(), candidate);
+    }
+    rename_rules(spec, &renames)
 }
 
 struct Renamer<'a> {
@@ -202,6 +234,7 @@ mod tests {
             source_content: None,
             service_count: 0,
             fields_with_metadata_count: 0,
+            declared_names: Default::default(),
         };
         let renames = rule_renames(&spec, legal, fix);
         assert_eq!(
@@ -220,5 +253,40 @@ mod tests {
             **element_type,
             CsilTypeExpression::Reference("open_type_".into())
         );
+    }
+
+    #[test]
+    fn reserved_rename_keeps_the_declared_name_and_avoids_taken_names() {
+        let text = || CsilTypeExpression::Builtin("text".into());
+        let spec = CsilSpecSerialized {
+            rules: vec![
+                rule("Transport", CsilRuleType::TypeDef(text())),
+                rule("TransportType", CsilRuleType::TypeDef(text())),
+                rule(
+                    "Use",
+                    CsilRuleType::TypeDef(CsilTypeExpression::Reference("Transport".into())),
+                ),
+            ],
+            source_content: None,
+            service_count: 0,
+            fields_with_metadata_count: 0,
+            declared_names: Default::default(),
+        };
+        let out = rename_reserved(&spec, |name| name == "Transport");
+        assert_eq!(out.rules[0].name, "TransportTypeType");
+        assert_eq!(out.rules[1].name, "TransportType");
+        assert_eq!(out.declared_name("TransportTypeType"), "Transport");
+        assert_eq!(out.declared_name("TransportType"), "TransportType");
+        let CsilRuleType::TypeDef(CsilTypeExpression::Reference(target)) = &out.rules[2].rule_type
+        else {
+            panic!("reference rule");
+        };
+        assert_eq!(target, "TransportTypeType");
+        // A second rename keeps the name from the CSIL source.
+        let again = rename_rules(
+            &out,
+            &HashMap::from([("TransportTypeType".to_string(), "T2".to_string())]),
+        );
+        assert_eq!(again.declared_name("T2"), "Transport");
     }
 }

@@ -10,7 +10,28 @@ use std::path::{Path, PathBuf};
 
 /// Record names that the generator's own codec helpers once used, so a record with
 /// one of these names declared the same Go function twice.
-const HELPER_NAMES: [&str; 5] = ["Date", "Decimal", "BigInt", "Timestamp", "CddlTime"];
+const HELPER_NAMES: [&str; 7] = [
+    "Date",
+    "Decimal",
+    "BigInt",
+    "Timestamp",
+    "CddlTime",
+    "Err",
+    "DepthLimit",
+];
+
+/// Record names equal to a name the generated package declares itself. The
+/// generator renames them to `<Name>Type`; the wire keeps the declared name.
+const RESERVED_NAMES: [&str; 8] = [
+    "Transport",
+    "WireReply",
+    "CsilDecimal",
+    "ParseCsilDecimal",
+    "ResolveRPCReply",
+    "RPCDecodeError",
+    "RPCEncodeError",
+    "RPCApplicationError",
+];
 
 fn pos() -> CsilPosition {
     CsilPosition {
@@ -120,7 +141,15 @@ fn rules() -> Vec<CsilRule> {
             CsilTypeExpression::Choice(vec![reference("Ok"), reference("RpError")]),
         ),
         service("Ops", "healthcheck", reference("Ok")),
+        service(
+            "Gate",
+            "refuse",
+            CsilTypeExpression::Choice(vec![reference("Ok"), reference("Transport")]),
+        ),
     ];
+    for name in RESERVED_NAMES {
+        rules.push(record(name, vec![entry("code", builtin("uint"))]));
+    }
     for name in HELPER_NAMES {
         rules.push(record(name, vec![entry("state", reference("State"))]));
     }
@@ -136,6 +165,7 @@ fn generate(target: &str) -> Vec<GeneratedFile> {
             source_content: None,
             service_count: 2,
             fields_with_metadata_count: 0,
+            declared_names: Default::default(),
         },
         config: GeneratorConfig {
             target: target.to_string(),
@@ -300,6 +330,22 @@ func TestTransportErrorIsNotWrapped(t *testing.T) {
 		if !errors.Is(err, context.Canceled) {
 			t.Fatalf("client %d: want context.Canceled, got %T %v", i, err, err)
 		}
+	}
+}
+
+func TestRenamedErrorArmKeepsItsWireName(t *testing.T) {
+	payload, err := EncodeTransportType(TransportType{Code: 3})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = NewGateClient(&fakeTransport{reply: WireReply{Variant: variant("Transport"), Payload: payload}}).Refuse(context.Background(), Req{})
+	var ae *RPCApplicationError[TransportType]
+	if !errors.As(err, &ae) || ae.Value.Code != 3 {
+		t.Fatalf("want *RPCApplicationError[TransportType], got %T %v", err, err)
+	}
+	name, _, err := EncodeGateRefuseReply(Ok{}, &RPCApplicationError[TransportType]{Value: TransportType{Code: 3}})
+	if err != nil || name != "Transport" {
+		t.Fatalf("reply variant: got %q, %v; want \"Transport\"", name, err)
 	}
 }
 

@@ -1021,7 +1021,75 @@ fn find_record<'a>(input: &'a WasmGeneratorInput, name: &str) -> Option<&'a Csil
         })
 }
 
+/// Modules the package declares itself under the module root. A rule of the same
+/// name would define that module a second time, and Elixir lets the later
+/// definition replace the earlier one at load time instead of failing the build.
+/// `ServiceError` is absent on purpose: the router defers to a spec's own record
+/// when it can (see `reserved_type_name`).
+const RESERVED_TYPE_NAMES: &[&str] = &[
+    "Cbor",
+    "Decimal",
+    "Transport",
+    "Codec",
+    "Validation",
+    "Constructors",
+];
+
+/// Besides the fixed modules, the package derives `<Service>Client`,
+/// `<Service>Server` and `<ErrorArm>Refusal` modules from schema names, so a rule
+/// that spells one of those out would collide in the same way.
+///
+/// A channel router builds `%ServiceError{code: .., message: ..}` itself, so a spec's
+/// own `ServiceError` of any other shape cannot stand in for the framework one
+/// there; it is renamed and the framework record is emitted beside it.
+fn reserved_type_name(spec: &csilgen_common::CsilSpecSerialized) -> impl Fn(&str) -> bool {
+    let mut derived = HashSet::new();
+    let mut has_channel = false;
+    for rule in &spec.rules {
+        if let CsilRuleType::ServiceDef(service) = &rule.rule_type {
+            let base = service_base(&rule.name);
+            derived.insert(format!("{base}Client"));
+            derived.insert(format!("{base}Server"));
+            has_channel |= service_has_channel_ops(service);
+        }
+    }
+    let framework_shaped = spec.rules.iter().any(|rule| {
+        let group = match &rule.rule_type {
+            CsilRuleType::GroupDef(g) => g,
+            CsilRuleType::TypeDef(CsilTypeExpression::Group(g)) => g,
+            _ => return false,
+        };
+        let keys: HashSet<&str> = group
+            .entries
+            .iter()
+            .filter_map(|entry| match &entry.key {
+                Some(CsilGroupKey::Bare(key)) => Some(key.as_str()),
+                _ => None,
+            })
+            .collect();
+        rule.name == "ServiceError"
+            && group.entries.len() == 2
+            && keys == HashSet::from(["code", "message"])
+    });
+    if has_channel && !framework_shaped {
+        derived.insert("ServiceError".to_string());
+    }
+    for (_, _, arms) in spec.rpc_operations() {
+        for arm in &arms[1..] {
+            if let Some(variant) = arm.rpc_variant_name() {
+                derived.insert(format!("{}Refusal", pascal_case(variant)));
+            }
+        }
+    }
+    move |name| {
+        let module = pascal_case(name);
+        RESERVED_TYPE_NAMES.contains(&module.as_str()) || derived.contains(&module)
+    }
+}
+
 fn process_generation(mut input: WasmGeneratorInput) -> Result<WasmGeneratorOutput, i32> {
+    input.csil_spec =
+        csilgen_common::rename_reserved(&input.csil_spec, reserved_type_name(&input.csil_spec));
     input.csil_spec = csilgen_common::hoist_inline_named_numbers(&input.csil_spec);
     input.csil_spec.supply_implicit_service_error();
     let config = ElixirConfig::from_options(&input.config.options)?;
@@ -2275,13 +2343,16 @@ fn generate_codec(input: &WasmGeneratorInput, config: &ElixirConfig) -> Option<S
     for (service, op, arms) in input.csil_spec.rpc_operations() {
         let stem = snake_case(&format!("{service}_{}", op.name));
         let method = &op.name;
-        let success = arms[0].rpc_variant_name().unwrap();
+        let success = input
+            .csil_spec
+            .declared_name(arms[0].rpc_variant_name().unwrap());
         let value = enc_value(&arms[0], "value", &cx).render(4, 0);
         content.push_str(&format!("\n  def encode_{stem}_reply({{:ok, value}}) do\n    {{{success:?}, encode({value})}}\n  end\n"));
         resolve.push_str(&format!("\n  def resolve_rpc_reply({service:?}, {method:?}, {success:?}, payload), do: payload\n"));
         for arm in &arms[1..] {
-            let wire = arm.rpc_variant_name().unwrap();
-            let tag = snake_case(wire);
+            let variant = arm.rpc_variant_name().unwrap();
+            let wire = input.csil_spec.declared_name(variant);
+            let tag = snake_case(variant);
             let pattern = if arms.len() == 2 {
                 "value".into()
             } else {
@@ -2289,7 +2360,7 @@ fn generate_codec(input: &WasmGeneratorInput, config: &ElixirConfig) -> Option<S
             };
             let enc = enc_value(arm, "value", &cx).render(4, 0);
             let dec = dec_value(arm, "decode(payload)", &cx).render(4, 0);
-            let exception = format!("{}Refusal", config.module(wire));
+            let exception = format!("{}Refusal", config.module(variant));
             exceptions.insert(exception.clone(), wire);
             content.push_str(&format!("\n  def encode_{stem}_reply({{:error, {pattern}}}) do\n    {{{wire:?}, encode({enc})}}\n  end\n"));
             resolve.push_str(&format!("\n  def resolve_rpc_reply({service:?}, {method:?}, {wire:?}, payload) do\n    value = {dec}\n    raise {exception}, value: value\n  end\n"));

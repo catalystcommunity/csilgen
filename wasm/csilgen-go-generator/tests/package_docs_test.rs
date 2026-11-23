@@ -41,6 +41,7 @@ fn create_test_input_with_package_desc(package_desc: Option<&str>) -> WasmGenera
             source_content: None,
             service_count: 0,
             fields_with_metadata_count: 0,
+            declared_names: Default::default(),
         },
         config: GeneratorConfig {
             target: "go".to_string(),

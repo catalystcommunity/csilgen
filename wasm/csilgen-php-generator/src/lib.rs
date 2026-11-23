@@ -102,6 +102,65 @@ fn process_generation(input_ptr: *const u8, input_len: usize) -> Result<WasmGene
     })
 }
 
+/// Class names the generated package declares itself, plus the names PHP does
+/// not allow as a class name. Compared in lower case, because PHP class names
+/// are case-insensitive. `cbor` is here because `codec.php` imports
+/// `Csilgen\Transport\CBOR`, so a `Cbor` record there silently resolves to the
+/// import and its codec reads every field as null.
+const RESERVED_TYPE_NAMES: &[&str] = &[
+    "bool",
+    "cbor",
+    "clienterror",
+    "codec",
+    "codecexception",
+    "csilreplytransport",
+    "false",
+    "float",
+    "int",
+    "iterable",
+    "match",
+    "mixed",
+    "never",
+    "null",
+    "object",
+    "parent",
+    "readonly",
+    "self",
+    "string",
+    "true",
+    "void",
+];
+
+/// Rename each rule whose class is reserved or equals a class or `Codec` method
+/// stem the generator derives from a service, an operation, or an RPC error arm
+/// (`<Base>Client`, `<Base>Handler`, `<Base>Router`, `<Arm>Refusal`,
+/// `encode<Service><Op>Reply`). Each of these is a fatal redeclaration at load.
+fn rename_reserved_php_names(spec: &CsilSpecSerialized) -> CsilSpecSerialized {
+    let mut derived = std::collections::HashSet::new();
+    for rule in &spec.rules {
+        if matches!(rule.rule_type, CsilRuleType::ServiceDef(_)) {
+            let base = service_base(&rule.name);
+            for suffix in ["Client", "Handler", "Router"] {
+                derived.insert(format!("{base}{suffix}").to_ascii_lowercase());
+            }
+        }
+    }
+    for (service, op, arms) in spec.rpc_operations() {
+        derived.insert(
+            format!("{}{}Reply", php_class(service), php_class(&op.name)).to_ascii_lowercase(),
+        );
+        for arm in &arms[1..] {
+            if let Some(name) = arm.rpc_variant_name() {
+                derived.insert(format!("{}Refusal", php_class(name)).to_ascii_lowercase());
+            }
+        }
+    }
+    csilgen_common::rename_reserved(spec, |name| {
+        let class = php_class(name).to_ascii_lowercase();
+        RESERVED_TYPE_NAMES.contains(&class.as_str()) || derived.contains(&class)
+    })
+}
+
 enum Surface {
     Server,
     Client,
@@ -112,7 +171,7 @@ pub fn generate_php_code_from_serialized(
     spec: &CsilSpecSerialized,
     config: &GeneratorConfig,
 ) -> Result<GeneratedFiles, i32> {
-    let spec = &csilgen_common::hoist_inline_named_numbers(spec);
+    let spec = &csilgen_common::hoist_inline_named_numbers(&rename_reserved_php_names(spec));
     let surface = match config.target.as_str() {
         "php" | "php-server" => Surface::Server,
         "php-client" => Surface::Client,
@@ -408,16 +467,17 @@ fn generate_codec_file(spec: &CsilSpecSerialized, namespace: &str) -> String {
     let mut refusals = std::collections::BTreeSet::new();
     for (_, _, arms) in spec.rpc_operations() {
         for arm in &arms[1..] {
-            let wire = arm.rpc_variant_name().unwrap();
-            let class = format!("{}Refusal", php_class(wire));
+            let name = arm.rpc_variant_name().unwrap();
+            let wire = spec.declared_name(name);
+            let class = format!("{}Refusal", php_class(name));
             if refusals.insert(class.clone()) {
-                out.push_str(&format!("class {class} extends \\RuntimeException\n{{\n    public $value;\n\n    public function __construct($value)\n    {{\n        parent::__construct('{}');\n        $this->value = $value;\n    }}\n}}\n\n", wire));
+                out.push_str(&format!("class {class} extends \\RuntimeException\n{{\n    public $value;\n\n    public function __construct($value)\n    {{\n        parent::__construct('{}');\n        $this->value = $value;\n    }}\n}}\n\n", php_string_body(wire)));
             }
         }
     }
     out.push_str("class Codec\n{\n");
     out.push_str(
-        "    public static function encodeValue($value)\n    {\n        return CBOR::encode($value);\n    }\n\n    public static function decodeValue($bytes)\n    {\n        return CBOR::decode($bytes);\n    }\n\n    public static function toCborValue($value)\n    {\n        return $value;\n    }\n\n    public static function fromCborValue($value)\n    {\n        return $value;\n    }\n\n",
+        "    public static function encode_value($value)\n    {\n        return CBOR::encode($value);\n    }\n\n    public static function decode_value($bytes)\n    {\n        return CBOR::decode($bytes);\n    }\n\n",
     );
     out.push_str(
         "    /** A literal-typed union/enum arm carries no shape of its own on the wire — the\n     * variant index (or the bare value itself for an enum) already selects it — so\n     * decode only needs to confirm the payload equals the declared literal. */\n    public static function expectLiteral($value, $expected)\n    {\n        if ($value !== $expected) {\n            throw new CodecException('csil cbor: literal mismatch, expected ' . var_export($expected, true) . ', got ' . var_export($value, true));\n        }\n        return $value;\n    }\n\n",
@@ -550,13 +610,14 @@ fn generate_codec_file(spec: &CsilSpecSerialized, namespace: &str) -> String {
         for (service, op, arms) in spec.rpc_operations() {
             let stem = format!("{}{}", php_class(service), php_class(&op.name));
             let method = &op.name;
-            let success = arms[0].rpc_variant_name().unwrap();
+            let success = php_string_body(spec.declared_name(arms[0].rpc_variant_name().unwrap()));
             let enc = codec_suffix(&arms[0]);
             out.push_str(&format!("    public static function encode{stem}Reply(callable $handler)\n    {{\n        try {{\n            return ['variant' => '{success}', 'payload' => self::encode{enc}($handler())];\n"));
             resolve.push_str(&format!("        if ($service === '{service}' && $op === '{method}') {{\n            if ($variant === '{success}') return $payload;\n"));
             for arm in &arms[1..] {
-                let wire = arm.rpc_variant_name().unwrap();
-                let class = php_class(wire);
+                let name = arm.rpc_variant_name().unwrap();
+                let wire = php_string_body(spec.declared_name(name));
+                let class = php_class(name);
                 let codec = codec_suffix(arm);
                 out.push_str(&format!("        }} catch ({class}Refusal $error) {{\n            return ['variant' => '{wire}', 'payload' => self::encode{codec}($error->value)];\n"));
                 resolve.push_str(&format!("            if ($variant === '{wire}') throw new {class}Refusal(self::decode{codec}($payload));\n"));
@@ -1579,7 +1640,9 @@ fn codec_suffix(expr: &CsilTypeExpression) -> String {
         CsilTypeExpression::Builtin(name) if name == "timestamp" => "_timestamp".into(),
         CsilTypeExpression::Builtin(name) if name == "cddl_time" => "_cddl_time".into(),
         CsilTypeExpression::Reference(name) => php_class(name),
-        _ => "Value".to_string(),
+        // A Pascal-case rule class never starts with `_`, so the generic codec
+        // cannot share a method name with a rule's codec (a rule named `Value`).
+        _ => "_value".to_string(),
     }
 }
 
@@ -1649,7 +1712,11 @@ fn service_base(name: &str) -> String {
 }
 
 fn php_string(value: &str) -> String {
-    format!("'{}'", value.replace('\\', "\\\\").replace('\'', "\\'"))
+    format!("'{}'", php_string_body(value))
+}
+
+fn php_string_body(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('\'', "\\'")
 }
 
 fn php_literal(value: &CsilLiteralValue) -> String {

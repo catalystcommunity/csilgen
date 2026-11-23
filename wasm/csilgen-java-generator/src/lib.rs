@@ -1024,6 +1024,91 @@ fn find_alias(input: &WasmGeneratorInput, name: &str) -> Option<CsilTypeExpressi
     })
 }
 
+// A schema rule becomes a top-level class (and file) in the generated package. A rule
+// named after a class the package declares itself overwrites that class's file, or is
+// hidden inside `CsilCbor` by the nested class of the same name; one named after a
+// `java.lang` class or a `KNOWN_IMPORTS` class shadows it, or is shadowed by the import,
+// wherever the generated code writes the simple name. `rename_reserved` moves such rules
+// aside instead.
+const RESERVED_TYPE_NAMES: &[&str] = &[
+    // Declared by the generated package.
+    "CborArray",
+    "CborBool",
+    "CborBytes",
+    "CborEntry",
+    "CborFloat",
+    "CborInt",
+    "CborMap",
+    "CborNull",
+    "CborTag",
+    "CborText",
+    "CborUint",
+    "CborValue",
+    "ClientException",
+    "Codec",
+    "CsilCbor",
+    "CsilCborException",
+    "EncodedMessage",
+    "RpcReply",
+    "Transport",
+    "WireReply",
+    // Hoisted to imports by `hoist_imports`.
+    "ArrayList",
+    "Arrays",
+    "BigDecimal",
+    "BigInteger",
+    "ByteArrayOutputStream",
+    "Function",
+    "Instant",
+    "LinkedHashMap",
+    "List",
+    "LocalDate",
+    "Map",
+    "Objects",
+    "Pattern",
+    "StandardCharsets",
+    // `java.lang` classes the generated code names unqualified.
+    "Boolean",
+    "Class",
+    "Double",
+    "Float",
+    "IllegalArgumentException",
+    "Integer",
+    "Long",
+    "Math",
+    "Object",
+    "Override",
+    "RuntimeException",
+    "String",
+    "StringBuilder",
+    "Throwable",
+];
+
+/// The per-service classes the generator names after a service, which a rule of the same
+/// PascalCase name would overwrite just like a fixed one.
+fn service_class_names(spec: &csilgen_common::CsilSpecSerialized) -> Vec<String> {
+    spec.rules
+        .iter()
+        .filter(|rule| matches!(rule.rule_type, CsilRuleType::ServiceDef(_)))
+        .flat_map(|rule| {
+            [
+                format!("{}Client", service_base(&rule.name)),
+                format!("{}Router", rule.name.to_case(Case::Pascal)),
+            ]
+        })
+        .collect()
+}
+
+fn rename_reserved_types(
+    spec: &csilgen_common::CsilSpecSerialized,
+) -> csilgen_common::CsilSpecSerialized {
+    let service_classes = service_class_names(spec);
+    csilgen_common::rename_reserved(spec, |name| {
+        let class = name.to_case(Case::Pascal);
+        RESERVED_TYPE_NAMES.contains(&class.as_str()) || service_classes.contains(&class)
+    })
+}
+
 fn generate_java(input: &WasmGeneratorInput) -> Result<Vec<GeneratedFile>, i32> {
     let config = JavaConfig::from_input(input)?;
     // Inline group/choice fields have no named rule to hang a Java class and codec on, so
@@ -1035,8 +1120,9 @@ fn generate_java(input: &WasmGeneratorInput) -> Result<Vec<GeneratedFile>, i32> 
     // nothing to hoist.
     let hoisted = {
         let mut cloned = input.clone();
+        let renamed = rename_reserved_types(&input.csil_spec);
         cloned.csil_spec = csilgen_common::hoist_inline_composites(
-            &input.csil_spec,
+            &renamed,
             csilgen_common::HoistOptions {
                 hoist_all_literal_choices: false,
             },
@@ -2775,9 +2861,10 @@ fn generate_codec(input: &WasmGeneratorInput, config: &JavaConfig) -> Option<Gen
                 "        if (\"{service}\".equals(service) && \"{method}\".equals(op)) {{\n"
             ));
             for (i, arm) in arms.iter().enumerate() {
-                let wire = arm.rpc_variant_name().unwrap();
+                let arm_name = arm.rpc_variant_name().unwrap();
+                let wire = input.csil_spec.declared_name(arm_name);
                 let ty = map_type_boxed(arm);
-                let exception = format!("{}Refusal", pascal_op_name(wire));
+                let exception = format!("{}Refusal", pascal_op_name(arm_name));
                 let source = if i == 0 { "value" } else { "refusal.value" };
                 let enc = java_enc_value(arm, source, &records, &aliases, &choices, 0);
                 if i == 0 {
@@ -4324,19 +4411,19 @@ const CODEC_ENUM_SCALAR_JAVA: &str = r#"    public static Object asEnumScalar(Cb
 /// the mantissa exceeds 64 bits so no precision is lost.
 const CODEC_DECIMAL_JAVA: &str = r#"    public static CborValue encDecimal(java.math.BigDecimal d) {
         long exp = -(long) d.scale();
-        return new CborTag(4, new CborArray(java.util.List.of(new CborInt(exp), encBigInt(d.unscaledValue()))));
+        return new CborTag(4, new CborArray(java.util.List.of(new CborInt(exp), csilEncBigInt(d.unscaledValue()))));
     }
 
     public static java.math.BigDecimal asDecimal(CborValue v) {
         if (v instanceof CborTag t && t.num() == 4 && t.inner() instanceof CborArray a && a.items().size() == 2) {
             long exp = asI64(a.items().get(0));
-            java.math.BigInteger mant = decBigInt(a.items().get(1));
+            java.math.BigInteger mant = csilDecBigInt(a.items().get(1));
             return new java.math.BigDecimal(mant, (int) -exp);
         }
         throw new CsilCborException("csil cbor: expected CBOR tag 4 decimal");
     }
 
-    private static CborValue encBigInt(java.math.BigInteger m) {
+    private static CborValue csilEncBigInt(java.math.BigInteger m) {
         if (m.bitLength() <= 63) {
             return new CborInt(m.longValue());
         }
@@ -4350,7 +4437,7 @@ const CODEC_DECIMAL_JAVA: &str = r#"    public static CborValue encDecimal(java.
         return new CborTag(3, new CborBytes(magnitudeBytes(n)));
     }
 
-    private static java.math.BigInteger decBigInt(CborValue v) {
+    private static java.math.BigInteger csilDecBigInt(CborValue v) {
         if (v instanceof CborUint x) {
             return unsignedToBigInteger(x.value());
         }
@@ -4438,6 +4525,7 @@ mod tests {
                 source_content: None,
                 service_count,
                 fields_with_metadata_count: 0,
+                declared_names: Default::default(),
             },
             config: GeneratorConfig {
                 target: target.to_string(),
@@ -7320,5 +7408,49 @@ public final class PomCheck {
             &[("## CSIL-RPC (HTTP)", "RpcExample")],
         )
         .unwrap_or_else(|e| panic!("reply-arm javac failed:\n{e}"));
+    }
+
+    /// A rule named after a class the package declares (`Transport`) is renamed so the
+    /// generated sources compile, but an RPC reply variant still names the rule as the
+    /// CSIL source declares it, because the variant string is what a peer matches on.
+    #[test]
+    fn reserved_rule_name_is_renamed_but_keeps_its_wire_variant() {
+        let svc = CsilServiceDefinition {
+            operations: vec![op(
+                "fetch",
+                CsilTypeExpression::Reference("Ok".to_string()),
+                CsilTypeExpression::Choice(vec![
+                    CsilTypeExpression::Reference("Ok".to_string()),
+                    CsilTypeExpression::Reference("Transport".to_string()),
+                ]),
+                CsilServiceDirection::Unidirectional,
+                None,
+            )],
+            wire_id: None,
+        };
+        let group = || CsilGroupExpression {
+            entries: vec![bare("code", builtin("uint"), None)],
+        };
+        let files = generate_java(&input_for(
+            vec![
+                rule("Ok", CsilRuleType::GroupDef(group())),
+                rule("Transport", CsilRuleType::GroupDef(group())),
+                rule("Svc", CsilRuleType::ServiceDef(svc)),
+            ],
+            "java-client",
+        ))
+        .unwrap();
+        let record = file(&files, "/TransportType.java");
+        assert!(record.content.contains("public record TransportType("));
+        let seam = file(&files, "/Transport.java");
+        assert!(seam.content.contains("public interface Transport"));
+        let codec = file(&files, "CsilCbor.java");
+        assert!(codec.content.contains(
+            "if (\"Transport\".equals(variant)) throw new TransportTypeRefusal(decTransportType(decode(payload)));"
+        ));
+        assert!(codec.content.contains(
+            "return new RpcReply(\"Transport\", encode(encTransportType(refusal.value)));"
+        ));
+        assert!(!codec.content.contains("\"TransportType\""));
     }
 }

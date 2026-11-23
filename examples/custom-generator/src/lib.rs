@@ -444,6 +444,7 @@ mod tests {
                 source_content: None,
                 service_count: 1,
                 fields_with_metadata_count: 1,
+                declared_names: Default::default(),
             },
             config: GeneratorConfig {
                 target: "mdsummary".to_string(),
@@ -497,6 +498,7 @@ mod tests {
                 source_content: None,
                 service_count: 0,
                 fields_with_metadata_count: 0,
+                declared_names: Default::default(),
             },
             config: GeneratorConfig {
                 target: "mdsummary".to_string(),

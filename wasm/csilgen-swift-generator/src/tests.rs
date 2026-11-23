@@ -39,6 +39,7 @@ fn input_from_rules(
             source_content: None,
             service_count,
             fields_with_metadata_count: 0,
+            declared_names: Default::default(),
         },
         config: GeneratorConfig {
             target: target.to_string(),
@@ -3349,3 +3350,39 @@ let refused = try encodeShaperReshapeReply { throw ErrorRefusal(value: Error(cod
 expect(refused.variant == "Error")
 expect(ShaperWireID.service == 3 && ShaperWireID.reshape == 0)
 "#;
+
+#[test]
+fn reserved_rule_name_is_renamed_but_keeps_its_wire_variant() {
+    let ops = vec![make_op(
+        "op",
+        reference("Req"),
+        CsilTypeExpression::Choice(vec![reference("Req"), reference("CsilTransport")]),
+        CsilServiceDirection::Unidirectional,
+    )];
+    let input = input_from_rules(
+        "swift-client",
+        vec![
+            group_rule("Req", vec![bare_entry("id", builtin("int"))]),
+            group_rule("CsilTransport", vec![bare_entry("code", builtin("uint"))]),
+            service_rule("Svc", ops, None),
+        ],
+        1,
+    );
+    let files = build_files(&input).expect("ok");
+    let file = |path: &str| {
+        files
+            .iter()
+            .find(|f| f.path == path)
+            .map(|f| f.content.clone())
+            .expect(path)
+    };
+    let types = file("Types.swift");
+    assert!(types.contains("public struct CsilTransportType: Equatable, Sendable {"));
+    assert!(!types.contains("public struct CsilTransport:"));
+    let codec = file("Codec.swift");
+    assert!(codec.contains("public struct CsilTransportTypeRefusal: Swift.Error {"));
+    assert!(codec.contains("} catch let refusal as CsilTransportTypeRefusal {\n        return (\"CsilTransport\", CsilCbor.encode("));
+    assert!(
+        codec.contains("        case \"CsilTransport\": throw CsilTransportTypeRefusal(value: ")
+    );
+}

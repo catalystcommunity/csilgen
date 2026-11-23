@@ -124,6 +124,7 @@ fn create_test_input_with_config(use_json: bool, use_yaml: bool) -> WasmGenerato
         source_content: None,
         service_count: 0,
         fields_with_metadata_count: 0,
+        declared_names: Default::default(),
     };
 
     WasmGeneratorInput {
@@ -189,6 +190,7 @@ fn create_test_input_with_optional_field() -> WasmGeneratorInput {
         source_content: None,
         service_count: 0,
         fields_with_metadata_count: 0,
+        declared_names: Default::default(),
     };
 
     WasmGeneratorInput {

@@ -78,6 +78,7 @@ fn spec(rules: Vec<CsilRule>, service_count: usize) -> CsilSpecSerialized {
         source_content: None,
         service_count,
         fields_with_metadata_count: 0,
+        declared_names: Default::default(),
     }
 }
 
@@ -3591,6 +3592,52 @@ fn multi_arm_rules() -> Vec<CsilRule> {
             doc_comments: Vec::new(),
         },
     ]
+}
+
+/// A rule named after a `dart:core` type the output uses (`Map`) is renamed to
+/// `MapType`, but the reply variant on the wire stays the declared CSIL name.
+#[test]
+fn reserved_error_arm_is_renamed_but_keeps_its_wire_variant() {
+    let mut rules = multi_arm_rules();
+    rules[2].name = "Map".to_string();
+    if let CsilRuleType::ServiceDef(def) = &mut rules[3].rule_type {
+        def.operations[0].output_type =
+            CsilTypeExpression::Choice(vec![reference("Resp"), reference("Map")]);
+    }
+    let files = generate_dart_code(&spec(rules, 1), &config("dart")).unwrap();
+    let types = types_file(&files);
+    assert!(types.contains("final class MapType {"), "{types}");
+    assert!(!types.contains("final class Map {"), "{types}");
+    assert!(
+        types.contains("final class MapTypeRefusal implements Exception"),
+        "{types}"
+    );
+    assert!(
+        types.contains("  } on MapTypeRefusal catch (refusal) {\n    return ('Map', "),
+        "{types}"
+    );
+    assert!(
+        types.contains("      case 'Map':\n        throw MapTypeRefusal("),
+        "{types}"
+    );
+    assert!(!types.contains("'MapType'"), "{types}");
+}
+
+/// The renamed `CsilDecimalType` must not count as a use of `CsilDecimal`: the
+/// decimal import would be unused.
+#[test]
+fn renamed_reserved_rules_do_not_pull_in_unused_imports() {
+    let rules = vec![record_rule(
+        "CsilDecimal",
+        vec![entry("b", builtin("text"), false)],
+    )];
+    let files = generate_dart_code(&spec(rules, 0), &config("dart")).unwrap();
+    let types = types_file(&files);
+    assert!(types.contains("final class CsilDecimalType {"), "{types}");
+    assert!(
+        !types.contains("import 'csil_decimal.gen.dart';"),
+        "{types}"
+    );
 }
 
 /// `call` returns bytes alone, so a multi-arm operation goes through `callReply`

@@ -526,6 +526,7 @@ fn convert_csil_spec_to_serializable(spec: &CsilSpec) -> CsilSpecSerialized {
         source_content: None, // Could be provided if needed
         service_count,
         fields_with_metadata_count,
+        declared_names: Default::default(),
     }
 }
 

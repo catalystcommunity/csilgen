@@ -33,6 +33,7 @@ fn create_test_input_with_defaults(
             source_content: None,
             service_count: 0,
             fields_with_metadata_count: 1,
+            declared_names: Default::default(),
         },
         config: GeneratorConfig {
             target: "go".to_string(),
@@ -300,6 +301,7 @@ fn test_constructor_disabled_via_config() {
             source_content: None,
             service_count: 0,
             fields_with_metadata_count: 1,
+            declared_names: Default::default(),
         },
         config: GeneratorConfig {
             target: "go".to_string(),

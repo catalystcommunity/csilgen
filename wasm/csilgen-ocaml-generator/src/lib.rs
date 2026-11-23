@@ -129,6 +129,27 @@ fn resolve_surface(target: &str) -> Result<Surface, i32> {
     }
 }
 
+/// Snake-case names a rule must not take. A rule named after one of these hides
+/// the Stdlib type the generated code names unqualified (`result`, `option`,
+/// `bool`, ...), clashes with a type the package declares itself (`client`,
+/// `handler`, `outcome`), or reuses a polymorphic-variant tag the typed client
+/// already gives its own meaning (`` `Transport ``, `` `Decode ``).
+const RESERVED_TYPE_NAMES: &[&str] = &[
+    "result",
+    "option",
+    "list",
+    "string",
+    "bytes",
+    "bool",
+    "float",
+    "unit",
+    "client",
+    "handler",
+    "outcome",
+    "transport",
+    "decode",
+];
+
 fn generate_ocaml(
     spec: &CsilSpecSerialized,
     config: &GeneratorConfig,
@@ -144,8 +165,11 @@ fn generate_ocaml(
     // because OCaml has no anonymous sum-type field syntax at all — even a closed
     // all-literal choice (`Pending | Shipped | Delivered`) must be a *named* `type`
     // (see the crate's original hoist-pass module doc, preserved in git history).
+    let renamed = csilgen_common::rename_reserved(spec, |name| {
+        RESERVED_TYPE_NAMES.contains(&name.to_case(Case::Snake).as_str())
+    });
     let mut hoisted_spec = csilgen_common::hoist_inline_composites(
-        spec,
+        &renamed,
         csilgen_common::HoistOptions {
             hoist_all_literal_choices: true,
         },
@@ -2563,7 +2587,7 @@ fn generate_codec(spec: &CsilSpecSerialized) -> Option<String> {
         let method = &op.name;
         let stem = ocaml_ident(&format!("{service}_{method}"));
         let req = &op.input_type;
-        let success = arms[0].rpc_variant_name().unwrap();
+        let success = spec.declared_name(arms[0].rpc_variant_name().unwrap());
         let root = "root";
         if !op_input_is_null(req) {
             let enc = enc_value(req, "value", &records, &choice_set, &aliases);
@@ -2580,8 +2604,9 @@ fn generate_codec(spec: &CsilSpecSerialized) -> Option<String> {
             "  | {service:?}, {method:?}, Some {success:?} -> payload\n"
         ));
         for arm in &arms[1..] {
-            let wire = arm.rpc_variant_name().unwrap();
-            let tag = ocaml_module_name(wire);
+            let variant = arm.rpc_variant_name().unwrap();
+            let wire = spec.declared_name(variant);
+            let tag = ocaml_module_name(variant);
             if exceptions.insert(tag.clone()) {
                 let ty = map_type(arm);
                 out.push_str(&format!("exception {tag}_refusal of {ty}\n\n"));

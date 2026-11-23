@@ -1257,6 +1257,7 @@ mod tests {
             source_content: Some("User = { name: text, email?: text }".to_string()),
             service_count: 0,
             fields_with_metadata_count: 2,
+            declared_names: Default::default(),
         };
 
         WasmGeneratorInput {

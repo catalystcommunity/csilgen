@@ -763,6 +763,40 @@ enum Surface {
 /// Generate Dart source from a serialized CSIL spec. Public so the crate's
 /// integration tests can assert on the emitted Dart without going through the
 /// WASM boundary.
+// A rule whose Dart class name equals one of these would shadow a `dart:core` /
+// `dart:typed_data` type the generated code uses unqualified (`Map<K, V>`,
+// `Future<T>`, ...) or clash with a class the generated runtime declares itself,
+// and break the package. Such a rule is renamed to `<Name>Type`; its wire name
+// stays the declared name.
+const RESERVED_TYPE_NAMES: &[&str] = &[
+    "CsilCbor",
+    "CsilDecimal",
+    "DateTime",
+    "Exception",
+    "FormatException",
+    "Future",
+    "List",
+    "Map",
+    "MapEntry",
+    "Object",
+    "String",
+    "Uint8List",
+];
+
+/// Whether `body` uses the identifier `ident` as a whole word. A plain substring
+/// test would also match a longer name such as `Uint8ListType` (a renamed rule)
+/// and pull in an import the file never uses, which `dart analyze` rejects.
+fn mentions(body: &str, ident: &str) -> bool {
+    let is_ident = |c: char| c.is_ascii_alphanumeric() || c == '_' || c == '$';
+    body.match_indices(ident).any(|(at, _)| {
+        !body[..at].chars().next_back().is_some_and(is_ident)
+            && !body[at + ident.len()..]
+                .chars()
+                .next()
+                .is_some_and(is_ident)
+    })
+}
+
 pub fn generate_dart_code(
     spec: &CsilSpecSerialized,
     config: &GeneratorConfig,
@@ -779,6 +813,17 @@ pub fn generate_dart_code(
             }
         },
     };
+    // The library mapping's `Decimal` comes from `package:decimal`, so a rule of
+    // that name would clash with it the same way `CsilDecimal` does.
+    let decimal_type = match decimal_mapping {
+        DecimalMapping::Csil => "CsilDecimal",
+        DecimalMapping::Library => "Decimal",
+    };
+    let renamed = csilgen_common::rename_reserved(spec, |name| {
+        let ident = dart_type_name(name);
+        ident == decimal_type || RESERVED_TYPE_NAMES.contains(&ident.as_str())
+    });
+    let spec = &renamed;
     // Validated early (before any file is emitted) so a misconfigured value fails
     // loudly rather than silently degrading. Absent -> Both: the blocking client is
     // preserved and the async twin comes for free.
@@ -1827,7 +1872,7 @@ impl DartGenerator {
         for (service, op, arms) in spec.rpc_operations() {
             let method = &op.name;
             let stem = format!("{}{}", dart_type_name(service), dart_type_name(method));
-            let success = arms[0].rpc_variant_name().unwrap();
+            let success = spec.declared_name(arms[0].rpc_variant_name().unwrap());
             let ty = map_type(&arms[0], &None, decimal);
             let enc = dart_to_cbor_expr(&arms[0], "value", &records, &aliases, &unions).flat();
             let mut handler = format!(
@@ -1835,9 +1880,10 @@ impl DartGenerator {
             );
             resolve.push_str(&format!("  if (service == '{service}' && op == '{method}') {{\n    switch (variant) {{\n      case '{success}':\n        return payload;\n"));
             for arm in &arms[1..] {
-                let wire = arm.rpc_variant_name().unwrap();
+                let name = arm.rpc_variant_name().unwrap();
+                let wire = spec.declared_name(name);
                 let ty = map_type(arm, &None, decimal);
-                let class = format!("{}Refusal", dart_type_name(wire));
+                let class = format!("{}Refusal", dart_type_name(name));
                 if refusals.insert(class.clone()) {
                     types_code.push_str(&format!("final class {class} implements Exception {{\n  final {ty} value;\n  const {class}(this.value);\n}}\n\n"));
                 }
@@ -2044,7 +2090,7 @@ impl DartGenerator {
     fn file_header(&self, title: &str, extra: &[String], body: &str) -> String {
         let mut imports: Vec<String> = Vec::new();
         // Bytes come in as Uint8List; pull the import only when something needs it.
-        if body.contains("Uint8List") {
+        if mentions(body, "Uint8List") {
             imports.push("dart:typed_data".to_string());
         }
         if let Some(dec) = self.decimal_import(body) {
@@ -2078,7 +2124,7 @@ impl DartGenerator {
     /// references no decimal value. The two mappings live in different places: the
     /// generated helper file vs. the third-party `package:decimal`.
     fn decimal_import(&self, body: &str) -> Option<&'static str> {
-        if !body.contains(self.cfg.decimal_dart_type()) {
+        if !mentions(body, self.cfg.decimal_dart_type()) {
             return None;
         }
         Some(match self.cfg.decimal_mapping {
