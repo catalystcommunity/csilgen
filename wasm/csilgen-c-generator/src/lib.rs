@@ -10,10 +10,10 @@
 use csilgen_common::{
     ChoiceClass, CsilControlOperator, CsilFieldMetadata, CsilGroupEntry, CsilGroupExpression,
     CsilGroupKey, CsilLiteralValue, CsilOccurrence, CsilRuleType, CsilServiceDefinition,
-    CsilServiceDirection, CsilSizeConstraint, CsilTypeExpression, CsilValidationConstraint,
-    GeneratedFile, GenerationStats, GeneratorCapability, GeneratorMetadata, GeneratorWarning,
-    HoistOptions, WarningLevel, WasmGeneratorInput, WasmGeneratorOutput, hoist_inline_composites,
-    wasm_interface::*,
+    CsilServiceDirection, CsilSizeConstraint, CsilSpecSerialized, CsilTypeExpression,
+    CsilValidationConstraint, GeneratedFile, GenerationStats, GeneratorCapability,
+    GeneratorMetadata, GeneratorWarning, HoistOptions, WarningLevel, WasmGeneratorInput,
+    WasmGeneratorOutput, hoist_inline_composites, rename_reserved, wasm_interface::*,
 };
 use std::collections::HashMap;
 
@@ -158,6 +158,63 @@ enum Surface {
     TypesOnly,
 }
 
+/// Names the generated headers declare themselves, plus the C library types,
+/// macros and functions, and the parameter names, they use. C keeps a rule name
+/// as written, so a schema type with one of these names redeclares a symbol or
+/// turns a parameter name into a type name.
+const RESERVED_TYPE_NAMES: &[&str] = &[
+    "CsilBytes",
+    "CsilCodecArena",
+    "CsilDecimal",
+    "CsilTimestamp",
+    "CsilgenCodec",
+    "CsilgenTransport",
+    "csilc_arena_block",
+    "csilc_buf",
+    "csilc_kind",
+    "csilc_pair",
+    "csilc_value",
+    "INT64_MAX",
+    "NULL",
+    "SIZE_MAX",
+    "int64_t",
+    "size_t",
+    "uint16_t",
+    "uint32_t",
+    "uint64_t",
+    "uint8_t",
+    "calloc",
+    "free",
+    "malloc",
+    "memcmp",
+    "memcpy",
+    "realloc",
+    "strcmp",
+    "strlen",
+    "a",
+    "b",
+    "ctx",
+    "in",
+    "len",
+    "m",
+    "t",
+];
+
+/// The spec every emitter reads: reserved rule names renamed first (so the hoister
+/// names its synthesized rules against the final names), then every inline
+/// composite hoisted to a named rule.
+fn prepare_spec(spec: &CsilSpecSerialized) -> CsilSpecSerialized {
+    let renamed = rename_reserved(spec, |name| {
+        RESERVED_TYPE_NAMES.contains(&name) || C_RESERVED_MEMBER_NAMES.contains(&name)
+    });
+    hoist_inline_composites(
+        &renamed,
+        HoistOptions {
+            hoist_all_literal_choices: true,
+        },
+    )
+}
+
 fn process_generation(mut input: WasmGeneratorInput) -> Result<WasmGeneratorOutput, i32> {
     let config = CConfig::from_options(&input.config.options)?;
     // Rewrite every inline (anonymous) choice/group field position to a synthesized
@@ -171,12 +228,7 @@ fn process_generation(mut input: WasmGeneratorInput) -> Result<WasmGeneratorOutp
     // rendering path — so an all-literal choice needs the same synthesized name a
     // mixed-kind or type-bearing choice does (`hoist_all_literal_choices: true`,
     // matching OCaml's setting and rationale, not TypeScript's).
-    input.csil_spec = hoist_inline_composites(
-        &input.csil_spec,
-        HoistOptions {
-            hoist_all_literal_choices: true,
-        },
-    );
+    input.csil_spec = prepare_spec(&input.csil_spec);
     let surface = match input.config.target.as_str() {
         "c" | "c-server" => Surface::Server,
         "c-client" => Surface::Client,
@@ -2692,16 +2744,18 @@ fn generate_codec(
         let reply = rpc_reply_type(service, op);
         content.push_str(&format!("static inline int csil_encode_{reply}(const {reply} *reply, const char **variant, uint8_t **payload, size_t *len) {{\n    switch (reply->kind) {{\n"));
         for arm in arms {
-            let wire = arm.rpc_variant_name().unwrap();
-            let field = format!("as_{}", to_snake(wire));
+            let ident = arm.rpc_variant_name().unwrap();
+            let wire = input.csil_spec.declared_name(ident);
+            let field = format!("as_{}", to_snake(ident));
             let codec = classify_boundary(arm, &codec_names, config).codec_name;
             content.push_str(&format!("    case {reply}_{field}:\n        *variant = \"{wire}\";\n        return csil_encode_{codec}(&reply->value.{field}, payload, len);\n"));
         }
         content.push_str("    }\n    return -1;\n}\n\n");
         content.push_str(&format!("static inline int csil_decode_{reply}(const char *variant, const uint8_t *payload, size_t len, {reply} *reply, CsilCodecArena **owner) {{\n    if (!variant) return -1;\n"));
         for arm in arms {
-            let wire = arm.rpc_variant_name().unwrap();
-            let field = format!("as_{}", to_snake(wire));
+            let ident = arm.rpc_variant_name().unwrap();
+            let wire = input.csil_spec.declared_name(ident);
+            let field = format!("as_{}", to_snake(ident));
             let codec = classify_boundary(arm, &codec_names, config).codec_name;
             content.push_str(&format!("    if (strcmp(variant, \"{wire}\") == 0) {{\n        reply->kind = {reply}_{field};\n        return csil_decode_{codec}(payload, len, &reply->value.{field}, owner);\n    }}\n"));
         }

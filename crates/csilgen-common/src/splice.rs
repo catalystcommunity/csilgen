@@ -41,6 +41,7 @@ pub fn splice_group_references(spec: &CsilSpecSerialized) -> CsilSpecSerialized 
         source_content: spec.source_content.clone(),
         service_count: spec.service_count,
         fields_with_metadata_count: spec.fields_with_metadata_count,
+        declared_names: spec.declared_names.clone(),
     }
 }
 
@@ -210,6 +211,7 @@ mod tests {
             source_content: None,
             service_count: 0,
             fields_with_metadata_count: 0,
+            declared_names: Default::default(),
         }
     }
 

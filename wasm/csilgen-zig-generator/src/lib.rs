@@ -11,9 +11,10 @@
 use csilgen_common::{
     ChoiceClass, CsilControlOperator, CsilFieldMetadata, CsilGroupEntry, CsilGroupExpression,
     CsilGroupKey, CsilLiteralValue, CsilOccurrence, CsilRuleType, CsilServiceDefinition,
-    CsilServiceDirection, CsilSizeConstraint, CsilTypeExpression, CsilValidationConstraint,
-    GeneratedFile, GenerationStats, GeneratorCapability, GeneratorMetadata, GeneratorWarning,
-    WarningLevel, WasmGeneratorInput, WasmGeneratorOutput, wasm_interface::*,
+    CsilServiceDirection, CsilSizeConstraint, CsilSpecSerialized, CsilTypeExpression,
+    CsilValidationConstraint, GeneratedFile, GenerationStats, GeneratorCapability,
+    GeneratorMetadata, GeneratorWarning, WarningLevel, WasmGeneratorInput, WasmGeneratorOutput,
+    wasm_interface::*,
 };
 use std::collections::HashMap;
 
@@ -149,6 +150,56 @@ enum Surface {
     TypesOnly,
 }
 
+/// Names `types.gen.zig` declares itself. Zig emits a rule name as written as a
+/// bare `pub const` in that file, so a schema type with one of these names (or a
+/// keyword or primitive name, see `zig_reserved_type_name`) does not compile.
+const RESERVED_TYPE_NAMES: &[&str] = &["CsilDecimal", "CsilTimestamp", "CsilValue", "std"];
+
+/// Whether a rule named `name` cannot be declared as a bare Zig type name.
+fn zig_reserved_type_name(name: &str) -> bool {
+    const PRIMITIVES: &[&str] = &[
+        "isize",
+        "usize",
+        "f16",
+        "f32",
+        "f64",
+        "f80",
+        "f128",
+        "c_char",
+        "c_short",
+        "c_ushort",
+        "c_int",
+        "c_uint",
+        "c_long",
+        "c_ulong",
+        "c_longlong",
+        "c_ulonglong",
+        "c_longdouble",
+    ];
+    // Zig treats every `i<N>`/`u<N>` as a primitive integer type.
+    let int_primitive = name.len() > 1
+        && (name.starts_with('i') || name.starts_with('u'))
+        && name[1..].bytes().all(|b| b.is_ascii_digit());
+    int_primitive
+        || PRIMITIVES.contains(&name)
+        || ZIG_KEYWORDS.contains(&name)
+        || ZIG_PRIMITIVE_NAMES.contains(&name)
+        || RESERVED_TYPE_NAMES.contains(&name)
+}
+
+/// The spec every emitter reads: reserved rule names renamed first (so the hoister
+/// names its synthesized rules against the final names), then every inline
+/// composite hoisted to a named rule.
+fn prepare_spec(spec: &CsilSpecSerialized) -> CsilSpecSerialized {
+    let renamed = csilgen_common::rename_reserved(spec, zig_reserved_type_name);
+    csilgen_common::hoist_inline_composites(
+        &renamed,
+        csilgen_common::HoistOptions {
+            hoist_all_literal_choices: true,
+        },
+    )
+}
+
 fn process_generation(mut input: WasmGeneratorInput) -> Result<WasmGeneratorOutput, i32> {
     let config = ZigConfig::from_options(&input.config.options)?;
     let _ = &config;
@@ -169,12 +220,7 @@ fn process_generation(mut input: WasmGeneratorInput) -> Result<WasmGeneratorOutp
     // build for a *named* rule. Matches this generator's pre-existing behavior
     // (its own former hand-rolled hoister hoisted every inline `Choice`
     // unconditionally, with no all-literal exemption).
-    input.csil_spec = csilgen_common::hoist_inline_composites(
-        &input.csil_spec,
-        csilgen_common::HoistOptions {
-            hoist_all_literal_choices: true,
-        },
-    );
+    input.csil_spec = prepare_spec(&input.csil_spec);
     let surface = match input.config.target.as_str() {
         "zig" | "zig-server" => Surface::Server,
         "zig-client" => Surface::Client,
@@ -2185,8 +2231,9 @@ fn generate_codec(
         }
         content.push_str(&format!("pub fn encode_{reply}(alloc: std.mem.Allocator, value: types.{reply}) CodecError!RpcReply {{\n    var buf = std.ArrayList(u8).init(alloc);\n    errdefer buf.deinit();\n    const out = &buf;\n    switch (value) {{\n"));
         for arm in arms {
-            let wire = arm.rpc_variant_name().unwrap();
-            let tag = zig_field_ident(&to_snake(wire));
+            let ident = arm.rpc_variant_name().unwrap();
+            let wire = input.csil_spec.declared_name(ident);
+            let tag = zig_field_ident(&to_snake(ident));
             let capture = if enc_arm_uses_capture(arm, &aliases) {
                 "|v| "
             } else {
@@ -2207,8 +2254,9 @@ fn generate_codec(
         content.push_str("    }\n}\n\n");
         content.push_str(&format!("pub fn decode_{reply}(alloc: std.mem.Allocator, variant: ?[]const u8, payload: []const u8, out: *types.{reply}) CodecError!void {{\n    const name = variant orelse return error.WrongType;\n    const src = try decode(alloc, payload);\n"));
         for arm in arms {
-            let wire = arm.rpc_variant_name().unwrap();
-            let tag = zig_field_ident(&to_snake(wire));
+            let ident = arm.rpc_variant_name().unwrap();
+            let wire = input.csil_spec.declared_name(ident);
+            let tag = zig_field_ident(&to_snake(ident));
             let ty = map_zig_type(arm, "types.");
             content.push_str(&format!(
                 "    if (std.mem.eql(u8, name, \"{wire}\")) {{\n        var v: {ty} = undefined;\n"
@@ -4107,7 +4155,7 @@ fn half_to_f64(h: u16) f64 {
 // frame reserve a large multiple of its size at every nesting level.
 const prealloc_limit: usize = 1024;
 
-fn decode_value(alloc: std.mem.Allocator, b: []const u8, depth: usize) CodecError!Decoded {
+fn csil_decode_value(alloc: std.mem.Allocator, b: []const u8, depth: usize) CodecError!Decoded {
     if (depth > 64) return error.Malformed;
     if (b.len == 0) return error.UnexpectedEof;
     const ib = b[0];
@@ -4137,7 +4185,7 @@ fn decode_value(alloc: std.mem.Allocator, b: []const u8, depth: usize) CodecErro
             var off = n;
             var i: usize = 0;
             while (i < count) : (i += 1) {
-                const d = try decode_value(alloc, b[off..], depth + 1);
+                const d = try csil_decode_value(alloc, b[off..], depth + 1);
                 try items.append(alloc, d.value);
                 off += d.consumed;
             }
@@ -4150,16 +4198,16 @@ fn decode_value(alloc: std.mem.Allocator, b: []const u8, depth: usize) CodecErro
             var off = n;
             var i: usize = 0;
             while (i < count) : (i += 1) {
-                const k = try decode_value(alloc, b[off..], depth + 1);
+                const k = try csil_decode_value(alloc, b[off..], depth + 1);
                 off += k.consumed;
-                const v = try decode_value(alloc, b[off..], depth + 1);
+                const v = try csil_decode_value(alloc, b[off..], depth + 1);
                 off += v.consumed;
                 try pairs.append(alloc, .{ .key = k.value, .val = v.value });
             }
             return .{ .value = .{ .map = try pairs.toOwnedSlice(alloc) }, .consumed = off };
         },
         6 => {
-            const inner = try decode_value(alloc, b[n..], depth + 1);
+            const inner = try csil_decode_value(alloc, b[n..], depth + 1);
             const content = try alloc.create(Value);
             content.* = inner.value;
             return .{ .value = .{ .tag = .{ .num = arg, .content = content } }, .consumed = n + inner.consumed };
@@ -4178,7 +4226,7 @@ fn decode_value(alloc: std.mem.Allocator, b: []const u8, depth: usize) CodecErro
 }
 
 fn decode(alloc: std.mem.Allocator, b: []const u8) CodecError!Value {
-    const d = try decode_value(alloc, b, 0);
+    const d = try csil_decode_value(alloc, b, 0);
     if (d.consumed != b.len) return error.TrailingBytes;
     return d.value;
 }

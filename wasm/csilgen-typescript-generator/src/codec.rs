@@ -1028,8 +1028,9 @@ fn rpc_replies(spec: &CsilSpecSerialized, ctx: &Ctx) -> String {
             op.name
         ));
         for (index, arm) in arms.iter().enumerate() {
-            let wire = arm.rpc_variant_name().unwrap();
-            let cls = format!("{}Refusal", common::to_pascal(wire));
+            let name = arm.rpc_variant_name().unwrap();
+            let wire = spec.declared_name(name);
+            let cls = format!("{}Refusal", common::to_pascal(name));
             if index == 0 {
                 let value = ts_enc_value(arm, "value", ctx, &mut imports);
                 encode.push_str(&format!("    return {{ variant: {wire:?}, payload: encodeValue({value}) }};\n  }} catch (error) {{\n"));
@@ -1040,7 +1041,7 @@ fn rpc_replies(spec: &CsilSpecSerialized, ctx: &Ctx) -> String {
                     out.push_str(&format!("export class {cls} extends Error {{\n  readonly value: {ty};\n\n  constructor(value: {ty}) {{\n    super({wire:?});\n    this.value = value;\n  }}\n}}\n\n"));
                 }
                 let fallback =
-                    wire == "ServiceError" && !spec.rules.iter().any(|rule| rule.name == wire);
+                    name == "ServiceError" && !spec.rules.iter().any(|rule| rule.name == name);
                 let value = if fallback {
                     "new Map<CborValue, CborValue>([[\"code\", error.value.code], [\"message\", error.value.message]])".into()
                 } else {

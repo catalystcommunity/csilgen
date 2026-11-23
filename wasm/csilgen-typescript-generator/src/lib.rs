@@ -141,6 +141,58 @@ fn process_generation(input_ptr: *const u8, input_len: usize) -> Result<WasmGene
     })
 }
 
+// A rule whose TypeScript type name equals one of these would shadow a global the
+// generated code uses unqualified (`Map<K, V>`, `Promise`, ...) or collide with a
+// name the generated runtime declares or imports itself, and break the package.
+// Such a rule is renamed to `<Name>Type`; its wire name stays the declared name.
+const RESERVED_TYPE_NAMES: &[&str] = &[
+    "ApiClient",
+    "AsyncApiClient",
+    "AsyncServiceTransport",
+    "CborTag",
+    "CborValue",
+    "Codec",
+    "CsilDecimal",
+    "Cursor",
+    "Date",
+    "Map",
+    "Promise",
+    "Record",
+    "RequestContext",
+    "RpcReply",
+    "ServerHandlers",
+    "ServiceError",
+    "ServiceTransport",
+    "Uint8Array",
+];
+
+/// Whether the spec's own `ServiceError` record is exactly `{ code, message }`. The
+/// router throws `{ code, message } satisfies ServiceError`, so that shape can keep
+/// its name, and specs commonly declare it so. Any other shape is renamed.
+fn service_error_fits_router(spec: &csilgen_common::CsilSpecSerialized) -> bool {
+    spec.rules.iter().any(|rule| {
+        rule.name == "ServiceError"
+            && match &rule.rule_type {
+                csilgen_common::CsilRuleType::GroupDef(group)
+                | csilgen_common::CsilRuleType::TypeDef(
+                    csilgen_common::CsilTypeExpression::Group(group),
+                ) => {
+                    let mut keys: Vec<&str> = group
+                        .entries
+                        .iter()
+                        .filter_map(|entry| match &entry.key {
+                            Some(csilgen_common::CsilGroupKey::Bare(key)) => Some(key.as_str()),
+                            _ => None,
+                        })
+                        .collect();
+                    keys.sort_unstable();
+                    keys == ["code", "message"] && group.entries.len() == 2
+                }
+                _ => false,
+            }
+    })
+}
+
 /// Produce the set of files appropriate for the requested target. The client
 /// and server outputs always travel with the types file they import from.
 ///
@@ -151,7 +203,7 @@ pub fn generate_files(input: &WasmGeneratorInput) -> Result<Vec<GeneratedFile>, 
     // Validate options *before* deciding which files to emit so a bad option
     // fails the entire run, regardless of which target is requested.
     let _mode = common::bidi_transport(input)?;
-    let _decimal = common::decimal_mapping(input)?;
+    let decimal = common::decimal_mapping(input)?;
     let style = common::client_style(input)?;
     let _import_extension = common::import_extension(input)?;
 
@@ -164,8 +216,19 @@ pub fn generate_files(input: &WasmGeneratorInput) -> Result<Vec<GeneratedFile>, 
     // correct bare-literal enum for it in the field position itself.
     let hoisted = {
         let mut cloned = input.clone();
+        // The library mapping imports `Decimal` from `decimal.js`, so a rule of that
+        // name would clash with it.
+        let library_decimal = matches!(decimal, common::DecimalMapping::Library);
+        let keep_service_error = service_error_fits_router(&input.csil_spec);
+        let renamed = csilgen_common::rename_reserved(&input.csil_spec, |name| {
+            let ident = common::to_pascal(name);
+            if ident == "ServiceError" {
+                return !keep_service_error;
+            }
+            (library_decimal && ident == "Decimal") || RESERVED_TYPE_NAMES.contains(&ident.as_str())
+        });
         cloned.csil_spec = csilgen_common::hoist_inline_composites(
-            &input.csil_spec,
+            &renamed,
             csilgen_common::HoistOptions {
                 hoist_all_literal_choices: false,
             },

@@ -99,6 +99,7 @@ fn process_generation(input: WasmGeneratorInput) -> Result<WasmGeneratorOutput, 
     // OCaml/Kotlin do.
     let input = {
         let mut input = input;
+        input.csil_spec = csilgen_common::rename_reserved(&input.csil_spec, is_reserved_go_name);
         input.csil_spec = hoist_inline_groups(&input.csil_spec);
         input
     };
@@ -1975,6 +1976,7 @@ fn hoist_inline_groups(spec: &CsilSpecSerialized) -> CsilSpecSerialized {
         source_content: hoisted.source_content,
         service_count: hoisted.service_count,
         fields_with_metadata_count: hoisted.fields_with_metadata_count,
+        declared_names: hoisted.declared_names.clone(),
     }
 }
 
@@ -2405,7 +2407,7 @@ fn go_uses_enc_latch(code: &str) -> bool {
 /// a declared local that is never used.
 fn go_enc_latch_decl(body: &str, indent: &str) -> String {
     if go_uses_enc_latch(body) {
-        format!("{indent}var csilE csilEncErr\n")
+        format!("{indent}var csilE csilRtEncErr\n")
     } else {
         String::new()
     }
@@ -2425,7 +2427,7 @@ fn go_enc_entry_decls(body: &str, indent: &str) -> String {
 /// overflows, which Go cannot recover from.
 fn go_enc_depth_guard(indent: &str) -> String {
     format!(
-        "{indent}if csilDepth > csilEncDepthLimit {{\n{indent}{indent}return nil, fmt.Errorf(\"csil cbor: nesting limit exceeded\")\n{indent}}}\n"
+        "{indent}if csilDepth > csilRtEncDepthLimit {{\n{indent}{indent}return nil, fmt.Errorf(\"csil cbor: nesting limit exceeded\")\n{indent}}}\n"
     )
 }
 
@@ -3565,9 +3567,10 @@ fn emit_rpc_replies(
         );
         dispatch.push_str(&format!("\tcase service == {service:?} && op == {:?}:\n\t\tif variant == nil {{\n\t\t\treturn nil, &RPCDecodeError{{fmt.Errorf(\"missing RPC reply variant\")}}\n\t\t}}\n\t\tswitch *variant {{\n", op.name));
         for (i, arm) in arms.iter().enumerate() {
-            let wire = arm.rpc_variant_name().unwrap();
+            let ident = arm.rpc_variant_name().unwrap();
+            let wire = input.csil_spec.declared_name(ident);
             let helper = if is_record_ref(arm, records) {
-                wire.to_string()
+                ident.to_string()
             } else if i == 0 {
                 format!("{stem}Response")
             } else {
@@ -3897,15 +3900,15 @@ func cborEncodeE(v cborValue, err error) ([]byte, error) {
 	return cborEncode(v), nil
 }
 
-// csilEncDepthLimit is the nesting limit every decoder enforces.
-const csilEncDepthLimit = 64
+// csilRtEncDepthLimit is the nesting limit every decoder enforces.
+const csilRtEncDepthLimit = 64
 
-// csilEncErr keeps the first failure of one encode call. Go accepts a two-result
+// csilRtEncErr keeps the first failure of one encode call. Go accepts a two-result
 // call only as the sole argument of another call, so the latch lets a fallible
 // encoder sit inside a composite literal of the value tree.
-type csilEncErr struct{ err error }
+type csilRtEncErr struct{ err error }
 
-func (e *csilEncErr) val(v cborValue, err error) cborValue {
+func (e *csilRtEncErr) val(v cborValue, err error) cborValue {
 	if err != nil {
 		if e.err == nil {
 			e.err = err
@@ -3915,7 +3918,7 @@ func (e *csilEncErr) val(v cborValue, err error) cborValue {
 	return v
 }
 
-func (e *csilEncErr) result(v cborValue) (cborValue, error) {
+func (e *csilRtEncErr) result(v cborValue) (cborValue, error) {
 	if e.err != nil {
 		return nil, e.err
 	}
@@ -6584,6 +6587,25 @@ fn go_method_name(name: &str) -> String {
     pascal_case(name)
 }
 
+/// Exported names the generated package declares for itself. A schema type with one
+/// of these names would declare it twice, so it is renamed before generation. The
+/// codec's own unexported names use the `csilRt` prefix instead, which no per-type
+/// `csilEnc<Type>`/`csilDec<Type>` name can have.
+const RESERVED_GO_NAMES: &[&str] = &[
+    "Transport",
+    "WireReply",
+    "CsilDecimal",
+    "ParseCsilDecimal",
+    "ResolveRPCReply",
+    "RPCDecodeError",
+    "RPCEncodeError",
+    "RPCApplicationError",
+];
+
+fn is_reserved_go_name(name: &str) -> bool {
+    RESERVED_GO_NAMES.contains(&pascal_case(name).as_str())
+}
+
 fn pascal_case(s: &str) -> String {
     s.split(&['_', '-'][..])
         .map(|word| {
@@ -7119,6 +7141,7 @@ mod tests {
                 source_content: None,
                 service_count: 1,
                 fields_with_metadata_count: 0,
+                declared_names: Default::default(),
             },
             config: GeneratorConfig {
                 target: "go".to_string(),
@@ -7462,6 +7485,7 @@ mod tests {
                 source_content: None,
                 service_count: 1,
                 fields_with_metadata_count: 0,
+                declared_names: Default::default(),
             },
             config: GeneratorConfig {
                 target: target.to_string(),
@@ -7629,6 +7653,7 @@ mod tests {
                 source_content: None,
                 service_count: 0,
                 fields_with_metadata_count: 0,
+                declared_names: Default::default(),
             },
             config: GeneratorConfig {
                 target: "go".to_string(),
@@ -7993,6 +8018,7 @@ mod tests {
                 source_content: None,
                 service_count: 0,
                 fields_with_metadata_count: 0,
+                declared_names: Default::default(),
             },
             config: GeneratorConfig {
                 target: "go".to_string(),
@@ -8077,6 +8103,7 @@ mod tests {
                 source_content: None,
                 service_count: 0,
                 fields_with_metadata_count: 0,
+                declared_names: Default::default(),
             },
             config: GeneratorConfig {
                 target: "go".to_string(),
@@ -8297,6 +8324,7 @@ mod tests {
                 source_content: None,
                 service_count: 0,
                 fields_with_metadata_count: 0,
+                declared_names: Default::default(),
             },
             config: GeneratorConfig {
                 target: "go".to_string(),
@@ -8892,6 +8920,7 @@ mod tests {
                 source_content: None,
                 service_count: 0,
                 fields_with_metadata_count: 0,
+                declared_names: Default::default(),
             },
             config: GeneratorConfig {
                 target: "go".to_string(),
@@ -9071,6 +9100,7 @@ mod tests {
                 source_content: None,
                 service_count: 0,
                 fields_with_metadata_count: 0,
+                declared_names: Default::default(),
             },
             config: GeneratorConfig {
                 target: "go".to_string(),
@@ -10274,6 +10304,7 @@ func main() {
                 source_content: None,
                 service_count: 0,
                 fields_with_metadata_count: 0,
+                declared_names: Default::default(),
             },
             config: GeneratorConfig {
                 target: "go".to_string(),
@@ -10592,6 +10623,7 @@ func main() {
                 source_content: None,
                 service_count: 0,
                 fields_with_metadata_count: 0,
+                declared_names: Default::default(),
             },
             config: GeneratorConfig {
                 target: "go".to_string(),
@@ -10813,6 +10845,7 @@ func main() {
                 source_content: None,
                 service_count: 0,
                 fields_with_metadata_count: 0,
+                declared_names: Default::default(),
             },
             config: GeneratorConfig {
                 target: "go".to_string(),
@@ -10918,6 +10951,7 @@ func main() {
                 source_content: None,
                 service_count: 1,
                 fields_with_metadata_count: 0,
+                declared_names: Default::default(),
             },
             config: GeneratorConfig {
                 target: "go-client".to_string(),

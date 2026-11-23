@@ -128,11 +128,150 @@ enum Surface {
 /// goes through `process_generation` instead). Returns the emitted `.rb` files, or a
 /// WASM error code on an unknown sub-target so a typo fails loudly rather than
 /// silently degrading to the default surface.
+/// Constant names a record must not take. Records are top-level constants, so a
+/// record named after a core or loaded stdlib constant (`String`, `Data`,
+/// `Time`, `BigDecimal`) silently reassigns it for the whole process, and Ruby
+/// only warns. `CsilCbor` is the codec module, and `Tag` is `CsilCbor::Tag`,
+/// which hides a `Tag` record inside the codec. The core list is the
+/// Pascal-case `Object.constants` of Ruby 3.4 after the `bigdecimal`, `date`,
+/// `time`, and `set` requires.
+const RESERVED_TYPE_NAMES: &[&str] = &[
+    "ArgumentError",
+    "Array",
+    "BasicObject",
+    "BigDecimal",
+    "BigMath",
+    "Binding",
+    "Class",
+    "ClosedQueueError",
+    "Comparable",
+    "Complex",
+    "ConditionVariable",
+    "CsilCbor",
+    "Data",
+    "Date",
+    "DateTime",
+    "DidYouMean",
+    "Dir",
+    "Encoding",
+    "EncodingError",
+    "Enumerable",
+    "Enumerator",
+    "Errno",
+    "ErrorHighlight",
+    "Exception",
+    "FalseClass",
+    "Fiber",
+    "FiberError",
+    "File",
+    "FileTest",
+    "Float",
+    "FloatDomainError",
+    "FrozenError",
+    "Gem",
+    "Hash",
+    "IndexError",
+    "Integer",
+    "Interrupt",
+    "Kernel",
+    "KeyError",
+    "LoadError",
+    "LocalJumpError",
+    "Marshal",
+    "MatchData",
+    "Math",
+    "Method",
+    "Module",
+    "Monitor",
+    "MonitorMixin",
+    "Mutex",
+    "NameError",
+    "NilClass",
+    "NoMatchingPatternError",
+    "NoMatchingPatternKeyError",
+    "NoMemoryError",
+    "NoMethodError",
+    "NotImplementedError",
+    "Numeric",
+    "Object",
+    "ObjectSpace",
+    "Proc",
+    "Process",
+    "Queue",
+    "Ractor",
+    "Random",
+    "Range",
+    "RangeError",
+    "Rational",
+    "RbConfig",
+    "Refinement",
+    "Regexp",
+    "RegexpError",
+    "RuntimeError",
+    "ScriptError",
+    "SecurityError",
+    "Set",
+    "Signal",
+    "SignalException",
+    "SizedQueue",
+    "SortedSet",
+    "StandardError",
+    "StopIteration",
+    "String",
+    "Struct",
+    "Symbol",
+    "SyntaxError",
+    "SyntaxSuggest",
+    "SystemCallError",
+    "SystemExit",
+    "SystemStackError",
+    "Tag",
+    "Thread",
+    "ThreadError",
+    "ThreadGroup",
+    "Time",
+    "TracePoint",
+    "TrueClass",
+    "TypeError",
+    "UnboundMethod",
+    "UncaughtThrowError",
+    "UnicodeNormalize",
+    "Warning",
+    "ZeroDivisionError",
+];
+
+/// Rename each rule whose constant is reserved, or equals a class the generator
+/// derives from a service or an RPC error arm (`<Base>Client`, `<Base>Handlers`,
+/// `<Base>Router`, `CsilCbor::<Arm>Refusal`). A reopened `<Base>Client` replaces
+/// the record's constructor, and `<Arm>Refusal` hides the record in the codec.
+fn rename_reserved_ruby_names(spec: &CsilSpecSerialized) -> CsilSpecSerialized {
+    let mut derived = std::collections::HashSet::new();
+    for rule in &spec.rules {
+        if matches!(rule.rule_type, CsilRuleType::ServiceDef(_)) {
+            let base = service_base(&rule.name);
+            for suffix in ["Client", "Handlers", "Router"] {
+                derived.insert(format!("{base}{suffix}"));
+            }
+        }
+    }
+    for (_, _, arms) in spec.rpc_operations() {
+        for arm in &arms[1..] {
+            if let Some(name) = arm.rpc_variant_name() {
+                derived.insert(format!("{}Refusal", ruby_class_name(name)));
+            }
+        }
+    }
+    csilgen_common::rename_reserved(spec, |name| {
+        let class = ruby_class_name(name);
+        RESERVED_TYPE_NAMES.contains(&class.as_str()) || derived.contains(&class)
+    })
+}
+
 pub fn generate_ruby_code_from_serialized(
     spec: &CsilSpecSerialized,
     config: &GeneratorConfig,
 ) -> Result<Vec<GeneratedFile>, i32> {
-    let spec = &csilgen_common::hoist_inline_named_numbers(spec);
+    let spec = &csilgen_common::hoist_inline_named_numbers(&rename_reserved_ruby_names(spec));
     let surface = match config.target.as_str() {
         "ruby" | "ruby-server" => Surface::Server,
         "ruby-client" => Surface::Client,
@@ -2604,15 +2743,16 @@ fn generate_codec_file(spec: &CsilSpecSerialized) -> Option<String> {
     for (service, op, arms) in spec.rpc_operations() {
         let stem = ruby_method_name(&format!("{service}_{}", op.name));
         let method = &op.name;
-        let success = arms[0].rpc_variant_name().unwrap();
+        let success = spec.declared_name(arms[0].rpc_variant_name().unwrap());
         let enc = enc_tree(&arms[0], "value", &records, &aliases, &unions);
         let mut handler = format!(
             "  def encode_{stem}_reply\n    value = yield\n    [{success:?}, encode({enc})]\n"
         );
         resolve.push_str(&format!("    if service == {service:?} && op == {method:?}\n      case variant\n      when {success:?} then return payload\n"));
         for arm in &arms[1..] {
-            let wire = arm.rpc_variant_name().unwrap();
-            let class = format!("{}Refusal", ruby_class_name(wire));
+            let name = arm.rpc_variant_name().unwrap();
+            let wire = spec.declared_name(name);
+            let class = format!("{}Refusal", ruby_class_name(name));
             if refusals.insert(class.clone()) {
                 content.push_str(&format!("  class {class} < StandardError\n    attr_reader :value\n\n    def initialize(value)\n      @value = value\n      super({wire:?})\n    end\n  end\n\n"));
             }
@@ -3796,6 +3936,7 @@ mod tests {
             source_content: None,
             service_count: 0,
             fields_with_metadata_count: 0,
+            declared_names: Default::default(),
         };
         let group = CsilGroupExpression {
             entries: vec![bare("object_id", builtin("text"))],
@@ -3834,6 +3975,7 @@ mod tests {
             source_content: None,
             service_count: 0,
             fields_with_metadata_count: 0,
+            declared_names: Default::default(),
         };
         let out = generate_codec_file(&spec).unwrap();
         // Encode dispatches on the runtime class to the arm index; decode reads it back.
@@ -3876,6 +4018,7 @@ mod tests {
             source_content: None,
             service_count: 0,
             fields_with_metadata_count: 0,
+            declared_names: Default::default(),
         };
         let out = generate_codec_file(&spec).unwrap();
         assert!(!out.contains("enc_union_Color"));
@@ -3899,6 +4042,7 @@ mod tests {
             source_content: None,
             service_count: 0,
             fields_with_metadata_count: 0,
+            declared_names: Default::default(),
         };
         let codec = generate_codec_file(&spec).expect("records present -> codec emitted");
         assert!(codec.starts_with("# frozen_string_literal: true\n"));
@@ -3918,6 +4062,7 @@ mod tests {
             source_content: None,
             service_count: 0,
             fields_with_metadata_count: 0,
+            declared_names: Default::default(),
         };
         assert!(generate_codec_file(&spec).is_none());
     }
@@ -4084,6 +4229,7 @@ mod tests {
             source_content: None,
             service_count: 1,
             fields_with_metadata_count: 0,
+            declared_names: Default::default(),
         }
     }
 
@@ -4290,6 +4436,7 @@ mod tests {
             source_content: None,
             service_count: 0,
             fields_with_metadata_count: 0,
+            declared_names: Default::default(),
         };
         let mut config = package_config();
         config.target = "ruby-typesonly".to_string();

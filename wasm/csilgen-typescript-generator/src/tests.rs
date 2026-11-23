@@ -53,6 +53,7 @@ fn spec_of(rules: Vec<CsilRule>) -> CsilSpecSerialized {
         source_content: None,
         service_count: 0,
         fields_with_metadata_count: 0,
+        declared_names: Default::default(),
     }
 }
 
@@ -179,6 +180,7 @@ fn sample_spec() -> CsilSpecSerialized {
         source_content: None,
         service_count: 2,
         fields_with_metadata_count: 0,
+        declared_names: Default::default(),
     }
 }
 
@@ -584,6 +586,42 @@ fn domain_error_union_returns_the_success_record() {
     assert!(codec.contains("class LoginErrorRefusal"));
 }
 
+/// A rule named after a global the output uses (`Map`) is renamed to `MapType`,
+/// but the reply variant on the wire stays the declared CSIL name.
+#[test]
+fn reserved_error_arm_is_renamed_but_keeps_its_wire_variant() {
+    let mut spec = sample_spec();
+    if let CsilRuleType::ServiceDef(def) = &mut spec.rules[6].rule_type {
+        def.operations[0].output_type =
+            CsilTypeExpression::Choice(vec![reference("LoginResponse"), reference("Map")]);
+    }
+    spec.rules.push(group_rule(
+        "Map",
+        vec![field("reason", builtin("text"), false)],
+        vec![],
+    ));
+    let mut input = input_for("typescript");
+    input.csil_spec = spec;
+    let files = generate_files(&input).expect("generate");
+    let types = file(&files, "types.gen.ts");
+    assert!(types.contains("export interface MapType {"), "{types}");
+    assert!(!types.contains("export interface Map {"), "{types}");
+    let codec = file(&files, "codec.gen.ts");
+    assert!(
+        codec.contains("export class MapTypeRefusal extends Error"),
+        "{codec}"
+    );
+    assert!(
+        codec.contains("if (error instanceof MapTypeRefusal) return { variant: \"Map\","),
+        "{codec}"
+    );
+    assert!(
+        codec.contains("case \"Map\": { const tree = decode(payload); throw new MapTypeRefusal("),
+        "{codec}"
+    );
+    assert!(!codec.contains("\"MapType\""), "{codec}");
+}
+
 #[test]
 fn client_types_module_option_changes_import_path() {
     let mut input = input_for("typescript-client");
@@ -675,6 +713,7 @@ fn channel_spec() -> CsilSpecSerialized {
         source_content: None,
         service_count: 1,
         fields_with_metadata_count: 0,
+        declared_names: Default::default(),
     }
 }
 
@@ -2278,6 +2317,7 @@ fn unidirectional_op_with_null_input_omits_request_param() {
         source_content: None,
         service_count: 1,
         fields_with_metadata_count: 0,
+        declared_names: Default::default(),
     };
 
     let client = file(
@@ -2335,6 +2375,7 @@ fn push_only_reverse_op_with_null_input_emits_cleanly() {
         source_content: None,
         service_count: 1,
         fields_with_metadata_count: 0,
+        declared_names: Default::default(),
     };
 
     // Connection mode (default): client receives via a handler, server pushes via
@@ -2400,6 +2441,7 @@ fn wire_id_spec() -> CsilSpecSerialized {
         source_content: None,
         service_count: 1,
         fields_with_metadata_count: 0,
+        declared_names: Default::default(),
     }
 }
 

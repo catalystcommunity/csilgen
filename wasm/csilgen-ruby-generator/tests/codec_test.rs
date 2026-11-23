@@ -935,3 +935,90 @@ end
 end
 puts "ok"
 "##;
+
+/// A `String` record would reassign Ruby's `String` for the whole process, so it
+/// is renamed; as an RPC error arm its wire variant keeps the declared name.
+#[test]
+fn reserved_name_error_arm_is_renamed_but_keeps_its_wire_variant() {
+    let s = spec(vec![
+        group_rule("Ping", vec![bare_entry("n", builtin("int"))]),
+        group_rule("String", vec![bare_entry("code", builtin("int"))]),
+        service_rule(
+            "Pinger",
+            vec![op(
+                "ping",
+                reference("Ping"),
+                CsilTypeExpression::Choice(vec![reference("Ping"), reference("String")]),
+                CsilServiceDirection::Unidirectional,
+            )],
+            None,
+        ),
+    ]);
+    let files =
+        generate_ruby_code_from_serialized(&s, &config("ruby")).expect("generation succeeded");
+    let content = |path: &str| {
+        files
+            .iter()
+            .find(|f| f.path == path)
+            .map(|f| f.content.clone())
+            .unwrap()
+    };
+    let types = content("types.rb");
+    assert!(types.contains("StringType = Data.define(:code)"));
+    assert!(!types.contains("\nString = "));
+    let codec = content("codec.rb");
+    assert!(codec.contains("  class StringTypeRefusal < StandardError\n"));
+    assert!(codec.contains("      super(\"String\")\n"));
+    assert!(codec.contains(
+        "  rescue StringTypeRefusal => refusal\n    [\"String\", encode((refusal.value).csil_to_tree)]\n"
+    ));
+    assert!(codec.contains(
+        "      when \"String\" then raise StringTypeRefusal.new(StringType.csil_from_tree(decode(payload)))\n"
+    ));
+
+    let have = std::process::Command::new("ruby")
+        .arg("--version")
+        .output()
+        .is_ok();
+    if !have {
+        eprintln!("skipping: no ruby on PATH");
+        return;
+    }
+    let dir =
+        std::env::temp_dir().join(format!("csilgen-ruby-reserved-type-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    for f in &files {
+        std::fs::write(dir.join(&f.path), &f.content).unwrap();
+    }
+    std::fs::write(
+        dir.join("driver.rb"),
+        r#"core = String
+require_relative "types"
+require_relative "codec"
+raise "String was reassigned" unless String.equal?(core)
+value = StringType.new(code: 13)
+variant, payload = CsilCbor.encode_pinger_ping_reply { raise CsilCbor::StringTypeRefusal.new(value) }
+raise "variant #{variant.inspect}" unless variant == "String"
+begin
+  CsilCbor.resolve_rpc_reply("Pinger", "ping", variant, payload)
+  raise "missing refusal"
+rescue CsilCbor::StringTypeRefusal => e
+  raise "refusal value" unless e.value == value
+end
+puts "ok"
+"#,
+    )
+    .unwrap();
+    let run = std::process::Command::new("ruby")
+        .arg(dir.join("driver.rb"))
+        .output()
+        .unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).trim() == "ok",
+        "ruby reserved-name driver failed:\n{}{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+}

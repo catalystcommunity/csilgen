@@ -371,6 +371,7 @@ mod tests {
             source_content: Some("Test CSIL with services and metadata".to_string()),
             service_count: 1,
             fields_with_metadata_count: 2,
+            declared_names: Default::default(),
         };
 
         WasmGeneratorInput {
@@ -410,6 +411,7 @@ mod tests {
                 source_content: None,
                 service_count: 0,
                 fields_with_metadata_count: 0,
+                declared_names: Default::default(),
             },
             config: GeneratorConfig {
                 target: "test".to_string(),
@@ -547,6 +549,7 @@ mod tests {
                 source_content: None,
                 service_count: 0,
                 fields_with_metadata_count: 0,
+                declared_names: Default::default(),
             },
             config: GeneratorConfig {
                 target: "test".to_string(),

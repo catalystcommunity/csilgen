@@ -115,6 +115,7 @@ fn spec(rules: Vec<CsilRule>) -> CsilSpecSerialized {
         source_content: None,
         service_count,
         fields_with_metadata_count: 0,
+        declared_names: Default::default(),
     }
 }
 
@@ -610,21 +611,22 @@ fn mixed_kind_literal_choice_is_a_bare_enum_not_a_union() {
     // type, regardless of whether the declared literal kinds happen to match.
     // Matches the Go/PHP/Python/TypeScript generators' shared contract decision:
     // only a choice with at least one NON-literal arm is a tagged-sum union.
-    let s = spec(vec![choice_rule("Mixed", vec![text_lit("a"), int_lit(1)])]);
+    // `Mixed` itself is a reserved PHP class name, so the rule is `Blend`.
+    let s = spec(vec![choice_rule("Blend", vec![text_lit("a"), int_lit(1)])]);
     let out = generate_php_code_from_serialized(&s, &config("php-typesonly")).unwrap();
     let codec = file(&out, "codec.php");
 
     // Encode: an already-valid literal is its own CBOR value (identity), no
     // `[index, value]` wrapping array.
     assert!(codec.contains(
-        "    public static function toCborMixed($value)\n    {\n        return $value;\n    }\n\n"
+        "    public static function toCborBlend($value)\n    {\n        return $value;\n    }\n\n"
     ));
     // Decode: validated against the declared member set, spanning both literal
     // kinds in one membership list (PHP `===` distinguishes `1` (int) from `'1'`
     // (string) natively, so mixing kinds in one `csilMembers` array is safe).
     assert!(codec.contains("static $csilMembers = array('a', 1);"));
     assert!(codec.contains(
-        "throw new CodecException('csil cbor: unknown Mixed value ' . var_export($value, true));"
+        "throw new CodecException('csil cbor: unknown Blend value ' . var_export($value, true));"
     ));
     // Never the tagged-sum shape an actual union gets.
     assert!(!codec.contains("csilIdx"));

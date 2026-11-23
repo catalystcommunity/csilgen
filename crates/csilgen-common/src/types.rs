@@ -96,6 +96,21 @@ pub struct CsilSpecSerialized {
     pub service_count: usize,
     /// Total count of fields with metadata for quick access
     pub fields_with_metadata_count: usize,
+    /// The name in the CSIL source of each rule that a generator renamed, keyed by
+    /// the new name. An RPC reply variant puts the declared name on the wire, so a
+    /// rename must not change it.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub declared_names: std::collections::BTreeMap<String, String>,
+}
+
+impl CsilSpecSerialized {
+    /// The name in the CSIL source for the rule now called `name`.
+    pub fn declared_name<'a>(&'a self, name: &'a str) -> &'a str {
+        self.declared_names
+            .get(name)
+            .map(String::as_str)
+            .unwrap_or(name)
+    }
 }
 
 /// Serialized CSIL rule with position information
@@ -811,6 +826,7 @@ mod tests {
             source_content: Some("User = { name: text @bidirectional }".to_string()),
             service_count: 1,
             fields_with_metadata_count: 1,
+            declared_names: Default::default(),
         };
 
         let json = serde_json::to_string(&spec).expect("Serialization failed");
@@ -936,6 +952,7 @@ mod tests {
             source_content: None,
             service_count: 2,
             fields_with_metadata_count: 5,
+            declared_names: Default::default(),
         };
 
         let input = WasmGeneratorInput {
@@ -1282,6 +1299,7 @@ mod tests {
             source_content: Some("Complete CSIL spec with services and metadata".to_string()),
             service_count: 1,
             fields_with_metadata_count: 2,
+            declared_names: Default::default(),
         };
 
         let config = GeneratorConfig {

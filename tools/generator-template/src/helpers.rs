@@ -859,6 +859,7 @@ mod tests {
             source_content: None,
             service_count: 1,
             fields_with_metadata_count: 0,
+            declared_names: Default::default(),
         }
     }
 
@@ -885,6 +886,7 @@ mod tests {
             source_content: None,
             service_count: 0,
             fields_with_metadata_count: 0,
+            declared_names: Default::default(),
         }
     }
 }

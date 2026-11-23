@@ -73,6 +73,7 @@ fn spec(rules: Vec<CsilRule>) -> CsilSpecSerialized {
         source_content: None,
         service_count: 0,
         fields_with_metadata_count: 0,
+        declared_names: Default::default(),
     }
 }
 

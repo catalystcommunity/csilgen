@@ -235,6 +235,57 @@ impl ClientShape {
     }
 }
 
+// A schema rule becomes a type in the generated namespace. A rule named after a type the
+// package declares itself is a duplicate definition there; one named `System` hides the
+// `System` namespace every `System.*` reference starts from; one named `Transport` or
+// `Reply` gives the client method parameter (named after its type) the name of the
+// transport the method calls through or of the reply local it declares. `rename_reserved`
+// moves such rules aside instead.
+const RESERVED_TYPE_NAMES: &[&str] = &[
+    "Cbor",
+    "CborException",
+    "CborValue",
+    "Codec",
+    "CsilClientException",
+    "CsilDecimal",
+    "CsilWireReply",
+    "ICsilAsyncTransport",
+    "ICsilCodec",
+    "ICsilTransport",
+    "Reply",
+    "System",
+    "Transport",
+];
+
+/// The per-service types the generator names after a service, which a rule of the same
+/// name would duplicate just like a fixed one.
+fn service_type_names(spec: &csilgen_common::CsilSpecSerialized) -> Vec<String> {
+    spec.rules
+        .iter()
+        .filter(|rule| matches!(rule.rule_type, CsilRuleType::ServiceDef(_)))
+        .flat_map(|rule| {
+            let base = service_base(&rule.name);
+            [
+                format!("{base}Client"),
+                format!("{base}AsyncClient"),
+                format!("{base}Router"),
+                format!("{base}WireIds"),
+                service_interface_name(&rule.name),
+            ]
+        })
+        .collect()
+}
+
+fn rename_reserved_types(
+    spec: &csilgen_common::CsilSpecSerialized,
+) -> csilgen_common::CsilSpecSerialized {
+    let service_types = service_type_names(spec);
+    csilgen_common::rename_reserved(spec, |name| {
+        let ident = pascal_ident(name);
+        RESERVED_TYPE_NAMES.contains(&ident.as_str()) || service_types.contains(&ident)
+    })
+}
+
 /// The single typed entry point used by both the WASM `generate` export and the
 /// integration tests. Kept `pub` so the `rlib` crate-type lets tests drive real
 /// generation (a `cdylib`-only crate cannot be linked by integration tests).
@@ -257,6 +308,7 @@ pub fn render(mut input: WasmGeneratorInput) -> Result<WasmGeneratorOutput, i32>
     // hoists to a synthesized `ScalarsSize` enum today. Passing `false` here would silently
     // regress that field (and every field like it) back to an untyped `object` with a
     // null-emitting codec.
+    input.csil_spec = rename_reserved_types(&input.csil_spec);
     input.csil_spec.supply_implicit_service_error();
     input.csil_spec = csilgen_common::hoist_inline_composites(
         &input.csil_spec,
@@ -2673,9 +2725,10 @@ fn generate_codec(input: &WasmGeneratorInput, config: &CsharpConfig) -> Option<S
             );
             resolve.push_str(&format!("        if (service == \"{service}\" && op == \"{method}\")\n        {{\n            return variant switch\n            {{\n"));
             for (i, arm) in arms.iter().enumerate() {
-                let wire = arm.rpc_variant_name().unwrap();
+                let arm_name = arm.rpc_variant_name().unwrap();
+                let wire = input.csil_spec.declared_name(arm_name);
                 let ty = map_csil_type(arm, config);
-                let exception = format!("{}Refusal", pascal_ident(wire));
+                let exception = format!("{}Refusal", pascal_ident(arm_name));
                 let source = if i == 0 { "value" } else { "refusal.Value" };
                 let enc = csharp_enc_value(arm, source, &records, &aliases, &choices);
                 if i == 0 {
@@ -4799,6 +4852,7 @@ mod tests {
                 source_content: None,
                 service_count: 1,
                 fields_with_metadata_count: 0,
+                declared_names: Default::default(),
             },
             config: GeneratorConfig {
                 target: target.to_string(),
@@ -4878,6 +4932,7 @@ mod tests {
                 source_content: None,
                 service_count: 1,
                 fields_with_metadata_count: 0,
+                declared_names: Default::default(),
             },
             config: GeneratorConfig {
                 target: target.to_string(),
@@ -4894,6 +4949,45 @@ mod tests {
                 homepage: None,
             },
         }
+    }
+
+    /// A rule named after a type the package declares (`Codec`) is renamed so the
+    /// generated sources compile, but an RPC reply variant still names the rule as the
+    /// CSIL source declares it, because the variant string is what a peer matches on.
+    #[test]
+    fn reserved_rule_name_is_renamed_but_keeps_its_wire_variant() {
+        let mut input = pingpong_input("csharp-server");
+        for rule in &mut input.csil_spec.rules {
+            match &mut rule.rule_type {
+                CsilRuleType::GroupDef(_) if rule.name == "ServiceError" => {
+                    rule.name = "Codec".to_string();
+                }
+                CsilRuleType::ServiceDef(svc) => {
+                    svc.operations[0].output_type = CsilTypeExpression::Choice(vec![
+                        CsilTypeExpression::Reference("PongResponse".to_string()),
+                        CsilTypeExpression::Reference("Codec".to_string()),
+                    ]);
+                }
+                _ => {}
+            }
+        }
+        let out = render(input).expect("generation ok");
+        let file = |suffix: &str| {
+            out.files
+                .iter()
+                .find(|f| f.path.ends_with(suffix))
+                .map(|f| f.content.clone())
+                .unwrap_or_else(|| panic!("no file ending in {suffix}"))
+        };
+        let types = file("Types.gen.cs");
+        assert!(types.contains("public sealed record CodecType"));
+        let codec = file("Codec.gen.cs");
+        assert!(codec.contains("public static class Codec"));
+        assert!(
+            codec.contains("return (\"Codec\", Cbor.Encode(CodecTypeToCborValue(refusal.Value)));")
+        );
+        assert!(codec.contains("\"Codec\" => throw new CodecTypeRefusal("));
+        assert!(!codec.contains("\"CodecType\""));
     }
 
     /// A service with ONLY a `<->` (bidirectional/channel) operation — no `Unidirectional`
@@ -4940,6 +5034,7 @@ mod tests {
                 source_content: None,
                 service_count: 1,
                 fields_with_metadata_count: 0,
+                declared_names: Default::default(),
             },
             config: GeneratorConfig {
                 target: target.to_string(),
@@ -5062,6 +5157,7 @@ mod tests {
                 source_content: None,
                 service_count: 0,
                 fields_with_metadata_count: 0,
+                declared_names: Default::default(),
             },
             config: GeneratorConfig {
                 target: target.to_string(),
@@ -5228,6 +5324,7 @@ System.Console.WriteLine("ok");
                 source_content: None,
                 service_count: 0,
                 fields_with_metadata_count: 0,
+                declared_names: Default::default(),
             },
             config: GeneratorConfig {
                 target: target.to_string(),
@@ -5413,6 +5510,7 @@ System.Console.WriteLine("ok");
                 source_content: None,
                 service_count: 1,
                 fields_with_metadata_count: 0,
+                declared_names: Default::default(),
             },
             config: GeneratorConfig {
                 target: target.to_string(),
@@ -5768,6 +5866,7 @@ System.Console.WriteLine("ok");
                 source_content: None,
                 service_count: 1,
                 fields_with_metadata_count: 0,
+                declared_names: Default::default(),
             },
             config: GeneratorConfig {
                 target: target.to_string(),
@@ -6063,6 +6162,7 @@ System.Console.WriteLine("ok");
                 source_content: None,
                 service_count: 1,
                 fields_with_metadata_count: 1,
+                declared_names: Default::default(),
             },
             config: GeneratorConfig {
                 target: target.to_string(),
@@ -6117,6 +6217,7 @@ System.Console.WriteLine("ok");
             source_content: None,
             service_count: 0,
             fields_with_metadata_count: 0,
+            declared_names: Default::default(),
         };
 
         let output = render(input).expect("generation ok");
@@ -6280,6 +6381,7 @@ System.Console.WriteLine("ok");
                 source_content: None,
                 service_count: 0,
                 fields_with_metadata_count: 3,
+                declared_names: Default::default(),
             },
             config: GeneratorConfig {
                 target: target.to_string(),
@@ -6455,6 +6557,7 @@ System.Console.WriteLine("ok");
                 source_content: None,
                 service_count: 0,
                 fields_with_metadata_count: 0,
+                declared_names: Default::default(),
             },
             config: GeneratorConfig {
                 target: target.to_string(),
@@ -7576,6 +7679,7 @@ internal sealed class SyncLoopback : ICsilTransport
                 source_content: None,
                 service_count: 1,
                 fields_with_metadata_count: 0,
+                declared_names: Default::default(),
             },
             config: GeneratorConfig {
                 target: target.to_string(),
@@ -7701,6 +7805,7 @@ internal sealed class SyncLoopback : ICsilTransport
                 source_content: None,
                 service_count: 0,
                 fields_with_metadata_count: 0,
+                declared_names: Default::default(),
             },
             config: GeneratorConfig {
                 target: "csharp".to_string(),

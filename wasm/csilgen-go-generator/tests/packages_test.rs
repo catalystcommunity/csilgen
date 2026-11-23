@@ -118,6 +118,7 @@ fn input(target: &str, options: HashMap<String, serde_json::Value>) -> WasmGener
             source_content: None,
             service_count: 1,
             fields_with_metadata_count: 0,
+            declared_names: Default::default(),
         },
         config: GeneratorConfig {
             target: target.to_string(),

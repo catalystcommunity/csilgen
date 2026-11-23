@@ -492,6 +492,7 @@ mod tests {
             source_content: Some("Test CSIL".to_string()),
             service_count: 0,
             fields_with_metadata_count: 1,
+            declared_names: Default::default(),
         };
 
         WasmGeneratorInput {

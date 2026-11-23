@@ -76,6 +76,7 @@ fn input_with_rules(
             source_content: None,
             service_count,
             fields_with_metadata_count: 0,
+            declared_names: Default::default(),
         },
         config: GeneratorConfig {
             target: target.to_string(),
@@ -412,8 +413,8 @@ fn text_lit(s: &str) -> CsilTypeExpression {
     CsilTypeExpression::Literal(CsilLiteralValue::Text(s.to_string()))
 }
 
-/// Build an input exactly like `input_with_rules`, but with the inline-composite
-/// hoisting pass already applied — the same rewrite `process_generation` runs before
+/// Build an input exactly like `input_with_rules`, but with the `prepare_spec` pass
+/// (reserved-name renames, then inline-composite hoisting) already applied — the same rewrite `process_generation` runs before
 /// any other phase. The white-box `generate_types`/`generate_codec` tests below call
 /// this (rather than `process_generation`) so they can assert on one phase's output
 /// in isolation, matching the rest of this file's testing style.
@@ -423,12 +424,7 @@ fn hoisted_input(
     options: HashMap<String, serde_json::Value>,
 ) -> WasmGeneratorInput {
     let mut input = input_with_rules(rules, target, options);
-    input.csil_spec = csilgen_common::hoist_inline_composites(
-        &input.csil_spec,
-        csilgen_common::HoistOptions {
-            hoist_all_literal_choices: true,
-        },
-    );
+    input.csil_spec = prepare_spec(&input.csil_spec);
     input
 }
 
@@ -2757,3 +2753,53 @@ pub fn main() !void {
     try std.io.getStdOut().writer().print("ok\n", .{});
 }
 "#;
+
+#[test]
+fn reserved_error_arm_is_renamed_but_keeps_its_wire_name() {
+    // A record named `CsilDecimal` would redeclare the decimal re-export in
+    // `types.gen.zig`.
+    let req = group_rule("Req", vec![bare_entry("id", builtin("text"))]);
+    let err = group_rule("CsilDecimal", vec![bare_entry("message", builtin("text"))]);
+    let svc = service_rule(
+        "Svc",
+        vec![op(
+            "get",
+            CsilTypeExpression::Reference("Req".to_string()),
+            CsilTypeExpression::Choice(vec![
+                CsilTypeExpression::Reference("Req".to_string()),
+                CsilTypeExpression::Reference("CsilDecimal".to_string()),
+            ]),
+            CsilServiceDirection::Unidirectional,
+            None,
+        )],
+        None,
+    );
+    let out =
+        process_generation(input_with_rules(vec![req, err, svc], "zig", HashMap::new())).unwrap();
+    let all: String = out.files.iter().map(|f| f.content.as_str()).collect();
+    assert!(
+        all.contains("pub const CsilDecimalType = struct {"),
+        "{all}"
+    );
+    assert!(!all.contains("pub const CsilDecimal = struct {"), "{all}");
+    assert!(all.contains(".variant = \"CsilDecimal\""), "{all}");
+    assert!(
+        all.contains("std.mem.eql(u8, name, \"CsilDecimal\")"),
+        "{all}"
+    );
+    assert!(!all.contains("\"CsilDecimalType\""), "{all}");
+}
+
+#[test]
+fn primitive_and_keyword_rule_names_are_renamed() {
+    let rules = vec![
+        group_rule("u8", vec![bare_entry("id", builtin("text"))]),
+        group_rule("struct", vec![bare_entry("id", builtin("text"))]),
+        group_rule("u", vec![bare_entry("id", builtin("text"))]),
+    ];
+    let out = process_generation(input_with_rules(rules, "zig", HashMap::new())).unwrap();
+    let all: String = out.files.iter().map(|f| f.content.as_str()).collect();
+    assert!(all.contains("pub const u8Type = struct {"), "{all}");
+    assert!(all.contains("pub const structType = struct {"), "{all}");
+    assert!(all.contains("pub const u = struct {"), "{all}");
+}

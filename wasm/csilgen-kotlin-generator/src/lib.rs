@@ -12,7 +12,8 @@ use csilgen_common::{
     CsilServiceDirection, CsilServiceOperation, CsilSizeConstraint, CsilTypeExpression,
     CsilValidationConstraint, GeneratedFile, GenerationStats, GeneratorCapability,
     GeneratorMetadata, GeneratorWarning, HoistOptions, WarningLevel, WasmGeneratorInput,
-    WasmGeneratorOutput, choice_arm_literal, hoist_inline_composites, wasm_interface::*,
+    WasmGeneratorOutput, choice_arm_literal, hoist_inline_composites, rename_reserved,
+    wasm_interface::*,
 };
 use std::collections::HashMap;
 
@@ -150,6 +151,71 @@ impl ClientShape {
     }
 }
 
+// A schema rule becomes a top-level class in the generated package. A rule named after a
+// declaration the package makes itself redeclares it; one named after a `kotlin.*` or
+// default-imported JVM class the generated code writes by simple name shadows it there.
+// `rename_reserved` moves such rules aside instead.
+const RESERVED_TYPE_NAMES: &[&str] = &[
+    // Declared by the generated package.
+    "AsyncTransport",
+    "CborError",
+    "CborValue",
+    "ClientError",
+    "Codec",
+    "CsilCbor",
+    "RpcReply",
+    "Transport",
+    "WireReply",
+    // Built-ins the generated code names unqualified.
+    "Any",
+    "Boolean",
+    "Byte",
+    "ByteArray",
+    "Char",
+    "Charsets",
+    "Class",
+    "Double",
+    "Float",
+    "Int",
+    "List",
+    "Long",
+    "Map",
+    "Math",
+    "MutableList",
+    "Pair",
+    "RuntimeException",
+    "String",
+    "Throwable",
+    "ULong",
+];
+
+/// The per-service declarations the generator names after a service, which a rule of the
+/// same name would redeclare just like a fixed one.
+fn service_type_names(spec: &csilgen_common::CsilSpecSerialized) -> Vec<String> {
+    spec.rules
+        .iter()
+        .filter(|rule| matches!(rule.rule_type, CsilRuleType::ServiceDef(_)))
+        .flat_map(|rule| {
+            let base = service_base(&rule.name);
+            [
+                format!("{base}Client"),
+                format!("{base}AsyncClient"),
+                format!("{}WireIds", pascal_case(&rule.name)),
+            ]
+        })
+        .collect()
+}
+
+fn rename_reserved_types(
+    spec: &csilgen_common::CsilSpecSerialized,
+) -> csilgen_common::CsilSpecSerialized {
+    let service_types = service_type_names(spec);
+    rename_reserved(spec, |name| {
+        let class = pascal_case(name);
+        RESERVED_TYPE_NAMES.contains(&class.as_str()) || service_types.contains(&class)
+    })
+}
+
 fn process_generation(mut input: WasmGeneratorInput) -> Result<WasmGeneratorOutput, i32> {
     // Lift every inline (anonymous) group/choice to a synthesized named rule up front,
     // so all downstream generation (types, codec, client, services) sees one uniform
@@ -159,6 +225,7 @@ fn process_generation(mut input: WasmGeneratorInput) -> Result<WasmGeneratorOutp
     // opaque `Any`/`CborValue.CNull` fallback), so an ALL-literal choice is hoisted
     // too (`hoist_all_literal_choices: true`) — unlike TypeScript/Go, Kotlin has no
     // bare-inline-enum rendering to fall back to; every choice needs a name.
+    input.csil_spec = rename_reserved_types(&input.csil_spec);
     input.csil_spec.supply_implicit_service_error();
     input.csil_spec = hoist_inline_composites(
         &input.csil_spec,
@@ -2667,9 +2734,10 @@ fn generate_codec(input: &WasmGeneratorInput, config: &KotlinConfig) -> Option<S
             );
             resolve.push_str(&format!("    if (service == \"{service}\" && op == \"{method}\") {{\n        return when (variant) {{\n"));
             for (i, arm) in arms.iter().enumerate() {
-                let wire = arm.rpc_variant_name().unwrap();
+                let arm_name = arm.rpc_variant_name().unwrap();
+                let wire = input.csil_spec.declared_name(arm_name);
                 let ty = map_csil_type_to_kotlin(arm, &None);
-                let exception = format!("{}Refusal", pascal_case(wire));
+                let exception = format!("{}Refusal", pascal_case(arm_name));
                 let source = if i == 0 { "value" } else { "refusal.value" };
                 let enc = kotlin_enc_value(arm, source, &codec_named, &aliases);
                 if i == 0 {
@@ -4064,6 +4132,7 @@ mod tests {
                 source_content: None,
                 service_count,
                 fields_with_metadata_count: 0,
+                declared_names: Default::default(),
             },
             config: GeneratorConfig {
                 target: target.to_string(),
@@ -6186,5 +6255,45 @@ mod tests {
             Some(CsilLiteralValue::Integer(5))
         ));
         assert!(choice_arm_literal(&builtin("text")).is_none());
+    }
+
+    /// A rule named after a class the package declares (`Transport`) is renamed so the
+    /// generated sources compile, but an RPC reply variant still names the rule as the
+    /// CSIL source declares it, because the variant string is what a peer matches on.
+    #[test]
+    fn reserved_rule_name_is_renamed_but_keeps_its_wire_variant() {
+        let group = || CsilGroupExpression {
+            entries: vec![entry("code", builtin("uint"), None)],
+        };
+        let svc = CsilServiceDefinition {
+            operations: vec![op(
+                "fetch",
+                reference("Ok"),
+                CsilTypeExpression::Choice(vec![reference("Ok"), reference("Transport")]),
+                CsilServiceDirection::Unidirectional,
+                None,
+            )],
+            wire_id: None,
+        };
+        let out = process_generation(spec(
+            "kotlin",
+            vec![
+                rule("Ok", CsilRuleType::GroupDef(group())),
+                rule("Transport", CsilRuleType::GroupDef(group())),
+                rule("Svc", CsilRuleType::ServiceDef(svc)),
+            ],
+        ))
+        .unwrap();
+        let types = content(&out, "Types.kt");
+        assert!(types.contains("data class TransportType("));
+        assert!(!types.contains("data class Transport("));
+        let codec = content(&out, "Codec.kt");
+        assert!(codec.contains(
+            "\"Transport\" -> throw TransportTypeRefusal(transportTypeFromCborValue(CsilCbor.decode(payload)))"
+        ));
+        assert!(
+            codec.contains("RpcReply(\"Transport\", CsilCbor.encode(refusal.value.toCborValue()))")
+        );
+        assert!(!codec.contains("\"TransportType\""));
     }
 }

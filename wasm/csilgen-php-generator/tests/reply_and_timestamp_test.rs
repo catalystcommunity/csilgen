@@ -84,6 +84,7 @@ fn echo_spec(multi: bool) -> CsilSpecSerialized {
         source_content: None,
         service_count: 1,
         fields_with_metadata_count: 0,
+        declared_names: Default::default(),
     }
 }
 
@@ -261,6 +262,7 @@ fn timestamp_codec_is_tagged_and_strict() {
         source_content: None,
         service_count: 0,
         fields_with_metadata_count: 0,
+        declared_names: Default::default(),
     };
     let files = generate_php_code_from_serialized(&spec, &config("php", false)).unwrap();
     let codec = file(&files, "codec.php");
@@ -279,6 +281,7 @@ fn cddl_time_codec_is_tag_one_epoch_seconds() {
         source_content: None,
         service_count: 0,
         fields_with_metadata_count: 0,
+        declared_names: Default::default(),
     };
     let files = generate_php_code_from_serialized(&spec, &config("php", false)).unwrap();
     let codec = file(&files, "codec.php");
@@ -374,4 +377,87 @@ echo "ok\n";
         String::from_utf8_lossy(&run.stderr)
     );
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A `Codec` record used as an RPC error arm would redeclare the generated
+/// `Codec` class, so it is renamed; the wire variant keeps the declared name. A
+/// `Value` record keeps its name, because the generic codec is `encode_value`.
+#[test]
+fn reserved_name_error_arm_is_renamed_but_keeps_its_wire_variant() {
+    let mut spec = echo_spec(true);
+    for rule in &mut spec.rules {
+        if rule.name == "Fault" {
+            rule.name = "Codec".to_string();
+        }
+        if let CsilRuleType::ServiceDef(def) = &mut rule.rule_type {
+            def.operations[0].output_type =
+                CsilTypeExpression::Choice(vec![reference("Pong"), reference("Codec")]);
+        }
+    }
+    spec.rules.push(group_rule("Value", "n", "int"));
+    let files = generate_php_code_from_serialized(&spec, &config("php-server", false)).unwrap();
+    let types = file(&files, "types.php");
+    assert!(types.contains("class CodecType\n"));
+    assert!(types.contains("class Value\n"));
+    let codec = file(&files, "codec.php");
+    assert!(codec.contains("class CodecTypeRefusal extends \\RuntimeException"));
+    assert!(codec.contains("parent::__construct('Codec');"));
+    assert!(codec.contains(
+        "} catch (CodecTypeRefusal $error) {\n            return ['variant' => 'Codec', 'payload' => self::encodeCodecType($error->value)];"
+    ));
+    assert!(codec.contains(
+        "if ($variant === 'Codec') throw new CodecTypeRefusal(self::decodeCodecType($payload));"
+    ));
+    assert_eq!(codec.matches("function encodeValue(").count(), 1);
+    assert!(codec.contains("public static function encode_value($value)"));
+    if !have_php() {
+        eprintln!("skipping: no php on PATH");
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("csilgen-php-reserved-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    for f in &files {
+        std::fs::write(dir.join(&f.path), &f.content).unwrap();
+    }
+    let mut script = String::from("<?php\n");
+    for lib in ["Errors", "CBOR"] {
+        script.push_str(&format!(
+            "require_once {:?};\n",
+            transport_src()
+                .join(format!("{lib}.php"))
+                .display()
+                .to_string()
+        ));
+    }
+    script.push_str(
+        r#"require_once __DIR__ . '/types.php';
+require_once __DIR__ . '/codec.php';
+
+use Csilgen\Generated\{Codec, CodecType, CodecTypeRefusal, Value};
+
+$reply = Codec::encodePingerPingReply(function () {
+    throw new CodecTypeRefusal(new CodecType(['code' => 13]));
+});
+if ($reply['variant'] !== 'Codec') throw new LogicException('variant ' . $reply['variant']);
+try {
+    Codec::resolveRpcReply('Pinger', 'ping', $reply['variant'], $reply['payload']);
+    throw new LogicException('missing refusal');
+} catch (CodecTypeRefusal $e) {
+    if ($e->value->code !== 13) throw new LogicException('refusal value');
+}
+if (Codec::decodeValue(Codec::encodeValue(new Value(['n' => 5])))->n !== 5) throw new LogicException('Value');
+echo "OK\n";
+"#,
+    );
+    let path = dir.join("reserved.php");
+    std::fs::write(&path, &script).unwrap();
+    let run = Command::new("php").arg(&path).output().expect("run php");
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        run.status.success() && stdout.contains("OK"),
+        "reserved-name driver failed:\n{stdout}\n{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
 }

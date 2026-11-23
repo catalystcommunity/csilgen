@@ -59,6 +59,7 @@ fn group_input(
             source_content: None,
             service_count: 0,
             fields_with_metadata_count: 0,
+            declared_names: Default::default(),
         },
         config: GeneratorConfig {
             target: "elixir".to_string(),
@@ -127,6 +128,7 @@ fn service_input(
             source_content: None,
             service_count: 1,
             fields_with_metadata_count: 0,
+            declared_names: Default::default(),
         },
         config: GeneratorConfig {
             target: target.to_string(),
@@ -912,6 +914,7 @@ fn corndogs_spec() -> CsilSpecSerialized {
         source_content: None,
         service_count: 1,
         fields_with_metadata_count: 0,
+        declared_names: Default::default(),
     }
 }
 
@@ -1187,6 +1190,7 @@ fn mixed_union_input() -> WasmGeneratorInput {
             source_content: None,
             service_count: 0,
             fields_with_metadata_count: 0,
+            declared_names: Default::default(),
         },
         config: GeneratorConfig {
             target: "elixir-typesonly".to_string(),
@@ -1329,6 +1333,7 @@ fn mixed_literal_enum_input() -> WasmGeneratorInput {
             source_content: None,
             service_count: 0,
             fields_with_metadata_count: 0,
+            declared_names: Default::default(),
         },
         config: GeneratorConfig {
             target: "elixir-typesonly".to_string(),
@@ -1642,6 +1647,7 @@ fn constrained_arm_torture_input() -> WasmGeneratorInput {
             source_content: None,
             service_count: 0,
             fields_with_metadata_count: 0,
+            declared_names: Default::default(),
         },
         config: GeneratorConfig {
             target: "elixir-typesonly".to_string(),
@@ -1991,6 +1997,7 @@ fn readme_package_input() -> WasmGeneratorInput {
             source_content: None,
             service_count: 1,
             fields_with_metadata_count: 0,
+            declared_names: Default::default(),
         },
         config: GeneratorConfig {
             target: "elixir-client".to_string(),
@@ -2058,6 +2065,7 @@ fn transports_package_input() -> WasmGeneratorInput {
             source_content: None,
             service_count: 1,
             fields_with_metadata_count: 0,
+            declared_names: Default::default(),
         },
         config: GeneratorConfig {
             target: "elixir-client".to_string(),
@@ -2914,4 +2922,91 @@ fn single_arm_spec_keeps_the_call_only_seam() {
     let client = file(&out, "client.gen.ex");
     assert!(client.contains("@callback call(t()"), "{client}");
     assert!(!client.contains("call_reply"), "{client}");
+}
+
+#[test]
+fn reserved_rule_name_is_renamed_but_keeps_its_wire_variant() {
+    let reply = CsilTypeExpression::Choice(vec![
+        CsilTypeExpression::Reference("Req".to_string()),
+        CsilTypeExpression::Reference("Transport".to_string()),
+    ]);
+    let mut input = service_input(
+        "Svc",
+        vec![make_op(
+            "op",
+            "Req",
+            reply,
+            CsilServiceDirection::Unidirectional,
+            None,
+        )],
+        None,
+        "elixir-client",
+    );
+    for name in ["Req", "Transport"] {
+        let record = group_input(
+            name,
+            vec![bare_entry(
+                "code",
+                CsilTypeExpression::Builtin("uint".to_string()),
+            )],
+            HashMap::new(),
+        );
+        input.csil_spec.rules.extend(record.csil_spec.rules);
+    }
+    let out = process_generation(input).unwrap();
+    let types = file(&out, "types.gen.ex");
+    assert!(types.contains("defmodule Csilgen.Generated.TransportType do"));
+    assert!(!types.contains("defmodule Csilgen.Generated.Transport do"));
+    let codec = file(&out, "codec.gen.ex");
+    assert!(codec.contains("defmodule Csilgen.Generated.TransportTypeRefusal do"));
+    assert!(codec.contains("{\"Transport\", encode("));
+    assert!(codec.contains("def resolve_rpc_reply(\"Svc\", \"op\", \"Transport\", payload) do"));
+    assert!(codec.contains("raise Csilgen.Generated.TransportTypeRefusal, value: value"));
+}
+
+/// The channel router builds the framework `ServiceError` with `code` and
+/// `message`, so a spec's `ServiceError` of that shape is kept and any other
+/// shape is renamed out of the framework's way.
+#[test]
+fn spec_service_error_yields_to_the_channel_router_only_when_its_shape_differs() {
+    for (second_field, renamed) in [("message", false), ("detail", true)] {
+        let mut input = service_input(
+            "Chat",
+            vec![make_op(
+                "talk",
+                "Msg",
+                CsilTypeExpression::Reference("Msg".to_string()),
+                CsilServiceDirection::Bidirectional,
+                None,
+            )],
+            None,
+            "elixir-server",
+        );
+        let text = || CsilTypeExpression::Builtin("text".to_string());
+        let records = [
+            group_input("Msg", vec![bare_entry("body", text())], HashMap::new()),
+            group_input(
+                "ServiceError",
+                vec![
+                    bare_entry("code", CsilTypeExpression::Builtin("int".to_string())),
+                    bare_entry(second_field, text()),
+                ],
+                HashMap::new(),
+            ),
+        ];
+        for record in records {
+            input.csil_spec.rules.extend(record.csil_spec.rules);
+        }
+        let out = process_generation(input).unwrap();
+        let types = file(&out, "types.gen.ex");
+        let server = file(&out, "server.gen.ex");
+        assert_eq!(
+            types.contains("defmodule Csilgen.Generated.ServiceErrorType do"),
+            renamed
+        );
+        assert_eq!(
+            server.contains("defmodule Csilgen.Generated.ServiceError do"),
+            renamed
+        );
+    }
 }

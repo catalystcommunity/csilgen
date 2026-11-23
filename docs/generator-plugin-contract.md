@@ -248,6 +248,7 @@ pub struct CsilSpecSerialized {
     pub source_content: Option<String>,     // currently always None from the CLI path
     pub service_count: usize,
     pub fields_with_metadata_count: usize,
+    #[serde(default)] pub declared_names: BTreeMap<String, String>, // renamed rule -> name in the CSIL source
 }
 
 pub struct CsilRule {
@@ -383,13 +384,22 @@ share classification/hoisting logic from `csilgen-common`
 (`csilgen_common::choice::classify_choice` for enum-vs-union classification,
 `csilgen_common::hoist` for literal-choice hoisting, `csilgen_common::splice` for
 group references, sockets and plugs, and `csilgen_common::rename` for rule names
-that are not identifiers in the target) so that every Rust-authored
+that are not identifiers in the target or that the generated code reserves) so that every Rust-authored
 generator in this repo applies the wire contract identically instead of
 re-deriving it. That is a convenience implementation available to Rust generators
 built against `csilgen-common`, not a requirement of either tier above. A
 generator authored in any other language, or a Rust generator that doesn't import
 `csilgen-common`'s helpers, satisfies Tier 1 the same way: by producing
 byte-identical output to what the wire contract specifies, by whatever means.
+
+**Reserved names.** A schema rule can have a name that the generated code
+declares itself (`Transport`, `CsilDecimal`) or uses from the target language
+(`Result`, `Map`). The generator must not let the two names collide.
+`csilgen_common::rename_reserved` renames such a rule to `<Name>Type` and every
+reference to it. It records the name from the CSIL source in
+`declared_names`. An RPC reply variant puts the rule name on the wire, so a
+generator writes `spec.declared_name(..)` for a variant string, and the renamed
+name for an identifier. The CLI sends `declared_names` empty.
 
 ## 5. Minimal walkthrough
 

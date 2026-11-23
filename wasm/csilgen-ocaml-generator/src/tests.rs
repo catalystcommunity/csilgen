@@ -215,6 +215,7 @@ fn type_decls_join_with_and() {
         source_content: None,
         service_count: 0,
         fields_with_metadata_count: 0,
+        declared_names: Default::default(),
     };
     let (ml, mli) = generate_types(&spec);
     assert!(ml.contains("type a = {"));
@@ -321,6 +322,7 @@ fn client_module_emits_typed_calls() {
         source_content: None,
         service_count: 1,
         fields_with_metadata_count: 0,
+        declared_names: Default::default(),
     };
     let out = generate_client(&spec);
     assert!(out.contains("type client = {"));
@@ -359,6 +361,7 @@ fn service_input(target: &str) -> WasmGeneratorInput {
             source_content: None,
             service_count: 1,
             fields_with_metadata_count: 0,
+            declared_names: Default::default(),
         },
         config: GeneratorConfig {
             target: target.into(),
@@ -590,6 +593,7 @@ fn corndogs_spec() -> CsilSpecSerialized {
         source_content: None,
         service_count: 1,
         fields_with_metadata_count: 0,
+        declared_names: Default::default(),
     }
 }
 
@@ -611,6 +615,7 @@ fn optional_bytes_encodes_on_presence_not_emptiness() {
         source_content: None,
         service_count: 0,
         fields_with_metadata_count: 0,
+        declared_names: Default::default(),
     };
     let (types, _mli) = generate_types(&spec);
     let codec = generate_codec(&spec).expect("codec emitted");
@@ -804,6 +809,7 @@ fn mixed_union_spec() -> CsilSpecSerialized {
         source_content: None,
         service_count: 0,
         fields_with_metadata_count: 0,
+        declared_names: Default::default(),
     }
 }
 
@@ -944,6 +950,7 @@ fn inline_choice_field_hoists_to_synthesized_type() {
         source_content: None,
         service_count: 0,
         fields_with_metadata_count: 0,
+        declared_names: Default::default(),
     };
     let spec = csilgen_common::hoist_inline_composites(
         &spec,
@@ -981,6 +988,7 @@ fn inline_group_field_hoists_to_synthesized_record() {
         source_content: None,
         service_count: 0,
         fields_with_metadata_count: 0,
+        declared_names: Default::default(),
     };
     let spec = csilgen_common::hoist_inline_composites(
         &spec,
@@ -1059,6 +1067,7 @@ fn inline_mixed_choice_spec() -> CsilSpecSerialized {
         source_content: None,
         service_count: 0,
         fields_with_metadata_count: 0,
+        declared_names: Default::default(),
     }
 }
 
@@ -1164,6 +1173,7 @@ fn inline_all_literal_choice_spec() -> CsilSpecSerialized {
         source_content: None,
         service_count: 0,
         fields_with_metadata_count: 0,
+        declared_names: Default::default(),
     }
 }
 
@@ -1358,6 +1368,7 @@ fn torture_spec() -> CsilSpecSerialized {
         source_content: None,
         service_count: 0,
         fields_with_metadata_count: 0,
+        declared_names: Default::default(),
     }
 }
 
@@ -1625,6 +1636,7 @@ fn pingpong_spec() -> CsilSpecSerialized {
         source_content: None,
         service_count: 1,
         fields_with_metadata_count: 0,
+        declared_names: Default::default(),
     }
 }
 
@@ -1668,6 +1680,7 @@ fn transports_spec() -> CsilSpecSerialized {
         source_content: None,
         service_count: 1,
         fields_with_metadata_count: 0,
+        declared_names: Default::default(),
     }
 }
 
@@ -1691,6 +1704,7 @@ fn timestamp_codec_canonicalizes_both_ways() {
         source_content: None,
         service_count: 0,
         fields_with_metadata_count: 0,
+        declared_names: Default::default(),
     };
     let codec = generate_codec(&spec).expect("codec");
     assert!(codec.contains("(Cbor.Tag (0, Cbor.Text (Cbor.canonical_timestamp v.at)))"));
@@ -2161,6 +2175,7 @@ fn mixed_kind_literal_choice_spec() -> CsilSpecSerialized {
         source_content: None,
         service_count: 0,
         fields_with_metadata_count: 0,
+        declared_names: Default::default(),
     }
 }
 
@@ -2285,6 +2300,7 @@ fn cddl_time_codec_uses_the_epoch_helpers() {
         source_content: None,
         service_count: 0,
         fields_with_metadata_count: 0,
+        declared_names: Default::default(),
     };
     let codec = generate_codec(&spec).expect("codec");
     assert!(codec.contains("(Cbor.epoch_to_cbor v.at)"), "{codec}");
@@ -2370,3 +2386,52 @@ let () =
    | Error _ -> ());
   print_endline "ok"
 "#;
+
+#[test]
+fn reserved_rule_name_is_renamed_but_keeps_its_wire_variant() {
+    let mut svc = attestation_service();
+    svc.operations[0].output_type = CsilTypeExpression::Choice(vec![
+        CsilTypeExpression::Reference("DepositClaimRequest".into()),
+        CsilTypeExpression::Reference("Result".into()),
+    ]);
+    let spec = CsilSpecSerialized {
+        rules: vec![
+            group_rule(
+                "DepositClaimRequest",
+                vec![bare_entry("subject", builtin("text"))],
+            ),
+            group_rule("Result", vec![bare_entry("code", builtin("uint"))]),
+            CsilRule {
+                name: "Attestation".into(),
+                rule_type: CsilRuleType::ServiceDef(svc),
+                position: pos(),
+                doc_comments: vec![],
+            },
+        ],
+        source_content: None,
+        service_count: 1,
+        fields_with_metadata_count: 0,
+        declared_names: Default::default(),
+    };
+    let files = generate_ocaml(&spec, &package_config("ocaml-client", None)).unwrap();
+    let file = |path: &str| {
+        files
+            .iter()
+            .find(|f| f.path == path)
+            .map(|f| f.content.clone())
+            .unwrap()
+    };
+    let types = file("types.ml");
+    assert!(types.contains("result_type = {"));
+    assert!(!types.contains("and result = {") && !types.contains("type result = {"));
+    let codec = file("codec.ml");
+    assert!(codec.contains("exception Result_type_refusal of result_type"));
+    assert!(codec.contains("| Error (`Result_type value) -> (\"Result\", Cbor.encode"));
+    assert!(codec.contains(
+        "| \"Attestation\", \"deposit-claim\", Some \"Result\" ->\n      (match Cbor.decode payload with Ok root -> raise (Result_type_refusal"
+    ));
+    assert!(
+        file("client.ml")
+            .contains("| Codec.Result_type_refusal value -> Error (`Result_type value)")
+    );
+}
