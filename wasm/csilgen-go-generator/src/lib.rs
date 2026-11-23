@@ -1612,24 +1612,11 @@ fn generate_types(
     }
 }
 
-/// Client scaffolding emitted once at the top of `client.gen.go`: the error type
-/// and the caller-supplied `Transport` every per-service client delegates to.
+/// Client scaffolding emitted once at the top of `client.gen.go`: the
+/// caller-supplied `Transport` every per-service client delegates to. Client errors
+/// use the `RPC*Error` types in `codec.gen.go`, which the server also uses, so one
+/// `errors.As` check works for every operation.
 const CLIENT_PRELUDE_GO: &str = "\
-// ClientError is returned by a generated client call: a structured error the
-// service returned (Code/Message), or a transport-level failure (Err).
-type ClientError struct {
-\tCode    int64
-\tMessage string
-\tErr     error
-}
-
-func (e *ClientError) Error() string {
-\tif e.Err != nil {
-\t\treturn \"transport error: \" + e.Err.Error()
-\t}
-\treturn fmt.Sprintf(\"service error %d: %s\", e.Code, e.Message)
-}
-
 // Transport is the caller-supplied byte carrier: it performs the call named by
 // (service, op) with the already-encoded request bytes and returns the response
 // bytes, or an error. Both names are the verbatim CSIL names (service as written,
@@ -2442,7 +2429,7 @@ fn go_enc_depth_guard(indent: &str) -> String {
     )
 }
 
-/// The declared members of an all-literal choice, as Go constants for `csilEncMember`.
+/// The declared members of an all-literal choice, as Go constants for `csilRtEncMember`.
 fn go_enum_member_list(choices: &[CsilTypeExpression]) -> String {
     choices
         .iter()
@@ -2473,12 +2460,12 @@ fn go_enc_value(
             "text" | "tstr" => GoEnc::Value(format!("cborText({expr})")),
             "bytes" | "bstr" => GoEnc::Value(format!("cborBytes({expr})")),
             "bool" => GoEnc::Value(format!("cborBool({expr})")),
-            "date" => GoEnc::Pair(format!("csilEncDate(string({expr}))")),
-            "timestamp" => GoEnc::Pair(format!("csilEncTimestamp({expr})")),
-            "cddl_time" => GoEnc::Pair(format!("csilEncCddlTime({expr})")),
+            "date" => GoEnc::Pair(format!("csilRtEncDate(string({expr}))")),
+            "timestamp" => GoEnc::Pair(format!("csilRtEncTimestamp({expr})")),
+            "cddl_time" => GoEnc::Pair(format!("csilRtEncCddlTime({expr})")),
             // Every CsilDecimal and shopspring value has a tag 4 form, so this
             // encoder has no failure to report.
-            "decimal" => GoEnc::Value(format!("csilEncDecimal({expr})")),
+            "decimal" => GoEnc::Value(format!("csilRtEncDecimal({expr})")),
             "nil" | "null" => GoEnc::Value("cborNull{}".to_string()),
             "any" => GoEnc::Pair(format!("cborEncAny({expr})")),
             _ => GoEnc::Value("cborNull{}".to_string()),
@@ -2491,7 +2478,7 @@ fn go_enc_value(
         // underlying type. Most scalar encoders (`cborText`/`cborUint`/...) are
         // themselves Go type conversions, so a same-underlying-type alias flows
         // through unchanged. `decimal`/`timestamp` encode via a genuine function
-        // (`csilEncDecimal`/`csilEncTimestamp`) that requires its exact declared
+        // (`csilRtEncDecimal`/`csilRtEncTimestamp`) that requires its exact declared
         // parameter type (`CsilDecimal`/`time.Time`), which a distinct named alias
         // (`type unit_price CsilDecimal`) is NOT implicitly assignable to — so the
         // conversion must be made explicit at the alias boundary before recursing.
@@ -2508,7 +2495,9 @@ fn go_enc_value(
                 .map(i64::to_string)
                 .collect::<Vec<_>>()
                 .join(", ");
-            GoEnc::Pair(format!("csilEncMember({expr}, cborInt({expr}), {members})"))
+            GoEnc::Pair(format!(
+                "csilRtEncMember({expr}, cborInt({expr}), {members})"
+            ))
         }
         CsilTypeExpression::Reference(name) if aliases.contains_key(name) => {
             let target = &aliases[name];
@@ -2601,7 +2590,7 @@ fn go_enc_value(
                 )
                 .value();
                 let members = go_enum_member_list(choices);
-                GoEnc::Pair(format!("csilEncMember({expr}, {scalar}, {members})"))
+                GoEnc::Pair(format!("csilRtEncMember({expr}, {scalar}, {members})"))
             }
             None if choice_all_literal(choices) => {
                 GoEnc::Pair(go_mixed_enum_enc_expr(choices, expr, indent))
@@ -3534,22 +3523,17 @@ fn emit_op_codec_pair(
     )
 }
 
-/// Encode a handler result and resolve a carrier reply at the typed RPC boundary.
-fn emit_rpc_replies(
-    input: &WasmGeneratorInput,
-    records: &std::collections::HashSet<String>,
-    aliases: &std::collections::HashMap<String, CsilTypeExpression>,
-    config: &GoConfig,
-) -> String {
-    let mut out = String::from(
-        r#"// RPCDecodeError reports a malformed typed RPC reply.
+/// The typed RPC error set. Every client and server uses it, with or without
+/// declared error arms, so a caller sorts every failure with one `errors.As` rule.
+const RPC_ERRORS_GO: &str = r#"// RPCDecodeError reports a malformed typed RPC reply.
 type RPCDecodeError struct{ Err error }
 
 func (e *RPCDecodeError) Error() string { return e.Err.Error() }
 func (e *RPCDecodeError) Unwrap() error { return e.Err }
 
-// RPCEncodeError reports a handler result that has no valid wire form. The server
-// answers it with a transport failure, because no reply payload exists.
+// RPCEncodeError reports a value that has no valid wire form. A client returns it
+// for a request and does not call the transport. A server answers it for a handler
+// result with a transport failure, because no reply payload exists.
 type RPCEncodeError struct{ Err error }
 
 func (e *RPCEncodeError) Error() string { return e.Err.Error() }
@@ -3560,8 +3544,16 @@ type RPCApplicationError[T any] struct{ Value T }
 
 func (e *RPCApplicationError[T]) Error() string { return fmt.Sprintf("application error: %v", e.Value) }
 
-"#,
-    );
+"#;
+
+/// Encode a handler result and resolve a carrier reply at the typed RPC boundary.
+fn emit_rpc_replies(
+    input: &WasmGeneratorInput,
+    records: &std::collections::HashSet<String>,
+    aliases: &std::collections::HashMap<String, CsilTypeExpression>,
+    config: &GoConfig,
+) -> String {
+    let mut out = String::new();
     let mut dispatch = String::from(
         "// ResolveRPCReply turns a status-zero reply into its success payload or the declared\n// error arm. Generated clients call it with the reply from Transport.CallReply.\nfunc ResolveRPCReply(service, op string, variant *string, payload []byte) ([]byte, error) {\n\tswitch {\n",
     );
@@ -3604,9 +3596,26 @@ func (e *RPCApplicationError[T]) Error() string { return fmt.Sprintf("applicatio
     out
 }
 
+/// Whether any service declares a unary operation, which the typed client and the
+/// server router serve.
+fn spec_has_rpc_ops(input: &WasmGeneratorInput) -> bool {
+    input
+        .csil_spec
+        .rules
+        .iter()
+        .any(|rule| match &rule.rule_type {
+            CsilRuleType::ServiceDef(service) => service
+                .operations
+                .iter()
+                .any(|op| matches!(op.direction, CsilServiceDirection::Unidirectional)),
+            _ => false,
+        })
+}
+
 fn generate_codec(input: &WasmGeneratorInput, config: &GoConfig) -> Option<String> {
     let typed_rpc = input.csil_spec.rpc_operations().next().is_some();
-    if !spec_has_records(input) && !typed_rpc {
+    let rpc_errors = typed_rpc || spec_has_rpc_ops(input);
+    if !spec_has_records(input) && !rpc_errors {
         return None;
     }
     let records = record_names(input);
@@ -3697,6 +3706,9 @@ fn generate_codec(input: &WasmGeneratorInput, config: &GoConfig) -> Option<Strin
     // Per-op byte helpers for non-record (and record) op boundaries, so client and a
     // consumer-side server share one codec surface for every op.
     content.push_str(&emit_op_codecs(input, &records, &aliases, config));
+    if rpc_errors {
+        content.push_str(RPC_ERRORS_GO);
+    }
     if typed_rpc {
         content.push_str(&emit_rpc_replies(input, &records, &aliases, config));
     }
@@ -3910,9 +3922,9 @@ func (e *csilEncErr) result(v cborValue) (cborValue, error) {
 	return v, nil
 }
 
-// csilEncMember refuses an enum value outside the declared set, because every
+// csilRtEncMember refuses an enum value outside the declared set, because every
 // decoder refuses it.
-func csilEncMember[T comparable](v T, enc cborValue, members ...T) (cborValue, error) {
+func csilRtEncMember[T comparable](v T, enc cborValue, members ...T) (cborValue, error) {
 	for _, m := range members {
 		if v == m {
 			return enc, nil
@@ -4377,8 +4389,8 @@ func csilCheckDate(s string) error {
 	return nil
 }
 
-// csilEncDate encodes YYYY-MM-DD text as CBOR tag 1004.
-func csilEncDate(s string) (cborValue, error) {
+// csilRtEncDate encodes YYYY-MM-DD text as CBOR tag 1004.
+func csilRtEncDate(s string) (cborValue, error) {
 	if err := csilCheckDate(s); err != nil {
 		return nil, err
 	}
@@ -4409,9 +4421,9 @@ const CODEC_CDDL_TIME_GO: &str = r#"const (
 	csilEpochUnits int64 = 1000000000
 )
 
-// csilEncCddlTime encodes a time.Time as CBOR tag 1 epoch seconds: an integer
+// csilRtEncCddlTime encodes a time.Time as CBOR tag 1 epoch seconds: an integer
 // when the instant has no fraction, else a binary64 float.
-func csilEncCddlTime(t time.Time) (cborValue, error) {
+func csilRtEncCddlTime(t time.Time) (cborValue, error) {
 	seconds, units := t.Unix(), int64(t.Nanosecond())
 	// An instant with no valid wire form is an error, not bytes every peer refuses.
 	if seconds < csilEpochFirst || seconds > csilEpochLast {
@@ -4469,10 +4481,10 @@ func csilAsCddlTime(v cborValue) (time.Time, error) {
 
 /// Timestamp (CBOR tag 0, RFC3339, always UTC) codec, emitted only when the spec
 /// uses `timestamp` so `time` is never an unused import.
-const CODEC_TIMESTAMP_GO: &str = r#"// csilEncTimestamp encodes a time.Time as CBOR tag 0 RFC3339 text in UTC. The
+const CODEC_TIMESTAMP_GO: &str = r#"// csilRtEncTimestamp encodes a time.Time as CBOR tag 0 RFC3339 text in UTC. The
 // fraction uses 3, 6, or 9 digits (never RFC3339Nano's shortest form) so every
 // target writes the same bytes for one instant.
-func csilEncTimestamp(t time.Time) (cborValue, error) {
+func csilRtEncTimestamp(t time.Time) (cborValue, error) {
 	u := t.UTC()
 	// An instant with no valid wire form is an error, not bytes every peer refuses.
 	if u.Year() < 1 || u.Year() > 9999 {
@@ -4581,9 +4593,9 @@ func csilAsTimestamp(v cborValue) (time.Time, error) {
 /// Exact-integer (de)serialization for a decimal mantissa: a 64-bit integer when it
 /// fits, otherwise a CBOR bignum (tag 2 non-negative / tag 3 negative). Emitted only
 /// alongside the decimal codec so `math/big` is never an unused import.
-const CODEC_BIGINT_GO: &str = r#"// csilEncBigInt encodes an exact integer mantissa: a CBOR integer when it fits in
+const CODEC_BIGINT_GO: &str = r#"// csilRtEncBigInt encodes an exact integer mantissa: a CBOR integer when it fits in
 // 64 bits, otherwise a bignum (RFC 8949 §3.4.3) so the value stays exact.
-func csilEncBigInt(m *big.Int) cborValue {
+func csilRtEncBigInt(m *big.Int) cborValue {
 	if m.IsInt64() {
 		return cborInt(m.Int64())
 	}
@@ -4598,7 +4610,7 @@ func csilEncBigInt(m *big.Int) cborValue {
 	return cborTag{num: 3, inner: cborBytes(n.Bytes())}
 }
 
-func csilDecBigInt(v cborValue) (*big.Int, error) {
+func csilRtDecBigInt(v cborValue) (*big.Int, error) {
 	switch x := v.(type) {
 	case cborUint:
 		return new(big.Int).SetUint64(uint64(x)), nil
@@ -4626,9 +4638,9 @@ func csilDecBigInt(v cborValue) (*big.Int, error) {
 
 /// Decimal codec under the default `csil` mapping: the generated `CsilDecimal`
 /// (exponent + big.Int mantissa) maps straight onto CBOR tag 4 `[exponent, mantissa]`.
-const CODEC_DECIMAL_CSIL_GO: &str = r#"// csilEncDecimal encodes a CsilDecimal as CBOR tag 4: [exponent, mantissa].
-func csilEncDecimal(d CsilDecimal) cborValue {
-	return cborTag{num: 4, inner: cborArray{cborInt(d.Exponent), csilEncBigInt(d.mantissa())}}
+const CODEC_DECIMAL_CSIL_GO: &str = r#"// csilRtEncDecimal encodes a CsilDecimal as CBOR tag 4: [exponent, mantissa].
+func csilRtEncDecimal(d CsilDecimal) cborValue {
+	return cborTag{num: 4, inner: cborArray{cborInt(d.Exponent), csilRtEncBigInt(d.mantissa())}}
 }
 
 // csilAsDecimal decodes a CBOR tag 4 decimal fraction into an exact CsilDecimal.
@@ -4645,7 +4657,7 @@ func csilAsDecimal(v cborValue) (CsilDecimal, error) {
 	if err != nil {
 		return CsilDecimal{}, err
 	}
-	mant, err := csilDecBigInt(arr[1])
+	mant, err := csilRtDecBigInt(arr[1])
 	if err != nil {
 		return CsilDecimal{}, err
 	}
@@ -4655,9 +4667,9 @@ func csilAsDecimal(v cborValue) (CsilDecimal, error) {
 
 /// Decimal codec under the `library` mapping: shopspring's Decimal carries the same
 /// exact value (coefficient * 10^exponent), so it maps onto CBOR tag 4 directly.
-const CODEC_DECIMAL_LIBRARY_GO: &str = r#"// csilEncDecimal encodes a shopspring Decimal as CBOR tag 4: [exponent, mantissa].
-func csilEncDecimal(d decimal.Decimal) cborValue {
-	return cborTag{num: 4, inner: cborArray{cborInt(int64(d.Exponent())), csilEncBigInt(d.Coefficient())}}
+const CODEC_DECIMAL_LIBRARY_GO: &str = r#"// csilRtEncDecimal encodes a shopspring Decimal as CBOR tag 4: [exponent, mantissa].
+func csilRtEncDecimal(d decimal.Decimal) cborValue {
+	return cborTag{num: 4, inner: cborArray{cborInt(int64(d.Exponent())), csilRtEncBigInt(d.Coefficient())}}
 }
 
 // csilAsDecimal decodes a CBOR tag 4 decimal fraction into a shopspring Decimal.
@@ -4674,7 +4686,7 @@ func csilAsDecimal(v cborValue) (decimal.Decimal, error) {
 	if err != nil {
 		return decimal.Decimal{}, err
 	}
-	mant, err := csilDecBigInt(arr[1])
+	mant, err := csilRtDecBigInt(arr[1])
 	if err != nil {
 		return decimal.Decimal{}, err
 	}
@@ -4761,14 +4773,9 @@ fn generate_client(
 
     content.push_str("import (\n");
     content.push_str(&format!("{}\"context\"\n", config.indent_style));
-    content.push_str(&format!("{}\"fmt\"\n", config.indent_style));
     content.push_str(")\n\n");
 
     if input.csil_spec.rpc_operations().next().is_some() {
-        let plain = CLIENT_PRELUDE_GO
-            .find("// Transport is the caller-supplied")
-            .expect("prelude declares Transport");
-        content.push_str(&CLIENT_PRELUDE_GO[..plain]);
         content.push_str(CLIENT_REPLY_SEAM_GO);
     } else {
         content.push_str(CLIENT_PRELUDE_GO);
@@ -4895,7 +4902,7 @@ fn emit_client_struct(
                 format!("Encode{stem}Request(req)")
             };
             content.push_str(&format!(
-                "{i}csilReq, csilErr := {encoder}\n{i}if csilErr != nil {{\n{i}{i}return csilZero, csilErr\n{i}}}\n",
+                "{i}csilReq, csilErr := {encoder}\n{i}if csilErr != nil {{\n{i}{i}return csilZero, &RPCEncodeError{{csilErr}}\n{i}}}\n",
                 i = config.indent_style
             ));
             "csilReq".to_string()
@@ -4924,11 +4931,10 @@ fn emit_client_struct(
         } else {
             format!("Decode{stem}Response(csilResp)")
         };
-        if operation.rpc_reply_arms().is_some() {
-            content.push_str(&format!("\tvalue, err := {decode_resp}\n\tif err != nil {{\n\t\treturn csilZero, &RPCDecodeError{{err}}\n\t}}\n\treturn value, nil\n"));
-        } else {
-            content.push_str(&format!("{}return {decode_resp}\n", config.indent_style));
-        }
+        content.push_str(&format!(
+            "{i}value, err := {decode_resp}\n{i}if err != nil {{\n{i}{i}return csilZero, &RPCDecodeError{{err}}\n{i}}}\n{i}return value, nil\n",
+            i = config.indent_style
+        ));
         content.push_str("}\n\n");
     }
 }
@@ -6219,7 +6225,7 @@ fn go_mixed_enum_enc_expr(choices: &[CsilTypeExpression], expr: &str, indent: us
         };
         let list = members[kind].join(", ");
         body.push_str(&format!(
-            "{tb}case {go_type}:\n{tb}\treturn csilEncMember(csilX, {cbor_ctor}, {list})\n"
+            "{tb}case {go_type}:\n{tb}\treturn csilRtEncMember(csilX, {cbor_ctor}, {list})\n"
         ));
     }
     body.push_str(&format!("{tb}}}\n{tb}return {}", go_not_a_member(expr)));
@@ -7487,7 +7493,8 @@ mod tests {
         assert!(client.content.contains(
             "Call(ctx context.Context, service string, op string, req []byte) ([]byte, error)"
         ));
-        assert!(client.content.contains("type ClientError struct"));
+        // Client errors are the shared `RPC*Error` types in codec.gen.go.
+        assert!(!client.content.contains("ClientError"));
         assert!(
             client
                 .content
@@ -7505,7 +7512,7 @@ mod tests {
         assert!(
             client
                 .content
-                .contains("csilReq, csilErr := EncodeSubmitTaskRequest(req)\n\tif csilErr != nil {\n\t\treturn csilZero, csilErr\n\t}\n")
+                .contains("csilReq, csilErr := EncodeSubmitTaskRequest(req)\n\tif csilErr != nil {\n\t\treturn csilZero, &RPCEncodeError{csilErr}\n\t}\n")
         );
         assert!(client.content.contains(
             "csilReply, csilErr := c.transport.CallReply(ctx, \"CorndogsService\", \"submit-task\", csilReq)"
@@ -7788,7 +7795,7 @@ mod tests {
             .find(|f| f.path == "codec.gen.go")
             .expect("codec emitted");
         assert!(codec.content.contains("\t\"time\"\n"));
-        assert!(codec.content.contains("csilEncCddlTime(csilV.SeenAt)"));
+        assert!(codec.content.contains("csilRtEncCddlTime(csilV.SeenAt)"));
         assert!(codec.content.contains("csilAsCddlTime"));
         assert!(
             codec
@@ -7854,10 +7861,10 @@ mod tests {
         assert!(
             codec
                 .content
-                .contains("func csilEncDecimal(d CsilDecimal) cborValue")
+                .contains("func csilRtEncDecimal(d CsilDecimal) cborValue")
         );
         assert!(codec.content.contains(
-            "cborTag{num: 4, inner: cborArray{cborInt(d.Exponent), csilEncBigInt(d.mantissa())}}"
+            "cborTag{num: 4, inner: cborArray{cborInt(d.Exponent), csilRtEncBigInt(d.mantissa())}}"
         ));
         assert!(codec.content.contains("\"math/big\""));
         assert!(!codec.content.contains("fxamacker"));
@@ -8242,7 +8249,7 @@ mod tests {
     fn decimal_and_timestamp_aliases_convert_at_the_encode_boundary() {
         // `unit_price = decimal .ge "0.00"` (examples/tagged-types/orders.csil) makes
         // `unit_price` a distinct named Go type (`type unit_price CsilDecimal`), not a
-        // bare alias. `csilEncDecimal`/`csilEncTimestamp` are genuine functions (unlike
+        // bare alias. `csilRtEncDecimal`/`csilRtEncTimestamp` are genuine functions (unlike
         // `cborText`/`cborUint`, which are Go type CONVERSIONS any same-underlying-type
         // alias flows through unchanged), so passing a `unit_price` value where
         // `CsilDecimal` is required needs an explicit conversion or Go refuses to
@@ -8317,12 +8324,12 @@ mod tests {
         assert!(
             codec
                 .content
-                .contains("csilEncDecimal(CsilDecimal(csilV.UnitPrice))")
+                .contains("csilRtEncDecimal(CsilDecimal(csilV.UnitPrice))")
         );
         assert!(
             codec
                 .content
-                .contains("csilEncTimestamp(time.Time(csilV.Start))")
+                .contains("csilRtEncTimestamp(time.Time(csilV.Start))")
         );
         // Decode: the raw decoded value converts back into the named alias type.
         assert!(codec.content.contains("unit_price(csilInner)"));
@@ -9275,7 +9282,8 @@ mod tests {
         // A null input carries no body: the transport gets a nil payload, and the
         // response bytes decode through the codec.
         assert!(client.contains("c.transport.Call(ctx, \"HealthService\", \"ping\", nil)"));
-        assert!(client.contains("return DecodePong(csilResp)"));
+        assert!(client.contains("value, err := DecodePong(csilResp)"));
+        assert!(client.contains("return csilZero, &RPCDecodeError{err}"));
         // No operation declares several reply arms, so the seam keeps only Call.
         assert!(!client.contains("CallReply"));
         assert!(!client.contains("WireReply"));

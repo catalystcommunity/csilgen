@@ -17,8 +17,11 @@ case "$lang" in
     rust)
         # The packages live outside the repository, where rustup does not see
         # `rust-toolchain.toml`. Use the pinned toolchain, which has rustfmt and clippy.
-        RUSTUP_TOOLCHAIN=$(rustup show active-toolchain | cut -d' ' -f1)
-        export RUSTUP_TOOLCHAIN ;;
+        # A host without rustup has one toolchain, so it needs no pin.
+        if command -v rustup >/dev/null; then
+            RUSTUP_TOOLCHAIN=$(rustup show active-toolchain | cut -d' ' -f1)
+            export RUSTUP_TOOLCHAIN
+        fi ;;
     swift) ;;
     *)
         echo "repo-specs: no compile check for $lang yet, skipped"
