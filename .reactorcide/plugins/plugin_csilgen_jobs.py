@@ -274,6 +274,8 @@ def _test_core(root: Path) -> None:
         "CARGO_HOME",
         str(Path.home() / ".cargo"),
     )
+    # The generated-code tests build their crates with `CARGO_NET_OFFLINE`, so
+    # every crate those crates name must be in the cache before the tests start.
     prefetch = root / "target" / "ci-prefetch"
     (prefetch / "src").mkdir(parents=True, exist_ok=True)
     (prefetch / "Cargo.toml").write_text(
@@ -283,6 +285,7 @@ def _test_core(root: Path) -> None:
         'edition = "2024"\n'
         "\n[dependencies]\n"
         'ureq = "2"\n'
+        'time = { version = "0.3.47", features = ["formatting", "parsing"] }\n'
         "\n[workspace]\n",
         encoding="utf-8",
     )
