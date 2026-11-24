@@ -2803,3 +2803,157 @@ fn primitive_and_keyword_rule_names_are_renamed() {
     assert!(all.contains("pub const structType = struct {"), "{all}");
     assert!(all.contains("pub const u = struct {"), "{all}");
 }
+
+/// Null outputs, `null` reply arms, a nullable record field and bare scalar, list
+/// and map op boundaries: the shapes whose generated Zig once bound an unread
+/// `.null` capture or called a nonexistent `codec.encode_text`/`decode_null`.
+fn null_and_scalar_boundary_rules() -> Vec<CsilRule> {
+    let reference = |name: &str| CsilTypeExpression::Reference(name.to_string());
+    let unary = |name: &str, input: CsilTypeExpression, output: CsilTypeExpression| {
+        op(
+            name,
+            input,
+            output,
+            CsilServiceDirection::Unidirectional,
+            None,
+        )
+    };
+    let text_list = || CsilTypeExpression::Array {
+        element_type: Box::new(builtin("text")),
+        occurrence: Some(CsilOccurrence::ZeroOrMore),
+    };
+    let int_map = || CsilTypeExpression::Map {
+        key: Box::new(builtin("text")),
+        value: Box::new(builtin("int")),
+        occurrence: Some(CsilOccurrence::ZeroOrMore),
+    };
+    vec![
+        group_rule("Ev", vec![bare_entry("msg", builtin("text"))]),
+        group_rule(
+            "Rec",
+            vec![
+                bare_entry(
+                    "nl",
+                    CsilTypeExpression::Choice(vec![builtin("null"), builtin("text")]),
+                ),
+                bare_entry("id", builtin("text")),
+            ],
+        ),
+        group_rule("Err", vec![bare_entry("why", builtin("text"))]),
+        service_rule(
+            "Svc",
+            vec![
+                unary("fire", reference("Ev"), builtin("null")),
+                unary("ping", builtin("null"), builtin("null")),
+                unary("echo", builtin("text"), builtin("text")),
+                unary("num", builtin("uint"), reference("Ev")),
+                unary("list", text_list(), text_list()),
+                unary("tally", int_map(), int_map()),
+                unary(
+                    "maybe",
+                    reference("Ev"),
+                    CsilTypeExpression::Choice(vec![reference("Ev"), builtin("null")]),
+                ),
+                unary(
+                    "fail",
+                    reference("Ev"),
+                    CsilTypeExpression::Choice(vec![builtin("null"), reference("Err")]),
+                ),
+                unary("rec", reference("Rec"), reference("Rec")),
+            ],
+            None,
+        ),
+    ]
+}
+
+const NULL_BOUNDARY_DRIVER_ZIG: &str = r#"const std = @import("std");
+const types = @import("types.gen.zig");
+const codec = @import("codec.gen.zig");
+
+test "every generated declaration analyzes" {
+    std.testing.refAllDeclsRecursive(@import("types.gen.zig"));
+    std.testing.refAllDeclsRecursive(@import("codec.gen.zig"));
+    std.testing.refAllDeclsRecursive(@import("client.gen.zig"));
+    std.testing.refAllDeclsRecursive(@import("server.gen.zig"));
+}
+
+test "null and scalar boundaries round-trip" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const nothing: ?*anyopaque = null;
+    const null_bytes = try codec.encode_SvcFireReplyResponse(alloc, &nothing);
+    try std.testing.expectEqualSlices(u8, &.{0xf6}, null_bytes);
+    var back: ?*anyopaque = undefined;
+    try codec.decode_SvcFireReplyResponse(alloc, null_bytes, &back);
+    try std.testing.expect(back == null);
+    try std.testing.expectError(error.WrongType, codec.decode_SvcFireReplyResponse(alloc, &.{0x01}, &back));
+
+    const word: []const u8 = "hi";
+    const text_bytes = try codec.encode_SvcEchoReplyRequest(alloc, &word);
+    var echoed: []const u8 = undefined;
+    try codec.decode_SvcEchoReplyResponse(alloc, text_bytes, &echoed);
+    try std.testing.expectEqualStrings("hi", echoed);
+
+    var words = [_][]const u8{ "a", "b" };
+    const list: [][]const u8 = &words;
+    const list_bytes = try codec.encode_SvcListReplyResponse(alloc, &list);
+    var listed: [][]const u8 = undefined;
+    try codec.decode_SvcListReplyResponse(alloc, list_bytes, &listed);
+    try std.testing.expectEqual(@as(usize, 2), listed.len);
+    try std.testing.expectEqualStrings("b", listed[1]);
+
+    const rec = types.Rec{ .nl = .{ .null = null }, .id = "x" };
+    const rec_bytes = try codec.encode_Rec(alloc, &rec);
+    var rec_back: types.Rec = undefined;
+    try codec.decode_Rec(alloc, rec_bytes, &rec_back);
+    try std.testing.expect(rec_back.nl == .null);
+}
+"#;
+
+/// Analyze every generated declaration (`zig ast-check` misses a call to a
+/// nonexistent codec function) and round-trip the null and scalar boundaries.
+/// Skips when `zig` is not on PATH.
+#[test]
+fn null_and_scalar_boundaries_analyze_and_round_trip_through_zig() {
+    let have_zig = std::process::Command::new("zig")
+        .arg("version")
+        .output()
+        .is_ok();
+    if !have_zig {
+        eprintln!("skipping: no zig on PATH");
+        return;
+    }
+    let mut options = HashMap::new();
+    options.insert("emit_packages".to_string(), serde_json::json!(["zig"]));
+    let out = process_generation(input_with_rules(
+        null_and_scalar_boundary_rules(),
+        "zig",
+        options,
+    ))
+    .unwrap();
+    let dir = std::env::temp_dir().join(format!("csilgen-zig-null-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    for file in &out.files {
+        let path = dir.join(&file.path);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, &file.content).unwrap();
+    }
+    std::fs::write(dir.join("driver.zig"), NULL_BOUNDARY_DRIVER_ZIG).unwrap();
+    let run = std::process::Command::new("zig")
+        .arg("test")
+        .arg(dir.join("driver.zig"))
+        .arg("--cache-dir")
+        .arg(dir.join("zig-cache"))
+        .output()
+        .unwrap();
+    assert!(
+        run.status.success(),
+        "zig test failed:\n{}{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

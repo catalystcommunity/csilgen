@@ -5230,13 +5230,21 @@ pub fn resolve_rpc_reply(
         out.push_str(&format!(
             "/// Encode the {helper} payload to canonical CSIL CBOR bytes.\n"
         ));
+        // A `null` boundary encodes a constant and never reads its value, so the
+        // parameter takes the `_` prefix that keeps `unused_variables` quiet.
+        let body = Self::rust_encode_wrapper_body(&enc);
+        let binding = if body.contains("csil_v") {
+            "csil_v"
+        } else {
+            "_csil_v"
+        };
         // clippy's `ptr_arg` rejects `&Vec<T>`; `&Vec<T>` callers coerce to a slice.
         let param = match rust_type
             .strip_prefix("Vec<")
             .and_then(|rest| rest.strip_suffix('>'))
         {
-            Some(element) => format!("csil_v: &[{element}]"),
-            None => format!("csil_v: &{rust_type}"),
+            Some(element) => format!("{binding}: &[{element}]"),
+            None => format!("{binding}: &{rust_type}"),
         };
         out.push_str(&Self::rust_sig(
             "pub ",
@@ -5244,7 +5252,7 @@ pub fn resolve_rpc_reply(
             &param,
             "Result<Vec<u8>, CsilCborError>",
         ));
-        out.push_str(&Self::rust_encode_wrapper_body(&enc));
+        out.push_str(&body);
         out.push_str("}\n\n");
         out.push_str(&format!(
             "/// Decode canonical CSIL CBOR bytes into the {helper} payload.\n"
@@ -7657,6 +7665,25 @@ mod tests {
         assert!(all.contains("Err(value) => (\"Transport\", "), "{all}");
         assert!(all.contains("Some(\"Transport\") => "), "{all}");
         assert!(!all.contains("\"TransportType\""), "{all}");
+    }
+
+    #[test]
+    fn null_output_encoder_does_not_bind_an_unread_value() {
+        // A `null` reply encodes a constant CBOR null, so a named `csil_v`
+        // parameter would trip `unused_variables` in the generated crate.
+        let mut input = make_unary_service_input("rust");
+        for rule in &mut input.csil_spec.rules {
+            if let CsilRuleType::ServiceDef(service) = &mut rule.rule_type {
+                service.operations[0].output_type = CsilTypeExpression::Builtin("null".to_string());
+            }
+        }
+        let files = RustCodeGenerator::new(&input).generate().unwrap();
+        let all: String = files.iter().map(|f| f.content.as_str()).collect();
+        assert!(
+            all.contains("pub fn encode_corndogs_submit_task_response(_csil_v: &())"),
+            "{all}"
+        );
+        assert!(!all.contains("(csil_v: &())"), "{all}");
     }
 
     #[test]
