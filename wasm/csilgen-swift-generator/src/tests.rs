@@ -389,9 +389,11 @@ fn int_literal_choice_referenced_by_a_struct_field_gets_a_working_codec() {
         .expect("Task codec extension emitted");
     assert!(!task_body.contains("\"prio\", .null"));
     assert!(task_body.contains("self.prio.toCborValue()"));
-    assert!(task_body.contains(
-        "let prio = try Priority(cborValue: (try CsilCbor.require(cborValue, \"prio\")))"
-    ));
+    assert!(
+        task_body.contains(
+            "let prio = try Priority(cborValue: try CsilCbor.require(cborValue, \"prio\"))"
+        )
+    );
 }
 
 #[test]
@@ -497,7 +499,7 @@ fn mixed_kind_literal_choice_referenced_by_a_struct_field_gets_a_working_codec()
     assert!(!holder_body.contains("\"value\", .null"));
     assert!(holder_body.contains("self.value.toCborValue()"));
     assert!(holder_body.contains(
-        "let value = try MixedLit(cborValue: (try CsilCbor.require(cborValue, \"value\")))"
+        "let value = try MixedLit(cborValue: try CsilCbor.require(cborValue, \"value\"))"
     ));
 }
 
@@ -690,13 +692,13 @@ fn struct_field_referencing_a_union_round_trips_through_its_own_codec() {
         .expect("Order codec extension emitted");
     // No more `.null` stub or `asText` misread for this field.
     assert!(!body.contains("\"status\", .null"));
-    assert!(!body.contains("CsilCbor.asText((try CsilCbor.require(cborValue, \"status\"))"));
+    assert!(!body.contains("CsilCbor.asText(try CsilCbor.require(cborValue, \"status\")"));
     // Encode/decode delegate to OrderStatus's own codec.
     assert!(
         body.contains("csilEntries.append((.text(\"status\"), try self.status.toCborValue()))")
     );
     assert!(body.contains(
-        "let status = try OrderStatus(cborValue: (try CsilCbor.require(cborValue, \"status\")))"
+        "let status = try OrderStatus(cborValue: try CsilCbor.require(cborValue, \"status\"))"
     ));
 }
 
@@ -1017,7 +1019,7 @@ fn single_element_tuple_with_an_inline_choice_collapses_to_the_bare_hoisted_type
         .nth(1)
         .expect("Torture codec extension emitted");
     assert!(struct_body.contains("CsilCborValue.array([try self.solo.toCborValue()])"));
-    assert!(struct_body.contains("try TortureSoloOnly(cborValue: (try CsilCbor.item("));
+    assert!(struct_body.contains("try TortureSoloOnly(cborValue: try CsilCbor.item("));
 }
 
 #[test]
@@ -1057,11 +1059,13 @@ fn named_pure_literal_choice_referenced_by_a_struct_field_gets_a_working_codec()
         .nth(1)
         .expect("Widget codec extension emitted");
     assert!(!widget_body.contains("\"color\", .null"));
-    assert!(!widget_body.contains("CsilCbor.asText((try CsilCbor.require(cborValue, \"color\"))"));
+    assert!(!widget_body.contains("CsilCbor.asText(try CsilCbor.require(cborValue, \"color\")"));
     assert!(widget_body.contains("self.color.toCborValue()"));
-    assert!(widget_body.contains(
-        "let color = try Color(cborValue: (try CsilCbor.require(cborValue, \"color\")))"
-    ));
+    assert!(
+        widget_body.contains(
+            "let color = try Color(cborValue: try CsilCbor.require(cborValue, \"color\"))"
+        )
+    );
 }
 
 #[test]
@@ -1133,7 +1137,7 @@ fn any_value_is_the_cbor_value_and_round_trips_unchanged() {
     assert!(codec.contains("public typealias AnyCsilValue = CsilCborValue"));
     assert!(codec.contains("(.text(\"body\"), self.body)"), "{codec}");
     assert!(
-        codec.contains("let body = (try CsilCbor.require(cborValue, \"body\"))"),
+        codec.contains("let body = try CsilCbor.require(cborValue, \"body\")"),
         "{codec}"
     );
     // No validation machinery when there are no constraints.
@@ -1261,11 +1265,8 @@ fn client_target_emits_typed_client_with_canonical_wire_strings() {
     // Canonical wire strings: verbatim CSIL service and op names
     // (csil-rpc-transport.md §1.1) — so a Swift client reaches the same endpoint
     // as its peers.
-    assert!(
-        client
-            .content
-            .contains("service: \"Attestation\", op: \"deposit-claim\"")
-    );
+    assert!(client.content.contains("service: \"Attestation\""));
+    assert!(client.content.contains("op: \"deposit-claim\""));
     // No server protocol for the client sub-target.
     assert!(!files.iter().any(|f| f.path == "Services.swift"));
 }
@@ -1396,7 +1397,7 @@ fn codec_emitted_with_typed_client() {
         .find(|f| f.path == "Codec.swift")
         .expect("Codec.swift emitted");
     assert!(codec.content.contains("public enum CsilCbor"));
-    assert!(codec.content.contains("public extension Task {"));
+    assert!(codec.content.contains("extension Task {"));
     assert!(codec.content.contains("func toCbor() throws -> [UInt8]"));
     assert!(
         codec
@@ -1739,14 +1740,14 @@ fn named_map_alias_field_roundtrips_as_a_map_not_a_stub() {
     ];
     let input = input_from_rules("swift", rules, 0);
     let codec = generate_codec(&input).expect("codec emitted");
-    // Encode must build a CBOR map; decode must read one back via asMap.
+    // Encode must build a CBOR map; decode must read one back via asCanonicalMap, which checks the key order.
     assert!(codec.contains("CsilCborValue.map(self.counts.map {"));
-    assert!(codec.contains("try CsilCbor.asMap"));
+    assert!(codec.contains("try CsilCbor.asCanonicalMap"));
     assert!(codec.contains("reduce(into: [String: Int64]()"));
     // The stub must be gone for this field.
     let body = codec.split("extension Holder").nth(1).unwrap();
     assert!(!body.contains("\"counts\", .null"));
-    assert!(!body.contains("CsilCbor.asText((try CsilCbor.require(cborValue, \"counts\"))"));
+    assert!(!body.contains("CsilCbor.asText(try CsilCbor.require(cborValue, \"counts\")"));
 }
 
 #[test]
@@ -1771,7 +1772,7 @@ fn named_map_of_record_alias_recurses_into_the_record_codec() {
     assert!(body.contains("CsilCborValue.map(try self.items.map {"));
     assert!(body.contains("try $0.value.toCborValue()"));
     // Decode reads a map and reconstructs each record value.
-    assert!(body.contains("try CsilCbor.asMap"));
+    assert!(body.contains("try CsilCbor.asCanonicalMap"));
     assert!(body.contains("try SomeRecord(cborValue: $1.1)"));
     assert!(!body.contains("\"items\", .null"));
 }
@@ -1801,11 +1802,8 @@ fn wire_strings_are_verbatim_csil_names() {
     );
     let files = build_files(&input).expect("ok");
     let client = files.iter().find(|f| f.path == "Client.swift").unwrap();
-    assert!(
-        client
-            .content
-            .contains("service: \"CorndogsService\", op: \"submit-task\"")
-    );
+    assert!(client.content.contains("service: \"CorndogsService\""));
+    assert!(client.content.contains("op: \"submit-task\""));
     assert!(!client.content.contains("\"corndogs\""));
     assert!(!client.content.contains("\"SubmitTask\""));
 }
@@ -1869,11 +1867,11 @@ fn package_manifest_declares_a_platform_floor_only_for_regex() {
         )],
     )]);
     assert!(
-        regex.contains("    platforms: [.macOS(.v13), .iOS(.v16), .tvOS(.v16), .watchOS(.v9)],\n"),
+        regex.contains("  platforms: [.macOS(.v13), .iOS(.v16), .tvOS(.v16), .watchOS(.v9)],\n"),
         "{regex}"
     );
     assert!(
-        regex.contains("\n    products: [\n"),
+        regex.contains("\n  products: [\n"),
         "the manifest keeps its indentation"
     );
 }
@@ -2379,7 +2377,7 @@ fn case_insensitive_collision_between_existing_rule_and_hoisted_inline_choice_is
     // colliding "UserData" a naive `format!("{owner}_{wire}")` scheme would produce.
     assert!(types.contains("public let data: UserData2"));
     assert!(types.contains(
-        "public enum UserData2: Equatable, Sendable, CaseIterable {\n    case x\n    case v1\n"
+        "public enum UserData2: Equatable, Sendable, CaseIterable {\n  case x\n  case v1\n"
     ));
 
     // Exactly one declaration for each name — not two conflicting `UserData`s.
@@ -2732,6 +2730,33 @@ do {
     _ = try Deadline(due: "2026-02-30").toCbor()
     fatalError("date encode accepted 2026-02-30")
 } catch CsilCborError.typeMismatch {}
+// A map key with a long-form head, a repeated key, or (for a dynamic map) keys out
+// of encoded-byte order is refused; a record takes its keys in any order.
+for bad in [[0xa1, 0x18, 0x01, 0x60], [0xa1, 0x78, 0x01, 0x61, 0x60], [0xa1, 0x19, 0x00, 0x05, 0x60]] as [[UInt8]] {
+    do {
+        _ = try CsilCbor.decode(bad)
+        fatalError("a long-form key was read")
+    } catch CsilCborError.longFormKey {}
+}
+do {
+    _ = try CsilCbor.decode([0xa2, 0x61, 0x61, 0x01, 0x61, 0x61, 0x02])
+    fatalError("a repeated key was read")
+} catch CsilCborError.duplicateKey(let key) { precondition(key == "\"a\"") }
+precondition(CsilCbor.shortestHead([0x18, 0x18]) && !CsilCbor.shortestHead([0x18, 0x17]))
+precondition(CsilCbor.shortestHead([0x1a, 0x00, 0x01, 0x00, 0x00]))
+precondition(!CsilCbor.shortestHead([0x1b, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff]))
+precondition(CsilCbor.shortestHead([0xf9, 0x00, 0x00]))
+do {
+    _ = try CsilCbor.asCanonicalMap(CsilCbor.decode([0xa2, 0x62, 0x61, 0x61, 0x01, 0x61, 0x62, 0x02]))
+    fatalError("unsorted dynamic map keys were read")
+} catch CsilCborError.mapKeyOrder {}
+_ = try CsilCbor.asCanonicalMap(CsilCbor.decode([0xa2, 0x61, 0x62, 0x01, 0x62, 0x61, 0x61, 0x02]))
+// Float keys are ordered on the bytes that arrived: a half float sorts before a double.
+_ = try CsilCbor.asCanonicalMap(CsilCbor.decode([0xa2, 0xf9, 0x3c, 0x00, 0x01, 0xfb, 0x3f, 0xf0, 0, 0, 0, 0, 0, 0, 0x02]))
+do {
+    _ = try CsilCbor.decode([0xa2, 0xfb, 0x3f, 0xf0, 0, 0, 0, 0, 0, 0, 0x01, 0xf9, 0x40, 0x00, 0x02])
+    fatalError("unsorted float keys were read")
+} catch CsilCborError.mapKeyOrder {}
 // A short tuple array from a peer throws instead of indexing out of range.
 let second = try CsilCbor.item(.array([.text("a"), .int(1)]), 1)
 precondition(CsilCbor.valueEquals(second, .int(1)))
@@ -2826,10 +2851,10 @@ fn multi_arm_operation_uses_call_reply_in_both_client_shapes() {
     };
     let sync = content("Client.swift");
     assert!(sync.contains(
-        "    func callReply(service: String, op: String, request: [UInt8]) throws -> (variant: String?, payload: [UInt8])\n"
+        "  func callReply(\n    service: String,\n    op: String,\n    request: [UInt8]\n  ) throws -> (variant: String?, payload: [UInt8])\n"
     ), "{sync}");
     assert!(sync.contains(
-        "        let csilReply = try transport.callReply(service: \"Signer\", op: \"sign\", request: csilRequest)\n        let csilResp = try resolveRpcReply(service: \"Signer\", op: \"sign\", variant: csilReply.variant, payload: csilReply.payload)\n"
+        "    let csilReply = try transport.callReply(service: \"Signer\", op: \"sign\", request: csilRequest)\n    let csilResp = try resolveRpcReply(\n      service: \"Signer\",\n      op: \"sign\",\n      variant: csilReply.variant,\n      payload: csilReply.payload\n    )\n"
     ), "{sync}");
     let twin = content("ClientAsync.swift");
     assert!(
@@ -2906,17 +2931,15 @@ fn encode_paths_throw_instead_of_trapping() {
         codec
             .contains("csilEntries.append((.text(\"seen\"), try CsilCbor.encodeEpoch(self.seen)))")
     );
-    assert!(
-        codec.contains("        return (\"Stamp\", CsilCbor.encode(try value.toCborValue()))\n")
-    );
+    assert!(codec.contains("    return (\"Stamp\", CsilCbor.encode(try value.toCborValue()))\n"));
     assert!(codec.contains("answer with transport status 6 (internal)"));
     let client = file("Client.swift");
     assert!(client.contains(
-        "        let csilRequest = try request.toCbor()\n        let csilReply = try transport.callReply(service: \"Clock\", op: \"stamp\", request: csilRequest)\n"
+        "    let csilRequest = try request.toCbor()\n    let csilReply = try transport.callReply(service: \"Clock\", op: \"stamp\", request: csilRequest)\n"
     ), "{client}");
     let twin = file("ClientAsync.swift");
     assert!(twin.contains(
-        "        let csilRequest = try request.toCbor()\n        let csilReply = try await transport.callReply("
+        "    let csilRequest = try request.toCbor()\n    let csilReply = try await transport.callReply("
     ), "{twin}");
     for file in files.iter().filter(|file| file.path.ends_with(".swift")) {
         for trap in [
@@ -3087,7 +3110,7 @@ fn nint_is_int64_with_a_sign_check_both_ways() {
     assert!(shapes_file("Types.swift").contains("public let n: Int64"));
     let codec = shapes_file("Codec.swift");
     assert!(codec.contains("try CsilCbor.encodeNint(self.n)"), "{codec}");
-    assert!(codec.contains("try CsilCbor.asNint((try CsilCbor.require(cborValue, \"n\")))"));
+    assert!(codec.contains("try CsilCbor.asNint(try CsilCbor.require(cborValue, \"n\"))"));
 }
 
 #[test]
@@ -3116,9 +3139,11 @@ fn records_and_unions_with_tuples_spell_out_equality() {
         "{types}"
     );
     assert!(types.contains(
-        "(lhs.triple.field0 == rhs.triple.field0 && lhs.triple.field1 == rhs.triple.field1 && lhs.triple.field2 == rhs.triple.field2)"
+        "      && lhs.triple.field0 == rhs.triple.field0\n      && lhs.triple.field1 == rhs.triple.field1\n      && lhs.triple.field2 == rhs.triple.field2\n"
     ), "{types}");
-    assert!(types.contains("CsilEq.optional(lhs.maybePair, rhs.maybePair) { (csilL0, csilR0) in"));
+    assert!(types.contains(
+        "CsilEq.optional(lhs.maybePair, rhs.maybePair) {\n        (csilL0, csilR0) in csilL0.field0"
+    ));
     assert!(
         types.contains("public static func == (lhs: Outcome, rhs: Outcome) -> Bool {"),
         "{types}"
@@ -3135,20 +3160,20 @@ fn records_and_unions_with_tuples_spell_out_equality() {
 fn optional_tuple_positions_travel_as_null_and_keep_the_length() {
     let codec = shapes_file("Codec.swift");
     assert!(codec.contains(
-        "(self.triple.field1.map { (csilSome) -> CsilCborValue in .int(csilSome) } ?? CsilCborValue.null)"
+        "self.triple.field1.map {\n              (csilSome) -> CsilCborValue in .int(csilSome)\n            } ?? CsilCborValue.null,"
     ), "{codec}");
     assert!(codec.contains(
-        "field1: try CsilCbor.orNull((try CsilCbor.item((try CsilCbor.require(cborValue, \"triple\")), 1, of: 3))) { (csilSome) in try CsilCbor.asI64(csilSome) }"
+        "field1: try CsilCbor.orNull(\n        try CsilCbor.item(try CsilCbor.require(cborValue, \"triple\"), 1, of: 3)\n      ) {\n        (csilSome) in try CsilCbor.asI64(csilSome)\n      },"
     ), "{codec}");
-    assert!(codec.contains(", 2, of: 3))"), "{codec}");
+    assert!(codec.contains(", 2, of: 3)\n"), "{codec}");
 }
 
 #[test]
 fn a_null_union_arm_has_no_payload() {
     let types = shapes_file("Types.swift");
-    assert!(types.contains("    case null\n"), "{types}");
+    assert!(types.contains("  case null\n"), "{types}");
     let codec = shapes_file("Codec.swift");
-    assert!(codec.contains("case .null:\n            return .array([.uint(1), .null])"));
+    assert!(codec.contains("case .null:\n      return .array([.uint(1), .null])"));
     assert!(codec.contains("guard csilPayload == .null else { throw CsilCborError.typeMismatch }"));
 }
 
@@ -3381,10 +3406,8 @@ fn reserved_rule_name_is_renamed_but_keeps_its_wire_variant() {
     assert!(!types.contains("public struct CsilTransport:"));
     let codec = file("Codec.swift");
     assert!(codec.contains("public struct CsilTransportTypeRefusal: Swift.Error {"));
-    assert!(codec.contains("} catch let refusal as CsilTransportTypeRefusal {\n        return (\"CsilTransport\", CsilCbor.encode("));
-    assert!(
-        codec.contains("        case \"CsilTransport\": throw CsilTransportTypeRefusal(value: ")
-    );
+    assert!(codec.contains("} catch let refusal as CsilTransportTypeRefusal {\n    return (\"CsilTransport\", CsilCbor.encode("));
+    assert!(codec.contains("    case \"CsilTransport\":\n      throw CsilTransportTypeRefusal(\n"));
 }
 
 /// `Svc.get: Holder -> Holder / <error_arm>` over `Holder = { fN: <rule> }`, one
@@ -3425,7 +3448,7 @@ fn rule_named_like_a_derived_type_is_renamed() {
     assert!(types.contains("public struct SvcClientType: Equatable, Sendable {"));
     let codec = file_text(&files, "Codec.swift");
     assert!(codec.contains("public struct FooRefusal: Swift.Error {"));
-    assert!(codec.contains("        case \"Foo\": throw FooRefusal(value: "));
+    assert!(codec.contains("    case \"Foo\": throw FooRefusal(value: "));
     assert!(file_text(&files, "Client.swift").contains("public struct SvcClient {"));
 }
 
@@ -3442,9 +3465,9 @@ fn rules_with_the_same_swift_name_are_told_apart() {
     }
     let codec = file_text(&files, "Codec.swift");
     assert!(codec.contains(
-        "} catch let refusal as ValueTypeRefusal {\n        return (\"value\", CsilCbor.encode("
+        "} catch let refusal as ValueTypeRefusal {\n    return (\"value\", CsilCbor.encode("
     ));
-    assert!(codec.contains("        case \"value\": throw ValueTypeRefusal(value: "));
+    assert!(codec.contains("    case \"value\": throw ValueTypeRefusal(value: "));
 }
 
 #[test]
@@ -3462,5 +3485,503 @@ fn renamed_rules_are_reported_as_warnings() {
         messages
             .iter()
             .any(|m| m.contains("`Int` is generated as `IntType` for swift-client"))
+    );
+}
+
+/// Type-check the emitted Swift sources, or skip when no Swift compiler is present
+/// (see `swift_compiler`). Only `-typecheck`, so a containerized `SWIFTC` works too.
+fn typecheck(files: &[GeneratedFile]) {
+    let Some(swiftc) = swift_compiler() else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let mut sources = Vec::new();
+    // The manifest is read by SwiftPM, not compiled with the module.
+    for file in files
+        .iter()
+        .filter(|f| f.path.ends_with(".swift") && f.path != "Package.swift")
+    {
+        let name = file.path.rsplit('/').next().unwrap().to_string();
+        std::fs::write(dir.path().join(&name), &file.content).unwrap();
+        sources.push(name);
+    }
+    let output = std::process::Command::new(&swiftc)
+        .current_dir(dir.path())
+        .arg("-typecheck")
+        .args(&sources)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "Swift type-check failed:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn count(haystack: &str, needle: &str) -> usize {
+    haystack.matches(needle).count()
+}
+
+/// The first schema of the linkkeys request: the op boundary is the record itself,
+/// so nothing is derived from the op that could clash with the record.
+#[test]
+fn op_boundary_record_keeps_its_name() {
+    let rules = vec![
+        group_rule(
+            "RpIssueAttestationRequest",
+            vec![bare_entry("claim_type", builtin("text"))],
+        ),
+        group_rule(
+            "RpIssueAttestationResponse",
+            vec![bare_entry("deposited", builtin("bool"))],
+        ),
+        service_rule(
+            "Rp",
+            vec![make_op(
+                "issue-attestation",
+                reference("RpIssueAttestationRequest"),
+                reference("RpIssueAttestationResponse"),
+                CsilServiceDirection::Unidirectional,
+            )],
+            None,
+        ),
+    ];
+    for target in ["swift", "swift-client"] {
+        let input = input_from_rules(target, rules.clone(), 1);
+        let (files, warnings) = build_files_with_warnings(&input).expect("ok");
+        assert!(warnings.is_empty(), "{target}: {warnings:?}");
+        let types = file_text(&files, "Types.swift");
+        assert_eq!(
+            count(&types, "public struct RpIssueAttestationRequest:"),
+            1,
+            "{target}"
+        );
+        assert!(!types.contains("RpIssueAttestationRequestType"));
+        typecheck(&files);
+    }
+}
+
+/// The second schema of the request. Swift emits `encodeMemberGetMemberRequest` for
+/// the `MemberID` boundary, but that is a free function with a lower-case name, so it
+/// does not clash with the type `MemberGetMemberRequest`, and no rename is needed.
+#[test]
+fn per_op_codec_function_does_not_clash_with_a_type() {
+    let rules = vec![
+        typedef_rule("MemberID", builtin("text")),
+        group_rule(
+            "MemberGetMemberRequest",
+            vec![bare_entry("id", builtin("text"))],
+        ),
+        service_rule(
+            "Member",
+            vec![make_op(
+                "get-member",
+                reference("MemberID"),
+                reference("MemberID"),
+                CsilServiceDirection::Unidirectional,
+            )],
+            None,
+        ),
+    ];
+    let input = input_from_rules("swift-client", rules, 1);
+    let (files, warnings) = build_files_with_warnings(&input).expect("ok");
+    assert!(warnings.is_empty(), "{warnings:?}");
+    let codec = file_text(&files, "Codec.swift");
+    assert_eq!(
+        count(&codec, "public func encodeMemberGetMemberRequest("),
+        1
+    );
+    assert_eq!(count(&codec, "\nextension MemberGetMemberRequest {"), 1);
+    typecheck(&files);
+}
+
+/// `<Service>Client` and `<Service>AsyncClient` are reserved only when the run emits
+/// that client struct.
+#[test]
+fn client_names_are_reserved_only_when_the_client_is_emitted() {
+    let names = |target: &str, style: Option<&str>| {
+        let mut input = clash_input(&["SvcClient", "SvcAsyncClient"], "Holder");
+        input.config.target = target.to_string();
+        if let Some(style) = style {
+            input
+                .config
+                .options
+                .insert("client_style".into(), serde_json::json!(style));
+        }
+        let (files, warnings) = build_files_with_warnings(&input).expect("ok");
+        typecheck(&files);
+        let types = file_text(&files, "Types.swift");
+        let renamed: Vec<&str> = ["SvcClientType", "SvcAsyncClientType"]
+            .into_iter()
+            .filter(|ty| types.contains(&format!("public struct {ty}:")))
+            .collect();
+        assert_eq!(warnings.len(), renamed.len(), "{target}: {warnings:?}");
+        renamed
+    };
+    assert!(names("swift", None).is_empty());
+    assert_eq!(
+        names("swift-client", None),
+        ["SvcClientType", "SvcAsyncClientType"]
+    );
+    assert_eq!(names("swift-client", Some("sync")), ["SvcClientType"]);
+    assert_eq!(names("swift-client", Some("async")), ["SvcClientType"]);
+}
+
+/// Two services whose Swift names are equal: the later one is renamed, and the wire
+/// keeps each declared name.
+#[test]
+fn services_with_the_same_swift_name_keep_their_wire_names() {
+    // `Foo` and `FooService` share the client name `FooClient`, so the later one is
+    // renamed too.
+    let rules = vec![
+        group_rule("Holder", vec![bare_entry("id", builtin("int"))]),
+        service_rule(
+            "Foo",
+            vec![make_op(
+                "get",
+                reference("Holder"),
+                reference("Holder"),
+                CsilServiceDirection::Unidirectional,
+            )],
+            None,
+        ),
+        service_rule(
+            "FooService",
+            vec![make_op(
+                "put",
+                reference("Holder"),
+                reference("Holder"),
+                CsilServiceDirection::Unidirectional,
+            )],
+            None,
+        ),
+    ];
+    let files = build_files(&input_from_rules("swift-client", rules, 2)).expect("ok");
+    let client = file_text(&files, "Client.swift");
+    assert!(client.contains("public struct FooClient {"));
+    assert!(client.contains("public struct FooService2Client {"));
+    assert!(client.contains("service: \"FooService\", op: \"put\""));
+    typecheck(&files);
+
+    let op = |name: &str| {
+        make_op(
+            name,
+            reference("Holder"),
+            reference("Holder"),
+            CsilServiceDirection::Unidirectional,
+        )
+    };
+    let rules = vec![
+        group_rule("Holder", vec![bare_entry("id", builtin("int"))]),
+        service_rule("UserSvc", vec![op("get")], None),
+        service_rule("user-svc", vec![op("put")], None),
+    ];
+    let mut input = input_from_rules("swift", rules, 2);
+    input
+        .config
+        .options
+        .insert("emit_packages".into(), serde_json::json!(["swift"]));
+    let (files, warnings) = build_files_with_warnings(&input).expect("ok");
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert!(
+        warnings[0]
+            .message
+            .contains("service `user-svc` is generated as `user-svc2`")
+    );
+    typecheck(&files);
+    let client = files
+        .iter()
+        .find(|f| f.path.ends_with("/Client.swift"))
+        .expect("client")
+        .content
+        .clone();
+    assert!(client.contains("public struct UserSvcClient {"));
+    assert!(client.contains("public struct UserSvc2Client {"));
+    assert!(client.contains("service: \"UserSvc\", op: \"get\""));
+    assert!(client.contains("service: \"user-svc\", op: \"put\""));
+    let services = files
+        .iter()
+        .find(|f| f.path.ends_with("/Services.swift"))
+        .expect("services")
+        .content
+        .clone();
+    assert!(services.contains("public protocol UserSvc {"));
+    assert!(services.contains("public protocol UserSvc2 {"));
+}
+
+/// A name the inline-composite hoister invents is checked like a user rule: the
+/// field `cbor` of `Csil` becomes `Csil_cbor`, whose Swift name `CsilCbor` is the
+/// runtime's own type.
+#[test]
+fn hoisted_names_are_checked_for_clashes() {
+    let inline = CsilTypeExpression::Group(CsilGroupExpression {
+        entries: vec![bare_entry("a", builtin("int"))],
+    });
+    let rules = vec![group_rule("Csil", vec![bare_entry("cbor", inline)])];
+    let input = input_from_rules("swift", rules, 0);
+    let (files, warnings) = build_files_with_warnings(&input).expect("ok");
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert!(warnings[0].message.contains("`Csil_cbor`"));
+    let types = file_text(&files, "Types.swift");
+    assert!(types.contains("public let cbor: CsilCborType\n"));
+    assert!(types.contains("public struct CsilCborType: Equatable, Sendable {"));
+    typecheck(&files);
+}
+
+/// A mixed op output is one named union with every arm, in the client and the server.
+#[test]
+fn mixed_op_output_is_a_named_union_with_every_arm() {
+    let output = CsilTypeExpression::Choice(vec![
+        CsilTypeExpression::Map {
+            key: Box::new(builtin("text")),
+            value: Box::new(builtin("int")),
+            occurrence: None,
+        },
+        reference("Err"),
+    ]);
+    let rules = vec![
+        group_rule("Holder", vec![bare_entry("id", builtin("int"))]),
+        group_rule("Err", vec![bare_entry("message", builtin("text"))]),
+        service_rule(
+            "Lookup",
+            vec![make_op(
+                "read-counts",
+                reference("Holder"),
+                output,
+                CsilServiceDirection::Unidirectional,
+            )],
+            None,
+        ),
+    ];
+    let mut input = input_from_rules("swift", rules, 1);
+    input
+        .config
+        .options
+        .insert("emit_packages".into(), serde_json::json!(["swift"]));
+    let files = build_files(&input).expect("ok");
+    let find = |suffix: &str| {
+        files
+            .iter()
+            .find(|f| f.path.ends_with(suffix))
+            .expect(suffix)
+            .content
+            .clone()
+    };
+    let types = find("/Types.swift");
+    assert!(types.contains("public enum LookupReadCountsOutput: Equatable, Sendable {"));
+    assert!(types.contains("case err(Err)"));
+    assert!(
+        find("/Client.swift")
+            .contains("func readCounts(_ request: Holder) throws -> LookupReadCountsOutput {")
+    );
+    assert!(
+        find("/Services.swift")
+            .contains("func readCounts(_ request: Holder) throws -> LookupReadCountsOutput\n")
+    );
+    typecheck(&files);
+}
+
+/// The runtime rejects a dynamic map whose keys are out of canonical order and any
+/// map with a key twice.
+#[test]
+fn runtime_checks_map_key_order_and_duplicates() {
+    assert!(CODEC_RUNTIME_SWIFT.contains("public static func asCanonicalMap("));
+    assert!(CODEC_RUNTIME_SWIFT.contains("!previous.lexicographicallyPrecedes(key)"));
+    assert!(CODEC_RUNTIME_SWIFT.contains("guard seen.insert(raw).inserted else {"));
+    assert!(CODEC_RUNTIME_SWIFT.contains("csil cbor: map keys are not in canonical order"));
+    assert!(CODEC_RUNTIME_SWIFT.contains("csil cbor: duplicate key"));
+    assert!(
+        CODEC_RUNTIME_SWIFT
+            .contains("guard shortestHead(raw) else { throw CsilCborError.longFormKey }")
+    );
+    assert!(CODEC_RUNTIME_SWIFT.contains("csil cbor: map key is not in shortest form"));
+}
+
+/// Every emitted Swift line fits the swift-format line length, except a line that
+/// holds one token the formatter cannot break either (a long name or string).
+/// `tests/interop/formatting` runs the real formatter on the same shapes.
+#[test]
+fn emitted_lines_fit_the_formatter_line_length() {
+    let long_enum = "NotificationChannelKindWithAnUnusuallyLongDescriptiveTypeNameForTesting";
+    let long_record = "ExtraordinarilyLongRecordNameForFormatterChecksAcrossEveryTargetLanguage";
+    let service = "ServiceWithAnExceedinglyLongNameUsedOnlyForFormatterChecks";
+    let rules = vec![
+        typedef_rule(
+            long_enum,
+            CsilTypeExpression::Choice(vec![
+                text_literal("electronic-mail-address-delivery"),
+                text_literal("push-notification-delivery-to-registered-device"),
+                text_literal("web-hook-callback-to-registered-endpoint"),
+            ]),
+        ),
+        typedef_rule(
+            "ClaimValueType",
+            CsilTypeExpression::Choice(
+                [
+                    "text", "url", "email", "bool", "int", "float", "decimal", "date",
+                ]
+                .into_iter()
+                .map(text_literal)
+                .collect(),
+            ),
+        ),
+        group_rule(
+            long_record,
+            vec![
+                bare_entry(
+                    "channel_kind_for_notifications_sent_to_the_account_holder",
+                    reference(long_enum),
+                ),
+                opt_entry(
+                    "optional_list_of_extraordinarily_long_record_references",
+                    CsilTypeExpression::Array {
+                        element_type: Box::new(reference("ShortRecord")),
+                        occurrence: None,
+                    },
+                ),
+                bare_entry(
+                    "map_from_identifier_to_holder_with_a_very_long_field_name",
+                    CsilTypeExpression::Map {
+                        key: Box::new(builtin("text")),
+                        value: Box::new(reference("ShortRecord")),
+                        occurrence: None,
+                    },
+                ),
+                bare_entry(
+                    "timestamp_of_the_last_modification_made_by_any_user",
+                    builtin("timestamp"),
+                ),
+            ],
+        ),
+        group_rule("ShortRecord", vec![bare_entry("a", builtin("int"))]),
+        group_rule(
+            "ErrorForLongOperations",
+            vec![bare_entry("message", builtin("text"))],
+        ),
+        service_rule(
+            service,
+            vec![
+                make_op(
+                    "operation-with-an-exceedingly-long-name-that-returns-a-choice",
+                    reference(long_record),
+                    CsilTypeExpression::Choice(vec![
+                        reference(long_record),
+                        reference("ErrorForLongOperations"),
+                    ]),
+                    CsilServiceDirection::Unidirectional,
+                ),
+                make_op(
+                    "read-mixed-output-with-an-inline-map-arm",
+                    reference("ShortRecord"),
+                    CsilTypeExpression::Choice(vec![
+                        CsilTypeExpression::Map {
+                            key: Box::new(builtin("text")),
+                            value: Box::new(builtin("int")),
+                            occurrence: None,
+                        },
+                        reference("ErrorForLongOperations"),
+                    ]),
+                    CsilServiceDirection::Unidirectional,
+                ),
+            ],
+            None,
+        ),
+    ];
+    let mut input = input_from_rules("swift", rules, 1);
+    input
+        .config
+        .options
+        .insert("emit_packages".into(), serde_json::json!(["swift"]));
+    let files = build_files(&input).expect("ok");
+    let mut checked = 0;
+    for file in files.iter().filter(|f| f.path.ends_with(".swift")) {
+        for line in file.content.lines() {
+            checked += 1;
+            if line.chars().count() <= swiftfmt::LINE_LENGTH {
+                continue;
+            }
+            let code = line.trim();
+            let atom = code.trim_start_matches("-> ");
+            let one_token = !atom.contains(' ') || (atom.starts_with('"') && atom.ends_with('"'));
+            assert!(
+                code.starts_with("//") || one_token,
+                "{}: line over {} columns: {line}",
+                file.path,
+                swiftfmt::LINE_LENGTH
+            );
+        }
+    }
+    assert!(checked > 500, "{checked}");
+    typecheck(&files);
+}
+
+/// Text enum values that are not Swift identifiers get legal case names, keep their
+/// wire value, and round-trip through the codec.
+#[test]
+fn text_enum_values_get_legal_case_names_and_round_trip() {
+    let values = ["calendars.read", "events.write", "a-b c", "2fa", "class"];
+    let rules = vec![
+        typedef_rule(
+            "Scope",
+            CsilTypeExpression::Choice(values.iter().map(|v| text_literal(v)).collect()),
+        ),
+        group_rule("Grant", vec![bare_entry("scope", reference("Scope"))]),
+    ];
+    let files = build_files(&input_from_rules("swift", rules, 0)).expect("ok");
+    let types = file_text(&files, "Types.swift");
+    for case in [
+        "case calendarsRead = \"calendars.read\"",
+        "case eventsWrite = \"events.write\"",
+        "case aBC = \"a-b c\"",
+        "case v2Fa = \"2fa\"",
+        "case `class` = \"class\"",
+    ] {
+        assert!(types.contains(case), "{case}\n{types}");
+    }
+    assert_eq!(
+        text_case_names(&["pending", "allow-once", "rawValue", "a.b", "a-b"]),
+        ["pending", "allowOnce", "vRawValue", "aB", "aB2"]
+    );
+    let Some(swiftc) = swift_compiler() else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let mut sources = Vec::new();
+    for file in files.iter().filter(|f| f.path.ends_with(".swift")) {
+        std::fs::write(dir.path().join(&file.path), &file.content).unwrap();
+        sources.push(file.path.clone());
+    }
+    std::fs::write(
+        dir.path().join("main.swift"),
+        r#"for scope in Scope.allCases {
+    let bytes = try Grant(scope: scope).toCbor()
+    let wire = Array(scope.rawValue.utf8)
+    precondition(bytes.suffix(wire.count) == wire[...], "wire value of \(scope)")
+    let back = try Grant.fromCbor(bytes).scope
+    precondition(back == scope, "round trip of \(scope)")
+}
+precondition(Scope.allCases.map(\.rawValue) == ["calendars.read", "events.write", "a-b c", "2fa", "class"])
+"#,
+    )
+    .unwrap();
+    sources.push("main.swift".into());
+    let output = std::process::Command::new(&swiftc)
+        .current_dir(dir.path())
+        .args(&sources)
+        .args(["-o", "enums"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "Swift compile failed:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let run = std::process::Command::new(dir.path().join("enums"))
+        .output()
+        .unwrap();
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
     );
 }

@@ -174,6 +174,11 @@ impl ImportResolver {
         let resolved_path = self.resolve_file_path(path, base_dir)?;
         let (imported_spec, imported_origins) = self.load_and_resolve_file(path, base_dir)?;
 
+        // The imported spec is already deduplicated, so a name it holds twice is two
+        // real definitions in that file. They share one origin, so the diamond guard
+        // below would drop the second one and hide the duplicate from validation.
+        let mut seen_in_file: HashSet<String> = HashSet::new();
+
         // Merge rules with optional namespace prefix
         for rule in imported_spec.rules {
             let origin = imported_origins
@@ -185,7 +190,8 @@ impl ImportResolver {
                 None => rule.name.clone(),
             };
 
-            if !merged.insert((final_name.clone(), origin.clone())) {
+            let repeated_in_file = !seen_in_file.insert(final_name.clone());
+            if !merged.insert((final_name.clone(), origin.clone())) && !repeated_in_file {
                 // Same true origin already merged into `spec` under this exact final
                 // name — a diamond (or an overlapping plain-include/selective-import
                 // pair), not a genuine collision. Two rules that merely *end up* with
@@ -993,6 +999,148 @@ mod tests {
             other => panic!("expected TypeDef(Choice(..)), got {other:?}"),
         }
         crate::validate_spec(&spec).expect("cross-include /= extension should validate cleanly");
+    }
+
+    /// `//=` adds record arms to the base record in declaration order, also across
+    /// includes: the base is always arm 0, then the arms of the file that includes come
+    /// in their order in that file, then the arms of each included file, in `include`
+    /// order (the resolver puts an included file's rules after the including file's
+    /// own rules). An arm's union variant index is its place in this order, so
+    /// the order is part of the wire contract.
+    #[test]
+    fn test_group_choice_extension_across_include_merges_in_declaration_order() {
+        let temp_dir = TempDir::new().unwrap();
+
+        fs::write(
+            temp_dir.path().join("entry.csil"),
+            r#"
+        include "phone.csil"
+        Contact = { id: int, name: text }
+        Contact //= { email: text }
+        "#,
+        )
+        .unwrap();
+
+        fs::write(
+            temp_dir.path().join("phone.csil"),
+            r#"
+        Contact //= { phone: text } // { pager: text }
+        "#,
+        )
+        .unwrap();
+
+        let mut resolver = ImportResolver::new();
+        let mut spec = parse_csil_file(temp_dir.path().join("entry.csil")).unwrap();
+        resolver
+            .resolve_imports(&mut spec, &temp_dir.path().join("entry.csil"))
+            .unwrap();
+
+        let contact: Vec<_> = spec.rules.iter().filter(|r| r.name == "Contact").collect();
+        assert_eq!(contact.len(), 1, "//= across an include must merge");
+        let RuleType::TypeDef(TypeExpression::Choice(arms)) = &contact[0].rule_type else {
+            panic!(
+                "expected TypeDef(Choice(..)), got {:?}",
+                contact[0].rule_type
+            );
+        };
+        let first_keys: Vec<String> = arms
+            .iter()
+            .map(|arm| match arm {
+                TypeExpression::Group(group) => match &group.entries[0].key {
+                    Some(crate::ast::GroupKey::Bare(name)) => name.clone(),
+                    other => panic!("expected a bare key, got {other:?}"),
+                },
+                other => panic!("expected a record arm, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(first_keys, vec!["id", "email", "phone", "pager"]);
+        crate::validate_spec(&spec).expect("cross-include //= extension should validate");
+    }
+
+    /// The base can live in an included file: it stays arm 0, then the including
+    /// file's arms, then the arms of the later include.
+    #[test]
+    fn test_group_choice_extension_with_base_in_include() {
+        let temp_dir = TempDir::new().unwrap();
+        fs::write(
+            temp_dir.path().join("entry.csil"),
+            "include \"base.csil\"\ninclude \"extra.csil\"\nContact //= { own: text }\n",
+        )
+        .unwrap();
+        fs::write(
+            temp_dir.path().join("base.csil"),
+            "Contact = { base: text }\n",
+        )
+        .unwrap();
+        fs::write(
+            temp_dir.path().join("extra.csil"),
+            "Contact //= { extra: text }\n",
+        )
+        .unwrap();
+        let mut resolver = ImportResolver::new();
+        let mut spec = parse_csil_file(temp_dir.path().join("entry.csil")).unwrap();
+        resolver
+            .resolve_imports(&mut spec, &temp_dir.path().join("entry.csil"))
+            .unwrap();
+        let contact: Vec<_> = spec.rules.iter().filter(|r| r.name == "Contact").collect();
+        assert_eq!(contact.len(), 1);
+        let RuleType::TypeDef(TypeExpression::Choice(arms)) = &contact[0].rule_type else {
+            panic!(
+                "expected TypeDef(Choice(..)), got {:?}",
+                contact[0].rule_type
+            );
+        };
+        let keys: Vec<String> = arms
+            .iter()
+            .map(|arm| match arm {
+                TypeExpression::Group(group) => match &group.entries[0].key {
+                    Some(crate::ast::GroupKey::Bare(name)) => name.clone(),
+                    other => panic!("expected a bare key, got {other:?}"),
+                },
+                other => panic!("expected a record arm, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(keys, vec!["base", "own", "extra"]);
+        crate::validate_spec(&spec).expect("//= with an included base should validate");
+    }
+
+    /// Two definitions of one name inside an included file are a real duplicate, not
+    /// a diamond. Before, the include kept only the first, so `generate` wrote the
+    /// record and silently dropped the service.
+    #[test]
+    fn test_duplicate_inside_included_file_is_reported() {
+        let temp_dir = TempDir::new().unwrap();
+        fs::write(temp_dir.path().join("entry.csil"), "include \"a.csil\"\n").unwrap();
+        fs::write(
+            temp_dir.path().join("a.csil"),
+            "Foo = { a: int }\nservice Foo { get: Foo -> Foo }\n",
+        )
+        .unwrap();
+        let mut resolver = ImportResolver::new();
+        let mut spec = parse_csil_file(temp_dir.path().join("entry.csil")).unwrap();
+        resolver
+            .resolve_imports(&mut spec, &temp_dir.path().join("entry.csil"))
+            .unwrap();
+        assert_eq!(spec.rules.iter().filter(|r| r.name == "Foo").count(), 2);
+        assert!(crate::validate_spec(&spec).is_err());
+    }
+
+    /// `//=` adds a record shape, so it cannot extend a scalar type. The rule stays a
+    /// second definition and validation reports it.
+    #[test]
+    fn test_group_choice_extension_of_scalar_is_rejected() {
+        let temp_dir = TempDir::new().unwrap();
+        fs::write(
+            temp_dir.path().join("entry.csil"),
+            "Id = int\nId //= { other: text }\n",
+        )
+        .unwrap();
+        let mut resolver = ImportResolver::new();
+        let mut spec = parse_csil_file(temp_dir.path().join("entry.csil")).unwrap();
+        resolver
+            .resolve_imports(&mut spec, &temp_dir.path().join("entry.csil"))
+            .unwrap();
+        assert!(crate::validate_spec(&spec).is_err());
     }
 
     /// A genuine duplicate `=` rule across two included files must still error even

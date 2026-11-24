@@ -817,7 +817,7 @@ struct UnaryExample {
 /// operation the typed client actually exposes — success and request both records (or a
 /// null request) — reduced to an example call. `None` for a serviceless package.
 fn first_unary_example(input: &WasmGeneratorInput) -> Option<UnaryExample> {
-    let records = record_names(input);
+    let records = record_names(&input.csil_spec);
     for rule in &input.csil_spec.rules {
         let CsilRuleType::ServiceDef(def) = &rule.rule_type else {
             continue;
@@ -835,7 +835,7 @@ fn first_unary_example(input: &WasmGeneratorInput) -> Option<UnaryExample> {
             }
             return Some(UnaryExample {
                 client_class: format!("{}Client", service_base(&rule.name)),
-                method: op.name.to_case(Case::Camel),
+                method: java_ident(&op.name.to_case(Case::Camel)),
                 response_class: record_ref_class(&success),
                 has_request: !null_input,
                 sample: if null_input {
@@ -875,7 +875,7 @@ struct ChannelExample {
 /// without dispatch wiring. The router dispatches the op's input type, so that is the
 /// message record.
 fn first_channel_example(input: &WasmGeneratorInput) -> Option<ChannelExample> {
-    let records = record_names(input);
+    let records = record_names(&input.csil_spec);
     for rule in &input.csil_spec.rules {
         let CsilRuleType::ServiceDef(def) = &rule.rule_type else {
             continue;
@@ -890,7 +890,7 @@ fn first_channel_example(input: &WasmGeneratorInput) -> Option<ChannelExample> {
             }
             let iface = rule.name.to_case(Case::Pascal);
             return Some(ChannelExample {
-                service_wire: rule.name.clone(),
+                service_wire: input.csil_spec.declared_name(&rule.name).to_string(),
                 op_wire: op.name.clone(),
                 iface: iface.clone(),
                 router_class: format!("{iface}Router"),
@@ -912,7 +912,7 @@ fn first_channel_example(input: &WasmGeneratorInput) -> Option<ChannelExample> {
 fn java_handler_stub_methods(def: &CsilServiceDefinition) -> String {
     let mut out = String::new();
     for op in &def.operations {
-        let camel = op.name.to_case(Case::Camel);
+        let camel = java_ident(&op.name.to_case(Case::Camel));
         match op.direction {
             CsilServiceDirection::Unidirectional => {
                 let output = map_type_boxed(&success_type(op.success_output()));
@@ -950,7 +950,7 @@ fn java_sample(input: &WasmGeneratorInput, ty: &CsilTypeExpression) -> String {
             "bool" => "false".to_string(),
             "bytes" | "bstr" => "new byte[0]".to_string(),
             "int" | "uint" | "nint" => "0L".to_string(),
-            "float" | "float64" | "double" => "0.0".to_string(),
+            "float" | "float16" | "float32" | "float64" | "double" => "0.0".to_string(),
             "date" => "java.time.LocalDate.of(1970, 1, 1)".to_string(),
             "timestamp" | "cddl_time" => "java.time.Instant.now()".to_string(),
             "decimal" => "java.math.BigDecimal.ZERO".to_string(),
@@ -1071,6 +1071,7 @@ const RESERVED_TYPE_NAMES: &[&str] = &[
     // `java.lang` classes the generated code names unqualified.
     "Boolean",
     "Class",
+    "ClassCastException",
     "Double",
     "Float",
     "IllegalArgumentException",
@@ -1082,6 +1083,7 @@ const RESERVED_TYPE_NAMES: &[&str] = &[
     "RuntimeException",
     "String",
     "StringBuilder",
+    "SuppressWarnings",
     "Throwable",
 ];
 
@@ -1097,37 +1099,17 @@ const HOIST_OPTIONS: csilgen_common::HoistOptions = csilgen_common::HoistOptions
 /// the per-operation codec pair also declares. `spec` must be hoisted already, because
 /// a hoisted rule's derived names are only known after hoisting.
 fn derived_class_names(spec: &csilgen_common::CsilSpecSerialized) -> Vec<String> {
-    let records: std::collections::HashSet<String> = spec
-        .rules
-        .iter()
-        .filter(|rule| {
-            matches!(
-                rule.rule_type,
-                CsilRuleType::GroupDef(_) | CsilRuleType::TypeDef(CsilTypeExpression::Group(_))
-            )
-        })
-        .map(|rule| rule.name.to_case(Case::Pascal))
-        .collect();
     let mut names = Vec::new();
     for rule in &spec.rules {
         let CsilRuleType::ServiceDef(service) = &rule.rule_type else {
             continue;
         };
         names.push(format!("{}Client", service_base(&rule.name)));
-        names.push(format!("{}Router", rule.name.to_case(Case::Pascal)));
-        for op in &service.operations {
-            if !matches!(op.direction, CsilServiceDirection::Unidirectional) {
-                continue;
-            }
-            let stem = op_codec_stem(&rule.name, op);
-            if !is_null_input(&op.input_type) && !is_record_ref(&op.input_type, &records) {
-                names.push(format!("{stem}Request"));
-            }
-            if !is_record_ref(&success_type(op.success_output()), &records) {
-                names.push(format!("{stem}Response"));
-            }
+        if emits_router(service) {
+            names.push(format!("{}Router", rule.name.to_case(Case::Pascal)));
         }
     }
+    names.extend(op_codec_helpers(spec).into_iter().map(|(helper, _)| helper));
     for (_, _, arms) in spec.rpc_operations() {
         for arm in arms.iter().skip(1) {
             names.push(format!(
@@ -1139,23 +1121,80 @@ fn derived_class_names(spec: &csilgen_common::CsilSpecSerialized) -> Vec<String>
     names
 }
 
-/// The spec as the generator emits it: rules whose class would clash with a fixed name,
-/// a derived name, or another rule's class are renamed, and inline composites are
-/// hoisted. The renames are kept in `declared_names` for the wire and the warnings.
+/// Return `spec` with each service renamed whose `service_base` equals an earlier
+/// service's, or whose class name equals a rule's. `service_base` drops a trailing
+/// `Service`, so `Foo` and `FooService`, or `UserSvc` and `user-svc`, would declare one
+/// `<Base>Client`; the `Service` suffix of the shared collision pass is dropped the same
+/// way, so this pass repeats the suffix until the base is free. The spec keeps the
+/// declared name for the wire.
+fn rename_service_base_collisions(
+    spec: &csilgen_common::CsilSpecSerialized,
+) -> csilgen_common::CsilSpecSerialized {
+    let mut names: std::collections::HashSet<String> =
+        spec.rules.iter().map(|rule| rule.name.clone()).collect();
+    let mut classes: std::collections::HashSet<String> = spec
+        .rules
+        .iter()
+        .filter(|rule| !matches!(rule.rule_type, CsilRuleType::ServiceDef(_)))
+        .map(|rule| rule.name.to_case(Case::Pascal))
+        .collect();
+    let mut bases = std::collections::HashSet::new();
+    let mut renames = std::collections::HashMap::new();
+    for rule in &spec.rules {
+        if !matches!(rule.rule_type, CsilRuleType::ServiceDef(_)) {
+            continue;
+        }
+        let free = |name: &str, bases: &std::collections::HashSet<String>| {
+            !bases.contains(&service_base(name))
+        };
+        if free(&rule.name, &bases) {
+            bases.insert(service_base(&rule.name));
+            classes.insert(rule.name.to_case(Case::Pascal));
+            continue;
+        }
+        let mut candidate = format!("{}Service", rule.name);
+        while names.contains(&candidate)
+            || !free(&candidate, &bases)
+            || classes.contains(&candidate.to_case(Case::Pascal))
+        {
+            candidate.push_str("Service");
+        }
+        bases.insert(service_base(&candidate));
+        classes.insert(candidate.to_case(Case::Pascal));
+        names.insert(candidate.clone());
+        renames.insert(rule.name.clone(), candidate);
+    }
+    csilgen_common::rename_rules(spec, &renames)
+}
+
+/// Whether the server surface writes a `<Service>Router` class for `def`.
+fn emits_router(def: &CsilServiceDefinition) -> bool {
+    service_has_channel_ops(def) || def.wire_id.is_some()
+}
+
+/// The spec as the generator emits it: op boundaries that are inline unions become
+/// named unions, inline composites are hoisted, and then rules whose class would clash
+/// with a fixed name, a derived name, or another rule's class are renamed. The renames
+/// run on the hoisted spec so a synthesized name is checked like a declared one; the
+/// synthesized rules come last, so a clash renames them and not a user rule. The renames
+/// are kept in `declared_names` for the wire and the warnings.
 fn prepare_spec(spec: &csilgen_common::CsilSpecSerialized) -> csilgen_common::CsilSpecSerialized {
-    let derived = derived_class_names(&csilgen_common::hoist_inline_composites(
-        spec,
-        HOIST_OPTIONS,
-    ));
-    let reserved = csilgen_common::rename_reserved(spec, |name| {
+    let named = csilgen_common::hoist_op_union_boundaries(spec);
+    let mut hoisted = csilgen_common::hoist_inline_composites(&named, HOIST_OPTIONS);
+    hoisted.supply_implicit_service_error();
+    // The shared pass settles services that share an identifier (`user-svc` after
+    // `UserSvc` becomes `user-svc2`); the local pass then handles the bases it cannot
+    // see, such as `Foo` and `FooService`. The shared pass runs again after
+    // `rename_reserved`, whose `Type` names it has not checked yet.
+    let distinct =
+        csilgen_common::rename_ident_collisions(&hoisted, |name| name.to_case(Case::Pascal));
+    let hoisted = rename_service_base_collisions(&distinct);
+    let derived = derived_class_names(&hoisted);
+    let reserved = csilgen_common::rename_reserved(&hoisted, |name| {
         let class = name.to_case(Case::Pascal);
         RESERVED_TYPE_NAMES.contains(&class.as_str()) || derived.contains(&class)
     });
-    let distinct =
-        csilgen_common::rename_ident_collisions(&reserved, |name| name.to_case(Case::Pascal));
-    let mut hoisted = csilgen_common::hoist_inline_composites(&distinct, HOIST_OPTIONS);
-    hoisted.supply_implicit_service_error();
-    hoisted
+    csilgen_common::rename_ident_collisions(&reserved, |name| name.to_case(Case::Pascal))
 }
 
 #[cfg(test)]
@@ -1200,9 +1239,14 @@ fn generate_java_with_warnings(
                 let mut code = config.header();
                 code.push_str(&javadoc("", &clean_doc(doc), &[]));
                 let numbers = csilgen_common::enum_numbers(arms);
-                let members = csilgen_common::text_enum_members(arms)
+                let wires: Vec<&str> = csilgen_common::text_enum_members(arms)
                     .unwrap()
+                    .into_iter()
+                    .map(|(_, wire)| wire)
+                    .collect();
+                let members = java_enum_constants(&wires)
                     .iter()
+                    .zip(&wires)
                     .enumerate()
                     .map(|(i, (name, wire))| {
                         let number = numbers
@@ -1246,7 +1290,10 @@ fn generate_java_with_warnings(
     // The self-contained per-record CBOR codec is emitted on every surface whenever the
     // spec has record types: that codec is what every payload (de)serializes through now
     // (the typed client owns the wire; no reflection path remains).
-    if let Some(codec) = generate_codec(input, &config) {
+    // A type that holds `any` names `CsilCbor.CborValue`, so the codec class must exist
+    // even in a spec without records.
+    let names_codec = files.iter().any(|f| f.content.contains("CsilCbor."));
+    if let Some(codec) = generate_codec(input, &config, names_codec) {
         files.push(codec);
     }
 
@@ -1275,9 +1322,9 @@ fn generate_java_with_warnings(
         || (config.package_mode && !matches!(config.surface, Surface::TypesOnly));
 
     if want_client && !services.is_empty() {
-        let records = record_names(input);
-        let aliases = codec_aliases(input);
-        let choices = codec_choices(input);
+        let records = record_names(&input.csil_spec);
+        let aliases = codec_aliases(&input.csil_spec);
+        let choices = codec_choices(&input.csil_spec);
         let reply_arms = has_reply_arms(input);
         files.push(generate_transport_iface(&config, reply_arms));
         if reply_arms {
@@ -1285,8 +1332,15 @@ fn generate_java_with_warnings(
         }
         files.push(generate_client_error(&config));
         for (name, def, doc) in &services {
+            let wire = input.csil_spec.declared_name(name);
             files.push(generate_client(
-                &config, name, def, doc, &records, &aliases, &choices,
+                &config,
+                (name, wire),
+                def,
+                doc,
+                &records,
+                &aliases,
+                &choices,
             ));
         }
     }
@@ -1301,7 +1355,7 @@ fn generate_java_with_warnings(
         }
         for (name, def, doc) in &services {
             files.push(generate_server_interface(&config, name, def, doc));
-            if service_has_channel_ops(def) || def.wire_id.is_some() {
+            if emits_router(def) {
                 files.push(generate_router(&config, name, def));
             }
         }
@@ -1715,7 +1769,15 @@ fn ordered_guard(
             guard(
                 field,
                 optional,
-                &format!("{field} {op} {v}"),
+                // A bound past the `int` range needs the `long` suffix to compile.
+                &format!(
+                    "{field} {op} {v}{}",
+                    if matches!(value, CsilLiteralValue::Integer(_)) {
+                        "L"
+                    } else {
+                        ""
+                    }
+                ),
                 &format!("field '{field}' must be {desc} {v}"),
             )
         }
@@ -1881,10 +1943,8 @@ fn generate_group_choice(
 /// The PascalCase names of every record type in the spec (a `GroupDef`, or a
 /// `TypeDef` wrapping a `Group`). Only records get a codec, so a `Reference` to one
 /// of these is what a field/operation payload (de)serializes through.
-fn record_names(input: &WasmGeneratorInput) -> std::collections::HashSet<String> {
-    input
-        .csil_spec
-        .rules
+fn record_names(spec: &csilgen_common::CsilSpecSerialized) -> std::collections::HashSet<String> {
+    spec.rules
         .iter()
         .filter_map(|rule| match &rule.rule_type {
             CsilRuleType::GroupDef(_) => Some(rule.name.to_case(Case::Pascal)),
@@ -1905,11 +1965,9 @@ fn record_names(input: &WasmGeneratorInput) -> std::collections::HashSet<String>
 /// value. The codec therefore unwraps `.value()` on encode and re-wraps on decode
 /// rather than emitting the `CborNull`/`null` stub a bare non-record reference yields.
 fn codec_aliases(
-    input: &WasmGeneratorInput,
+    spec: &csilgen_common::CsilSpecSerialized,
 ) -> std::collections::HashMap<String, CsilTypeExpression> {
-    input
-        .csil_spec
-        .rules
+    spec.rules
         .iter()
         .filter_map(|rule| match &rule.rule_type {
             CsilRuleType::TypeDef(t) => match t {
@@ -2048,11 +2106,9 @@ fn inline_enum_literals(choices: &[CsilTypeExpression]) -> Option<Vec<&CsilLiter
 /// through `.value()` for a literal-narrowed scalar. The sealed-interface `TypeChoice`
 /// rules are a distinct shape and are intentionally excluded here.
 fn codec_choices(
-    input: &WasmGeneratorInput,
+    spec: &csilgen_common::CsilSpecSerialized,
 ) -> std::collections::HashMap<String, Vec<CsilTypeExpression>> {
-    input
-        .csil_spec
-        .rules
+    spec.rules
         .iter()
         .filter_map(|rule| match &rule.rule_type {
             CsilRuleType::TypeDef(CsilTypeExpression::Choice(choices)) => {
@@ -2078,10 +2134,13 @@ fn java_enc_value(
         CsilTypeExpression::Builtin(name) => match name.as_str() {
             "int" | "nint" => format!("new CborInt({expr})"),
             "uint" => format!("new CborUint({expr})"),
-            "float" | "float64" | "double" => format!("new CborFloat({expr})"),
+            "float" | "float16" | "float32" | "float64" | "double" => {
+                format!("new CborFloat({expr})")
+            }
             "text" | "tstr" => format!("new CborText({expr})"),
             "bytes" | "bstr" => format!("new CborBytes({expr})"),
             "bool" => format!("new CborBool({expr})"),
+            "true" | "false" => format!("new CborBool({name})"),
             "date" => format!("encDate({expr})"),
             "timestamp" => format!("encTimestamp({expr})"),
             "cddl_time" => format!("encCddlTime({expr})"),
@@ -2193,10 +2252,11 @@ fn java_dec_value(
         CsilTypeExpression::Builtin(name) => match name.as_str() {
             "int" | "nint" => format!("asI64({expr})"),
             "uint" => format!("asU64({expr})"),
-            "float" | "float64" | "double" => format!("asF64({expr})"),
+            "float" | "float16" | "float32" | "float64" | "double" => format!("asF64({expr})"),
             "text" | "tstr" => format!("asText({expr})"),
             "bytes" | "bstr" => format!("asBytes({expr})"),
             "bool" => format!("asBool({expr})"),
+            "true" | "false" => format!("expectLiteral({expr}, new CborBool({name}), {name})"),
             "date" => format!("asDate({expr})"),
             "timestamp" => format!("asTimestamp({expr})"),
             "cddl_time" => format!("asCddlTime({expr})"),
@@ -2688,7 +2748,11 @@ fn emit_object_union_encode(
     let mut groups: std::collections::HashMap<String, Vec<usize>> =
         std::collections::HashMap::new();
     for (idx, arm) in choices.iter().enumerate() {
-        let ty = map_type_boxed(arm);
+        let ty = if is_null_arm(arm) {
+            NULL_ARM.to_string()
+        } else {
+            map_type_boxed(arm)
+        };
         let entry = groups.entry(ty.clone()).or_default();
         if entry.is_empty() {
             type_order.push(ty.clone());
@@ -2698,6 +2762,14 @@ fn emit_object_union_encode(
 
     for ty in &type_order {
         let idxs = &groups[ty];
+        if ty == NULL_ARM {
+            // A null arm holds Java `null`, which no `instanceof` matches.
+            let idx = idxs[0];
+            out.push_str(&format!(
+                "        if (csilInner == null) {{\n            return new CborArray(java.util.Arrays.asList(new CborUint({idx}L), new CborNull()));\n        }}\n"
+            ));
+            continue;
+        }
         let cast = format!("csilCast{}", idxs[0]);
         if idxs.len() == 1 {
             let idx = idxs[0];
@@ -2707,6 +2779,14 @@ fn emit_object_union_encode(
                 let cmp = java_literal_equals_expr(lit, &cast);
                 out.push_str(&format!(
                     "        if (csilInner instanceof {ty} {cast} && {cmp}) {{\n            return new CborArray(java.util.Arrays.asList(new CborUint({idx}L), {enc}));\n        }}\n"
+                ));
+            } else if let Some(erased) = wildcard_type(ty) {
+                // A generic arm's type arguments are erased, so `instanceof` cannot tell
+                // `Map<String, Long>` from `Map<Long, String>`. The first arm whose
+                // elements encode wins; a wrong guess fails with a ClassCastException
+                // inside the element encoders before anything is returned.
+                out.push_str(&format!(
+                    "        if (csilInner instanceof {erased}) {{\n            try {{\n                {ty} {cast} = csilUnchecked(csilInner);\n                return new CborArray(java.util.Arrays.asList(new CborUint({idx}L), {enc}));\n            }} catch (ClassCastException csilWrongArm) {{\n                // The next arm may fit.\n            }}\n        }}\n"
                 ));
             } else {
                 out.push_str(&format!(
@@ -2759,6 +2839,36 @@ fn emit_object_union_encode(
     out
 }
 
+/// The dispatch key of a union's null arm, which has no Java type to test.
+const NULL_ARM: &str = "null";
+
+fn is_null_arm(arm: &CsilTypeExpression) -> bool {
+    matches!(
+        codec_unwrap_constrained(arm),
+        CsilTypeExpression::Builtin(name) if name == "null" || name == "nil"
+    ) || matches!(
+        codec_unwrap_constrained(arm),
+        CsilTypeExpression::Literal(CsilLiteralValue::Null)
+    )
+}
+
+/// `ty` with every type argument replaced by `?` (`java.util.Map<?, ?>`), the only form
+/// `instanceof` accepts for a generic type; `None` for a type without arguments.
+fn wildcard_type(ty: &str) -> Option<String> {
+    let (raw, args) = ty.split_once('<')?;
+    let mut depth = 0usize;
+    let mut arity = 1;
+    for c in args.chars() {
+        match c {
+            '<' => depth += 1,
+            '>' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => arity += 1,
+            _ => {}
+        }
+    }
+    Some(format!("{raw}<{}>", vec!["?"; arity].join(", ")))
+}
+
 /// Decode body shared by both union shapes: read the tagged sum's index and dispatch
 /// to the arm declared at that position. A literal arm's `java_dec_value` already
 /// validates the payload equals the declared literal (`expectLiteral`), erroring on a
@@ -2772,6 +2882,9 @@ fn emit_union_decode(
 ) -> String {
     let mut out = format!("    static {class} dec{class}(CborValue v) {{\n");
     out.push_str("        java.util.List<CborValue> csilArr = asArray(v);\n");
+    out.push_str(&format!(
+        "        if (csilArr.size() != 2) {{\n            throw new CsilCborException(\"csil cbor: {class} is not a [variant_index, value] pair\");\n        }}\n"
+    ));
     out.push_str("        long csilIdx = asU64(csilArr.get(0));\n");
     out.push_str("        CborValue csilPayload = csilArr.get(1);\n");
     for (idx, arm) in choices.iter().enumerate() {
@@ -2800,8 +2913,24 @@ fn emit_op_codecs(
     aliases: &std::collections::HashMap<String, CsilTypeExpression>,
     choices: &std::collections::HashMap<String, Vec<CsilTypeExpression>>,
 ) -> String {
-    let mut out = String::new();
-    for rule in &input.csil_spec.rules {
+    op_codec_helpers(&input.csil_spec)
+        .iter()
+        .map(|(helper, ty)| emit_op_codec_pair(helper, ty, records, aliases, choices))
+        .collect()
+}
+
+/// The op-keyed `encode<Helper>`/`decode<Helper>` pairs the codec emits, with the
+/// boundary type each one carries. `emit_op_codecs` writes exactly these and
+/// `derived_class_names` reserves exactly these, so a rule is renamed only when its own
+/// `decode<Name>(byte[])` really meets an op helper of the same name.
+fn op_codec_helpers(
+    spec: &csilgen_common::CsilSpecSerialized,
+) -> Vec<(String, CsilTypeExpression)> {
+    let records = record_names(spec);
+    let aliases = codec_aliases(spec);
+    let choices = codec_choices(spec);
+    let mut helpers = Vec::new();
+    for rule in &spec.rules {
         let CsilRuleType::ServiceDef(service) = &rule.rule_type else {
             continue;
         };
@@ -2814,34 +2943,22 @@ fn emit_op_codecs(
             let success = success_type(op.success_output());
             let null_input = is_null_input(&op.input_type);
             let req_ok = null_input
-                || java_op_boundary_expressible(&op.input_type, records, aliases, choices);
-            if !req_ok || !java_op_boundary_expressible(&success, records, aliases, choices) {
+                || java_op_boundary_expressible(&op.input_type, &records, &aliases, &choices);
+            if !req_ok || !java_op_boundary_expressible(&success, &records, &aliases, &choices) {
                 continue;
             }
             let stem = op_codec_stem(&rule.name, op);
             // A record boundary already has its `encode<T>`/`decode<T>` wrapper; only the
             // non-record shapes need a fresh op-keyed pair.
-            if !null_input && !is_record_ref(&op.input_type, records) {
-                out.push_str(&emit_op_codec_pair(
-                    &format!("{stem}Request"),
-                    &op.input_type,
-                    records,
-                    aliases,
-                    choices,
-                ));
+            if !null_input && !is_record_ref(&op.input_type, &records) {
+                helpers.push((format!("{stem}Request"), op.input_type.clone()));
             }
-            if !is_record_ref(&success, records) {
-                out.push_str(&emit_op_codec_pair(
-                    &format!("{stem}Response"),
-                    &success,
-                    records,
-                    aliases,
-                    choices,
-                ));
+            if !is_record_ref(&success, &records) {
+                helpers.push((format!("{stem}Response"), success));
             }
         }
     }
-    out
+    helpers
 }
 
 /// One `encode<Name>`/`decode<Name>` pair over the same value builders the record codec
@@ -2863,13 +2980,17 @@ fn emit_op_codec_pair(
     )
 }
 
-fn generate_codec(input: &WasmGeneratorInput, config: &JavaConfig) -> Option<GeneratedFile> {
-    let records = record_names(input);
-    if records.is_empty() && input.csil_spec.rpc_operations().next().is_none() {
+fn generate_codec(
+    input: &WasmGeneratorInput,
+    config: &JavaConfig,
+    required: bool,
+) -> Option<GeneratedFile> {
+    let records = record_names(&input.csil_spec);
+    if !required && records.is_empty() && input.csil_spec.rpc_operations().next().is_none() {
         return None;
     }
-    let aliases = codec_aliases(input);
-    let choices = codec_choices(input);
+    let aliases = codec_aliases(&input.csil_spec);
+    let choices = codec_choices(&input.csil_spec);
     let mut body = String::new();
     for rule in &input.csil_spec.rules {
         let group = match &rule.rule_type {
@@ -2903,6 +3024,7 @@ fn generate_codec(input: &WasmGeneratorInput, config: &JavaConfig) -> Option<Gen
         for (service, op, arms) in input.csil_spec.rpc_operations() {
             let method = &op.name;
             let stem = op_codec_stem(service, op);
+            let service = input.csil_spec.declared_name(service);
             let success = map_type_boxed(&arms[0]);
             let mut encode = format!(
                 "    public static RpcReply encode{stem}Reply(java.util.function.Supplier<{success}> handler) {{\n        try {{\n            {success} value = handler.get();\n"
@@ -3060,6 +3182,7 @@ fn generate_client_error(config: &JavaConfig) -> GeneratedFile {
          \x20* error — application errors ride inside the decoded payload, distinct from this.\n\
          \x20*/\n\
          public class ClientException extends RuntimeException {\n\
+         \x20   private static final long serialVersionUID = 1L;\n\n\
          \x20   public ClientException(String message) {\n\
          \x20       super(message);\n\
          \x20   }\n\
@@ -3077,7 +3200,7 @@ fn generate_client_error(config: &JavaConfig) -> GeneratedFile {
 
 fn generate_client(
     config: &JavaConfig,
-    name: &str,
+    (name, wire): (&str, &str),
     service: &CsilServiceDefinition,
     doc: &[String],
     records: &std::collections::HashSet<String>,
@@ -3122,7 +3245,7 @@ fn generate_client(
             ));
             continue;
         }
-        let camel = op.name.to_case(Case::Camel);
+        let camel = java_ident(&op.name.to_case(Case::Camel));
         let stem = op_codec_stem(name, op);
         let resp_type = map_type_boxed(&success);
         // A record success reuses its `decode<T>` wrapper; any other shape uses the op's
@@ -3155,12 +3278,12 @@ fn generate_client(
             // The reply variant picks the arm: the resolver passes the success payload
             // through, throws the declared error arm, and rejects a missing or unknown one.
             code.push_str(&format!(
-                "        WireReply reply = transport.callReply(\"{name}\", \"{op_name}\", {req_bytes});\n\
-                 \x20       return {decode_resp}(CsilCbor.resolveRpcReply(\"{name}\", \"{op_name}\", reply.variant(), reply.payload()));\n"
+                "        WireReply reply = transport.callReply(\"{wire}\", \"{op_name}\", {req_bytes});\n\
+                 \x20       return {decode_resp}(CsilCbor.resolveRpcReply(\"{wire}\", \"{op_name}\", reply.variant(), reply.payload()));\n"
             ));
         } else {
             code.push_str(&format!(
-                "        return {decode_resp}(transport.call(\"{name}\", \"{op_name}\", {req_bytes}));\n"
+                "        return {decode_resp}(transport.call(\"{wire}\", \"{op_name}\", {req_bytes}));\n"
             ));
         }
         code.push_str("    }\n");
@@ -3247,7 +3370,7 @@ fn generate_server_interface(
     code.push_str(&format!("public interface {iface} {{\n"));
     let mut first = true;
     for op in &service.operations {
-        let camel = op.name.to_case(Case::Camel);
+        let camel = java_ident(&op.name.to_case(Case::Camel));
         let method = match op.direction {
             CsilServiceDirection::Unidirectional => {
                 let output = map_type_boxed(&success_type(op.success_output()));
@@ -3329,7 +3452,7 @@ fn generate_router(
                 continue;
             }
             let m = &op.name;
-            let camel = op.name.to_case(Case::Camel);
+            let camel = java_ident(&op.name.to_case(Case::Camel));
             let input = map_type(&op.input_type);
             code.push_str(&format!("            case \"{m}\" -> {{\n"));
             code.push_str(&format!(
@@ -3357,7 +3480,7 @@ fn generate_router(
                     continue;
                 }
                 let Some(op_id) = op.wire_id else { continue };
-                let camel = op.name.to_case(Case::Camel);
+                let camel = java_ident(&op.name.to_case(Case::Camel));
                 let input = map_type(&op.input_type);
                 let kw = if first { "if" } else { "} else if" };
                 first = false;
@@ -3420,7 +3543,7 @@ fn map_type(type_expr: &CsilTypeExpression) -> String {
             // `nint` is a CBOR negative integer; it still lives in a signed 64-bit slot.
             "int" | "uint" | "nint" => "long".to_string(),
             // `float64` is the explicit-width spelling of `float`; both are IEEE-754 doubles.
-            "float" | "float64" | "double" => "double".to_string(),
+            "float" | "float16" | "float32" | "float64" | "double" => "double".to_string(),
             "text" | "tstr" => "String".to_string(),
             "bytes" | "bstr" => "byte[]".to_string(),
             "bool" => "boolean".to_string(),
@@ -3434,7 +3557,9 @@ fn map_type(type_expr: &CsilTypeExpression) -> String {
             // value tree is exactly that, so the field holds a CborValue and the codec is
             // an identity at the seam.
             "any" => "CsilCbor.CborValue".to_string(),
-            "nil" | "null" => "Object".to_string(),
+            "nil" | "null" | "undefined" => "Object".to_string(),
+            // A `true`/`false` type has one value, so it is a boolean that the codec checks.
+            "true" | "false" => "boolean".to_string(),
             other => other.to_case(Case::Pascal),
         },
         CsilTypeExpression::Reference(name) => name.to_case(Case::Pascal),
@@ -3549,14 +3674,14 @@ fn pascal_op_name(name: &str) -> String {
 /// name can be derived (e.g. a typed key).
 fn entry_field_name(entry: &CsilGroupEntry) -> Option<String> {
     match &entry.key {
-        Some(CsilGroupKey::Bare(name)) => Some(name.to_case(Case::Camel)),
+        Some(CsilGroupKey::Bare(name)) => Some(java_ident(&name.to_case(Case::Camel))),
         Some(CsilGroupKey::Literal(CsilLiteralValue::Text(name))) => {
-            Some(name.to_case(Case::Camel))
+            Some(java_ident(&name.to_case(Case::Camel)))
         }
         Some(_) => None,
         None => match &entry.value_type {
             CsilTypeExpression::Reference(name) | CsilTypeExpression::Builtin(name) => {
-                Some(name.to_case(Case::Camel))
+                Some(java_ident(&name.to_case(Case::Camel)))
             }
             _ => None,
         },
@@ -3598,6 +3723,83 @@ fn literal_as_text(value: &CsilLiteralValue) -> Option<String> {
         CsilLiteralValue::Integer(i) => Some(i.to_string()),
         CsilLiteralValue::Float(f) => Some(f.to_string()),
         _ => None,
+    }
+}
+
+/// The constant names of a text enum's values, in order: the shared word split in
+/// SCREAMING_SNAKE case (`calendars.read` → `CALENDARS_READ`), with `V` first for a value
+/// that starts with a digit. Java keywords are lower case, so no constant meets one.
+fn java_enum_constants(values: &[&str]) -> Vec<String> {
+    csilgen_common::member_idents(
+        values,
+        |words| words.join("_").to_ascii_uppercase(),
+        |name| name.starts_with(|c: char| c.is_ascii_alphabetic()),
+    )
+}
+
+/// `name` with a `_` suffix when it is a Java keyword or literal, which cannot name a
+/// record component or a method.
+fn java_ident(name: &str) -> String {
+    const KEYWORDS: &[&str] = &[
+        "abstract",
+        "assert",
+        "boolean",
+        "break",
+        "byte",
+        "case",
+        "catch",
+        "char",
+        "class",
+        "const",
+        "continue",
+        "default",
+        "do",
+        "double",
+        "else",
+        "enum",
+        "extends",
+        "false",
+        "final",
+        "finally",
+        "float",
+        "for",
+        "goto",
+        "if",
+        "implements",
+        "import",
+        "instanceof",
+        "int",
+        "interface",
+        "long",
+        "native",
+        "new",
+        "null",
+        "package",
+        "private",
+        "protected",
+        "public",
+        "return",
+        "short",
+        "static",
+        "strictfp",
+        "super",
+        "switch",
+        "synchronized",
+        "this",
+        "throw",
+        "throws",
+        "transient",
+        "true",
+        "try",
+        "void",
+        "volatile",
+        "while",
+        "_",
+    ];
+    if KEYWORDS.contains(&name) {
+        format!("{name}_")
+    } else {
+        name.to_string()
     }
 }
 
@@ -3763,7 +3965,16 @@ const CODEC_RUNTIME_JAVA: &str = r#"    /** A minimal canonical-CBOR value tree:
     public record CborBytes(byte[] value) implements CborValue {}
     public record CborArray(java.util.List<CborValue> items) implements CborValue {}
     public record CborEntry(CborValue key, CborValue val) {}
-    public record CborMap(java.util.List<CborEntry> entries) implements CborValue {}
+    /**
+     * A map. {@code canonical} is false when a decoded map's encoded keys were not in
+     * strictly ascending bytewise order (RFC 8949 section 4.2.1); a dynamic map decoder
+     * rejects such a map, while a record accepts its fields in any order.
+     */
+    public record CborMap(java.util.List<CborEntry> entries, boolean canonical) implements CborValue {
+        public CborMap(java.util.List<CborEntry> entries) {
+            this(entries, true);
+        }
+    }
     public record CborTag(long num, CborValue inner) implements CborValue {}
 
     /**
@@ -3772,6 +3983,8 @@ const CODEC_RUNTIME_JAVA: &str = r#"    /** A minimal canonical-CBOR value tree:
      * not a recoverable application error (those ride inside the decoded payload).
      */
     public static final class CsilCborException extends RuntimeException {
+        private static final long serialVersionUID = 1L;
+
         public CsilCborException(String message) {
             super(message);
         }
@@ -4026,18 +4239,72 @@ const CODEC_RUNTIME_JAVA: &str = r#"    /** A minimal canonical-CBOR value tree:
                 }
                 int n = (int) arg;
                 java.util.List<CborEntry> entries = new java.util.ArrayList<>(Math.min(n, PREALLOC_LIMIT));
+                // Each key is compared with the one before it as raw bytes, so the order
+                // check is O(n). Only a map out of order can repeat a key, so the set of
+                // seen keys is built only then.
+                boolean ascending = true;
+                java.util.Set<java.nio.ByteBuffer> seen = null;
+                java.util.List<int[]> keyRanges = new java.util.ArrayList<>(Math.min(n, PREALLOC_LIMIT));
                 for (int i = 0; i < n; i++) {
+                    int keyStart = pos[0];
                     CborValue k = dec(b, pos, depth + 1);
+                    int keyEnd = pos[0];
+                    if (!shortestHead(b, keyStart)) {
+                        throw new CsilCborException("csil cbor: map key is not in shortest form");
+                    }
+                    if (i > 0 && ascending) {
+                        int[] prev = keyRanges.get(i - 1);
+                        if (java.util.Arrays.compareUnsigned(b, prev[0], prev[1], b, keyStart, keyEnd) >= 0) {
+                            ascending = false;
+                            seen = new java.util.HashSet<>();
+                            for (int[] r : keyRanges) {
+                                seen.add(java.nio.ByteBuffer.wrap(b, r[0], r[1] - r[0]));
+                            }
+                        }
+                    }
+                    if (!ascending && !seen.add(java.nio.ByteBuffer.wrap(b, keyStart, keyEnd - keyStart))) {
+                        throw new CsilCborException("csil cbor: duplicate key " + describeKey(k));
+                    }
+                    keyRanges.add(new int[] {keyStart, keyEnd});
                     CborValue val = dec(b, pos, depth + 1);
                     entries.add(new CborEntry(k, val));
                 }
-                return new CborMap(entries);
+                return new CborMap(entries, ascending);
             }
             case 6:
                 return new CborTag(arg, dec(b, pos, depth + 1));
             default:
                 throw new CsilCborException("csil cbor: unexpected major type");
         }
+    }
+
+    /** Whether the head at {@code at} uses the shortest argument for its value. A float
+     * head (major 7) carries no length, so it is not checked. */
+    private static boolean shortestHead(byte[] b, int at) {
+        int major = (b[at] & 0xff) >> 5;
+        int low = b[at] & 0x1f;
+        if (major == 7 || low < 24) {
+            return true;
+        }
+        int width = 1 << (low - 24);
+        long arg = 0;
+        for (int i = 1; i <= width; i++) {
+            arg = (arg << 8) | (b[at + i] & 0xffL);
+        }
+        long floor = low == 24 ? 24L : 1L << (8 * (width / 2));
+        return Long.compareUnsigned(arg, floor) >= 0;
+    }
+
+    private static String describeKey(CborValue k) {
+        if (k instanceof CborText t) {
+            return "\"" + t.value() + "\"";
+        }
+        return java.util.HexFormat.of().formatHex(encode(k));
+    }
+
+    @SuppressWarnings("unchecked")
+    static <T> T csilUnchecked(Object value) {
+        return (T) value;
     }
 
     public static long asI64(CborValue v) {
@@ -4163,11 +4430,25 @@ const CODEC_RUNTIME_JAVA: &str = r#"    /** A minimal canonical-CBOR value tree:
     }
 
     public static <K, V> CborValue encMap(java.util.Map<K, V> m, java.util.function.Function<K, CborValue> kf, java.util.function.Function<V, CborValue> vf) {
+        // A dynamic map goes out in canonical key order: bytewise order of each key's
+        // encoding (RFC 8949 section 4.2.1), which is not the order of the Java keys.
+        java.util.List<byte[]> keys = new java.util.ArrayList<>(m.size());
         java.util.List<CborEntry> entries = new java.util.ArrayList<>(m.size());
         for (java.util.Map.Entry<K, V> e : m.entrySet()) {
-            entries.add(new CborEntry(kf.apply(e.getKey()), vf.apply(e.getValue())));
+            CborValue key = kf.apply(e.getKey());
+            keys.add(encode(key));
+            entries.add(new CborEntry(key, vf.apply(e.getValue())));
         }
-        return new CborMap(entries);
+        Integer[] order = new Integer[entries.size()];
+        for (int i = 0; i < order.length; i++) {
+            order[i] = i;
+        }
+        java.util.Arrays.sort(order, (x, y) -> java.util.Arrays.compareUnsigned(keys.get(x), keys.get(y)));
+        java.util.List<CborEntry> sorted = new java.util.ArrayList<>(entries.size());
+        for (int i : order) {
+            sorted.add(entries.get(i));
+        }
+        return new CborMap(sorted);
     }
 
     public static <E> java.util.List<E> decArray(CborValue v, java.util.function.Function<CborValue, E> f) {
@@ -4180,6 +4461,9 @@ const CODEC_RUNTIME_JAVA: &str = r#"    /** A minimal canonical-CBOR value tree:
     }
 
     public static <K, V> java.util.Map<K, V> decMap(CborValue v, java.util.function.Function<CborValue, K> kf, java.util.function.Function<CborValue, V> vf) {
+        if (v instanceof CborMap x && !x.canonical()) {
+            throw new CsilCborException("csil cbor: map keys are not in canonical order");
+        }
         java.util.Map<K, V> out = new java.util.LinkedHashMap<>();
         for (CborEntry e : asMap(v)) {
             out.put(kf.apply(e.key()), vf.apply(e.val()));
@@ -4540,7 +4824,7 @@ mod tests {
             CODEC_RUNTIME_JAVA
                 .matches("new java.util.ArrayList<>(Math.min(n, PREALLOC_LIMIT))")
                 .count(),
-            2
+            3
         );
         assert!(CODEC_RUNTIME_JAVA.contains("map length exceeds remaining input"));
         assert!(CODEC_RUNTIME_JAVA.contains("if (depth > 64)"));
@@ -7596,4 +7880,458 @@ public final class PomCheck {
                 .contains("rule `value` is generated as `valueType` for java-client")
         );
     }
+
+    fn record_rule(name: &str, fields: &[(&str, &str)]) -> CsilRule {
+        rule(
+            name,
+            CsilRuleType::GroupDef(CsilGroupExpression {
+                entries: fields
+                    .iter()
+                    .map(|(key, ty)| bare(key, reference_or_builtin(ty), None))
+                    .collect(),
+            }),
+        )
+    }
+
+    fn reference_or_builtin(ty: &str) -> CsilTypeExpression {
+        if ty.starts_with(char::is_uppercase) {
+            CsilTypeExpression::Reference(ty.to_string())
+        } else {
+            builtin(ty)
+        }
+    }
+
+    fn service_rule(name: &str, ops: Vec<CsilServiceOperation>) -> CsilRule {
+        rule(
+            name,
+            CsilRuleType::ServiceDef(CsilServiceDefinition {
+                operations: ops,
+                wire_id: None,
+            }),
+        )
+    }
+
+    fn unary(
+        name: &str,
+        input: CsilTypeExpression,
+        output: CsilTypeExpression,
+    ) -> CsilServiceOperation {
+        op(
+            name,
+            input,
+            output,
+            CsilServiceDirection::Unidirectional,
+            None,
+        )
+    }
+
+    /// Compile the generated Java sources plus `driver` (a `csilgen.generated.Driver`
+    /// class) and return what the driver prints. `None` when there is no JDK.
+    fn run_under_javac(files: &[GeneratedFile], driver: Option<&str>) -> Option<String> {
+        let have = std::process::Command::new("javac")
+            .arg("-version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if !have {
+            eprintln!("skipping: no javac on PATH");
+            return None;
+        }
+        static RUN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = RUN.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!("csilgen-java-run-{}-{n}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut sources = Vec::new();
+        for f in files.iter().filter(|f| f.path.ends_with(".java")) {
+            let path = dir.join(&f.path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, &f.content).unwrap();
+            sources.push(path);
+        }
+        if let Some(driver) = driver {
+            let path = dir.join("csilgen/generated/Driver.java");
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, driver).unwrap();
+            sources.push(path);
+        }
+        let classes = dir.join("classes");
+        let compile = std::process::Command::new("javac")
+            .arg("-Werror")
+            .arg("-d")
+            .arg(&classes)
+            .args(&sources)
+            .output()
+            .unwrap();
+        assert!(
+            compile.status.success(),
+            "javac failed:\n{}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+        let mut stdout = String::new();
+        if driver.is_some() {
+            let run = std::process::Command::new("java")
+                .arg("-cp")
+                .arg(&classes)
+                .arg("csilgen.generated.Driver")
+                .output()
+                .unwrap();
+            stdout = String::from_utf8_lossy(&run.stdout).into_owned();
+            assert!(
+                run.status.success(),
+                "{stdout}{}",
+                String::from_utf8_lossy(&run.stderr)
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        Some(stdout)
+    }
+
+    /// An op whose input and output are its own records emits no op-keyed codec, so the
+    /// records keep their names (linkkeys `RpIssueAttestationRequest`).
+    #[test]
+    fn op_records_named_like_the_op_codec_keep_their_names() {
+        let rules = vec![
+            record_rule("SignedSigningRequest", &[("sig", "bytes")]),
+            record_rule("Claim", &[("v", "text")]),
+            record_rule(
+                "RpIssueAttestationRequest",
+                &[
+                    ("signed_request", "SignedSigningRequest"),
+                    ("claim_type", "text"),
+                ],
+            ),
+            record_rule(
+                "RpIssueAttestationResponse",
+                &[("claim", "Claim"), ("deposited", "bool")],
+            ),
+            service_rule(
+                "Rp",
+                vec![unary(
+                    "issue-attestation",
+                    CsilTypeExpression::Reference("RpIssueAttestationRequest".into()),
+                    CsilTypeExpression::Reference("RpIssueAttestationResponse".into()),
+                )],
+            ),
+        ];
+        for target in ["java", "java-client"] {
+            let (files, warnings) =
+                generate_java_with_warnings(&input_for(rules.clone(), target)).unwrap();
+            assert!(warnings.is_empty(), "{warnings:?}");
+            assert_eq!(
+                paths(&files)
+                    .iter()
+                    .filter(|p| p.ends_with("/RpIssueAttestationRequest.java"))
+                    .count(),
+                1
+            );
+            let codec = &file(&files, "CsilCbor.java").content;
+            assert_eq!(
+                codec
+                    .matches(
+                        "public static RpIssueAttestationRequest decodeRpIssueAttestationRequest("
+                    )
+                    .count(),
+                1
+            );
+            run_under_javac(&files, None);
+        }
+    }
+
+    /// A `MemberID` boundary gets op-keyed `decodeMemberGetMemberRequest(byte[])`, which
+    /// the record `MemberGetMemberRequest` would declare too, so the record is renamed.
+    #[test]
+    fn rule_named_like_an_emitted_op_codec_is_renamed() {
+        let rules = vec![
+            rule("MemberID", CsilRuleType::TypeDef(builtin("text"))),
+            record_rule("MemberGetMemberRequest", &[("id", "text")]),
+            service_rule(
+                "Member",
+                vec![unary(
+                    "get-member",
+                    CsilTypeExpression::Reference("MemberID".into()),
+                    CsilTypeExpression::Reference("MemberID".into()),
+                )],
+            ),
+        ];
+        let (files, warnings) =
+            generate_java_with_warnings(&input_for(rules, "java-client")).unwrap();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].message.contains(
+            "rule `MemberGetMemberRequest` is generated as `MemberGetMemberRequestType`"
+        ));
+        assert!(
+            paths(&files)
+                .iter()
+                .any(|p| p.ends_with("/MemberGetMemberRequestType.java"))
+        );
+        assert!(
+            file(&files, "CsilCbor.java")
+                .content
+                .contains("decodeMemberGetMemberRequest(byte[] csilData)")
+        );
+        run_under_javac(&files, None);
+    }
+
+    /// `read-counts: Holder -> { * text => int } / Err` exposes the whole union, both
+    /// arms, on the client and the server, and the codec encodes a map value that fits
+    /// both map arms with the first one (first fit for erased generic arms).
+    #[test]
+    fn mixed_op_output_is_a_named_union_on_both_sides() {
+        let map = |k: &str, v: &str| CsilTypeExpression::Map {
+            key: Box::new(builtin(k)),
+            value: Box::new(builtin(v)),
+            occurrence: None,
+        };
+        let rules = vec![
+            record_rule("Holder", &[("n", "int")]),
+            record_rule("Err", &[("message", "text")]),
+            service_rule(
+                "Lookup",
+                vec![unary(
+                    "read-counts",
+                    CsilTypeExpression::Reference("Holder".into()),
+                    CsilTypeExpression::Choice(vec![
+                        map("text", "int"),
+                        map("text", "text"),
+                        CsilTypeExpression::Reference("Err".into()),
+                    ]),
+                )],
+            ),
+        ];
+        let files = generate_java(&input_for(rules.clone(), "java-client")).unwrap();
+        let client = &file(&files, "/LookupClient.java").content;
+        assert!(
+            client.contains("public LookupReadCountsOutput readCounts(Holder req)"),
+            "{client}"
+        );
+        let union = &file(&files, "/LookupReadCountsOutput.java").content;
+        assert!(union.contains("record LookupReadCountsOutput(Object value)"));
+        let server = generate_java(&input_for(rules, "java-server")).unwrap();
+        assert!(
+            file(&server, "/Lookup.java")
+                .content
+                .contains("LookupReadCountsOutput readCounts(Holder req);")
+        );
+        let driver = r#"package csilgen.generated;
+
+import java.util.HexFormat;
+import java.util.Map;
+
+public class Driver {
+    static String hex(LookupReadCountsOutput v) {
+        return HexFormat.of().formatHex(CsilCbor.encode(CsilCbor.encLookupReadCountsOutput(v)));
+    }
+
+    public static void main(String[] args) {
+        // An empty map fits both map arms: the first wins.
+        System.out.println(hex(new LookupReadCountsOutput(Map.of())));
+        // Text values fit only the second map arm.
+        System.out.println(hex(new LookupReadCountsOutput(Map.of("a", "b"))));
+        System.out.println(hex(new LookupReadCountsOutput(new Err("x"))));
+    }
+}
+"#;
+        if let Some(out) = run_under_javac(&files, Some(driver)) {
+            assert_eq!(out, "8200a0\n8201a161616162\n8202a1676d6573736167656178\n");
+        }
+    }
+
+    /// `UserSvc` and `user-svc` are one Java identifier; the later one is renamed for
+    /// the generated classes, and both keep their declared name on the wire.
+    #[test]
+    fn services_with_one_identifier_keep_their_wire_names() {
+        let ping = || CsilTypeExpression::Reference("Ping".into());
+        let rules = vec![
+            record_rule("Ping", &[("n", "int")]),
+            service_rule("UserSvc", vec![unary("ping", ping(), ping())]),
+            service_rule("user-svc", vec![unary("ping", ping(), ping())]),
+        ];
+        let (files, warnings) =
+            generate_java_with_warnings(&input_for(rules.clone(), "java-client")).unwrap();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0]
+                .message
+                .starts_with("service `user-svc` is generated as")
+        );
+        let first = &file(&files, "/UserSvcClient.java").content;
+        assert!(first.contains("transport.call(\"UserSvc\", \"ping\""));
+        let second = &file(&files, "/UserSvc2Client.java").content;
+        assert!(second.contains("transport.call(\"user-svc\", \"ping\""));
+        run_under_javac(&files, None);
+        let server = generate_java(&input_for(rules, "java-server")).unwrap();
+        assert!(paths(&server).iter().any(|p| p.ends_with("/UserSvc.java")));
+        assert!(paths(&server).iter().any(|p| p.ends_with("/UserSvc2.java")));
+        run_under_javac(&server, None);
+    }
+
+    /// `Foo` and `FooService` have distinct identifiers, but both drop to the base `Foo`
+    /// and would declare `FooClient` twice. The local pass renames the later one.
+    #[test]
+    fn services_with_one_base_are_told_apart() {
+        let ping = || CsilTypeExpression::Reference("Ping".into());
+        let rules = vec![
+            record_rule("Ping", &[("n", "int")]),
+            service_rule("Foo", vec![unary("ping", ping(), ping())]),
+            service_rule("FooService", vec![unary("ping", ping(), ping())]),
+        ];
+        let (files, warnings) =
+            generate_java_with_warnings(&input_for(rules, "java-client")).unwrap();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            file(&files, "/FooClient.java")
+                .content
+                .contains("transport.call(\"Foo\", \"ping\"")
+        );
+        assert!(
+            file(&files, "/FooServiceClient.java")
+                .content
+                .contains("transport.call(\"FooService\", \"ping\"")
+        );
+        run_under_javac(&files, None);
+    }
+
+    /// The hoister names the inline record `SvcDoIt_request`, whose class `SvcDoItRequest`
+    /// meets the op codec `decodeSvcDoItRequest(byte[])` of `do-it: [* int] -> int`. The
+    /// synthesized rule is renamed; the user rule `SvcDoIt` keeps its name.
+    #[test]
+    fn synthesized_rule_that_clashes_is_renamed() {
+        let inline = CsilTypeExpression::Group(CsilGroupExpression {
+            entries: vec![bare("x", builtin("int"), None)],
+        });
+        let rules = vec![
+            rule(
+                "SvcDoIt",
+                CsilRuleType::GroupDef(CsilGroupExpression {
+                    entries: vec![bare("request", inline, None)],
+                }),
+            ),
+            service_rule(
+                "Svc",
+                vec![unary(
+                    "do-it",
+                    CsilTypeExpression::Array {
+                        element_type: Box::new(builtin("int")),
+                        occurrence: None,
+                    },
+                    builtin("int"),
+                )],
+            ),
+        ];
+        let (files, warnings) =
+            generate_java_with_warnings(&input_for(rules, "java-client")).unwrap();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0]
+                .message
+                .contains("rule `SvcDoIt_request` is generated as `SvcDoIt_requestType`")
+        );
+        assert!(paths(&files).iter().any(|p| p.ends_with("/SvcDoIt.java")));
+        assert!(
+            paths(&files)
+                .iter()
+                .any(|p| p.ends_with("/SvcDoItRequestType.java"))
+        );
+        run_under_javac(&files, None);
+    }
+
+    /// Dynamic maps encode in canonical key order and decode only in that order; a
+    /// record takes its fields in any order but not twice.
+    #[test]
+    fn map_key_order_and_duplicate_keys_under_javac() {
+        let counts = CsilTypeExpression::Map {
+            key: Box::new(builtin("text")),
+            value: Box::new(builtin("int")),
+            occurrence: None,
+        };
+        let rules = vec![
+            rule("Counts", CsilRuleType::TypeDef(counts)),
+            record_rule("Holder", &[("counts", "Counts"), ("n", "int")]),
+        ];
+        let files = generate_java(&input_for(rules, "java")).unwrap();
+        let driver = r#"package csilgen.generated;
+
+import java.util.HexFormat;
+import java.util.LinkedHashMap;
+import java.util.Map;
+
+public class Driver {
+    static String decode(String hex) {
+        try {
+            CsilCbor.decodeHolder(HexFormat.of().parseHex(hex));
+            return "ok";
+        } catch (CsilCbor.CsilCborException e) {
+            return e.getMessage();
+        }
+    }
+
+    public static void main(String[] args) {
+        Map<String, Long> m = new LinkedHashMap<>();
+        m.put("aa", 1L);
+        m.put("b", 2L);
+        System.out.println(HexFormat.of().formatHex(CsilCbor.encodeHolder(new Holder(new Counts(m), 0L))));
+        System.out.println(decode("a2616e0066636f756e7473a2616201626161 02".replace(" ", "")));
+        System.out.println(decode("a2616e0066636f756e7473a262616102616201"));
+        System.out.println(decode("a2616e0066636f756e7473a2616101616102"));
+        System.out.println(decode("a3616e00616e0066636f756e7473a0"));
+        System.out.println(decode("a2616e0066636f756e7473a178016101"));
+        System.out.println(decode("a278016e0066636f756e7473a0"));
+    }
+}
+"#;
+        if let Some(out) = run_under_javac(&files, Some(driver)) {
+            assert_eq!(
+                out,
+                "a2616e0066636f756e7473a261620262616101\nok\ncsil cbor: map keys are not in canonical order\ncsil cbor: duplicate key \"a\"\ncsil cbor: duplicate key \"n\"\ncsil cbor: map key is not in shortest form\ncsil cbor: map key is not in shortest form\n"
+            );
+        }
+    }
+
+    /// A text enum value that is not an identifier gets a legal constant from the shared
+    /// word split, and keeps its value on the wire.
+    #[test]
+    fn dotted_enum_values_get_legal_constants_and_round_trip() {
+        let scope = rule(
+            "Scope",
+            CsilRuleType::TypeDef(CsilTypeExpression::Choice(
+                DOTTED_VALUES
+                    .iter()
+                    .map(|v| CsilTypeExpression::Literal(CsilLiteralValue::Text(v.to_string())))
+                    .collect(),
+            )),
+        );
+        let files = generate_java(&input_for(
+            vec![scope, record_rule("Grant", &[("scope", "Scope")])],
+            "java",
+        ))
+        .unwrap();
+        let class = &file(&files, "/Scope.java").content;
+        for constant in [
+            "CALENDARS_READ(",
+            "EVENTS_WRITE(",
+            "A_B_C(",
+            "V_2FA(",
+            "CLASS(",
+        ] {
+            assert!(class.contains(constant), "{class}");
+        }
+        let driver = r#"package csilgen.generated;
+
+public class Driver {
+    public static void main(String[] args) {
+        for (Scope s : Scope.values()) {
+            Grant back = CsilCbor.decodeGrant(CsilCbor.encodeGrant(new Grant(s)));
+            if (back.scope() != s) throw new IllegalStateException(s.name());
+            System.out.println(back.scope().value());
+        }
+    }
+}
+"#;
+        if let Some(out) = run_under_javac(&files, Some(driver)) {
+            assert_eq!(out, DOTTED_EXPECTED);
+        }
+    }
+
+    const DOTTED_VALUES: [&str; 5] = ["calendars.read", "events.write", "a-b c", "2fa", "class"];
+    const DOTTED_EXPECTED: &str = "calendars.read\nevents.write\na-b c\n2fa\nclass\n";
 }

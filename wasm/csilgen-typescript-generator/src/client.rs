@@ -114,7 +114,7 @@ pub fn generate(input: &WasmGeneratorInput, shape: ClientShape) -> Result<String
             body.push('\n');
         }
         if mode == BidiTransport::Connection && common::service_has_channel_ops(def) {
-            body.push_str(&channel_block(name, def, mapping, shape));
+            body.push_str(&channel_block(spec, name, def, mapping, shape));
             body.push('\n');
         }
     }
@@ -205,7 +205,7 @@ pub fn generate(input: &WasmGeneratorInput, shape: ClientShape) -> Result<String
 
     out.push_str(&body);
 
-    let aggregate = string_option(input, "aggregate_class_name", DEFAULT_AGGREGATE);
+    let aggregate = aggregate_name(input);
     let services_with_class: Vec<&(&str, &CsilServiceDefinition)> = services
         .iter()
         .filter(|(_, def)| service_class_has_methods(def, mode))
@@ -220,7 +220,12 @@ pub fn generate(input: &WasmGeneratorInput, shape: ClientShape) -> Result<String
 /// Whether a per-service client class would have any methods. Connection-mode
 /// services with only `<->`/`<-` ops yield nothing here (their interactions go
 /// through the channel block instead).
-fn service_class_has_methods(def: &CsilServiceDefinition, mode: BidiTransport) -> bool {
+/// The configured aggregate client class name; empty turns the aggregate off.
+pub(crate) fn aggregate_name(input: &WasmGeneratorInput) -> String {
+    string_option(input, "aggregate_class_name", DEFAULT_AGGREGATE)
+}
+
+pub(crate) fn service_class_has_methods(def: &CsilServiceDefinition, mode: BidiTransport) -> bool {
     def.operations.iter().any(|op| match mode {
         BidiTransport::Connection => common::is_unidirectional(op),
         BidiTransport::Rpc => true, // all ops route through call() in rpc mode
@@ -243,7 +248,7 @@ fn service_class(
     let records = &records;
     let class = shape.class_name(&common::service_base(name));
     let transport = shape.transport_name();
-    let wire_service = common::service_wire(name);
+    let wire_service = common::service_wire(spec, name);
 
     let mut out = format!("export class {class} {{\n");
     out.push_str(&format!(
@@ -507,18 +512,25 @@ fn pascal_from_camel(s: &str) -> String {
     }
 }
 
+/// The client's channel handler interface for a service base (`FooChannelHandlers`,
+/// or `FooAsyncChannelHandlers` for the twin).
+pub(crate) fn channel_handlers_name(base: &str, shape: ClientShape) -> String {
+    format!("{base}{}ChannelHandlers", shape.marker)
+}
+
 /// Connection-mode emission for the channel ops of a single service:
 /// inbound handler interface, router, and per-`<->`-op outbound encoders.
 fn channel_block(
+    spec: &CsilSpecSerialized,
     name: &str,
     def: &CsilServiceDefinition,
     mapping: DecimalMapping,
     shape: ClientShape,
 ) -> String {
     let base = common::service_base(name);
-    let handlers_iface = format!("{base}{}ChannelHandlers", shape.marker);
+    let handlers_iface = channel_handlers_name(&base, shape);
     let codec_name = shape.codec_name();
-    let wire_service = common::service_wire(name);
+    let wire_service = common::service_wire(spec, name);
 
     let channel_ops: Vec<&CsilServiceOperation> = def
         .operations

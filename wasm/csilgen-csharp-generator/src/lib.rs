@@ -272,12 +272,16 @@ fn derived_type_names(spec: &csilgen_common::CsilSpecSerialized) -> Vec<String> 
     for rule in &spec.rules {
         let base = pascal_ident(&rule.name);
         match &rule.rule_type {
-            CsilRuleType::ServiceDef(_) => {
+            CsilRuleType::ServiceDef(def) => {
                 let service = service_base(&rule.name);
                 names.push(format!("{service}Client"));
                 names.push(format!("{service}AsyncClient"));
-                names.push(format!("{service}Router"));
-                names.push(format!("{service}WireIds"));
+                if service_has_channel_ops(def) {
+                    names.push(format!("{service}Router"));
+                }
+                if def.wire_id.is_some() {
+                    names.push(format!("{service}WireIds"));
+                }
                 names.push(service_interface_name(&rule.name));
             }
             CsilRuleType::TypeDef(CsilTypeExpression::Choice(choices))
@@ -317,19 +321,61 @@ fn derived_type_names(spec: &csilgen_common::CsilSpecSerialized) -> Vec<String> 
 /// derived name, or another rule's type are renamed, and inline composites are hoisted.
 /// The renames are kept in `declared_names` for the wire and the warnings.
 fn prepare_spec(spec: &csilgen_common::CsilSpecSerialized) -> csilgen_common::CsilSpecSerialized {
-    let mut probe = spec.clone();
-    probe.supply_implicit_service_error();
-    let derived = derived_type_names(&csilgen_common::hoist_inline_composites(
-        &probe,
-        HOIST_OPTIONS,
-    ));
-    let reserved = csilgen_common::rename_reserved(spec, |name| {
+    let named = csilgen_common::hoist_op_union_boundaries(spec);
+    let mut hoisted = csilgen_common::hoist_inline_composites(&named, HOIST_OPTIONS);
+    hoisted.supply_implicit_service_error();
+    // The shared pass settles services that share an identifier (`user-svc` after
+    // `UserSvc` becomes `user-svc2`); the local pass then handles the bases it cannot
+    // see, such as `Foo` and `FooService`. The shared pass runs again after
+    // `rename_reserved`, whose `Type` names it has not checked yet.
+    let distinct = csilgen_common::rename_ident_collisions(&hoisted, pascal_ident);
+    let hoisted = rename_service_base_collisions(&distinct);
+    let derived = derived_type_names(&hoisted);
+    let reserved = csilgen_common::rename_reserved(&hoisted, |name| {
         let ident = pascal_ident(name);
         RESERVED_TYPE_NAMES.contains(&ident.as_str()) || derived.contains(&ident)
     });
-    let mut distinct = csilgen_common::rename_ident_collisions(&reserved, pascal_ident);
-    distinct.supply_implicit_service_error();
-    csilgen_common::hoist_inline_composites(&distinct, HOIST_OPTIONS)
+    csilgen_common::rename_ident_collisions(&reserved, pascal_ident)
+}
+
+/// Return `spec` with each service renamed whose `service_base` equals an earlier
+/// service's, or whose types would take a rule's name. `service_base` drops a trailing
+/// `Service`, so `Foo` and `FooService`, or `UserSvc` and `user-svc`, would declare one
+/// `<Base>Client`; the `Service` suffix of the shared collision pass is dropped the same
+/// way, so this pass repeats the suffix until the base is free. The spec keeps the
+/// declared name for the wire.
+fn rename_service_base_collisions(
+    spec: &csilgen_common::CsilSpecSerialized,
+) -> csilgen_common::CsilSpecSerialized {
+    let mut names: std::collections::HashSet<String> =
+        spec.rules.iter().map(|rule| rule.name.clone()).collect();
+    let types: std::collections::HashSet<String> = spec
+        .rules
+        .iter()
+        .filter(|rule| !matches!(rule.rule_type, CsilRuleType::ServiceDef(_)))
+        .map(|rule| pascal_ident(&rule.name))
+        .collect();
+    let mut bases = std::collections::HashSet::new();
+    let mut renames = HashMap::new();
+    for rule in &spec.rules {
+        if !matches!(rule.rule_type, CsilRuleType::ServiceDef(_)) {
+            continue;
+        }
+        if bases.insert(service_base(&rule.name)) {
+            continue;
+        }
+        let mut candidate = format!("{}Service", rule.name);
+        while names.contains(&candidate)
+            || bases.contains(&service_base(&candidate))
+            || types.contains(&service_interface_name(&candidate))
+        {
+            candidate.push_str("Service");
+        }
+        bases.insert(service_base(&candidate));
+        names.insert(candidate.clone());
+        renames.insert(rule.name.clone(), candidate);
+    }
+    csilgen_common::rename_rules(spec, &renames)
 }
 
 /// The single typed entry point used by both the WASM `generate` export and the
@@ -1134,7 +1180,7 @@ fn first_channel_example(
         };
         let base = service_base(&rule.name);
         return Some(ChannelExample {
-            service_wire: rule.name.clone(),
+            service_wire: input.csil_spec.declared_name(&rule.name).to_string(),
             router: format!("{base}Router"),
             iface: service_interface_name(&rule.name),
             encode_method: format!("Encode{}", pascal_ident(&chan.name)),
@@ -1299,6 +1345,7 @@ fn find_record_group<'a>(
 // ---------------------------------------------------------------------------
 
 fn generate_types(input: &WasmGeneratorInput, config: &CsharpConfig) -> Option<String> {
+    let alias_targets = codec_aliases(input);
     let mut body = String::new();
     let mut aliases: Vec<String> = Vec::new();
     let mut has_types = false;
@@ -1322,7 +1369,12 @@ fn generate_types(input: &WasmGeneratorInput, config: &CsharpConfig) -> Option<S
                     // file-scoped `using`) so the named type is visible from the service
                     // and client files too; the target is namespace-qualified because a
                     // global-using alias resolves its right side in the global namespace.
-                    let target = map_csil_type_qualified(type_expr, config);
+                    // One `global using` cannot name another, so a target that names an
+                    // alias spells out what that alias stands for.
+                    let target = map_csil_type_qualified(
+                        &expand_aliases(type_expr, &alias_targets, 0),
+                        config,
+                    );
                     aliases.push(format!(
                         "global using {} = {target};",
                         pascal_ident(&rule.name)
@@ -1549,6 +1601,43 @@ fn enum_member_ident(enum_name: &str, literal: &CsilLiteralValue, index: usize) 
     }
 }
 
+/// The member name of every arm of an enum, by arm index (empty for an arm with no
+/// literal). Text values take the shared word split in PascalCase, so `calendars.read`
+/// becomes `CalendarsRead` and `2fa` becomes `V2fa`; a member named like the enum keeps
+/// its `_` suffix. The other literal kinds keep `enum_member_ident`.
+fn enum_member_idents(enum_name: &str, choices: &[CsilTypeExpression]) -> Vec<String> {
+    let texts: Vec<&str> = choices
+        .iter()
+        .filter_map(|c| match choice_arm_literal(c) {
+            Some(CsilLiteralValue::Text(text)) => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    // C# keywords are lower case, so a PascalCase member meets none of them.
+    let mut text_names = csilgen_common::member_idents(
+        &texts,
+        |words| pascal_case(&words.join("_")),
+        |name| name.starts_with(|c: char| c.is_ascii_alphabetic()),
+    )
+    .into_iter();
+    choices
+        .iter()
+        .enumerate()
+        .map(|(index, choice)| match choice_arm_literal(choice) {
+            Some(CsilLiteralValue::Text(_)) => {
+                let name = text_names.next().unwrap_or_default();
+                if name == enum_name {
+                    format!("{name}_")
+                } else {
+                    name
+                }
+            }
+            Some(literal) => enum_member_ident(enum_name, literal, index),
+            None => String::new(),
+        })
+        .collect()
+}
+
 fn emit_enum(body: &mut String, name: &str, choices: &[CsilTypeExpression]) {
     let enum_name = pascal_ident(name);
     let numbers = csilgen_common::enum_numbers(choices);
@@ -1565,7 +1654,7 @@ fn emit_enum(body: &mut String, name: &str, choices: &[CsilTypeExpression]) {
         let Some(literal) = choice_arm_literal(choice) else {
             continue;
         };
-        let member = enum_member_ident(&enum_name, literal, index);
+        let member = enum_member_idents(&enum_name, choices).swap_remove(index);
         match literal {
             CsilLiteralValue::Text(_) if numbers.is_some() => {
                 body.push_str(&format!(
@@ -1597,7 +1686,7 @@ fn emit_enum(body: &mut String, name: &str, choices: &[CsilTypeExpression]) {
             let CsilLiteralValue::Text(label) = literal else {
                 unreachable!()
             };
-            let member = enum_member_ident(&enum_name, literal, i);
+            let member = enum_member_idents(&enum_name, choices).swap_remove(i);
             let label = csharp_escape(label);
             read.push_str(&format!("        \"{label}\" => {enum_name}.{member},\n"));
             write.push_str(&format!("        {enum_name}.{member} => \"{label}\",\n"));
@@ -1715,8 +1804,16 @@ fn generate_client(
 
     for rule in &input.csil_spec.rules {
         if let CsilRuleType::ServiceDef(service) = &rule.rule_type {
+            let wire = input.csil_spec.declared_name(&rule.name);
             emit_client_class(
-                &mut body, &rule.name, service, config, &records, &aliases, &choices, shape,
+                &mut body,
+                (&rule.name, wire),
+                service,
+                config,
+                &records,
+                &aliases,
+                &choices,
+                shape,
             );
             emitted = true;
         }
@@ -1739,7 +1836,7 @@ fn generate_client(
 #[allow(clippy::too_many_arguments)]
 fn emit_client_class(
     body: &mut String,
-    name: &str,
+    (name, wire): (&str, &str),
     service: &CsilServiceDefinition,
     config: &CsharpConfig,
     records: &std::collections::HashSet<String>,
@@ -1847,10 +1944,10 @@ fn emit_client_class(
         // throws the declared error arm, and rejects a missing or unknown variant.
         let call = if multi_arm {
             format!(
-                "Codec.ResolveRpcReply(\"{name}\", \"{wire_op}\", reply.Variant, reply.Payload)"
+                "Codec.ResolveRpcReply(\"{wire}\", \"{wire_op}\", reply.Variant, reply.Payload)"
             )
         } else {
-            format!("{await_kw}transport.Call(\"{name}\", \"{wire_op}\", {req_bytes})")
+            format!("{await_kw}transport.Call(\"{wire}\", \"{wire_op}\", {req_bytes})")
         };
         // A record success reuses the generic `Codec.Decode<T>`; any other shape uses the
         // op's per-op response decoder.
@@ -1861,7 +1958,7 @@ fn emit_client_class(
         };
         if multi_arm {
             body.push_str(&format!(
-                "    public {async_kw}{ret} {method}({params_sig})\n    {{\n        var reply = {await_kw}transport.CallReply(\"{name}\", \"{wire_op}\", {req_bytes});\n        return {decode};\n    }}\n"
+                "    public {async_kw}{ret} {method}({params_sig})\n    {{\n        var reply = {await_kw}transport.CallReply(\"{wire}\", \"{wire_op}\", {req_bytes});\n        return {decode};\n    }}\n"
             ));
         } else {
             body.push_str(&format!(
@@ -2103,10 +2200,13 @@ fn csharp_enc_value(
         CsilTypeExpression::Builtin(name) => match name.as_str() {
             "int" | "nint" => format!("new CborValue.Int({expr})"),
             "uint" => format!("new CborValue.Uint({expr})"),
-            "float" | "float64" | "double" => format!("new CborValue.Float({expr})"),
+            "float" | "float16" | "float32" | "float64" | "double" => {
+                format!("new CborValue.Float({expr})")
+            }
             "text" | "tstr" => format!("new CborValue.Text({expr})"),
             "bytes" | "bstr" => format!("new CborValue.Bytes({expr})"),
             "bool" => format!("new CborValue.Bool({expr})"),
+            "true" | "false" => format!("new CborValue.Bool({name})"),
             "date" => format!("Cbor.EncDate({expr})"),
             "timestamp" => format!("Cbor.EncTimestamp({expr})"),
             "cddl_time" => format!("Cbor.EncCddlTime({expr})"),
@@ -2144,7 +2244,7 @@ fn csharp_enc_value(
             let kenc = csharp_enc_value(key, "csilKv.Key", records, aliases, choices);
             let venc = csharp_enc_value(value, "csilKv.Value", records, aliases, choices);
             format!(
-                "new CborValue.Map({expr}.Select(csilKv => ((CborValue){kenc}, (CborValue){venc})).ToList())"
+                "new CborValue.Map(Cbor.CanonicalEntries({expr}.Select(csilKv => ((CborValue){kenc}, (CborValue){venc}))))"
             )
         }
         // A tuple is a fixed-length positional CBOR array.
@@ -2205,10 +2305,18 @@ fn csharp_dec_value(
         CsilTypeExpression::Builtin(name) => match name.as_str() {
             "int" | "nint" => format!("Cbor.AsI64({expr})"),
             "uint" => format!("Cbor.AsU64({expr})"),
-            "float" | "float64" | "double" => format!("Cbor.AsDouble({expr})"),
+            "float" | "float16" | "float32" | "float64" | "double" => {
+                format!("Cbor.AsDouble({expr})")
+            }
             "text" | "tstr" => format!("Cbor.AsText({expr})"),
             "bytes" | "bstr" => format!("Cbor.AsBytes({expr})"),
             "bool" => format!("Cbor.AsBool({expr})"),
+            "true" | "false" => format!(
+                "(Cbor.AsBool({expr}) == {name} ? {name} : throw new CborException(\"csil cbor: expected {name}\"))"
+            ),
+            "nil" | "null" | "undefined" => format!(
+                "({expr} is CborValue.Null ? (object?)null : throw new CborException(\"csil cbor: expected null\"))"
+            ),
             "date" => format!("Cbor.AsDate({expr})"),
             "timestamp" => format!("Cbor.AsTimestamp({expr})"),
             "cddl_time" => format!("Cbor.AsCddlTime({expr})"),
@@ -2242,7 +2350,7 @@ fn csharp_dec_value(
         CsilTypeExpression::Map { key, value, .. } => {
             let kdec = csharp_dec_value(key, "csilKv.Key", records, aliases, choices);
             let vdec = csharp_dec_value(value, "csilKv.Value", records, aliases, choices);
-            format!("Cbor.AsMap({expr}).ToDictionary(csilKv => {kdec}, csilKv => {vdec})")
+            format!("Cbor.AsDynamicMap({expr}).ToDictionary(csilKv => {kdec}, csilKv => {vdec})")
         }
         CsilTypeExpression::Tuple(group) => {
             csharp_tuple_dec(ty, &group.entries, expr, records, aliases, choices)
@@ -2509,7 +2617,7 @@ fn emit_enum_codec(type_name: &str, cases: &[CsilTypeExpression]) -> String {
         let Some(literal) = choice_arm_literal(case) else {
             continue;
         };
-        let member = enum_member_ident(type_name, literal, index);
+        let member = enum_member_idents(type_name, cases).swap_remove(index);
         match literal {
             // Encode is unaffected by the mixed-kind decode bug below: each arm's `value
             // switch` produces its own `CborValue` per enum MEMBER, not per wire kind — kept
@@ -2556,8 +2664,8 @@ fn emit_enum_codec(type_name: &str, cases: &[CsilTypeExpression]) -> String {
     if int_only {
         let mut from_arms = String::new();
         for (index, case) in cases.iter().enumerate() {
-            if let Some(literal @ CsilLiteralValue::Integer(value)) = choice_arm_literal(case) {
-                let member = enum_member_ident(type_name, literal, index);
+            if let Some(CsilLiteralValue::Integer(value)) = choice_arm_literal(case) {
+                let member = enum_member_idents(type_name, cases).swap_remove(index);
                 from_arms.push_str(&format!("        {value} => {type_name}.{member},\n"));
             }
         }
@@ -2567,8 +2675,8 @@ fn emit_enum_codec(type_name: &str, cases: &[CsilTypeExpression]) -> String {
     } else if text_only {
         let mut from_arms = String::new();
         for (index, case) in cases.iter().enumerate() {
-            if let Some(literal @ CsilLiteralValue::Text(text)) = choice_arm_literal(case) {
-                let member = enum_member_ident(type_name, literal, index);
+            if let Some(CsilLiteralValue::Text(text)) = choice_arm_literal(case) {
+                let member = enum_member_idents(type_name, cases).swap_remove(index);
                 let lit = csharp_escape(text);
                 from_arms.push_str(&format!("        \"{lit}\" => {type_name}.{member},\n"));
             }
@@ -2582,7 +2690,7 @@ fn emit_enum_codec(type_name: &str, cases: &[CsilTypeExpression]) -> String {
             let Some(literal) = choice_arm_literal(case) else {
                 continue;
             };
-            let member = enum_member_ident(type_name, literal, index);
+            let member = enum_member_idents(type_name, cases).swap_remove(index);
             let guard = csharp_literal_equals_expr("csilLitValue", literal);
             from_arms.push_str(&format!(
                 "        CborValue csilLitValue when {guard} => {type_name}.{member},\n"
@@ -2613,7 +2721,7 @@ fn emit_union_codec(
         to_arms.push_str(&format!(
             "        {arm} csilArm => new CborValue.Array(new CborValue[] {{ new CborValue.Uint({index}), (CborValue){enc} }}),\n"
         ));
-        from_arms.push_str(&format!("        {index} => new {arm}({dec}),\n"));
+        from_arms.push_str(&format!("            {index} => new {arm}({dec}),\n"));
     }
     let mut out = String::new();
     out.push_str(&format!(
@@ -2626,7 +2734,7 @@ fn emit_union_codec(
         "    /// <summary>Reconstruct a {type_name} from its tagged-sum CBOR value.</summary>\n"
     ));
     out.push_str(&format!(
-        "    public static {type_name} {type_name}FromCborValue(CborValue value)\n    {{\n        var csilArr = Cbor.AsArray(value);\n        return Cbor.AsU64(csilArr[0]) switch\n        {{\n{from_arms}            _ => throw new CborException(\"invalid {type_name} variant\"),\n        }};\n    }}\n\n"
+        "    public static {type_name} {type_name}FromCborValue(CborValue value)\n    {{\n        var csilArr = Cbor.AsArray(value);\n        if (csilArr.Count != 2) {{ throw new CborException(\"{type_name} is not a [variant_index, value] pair\"); }}\n        return Cbor.AsU64(csilArr[0]) switch\n        {{\n{from_arms}            _ => throw new CborException(\"invalid {type_name} variant\"),\n        }};\n    }}\n\n"
     ));
     out
 }
@@ -2651,9 +2759,12 @@ fn generate_codec(input: &WasmGeneratorInput, config: &CsharpConfig) -> Option<S
     // Per-op byte helpers for non-record op boundaries; their presence also means a
     // record-free spec with scalar/array/map ops still needs the codec runtime + class.
     let op_codecs = emit_op_codecs(input, &records, &aliases, &choices, config);
+    // A type that holds `any` names the runtime's `CborValue`, so the runtime must exist
+    // even in a spec without records.
     if !spec_has_records(input)
         && op_codecs.is_empty()
         && input.csil_spec.rpc_operations().next().is_none()
+        && !spec_uses_builtin(input, "any")
     {
         return None;
     }
@@ -2758,6 +2869,7 @@ fn generate_codec(input: &WasmGeneratorInput, config: &CsharpConfig) -> Option<S
         for (service, op, arms) in input.csil_spec.rpc_operations() {
             let method = &op.name;
             let stem = op_codec_stem(service, &op.name);
+            let service = input.csil_spec.declared_name(service);
             let success = map_csil_type(&arms[0], config);
             let mut encode = format!(
                 "    public static (string Variant, byte[] Payload) Encode{stem}Reply(System.Func<{success}> handler)\n    {{\n        try\n        {{\n            var value = handler();\n"
@@ -3476,7 +3588,7 @@ fn map_csil_type_inner(
             "uint" => "ulong".to_string(),
             // `nint` is a CBOR negative integer; it still lands in a signed 64-bit C# `long`.
             "nint" => "long".to_string(),
-            "float" | "float64" | "double" => "double".to_string(),
+            "float" | "float16" | "float32" | "float64" | "double" => "double".to_string(),
             // `tstr`/`bstr` are the CDDL spellings of `text`/`bytes`.
             "text" | "tstr" => "string".to_string(),
             "bytes" | "bstr" => "byte[]".to_string(),
@@ -3495,7 +3607,9 @@ fn map_csil_type_inner(
             // generated codec's own `CborValue` value tree so it round-trips losslessly.
             "any" => format!("{prefix}CborValue"),
             // `nil`/`null` are the CBOR null item — `object?` in C#.
-            "nil" | "null" => "object?".to_string(),
+            "nil" | "null" | "undefined" => "object?".to_string(),
+            // A `true`/`false` type has one value, so it is a bool that the codec checks.
+            "true" | "false" => "bool".to_string(),
             other => format!("{prefix}{}", pascal_ident(other)),
         },
         CsilTypeExpression::Reference(name) => format!("{prefix}{}", pascal_ident(name)),
@@ -3525,6 +3639,59 @@ fn map_csil_type_inner(
             map_csil_type_inner(base_type, config, qualify)
         }
         _ => "object".to_string(),
+    }
+}
+
+/// `ty` with every reference to a transparent alias replaced by the alias's target, at
+/// any depth. The depth bound stops a recursive alias; such a reference stays as written.
+fn expand_aliases(
+    ty: &CsilTypeExpression,
+    aliases: &std::collections::HashMap<String, CsilTypeExpression>,
+    depth: usize,
+) -> CsilTypeExpression {
+    if depth > 16 {
+        return ty.clone();
+    }
+    let expand = |inner: &CsilTypeExpression| Box::new(expand_aliases(inner, aliases, depth + 1));
+    match ty {
+        CsilTypeExpression::Reference(name) => match aliases.get(&pascal_ident(name)) {
+            Some(target) => expand_aliases(target, aliases, depth + 1),
+            None => ty.clone(),
+        },
+        CsilTypeExpression::Array {
+            element_type,
+            occurrence,
+        } => CsilTypeExpression::Array {
+            element_type: expand(element_type),
+            occurrence: occurrence.clone(),
+        },
+        CsilTypeExpression::Map {
+            key,
+            value,
+            occurrence,
+        } => CsilTypeExpression::Map {
+            key: expand(key),
+            value: expand(value),
+            occurrence: occurrence.clone(),
+        },
+        CsilTypeExpression::Constrained {
+            base_type,
+            constraints,
+        } => CsilTypeExpression::Constrained {
+            base_type: expand(base_type),
+            constraints: constraints.clone(),
+        },
+        CsilTypeExpression::Tuple(group) => CsilTypeExpression::Tuple(CsilGroupExpression {
+            entries: group
+                .entries
+                .iter()
+                .map(|entry| CsilGroupEntry {
+                    value_type: expand_aliases(&entry.value_type, aliases, depth + 1),
+                    ..entry.clone()
+                })
+                .collect(),
+        }),
+        other => other.clone(),
     }
 }
 
@@ -4004,7 +4171,9 @@ public abstract record CborValue
     public sealed record Text(string Value) : CborValue;
     public sealed record Bytes(byte[] Value) : CborValue;
     public sealed record Array(System.Collections.Generic.IReadOnlyList<CborValue> Items) : CborValue;
-    public sealed record Map(System.Collections.Generic.IReadOnlyList<(CborValue Key, CborValue Value)> Entries) : CborValue;
+    // Canonical is false when a decoded map's encoded keys were not strictly ascending
+    // bytewise (RFC 8949 section 4.2.1): a dynamic map rejects that, a record does not.
+    public sealed record Map(System.Collections.Generic.IReadOnlyList<(CborValue Key, CborValue Value)> Entries, bool Canonical = true) : CborValue;
     public sealed record Tag(ulong Number, CborValue Inner) : CborValue;
 }
 
@@ -4231,13 +4400,38 @@ public static partial class Cbor
                 if (arg > (ulong)(b.Length - csilPos)) { throw new CborException("map length exceeds remaining input"); }
                 var n = (int)arg;
                 var kvs = new System.Collections.Generic.List<(CborValue, CborValue)>(System.Math.Min(n, PreallocLimit));
+                // Each key is compared with the one before it as raw bytes, so the order
+                // check is O(n). Only a map out of order can repeat a key, so the set of
+                // seen keys is built only then.
+                var csilKeys = new System.Collections.Generic.List<(int Start, int Length)>(System.Math.Min(n, PreallocLimit));
+                System.Collections.Generic.HashSet<string>? csilSeen = null;
                 for (int csilI = 0; csilI < n; csilI++)
                 {
+                    var csilStart = csilPos;
                     var k = Dec(b, ref csilPos, csilDepth + 1);
+                    var csilKey = (Start: csilStart, Length: csilPos - csilStart);
+                    if (!ShortestHead(b, csilStart)) { throw new CborException("csil cbor: map key is not in shortest form"); }
+                    if (csilSeen == null && csilI > 0)
+                    {
+                        var csilPrev = csilKeys[csilI - 1];
+                        if (System.MemoryExtensions.SequenceCompareTo(new System.ReadOnlySpan<byte>(b, csilPrev.Start, csilPrev.Length), new System.ReadOnlySpan<byte>(b, csilKey.Start, csilKey.Length)) >= 0)
+                        {
+                            csilSeen = new System.Collections.Generic.HashSet<string>();
+                            foreach (var csilEarlier in csilKeys)
+                            {
+                                csilSeen.Add(System.Convert.ToHexString(b, csilEarlier.Start, csilEarlier.Length));
+                            }
+                        }
+                    }
+                    if (csilSeen != null && !csilSeen.Add(System.Convert.ToHexString(b, csilKey.Start, csilKey.Length)))
+                    {
+                        throw new CborException($"csil cbor: duplicate key {DescribeKey(k)}");
+                    }
+                    csilKeys.Add(csilKey);
                     var val = Dec(b, ref csilPos, csilDepth + 1);
                     kvs.Add((k, val));
                 }
-                return new CborValue.Map(kvs);
+                return new CborValue.Map(kvs, csilSeen == null);
             }
             case 6:
             {
@@ -4320,6 +4514,47 @@ public static partial class Cbor
 
     public static System.Collections.Generic.IReadOnlyList<(CborValue Key, CborValue Value)> AsMap(CborValue v) =>
         v is CborValue.Map x ? x.Entries : throw new CborException("expected map");
+
+    /// <summary>The entries of a dynamic map, which must arrive in canonical key order.</summary>
+    public static System.Collections.Generic.IReadOnlyList<(CborValue Key, CborValue Value)> AsDynamicMap(CborValue v) =>
+        v is CborValue.Map { Canonical: false }
+            ? throw new CborException("csil cbor: map keys are not in canonical order")
+            : AsMap(v);
+
+    /// <summary>The entries in canonical order: bytewise order of each key's encoding,
+    /// which is not the order of the .NET keys.</summary>
+    public static System.Collections.Generic.List<(CborValue, CborValue)> CanonicalEntries(
+        System.Collections.Generic.IEnumerable<(CborValue Key, CborValue Value)> entries) =>
+        entries
+            .Select(csilEntry => (Bytes: Encode(csilEntry.Key), Entry: csilEntry))
+            .OrderBy(csilEntry => csilEntry.Bytes, CsilKeyOrder.Instance)
+            .Select(csilEntry => ((CborValue)csilEntry.Entry.Key, csilEntry.Entry.Value))
+            .ToList();
+
+    sealed class CsilKeyOrder : System.Collections.Generic.IComparer<byte[]>
+    {
+        public static readonly CsilKeyOrder Instance = new();
+
+        public int Compare(byte[]? x, byte[]? y) =>
+            System.MemoryExtensions.SequenceCompareTo(new System.ReadOnlySpan<byte>(x), new System.ReadOnlySpan<byte>(y));
+    }
+
+    /// <summary>Whether the head at <paramref name="at"/> uses the shortest argument for
+    /// its value. A float head (major 7) carries no length, so it is not checked.</summary>
+    static bool ShortestHead(byte[] b, int at)
+    {
+        var major = b[at] >> 5;
+        var low = b[at] & 0x1f;
+        if (major == 7 || low < 24) { return true; }
+        var width = 1 << (low - 24);
+        ulong arg = 0;
+        for (int csilI = 1; csilI <= width; csilI++) { arg = (arg << 8) | b[at + csilI]; }
+        ulong floor = low == 24 ? 24UL : 1UL << (8 * (width / 2));
+        return arg >= floor;
+    }
+
+    static string DescribeKey(CborValue k) =>
+        k is CborValue.Text t ? $"\"{t.Value}\"" : System.Convert.ToHexString(Encode(k)).ToLowerInvariant();
 
     public static string AsTaggedText(CborValue v, ulong num) =>
         v is CborValue.Tag x && x.Number == num ? AsText(x.Inner) : throw new CborException("expected tagged text");
@@ -4645,7 +4880,7 @@ mod tests {
             CODEC_RUNTIME_CSHARP
                 .matches(">(System.Math.Min(n, PreallocLimit))")
                 .count(),
-            2
+            3
         );
         assert!(CODEC_RUNTIME_CSHARP.contains("if (csilDepth > 64)"));
         assert!(CODEC_RUNTIME_CSHARP.contains("new System.Text.UTF8Encoding(false, true)"));
@@ -8156,4 +8391,464 @@ internal static class Program
     }
 }
 "#;
+
+    fn spec_input(target: &str, rules: Vec<CsilRule>) -> WasmGeneratorInput {
+        let service_count = rules
+            .iter()
+            .filter(|r| matches!(r.rule_type, CsilRuleType::ServiceDef(_)))
+            .count();
+        let mut input = pingpong_input(target);
+        input.csil_spec = CsilSpecSerialized {
+            rules,
+            source_content: None,
+            service_count,
+            fields_with_metadata_count: 0,
+            declared_names: Default::default(),
+        };
+        input
+    }
+
+    fn named_rule(name: &str, rule_type: CsilRuleType) -> CsilRule {
+        CsilRule {
+            name: name.to_string(),
+            rule_type,
+            position: CsilPosition {
+                line: 1,
+                column: 1,
+                offset: 0,
+            },
+            doc_comments: Vec::new(),
+        }
+    }
+
+    fn reference(name: &str) -> CsilTypeExpression {
+        CsilTypeExpression::Reference(name.to_string())
+    }
+
+    fn record_rule(name: &str, fields: &[(&str, &str)]) -> CsilRule {
+        named_rule(
+            name,
+            CsilRuleType::GroupDef(CsilGroupExpression {
+                entries: fields
+                    .iter()
+                    .map(|(key, ty)| {
+                        let ty = if ty.starts_with(char::is_uppercase) {
+                            reference(ty)
+                        } else {
+                            CsilTypeExpression::Builtin(ty.to_string())
+                        };
+                        bare_entry(key, ty)
+                    })
+                    .collect(),
+            }),
+        )
+    }
+
+    fn service_rule(
+        name: &str,
+        ops: Vec<(&str, CsilTypeExpression, CsilTypeExpression)>,
+    ) -> CsilRule {
+        named_rule(
+            name,
+            CsilRuleType::ServiceDef(CsilServiceDefinition {
+                operations: ops
+                    .into_iter()
+                    .map(|(op, input, output)| CsilServiceOperation {
+                        name: op.to_string(),
+                        input_type: input,
+                        output_type: output,
+                        direction: CsilServiceDirection::Unidirectional,
+                        position: CsilPosition {
+                            line: 1,
+                            column: 1,
+                            offset: 0,
+                        },
+                        doc_comments: Vec::new(),
+                        wire_id: None,
+                    })
+                    .collect(),
+                wire_id: None,
+            }),
+        )
+    }
+
+    fn rename_messages(out: &WasmGeneratorOutput) -> Vec<String> {
+        out.warnings
+            .iter()
+            .map(|w| w.message.clone())
+            .filter(|m| m.contains("is generated as"))
+            .collect()
+    }
+
+    /// Build the generated files plus `driver` (top-level statements) with `dotnet run`
+    /// and return what it prints. `None` when there is no dotnet toolchain.
+    fn run_under_dotnet(out: &WasmGeneratorOutput, label: &str, driver: &str) -> Option<String> {
+        if !have_dotnet() {
+            eprintln!("skipping: no dotnet toolchain on PATH");
+            return None;
+        }
+        let dir = std::env::temp_dir().join(format!("csilgen-cs-{label}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for file in out.files.iter().filter(|f| f.path.ends_with(".cs")) {
+            std::fs::write(dir.join(&file.path), &file.content).unwrap();
+        }
+        std::fs::write(dir.join("Program.cs"), driver).unwrap();
+        std::fs::write(dir.join("roundtrip.csproj"), CSHARP_CSPROJ).unwrap();
+        let run = run_dotnet(&dir, "run");
+        let stdout = String::from_utf8_lossy(&run.stdout).into_owned();
+        assert!(
+            run.status.success(),
+            "dotnet run failed:\nstdout:\n{stdout}\nstderr:\n{}",
+            String::from_utf8_lossy(&run.stderr)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        Some(stdout)
+    }
+
+    const COMPILE_ONLY: &str = "System.Console.WriteLine(\"ok\");\n";
+
+    /// An op whose input and output are its own records emits no derived type that
+    /// could meet them, so the records keep their names (linkkeys
+    /// `RpIssueAttestationRequest`).
+    #[test]
+    fn op_records_named_like_the_op_keep_their_names() {
+        let rules = vec![
+            record_rule("SignedSigningRequest", &[("sig", "bytes")]),
+            record_rule("Claim", &[("v", "text")]),
+            record_rule(
+                "RpIssueAttestationRequest",
+                &[
+                    ("signed_request", "SignedSigningRequest"),
+                    ("claim_type", "text"),
+                ],
+            ),
+            record_rule(
+                "RpIssueAttestationResponse",
+                &[("claim", "Claim"), ("deposited", "bool")],
+            ),
+            service_rule(
+                "Rp",
+                vec![(
+                    "issue-attestation",
+                    reference("RpIssueAttestationRequest"),
+                    reference("RpIssueAttestationResponse"),
+                )],
+            ),
+        ];
+        let out = render(spec_input("csharp-client", rules)).unwrap();
+        assert!(rename_messages(&out).is_empty(), "{:?}", out.warnings);
+        let types = output_file(&out, "Types.gen.cs");
+        assert_eq!(
+            types
+                .matches("public sealed record RpIssueAttestationRequest\n")
+                .count(),
+            1
+        );
+        run_under_dotnet(&out, "t1-records", COMPILE_ONLY);
+    }
+
+    /// C# op codecs are `Codec` methods and type names are types, so `MemberID ->
+    /// MemberID` and a record `MemberGetMemberRequest` declare nothing twice: the record
+    /// keeps its name. A rule named like the client class is a real clash and is renamed.
+    #[test]
+    fn only_a_real_clash_with_a_derived_name_renames() {
+        let rules = vec![
+            named_rule(
+                "MemberID",
+                CsilRuleType::TypeDef(CsilTypeExpression::Builtin("text".into())),
+            ),
+            record_rule("MemberGetMemberRequest", &[("id", "text")]),
+            record_rule("MemberClient", &[("id", "text")]),
+            service_rule(
+                "Member",
+                vec![("get-member", reference("MemberID"), reference("MemberID"))],
+            ),
+        ];
+        let out = render(spec_input("csharp-client", rules)).unwrap();
+        let renames = rename_messages(&out);
+        assert_eq!(renames.len(), 1, "{renames:?}");
+        assert!(renames[0].contains("rule `MemberClient` is generated as `MemberClientType`"));
+        assert!(
+            output_file(&out, "Types.gen.cs")
+                .contains("public sealed record MemberGetMemberRequest\n")
+        );
+        assert!(
+            output_file(&out, "Codec.gen.cs")
+                .contains("public static byte[] EncodeMemberGetMemberRequest(")
+        );
+        run_under_dotnet(&out, "t1-clash", COMPILE_ONLY);
+    }
+
+    /// `read-counts: Holder -> { * text => int } / Err` exposes the whole union, both
+    /// arms, on the client and the server.
+    #[test]
+    fn mixed_op_output_is_a_named_union_on_both_sides() {
+        let rules = || {
+            vec![
+                record_rule("Holder", &[("n", "int")]),
+                record_rule("Err", &[("message", "text")]),
+                service_rule(
+                    "Lookup",
+                    vec![(
+                        "read-counts",
+                        reference("Holder"),
+                        CsilTypeExpression::Choice(vec![
+                            CsilTypeExpression::Map {
+                                key: Box::new(CsilTypeExpression::Builtin("text".into())),
+                                value: Box::new(CsilTypeExpression::Builtin("int".into())),
+                                occurrence: None,
+                            },
+                            reference("Err"),
+                        ]),
+                    )],
+                ),
+            ]
+        };
+        let client = render(spec_input("csharp-client", rules())).unwrap();
+        assert!(
+            output_file(&client, "Client.gen.cs")
+                .contains("public LookupReadCountsOutput ReadCounts(Holder holder)")
+        );
+        let types = output_file(&client, "Types.gen.cs");
+        assert!(types.contains("public sealed record LookupReadCountsOutputVariant1(System.Collections.Generic.Dictionary<string, long> Value) : LookupReadCountsOutput;"));
+        assert!(types.contains(
+            "public sealed record LookupReadCountsOutputErr(Err Value) : LookupReadCountsOutput;"
+        ));
+        let server = render(spec_input("csharp-server", rules())).unwrap();
+        assert!(
+            output_file(&server, "Services.gen.cs")
+                .contains("LookupReadCountsOutput ReadCounts(Holder holder);")
+        );
+        run_under_dotnet(&client, "t2-union", COMPILE_ONLY);
+    }
+
+    /// `UserSvc` and `user-svc` are one C# identifier; the later one is renamed for the
+    /// generated types, and both keep their declared name on the wire.
+    #[test]
+    fn services_with_one_identifier_keep_their_wire_names() {
+        let rules = || {
+            vec![
+                record_rule("Ping", &[("n", "int")]),
+                service_rule(
+                    "UserSvc",
+                    vec![("ping", reference("Ping"), reference("Ping"))],
+                ),
+                service_rule(
+                    "user-svc",
+                    vec![("ping", reference("Ping"), reference("Ping"))],
+                ),
+            ]
+        };
+        let out = render(spec_input("csharp-client", rules())).unwrap();
+        let renames = rename_messages(&out);
+        assert_eq!(renames.len(), 1, "{renames:?}");
+        assert!(renames[0].starts_with("service `user-svc` is generated as"));
+        let client = output_file(&out, "Client.gen.cs");
+        assert!(client.contains("class UserSvcClient("));
+        assert!(client.contains("class UserSvc2Client("));
+        assert!(client.contains("transport.Call(\"UserSvc\", \"ping\""));
+        assert!(client.contains("transport.Call(\"user-svc\", \"ping\""));
+        run_under_dotnet(&out, "t3-client", COMPILE_ONLY);
+        let server = render(spec_input("csharp-server", rules())).unwrap();
+        let services = output_file(&server, "Services.gen.cs");
+        assert!(services.contains("public interface IUserSvcService\n"));
+        assert!(services.contains("public interface IUserSvc2Service\n"));
+        run_under_dotnet(&server, "t3-server", COMPILE_ONLY);
+    }
+
+    /// `Foo` and `FooService` have distinct identifiers, but both drop to the base `Foo`
+    /// and would declare `FooClient` twice. The local pass renames the later one.
+    #[test]
+    fn services_with_one_base_are_told_apart() {
+        let rules = vec![
+            record_rule("Ping", &[("n", "int")]),
+            service_rule("Foo", vec![("ping", reference("Ping"), reference("Ping"))]),
+            service_rule(
+                "FooService",
+                vec![("ping", reference("Ping"), reference("Ping"))],
+            ),
+        ];
+        let out = render(spec_input("csharp-client", rules)).unwrap();
+        assert_eq!(rename_messages(&out).len(), 1, "{:?}", out.warnings);
+        let client = output_file(&out, "Client.gen.cs");
+        assert!(client.contains("class FooClient("));
+        assert!(client.contains("class FooServiceClient("));
+        assert!(client.contains("transport.Call(\"FooService\", \"ping\""));
+        run_under_dotnet(&out, "t3-base", COMPILE_ONLY);
+    }
+
+    /// The hoister names the inline record of `Err.refusal` `Err_refusal`, whose type
+    /// `ErrRefusal` is also the refusal exception the codec declares for the error arm
+    /// `Err`. The synthesized rule is renamed; `Err` keeps its name and its wire variant.
+    #[test]
+    fn synthesized_rule_that_clashes_is_renamed() {
+        let inline = CsilTypeExpression::Group(CsilGroupExpression {
+            entries: vec![bare_entry(
+                "why",
+                CsilTypeExpression::Builtin("text".into()),
+            )],
+        });
+        let rules = vec![
+            record_rule("Ping", &[("n", "int")]),
+            named_rule(
+                "Err",
+                CsilRuleType::GroupDef(CsilGroupExpression {
+                    entries: vec![bare_entry("refusal", inline)],
+                }),
+            ),
+            service_rule(
+                "Svc",
+                vec![(
+                    "ping",
+                    reference("Ping"),
+                    CsilTypeExpression::Choice(vec![reference("Ping"), reference("Err")]),
+                )],
+            ),
+        ];
+        let out = render(spec_input("csharp-client", rules)).unwrap();
+        let renames = rename_messages(&out);
+        assert_eq!(renames.len(), 1, "{renames:?}");
+        assert!(renames[0].contains("rule `Err_refusal` is generated as `Err_refusalType`"));
+        let types = output_file(&out, "Types.gen.cs");
+        assert!(types.contains("public sealed record Err\n"));
+        assert!(types.contains("public sealed record ErrRefusalType\n"));
+        assert!(output_file(&out, "Codec.gen.cs").contains("\"Err\" => throw new ErrRefusal("));
+        run_under_dotnet(&out, "t4-synth", COMPILE_ONLY);
+    }
+
+    /// Dynamic maps encode in canonical key order and decode only in that order; a
+    /// record takes its fields in any order but not twice.
+    #[test]
+    fn map_key_order_and_duplicate_keys_through_dotnet() {
+        let rules = vec![
+            named_rule(
+                "Counts",
+                CsilRuleType::TypeDef(CsilTypeExpression::Map {
+                    key: Box::new(CsilTypeExpression::Builtin("text".into())),
+                    value: Box::new(CsilTypeExpression::Builtin("int".into())),
+                    occurrence: None,
+                }),
+            ),
+            record_rule("Holder", &[("counts", "Counts"), ("n", "int")]),
+        ];
+        let out = render(spec_input("csharp", rules)).unwrap();
+        let driver = r#"using Csilgen.Transport;
+
+static string Decodes(string hex)
+{
+    try
+    {
+        Codec.HolderFromCborValue(Cbor.Decode(System.Convert.FromHexString(hex)));
+        return "ok";
+    }
+    catch (CborException e)
+    {
+        return e.Message;
+    }
+}
+
+var counts = new System.Collections.Generic.Dictionary<string, long> { ["aa"] = 1, ["b"] = 2 };
+var bytes = Cbor.Encode(Codec.HolderToCborValue(new Holder { Counts = counts, N = 0 }));
+System.Console.WriteLine(System.Convert.ToHexString(bytes).ToLowerInvariant());
+System.Console.WriteLine(Decodes("a2616e0066636f756e7473a261620262616102"));
+System.Console.WriteLine(Decodes("a2616e0066636f756e7473a262616102616201"));
+System.Console.WriteLine(Decodes("a2616e0066636f756e7473a2616101616102"));
+System.Console.WriteLine(Decodes("a3616e00616e0066636f756e7473a0"));
+System.Console.WriteLine(Decodes("a2616e0066636f756e7473a178016101"));
+System.Console.WriteLine(Decodes("a278016e0066636f756e7473a0"));
+"#;
+        if let Some(stdout) = run_under_dotnet(&out, "t5-maps", driver) {
+            assert_eq!(
+                stdout,
+                "a2616e0066636f756e7473a261620262616101\nok\ncsil cbor: map keys are not in canonical order\ncsil cbor: duplicate key \"a\"\ncsil cbor: duplicate key \"n\"\ncsil cbor: map key is not in shortest form\ncsil cbor: map key is not in shortest form\n"
+            );
+        }
+    }
+
+    /// `dotnet format whitespace` has no line width, so the crate checks what it does
+    /// enforce on every emitted C# file: no tab, no trailing whitespace, indentation in
+    /// steps of four spaces, and one final newline.
+    #[test]
+    fn emitted_csharp_is_whitespace_clean() {
+        let inputs = [
+            spec_input(
+                "csharp",
+                vec![
+                    record_rule("Holder", &[("n", "int")]),
+                    record_rule("Err", &[("message", "text")]),
+                    service_rule(
+                        "Lookup",
+                        vec![(
+                            "read-counts",
+                            reference("Holder"),
+                            CsilTypeExpression::Choice(vec![reference("Holder"), reference("Err")]),
+                        )],
+                    ),
+                ],
+            ),
+            corndogs_input("csharp-client"),
+            transports_input("csharp"),
+        ];
+        for input in inputs {
+            let out = render(input).unwrap();
+            for file in out.files.iter().filter(|f| f.path.ends_with(".cs")) {
+                assert!(file.content.ends_with('\n'), "{}", file.path);
+                let mut in_raw = false;
+                for (n, line) in file.content.lines().enumerate() {
+                    let at = format!("{}:{}: {line:?}", file.path, n + 1);
+                    assert!(!line.contains('\t'), "{at}");
+                    assert_eq!(line.trim_end(), line, "{at}");
+                    // A verbatim string body keeps the user's own spacing.
+                    if !in_raw {
+                        let indent = line.len() - line.trim_start().len();
+                        let doc = line.trim_start().starts_with('*');
+                        assert!(indent % 4 == 0 || doc, "{at}");
+                    }
+                    if line.matches("\"\"\"").count() % 2 == 1 {
+                        in_raw = !in_raw;
+                    }
+                }
+            }
+        }
+    }
+
+    /// A text enum value that is not an identifier gets a legal member from the shared
+    /// word split, and keeps its value on the wire.
+    #[test]
+    fn dotted_enum_values_get_legal_members_and_round_trip() {
+        let scope = named_rule(
+            "Scope",
+            CsilRuleType::TypeDef(CsilTypeExpression::Choice(
+                DOTTED_VALUES
+                    .iter()
+                    .map(|v| CsilTypeExpression::Literal(CsilLiteralValue::Text(v.to_string())))
+                    .collect(),
+            )),
+        );
+        let out = render(spec_input(
+            "csharp",
+            vec![scope, record_rule("Grant", &[("scope", "Scope")])],
+        ))
+        .unwrap();
+        let types = output_file(&out, "Types.gen.cs");
+        for member in ["CalendarsRead,", "EventsWrite,", "ABC,", "V2fa,", "Class,"] {
+            assert!(types.contains(member), "{types}");
+        }
+        let driver = r#"using Csilgen.Transport;
+
+foreach (var s in System.Enum.GetValues<Scope>())
+{
+    var back = Codec.GrantFromCborValue(Cbor.Decode(Cbor.Encode(Codec.GrantToCborValue(new Grant { Scope = s }))));
+    if (back.Scope != s) throw new System.InvalidOperationException(s.ToString());
+    System.Console.WriteLine(((CborValue.Text)Codec.ScopeToCborValue(s)).Value);
+}
+"#;
+        if let Some(stdout) = run_under_dotnet(&out, "dotted-enum", driver) {
+            assert_eq!(stdout, DOTTED_EXPECTED);
+        }
+    }
+
+    const DOTTED_VALUES: [&str; 5] = ["calendars.read", "events.write", "a-b c", "2fa", "class"];
+    const DOTTED_EXPECTED: &str = "calendars.read\nevents.write\na-b c\n2fa\nclass\n";
 }

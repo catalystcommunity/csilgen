@@ -94,8 +94,12 @@ The response separates two concerns that are easy to conflate:
 
   - When the output is a single type with no `/` arms, `variant` MAY be omitted
     and the client decodes the sole type.
-  - When the output has multiple arms, `variant` is **REQUIRED** on a `status==0`
-    response.
+  - When the output has multiple arms and every arm is a rule name or a built-in
+    type, `variant` is **REQUIRED** on a `status==0` response.
+  - When an arm is inline (`Ev -> {* text => int} / Err`), the output is one named
+    union value (`<Service><Op>Output`, encoded as `[variant_index, value]`), and
+    `variant` is omitted as for a single type. See `csil-spec.md`, "Inline arms
+    make one union value".
 
 The generated client maps the reply per language idiom: the success arm becomes
 the returned value; a declared error arm becomes the language's error path (Rust

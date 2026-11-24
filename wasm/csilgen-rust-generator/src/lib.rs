@@ -26,6 +26,17 @@ enum Surface {
     TypesOnly,
 }
 
+impl Surface {
+    fn of(target: &str) -> Option<Self> {
+        match target {
+            "rust" | "rust-server" => Some(Self::Server),
+            "rust-client" => Some(Self::Client),
+            "rust-typesonly" => Some(Self::TypesOnly),
+            _ => None,
+        }
+    }
+}
+
 /// In-memory type chosen for the `decimal` core type, selected by the
 /// `decimal_mapping` file option. The wire form (CBOR tag 4) is identical for
 /// both; only the generated Rust type differs.
@@ -660,8 +671,18 @@ fn client_prelude(shape: ClientShape, variants: &str, displays: &str, reply_seam
     // A marked twin shares the sync module's `ClientError`; redefining it would
     // collide when both clients are re-exported from the module root.
     if shape.marker.is_empty() {
+        // rustfmt writes the `Service` struct variant on one line only while no
+        // other variant of the enum spans several lines.
+        let error = if variants.contains("(\n") {
+            CLIENT_ERROR.replace(
+                "    Service { code: i64, message: String },",
+                "    Service {\n        code: i64,\n        message: String,\n    },",
+            )
+        } else {
+            CLIENT_ERROR.to_string()
+        };
         out.push_str(
-            &CLIENT_ERROR
+            &error
                 .replace(
                     "    Decode(String),",
                     &format!("{variants}    Decode(String),"),
@@ -890,7 +911,7 @@ fn cbor_read_arg(b: &[u8], pos: &mut usize, low: u8) -> Result<u64, CsilCborErro
         _ => {
             return Err(CsilCborError(format!(
                 "csil cbor: reserved additional info {low}"
-            )))
+            )));
         }
     };
     let bytes = pos
@@ -903,6 +924,38 @@ fn cbor_read_arg(b: &[u8], pos: &mut usize, low: u8) -> Result<u64, CsilCborErro
     }
     *pos += 1 + width;
     Ok(v)
+}
+
+/// Whether the item head at `at` uses the shortest argument for its value or
+/// length (RFC 8949 section 4.2.1). A map key with a longer head has a second byte
+/// form, and the canonical order check could then accept a map that no canonical
+/// encoder writes. Floats and simple values (major type 7) are not checked here,
+/// and a truncated head is left to the decoder to report.
+fn cbor_head_is_shortest(b: &[u8], at: usize) -> bool {
+    let Some(&ib) = b.get(at) else {
+        return true;
+    };
+    let (major, low) = (ib >> 5, ib & 0x1f);
+    let width = match low {
+        24 => 1usize,
+        25 => 2,
+        26 => 4,
+        27 => 8,
+        _ => return true,
+    };
+    if major == 7 {
+        return true;
+    }
+    let Some(bytes) = b.get(at + 1..at + 1 + width) else {
+        return true;
+    };
+    let value = bytes.iter().fold(0u64, |v, &byte| (v << 8) | byte as u64);
+    match width {
+        1 => value >= 24,
+        2 => value > 0xff,
+        4 => value > 0xffff,
+        _ => value > 0xffff_ffff,
+    }
 }
 
 /// The most elements a decoded array or map reserves before it reads them. The
@@ -1028,6 +1081,11 @@ fn cbor_dec(b: &[u8], pos: &mut usize, depth: usize) -> Result<CsilCborValue, Cs
             let n = arg as usize;
             let mut entries = Vec::with_capacity(n.min(CSIL_CBOR_PREALLOC_LIMIT));
             for _ in 0..n {
+                if !cbor_head_is_shortest(b, *pos) {
+                    return Err(CsilCborError(
+                        "csil cbor: map key is not in shortest form".to_string(),
+                    ));
+                }
                 let k = cbor_dec(b, pos, depth + 1)?;
                 let val = cbor_dec(b, pos, depth + 1)?;
                 entries.push((k, val));
@@ -1055,18 +1113,20 @@ fn cbor_enc_array<E>(
         .map(CsilCborValue::Array)
 }
 
-/// Map a typed map to a CBOR map. Rust `HashMap` iteration is unordered, so the inner
-/// map's entry order is not canonicalized; the record's own keys (laid down at
-/// generation time) are what the cross-language wire contract pins.
+/// Map a typed map to a CBOR map with its entries in canonical order: the bytewise
+/// order of each encoded key (RFC 8949 section 4.2.1). `HashMap` iteration order is
+/// arbitrary, and a peer rejects a map whose keys are not in that order.
 fn cbor_enc_map<K, V>(
     m: &std::collections::HashMap<K, V>,
     kf: impl Fn(&K) -> Result<CsilCborValue, CsilCborError>,
     vf: impl Fn(&V) -> Result<CsilCborValue, CsilCborError>,
 ) -> Result<CsilCborValue, CsilCborError> {
-    m.iter()
+    let mut entries = m
+        .iter()
         .map(|(k, v)| Ok((kf(k)?, vf(v)?)))
-        .collect::<Result<Vec<_>, _>>()
-        .map(CsilCborValue::Map)
+        .collect::<Result<Vec<_>, CsilCborError>>()?;
+    entries.sort_by_cached_key(|(k, _)| cbor_encode(k));
+    Ok(CsilCborValue::Map(entries))
 }
 
 fn cbor_dec_array<E>(
@@ -1076,6 +1136,9 @@ fn cbor_dec_array<E>(
     cbor_as_array(v)?.iter().map(f).collect()
 }
 
+/// Decode a dynamic map. Its keys must be in strictly ascending canonical order, so
+/// each key is compared with the one before it only: one pass, no sort, and a key
+/// that comes twice is refused too.
 fn cbor_dec_map<K: std::cmp::Eq + std::hash::Hash, V>(
     v: &CsilCborValue,
     kf: impl Fn(&CsilCborValue) -> Result<K, CsilCborError>,
@@ -1083,10 +1146,42 @@ fn cbor_dec_map<K: std::cmp::Eq + std::hash::Hash, V>(
 ) -> Result<std::collections::HashMap<K, V>, CsilCborError> {
     let entries = cbor_as_map(v)?;
     let mut out = std::collections::HashMap::with_capacity(entries.len());
+    let mut previous: Option<Vec<u8>> = None;
     for (k, val) in entries {
+        let key = cbor_encode(k);
+        match previous.as_deref().map(|p| p.cmp(key.as_slice())) {
+            Some(std::cmp::Ordering::Equal) => return Err(cbor_duplicate_key(k)),
+            Some(std::cmp::Ordering::Greater) => {
+                return Err(CsilCborError(
+                    "csil cbor: map keys are not in canonical order".to_string(),
+                ));
+            }
+            _ => {}
+        }
         out.insert(kf(k)?, vf(val)?);
+        previous = Some(key);
     }
     Ok(out)
+}
+
+fn cbor_duplicate_key(k: &CsilCborValue) -> CsilCborError {
+    match k {
+        CsilCborValue::Text(name) => CsilCborError(format!("csil cbor: duplicate key {name:?}")),
+        other => CsilCborError(format!("csil cbor: duplicate key {other:?}")),
+    }
+}
+
+/// Refuse a record map that names one key twice. Record fields may come in any
+/// order, so a set of the encoded keys finds a repeat in one pass.
+fn cbor_check_record(v: &CsilCborValue) -> Result<(), CsilCborError> {
+    let entries = cbor_as_map(v)?;
+    let mut seen = std::collections::HashSet::with_capacity(entries.len());
+    for (k, _) in entries {
+        if !seen.insert(cbor_encode(k)) {
+            return Err(cbor_duplicate_key(k));
+        }
+    }
+    Ok(())
 }
 
 fn cbor_map_get<'a>(v: &'a CsilCborValue, key: &str) -> Option<&'a CsilCborValue> {
@@ -1284,10 +1379,11 @@ pub(super) fn csil_parse_timestamp(s: &str) -> Result<time::OffsetDateTime, Csil
                 return Err(invalid());
             }
             let total = (h * 3600 + m * 60) as i32;
-            if *sign == b'-' {
-                -total
-            } else {
-                total
+            // A `match`, because rustfmt's 2021 and 2024 styles lay out a short
+            // `if`/`else` tail differently.
+            match *sign {
+                b'-' => -total,
+                _ => total,
             }
         }
         _ => return Err(invalid()),
@@ -1381,7 +1477,7 @@ fn csil_as_cddl_time(v: &CsilCborValue) -> Result<time::OffsetDateTime, CsilCbor
         _ => {
             return Err(CsilCborError(
                 "csil cbor: cddl_time content must be a number".to_string(),
-            ))
+            ));
         }
     };
     if !(CSIL_EPOCH_FIRST..=CSIL_EPOCH_LAST).contains(&seconds) {
@@ -1659,10 +1755,17 @@ impl RustExpr {
     fn flat(&self) -> Option<String> {
         match self {
             RustExpr::Atom(s) => Some(s.clone()),
-            RustExpr::Call { head, args, .. } => {
+            RustExpr::Call {
+                head,
+                args,
+                macro_like,
+            } => {
                 let parts: Option<Vec<String>> = args.iter().map(RustExpr::flat).collect();
                 let joined = parts?.join(", ");
-                if joined.len() <= 60 {
+                // rustfmt does not apply `fn_call_width` to a call whose one argument
+                // is a single term: only the line width can break it.
+                let lone_term = !*macro_like && matches!(args.as_slice(), [RustExpr::Atom(_)]);
+                if joined.len() <= 60 || lone_term {
                     Some(format!("{head}({joined})"))
                 } else {
                     None
@@ -1889,7 +1992,60 @@ impl<'a> RustCodeGenerator<'a> {
         // `hoist_inline` runs the shared hoister one rule at a time over name
         // stand-ins, so it cannot see the group rules a splice reads; splice first.
         let spliced = csilgen_common::splice_group_references(&input.csil_spec);
-        let renames = csilgen_common::rule_renames(&spliced, Self::is_rust_ident, |name| {
+        let unions = csilgen_common::hoist_op_union_boundaries(&spliced);
+        // The hoisters invent names, so every rename pass runs after them: a
+        // synthesized name gets the same legality, reserved-name and collision
+        // checks as a declared one, and it is appended after the declared rules,
+        // so a collision renames the synthesized rule and not the user's.
+        let hoisted = Self::hoist_inline(&Self::legal_names(&unions));
+        let legal = Self::legal_names(&hoisted);
+        let services = csilgen_common::rename_ident_collisions(&legal, Self::to_snake_case);
+        let (derived_types, derived_fns) = Self::with_spec(input, services.clone()).derived_names();
+        // Records and named choices emit their own public `encode_`/`decode_` pair.
+        let mut public_codecs = Self::with_spec(input, services.clone()).record_names();
+        public_codecs.extend(
+            services
+                .rules
+                .iter()
+                .filter(|rule| {
+                    matches!(
+                        rule.rule_type,
+                        CsilRuleType::TypeChoice(_)
+                            | CsilRuleType::TypeDef(CsilTypeExpression::Choice(_))
+                    )
+                })
+                .map(|rule| rule.name.clone()),
+        );
+        let reserved = csilgen_common::rename_reserved(&services, |name| {
+            Self::is_reserved(name)
+                || derived_types.contains(name)
+                || (public_codecs.contains(name)
+                    && derived_fns.contains(&Self::to_snake_case(name)))
+        });
+        // A rule keeps its name as written for its type, but its codec functions take
+        // the snake_case form, so two rules with one snake_case name (`Value` and
+        // `value`, `UserId` and `user_id`) clash even when their types do not.
+        let renamed = csilgen_common::rename_ident_collisions(&reserved, Self::to_snake_case);
+        let mut generator = Self::with_spec(input, renamed);
+        generator.warnings = csilgen_common::rename_warnings(&generator.spec, &input.config.target);
+        generator
+    }
+
+    fn with_spec(input: &'a WasmGeneratorInput, spec: CsilSpecSerialized) -> Self {
+        Self {
+            spec,
+            input,
+            warnings: Vec::new(),
+            type_definitions: HashSet::new(),
+            decimal_mapping: DecimalMapping::Csil,
+            needs_validation_error: false,
+            uses_regex: false,
+        }
+    }
+
+    /// `spec` with every rule name that is not a Rust identifier made one.
+    fn legal_names(spec: &CsilSpecSerialized) -> CsilSpecSerialized {
+        let renames = csilgen_common::rule_renames(spec, Self::is_rust_ident, |name| {
             let fixed: String = name
                 .chars()
                 .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
@@ -1900,62 +2056,141 @@ impl<'a> RustCodeGenerator<'a> {
                 fixed
             }
         });
-        let legal = csilgen_common::rename_rules(&spliced, &renames);
-        let (derived_types, derived_fns) = Self::derived_names(&legal);
-        let reserved = csilgen_common::rename_reserved(&legal, |name| {
-            Self::is_reserved(name)
-                || derived_types.contains(name)
-                || derived_fns.contains(&Self::to_snake_case(name))
-        });
-        // A rule keeps its name as written for its type, but its codec functions take
-        // the snake_case form, so two rules with one snake_case name (`Value` and
-        // `value`, `UserId` and `user_id`) clash even when their types do not.
-        let renamed = csilgen_common::rename_ident_collisions(&reserved, Self::to_snake_case);
-        let warnings = csilgen_common::rename_warnings(&renamed, &input.config.target);
-        Self {
-            spec: Self::hoist_inline(&renamed),
-            input,
-            warnings,
-            type_definitions: HashSet::new(),
-            decimal_mapping: DecimalMapping::Csil,
-            needs_validation_error: false,
-            uses_regex: false,
-        }
+        csilgen_common::rename_rules(spec, &renames)
     }
 
-    /// The names the generator builds from services and operations: the client
-    /// structs and wire-id modules (compared as written, like a type), and the
-    /// snake_case stems of the per-op codec functions (`encode_<stem>` and
-    /// `decode_<stem>`, compared with a rule's snake_case form, which its own
-    /// codec functions use).
-    fn derived_names(spec: &CsilSpecSerialized) -> (HashSet<String>, HashSet<String>) {
+    /// The names this run emits for services and operations: the type-namespace
+    /// items (client structs, wire-id modules, multi-arm handler error enums),
+    /// compared with a rule name as written, and the snake_case stems of the
+    /// per-op and channel codec functions (`encode_<stem>`/`decode_<stem>`),
+    /// compared with the snake_case form of a record, whose own codec functions use
+    /// it. Each name comes from the predicate its emitter uses, so a name is
+    /// reserved exactly when the output declares it: a record that IS an op's
+    /// boundary has no per-op codec beside its own, and keeps its name.
+    fn derived_names(&self) -> (HashSet<String>, HashSet<String>) {
+        let records = self.record_names();
+        let aliases = self.codec_aliases();
+        let surface = Surface::of(&self.input.config.target);
+        let package = emit_rust_package(self.input);
+        let want_client = matches!(surface, Some(Surface::Client))
+            || (package && !matches!(surface, Some(Surface::TypesOnly)));
+        let want_server = matches!(surface, Some(Surface::Server))
+            || (package && !matches!(surface, Some(Surface::TypesOnly)));
+        let style = client_style(self.input).unwrap_or(ClientStyle::Both);
         let mut types = HashSet::new();
         let mut fns = HashSet::new();
-        for rule in &spec.rules {
+        for rule in &self.spec.rules {
             let CsilRuleType::ServiceDef(service) = &rule.rule_type else {
                 continue;
             };
             let base = Self::service_base(&rule.name);
-            let svc_snake = Self::to_snake_case(&rule.name);
-            types.insert(format!("{base}Client"));
-            types.insert(format!("{base}AsyncClient"));
-            types.insert(format!("{svc_snake}_wire_ids"));
+            if want_client {
+                types.insert(format!("{base}Client"));
+                if matches!(style, ClientStyle::Both) {
+                    types.insert(format!("{base}AsyncClient"));
+                }
+            }
+            if want_server && service.wire_id.is_some() {
+                types.insert(format!("{}_wire_ids", Self::to_snake_case(&rule.name)));
+            }
             for op in &service.operations {
-                let op_snake = Self::to_snake_case(&op.name);
-                if matches!(op.direction, CsilServiceDirection::Unidirectional) {
-                    let stem = format!("{}_{op_snake}", Self::to_snake_case(&base));
+                let stem = self.op_codec_stem(&rule.name, &op.name);
+                if self.emits_request_helper(op, &records, &aliases) {
                     fns.insert(format!("{stem}_request"));
+                }
+                if self.emits_response_helper(op, &records, &aliases) {
                     fns.insert(format!("{stem}_response"));
+                }
+                if let Some(arms) = self.reply_codec_arms(op, &records, &aliases) {
                     fns.insert(format!("{stem}_reply"));
-                    for index in 1..op.rpc_reply_arms().map_or(0, <[_]>::len) {
-                        fns.insert(format!("{stem}_error_{index}"));
+                    for (index, arm) in arms.iter().enumerate().skip(1) {
+                        if !Self::is_record_ref(arm, &records) {
+                            fns.insert(format!("{stem}_error_{index}"));
+                        }
                     }
-                } else {
-                    fns.insert(format!("{svc_snake}_{op_snake}"));
+                }
+                if op.rpc_reply_arms().is_some_and(|arms| arms.len() > 2) {
+                    types.insert(Self::rpc_error_enum_name(&rule.name, &op.name));
+                }
+                if want_server && Self::emits_channel_encoder(op, &records) {
+                    fns.insert(format!(
+                        "{}_{}",
+                        Self::to_snake_case(&rule.name),
+                        Self::to_snake_case(&op.name)
+                    ));
                 }
             }
         }
         (types, fns)
+    }
+
+    /// Whether the codec emits `encode_/decode_<stem>_request` for `op`: a unary op
+    /// whose input is expressible but neither `null` nor a record (a record input
+    /// rides the record's own codec).
+    fn emits_request_helper(
+        &self,
+        op: &CsilServiceOperation,
+        records: &HashSet<String>,
+        aliases: &HashMap<String, CsilTypeExpression>,
+    ) -> bool {
+        matches!(op.direction, CsilServiceDirection::Unidirectional)
+            && !is_null_input(&op.input_type)
+            && !Self::is_record_ref(&op.input_type, records)
+            && self.op_boundary_expressible(&op.input_type, records, aliases)
+    }
+
+    /// Whether the codec emits `encode_/decode_<stem>_response` for `op`: a unary op
+    /// whose success output is expressible and not a record.
+    fn emits_response_helper(
+        &self,
+        op: &CsilServiceOperation,
+        records: &HashSet<String>,
+        aliases: &HashMap<String, CsilTypeExpression>,
+    ) -> bool {
+        let success = success_type(op.success_output());
+        matches!(op.direction, CsilServiceDirection::Unidirectional)
+            && !Self::is_record_ref(&success, records)
+            && self.op_boundary_expressible(&success, records, aliases)
+    }
+
+    /// The reply arms of `op` when the codec emits `encode_<stem>_reply` for it:
+    /// every arm of a multi-arm reply is expressible.
+    fn reply_codec_arms<'o>(
+        &self,
+        op: &'o CsilServiceOperation,
+        records: &HashSet<String>,
+        aliases: &HashMap<String, CsilTypeExpression>,
+    ) -> Option<&'o [CsilTypeExpression]> {
+        op.rpc_reply_arms().filter(|arms| {
+            arms.iter()
+                .all(|arm| self.op_boundary_expressible(arm, records, aliases))
+        })
+    }
+
+    /// Whether the services file emits `encode_<service>_<op>` for a channel op: a
+    /// server-pushed op whose message is `null` or a record.
+    fn emits_channel_encoder(op: &CsilServiceOperation, records: &HashSet<String>) -> bool {
+        matches!(
+            op.direction,
+            CsilServiceDirection::Bidirectional | CsilServiceDirection::Reverse
+        ) && (is_null_input(&op.output_type) || Self::is_record_ref(&op.output_type, records))
+    }
+
+    /// The trait identifier of a service: the rule name with every character that
+    /// cannot be in a Rust identifier made `_`. The wire keeps the declared name.
+    fn service_trait_ident(name: &str) -> String {
+        name.chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+            .collect()
+    }
+
+    /// The handler error enum of an op with more than one error arm.
+    fn rpc_error_enum_name(service: &str, op: &str) -> String {
+        format!(
+            "{}{}Error",
+            Self::to_pascal_case(service),
+            Self::to_pascal_case(op)
+        )
     }
 
     fn is_rust_ident(name: &str) -> bool {
@@ -2283,15 +2518,11 @@ impl<'a> RustCodeGenerator<'a> {
         // `rust-client` emits a transport-agnostic client; `rust-typesonly`
         // emits the types alone. An unrecognized sub-target is an error rather
         // than a silent fall-through.
-        let surface = match self.input.config.target.as_str() {
-            "rust" | "rust-server" => Surface::Server,
-            "rust-client" => Surface::Client,
-            "rust-typesonly" => Surface::TypesOnly,
-            other => {
-                return Err(format!(
-                    "Unknown rust sub-target '{other}'. Supported: rust, rust-server, rust-client, rust-typesonly"
-                ));
-            }
+        let target = self.input.config.target.as_str();
+        let Some(surface) = Surface::of(target) else {
+            return Err(format!(
+                "Unknown rust sub-target '{target}'. Supported: rust, rust-server, rust-client, rust-typesonly"
+            ));
         };
 
         // Validate the decimal mapping before emitting anything so a bad option
@@ -2448,11 +2679,46 @@ impl<'a> RustCodeGenerator<'a> {
 
         for file in &mut files {
             if file.path.ends_with(".rs") {
-                file.content = format!("{}\n", file.content.trim_end());
+                let content = Self::break_long_lines(file.content.trim_end());
+                file.content = format!("{}\n", content.trim_end());
             }
         }
 
         Ok(files)
+    }
+
+    /// Break the fixed-shape lines that the emitters write at a fixed indent and
+    /// that pass rustfmt's width only for long names: a `field: "...".to_string(),`
+    /// struct field, whose method call moves to the next line. rustfmt makes the
+    /// same change in both styles.
+    fn break_long_lines(content: &str) -> String {
+        let mut out = String::with_capacity(content.len());
+        for line in content.lines() {
+            let trimmed = line.trim_start();
+            let pad = &line[..line.len() - trimmed.len()];
+            if line.len() > 100
+                && let Some((key, literal)) = trimmed
+                    .strip_suffix(".to_string(),")
+                    .and_then(|rest| rest.split_once(": "))
+                    .filter(|(key, literal)| {
+                        key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                            && literal.starts_with('"')
+                            && literal.ends_with('"')
+                    })
+            {
+                if pad.len() + key.len() + 2 + literal.len() < 100 {
+                    out.push_str(&format!("{pad}{key}: {literal}\n{pad}    .to_string(),\n"));
+                } else {
+                    out.push_str(&format!(
+                        "{pad}{key}:\n{pad}    {literal}\n{pad}        .to_string(),\n"
+                    ));
+                }
+                continue;
+            }
+            out.push_str(line);
+            out.push('\n');
+        }
+        out
     }
 
     /// Build the `Cargo.toml` for package mode. The crate is kept dependency-free
@@ -2654,7 +2920,7 @@ impl<'a> RustCodeGenerator<'a> {
         let demo_snake = Self::to_snake_case(&ch.op_name);
         let mut out = format!(
             "struct QuickstartHandlers;\n\nimpl {} for QuickstartHandlers {{\n    type Context = ();\n",
-            ch.service_trait
+            Self::service_trait_ident(&ch.service_trait)
         );
         for op in operations {
             let op_snake = Self::to_snake_case(&op.name);
@@ -2938,7 +3204,7 @@ fn main() {{
                     service_trait: rule.name.clone(),
                     // The wire carries the CSIL service name verbatim
                     // (docs/cbor-wire-contract.md "RPC call naming").
-                    wire_service: rule.name.clone(),
+                    wire_service: self.spec.declared_name(&rule.name).to_string(),
                     op_name: op.name.clone(),
                     outbound_sample: self.rust_sample(&success),
                 });
@@ -3066,11 +3332,12 @@ fn main() {{
         for (service, op, arms) in self.spec.clone().rpc_operations() {
             if arms.len() > 2 {
                 let error = self.rpc_handler_error(service, op)?;
-                body.push_str(&format!("#[derive(Debug, Clone)]\npub enum {error} {{\n"));
+                body.push_str("#[derive(Debug, Clone)]\n");
+                body.push_str(&Self::rust_item_open(&format!("pub enum {error}")));
                 for arm in &arms[1..] {
                     let name = Self::to_pascal_case(arm.rpc_variant_name().unwrap());
                     let ty = self.map_type_to_rust(arm, &None)?;
-                    body.push_str(&format!("    {name}({ty}),\n"));
+                    body.push_str(&Self::rust_tuple_variant(&name, &ty));
                 }
                 body.push_str("}\n\n");
             }
@@ -3166,7 +3433,7 @@ fn main() {{
             return Ok(content);
         }
 
-        content.push_str(&format!("pub struct {name} {{\n"));
+        content.push_str(&Self::rust_item_open(&format!("pub struct {name}")));
 
         for entry in &group.entries {
             if let Some(field_name) = self.extract_field_name(&entry.key) {
@@ -3192,7 +3459,7 @@ fn main() {{
                 }
 
                 let rust_type = self.map_type_to_rust(&entry.value_type, &entry.occurrence)?;
-                content.push_str(&format!("    pub {field_name}: {rust_type},\n"));
+                content.push_str(&Self::rust_struct_field(&field_name, &rust_type));
             } else if let Some(spread) = Self::group_spread_reference(&entry.value_type) {
                 // A keyless entry that references another group is a CDDL-style
                 // group spread. Rust structs cannot inline another struct's
@@ -3201,7 +3468,7 @@ fn main() {{
                 // unrepresentable). The field is named after the referenced type.
                 let field_name = Self::escape_rust_ident(&Self::to_snake_case(&spread));
                 content.push_str("    /// Inlined from group spread; flattened on the wire.\n");
-                content.push_str(&format!("    pub {field_name}: {spread},\n"));
+                content.push_str(&Self::rust_struct_field(&field_name, &spread));
             }
         }
 
@@ -3406,36 +3673,40 @@ fn main() {{
     /// fallback. The codec pairs each emitted variant with its literal by index, so the
     /// name is cosmetic — only its uniqueness within the enum matters.
     fn enum_variant_ident(lit: &CsilLiteralValue, idx: usize) -> String {
-        let candidate = match lit {
-            CsilLiteralValue::Text(s) => {
-                let p = Self::to_pascal_case(s);
-                if p.is_empty() || p.chars().next().is_some_and(|c| c.is_ascii_digit()) {
-                    String::new()
-                } else if p == "Self" {
-                    // `Self` is the one PascalCase keyword, and it cannot be a raw identifier.
-                    "Self_".to_string()
-                } else {
-                    p
-                }
-            }
+        match lit {
             CsilLiteralValue::Integer(n) if *n < 0 => format!("VNeg{}", n.unsigned_abs()),
             CsilLiteralValue::Integer(n) => format!("V{n}"),
-            _ => String::new(),
-        };
-        if candidate.is_empty() {
-            format!("Variant{idx}")
-        } else {
-            candidate
+            _ => format!("Variant{idx}"),
         }
     }
 
-    /// The unique unit-variant identifiers for an enum, de-duplicating any two literals
-    /// that PascalCase to the same name by falling back to the positional form.
+    /// The unique unit-variant identifiers for an enum. Text values go through the
+    /// shared `member_idents`, so a value such as `calendars.read` or `2fa` gives a
+    /// legal name (`CalendarsRead`, `V2fa`) the same way in every generator; a plain
+    /// value keeps the PascalCase name it always had. Any other literal that clashes
+    /// falls back to the positional form.
     fn enum_variant_idents(lits: &[CsilLiteralValue]) -> Vec<String> {
+        let texts: Vec<&str> = lits
+            .iter()
+            .filter_map(|lit| match lit {
+                CsilLiteralValue::Text(s) => Some(s.as_str()),
+                _ => None,
+            })
+            .collect();
+        // `Self` is the one PascalCase keyword, and it cannot be a raw identifier.
+        let mut text_idents = csilgen_common::member_idents(
+            &texts,
+            |words| words.iter().map(|w| Self::to_pascal_case(w)).collect(),
+            |name| name != "Self" && !name.starts_with(|c: char| c.is_ascii_digit()),
+        )
+        .into_iter();
         let mut seen: HashSet<String> = HashSet::new();
         let mut out = Vec::with_capacity(lits.len());
         for (i, lit) in lits.iter().enumerate() {
-            let mut ident = Self::enum_variant_ident(lit, i);
+            let mut ident = match lit {
+                CsilLiteralValue::Text(_) => text_idents.next().unwrap_or_default(),
+                other => Self::enum_variant_ident(other, i),
+            };
             if !seen.insert(ident.clone()) {
                 ident = format!("Variant{i}");
                 seen.insert(ident.clone());
@@ -3461,7 +3732,7 @@ fn main() {{
         } else {
             "#[derive(Debug, Clone, PartialEq)]\n"
         });
-        content.push_str(&format!("pub enum {name} {{\n"));
+        content.push_str(&Self::rust_item_open(&format!("pub enum {name}")));
 
         // A literal-only choice is an enum (unit variants, bare-literal wire); a
         // choice with type-bearing variants is a union (a tagged sum, payload per
@@ -3474,7 +3745,7 @@ fn main() {{
             for (i, choice) in choices.iter().enumerate() {
                 let variant_name = format!("Variant{i}");
                 let rust_type = self.map_type_to_rust(choice, &None)?;
-                content.push_str(&format!("    {variant_name}({rust_type}),\n"));
+                content.push_str(&Self::rust_tuple_variant(&variant_name, &rust_type));
             }
         }
 
@@ -3482,25 +3753,44 @@ fn main() {{
         if let Some(numbers) = csilgen_common::enum_numbers(choices) {
             let literals = Self::enum_literals(choices).unwrap();
             let idents = Self::enum_variant_idents(&literals);
-            content.push_str(&format!("\n\nimpl {name} {{\n    pub fn as_str(&self) -> &'static str {{\n        match self {{\n"));
+            content.push_str(&format!(
+                "\n\n{}    pub fn as_str(&self) -> &'static str {{\n        match self {{\n",
+                Self::rust_impl_open(name)
+            ));
             for (id, literal) in idents.iter().zip(&literals) {
                 if let CsilLiteralValue::Text(label) = literal {
-                    content.push_str(&format!("            Self::{id} => {label:?},\n"));
+                    content.push_str(&Self::rust_match_arm_at(
+                        12,
+                        &format!("Self::{id}"),
+                        &format!("{label:?}"),
+                    ));
                 }
             }
             content.push_str("        }\n    }\n\n    pub fn from_label(label: &str) -> Option<Self> {\n        match label {\n");
             for (id, literal) in idents.iter().zip(&literals) {
                 if let CsilLiteralValue::Text(label) = literal {
-                    content.push_str(&format!("            {label:?} => Some(Self::{id}),\n"));
+                    content.push_str(&Self::rust_match_arm_at(
+                        12,
+                        &format!("{label:?}"),
+                        &format!("Some(Self::{id})"),
+                    ));
                 }
             }
             content.push_str("            _ => None,\n        }\n    }\n\n    pub fn to_number(self) -> i64 {\n        match self {\n");
             for (id, number) in idents.iter().zip(&numbers) {
-                content.push_str(&format!("            Self::{id} => {number},\n"));
+                content.push_str(&Self::rust_match_arm_at(
+                    12,
+                    &format!("Self::{id}"),
+                    &number.to_string(),
+                ));
             }
             content.push_str("        }\n    }\n\n    pub fn from_number(number: i64) -> Option<Self> {\n        match number {\n");
             for (id, number) in idents.iter().zip(&numbers) {
-                content.push_str(&format!("            {number} => Some(Self::{id}),\n"));
+                content.push_str(&Self::rust_match_arm_at(
+                    12,
+                    &number.to_string(),
+                    &format!("Some(Self::{id})"),
+                ));
             }
             content.push_str("            _ => None,\n        }\n    }\n}");
         }
@@ -3517,7 +3807,12 @@ fn main() {{
             CsilTypeExpression::Choice(choices) => self.generate_enum(name, choices),
             _ => {
                 let rust_type = self.map_type_to_rust(type_expr, &None)?;
-                Ok(format!("pub type {name} = {rust_type};"))
+                let line = format!("pub type {name} = {rust_type};");
+                if line.len() <= 100 {
+                    Ok(line)
+                } else {
+                    Ok(format!("pub type {name} =\n    {rust_type};"))
+                }
             }
         }
     }
@@ -3529,11 +3824,7 @@ fn main() {{
     ) -> Result<String, String> {
         match op.rpc_reply_arms() {
             Some([_, error]) => self.map_type_to_rust(error, &None),
-            Some(_) => Ok(format!(
-                "{}{}Error",
-                Self::to_pascal_case(service),
-                Self::to_pascal_case(&op.name)
-            )),
+            Some(_) => Ok(Self::rpc_error_enum_name(service, &op.name)),
             None => Ok("ServiceError".into()),
         }
     }
@@ -3545,13 +3836,10 @@ fn main() {{
     ) -> Result<String, String> {
         let spec = self.spec.clone();
         let mut out = String::new();
-        for (service, op, arms) in spec.rpc_operations() {
-            if !arms
-                .iter()
-                .all(|arm| self.op_boundary_expressible(arm, records, aliases))
-            {
+        for (service, op, _) in spec.rpc_operations() {
+            let Some(arms) = self.reply_codec_arms(op, records, aliases) else {
                 continue;
-            }
+            };
             let stem = self.op_codec_stem(service, &op.name);
             let success = self.map_type_to_rust(&arms[0], &None)?;
             let error = self.rpc_handler_error(service, op)?;
@@ -3581,12 +3869,42 @@ fn main() {{
                 } else {
                     format!("Err({error}::{}(value))", Self::to_pascal_case(ident))
                 };
-                let item = format!("encode_{helper}(&value)?");
+                let item = Self::render_expr(
+                    &RustExpr::try_(RustExpr::call(
+                        &format!("encode_{helper}"),
+                        vec![RustExpr::Atom("&value".into())],
+                    )),
+                    12,
+                    12,
+                    1,
+                );
                 let inner = format!("{wire:?}, {item}");
                 let expr = format!("({inner})");
                 let line = format!("        {pattern} => {expr},");
-                // rustfmt stacks a tuple whose items pass `fn_call_width` (60).
+                // rustfmt stacks a tuple whose items pass `fn_call_width` (60). A long
+                // `Err(<Enum>::<Arm>(value))` pattern then breaks in the steps below,
+                // measured against rustfmt in both styles; past the last step rustfmt
+                // leaves the pattern as written.
                 if inner.len() > 60 {
+                    let head = 8 + pattern.len() + 5;
+                    let path = pattern.len().saturating_sub(12);
+                    let pattern = match (head, path) {
+                        (100, _) => {
+                            encoder.push_str(&format!(
+                                "        {pattern} => {{\n            (\n                {wire:?},\n                {item},\n            )\n        }}\n"
+                            ));
+                            continue;
+                        }
+                        (101.., 76..=81) if index > 0 && arms.len() > 2 => format!(
+                            "Err({error}::{}(\n            value,\n        ))",
+                            Self::to_pascal_case(ident)
+                        ),
+                        (101.., 82..=87) if index > 0 && arms.len() > 2 => format!(
+                            "Err(\n            {error}::{}(\n                value,\n            ),\n        )",
+                            Self::to_pascal_case(ident)
+                        ),
+                        _ => pattern,
+                    };
                     encoder.push_str(&format!(
                         "        {pattern} => (\n            {wire:?},\n            {item},\n        ),\n"
                     ));
@@ -3629,36 +3947,110 @@ fn main() {{
                 continue;
             }
             let stem = self.op_codec_stem(service, &op.name);
-            body.push_str(&format!(
-                "        ({service:?}, {:?}) => match variant {{\n",
-                op.name
-            ));
-            for (i, arm) in arms.iter().enumerate() {
-                let ident = arm.rpc_variant_name().unwrap();
+            let wire_service = self.spec.declared_name(service);
+            // rustfmt keeps `(service, op) => match variant {` on one line while it
+            // fits; then it wraps the match in a block when `(service, op) => {`
+            // fits, which moves every arm four columns deeper; then it stacks the
+            // tuple.
+            let tuple = format!("({wire_service:?}, {:?})", op.name);
+            let (head, close, m) = if 8 + tuple.len() + 19 <= 100 {
+                (
+                    format!("        {tuple} => match variant {{\n"),
+                    "        },\n",
+                    0,
+                )
+            } else if 8 + tuple.len() + 17 <= 100 {
+                (
+                    format!("        {tuple} => match variant\n        {{\n"),
+                    "        },\n",
+                    0,
+                )
+            } else if 8 + tuple.len() + 5 <= 100 {
+                (
+                    format!("        {tuple} => {{\n            match variant {{\n"),
+                    "            }\n        }\n",
+                    4,
+                )
+            } else {
+                (
+                    format!(
+                        "        (\n            {wire_service:?},\n            {:?},\n        ) => match variant {{\n",
+                        op.name
+                    ),
+                    "        },\n",
+                    0,
+                )
+            };
+            body.push_str(&head);
+            let arm = 12 + m;
+            let pad = " ".repeat(arm);
+            let inner = " ".repeat(arm + 4);
+            for (i, arm_ty) in arms.iter().enumerate() {
+                let ident = arm_ty.rpc_variant_name().unwrap();
                 let wire = self.spec.declared_name(ident).to_string();
                 if i == 0 {
-                    body.push_str(&format!("            Some({wire:?}) => Ok(payload),\n"));
+                    body.push_str(&Self::rust_match_arm_at(
+                        arm,
+                        &format!("Some({wire:?})"),
+                        "Ok(payload)",
+                    ));
                 } else {
                     let var = format!("Application{}", Self::to_pascal_case(ident));
-                    enums.insert(var.clone(), self.map_type_to_rust(arm, &None)?);
-                    let suffix = if Self::is_record_ref(arm, &records) {
+                    enums.insert(var.clone(), self.map_type_to_rust(arm_ty, &None)?);
+                    let suffix = if Self::is_record_ref(arm_ty, &records) {
                         Self::to_snake_case(ident)
                     } else {
                         format!("{stem}_error_{i}")
                     };
-                    body.push_str(&format!("            Some({wire:?}) => {{\n                let value = decode_{suffix}(&payload)?;\n                Err(ClientError::{var}(Box::new(value)))\n            }}\n"));
+                    let decode = RustExpr::try_(RustExpr::call(
+                        &format!("decode_{suffix}"),
+                        vec![RustExpr::Atom("&payload".into())],
+                    ));
+                    // Each step in its own statement: rustfmt breaks the nested
+                    // `Err(ClientError::X(Box::new(value)))` in steps that depend on
+                    // the name length, while a one-argument call breaks one way.
+                    let error = RustExpr::call(
+                        &format!("ClientError::{var}"),
+                        vec![RustExpr::Atom("value".into())],
+                    );
+                    let pattern = if arm + 5 + wire.len() + 2 + 6 <= 100 {
+                        format!("Some({wire:?})")
+                    } else {
+                        format!("Some(\n{inner}{wire:?},\n{pad})")
+                    };
+                    body.push_str(&format!(
+                        "{pad}{pattern} => {{\n{}{inner}let value = Box::new(value);\n{}{inner}Err(error)\n{pad}}}\n",
+                        Self::render_let(arm + 4, "value", &decode),
+                        Self::render_let(arm + 4, "error", &error),
+                    ));
                 }
             }
-            body.push_str("            _ => Err(ClientError::Decode(format!(\n                \"invalid reply variant {variant:?}\"\n            ))),\n        },\n");
+            body.push_str(&format!(
+                "{pad}_ => Err(ClientError::Decode(format!(\n{inner}\"invalid reply variant {{variant:?}}\"\n{pad}))),\n{close}"
+            ));
         }
         let variants = enums
             .iter()
-            .map(|(v, t)| format!("    {v}(Box<{t}>),\n"))
+            .map(|(v, t)| {
+                let line = format!("    {v}(Box<{t}>),");
+                if line.len() <= 100 {
+                    format!("{line}\n")
+                } else {
+                    format!(
+                        "    {v}(\n{}    ),\n",
+                        Self::rust_type_lines(8, &format!("Box<{t}>"), ",")
+                    )
+                }
+            })
             .collect();
         let displays = enums
             .keys()
             .map(|v| {
-                format!("            Self::{v}(e) => write!(f, \"application error: {{e:?}}\"),\n")
+                Self::rust_match_arm_at(
+                    12,
+                    &format!("Self::{v}(e)"),
+                    "write!(f, \"application error: {e:?}\")",
+                )
             })
             .collect();
         let dispatch = if body.is_empty() {
@@ -3766,7 +4158,9 @@ pub fn resolve_rpc_reply(
         if self.body_uses_codec(&body) {
             content.push_str("use super::codec::*;\n");
         }
-        content.push_str("use super::types::*;\n");
+        if self.body_uses_types(&body) {
+            content.push_str("use super::types::*;\n");
+        }
         content.push('\n');
         content.push_str(&body);
 
@@ -3822,7 +4216,9 @@ pub fn resolve_rpc_reply(
         if self.body_uses_codec(&body) {
             content.push_str("use super::codec::*;\n");
         }
-        content.push_str("use super::types::*;\n");
+        if self.body_uses_types(&body) {
+            content.push_str("use super::types::*;\n");
+        }
         content.push('\n');
         content.push_str(&body);
 
@@ -3840,6 +4236,26 @@ pub fn resolve_rpc_reply(
     /// The scan is per identifier, and skips schema type names and the names a
     /// `fn` declares: a schema type such as `CsilDecimalType`, or an op such as
     /// `decode-thing`, matches a codec prefix but is not a codec symbol.
+    /// Whether `body` names a type that `types.rs` declares: a schema type or a
+    /// multi-arm handler error enum. An op over builtins only names none, and the
+    /// import would then be unused.
+    fn body_uses_types(&self, body: &str) -> bool {
+        let mut declared: HashSet<String> = self
+            .spec
+            .rules
+            .iter()
+            .filter(|r| !matches!(r.rule_type, CsilRuleType::ServiceDef(_)))
+            .map(|r| r.name.clone())
+            .collect();
+        for (service, op, arms) in self.spec.rpc_operations() {
+            if arms.len() > 2 {
+                declared.insert(Self::rpc_error_enum_name(service, &op.name));
+            }
+        }
+        body.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .any(|token| declared.contains(token))
+    }
+
     fn body_uses_codec(&self, body: &str) -> bool {
         let rule_names: HashSet<&str> = self.spec.rules.iter().map(|r| r.name.as_str()).collect();
         let mut declares = false;
@@ -3876,7 +4292,9 @@ pub fn resolve_rpc_reply(
 
         let mut content = String::new();
         content.push_str(&format!("/// Typed client for the {name} service.\n"));
-        content.push_str(&format!("pub struct {client}<T: {transport}> {{\n"));
+        content.push_str(&Self::rust_item_open(&format!(
+            "pub struct {client}<T: {transport}>"
+        )));
         // A service whose every operation is a channel op (`<->`/`<-`) has no
         // unary method to call `self.transport` from (channel ops ride the
         // router/encoder surface below, not the client struct) — `transport` is
@@ -3888,7 +4306,19 @@ pub fn resolve_rpc_reply(
         content.push_str("    transport: T,\n");
         content.push_str("}\n\n");
 
-        content.push_str(&format!("impl<T: {transport}> {client}<T> {{\n"));
+        let impl_head = format!("impl<T: {transport}> {client}<T> {{");
+        if impl_head.len() <= 100 {
+            content.push_str(&format!("{impl_head}\n"));
+        } else {
+            let target = format!("    {client}<T>");
+            if target.len() <= 100 {
+                content.push_str(&format!("impl<T: {transport}>\n{target}\n{{\n"));
+            } else {
+                content.push_str(&format!(
+                    "impl<T: {transport}>\n    {client}<\n        T,\n    >\n{{\n"
+                ));
+            }
+        }
         content.push_str("    pub fn new(transport: T) -> Self {\n");
         content.push_str("        Self { transport }\n");
         content.push_str("    }\n");
@@ -3898,7 +4328,8 @@ pub fn resolve_rpc_reply(
         // The client hands its transport seam the CSIL service and operation names
         // verbatim, so a Rust client reaches the same endpoint as its peers
         // (docs/cbor-wire-contract.md "RPC call naming").
-        let wire_service = name;
+        let wire_service = self.spec.declared_name(name).to_string();
+        let wire_service = wire_service.as_str();
         for operation in &service.operations {
             // Only unary request/response operations belong on the RPC client;
             // channel (`<->`/`<-`) ops ride the router/encoder surface instead.
@@ -3982,11 +4413,22 @@ pub fn resolve_rpc_reply(
                 ));
                 // The request is encoded before the transport call, so a value
                 // with no wire form never reaches the carrier.
+                // A codec name too long for the match line is bound to a short
+                // local first, so the match keeps one shape for every name length.
+                let direct = format!("        let csil_req = match {req_enc}(&req) {{");
+                let callee = if direct.len() <= 100 {
+                    req_enc.as_str()
+                } else {
+                    content.push_str(&Self::rust_let_simple(8, "encode", &req_enc));
+                    "encode"
+                };
+                let (head, extra) = Self::rust_let_match(8, "csil_req", callee, &["&req"]);
+                let pad = " ".repeat(extra);
                 content.push_str(&format!(
-                    "        let csil_req = match {req_enc}(&req) {{\n\
-                     \x20           Ok(csil_bytes) => csil_bytes,\n\
-                     \x20           Err(e) => return Err(ClientError::Encode(e.to_string())),\n\
-                     \x20       }};\n"
+                    "{head}\
+                     {pad}            Ok(csil_bytes) => csil_bytes,\n\
+                     {pad}            Err(e) => return Err(ClientError::Encode(e.to_string())),\n\
+                     {pad}        }};\n"
                 ));
                 content.push_str(&Self::rust_client_call(
                     wire_service,
@@ -4008,6 +4450,13 @@ pub fn resolve_rpc_reply(
             );
             if decode_line.trim_end().len() <= 100 {
                 content.push_str(&decode_line);
+            } else if 8 + resp_dec.len() + 12 > 100 {
+                // The call alone passes the width: bind the decoder to a short local,
+                // so the chain keeps one shape for every name length.
+                content.push_str(&Self::rust_let_simple(8, "decode", &resp_dec));
+                content.push_str(
+                    "        decode(&csil_resp).map_err(|e| ClientError::Decode(e.to_string()))\n",
+                );
             } else {
                 content.push_str(&format!(
                     "        {resp_dec}(&csil_resp)\n\
@@ -4359,7 +4808,21 @@ pub fn resolve_rpc_reply(
         let pad = " ".repeat(indent);
         let pad4 = " ".repeat(indent + 4);
         match expr {
-            RustExpr::Atom(s) => s.clone(),
+            // An over-wide field access breaks before its `.field`, as rustfmt
+            // breaks a chain.
+            RustExpr::Atom(s) => {
+                let place = s.trim_start_matches(['&', '*']);
+                let prefix = &s[..s.len() - place.len()];
+                let ident = |t: &str| {
+                    !t.is_empty() && t.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                };
+                match place.split_once('.') {
+                    Some((base, field)) if ident(base) && ident(field) => {
+                        format!("{prefix}{base}\n{pad4}.{field}")
+                    }
+                    _ => s.clone(),
+                }
+            }
             RustExpr::Closure { params, body } => {
                 let inner = match body.as_ref() {
                     RustExpr::TupleDec { arity, elems } => {
@@ -4590,7 +5053,17 @@ pub fn resolve_rpc_reply(
         }
         let col = indent + 4 + var.len() + 3;
         let rendered = Self::render_expr(expr, indent, col, 1);
-        format!("{pad}let {var} = {rendered};\n")
+        let opener = rendered.lines().next().unwrap_or_default();
+        // A first line that opens a broken argument list must end before column
+        // 100, or rustfmt moves the value below the `=`.
+        let limit = if opener.ends_with('(') { 99 } else { 100 };
+        if col + opener.len() <= limit {
+            return format!("{pad}let {var} = {rendered};\n");
+        }
+        // rustfmt moves the value below the `=` when even its first line does not
+        // fit beside it.
+        let rendered = Self::render_expr(expr, indent + 4, indent + 4, 1);
+        format!("{pad}let {var} =\n{pad}    {rendered};\n")
     }
 
     /// A Rust expression of type `impl Fn(&CsilCborValue) -> Result<T, CsilCborError>`
@@ -4726,9 +5199,12 @@ pub fn resolve_rpc_reply(
             }
         }
         let rendered = Self::render_expr(value, indent + 4, indent + 4, 1);
-        format!(
-            "{pad}csil_entries.push((\n{pad4}cbor_text({wire_lit}),\n{pad4}{rendered},\n{pad}));\n"
-        )
+        let key = if indent + 4 + 10 + wire_lit.len() + 2 <= 100 {
+            format!("cbor_text({wire_lit})")
+        } else {
+            format!("cbor_text(\n{pad4}    {wire_lit},\n{pad4})")
+        };
+        format!("{pad}csil_entries.push((\n{pad4}{key},\n{pad4}{rendered},\n{pad}));\n")
     }
 
     fn rust_literal_cbor_expr(literal: &CsilLiteralValue) -> String {
@@ -4795,7 +5271,7 @@ pub fn resolve_rpc_reply(
         }
 
         let one_line = format!("    Ok({name} {{ {} }})\n", members.join(", "));
-        if format!("{{ {} }}", members.join(", ")).len() <= 22 {
+        if format!("{{ {} }}", members.join(", ")).len() <= 22 && one_line.len() <= 100 {
             return one_line;
         }
 
@@ -4820,12 +5296,109 @@ pub fn resolve_rpc_reply(
     /// One `pat => value,` match arm at codec indent. rustfmt keeps the arm on one
     /// line up to the width limit and otherwise braces the body on its own line (a
     /// braced arm carries no trailing comma).
+    /// An item head and its opening brace; rustfmt puts the brace on its own line
+    /// when the head line passes the width.
+    fn rust_item_open(head: &str) -> String {
+        if head.len() + 2 <= 100 {
+            return format!("{head} {{\n");
+        }
+        // A head that itself passes the width stacks its generic parameters.
+        if head.len() > 100
+            && let Some((base, params)) = head.strip_suffix('>').and_then(|h| h.split_once('<'))
+        {
+            return format!("{base}<\n    {params},\n> {{\n");
+        }
+        format!("{head}\n{{\n")
+    }
+
+    /// `let <var> = <rhs>;` for a path or literal `rhs`, which rustfmt cannot break:
+    /// on one line, or below the `=` when that fits, or as written.
+    fn rust_let_simple(indent: usize, var: &str, rhs: &str) -> String {
+        let pad = " ".repeat(indent);
+        let line = format!("{pad}let {var} = {rhs};");
+        if line.len() > 100 && indent + 4 + rhs.len() < 100 {
+            format!("{pad}let {var} =\n{pad}    {rhs};\n")
+        } else {
+            format!("{line}\n")
+        }
+    }
+
+    /// `impl <name> {`; rustfmt moves a name that passes the width to its own line.
+    fn rust_impl_open(name: &str) -> String {
+        if 5 + name.len() + 2 <= 100 {
+            format!("impl {name} {{\n")
+        } else {
+            format!("impl\n    {name}\n{{\n")
+        }
+    }
+
+    /// A one-field tuple variant; rustfmt stacks the field when the line passes
+    /// the width.
+    fn rust_tuple_variant(name: &str, ty: &str) -> String {
+        let line = format!("    {name}({ty}),");
+        if line.len() <= 100 {
+            format!("{line}\n")
+        } else {
+            format!("    {name}(\n{}    ),\n", Self::rust_type_lines(8, ty, ","))
+        }
+    }
+
+    /// A public struct field; rustfmt moves the type to the next line when the
+    /// field passes the width.
+    fn rust_struct_field(name: &str, ty: &str) -> String {
+        let line = format!("    pub {name}: {ty},");
+        if line.len() <= 100 {
+            return format!("{line}\n");
+        }
+        if 8 + ty.len() < 100 {
+            return format!("    pub {name}:\n        {ty},\n");
+        }
+        // A type that passes the width below the name too stacks its generic
+        // argument, beside the name while `pub <name>: <Base><` fits.
+        match ty.strip_suffix('>').and_then(|t| t.split_once('<')) {
+            Some((base, inner)) if 8 + name.len() + 2 + base.len() < 100 => {
+                let mut out = format!("    pub {name}: {base}<\n");
+                for arg in Self::split_top_level(inner) {
+                    out.push_str(&Self::rust_type_lines(8, &arg, ","));
+                }
+                out.push_str("    >,\n");
+                out
+            }
+            Some(_) => format!("    pub {name}:\n{}", Self::rust_type_lines(8, ty, ",")),
+            None => format!("    pub {name}:\n        {ty},\n"),
+        }
+    }
+
     fn rust_match_arm(pat: &str, value: &str) -> String {
-        let one_line = format!("        {pat} => {value},\n");
+        Self::rust_match_arm_at(8, pat, value)
+    }
+
+    fn rust_match_arm_at(indent: usize, pat: &str, value: &str) -> String {
+        let pad = " ".repeat(indent);
+        let one_line = format!("{pad}{pat} => {value},\n");
         if one_line.trim_end().len() <= 100 {
             return one_line;
         }
-        format!("        {pat} => {{\n            {value}\n        }}\n")
+        // A pattern that passes the width with its `=> {` stacks its one binding.
+        let pat = match pat.strip_suffix(')').and_then(|p| p.split_once('(')) {
+            Some((head, binding)) if indent + pat.len() + 5 > 100 && !binding.contains(',') => {
+                format!("{head}(\n{pad}    {binding},\n{pad})")
+            }
+            _ => pat.to_string(),
+        };
+        if pat.contains('\n') && indent + 5 + value.len() < 100 {
+            return format!("{pad}{pat} => {value},\n");
+        }
+        // A one-argument value that passes the width inside the block hangs off
+        // the arrow with its argument stacked instead.
+        if let Some((head, arg)) = value.strip_suffix(')').and_then(|v| v.split_once('('))
+            && indent + 4 + value.len() > 100
+            && !arg.contains(',')
+            && !head.contains('!')
+        {
+            return format!("{pad}{pat} => {head}(\n{pad}    {arg},\n{pad}),\n");
+        }
+        format!("{pad}{pat} => {{\n{pad}    {value}\n{pad}}}\n")
     }
 
     /// The body of a public `encode_*` wrapper: the value tree is bound first so
@@ -4843,7 +5416,99 @@ pub fn resolve_rpc_reply(
         if one_line.trim_end().len() <= 100 {
             return one_line;
         }
-        format!("{prefix}fn {name}(\n    {param},\n) -> {ret} {{\n")
+        let (binding, ty) = param.split_once(": ").unwrap_or(("", param));
+        format!(
+            "{prefix}fn {name}(\n{}{}",
+            Self::rust_generic_line(4, &format!("{binding}: "), ty, ","),
+            Self::rust_ret_brace("", ret)
+        )
+    }
+
+    /// The head of `let <var> = match <head>(<args>) {` at `indent`, and how much
+    /// deeper the match arms go. rustfmt tries, in order: one line; the match
+    /// below the `=`; the arguments broken beside the `=`; the match below the `=`
+    /// with its arguments broken. When none fits it leaves the line as written.
+    fn rust_let_match(indent: usize, var: &str, head: &str, args: &[&str]) -> (String, usize) {
+        let pad = " ".repeat(indent);
+        let joined = args.join(", ");
+        // `fn_call_width` (60) bounds the argument list of a call on one line,
+        // unless the call has one argument.
+        let flat_ok = args.len() == 1 || joined.len() <= 60;
+        let call = format!("{head}({joined})");
+        let one_line = format!("{pad}let {var} = match {call} {{");
+        if flat_ok && one_line.len() <= 100 {
+            return (format!("{one_line}\n"), 0);
+        }
+        if flat_ok && indent + 4 + 6 + call.len() + 2 <= 100 {
+            return (format!("{pad}let {var} =\n{pad}    match {call} {{\n"), 4);
+        }
+        let stacked = |at: usize| {
+            let inner = " ".repeat(at + 4);
+            args.iter()
+                .map(|arg| format!("{inner}{arg},\n"))
+                .collect::<String>()
+        };
+        if indent + 4 + var.len() + 9 + head.len() < 100 {
+            return (
+                format!(
+                    "{pad}let {var} = match {head}(\n{}{pad}) {{\n",
+                    stacked(indent)
+                ),
+                0,
+            );
+        }
+        if indent + 4 + 6 + head.len() < 100 {
+            return (
+                format!(
+                    "{pad}let {var} =\n{pad}    match {head}(\n{}{pad}    ) {{\n",
+                    stacked(indent + 4)
+                ),
+                4,
+            );
+        }
+        (format!("{one_line}\n"), 0)
+    }
+
+    /// The `) -> <ret> {` line that closes a broken parameter list at `indent`,
+    /// as rustfmt lays it out in both styles: on one line; with the brace on its own
+    /// line while `) -> <ret>` is at most 102 columns; with each generic argument of
+    /// `<ret>` on its own line while those lines fit; and otherwise with the brace
+    /// written straight after `<ret>`, which is what rustfmt leaves when nothing fits.
+    fn rust_ret_brace(indent: &str, ret: &str) -> String {
+        let line = format!("{indent}) -> {ret}");
+        // Measured: the brace stays beside the type while the line plus the indent
+        // again is at most 100 columns.
+        if line.len() + 2 + indent.len() <= 100 {
+            return format!("{line} {{\n");
+        }
+        if line.len() <= 102 {
+            return format!("{line}\n{indent}{{\n");
+        }
+        if let Some((base, inner)) = ret.strip_suffix('>').and_then(|rest| rest.split_once('<')) {
+            let args = Self::split_top_level(inner);
+            let pad = format!("{indent}    ");
+            // An argument that passes the width stacks its own generic argument.
+            let rendered: Vec<Option<String>> = args
+                .iter()
+                .map(|arg| {
+                    if pad.len() + arg.len() < 100 {
+                        return Some(format!("{pad}{arg},\n"));
+                    }
+                    let (arg_base, arg_inner) = arg.strip_suffix('>')?.split_once('<')?;
+                    (pad.len() + 4 + arg_inner.len() < 100)
+                        .then(|| format!("{pad}{arg_base}<\n{pad}    {arg_inner},\n{pad}>,\n"))
+                })
+                .collect();
+            if args.len() > 1 && rendered.iter().all(Option::is_some) {
+                let mut out = format!("{indent}) -> {base}<\n");
+                for line in rendered.into_iter().flatten() {
+                    out.push_str(&line);
+                }
+                out.push_str(&format!("{indent}> {{\n"));
+                return out;
+            }
+        }
+        format!("{line}{{\n")
     }
 
     fn rust_fn_header(name: &str, arg: &str, ret: &str) -> String {
@@ -4881,18 +5546,106 @@ pub fn resolve_rpc_reply(
         if one_line.trim_end().len() <= 99 {
             return one_line;
         }
-        if one_line.trim_end().len() == 100 {
-            return format!("    fn {name}({params})\n        -> Result<{ret}, {error}>;\n");
-        }
-
+        // At exactly 100 columns rustfmt keeps the parameters on one line and moves
+        // only the return type, indented 8 by the 2021 style and 4 by the 2024 style.
+        // No layout passes both, so a longer parameter name takes the signature past
+        // 100, where both styles put one parameter per line.
+        let args: Vec<String> = if one_line.trim_end().len() == 100 {
+            let last = args.len() - 1;
+            args.iter()
+                .enumerate()
+                .map(|(i, arg)| match arg.split_once(": ") {
+                    Some((param, ty)) if i == last => format!("{param}_value: {ty}"),
+                    _ => arg.clone(),
+                })
+                .collect()
+        } else {
+            args.to_vec()
+        };
         let mut out = format!("    fn {name}(\n        &self,\n");
-        for arg in args {
+        for arg in &args {
             out.push_str("        ");
             out.push_str(arg);
             out.push_str(",\n");
         }
-        out.push_str(&format!("    ) -> Result<{ret}, {error}>;\n"));
+        // Measured: with its `;` the line may run to column 103.
+        let ret_line = format!("    ) -> Result<{ret}, {error}>");
+        if ret_line.len() <= 102 {
+            out.push_str(&format!("{ret_line};\n"));
+        } else {
+            out.push_str(&Self::rust_generic_line(
+                4,
+                ") -> ",
+                &format!("Result<{ret}, {error}>"),
+                ";",
+            ));
+        }
         out
+    }
+
+    /// `{prefix}{ty}{suffix}` at `indent`. Past the width rustfmt puts each
+    /// top-level generic argument of `ty` on its own line.
+    fn rust_generic_line(indent: usize, prefix: &str, ty: &str, suffix: &str) -> String {
+        let pad = " ".repeat(indent);
+        let line = format!("{pad}{prefix}{ty}{suffix}");
+        let split = ty
+            .strip_suffix('>')
+            .and_then(|rest| rest.split_once('<'))
+            .map(|(base, inner)| (base, Self::split_top_level(inner)));
+        match split {
+            Some((base, args)) if line.len() > 100 && args.len() > 1 => {
+                let mut out = format!("{pad}{prefix}{base}<\n");
+                for arg in args {
+                    out.push_str(&Self::rust_type_lines(indent + 4, &arg, ","));
+                }
+                out.push_str(&format!("{pad}>{suffix}\n"));
+                out
+            }
+            _ => format!("{line}\n"),
+        }
+    }
+
+    /// `{ty}{suffix}` at `indent`, with each generic argument list that passes the
+    /// width stacked one argument per line, recursively, as rustfmt stacks a type.
+    fn rust_type_lines(indent: usize, ty: &str, suffix: &str) -> String {
+        let pad = " ".repeat(indent);
+        let line = format!("{pad}{ty}{suffix}");
+        if line.len() <= 100 {
+            return format!("{line}\n");
+        }
+        match ty.strip_suffix('>').and_then(|t| t.split_once('<')) {
+            Some((base, inner)) => {
+                let mut out = format!("{pad}{base}<\n");
+                for arg in Self::split_top_level(inner) {
+                    out.push_str(&Self::rust_type_lines(indent + 4, &arg, ","));
+                }
+                out.push_str(&format!("{pad}>{suffix}\n"));
+                out
+            }
+            None => format!("{line}\n"),
+        }
+    }
+
+    /// `text` split at the commas that are not inside `<>`, `()` or `[]`.
+    fn split_top_level(text: &str) -> Vec<String> {
+        let mut parts = Vec::new();
+        let mut depth = 0i32;
+        let mut current = String::new();
+        for c in text.chars() {
+            match c {
+                '<' | '(' | '[' => depth += 1,
+                '>' | ')' | ']' => depth -= 1,
+                ',' if depth == 0 => {
+                    parts.push(current.trim().to_string());
+                    current.clear();
+                    continue;
+                }
+                _ => {}
+            }
+            current.push(c);
+        }
+        parts.push(current.trim().to_string());
+        parts
     }
 
     /// A client method signature at impl indent: one line through rustfmt's
@@ -4917,7 +5670,10 @@ pub fn resolve_rpc_reply(
         if let Some(t) = input {
             out.push_str(&format!("        req: {t},\n"));
         }
-        out.push_str(&format!("    ) -> Result<{output}, ClientError> {{\n"));
+        out.push_str(&Self::rust_ret_brace(
+            "    ",
+            &format!("Result<{output}, ClientError>"),
+        ));
         out
     }
 
@@ -5062,11 +5818,6 @@ pub fn resolve_rpc_reply(
         } else {
             "_csil_v"
         };
-        let root_param = if named.is_empty() {
-            "_csil_root"
-        } else {
-            "csil_root"
-        };
 
         out.push_str(&format!(
             "/// Build the canonical CBOR value tree for a {name}.\n"
@@ -5095,9 +5846,23 @@ pub fn resolve_rpc_reply(
                         records,
                         aliases,
                     );
-                    out.push_str(&format!(
-                        "    if let Some(csil_inner) = &csil_v.{member} {{\n"
-                    ));
+                    let head = format!("    if let Some(csil_inner) = &csil_v.{member}");
+                    if head.len() + 2 <= 100 {
+                        out.push_str(&format!("{head} {{\n"));
+                    } else if head.len() <= 100 {
+                        out.push_str(&format!("{head}\n    {{\n"));
+                    } else {
+                        let after_eq = format!("        &csil_v.{member}");
+                        if after_eq.len() <= 100 {
+                            out.push_str(&format!(
+                                "    if let Some(csil_inner) =\n{after_eq}\n    {{\n"
+                            ));
+                        } else {
+                            out.push_str(&format!(
+                                "    if let Some(csil_inner) = &csil_v\n        .{member}\n    {{\n"
+                            ));
+                        }
+                    }
                     out.push_str(&Self::rust_push_entry(8, &wire_lit, &enc));
                     out.push_str("    }\n");
                 } else {
@@ -5115,9 +5880,10 @@ pub fn resolve_rpc_reply(
         ));
         out.push_str(&Self::rust_fn_header(
             &format!("csil_dec_{snake}"),
-            root_param,
+            "csil_root",
             name,
         ));
+        out.push_str("    cbor_check_record(csil_root)?;\n");
         for (member, wire, entry) in &named {
             let wire_lit = format!("{wire:?}");
             // The decoder is bound to a local before being called: a composite field's
@@ -5131,19 +5897,24 @@ pub fn resolve_rpc_reply(
                 // to its own line (the head itself may then still exceed the width —
                 // rustfmt accepts that); only when even the braceless head overflows
                 // does it break after `=`, shifting the whole match four deeper.
-                let map_get = format!("cbor_map_get(csil_root, {wire_lit})");
-                let head = format!("    let {member} = match {map_get} {{");
-                let extra = if head.len() <= 100 {
-                    out.push_str(&head);
-                    out.push('\n');
-                    0
-                } else if head.len() - 2 <= 100 {
-                    out.push_str(&format!("    let {member} = match {map_get}\n    {{\n"));
-                    0
+                // A long key or field name is bound to a short local first, so the
+                // match keeps one shape for every name length.
+                let direct =
+                    format!("    let {member} = match cbor_map_get(csil_root, {wire_lit}) {{");
+                let target = if direct.len() <= 100 {
+                    member.as_str()
                 } else {
-                    out.push_str(&format!("    let {member} =\n        match {map_get} {{\n"));
-                    4
+                    out.push_str(&Self::rust_let_simple(4, "csil_key", &wire_lit));
+                    "csil_opt"
                 };
+                let key = if direct.len() <= 100 {
+                    wire_lit.as_str()
+                } else {
+                    "csil_key"
+                };
+                let (head, extra) =
+                    Self::rust_let_match(4, target, "cbor_map_get", &["csil_root", key]);
+                out.push_str(&head);
                 let pad = " ".repeat(extra);
                 out.push_str(&format!("{pad}        Some(csil_field) => {{\n"));
                 out.push_str(&Self::rust_decode_binding(12 + extra, &dec));
@@ -5153,11 +5924,23 @@ pub fn resolve_rpc_reply(
                      {pad}        None => None,\n\
                      {pad}    }};\n"
                 ));
+                if target != member.as_str() {
+                    out.push_str(&Self::rust_let_simple(4, member, "csil_opt"));
+                }
             } else {
-                out.push_str(&format!(
-                    "    let {member} = {{\n\
-                     \x20       let csil_field = cbor_require(csil_root, {wire_lit})?;\n"
-                ));
+                let require =
+                    format!("        let csil_field = cbor_require(csil_root, {wire_lit})?;");
+                let require = if require.len() <= 100 {
+                    require
+                } else {
+                    // A long key is bound to a short local first, so the call keeps
+                    // one shape for every name length.
+                    format!(
+                        "{}        let csil_field = cbor_require(csil_root, csil_key)?;",
+                        Self::rust_let_simple(8, "csil_key", &wire_lit)
+                    )
+                };
+                out.push_str(&format!("    let {member} = {{\n{require}\n"));
                 out.push_str(&Self::rust_decode_binding(8, &dec));
                 out.push_str(
                     "        csil_decode(csil_field)?\n\
@@ -5169,9 +5952,15 @@ pub fn resolve_rpc_reply(
         out.push_str(&Self::rust_struct_ok(name, &members));
         out.push_str("}\n\n");
 
-        out.push_str(&format!(
-            "/// Encode a {name} to canonical CSIL CBOR bytes.\n"
-        ));
+        out.push_str(&Self::public_codec_pair(name));
+        out
+    }
+
+    /// The public `encode_<t>`/`decode_<t>` byte wrappers over a named rule's value
+    /// codec, for a record and for a named enum or union alike.
+    fn public_codec_pair(name: &str) -> String {
+        let snake = Self::to_snake_case(name);
+        let mut out = format!("/// Encode a {name} to canonical CSIL CBOR bytes.\n");
         out.push_str(&Self::rust_sig(
             "pub ",
             &format!("encode_{snake}"),
@@ -5192,9 +5981,15 @@ pub fn resolve_rpc_reply(
             &format!("decode_{snake}"),
             name,
         ));
-        out.push_str(&format!(
-            "    let csil_root = cbor_decode(csil_data)?;\n    csil_dec_{snake}(&csil_root)\n}}\n\n"
-        ));
+        out.push_str("    let csil_root = cbor_decode(csil_data)?;\n");
+        let call = format!("    csil_dec_{snake}(&csil_root)");
+        if call.len() <= 100 {
+            out.push_str(&format!("{call}\n}}\n\n"));
+        } else {
+            out.push_str(&format!(
+                "    csil_dec_{snake}(\n        &csil_root,\n    )\n}}\n\n"
+            ));
+        }
         out
     }
 
@@ -5220,21 +6015,15 @@ pub fn resolve_rpc_reply(
                 continue;
             };
             for op in &service.operations {
-                if !matches!(op.direction, CsilServiceDirection::Unidirectional) {
-                    continue;
-                }
-                let success = success_type(op.success_output());
                 let stem = self.op_codec_stem(&rule.name, &op.name);
-                if !is_null_input(&op.input_type)
-                    && !Self::is_record_ref(&op.input_type, records)
-                    && self.op_boundary_expressible(&op.input_type, records, aliases)
-                {
+                if self.emits_request_helper(op, records, aliases) {
                     targets.push((format!("{stem}_request"), op.input_type.clone()));
                 }
-                if !Self::is_record_ref(&success, records)
-                    && self.op_boundary_expressible(&success, records, aliases)
-                {
-                    targets.push((format!("{stem}_response"), success));
+                if self.emits_response_helper(op, records, aliases) {
+                    targets.push((
+                        format!("{stem}_response"),
+                        success_type(op.success_output()),
+                    ));
                 }
             }
         }
@@ -5272,12 +6061,14 @@ pub fn resolve_rpc_reply(
         } else {
             "_csil_v"
         };
-        // clippy's `ptr_arg` rejects `&Vec<T>`; `&Vec<T>` callers coerce to a slice.
+        // clippy's `ptr_arg` rejects `&Vec<T>` and `&String`; callers' `&Vec<T>` and
+        // `&String` coerce to a slice and a `&str`.
         let param = match rust_type
             .strip_prefix("Vec<")
             .and_then(|rest| rest.strip_suffix('>'))
         {
             Some(element) => format!("{binding}: &[{element}]"),
+            None if rust_type == "String" => format!("{binding}: &str"),
             None => format!("{binding}: &{rust_type}"),
         };
         out.push_str(&Self::rust_sig(
@@ -5341,7 +6132,25 @@ pub fn resolve_rpc_reply(
                     "csil_v",
                     name,
                 ));
-                out.push_str(&format!("    let number = cbor_as_i64(csil_v)?;\n    {name}::from_number(number)\n        .ok_or_else(|| CsilCborError(format!(\"csil cbor: unknown {name} value {{number}}\")))\n}}\n\n"));
+                out.push_str("    let number = cbor_as_i64(csil_v)?;\n");
+                let message = format!("\"csil cbor: unknown {name} value {{number}}\"");
+                let chained = format!("        .ok_or_else(|| CsilCborError(format!({message})))");
+                // rustfmt keeps the `.ok_or_else` link on its own line while it fits
+                // and `format!(..)` stays inside `fn_call_width` (60); otherwise it
+                // hangs the closure body as a block off the call.
+                if chained.len() <= 100 && message.len() + 9 <= 60 {
+                    out.push_str(&format!(
+                        "    {name}::from_number(number)\n{chained}\n}}\n\n"
+                    ));
+                } else {
+                    out.push_str(&format!(
+                        "    {name}::from_number(number).ok_or_else(|| {{\n\
+                         \x20       CsilCborError(format!(\n\
+                         \x20           {message}\n\
+                         \x20       ))\n\
+                         \x20   }})\n}}\n\n"
+                    ));
+                }
                 return out;
             }
             out.push_str("    Ok(match csil_v {\n");
@@ -5458,6 +6267,30 @@ pub fn resolve_rpc_reply(
             // simply `max_width`, since the opener line ending in `[` doesn't
             // carry a trailing comma the way a flat arm's does).
             let hang_open = format!("        {pat} => CsilCborValue::Array(vec![");
+            if 8 + pat.len() + 5 > 100 {
+                // The pattern alone passes the width: rustfmt stacks its binding
+                // and hangs the value off the closing `) =>`.
+                let RustExpr::ArrayVec(elems) = &value else {
+                    unreachable!("emit_choice_codec's union arm value is always an ArrayVec");
+                };
+                let open =
+                    format!("        {name}::Variant{i}(\n            {binding},\n        ) => ");
+                match value.flat() {
+                    Some(f) if 8 + 5 + f.len() < 100 => {
+                        out.push_str(&format!("{open}{f},\n"));
+                    }
+                    _ => {
+                        out.push_str(&format!("{open}CsilCborValue::Array(vec![\n"));
+                        for elem in elems {
+                            out.push_str("            ");
+                            out.push_str(&Self::render_expr(elem, 12, 12, 1));
+                            out.push_str(",\n");
+                        }
+                        out.push_str("        ]),\n");
+                    }
+                }
+                continue;
+            }
             match value.flat() {
                 Some(f) if 8 + pat.len() + 4 + f.len() < 100 => {
                     out.push_str(&format!("        {pat} => {f},\n"));
@@ -5528,32 +6361,7 @@ pub fn resolve_rpc_reply(
             let dec = self.rust_dec_func(choice, records, aliases);
             out.push_str(&format!("        {i} => {{\n"));
             out.push_str(&Self::rust_decode_binding(12, &dec));
-            // A long synthesized hoisted-choice name (`<Record>_<field>` or
-            // `<Service>_<op>_response`) can push this call past rustfmt's width.
-            // For this exact fixed shape (`Ok(Name::VariantN(csil_decode(&csil_arr[1])?))`
-            // at a fixed indent of 12), rustfmt's actual choice among flat /
-            // break-the-inner-call's-argument / break-the-outer-call's-argument
-            // was reverse-engineered by trial against real `rustfmt` at varying
-            // name lengths — it is not simply `max_width`(100) or
-            // `fn_call_width`(60), so the two breakpoints below (76, 90) are
-            // empirical for this one shape, not general-purpose constants.
-            let flat = format!("            Ok({name}::Variant{i}(csil_decode(csil_payload)?))\n");
-            let flat_len = flat.trim_end().len();
-            if flat_len <= 76 {
-                out.push_str(&flat);
-            } else if flat_len <= 90 {
-                out.push_str(&format!(
-                    "            Ok({name}::Variant{i}(csil_decode(\n\
-                     \x20               csil_payload,\n\
-                     \x20           )?))\n"
-                ));
-            } else {
-                out.push_str(&format!(
-                    "            Ok({name}::Variant{i}(\n\
-                     \x20               csil_decode(csil_payload)?,\n\
-                     \x20           ))\n"
-                ));
-            }
+            out.push_str(&Self::rust_union_arm_decode(name, i));
             out.push_str("        }\n");
         }
         out.push_str(&format!(
@@ -5564,6 +6372,41 @@ pub fn resolve_rpc_reply(
         out
     }
 
+    /// `Ok(<name>::Variant<i>(csil_decode(csil_payload)?))` at indent 12, broken as
+    /// rustfmt breaks it in both styles. The steps depend only on the length of
+    /// `<name>::Variant<i>` and were measured against rustfmt; past the last step
+    /// rustfmt leaves the line as written.
+    fn rust_union_arm_decode(name: &str, i: usize) -> String {
+        let variant = format!("{name}::Variant{i}");
+        match variant.len() {
+            0..=32 | 84.. => format!("            Ok({variant}(csil_decode(csil_payload)?))\n"),
+            33..=46 => format!(
+                "            Ok({variant}(csil_decode(\n\
+                 \x20               csil_payload,\n\
+                 \x20           )?))\n"
+            ),
+            47..=59 => format!(
+                "            Ok({variant}(\n\
+                 \x20               csil_decode(csil_payload)?,\n\
+                 \x20           ))\n"
+            ),
+            60..=69 => format!(
+                "            Ok(\n\
+                 \x20               {variant}(csil_decode(\n\
+                 \x20                   csil_payload,\n\
+                 \x20               )?),\n\
+                 \x20           )\n"
+            ),
+            _ => format!(
+                "            Ok(\n\
+                 \x20               {variant}(\n\
+                 \x20                   csil_decode(csil_payload)?,\n\
+                 \x20               ),\n\
+                 \x20           )\n"
+            ),
+        }
+    }
+
     /// Build `codec.gen.rs`: the self-contained canonical-CBOR runtime plus an
     /// `encode_`/`decode_` pair per record. `None` when the spec declares no record
     /// the codec can model.
@@ -5571,8 +6414,17 @@ pub fn resolve_rpc_reply(
         let records = self.record_names();
         // `any` maps to `crate::codec::CsilCborValue`, so an alias-only spec that
         // mentions it still needs the codec module for `types.rs` to compile.
+        // Named choices and per-op helpers have public codecs too, so only a spec
+        // with no record, no choice, no service and no `any` goes without one.
+        let has_choices = self.spec.rules.iter().any(|rule| {
+            matches!(
+                rule.rule_type,
+                CsilRuleType::TypeChoice(_) | CsilRuleType::TypeDef(CsilTypeExpression::Choice(_))
+            )
+        });
         if records.is_empty()
-            && self.spec.rpc_operations().next().is_none()
+            && !has_choices
+            && self.spec.service_count == 0
             && !self.spec_uses_builtin("any")
         {
             return Ok(None);
@@ -5651,6 +6503,7 @@ pub fn resolve_rpc_reply(
                 _ => continue,
             };
             content.push_str(&self.emit_choice_codec(&rule.name, choices, &records, &aliases));
+            content.push_str(&Self::public_codec_pair(&rule.name));
         }
 
         // Per-op byte helpers for non-record (non-null) op boundaries, so the client and
@@ -5733,7 +6586,11 @@ pub fn resolve_rpc_reply(
         let mut content = String::new();
 
         content.push_str(&format!("/// {name} service trait\n"));
-        content.push_str(&format!("pub trait {name} {{\n"));
+        let ident = Self::service_trait_ident(name);
+        if ident.contains('_') || ident.starts_with(|c: char| c.is_ascii_lowercase()) {
+            content.push_str("#[allow(non_camel_case_types)]\n");
+        }
+        content.push_str(&Self::rust_item_open(&format!("pub trait {ident}")));
         content.push_str("    type Context;\n");
 
         for operation in &service.operations {
@@ -5865,8 +6722,16 @@ pub fn resolve_rpc_reply(
             "decode_{}",
             Self::to_snake_case(&Self::type_ref_name(&op.input_type))
         );
+        let decode = Self::render_let(
+            12,
+            "msg",
+            &RustExpr::try_(RustExpr::call(
+                &decode_fn,
+                vec![RustExpr::Atom("bytes".into())],
+            )),
+        );
         Some(format!(
-            "        {label} => {{\n            let msg = {decode_fn}(bytes)?;\n            handlers.{op_snake}(ctx, msg)\n        }}\n"
+            "        {label} => {{\n{decode}            handlers.{op_snake}(ctx, msg)\n        }}\n"
         ))
     }
 
@@ -5895,24 +6760,34 @@ pub fn resolve_rpc_reply(
             .collect();
 
         let mut content = String::new();
+        let service_trait = Self::service_trait_ident(service_name);
+        let open_fn = |fn_name: &str| {
+            // A name that passes the width with `<H>(` stacks the generic parameter.
+            if 7 + fn_name.len() + 4 >= 100 {
+                format!("pub fn {fn_name}<\n    H,\n>(")
+            } else {
+                format!("pub fn {fn_name}<H>(")
+            }
+        };
         let fn_name = format!("route_{}_channel", Self::to_snake_case(service_name));
         let (handlers, ctx, bytes) = if arms.is_empty() {
             ("_handlers", "_ctx", "_bytes")
         } else {
             ("handlers", "ctx", "bytes")
         };
+        let open = open_fn(&fn_name);
         content.push_str(&format!(
             "/// Decode one inbound channel frame for {service_name} (with the generated\n\
              /// per-type codec) and dispatch to the matching trait method. The implementer\n\
              /// feeds raw bytes from its connection here; we never own the wire.\n\
-             pub fn {fn_name}<H>(\n\
+             {open}\n\
              \x20   {handlers}: &H,\n\
              \x20   {ctx}: &H::Context,\n\
              \x20   method: &str,\n\
              \x20   {bytes}: &[u8],\n\
              ) -> Result<(), {route_error}>\n\
              where\n\
-             \x20   H: {service_name},\n\
+             \x20   H: {service_trait},\n\
              {{\n"
         ));
         if arms.is_empty() {
@@ -5962,6 +6837,15 @@ pub fn resolve_rpc_reply(
             .collect();
 
         let mut content = String::new();
+        let service_trait = Self::service_trait_ident(service_name);
+        let open_fn = |fn_name: &str| {
+            // A name that passes the width with `<H>(` stacks the generic parameter.
+            if 7 + fn_name.len() + 4 >= 100 {
+                format!("pub fn {fn_name}<\n    H,\n>(")
+            } else {
+                format!("pub fn {fn_name}<H>(")
+            }
+        };
         let fn_name = format!(
             "route_{}_channel_compact",
             Self::to_snake_case(service_name)
@@ -5971,20 +6855,21 @@ pub fn resolve_rpc_reply(
         } else {
             ("handlers", "ctx", "bytes")
         };
+        let open = open_fn(&fn_name);
         content.push_str(&format!(
             "/// Decode one inbound channel frame for {service_name} by its\n\
              /// `@wire-id` ordinal (compact transport profile) and dispatch to the\n\
              /// matching trait method. The verbose-profile twin is\n\
              /// `route_{}_channel`; the host calls whichever matches the profile\n\
              /// negotiated on the wire.\n\
-             pub fn {fn_name}<H>(\n\
+             {open}\n\
              \x20   {handlers}: &H,\n\
              \x20   {ctx}: &H::Context,\n\
              \x20   op: u64,\n\
              \x20   {bytes}: &[u8],\n\
              ) -> Result<(), {route_error}>\n\
              where\n\
-             \x20   H: {service_name},\n\
+             \x20   H: {service_trait},\n\
              {{\n",
             Self::to_snake_case(service_name)
         ));
@@ -6019,10 +6904,7 @@ pub fn resolve_rpc_reply(
         let svc_snake = Self::to_snake_case(service_name);
         let records = self.record_names();
         for op in &service.operations {
-            if !matches!(
-                op.direction,
-                CsilServiceDirection::Bidirectional | CsilServiceDirection::Reverse
-            ) {
+            if !Self::emits_channel_encoder(op, &records) {
                 continue;
             }
             let op_snake = Self::to_snake_case(&op.name);
@@ -6041,9 +6923,6 @@ pub fn resolve_rpc_reply(
                 ));
                 content.push_str(&Self::rust_wire_tuple(wire, "Vec::new()"));
                 content.push_str("}\n");
-                continue;
-            }
-            if !Self::is_record_ref(&op.output_type, &records) {
                 continue;
             }
             let output_type = self.map_type_to_rust(&op.output_type, &None)?;
@@ -6072,7 +6951,13 @@ pub fn resolve_rpc_reply(
         if inner.len() <= 60 && one_line.trim_end().len() <= 100 {
             return one_line;
         }
-        format!("    Ok((\n        \"{wire}\".to_string(),\n        {bytes_expr},\n    ))\n")
+        let bytes_line = match bytes_expr.strip_suffix("(msg)?") {
+            Some(head) if 8 + bytes_expr.len() + 1 > 100 => {
+                format!("{head}(\n            msg,\n        )?")
+            }
+            _ => bytes_expr.to_string(),
+        };
+        format!("    Ok((\n        \"{wire}\".to_string(),\n        {bytes_line},\n    ))\n")
     }
 
     fn generate_lib_file(&mut self, files: &[GeneratedFile]) -> Result<String, String> {
@@ -6329,7 +7214,19 @@ pub fn resolve_rpc_reply(
                 blocks.push_str("        }\n");
             } else {
                 blocks.push_str("        {\n");
-                blocks.push_str(&format!("            let v = &self.{field_name};\n"));
+                let bind = format!("            let v = &self.{field_name};");
+                if bind.len() <= 100 {
+                    blocks.push_str(&format!("{bind}\n"));
+                } else {
+                    let after_eq = format!("                &self.{field_name};");
+                    if after_eq.len() <= 100 {
+                        blocks.push_str(&format!("            let v =\n{after_eq}\n"));
+                    } else {
+                        blocks.push_str(&format!(
+                            "            let v = &self\n                .{field_name};\n"
+                        ));
+                    }
+                }
                 for c in &checks {
                     blocks.push_str(c);
                 }
@@ -6344,7 +7241,7 @@ pub fn resolve_rpc_reply(
         self.needs_validation_error = true;
 
         let mut out = String::new();
-        out.push_str(&format!("impl {name} {{\n"));
+        out.push_str(&Self::rust_impl_open(name));
         out.push_str(
             "    /// Validate this value against the constraints declared in the CSIL spec.\n",
         );
@@ -6764,6 +7661,10 @@ pub fn resolve_rpc_reply(
                 one_line
             } else if after_eq.len() <= 100 {
                 format!("                let re =\n{after_eq}\n")
+            } else if 25 + static_name.len() >= 100 && chain_elem.len() + 4 <= 100 {
+                format!(
+                    "                let re =\n                    {static_name}\n    {chain_elem}\n"
+                )
             } else if chain_elem.len() <= 100 {
                 format!("                let re = {static_name}\n{chain_elem}\n")
             } else if block_call.len() <= 100 {
@@ -6781,10 +7682,31 @@ pub fn resolve_rpc_reply(
                 one_line
             }
         };
+        // rustfmt's ladder for the declaration at this indent: the type beside the
+        // name; then the generic argument on its own line while the head fits in
+        // 99 columns; then the type below the name.
+        let head = format!("                static {static_name}: std::sync::OnceLock<");
+        let declaration = if head.len() + 37 <= 100 {
+            format!(
+                "{head}Result<regex::Regex, regex::Error>> =\n\
+                 \x20                   std::sync::OnceLock::new();\n"
+            )
+        } else if head.len() <= 99 {
+            format!(
+                "{head}\n\
+                 \x20                   Result<regex::Regex, regex::Error>,\n\
+                 \x20               > = std::sync::OnceLock::new();\n"
+            )
+        } else {
+            format!(
+                "                static {static_name}:\n\
+                 \x20                   std::sync::OnceLock<Result<regex::Regex, regex::Error>> =\n\
+                 \x20                   std::sync::OnceLock::new();\n"
+            )
+        };
         format!(
             "            {{\n\
-             \x20               static {static_name}: std::sync::OnceLock<Result<regex::Regex, regex::Error>> =\n\
-             \x20                   std::sync::OnceLock::new();\n\
+             {declaration}\
              {init_stmt}\
              \x20               let re = re.as_ref().map_err(|e| ValidationError {{\n\
              \x20                   field: \"{field}\".to_string(),\n\
@@ -6966,6 +7888,9 @@ fn is_null_input(type_expr: &CsilTypeExpression) -> bool {
             CsilTypeExpression::Literal(CsilLiteralValue::Null)
         )
 }
+
+#[cfg(test)]
+mod name_tests;
 
 #[cfg(test)]
 mod tests {
@@ -7723,10 +8648,19 @@ mod tests {
     #[test]
     fn rules_named_like_derived_items_are_renamed() {
         // `CorndogsClient` is the service's client struct, and the snake_case of
-        // `CorndogsSubmitTaskReply` is the stem of the op's `encode_..._reply`.
+        // `CorndogsSubmitTaskReply` is the stem of the op's `encode_..._reply`, which
+        // the codec emits because the op has two reply arms.
         let mut input = make_unary_service_input("rust-client");
-        for name in ["CorndogsClient", "CorndogsSubmitTaskReply"] {
+        for name in ["CorndogsClient", "CorndogsSubmitTaskReply", "TaskError"] {
             input.csil_spec.rules.push(group_rule(name, "x", "text"));
+        }
+        for rule in &mut input.csil_spec.rules {
+            if let CsilRuleType::ServiceDef(service) = &mut rule.rule_type {
+                service.operations[0].output_type = CsilTypeExpression::Choice(vec![
+                    CsilTypeExpression::Reference("SubmitTaskResponse".to_string()),
+                    CsilTypeExpression::Reference("TaskError".to_string()),
+                ]);
+            }
         }
         let files = RustCodeGenerator::new(&input).generate().unwrap();
         let all: String = files.iter().map(|f| f.content.as_str()).collect();
@@ -8703,8 +9637,29 @@ mod tests {
 
     #[test]
     fn self_literal_gets_a_legal_variant_identifier() {
-        let lit = CsilLiteralValue::Text("self".to_string());
-        assert_eq!(RustCodeGenerator::enum_variant_ident(&lit, 0), "Self_");
+        let lits = [
+            CsilLiteralValue::Text("self".to_string()),
+            CsilLiteralValue::Text("pending".to_string()),
+            CsilLiteralValue::Text("in_progress".to_string()),
+            CsilLiteralValue::Text("calendars.read".to_string()),
+            CsilLiteralValue::Text("a-b c".to_string()),
+            CsilLiteralValue::Text("2fa".to_string()),
+            CsilLiteralValue::Text("class".to_string()),
+            CsilLiteralValue::Integer(-3),
+        ];
+        assert_eq!(
+            RustCodeGenerator::enum_variant_idents(&lits),
+            [
+                "VSelf",
+                "Pending",
+                "InProgress",
+                "CalendarsRead",
+                "ABC",
+                "V2fa",
+                "Class",
+                "VNeg3"
+            ]
+        );
     }
 
     #[test]
@@ -9379,8 +10334,9 @@ mod tests {
 
     #[test]
     fn trait_method_signature_follows_rustfmt_ladder() {
-        // One line through 99 columns; at exactly 100 rustfmt drops only the
-        // return type to the next line; past that, params go one per line.
+        // One line through 99 columns; past that, params go one per line. At
+        // exactly 100 the 2021 and 2024 styles disagree, so the last parameter is
+        // renamed to reach the one-per-line layout both agree on.
         let short = RustCodeGenerator::rust_trait_method(
             "get",
             &["input: serde_json::Value".to_string()],
@@ -9404,8 +10360,11 @@ mod tests {
         );
         assert_eq!(
             exactly_100,
-            "    fn get_cart(&self, ctx: &Self::Context, input: serde_json::Value)\n\
-             \x20       -> Result<Cart, ServiceError>;\n"
+            "    fn get_cart(\n\
+             \x20       &self,\n\
+             \x20       ctx: &Self::Context,\n\
+             \x20       input_value: serde_json::Value,\n\
+             \x20   ) -> Result<Cart, ServiceError>;\n"
         );
 
         let long = RustCodeGenerator::rust_trait_method(

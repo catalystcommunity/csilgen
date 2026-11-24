@@ -87,35 +87,55 @@ pub fn rename_reserved(
     rename_rules(spec, &renames)
 }
 
-/// Return `spec` with every non-service rule whose generated identifier equals the
-/// identifier of an earlier rule renamed to a free `<Name>Type`. `ident` is the
-/// generator's own rule-name-to-identifier function, so `Value` and `value`, or
-/// `user_id` and `UserId`, collide only where the target language makes them the
-/// same name. The first rule in the spec keeps its name, so adding a rule never
-/// renames an existing one. Service identifiers count as taken but services are
-/// never renamed, because the RPC wire carries them as written.
+/// Return `spec` with every rule whose generated identifier equals the identifier of
+/// an earlier rule renamed to a free name. `ident` is the generator's own
+/// rule-name-to-identifier function, so `Value` and `value`, or `user_id` and
+/// `UserId`, collide only where the target language makes them the same name. The
+/// first rule in the spec keeps its name, so adding a rule never renames an existing
+/// one.
+///
+/// Services are compared first, with each other only: a later service whose
+/// identifier equals an earlier one's gets a digit suffix (`user-svc` after `UserSvc`
+/// becomes `user-svc2`). Not a word suffix such as `Service`: several generators
+/// strip a trailing `Service` from a service name to make `<Base>Client`, which would
+/// make the two names one again. Its generated names then differ, and the spec keeps
+/// the declared name for the wire, which carries service names as written. Service
+/// identifiers then count as taken for the other rules, which get a `Type` suffix.
 pub fn rename_ident_collisions(
     spec: &CsilSpecSerialized,
     ident: impl Fn(&str) -> String,
 ) -> CsilSpecSerialized {
     let mut names: HashSet<String> = spec.rules.iter().map(|rule| rule.name.clone()).collect();
-    let mut idents: HashSet<String> = spec
+    let mut idents: HashSet<String> = HashSet::new();
+    let mut renames = HashMap::new();
+    let services = spec
         .rules
         .iter()
-        .filter(|rule| matches!(rule.rule_type, CsilRuleType::ServiceDef(_)))
-        .map(|rule| ident(&rule.name))
-        .collect();
-    let mut renames = HashMap::new();
-    for rule in &spec.rules {
-        if matches!(rule.rule_type, CsilRuleType::ServiceDef(_)) {
-            continue;
-        }
+        .filter(|rule| matches!(rule.rule_type, CsilRuleType::ServiceDef(_)));
+    let others = spec
+        .rules
+        .iter()
+        .filter(|rule| !matches!(rule.rule_type, CsilRuleType::ServiceDef(_)));
+    for (rule, is_service) in services
+        .map(|rule| (rule, true))
+        .chain(others.map(|rule| (rule, false)))
+    {
         if idents.insert(ident(&rule.name)) {
             continue;
         }
-        let mut candidate = format!("{}Type", rule.name);
+        let mut n = 2;
+        let mut candidate = if is_service {
+            format!("{}{n}", rule.name)
+        } else {
+            format!("{}Type", rule.name)
+        };
         while names.contains(&candidate) || idents.contains(&ident(&candidate)) {
-            candidate.push_str("Type");
+            if is_service {
+                n += 1;
+                candidate = format!("{}{n}", rule.name);
+            } else {
+                candidate.push_str("Type");
+            }
         }
         names.insert(candidate.clone());
         idents.insert(ident(&candidate));
@@ -140,10 +160,17 @@ pub fn rename_warnings(spec: &CsilSpecSerialized, target: &str) -> Vec<Generator
                     offset: rule.position.offset,
                     context: Some(declared.clone()),
                 });
+            let kind = if spec.rules.iter().any(|rule| {
+                &rule.name == new && matches!(rule.rule_type, CsilRuleType::ServiceDef(_))
+            }) {
+                "service"
+            } else {
+                "rule"
+            };
             GeneratorWarning {
                 level: WarningLevel::Warning,
                 message: format!(
-                    "rule `{declared}` is generated as `{new}` for {target}, because `{declared}` \
+                    "{kind} `{declared}` is generated as `{new}` for {target}, because `{declared}` \
                      clashes with a name the generated code uses, with another rule, or is not a \
                      legal identifier there; the wire still uses `{declared}`"
                 ),
@@ -357,6 +384,52 @@ mod tests {
             &HashMap::from([("TransportTypeType".to_string(), "T2".to_string())]),
         );
         assert_eq!(again.declared_name("T2"), "Transport");
+    }
+
+    #[test]
+    fn service_ident_collision_renames_the_later_service_and_keeps_the_wire_name() {
+        let service = || {
+            CsilRuleType::ServiceDef(crate::CsilServiceDefinition {
+                operations: Vec::new(),
+                wire_id: None,
+            })
+        };
+        let spec = CsilSpecSerialized {
+            rules: vec![
+                rule(
+                    "UserSvc2",
+                    CsilRuleType::TypeDef(CsilTypeExpression::Builtin("text".into())),
+                ),
+                rule("UserSvc", service()),
+                rule("user-svc", service()),
+            ],
+            source_content: None,
+            service_count: 2,
+            fields_with_metadata_count: 0,
+            declared_names: Default::default(),
+        };
+        let pascal = |name: &str| {
+            name.split('-')
+                .map(|part| {
+                    let mut chars = part.chars();
+                    chars
+                        .next()
+                        .map(|c| c.to_uppercase().collect::<String>() + chars.as_str())
+                        .unwrap_or_default()
+                })
+                .collect::<String>()
+        };
+        let out = rename_ident_collisions(&spec, pascal);
+        assert_eq!(out.rules[1].name, "UserSvc");
+        assert_eq!(out.rules[2].name, "user-svc2");
+        assert_eq!(out.declared_name("user-svc2"), "user-svc");
+        // The record whose identifier the renamed service now takes yields to it.
+        assert_eq!(out.rules[0].name, "UserSvc2Type");
+        let warnings = rename_warnings(&out, "go");
+        assert!(warnings.iter().any(|w| {
+            w.message
+                .starts_with("service `user-svc` is generated as `user-svc2`")
+        }));
     }
 
     #[test]

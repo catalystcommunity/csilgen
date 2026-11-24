@@ -199,25 +199,100 @@ fn service_error_fits_router(spec: &csilgen_common::CsilSpecSerialized) -> bool 
     })
 }
 
-/// The type names the generator builds from other rules: the per-service client,
-/// handler and wire-id names, `<ErrorArm>Refusal`, and `<Enum>Numbers`. A rule
-/// that takes one of them would collide with the declaration made for its owner,
-/// or hide it from the package `index.ts` (which re-exports a name only once).
-fn derived_type_names(spec: &CsilSpecSerialized) -> HashSet<String> {
+/// Which files one run emits, and in which shape. Emission and the derived-name
+/// reservation both read it, so a name is reserved exactly when its item is emitted.
+#[derive(Debug, Clone)]
+struct Surfaces {
+    /// The aggregate client class name; empty when the option turns it off.
+    aggregate: String,
+    client: bool,
+    server: bool,
+    mode: common::BidiTransport,
+    style: common::ClientStyle,
+}
+
+impl Surfaces {
+    fn new(input: &WasmGeneratorInput) -> Result<Self, String> {
+        let (client, server) = match input.config.target.as_str() {
+            "typescript-typesonly" => (false, false),
+            "typescript-client" => (true, false),
+            "typescript-server" => (false, true),
+            // "typescript" and any alias emit everything
+            _ => (true, true),
+        };
+        // A service-less spec has nothing for `client.gen.ts`/`server.gen.ts` to
+        // route to, and `types.gen.ts` only exports the synthetic `ServiceError`
+        // they reference when the spec declares services, so both are skipped (as
+        // Go and Python do).
+        let services = common::has_services(&input.csil_spec);
+        Ok(Self {
+            aggregate: client::aggregate_name(input),
+            client: client && services,
+            server: server && services,
+            mode: common::bidi_transport(input)?,
+            style: common::client_style(input)?,
+        })
+    }
+
+    /// Each client file to emit with its shape. `Both` (the default) ships the
+    /// blocking client at `client.gen.ts` and an async twin at `client.async.gen.ts`
+    /// whose symbols carry an `Async` marker so both coexist in one barrel; `Async`
+    /// makes the async client a drop-in at `client.gen.ts`.
+    fn client_files(&self) -> Vec<(&'static str, common::ClientShape)> {
+        if !self.client {
+            return Vec::new();
+        }
+        let sync = common::ClientShape {
+            is_async: false,
+            marker: "",
+        };
+        let async_drop_in = common::ClientShape {
+            is_async: true,
+            marker: "",
+        };
+        let async_twin = common::ClientShape {
+            is_async: true,
+            marker: "Async",
+        };
+        match self.style {
+            common::ClientStyle::Sync => vec![("client.gen.ts", sync)],
+            common::ClientStyle::Async => vec![("client.gen.ts", async_drop_in)],
+            common::ClientStyle::Both => {
+                vec![("client.gen.ts", sync), ("client.async.gen.ts", async_twin)]
+            }
+        }
+    }
+}
+
+/// The type names the generator builds from other rules and emits for this run:
+/// the per-service client, handler and wire-id names, `<ErrorArm>Refusal`, and
+/// `<Enum>Numbers`. A rule that takes one of them would collide with the
+/// declaration made for its owner, or hide it from the package `index.ts` (which
+/// re-exports a name only once). A name whose item is not emitted is not reserved,
+/// so a rule is never renamed for a clash that cannot happen.
+fn derived_type_names(spec: &CsilSpecSerialized, surfaces: &Surfaces) -> HashSet<String> {
     let mut names = HashSet::new();
+    let channels = surfaces.mode == common::BidiTransport::Connection;
     for rule in &spec.rules {
         match &rule.rule_type {
-            CsilRuleType::ServiceDef(_) => {
+            CsilRuleType::ServiceDef(def) => {
                 let base = common::service_base(&rule.name);
-                for suffix in [
-                    "Client",
-                    "AsyncClient",
-                    "Handlers",
-                    "ChannelHandlers",
-                    "AsyncChannelHandlers",
-                    "WireIds",
-                ] {
-                    names.insert(format!("{base}{suffix}"));
+                for (_, shape) in surfaces.client_files() {
+                    if client::service_class_has_methods(def, surfaces.mode) {
+                        names.insert(shape.class_name(&base));
+                    }
+                    if channels && common::service_has_channel_ops(def) {
+                        names.insert(client::channel_handlers_name(&base, shape));
+                    }
+                }
+                if surfaces.server {
+                    names.insert(server::handlers_name(&rule.name));
+                    if def.wire_id.is_some() {
+                        names.insert(server::wire_ids_name(&rule.name));
+                    }
+                    if channels && common::service_has_channel_ops(def) {
+                        names.insert(server::channel_handlers_name(&base));
+                    }
                 }
             }
             _ if csilgen_common::rule_enum_numbers(rule).is_some() => {
@@ -229,18 +304,122 @@ fn derived_type_names(spec: &CsilSpecSerialized) -> HashSet<String> {
     for (_, _, arms) in spec.rpc_operations() {
         for arm in &arms[1..] {
             if let Some(name) = arm.rpc_variant_name() {
-                names.insert(format!("{}Refusal", common::to_pascal(name)));
+                names.insert(codec::refusal_name(name));
             }
         }
     }
     names
 }
 
+/// Give each later service whose `<Base>` (its PascalCase name without a trailing
+/// `Service`) is taken a digit suffix until it is free, as the shared collision
+/// pass does. That pass compares full PascalCase names, so it keeps `Foo` and
+/// `FooService` apart, but both derive `FooClient` here.
+fn rename_service_bases(spec: &CsilSpecSerialized, surfaces: &Surfaces) -> CsilSpecSerialized {
+    let mut names: HashSet<String> = spec.rules.iter().map(|rule| rule.name.clone()).collect();
+    // The aggregate client class (`ApiClient` by default, `AsyncApiClient` for the
+    // twin) shares the client file with the per-service classes, so a service `Api`
+    // would declare `ApiClient` twice.
+    let mut bases: HashSet<String> = surfaces
+        .client_files()
+        .iter()
+        .filter_map(|(_, shape)| {
+            let aggregate = shape.aggregate_name(&surfaces.aggregate);
+            aggregate
+                .strip_suffix(&shape.class_name(""))
+                .map(str::to_string)
+        })
+        .collect();
+    let reserved = bases.clone();
+    let mut renames = std::collections::HashMap::new();
+    for rule in &spec.rules {
+        if !matches!(rule.rule_type, CsilRuleType::ServiceDef(_)) {
+            continue;
+        }
+        let base = common::service_base(&rule.name);
+        if !reserved.contains(&base) && bases.insert(base) {
+            continue;
+        }
+        let mut n = 2;
+        let mut candidate = format!("{}{n}", rule.name);
+        while names.contains(&candidate) || bases.contains(&common::service_base(&candidate)) {
+            n += 1;
+            candidate = format!("{}{n}", rule.name);
+        }
+        names.insert(candidate.clone());
+        bases.insert(common::service_base(&candidate));
+        renames.insert(rule.name.clone(), candidate);
+    }
+    csilgen_common::rename_rules(spec, &renames)
+}
+
+/// Give each operation input or output that is an inline record a named record
+/// rule, `<Service><Op>Input` or `<Service><Op>Output` as the shared union pass
+/// names its rules. The shared hoister leaves op boundaries alone, and a bare
+/// inline group has no TypeScript codec: the client typed it `object` and handed
+/// it to `encodeValue`, which does not encode a plain object. A named record encodes
+/// as the same CBOR map, so the wire does not change.
+fn hoist_record_op_boundaries(spec: &CsilSpecSerialized) -> CsilSpecSerialized {
+    let canonical = |name: &str| name.replace(['-', '_'], "").to_lowercase();
+    let mut used: HashSet<String> = spec.rules.iter().map(|r| canonical(&r.name)).collect();
+    let mut synth = Vec::new();
+    let mut rules = Vec::with_capacity(spec.rules.len());
+    for rule in &spec.rules {
+        let CsilRuleType::ServiceDef(service) = &rule.rule_type else {
+            rules.push(rule.clone());
+            continue;
+        };
+        let mut service = service.clone();
+        for op in &mut service.operations {
+            for (boundary, suffix) in [
+                (&mut op.input_type, "Input"),
+                (&mut op.output_type, "Output"),
+            ] {
+                if !matches!(boundary, csilgen_common::CsilTypeExpression::Group(_)) {
+                    continue;
+                }
+                let base = format!(
+                    "{}{}{suffix}",
+                    common::to_pascal(&rule.name),
+                    common::to_pascal(&op.name)
+                );
+                let mut name = base.clone();
+                let mut n = 2;
+                while used.contains(&canonical(&name)) {
+                    name = format!("{base}{n}");
+                    n += 1;
+                }
+                used.insert(canonical(&name));
+                synth.push(csilgen_common::CsilRule {
+                    name: name.clone(),
+                    rule_type: CsilRuleType::TypeDef(boundary.clone()),
+                    position: op.position.clone(),
+                    doc_comments: Vec::new(),
+                });
+                *boundary = csilgen_common::CsilTypeExpression::Reference(name);
+            }
+        }
+        rules.push(csilgen_common::CsilRule {
+            rule_type: CsilRuleType::ServiceDef(service),
+            ..rule.clone()
+        });
+    }
+    rules.extend(synth);
+    CsilSpecSerialized {
+        rules,
+        ..spec.clone()
+    }
+}
+
 /// Rename every rule whose TypeScript type name is reserved, derived from another
 /// rule, or equal to an earlier rule's type name. A rename changes the names
 /// derived from the renamed rule (its `Refusal` class), so it repeats until no
 /// rule moves.
-fn rename_spec(spec: &CsilSpecSerialized, decimal: common::DecimalMapping) -> CsilSpecSerialized {
+fn rename_spec(
+    spec: &CsilSpecSerialized,
+    decimal: common::DecimalMapping,
+    surfaces: &Surfaces,
+) -> CsilSpecSerialized {
     // The library mapping imports `Decimal` from `decimal.js`, so a rule of that
     // name would clash with it.
     let library_decimal = matches!(decimal, common::DecimalMapping::Library);
@@ -248,7 +427,7 @@ fn rename_spec(spec: &CsilSpecSerialized, decimal: common::DecimalMapping) -> Cs
     let mut spec = spec.clone();
     loop {
         let before = spec.declared_names.len();
-        let derived = derived_type_names(&spec);
+        let derived = derived_type_names(&spec, surfaces);
         spec = csilgen_common::rename_reserved(&spec, |name| {
             let ident = common::to_pascal(name);
             if ident == "ServiceError" {
@@ -259,6 +438,7 @@ fn rename_spec(spec: &CsilSpecSerialized, decimal: common::DecimalMapping) -> Cs
                 || derived.contains(&ident)
         });
         spec = csilgen_common::rename_ident_collisions(&spec, common::to_pascal);
+        spec = rename_service_bases(&spec, surfaces);
         if spec.declared_names.len() == before {
             return spec;
         }
@@ -281,55 +461,29 @@ fn generate_output(
 ) -> Result<(Vec<GeneratedFile>, Vec<GeneratorWarning>), String> {
     // Validate options *before* deciding which files to emit so a bad option
     // fails the entire run, regardless of which target is requested.
-    let _mode = common::bidi_transport(input)?;
+    let surfaces = Surfaces::new(input)?;
     let decimal = common::decimal_mapping(input)?;
-    let style = common::client_style(input)?;
     let _import_extension = common::import_extension(input)?;
 
-    let renamed = rename_spec(&input.csil_spec, decimal);
-    let warnings = csilgen_common::rename_warnings(&renamed, &input.config.target);
-
-    // Rewrite inline (anonymous) composite field types to synthesized named rules so
-    // every emitter sees them as ordinary references and routes them through the
-    // named-rule machinery; a spec without inline composites is reproduced unchanged.
-    // Every emitter below reads from this single hoisted view so types, codec, client,
-    // and server agree on the synthesized declarations. An all-literal choice is left
-    // inline (`hoist_all_literal_choices: false`) — the codec already renders a
-    // correct bare-literal enum for it in the field position itself.
-    let hoisted = {
-        let mut cloned = input.clone();
-        cloned.csil_spec = csilgen_common::hoist_inline_composites(
-            &renamed,
-            csilgen_common::HoistOptions {
-                hoist_all_literal_choices: false,
-            },
-        );
-        cloned
-    };
-    let input = &hoisted;
-
-    let (want_client, want_server) = match input.config.target.as_str() {
-        "typescript-typesonly" => (false, false),
-        "typescript-client" => (true, false),
-        "typescript-server" => (false, true),
-        // "typescript" and any alias emit everything
-        _ => (true, true),
-    };
-    // A service-less spec has nothing for `client.gen.ts`/`server.gen.ts` to route
-    // to. Both files still unconditionally reference the synthetic `ServiceError`
-    // (thrown by the router's default case / used in JSDoc), but `types.gen.ts`
-    // only exports it when the spec declares services, so a service-less "full"
-    // build previously emitted a `server.gen.ts` (and would emit `client.gen.ts`
-    // for any channel-carrying spec) that imported a name the types module never
-    // exported. Go and Python already skip client/server emission entirely for
-    // service-less specs (see `wasm/csilgen-go-generator/src/lib.rs` and
-    // `wasm/csilgen-python-generator/src/lib.rs`); mirror that instead of forcing
-    // `types.gen.ts` to export an unused `ServiceError` just to patch the import.
-    let (want_client, want_server) = (
-        want_client && common::has_services(&input.csil_spec),
-        want_server && common::has_services(&input.csil_spec),
+    // Inline (anonymous) composites become synthesized named rules so every emitter
+    // sees ordinary references; a spec without them is reproduced unchanged. A
+    // mixed op boundary becomes a named union first, so the client and server expose
+    // every arm. An all-literal choice stays inline: the codec renders a bare-literal
+    // enum for it in the field position itself. The renames run on the result, so a
+    // synthesized name that clashes is renamed and warned like a declared one; the
+    // synthesized rules come last, so they move before a user rule does.
+    let hoisted = csilgen_common::hoist_inline_composites(
+        &hoist_record_op_boundaries(&csilgen_common::hoist_op_union_boundaries(&input.csil_spec)),
+        csilgen_common::HoistOptions {
+            hoist_all_literal_choices: false,
+        },
     );
-
+    let renamed = rename_spec(&hoisted, decimal, &surfaces);
+    let warnings = csilgen_common::rename_warnings(&renamed, &input.config.target);
+    let input = &WasmGeneratorInput {
+        csil_spec: renamed,
+        ..input.clone()
+    };
     let mut files = vec![GeneratedFile {
         path: "types.gen.ts".to_string(),
         content: types::generate(input),
@@ -345,45 +499,13 @@ fn generate_output(
         });
     }
 
-    // `Both` (the default) ships the blocking client at `client.gen.ts` and an async
-    // twin at `client.async.gen.ts`; `Async` makes the async client a drop-in at
-    // `client.gen.ts`; `Sync` is the original blocking-only output. The async twin
-    // carries an `Async` marker on its symbols so both coexist in one barrel.
-    if want_client {
-        let sync = common::ClientShape {
-            is_async: false,
-            marker: "",
-        };
-        let async_drop_in = common::ClientShape {
-            is_async: true,
-            marker: "",
-        };
-        let async_twin = common::ClientShape {
-            is_async: true,
-            marker: "Async",
-        };
-        match style {
-            common::ClientStyle::Sync => files.push(GeneratedFile {
-                path: "client.gen.ts".to_string(),
-                content: client::generate(input, sync)?,
-            }),
-            common::ClientStyle::Async => files.push(GeneratedFile {
-                path: "client.gen.ts".to_string(),
-                content: client::generate(input, async_drop_in)?,
-            }),
-            common::ClientStyle::Both => {
-                files.push(GeneratedFile {
-                    path: "client.gen.ts".to_string(),
-                    content: client::generate(input, sync)?,
-                });
-                files.push(GeneratedFile {
-                    path: "client.async.gen.ts".to_string(),
-                    content: client::generate(input, async_twin)?,
-                });
-            }
-        }
+    for (path, shape) in surfaces.client_files() {
+        files.push(GeneratedFile {
+            path: path.to_string(),
+            content: client::generate(input, shape)?,
+        });
     }
-    if want_server {
+    if surfaces.server {
         files.push(GeneratedFile {
             path: "server.gen.ts".to_string(),
             content: server::generate(input)?,

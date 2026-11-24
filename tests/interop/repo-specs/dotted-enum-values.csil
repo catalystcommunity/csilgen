@@ -1,0 +1,7 @@
+; A repo spec for the compile checks in check.sh.
+; Text enum values that are not identifiers in any language: a dot, a hyphen,
+; a space, a leading digit and a keyword. Each generator must make a legal
+; member name and keep the value as written on the wire.
+Scope = "calendars.read" / "events.write" / "a-b c" / "2fa" / "class"
+Grant = { scope: Scope, ? extra: [* Scope] }
+service Auth { grant: Grant -> Grant }

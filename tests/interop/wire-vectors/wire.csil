@@ -1,0 +1,28 @@
+; Shapes the wire vectors decode in every target. See vectors.tsv and check.sh.
+include "contact-extra.csil"
+
+; A dynamic map must arrive with its keys in canonical order (RFC 8949 section
+; 4.2.1, bytewise order of the encoded keys), with no key twice.
+Counts = { * text => int }
+Labels = { * int => text }
+Holder = {
+    counts: Counts,
+    labels: Labels,
+}
+
+; A record union built with `//=`. Like every union it encodes as
+; [variant_index, value]. The index is the arm's place in declaration order: the
+; base (0), then this file's arms, then the arms of the included file.
+Contact = {
+    id: int,
+    name: text,
+}
+Contact //= { id: int }
+
+Err = { message: text }
+
+service Lookup {
+    ; An output with an inline arm has no reply variants. It is one union value,
+    ; the same as a named union `{ * text => int } / Err`.
+    read-counts: Holder -> { * text => int } / Err,
+}

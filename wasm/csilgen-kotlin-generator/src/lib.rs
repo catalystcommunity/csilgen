@@ -203,11 +203,13 @@ fn derived_type_names(spec: &csilgen_common::CsilSpecSerialized) -> Vec<String> 
     for rule in &spec.rules {
         let class = pascal_case(&rule.name);
         match &rule.rule_type {
-            CsilRuleType::ServiceDef(_) => {
+            CsilRuleType::ServiceDef(service) => {
                 let base = service_base(&rule.name);
                 names.push(format!("{base}Client"));
                 names.push(format!("{base}AsyncClient"));
-                names.push(format!("{class}WireIds"));
+                if service.wire_id.is_some() {
+                    names.push(format!("{class}WireIds"));
+                }
             }
             CsilRuleType::TypeDef(CsilTypeExpression::Choice(choices))
                 if matches!(classify_choice(choices), ChoiceKind::Union) =>
@@ -240,16 +242,63 @@ fn derived_type_names(spec: &csilgen_common::CsilSpecSerialized) -> Vec<String> 
 /// a derived name, or another rule's class are renamed, and inline composites are
 /// hoisted. The renames are kept in `declared_names` for the wire and the warnings.
 fn prepare_spec(spec: &csilgen_common::CsilSpecSerialized) -> csilgen_common::CsilSpecSerialized {
-    let mut probe = spec.clone();
-    probe.supply_implicit_service_error();
-    let derived = derived_type_names(&hoist_inline_composites(&probe, HOIST_OPTIONS));
-    let reserved = rename_reserved(spec, |name| {
+    let named = csilgen_common::hoist_op_union_boundaries(spec);
+    let mut hoisted = hoist_inline_composites(&named, HOIST_OPTIONS);
+    hoisted.supply_implicit_service_error();
+    // The shared pass settles services that share an identifier (`user-svc` after
+    // `UserSvc` becomes `user-svc2`); the local pass then handles the bases it cannot
+    // see, such as `Foo` and `FooService`. The shared pass runs again after
+    // `rename_reserved`, whose `Type` names it has not checked yet.
+    let distinct = csilgen_common::rename_ident_collisions(&hoisted, pascal_case);
+    let hoisted = rename_service_base_collisions(&distinct);
+    let derived = derived_type_names(&hoisted);
+    let reserved = rename_reserved(&hoisted, |name| {
         let class = pascal_case(name);
         RESERVED_TYPE_NAMES.contains(&class.as_str()) || derived.contains(&class)
     });
-    let mut distinct = csilgen_common::rename_ident_collisions(&reserved, pascal_case);
-    distinct.supply_implicit_service_error();
-    hoist_inline_composites(&distinct, HOIST_OPTIONS)
+    csilgen_common::rename_ident_collisions(&reserved, pascal_case)
+}
+
+/// Return `spec` with each service renamed whose `service_base` equals an earlier
+/// service's, or whose interface name equals a rule's. `service_base` drops a trailing
+/// `Service`, so `Foo` and `FooService`, or `UserSvc` and `user-svc`, would declare one
+/// `<Base>Client`; the `Service` suffix of the shared collision pass is dropped the same
+/// way, so this pass repeats the suffix until the base is free. The spec keeps the
+/// declared name for the wire.
+fn rename_service_base_collisions(
+    spec: &csilgen_common::CsilSpecSerialized,
+) -> csilgen_common::CsilSpecSerialized {
+    let mut names: std::collections::HashSet<String> =
+        spec.rules.iter().map(|rule| rule.name.clone()).collect();
+    let mut classes: std::collections::HashSet<String> = spec
+        .rules
+        .iter()
+        .filter(|rule| !matches!(rule.rule_type, CsilRuleType::ServiceDef(_)))
+        .map(|rule| pascal_case(&rule.name))
+        .collect();
+    let mut bases = std::collections::HashSet::new();
+    let mut renames = HashMap::new();
+    for rule in &spec.rules {
+        if !matches!(rule.rule_type, CsilRuleType::ServiceDef(_)) {
+            continue;
+        }
+        if bases.insert(service_base(&rule.name)) {
+            classes.insert(pascal_case(&rule.name));
+            continue;
+        }
+        let mut candidate = format!("{}Service", rule.name);
+        while names.contains(&candidate)
+            || bases.contains(&service_base(&candidate))
+            || classes.contains(&pascal_case(&candidate))
+        {
+            candidate.push_str("Service");
+        }
+        bases.insert(service_base(&candidate));
+        classes.insert(pascal_case(&candidate));
+        names.insert(candidate.clone());
+        renames.insert(rule.name.clone(), candidate);
+    }
+    csilgen_common::rename_rules(spec, &renames)
 }
 
 fn process_generation(mut input: WasmGeneratorInput) -> Result<WasmGeneratorOutput, i32> {
@@ -1073,7 +1122,7 @@ fn first_channel_example(input: &WasmGeneratorInput) -> Option<ChannelExample> {
             let iface = pascal_case(&rule.name);
             return Some(ChannelExample {
                 iface: iface.clone(),
-                service_wire: rule.name.clone(),
+                service_wire: input.csil_spec.declared_name(&rule.name).to_string(),
                 route_fn: format!("route{iface}Channel"),
                 encode_fn: format!("encode{iface}{}", pascal_case(&op.name)),
                 inbound_type: pascal_case(reference_raw(&op.input_type)),
@@ -1187,11 +1236,11 @@ fn enum_default_kotlin(
     let choices = find_choice(input, name)?;
     let iface = pascal_case(name);
     if let Some(label) = csilgen_common::enum_number_label(choices, value) {
-        return Some(format!("{iface}.{}", enum_text_variant(label)));
+        return Some(format!("{iface}.{}", enum_text_variant(choices, label)));
     }
     match classify_choice(choices) {
         ChoiceKind::EnumText => match value {
-            CsilLiteralValue::Text(s) => Some(format!("{iface}.{}", enum_text_variant(s))),
+            CsilLiteralValue::Text(s) => Some(format!("{iface}.{}", enum_text_variant(choices, s))),
             _ => None,
         },
         ChoiceKind::EnumInt => match value {
@@ -1559,8 +1608,15 @@ fn generate_client(
     let mut emitted = false;
     for rule in &input.csil_spec.rules {
         if let CsilRuleType::ServiceDef(service) = &rule.rule_type {
+            let wire = input.csil_spec.declared_name(&rule.name);
             emit_client_class(
-                &mut body, &rule.name, service, &records, &named, &aliases, shape,
+                &mut body,
+                (&rule.name, wire),
+                service,
+                &records,
+                &named,
+                &aliases,
+                shape,
             );
             emitted = true;
         }
@@ -1575,7 +1631,7 @@ fn generate_client(
 
 fn emit_client_class(
     body: &mut String,
-    name: &str,
+    (name, wire): (&str, &str),
     service: &CsilServiceDefinition,
     records: &std::collections::HashSet<String>,
     named: &std::collections::HashSet<String>,
@@ -1635,9 +1691,9 @@ fn emit_client_class(
         // The reply variant picks the arm: the resolver passes the success payload through,
         // throws the declared error arm, and rejects a missing or unknown variant.
         let call = if multi_arm {
-            format!("resolveRpcReply(\"{name}\", \"{wire_op}\", reply.variant, reply.payload)")
+            format!("resolveRpcReply(\"{wire}\", \"{wire_op}\", reply.variant, reply.payload)")
         } else {
-            format!("transport.call(\"{name}\", \"{wire_op}\", {req_bytes})")
+            format!("transport.call(\"{wire}\", \"{wire_op}\", {req_bytes})")
         };
         // A record success reuses the generic reified `decode`; any other shape uses the
         // op's per-op response decoder.
@@ -1656,7 +1712,7 @@ fn emit_client_class(
         }
         if multi_arm {
             body.push_str(&format!(
-                "        val reply = transport.callReply(\"{name}\", \"{wire_op}\", {req_bytes})\n"
+                "        val reply = transport.callReply(\"{wire}\", \"{wire_op}\", {req_bytes})\n"
             ));
         }
         body.push_str(&format!("        return {decode_resp}\n"));
@@ -2007,10 +2063,13 @@ fn kotlin_enc_value(
         CsilTypeExpression::Builtin(name) => match name.as_str() {
             "int" | "nint" => format!("CborValue.CInt({expr})"),
             "uint" => format!("CborValue.CUint({expr})"),
-            "float" | "float64" | "double" => format!("CborValue.CFloat({expr})"),
+            "float" | "float16" | "float32" | "float64" | "double" => {
+                format!("CborValue.CFloat({expr})")
+            }
             "text" | "tstr" => format!("CborValue.CText({expr})"),
             "bytes" | "bstr" => format!("CborValue.CBytes({expr})"),
             "bool" => format!("CborValue.CBool({expr})"),
+            "true" | "false" => format!("CborValue.CBool({name})"),
             "date" => format!("CsilCbor.encDate({expr})"),
             "timestamp" => format!("CsilCbor.encTimestamp({expr})"),
             "cddl_time" => format!("CsilCbor.encCddlTime({expr})"),
@@ -2018,7 +2077,7 @@ fn kotlin_enc_value(
             "decimal" => format!(
                 "CborValue.CTag(4uL, CborValue.CArray(listOf(CborValue.CInt((-({expr}).scale()).toLong()), CborValue.CInt(({expr}).unscaledValue().longValueExact()))))"
             ),
-            "nil" | "null" => "CborValue.CNull".to_string(),
+            "nil" | "null" | "undefined" => "CborValue.CNull".to_string(),
             // `any` is already a CborValue (see map_csil_type_to_kotlin); pass it through.
             "any" => expr.to_string(),
             _ => "CborValue.CNull".to_string(),
@@ -2040,7 +2099,9 @@ fn kotlin_enc_value(
         CsilTypeExpression::Map { key, value, .. } => {
             let k = kotlin_enc_value(key, "csilK", records, aliases);
             let v = kotlin_enc_value(value, "csilV", records, aliases);
-            format!("CborValue.CMap(({expr}).map {{ (csilK, csilV) -> {k} to {v} }})")
+            format!(
+                "CborValue.CMap(CsilCbor.canonicalEntries(({expr}).map {{ (csilK, csilV) -> {k} to {v} }}))"
+            )
         }
         // A fixed-shape tuple is a positional CBOR array; an absent optional element is a
         // `null` held in place so the array length is fixed (the locked wire).
@@ -2087,10 +2148,18 @@ fn kotlin_dec_value(
         CsilTypeExpression::Builtin(name) => match name.as_str() {
             "int" | "nint" => format!("CsilCbor.asLong({expr})"),
             "uint" => format!("CsilCbor.asULong({expr})"),
-            "float" | "float64" | "double" => format!("CsilCbor.asDouble({expr})"),
+            "float" | "float16" | "float32" | "float64" | "double" => {
+                format!("CsilCbor.asDouble({expr})")
+            }
             "text" | "tstr" => format!("CsilCbor.asText({expr})"),
             "bytes" | "bstr" => format!("CsilCbor.asBytes({expr})"),
             "bool" => format!("CsilCbor.asBoolean({expr})"),
+            "true" | "false" => {
+                format!("CsilCbor.expectLiteral({expr}, CborValue.CBool({name}), {name})")
+            }
+            "nil" | "null" | "undefined" => {
+                format!("CsilCbor.expectLiteral({expr}, CborValue.CNull, Unit)")
+            }
             "date" => format!("CsilCbor.asDate({expr})"),
             "timestamp" => format!("CsilCbor.asTimestamp({expr})"),
             "cddl_time" => format!("CsilCbor.asCddlTime({expr})"),
@@ -2114,7 +2183,7 @@ fn kotlin_dec_value(
         CsilTypeExpression::Map { key, value, .. } => {
             let k = kotlin_dec_value(key, "csilK", records, aliases);
             let v = kotlin_dec_value(value, "csilV", records, aliases);
-            format!("CsilCbor.asMap({expr}).associate {{ (csilK, csilV) -> {k} to {v} }}")
+            format!("CsilCbor.asDynamicMap({expr}).associate {{ (csilK, csilV) -> {k} to {v} }}")
         }
         // Tuple: a positional CBOR array; optional elements decode through a `null`-in-place
         // guard. The result is a `List<Any?>` matching the generated field type.
@@ -2210,10 +2279,38 @@ fn classify_enum(literals: &[&CsilLiteralValue]) -> ChoiceKind {
     }
 }
 
-/// The enum-constant name for a text literal: PascalCase of the literal text (mirrors the
-/// reference generators, e.g. `"green"` → `Green`).
-fn enum_text_variant(s: &str) -> String {
-    pascal_case(s)
+/// The enum-constant names of a text enum's values, in order: the shared word split in
+/// PascalCase (`"green"` → `Green`, `"calendars.read"` → `CalendarsRead`), with `V` first
+/// for a value that starts with a digit and a number for a repeat.
+fn text_enum_variants(values: &[&str]) -> Vec<String> {
+    csilgen_common::member_idents(
+        values,
+        |words| pascal_case(&words.join("_")),
+        text_variant_legal,
+    )
+}
+
+/// The constant name of one text value of `choices`.
+fn enum_text_variant(choices: &[CsilTypeExpression], value: &str) -> String {
+    let values: Vec<&str> = choices
+        .iter()
+        .filter_map(|c| match choice_arm_literal(c) {
+            Some(CsilLiteralValue::Text(s)) => Some(s.as_str()),
+            _ => None,
+        })
+        .collect();
+    let at = values.iter().position(|v| *v == value).unwrap_or(0);
+    text_enum_variants(&values)
+        .into_iter()
+        .nth(at)
+        .unwrap_or_else(|| text_enum_variants(&[value]).remove(0))
+}
+
+/// Kotlin keywords are lower case, so a PascalCase constant meets none of them. It must
+/// not start with a digit, and an enum class with a companion object cannot also have a
+/// constant `Companion`.
+fn text_variant_legal(name: &str) -> bool {
+    name.starts_with(|c: char| c.is_ascii_alphabetic()) && name != "Companion"
 }
 
 /// The enum-constant name for an int literal: `V<n>` (a negative `n` becomes `VNeg<abs>`
@@ -2227,14 +2324,14 @@ fn enum_int_variant(n: i64) -> String {
 }
 
 /// A name basis for a literal's enum constant in a `MixedEnum` — text/int reuse
-/// `enum_text_variant`/`enum_int_variant` so the SAME literal gets the SAME constant
+/// `text_enum_variants`/`enum_int_variant` so the SAME literal gets the SAME constant
 /// name whether or not the rest of the choice happens to share its kind. Bool/Float/
 /// Null/Bytes get their own basis; an Array literal choice arm does not occur from
 /// real CSIL source (see the module doc on `csilgen_common::choice`) but is handled
 /// defensively via a stable placeholder so this never panics.
 fn mixed_enum_variant_base(lit: &CsilLiteralValue) -> String {
     match lit {
-        CsilLiteralValue::Text(s) => enum_text_variant(s),
+        CsilLiteralValue::Text(s) => text_enum_variants(&[s]).remove(0),
         CsilLiteralValue::Integer(n) => enum_int_variant(*n),
         CsilLiteralValue::Bool(true) => "True".to_string(),
         CsilLiteralValue::Bool(false) => "False".to_string(),
@@ -2286,13 +2383,14 @@ fn emit_named_choice_type(body: &mut String, name: &str, choices: &[CsilTypeExpr
     let iface = pascal_case(name);
     match classify_choice(choices) {
         ChoiceKind::EnumText => {
-            let variants: Vec<String> = choices
+            let values: Vec<&str> = choices
                 .iter()
                 .filter_map(|c| match choice_arm_literal(c) {
-                    Some(CsilLiteralValue::Text(s)) => Some(enum_text_variant(s)),
+                    Some(CsilLiteralValue::Text(s)) => Some(s.as_str()),
                     _ => None,
                 })
                 .collect();
+            let variants = text_enum_variants(&values);
             if let Some(numbers) = csilgen_common::enum_numbers(choices) {
                 let labels = csilgen_common::text_enum_members(choices).unwrap();
                 let entries = variants
@@ -2380,12 +2478,16 @@ fn emit_choice_codec(
             body.push_str(&format!("fun {tn}.toCborValue(): CborValue = CborValue.CInt(wireNumber)\n\nfun {dec}FromCborValue(cbor: CborValue): {tn} = {tn}.fromNumber(CsilCbor.asLong(cbor)) ?: throw CborError(\"unknown {tn} value\")\n\n"));
         }
         ChoiceKind::EnumText => {
-            let lits: Vec<(String, String)> = choices
+            let values: Vec<&str> = choices
                 .iter()
                 .filter_map(|c| match choice_arm_literal(c) {
-                    Some(CsilLiteralValue::Text(s)) => Some((enum_text_variant(s), s.clone())),
+                    Some(CsilLiteralValue::Text(s)) => Some(s.as_str()),
                     _ => None,
                 })
+                .collect();
+            let lits: Vec<(String, String)> = text_enum_variants(&values)
+                .into_iter()
+                .zip(values.iter().map(|v| v.to_string()))
                 .collect();
             body.push_str(&format!(
                 "/** Encode a {tn} enum as its bare literal value. */\n"
@@ -2715,7 +2817,12 @@ fn emit_op_codec_pair(
 /// and the generic dispatch. `None` when the spec declares no record types.
 fn generate_codec(input: &WasmGeneratorInput, config: &KotlinConfig) -> Option<String> {
     let records = kotlin_record_names(input);
-    if records.is_empty() && input.csil_spec.rpc_operations().next().is_none() {
+    // A type that holds `any` names the runtime's `CborValue`, so the runtime must exist
+    // even in a spec without records.
+    if records.is_empty()
+        && input.csil_spec.rpc_operations().next().is_none()
+        && !input.csil_spec.uses_builtin("any")
+    {
         return None;
     }
     let aliases = codec_aliases(input);
@@ -2757,6 +2864,7 @@ fn generate_codec(input: &WasmGeneratorInput, config: &KotlinConfig) -> Option<S
         for (service, op, arms) in input.csil_spec.rpc_operations() {
             let method = &op.name;
             let stem = op_codec_stem(service, op);
+            let service = input.csil_spec.declared_name(service);
             let success = map_csil_type_to_kotlin(&arms[0], &None);
             let mut encode = format!(
                 "fun encode{stem}Reply(handler: () -> {success}): RpcReply =\n    try {{\n        val value = handler()\n"
@@ -2824,7 +2932,9 @@ sealed class CborValue {
         override fun hashCode(): Int = value.contentHashCode()
     }
     data class CArray(val items: List<CborValue>) : CborValue()
-    data class CMap(val entries: List<Pair<CborValue, CborValue>>) : CborValue()
+    // `canonical` is false when a decoded map's encoded keys were not strictly ascending
+    // bytewise (RFC 8949 section 4.2.1): a dynamic map rejects that, a record does not.
+    data class CMap(val entries: List<Pair<CborValue, CborValue>>, val canonical: Boolean = true) : CborValue()
     data class CTag(val tag: ULong, val value: CborValue) : CborValue()
 }
 
@@ -3057,12 +3167,30 @@ object CsilCbor {
                 if (arg > (cur.b.size - cur.pos).toULong()) throw CborError("map length exceeds remaining input")
                 val n = arg.toInt()
                 val entries = ArrayList<Pair<CborValue, CborValue>>(minOf(n, PREALLOC_LIMIT))
+                // Each key is compared with the one before it as raw bytes, so the order
+                // check is O(n). Only a map out of order can repeat a key, so the set of
+                // seen keys is built only then.
+                val keyRanges = ArrayList<IntArray>(minOf(n, PREALLOC_LIMIT))
+                var seen: HashSet<java.nio.ByteBuffer>? = null
                 repeat(n) {
+                    val keyStart = cur.pos
                     val k = dec(cur, depth + 1)
+                    val keyEnd = cur.pos
+                    if (!shortestHead(cur.b, keyStart)) throw CborError("csil cbor: map key is not in shortest form")
+                    if (seen == null && keyRanges.isNotEmpty()) {
+                        val prev = keyRanges[keyRanges.size - 1]
+                        if (java.util.Arrays.compareUnsigned(cur.b, prev[0], prev[1], cur.b, keyStart, keyEnd) >= 0) {
+                            seen = keyRanges.mapTo(HashSet()) { java.nio.ByteBuffer.wrap(cur.b, it[0], it[1] - it[0]) }
+                        }
+                    }
+                    if (seen?.add(java.nio.ByteBuffer.wrap(cur.b, keyStart, keyEnd - keyStart)) == false) {
+                        throw CborError("csil cbor: duplicate key ${describeKey(k)}")
+                    }
+                    keyRanges.add(intArrayOf(keyStart, keyEnd))
                     val value = dec(cur, depth + 1)
                     entries.add(k to value)
                 }
-                CborValue.CMap(entries)
+                CborValue.CMap(entries, seen == null)
             }
             6 -> CborValue.CTag(arg, dec(cur, depth + 1))
             else -> throw CborError("malformed CBOR major type")
@@ -3125,6 +3253,35 @@ object CsilCbor {
 
     fun asMap(v: CborValue): List<Pair<CborValue, CborValue>> =
         (v as? CborValue.CMap)?.entries ?: throw CborError("expected map")
+
+    /** The entries of a dynamic map, which must arrive in canonical key order. */
+    fun asDynamicMap(v: CborValue): List<Pair<CborValue, CborValue>> {
+        if (v is CborValue.CMap && !v.canonical) throw CborError("csil cbor: map keys are not in canonical order")
+        return asMap(v)
+    }
+
+    /** `entries` in canonical order: bytewise order of each key's encoding, which is not
+     * the order of the Kotlin keys. */
+    fun canonicalEntries(entries: List<Pair<CborValue, CborValue>>): List<Pair<CborValue, CborValue>> =
+        entries.map { encode(it.first) to it }
+            .sortedWith { x, y -> java.util.Arrays.compareUnsigned(x.first, y.first) }
+            .map { it.second }
+
+    /** Whether the head at [at] uses the shortest argument for its value. A float head
+     * (major 7) carries no length, so it is not checked. */
+    private fun shortestHead(b: ByteArray, at: Int): Boolean {
+        val major = (b[at].toInt() and 0xff) shr 5
+        val low = b[at].toInt() and 0x1f
+        if (major == 7 || low < 24) return true
+        val width = 1 shl (low - 24)
+        var arg = 0uL
+        for (i in 1..width) arg = (arg shl 8) or (b[at + i].toInt() and 0xff).toULong()
+        val floor = if (low == 24) 24uL else 1uL shl (8 * (width / 2))
+        return arg >= floor
+    }
+
+    private fun describeKey(k: CborValue): String =
+        if (k is CborValue.CText) "\"${k.value}\"" else encode(k).joinToString("") { "%02x".format(it) }
 
     fun encDate(date: java.time.LocalDate): CborValue {
         val text = date.toString()
@@ -3734,7 +3891,7 @@ fn map_csil_type_to_kotlin(
         CsilTypeExpression::Builtin(name) => match name.as_str() {
             "int" | "nint" => "Long".to_string(),
             "uint" => "ULong".to_string(),
-            "float" | "float64" | "double" => "Double".to_string(),
+            "float" | "float16" | "float32" | "float64" | "double" => "Double".to_string(),
             "text" | "tstr" => "String".to_string(),
             "bytes" | "bstr" => "ByteArray".to_string(),
             "bool" => "Boolean".to_string(),
@@ -3744,7 +3901,9 @@ fn map_csil_type_to_kotlin(
             "timestamp" | "cddl_time" => "java.time.Instant".to_string(),
             // CBOR tag 4 exact decimal; BigDecimal is the JVM-idiomatic exact type.
             "decimal" => "java.math.BigDecimal".to_string(),
-            "nil" | "null" => "Unit".to_string(),
+            "nil" | "null" | "undefined" => "Unit".to_string(),
+            // A `true`/`false` type has one value, so it is a Boolean the codec checks.
+            "true" | "false" => "Boolean".to_string(),
             // `any` rides as the codec's own CBOR value model so it passes through
             // byte-identically, the JVM analog of Rust's `CsilCborValue` mapping.
             "any" => "CborValue".to_string(),
@@ -4139,7 +4298,7 @@ mod tests {
             CODEC_RUNTIME_KT
                 .matches(">(minOf(n, PREALLOC_LIMIT))")
                 .count(),
-            2
+            3
         );
         assert!(CODEC_RUNTIME_KT.contains("map length exceeds remaining input"));
         assert!(CODEC_RUNTIME_KT.contains("if (depth > 64)"));
@@ -5085,7 +5244,7 @@ mod tests {
         assert!(
             codec.contains("CborValue.CArray((this.tags).map { csilE -> CborValue.CText(csilE) })")
         );
-        assert!(codec.contains("CborValue.CMap((this.labels).map { (csilK, csilV) -> CborValue.CText(csilK) to CborValue.CInt(csilV) })"));
+        assert!(codec.contains("CborValue.CMap(CsilCbor.canonicalEntries((this.labels).map { (csilK, csilV) -> CborValue.CText(csilK) to CborValue.CInt(csilV) }))"));
         // Generic dispatch the typed client uses.
         assert!(codec.contains("fun <T> encode(value: T): ByteArray"));
         assert!(codec.contains("inline fun <reified T> decode(bytes: ByteArray): T"));
@@ -5385,9 +5544,9 @@ mod tests {
         let codec = content(&out, "Codec.kt");
 
         // The named map alias resolves to a real CBOR map, not the `CborValue.CNull` stub.
-        assert!(codec.contains("CborValue.CMap((this.counts).map { (csilK, csilV) -> CborValue.CText(csilK) to CborValue.CInt(csilV) })"));
+        assert!(codec.contains("CborValue.CMap(CsilCbor.canonicalEntries((this.counts).map { (csilK, csilV) -> CborValue.CText(csilK) to CborValue.CInt(csilV) }))"));
         assert!(codec.contains(
-            "CsilCbor.asMap(CsilCbor.require(cbor, \"counts\")).associate { (csilK, csilV) -> CsilCbor.asText(csilK) to CsilCbor.asLong(csilV) }"
+            "CsilCbor.asDynamicMap(CsilCbor.require(cbor, \"counts\")).associate { (csilK, csilV) -> CsilCbor.asText(csilK) to CsilCbor.asLong(csilV) }"
         ));
         // The named list alias resolves to a CBOR array.
         assert!(
@@ -5398,9 +5557,9 @@ mod tests {
         // The named scalar alias resolves to text.
         assert!(codec.contains("CborValue.CText(this.uuid)"));
         // The map-of-record alias recurses to the record codec on both seams.
-        assert!(codec.contains("CborValue.CMap((this.members).map { (csilK, csilV) -> CborValue.CText(csilK) to csilV.toCborValue() })"));
+        assert!(codec.contains("CborValue.CMap(CsilCbor.canonicalEntries((this.members).map { (csilK, csilV) -> CborValue.CText(csilK) to csilV.toCborValue() }))"));
         assert!(codec.contains(
-            "CsilCbor.asMap(CsilCbor.require(cbor, \"members\")).associate { (csilK, csilV) -> CsilCbor.asText(csilK) to memberFromCborValue(csilV) }"
+            "CsilCbor.asDynamicMap(CsilCbor.require(cbor, \"members\")).associate { (csilK, csilV) -> CsilCbor.asText(csilK) to memberFromCborValue(csilV) }"
         ));
 
         // No field above degraded to the null/text stub a bare non-record reference yields.
@@ -6402,4 +6561,408 @@ mod tests {
             .collect();
         assert_eq!(renames.len(), 1, "{:?}", out.warnings);
     }
+
+    fn record_rule(name: &str, fields: &[(&str, &str)]) -> CsilRule {
+        rule(
+            name,
+            CsilRuleType::GroupDef(CsilGroupExpression {
+                entries: fields
+                    .iter()
+                    .map(|(key, ty)| {
+                        let ty = if ty.starts_with(char::is_uppercase) {
+                            reference(ty)
+                        } else {
+                            builtin(ty)
+                        };
+                        entry(key, ty, None)
+                    })
+                    .collect(),
+            }),
+        )
+    }
+
+    fn service_rule(name: &str, ops: Vec<CsilServiceOperation>) -> CsilRule {
+        rule(
+            name,
+            CsilRuleType::ServiceDef(CsilServiceDefinition {
+                operations: ops,
+                wire_id: None,
+            }),
+        )
+    }
+
+    fn unary(
+        name: &str,
+        input: CsilTypeExpression,
+        output: CsilTypeExpression,
+    ) -> CsilServiceOperation {
+        op(
+            name,
+            input,
+            output,
+            CsilServiceDirection::Unidirectional,
+            None,
+        )
+    }
+
+    fn rename_warnings(out: &WasmGeneratorOutput) -> Vec<String> {
+        out.warnings
+            .iter()
+            .map(|w| w.message.clone())
+            .filter(|m| m.contains("is generated as"))
+            .collect()
+    }
+
+    /// Build the generated Kotlin sources (plus an optional `main.kt` driver) with Gradle
+    /// offline and return what the driver prints. `None` when there is no Gradle.
+    fn run_under_gradle(out: &WasmGeneratorOutput, driver: Option<&str>) -> Option<String> {
+        let have = std::process::Command::new("gradle")
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if !have {
+            eprintln!("skipping: no gradle on PATH");
+            return None;
+        }
+        static RUN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = RUN.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let dir =
+            std::env::temp_dir().join(format!("csilgen-kotlin-run-{}-{n}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let src = dir.join("src/main/kotlin");
+        for f in out.files.iter().filter(|f| f.path.ends_with(".kt")) {
+            let path = src.join(&f.path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, &f.content).unwrap();
+        }
+        let main =
+            driver.unwrap_or("package community.catalyst.csilgen.generated\n\nfun main() {}\n");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("Driver.kt"), main).unwrap();
+        std::fs::write(
+            dir.join("settings.gradle.kts"),
+            "rootProject.name = \"check\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("build.gradle.kts"),
+            "plugins {\n    kotlin(\"jvm\") version \"2.2.20\"\n    application\n}\nrepositories { mavenCentral() }\napplication { mainClass.set(\"community.catalyst.csilgen.generated.DriverKt\") }\n",
+        )
+        .unwrap();
+        let run = std::process::Command::new("gradle")
+            .args(["--offline", "--console=plain", "-q", "run"])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&run.stdout).into_owned();
+        assert!(
+            run.status.success(),
+            "gradle failed:\n{stdout}{}",
+            String::from_utf8_lossy(&run.stderr)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        Some(stdout)
+    }
+
+    /// An op whose input and output are its own records emits no op-keyed codec that
+    /// could meet them, so the records keep their names (linkkeys
+    /// `RpIssueAttestationRequest`).
+    #[test]
+    fn op_records_named_like_the_op_keep_their_names() {
+        let rules = vec![
+            record_rule("SignedSigningRequest", &[("sig", "bytes")]),
+            record_rule("Claim", &[("v", "text")]),
+            record_rule(
+                "RpIssueAttestationRequest",
+                &[
+                    ("signed_request", "SignedSigningRequest"),
+                    ("claim_type", "text"),
+                ],
+            ),
+            record_rule(
+                "RpIssueAttestationResponse",
+                &[("claim", "Claim"), ("deposited", "bool")],
+            ),
+            service_rule(
+                "Rp",
+                vec![unary(
+                    "issue-attestation",
+                    reference("RpIssueAttestationRequest"),
+                    reference("RpIssueAttestationResponse"),
+                )],
+            ),
+        ];
+        let out = process_generation(spec("kotlin-client", rules)).unwrap();
+        assert!(rename_warnings(&out).is_empty(), "{:?}", out.warnings);
+        let types = content(&out, "Types.kt");
+        assert_eq!(
+            types
+                .matches("data class RpIssueAttestationRequest(")
+                .count(),
+            1
+        );
+        run_under_gradle(&out, None);
+    }
+
+    /// Kotlin op codecs are functions and type names are classes, so `MemberID ->
+    /// MemberID` and a record `MemberGetMemberRequest` declare nothing twice: the record
+    /// keeps its name. A rule named like the client class is a real clash and is renamed.
+    #[test]
+    fn only_a_real_clash_with_a_derived_name_renames() {
+        let rules = vec![
+            rule("MemberID", CsilRuleType::TypeDef(builtin("text"))),
+            record_rule("MemberGetMemberRequest", &[("id", "text")]),
+            record_rule("MemberClient", &[("id", "text")]),
+            service_rule(
+                "Member",
+                vec![unary(
+                    "get-member",
+                    reference("MemberID"),
+                    reference("MemberID"),
+                )],
+            ),
+        ];
+        let out = process_generation(spec("kotlin-client", rules)).unwrap();
+        let renames = rename_warnings(&out);
+        assert_eq!(renames.len(), 1, "{renames:?}");
+        assert!(renames[0].contains("rule `MemberClient` is generated as `MemberClientType`"));
+        let types = content(&out, "Types.kt");
+        assert!(types.contains("data class MemberGetMemberRequest("));
+        assert!(content(&out, "Codec.kt").contains("fun encodeMemberGetMemberRequest("));
+        run_under_gradle(&out, None);
+    }
+
+    /// `read-counts: Holder -> { * text => int } / Err` exposes the whole union, both
+    /// arms, on the client and the server.
+    #[test]
+    fn mixed_op_output_is_a_named_union_on_both_sides() {
+        let rules = || {
+            vec![
+                record_rule("Holder", &[("n", "int")]),
+                record_rule("Err", &[("message", "text")]),
+                service_rule(
+                    "Lookup",
+                    vec![unary(
+                        "read-counts",
+                        reference("Holder"),
+                        CsilTypeExpression::Choice(vec![
+                            CsilTypeExpression::Map {
+                                key: Box::new(builtin("text")),
+                                value: Box::new(builtin("int")),
+                                occurrence: None,
+                            },
+                            reference("Err"),
+                        ]),
+                    )],
+                ),
+            ]
+        };
+        let client = process_generation(spec("kotlin-client", rules())).unwrap();
+        assert!(
+            content(&client, "Client.kt")
+                .contains("fun readCounts(request: Holder): LookupReadCountsOutput")
+        );
+        let types = content(&client, "Types.kt");
+        assert!(types.contains(
+            "data class LookupReadCountsOutputVariant0(val value: Map<String, Long>) : LookupReadCountsOutput"
+        ));
+        assert!(types.contains(
+            "data class LookupReadCountsOutputVariant1(val value: Err) : LookupReadCountsOutput"
+        ));
+        let server = process_generation(spec("kotlin-server", rules())).unwrap();
+        assert!(
+            content(&server, "Services.kt")
+                .contains("fun readCounts(request: Holder): LookupReadCountsOutput")
+        );
+        run_under_gradle(&client, None);
+    }
+
+    /// `UserSvc` and `user-svc` are one Kotlin identifier; the later one is renamed for
+    /// the generated declarations, and both keep their declared name on the wire.
+    #[test]
+    fn services_with_one_identifier_keep_their_wire_names() {
+        let rules = || {
+            vec![
+                record_rule("Ping", &[("n", "int")]),
+                service_rule(
+                    "UserSvc",
+                    vec![unary("ping", reference("Ping"), reference("Ping"))],
+                ),
+                service_rule(
+                    "user-svc",
+                    vec![unary("ping", reference("Ping"), reference("Ping"))],
+                ),
+            ]
+        };
+        let out = process_generation(spec("kotlin-client", rules())).unwrap();
+        let renames = rename_warnings(&out);
+        assert_eq!(renames.len(), 1, "{renames:?}");
+        assert!(renames[0].starts_with("service `user-svc` is generated as"));
+        let client = content(&out, "Client.kt");
+        assert!(client.contains("class UserSvcClient("));
+        assert!(client.contains("class UserSvc2Client("));
+        assert!(client.contains("transport.call(\"UserSvc\", \"ping\""));
+        assert!(client.contains("transport.call(\"user-svc\", \"ping\""));
+        run_under_gradle(&out, None);
+        let server = process_generation(spec("kotlin-server", rules())).unwrap();
+        let services = content(&server, "Services.kt");
+        assert!(services.contains("interface UserSvc {"));
+        assert!(services.contains("interface UserSvc2 {"));
+        run_under_gradle(&server, None);
+    }
+
+    /// `Foo` and `FooService` have distinct identifiers, but both drop to the base `Foo`
+    /// and would declare `FooClient` twice. The local pass renames the later one.
+    #[test]
+    fn services_with_one_base_are_told_apart() {
+        let rules = vec![
+            record_rule("Ping", &[("n", "int")]),
+            service_rule(
+                "Foo",
+                vec![unary("ping", reference("Ping"), reference("Ping"))],
+            ),
+            service_rule(
+                "FooService",
+                vec![unary("ping", reference("Ping"), reference("Ping"))],
+            ),
+        ];
+        let out = process_generation(spec("kotlin-client", rules)).unwrap();
+        assert_eq!(rename_warnings(&out).len(), 1, "{:?}", out.warnings);
+        let client = content(&out, "Client.kt");
+        assert!(client.contains("class FooClient("));
+        assert!(client.contains("class FooServiceClient("));
+        assert!(client.contains("transport.call(\"FooService\", \"ping\""));
+        run_under_gradle(&out, None);
+    }
+
+    /// The hoister names the arms of `PickVariant = {a: int} / {b: int}` `PickVariant_0`
+    /// and `PickVariant_1`, whose class `PickVariant0` is also the derived variant class
+    /// of the union `Pick`. The synthesized rule is renamed, the user rules are not.
+    #[test]
+    fn synthesized_rule_that_clashes_is_renamed() {
+        let inline = |key: &str| {
+            CsilTypeExpression::Group(CsilGroupExpression {
+                entries: vec![entry(key, builtin("int"), None)],
+            })
+        };
+        let rules = vec![
+            record_rule("A", &[("a", "int")]),
+            record_rule("B", &[("b", "int")]),
+            rule(
+                "Pick",
+                CsilRuleType::TypeDef(CsilTypeExpression::Choice(vec![
+                    reference("A"),
+                    reference("B"),
+                ])),
+            ),
+            rule(
+                "PickVariant",
+                CsilRuleType::TypeDef(CsilTypeExpression::Choice(vec![inline("a"), inline("b")])),
+            ),
+        ];
+        let out = process_generation(spec("kotlin", rules)).unwrap();
+        let renames = rename_warnings(&out);
+        assert_eq!(renames.len(), 2, "{renames:?}");
+        assert!(
+            renames
+                .iter()
+                .any(|m| m.contains("rule `PickVariant_0` is generated as `PickVariant_0Type`"))
+        );
+        assert!(
+            renames
+                .iter()
+                .any(|m| m.contains("rule `PickVariant_1` is generated as `PickVariant_1Type`"))
+        );
+        let types = content(&out, "Types.kt");
+        assert!(types.contains("sealed interface PickVariant\n"));
+        assert!(types.contains("data class PickVariant0Type("));
+        run_under_gradle(&out, None);
+    }
+
+    /// Dynamic maps encode in canonical key order and decode only in that order; a
+    /// record takes its fields in any order but not twice.
+    #[test]
+    fn map_key_order_and_duplicate_keys_under_gradle() {
+        let rules = vec![
+            rule(
+                "Counts",
+                CsilRuleType::TypeDef(CsilTypeExpression::Map {
+                    key: Box::new(builtin("text")),
+                    value: Box::new(builtin("int")),
+                    occurrence: None,
+                }),
+            ),
+            record_rule("Holder", &[("counts", "Counts"), ("n", "int")]),
+        ];
+        let out = process_generation(spec("kotlin", rules)).unwrap();
+        let driver = r#"package community.catalyst.csilgen.generated
+
+private fun hex(text: String): ByteArray = ByteArray(text.length / 2) { text.substring(it * 2, it * 2 + 2).toInt(16).toByte() }
+
+private fun decodes(text: String): String = try {
+    holderFromCbor(hex(text))
+    "ok"
+} catch (e: CborError) {
+    e.message ?: ""
+}
+
+fun main() {
+    val bytes = Holder(counts = linkedMapOf("aa" to 1L, "b" to 2L), n = 0L).toCbor()
+    println(bytes.joinToString("") { "%02x".format(it.toInt() and 0xff) })
+    println(decodes("a2616e0066636f756e7473a261620262616102"))
+    println(decodes("a2616e0066636f756e7473a262616102616201"))
+    println(decodes("a2616e0066636f756e7473a2616101616102"))
+    println(decodes("a3616e00616e0066636f756e7473a0"))
+    println(decodes("a2616e0066636f756e7473a178016101"))
+    println(decodes("a278016e0066636f756e7473a0"))
+}
+"#;
+        if let Some(stdout) = run_under_gradle(&out, Some(driver)) {
+            assert_eq!(
+                stdout,
+                "a2616e0066636f756e7473a261620262616101\nok\ncsil cbor: map keys are not in canonical order\ncsil cbor: duplicate key \"a\"\ncsil cbor: duplicate key \"n\"\ncsil cbor: map key is not in shortest form\ncsil cbor: map key is not in shortest form\n"
+            );
+        }
+    }
+
+    /// A text enum value that is not an identifier gets a legal constant from the shared
+    /// word split, and keeps its value on the wire.
+    #[test]
+    fn dotted_enum_values_get_legal_constants_and_round_trip() {
+        let scope = rule(
+            "Scope",
+            CsilRuleType::TypeDef(CsilTypeExpression::Choice(
+                DOTTED_VALUES
+                    .iter()
+                    .map(|v| CsilTypeExpression::Literal(CsilLiteralValue::Text(v.to_string())))
+                    .collect(),
+            )),
+        );
+        let out = process_generation(spec(
+            "kotlin",
+            vec![scope, record_rule("Grant", &[("scope", "Scope")])],
+        ))
+        .unwrap();
+        assert!(
+            content(&out, "Types.kt")
+                .contains("enum class Scope { CalendarsRead, EventsWrite, ABC, V2fa, Class }")
+        );
+        let driver = r#"package community.catalyst.csilgen.generated
+
+fun main() {
+    for (s in Scope.values()) {
+        val back = grantFromCbor(Grant(scope = s).toCbor())
+        check(back.scope == s) { s.name }
+        println((s.toCborValue() as CborValue.CText).value)
+    }
+}
+"#;
+        if let Some(stdout) = run_under_gradle(&out, Some(driver)) {
+            assert_eq!(stdout, DOTTED_EXPECTED);
+        }
+    }
+
+    const DOTTED_VALUES: [&str; 5] = ["calendars.read", "events.write", "a-b c", "2fa", "class"];
+    const DOTTED_EXPECTED: &str = "calendars.read\nevents.write\na-b c\n2fa\nclass\n";
 }

@@ -110,7 +110,7 @@ pub fn run_generation(input: &WasmGeneratorInput) -> Result<WasmGeneratorOutput,
     Ok(WasmGeneratorOutput {
         files,
         warnings: csilgen_common::rename_warnings(
-            &prepare_spec(&input.csil_spec),
+            &prepare_spec(&input.csil_spec, &input.config),
             &input.config.target,
         ),
         stats: GenerationStats {
@@ -248,25 +248,50 @@ const RESERVED_TYPE_NAMES: &[&str] = &[
     "ZeroDivisionError",
 ];
 
-/// Rename each rule whose constant is reserved, or equals a class the generator
-/// derives from a service or an RPC error arm (`<Base>Client`, `<Base>Handlers`,
-/// `<Base>Router`, `<Base>WireIds`, `CsilCbor::<Arm>Refusal`). A reopened
-/// `<Base>Client` replaces the record's constructor, a `<Base>Router` or
-/// `<Base>WireIds` module cannot reopen the record class, and `<Arm>Refusal`
-/// hides the record in the codec.
-fn rename_reserved_ruby_names(spec: &CsilSpecSerialized) -> CsilSpecSerialized {
+/// Which client/server files a request emits. Both the emitter and the derived-name
+/// reservation read this, so a name is reserved exactly when its class is emitted.
+/// A package carries both surfaces, because its genquickstart uses the client and
+/// the router. `None` for an unknown sub-target.
+fn emitted_surfaces(config: &GeneratorConfig) -> Option<(bool, bool)> {
+    let surface = match config.target.as_str() {
+        "ruby" | "ruby-server" => Surface::Server,
+        "ruby-client" => Surface::Client,
+        "ruby-typesonly" => Surface::TypesOnly,
+        _ => return None,
+    };
+    let pkg_mode = emit_packages_includes(config, "ruby");
+    let typesonly = matches!(surface, Surface::TypesOnly);
+    let client = matches!(surface, Surface::Client) || (pkg_mode && !typesonly);
+    let server = matches!(surface, Surface::Server) || (pkg_mode && !typesonly);
+    Some((client, server))
+}
+
+/// The top-level constants the emitted client/server/codec files declare from
+/// services and RPC error arms, for this request's surfaces only.
+fn derived_ruby_names(
+    spec: &CsilSpecSerialized,
+    config: &GeneratorConfig,
+) -> std::collections::HashSet<String> {
     let mut derived = std::collections::HashSet::new();
+    let (client, server) = emitted_surfaces(config).unwrap_or((false, false));
     for rule in &spec.rules {
         if let CsilRuleType::ServiceDef(service) = &rule.rule_type {
             let base = service_base(&rule.name);
-            for suffix in ["Client", "Handlers", "Router"] {
-                derived.insert(format!("{base}{suffix}"));
+            if client {
+                derived.insert(format!("{base}Client"));
+                if service.wire_id.is_some() {
+                    derived.insert(format!("{base}WireIds"));
+                }
             }
-            if service.wire_id.is_some() {
-                derived.insert(format!("{base}WireIds"));
+            if server {
+                derived.insert(format!("{base}Handlers"));
+                if service_has_channel_ops(service) {
+                    derived.insert(format!("{base}Router"));
+                }
             }
         }
     }
+    // The codec file declares the refusal classes on every surface.
     for (_, _, arms) in spec.rpc_operations() {
         for arm in &arms[1..] {
             if let Some(name) = arm.rpc_variant_name() {
@@ -274,30 +299,70 @@ fn rename_reserved_ruby_names(spec: &CsilSpecSerialized) -> CsilSpecSerialized {
             }
         }
     }
+    derived
+}
+
+/// Rename each rule whose constant is reserved, or equals a constant the generator
+/// emits from a service or an RPC error arm (`derived_ruby_names`). A reopened
+/// `<Base>Client` replaces the record's constructor, a `<Base>Router` or
+/// `<Base>WireIds` module cannot reopen the record class, and `<Arm>Refusal`
+/// hides the record in the codec.
+fn rename_reserved_ruby_names(
+    spec: &CsilSpecSerialized,
+    config: &GeneratorConfig,
+) -> CsilSpecSerialized {
+    let derived = derived_ruby_names(spec, config);
     csilgen_common::rename_reserved(spec, |name| {
         let class = ruby_class_name(name);
         RESERVED_TYPE_NAMES.contains(&class.as_str()) || derived.contains(&class)
     })
 }
 
-/// The spec the generator works on: reserved and derived names renamed first,
-/// then rules whose constants are equal (`user_id` and `UserId`), because the
-/// second constant would reassign the first.
-fn prepare_spec(spec: &CsilSpecSerialized) -> CsilSpecSerialized {
-    csilgen_common::rename_ident_collisions(&rename_reserved_ruby_names(spec), ruby_class_name)
+/// Rename rules whose constants are equal (`user_id` and `UserId`), because the
+/// second constant would reassign the first. A service declares only `<Base>...`
+/// constants, so services are compared by base, apart from the records. A name
+/// that is not a rule yet is a candidate the shared pass builds for a renamed
+/// service (`<name>2`).
+fn rename_ruby_ident_collisions(spec: &CsilSpecSerialized) -> CsilSpecSerialized {
+    let names: std::collections::HashSet<&str> =
+        spec.rules.iter().map(|rule| rule.name.as_str()).collect();
+    let services: std::collections::HashSet<&str> = spec
+        .rules
+        .iter()
+        .filter(|rule| matches!(rule.rule_type, CsilRuleType::ServiceDef(_)))
+        .map(|rule| rule.name.as_str())
+        .collect();
+    csilgen_common::rename_ident_collisions(spec, |name| {
+        let candidate = !names.contains(name)
+            && services.contains(name.trim_end_matches(|c: char| c.is_ascii_digit()));
+        if services.contains(name) || candidate {
+            format!("service {}", service_base(name))
+        } else {
+            ruby_class_name(name)
+        }
+    })
+}
+
+/// The spec the generator works on. The shared hoists run first, so the names they
+/// synthesize (`<Service><Op>Output`, `<Owner>_<field>`) get the same rename checks
+/// as declared rules; they come last in the spec, so a clash renames them and not a
+/// user rule. Services are renamed before the derived names are computed from them,
+/// and the collision pass runs again for the names `rename_reserved` picks.
+fn prepare_spec(spec: &CsilSpecSerialized, config: &GeneratorConfig) -> CsilSpecSerialized {
+    let spec = csilgen_common::hoist_op_union_boundaries(spec);
+    let spec = csilgen_common::hoist_inline_composites(&spec, Default::default());
+    let spec = rename_ruby_ident_collisions(&spec);
+    let spec = rename_reserved_ruby_names(&spec, config);
+    rename_ruby_ident_collisions(&spec)
 }
 
 pub fn generate_ruby_code_from_serialized(
     spec: &CsilSpecSerialized,
     config: &GeneratorConfig,
 ) -> Result<Vec<GeneratedFile>, i32> {
-    let spec = &csilgen_common::hoist_inline_named_numbers(&prepare_spec(spec));
-    let surface = match config.target.as_str() {
-        "ruby" | "ruby-server" => Surface::Server,
-        "ruby-client" => Surface::Client,
-        "ruby-typesonly" => Surface::TypesOnly,
-        _ => return Err(error_codes::GENERATION_ERROR),
-    };
+    let (want_client, want_server) =
+        emitted_surfaces(config).ok_or(error_codes::GENERATION_ERROR)?;
+    let spec = &prepare_spec(spec, config);
 
     let mut files = Vec::new();
 
@@ -324,12 +389,7 @@ pub fn generate_ruby_code_from_serialized(
     // carry both surfaces for its own quickstart to load/run — regardless of which surface
     // was requested. A flat (non-package) build stays byte-identical: it emits only the
     // requested surface.
-    let pkg_mode = emit_packages_includes(config, "ruby");
     if spec.service_count > 0 {
-        let want_client = matches!(surface, Surface::Client)
-            || (pkg_mode && !matches!(surface, Surface::TypesOnly));
-        let want_server = matches!(surface, Surface::Server)
-            || (pkg_mode && !matches!(surface, Surface::TypesOnly));
         if want_client && let Some(client) = generate_client_file(spec) {
             files.push(GeneratedFile {
                 path: "client.rb".to_string(),
@@ -988,7 +1048,7 @@ fn first_channel_example(spec: &CsilSpecSerialized) -> Option<ChannelExample> {
             let method = ruby_method_name(&op.name);
             return Some(ChannelExample {
                 router_module: format!("{base}Router"),
-                wire_service: rule.name.clone(),
+                wire_service: spec.declared_name(&rule.name).to_string(),
                 encode_fn: format!("encode_{method}"),
                 handlers_class: format!("{base}Handlers"),
                 inbound_class: inbound,
@@ -1403,6 +1463,29 @@ fn finalize(mut content: String) -> String {
     content
 }
 
+/// Constants the enum class declares itself, which a member must not reassign.
+const RUBY_ENUM_CONSTANTS: &[&str] = &["NUMBERS", "BY_NUMBER", "MEMBERS_BY_WIRE"];
+
+/// The member constants (`CALENDARS_READ`) and wire values of a text enum, or `None`
+/// for any other choice. The shared splitter makes the words, so every generator
+/// agrees on them; a constant must start with a letter and must not be one of the
+/// class's own constants.
+fn ruby_enum_members(arms: &[CsilTypeExpression]) -> Option<Vec<(String, &str)>> {
+    let values: Vec<&str> = csilgen_common::text_enum_members(arms)?
+        .into_iter()
+        .map(|(_, value)| value)
+        .collect();
+    let idents = csilgen_common::member_idents(
+        &values,
+        |words| words.join("_").to_ascii_uppercase(),
+        |name| {
+            name.starts_with(|c: char| c.is_ascii_alphabetic())
+                && !RUBY_ENUM_CONSTANTS.contains(&name)
+        },
+    );
+    Some(idents.into_iter().zip(values).collect())
+}
+
 fn generate_types_file(spec: &CsilSpecSerialized) -> Option<String> {
     let mut body = String::new();
     let mut has_types = false;
@@ -1420,7 +1503,7 @@ fn generate_types_file(spec: &CsilSpecSerialized) -> Option<String> {
         }
         if let CsilRuleType::TypeDef(CsilTypeExpression::Choice(arms))
         | CsilRuleType::TypeChoice(arms) = &rule.rule_type
-            && let Some(members) = csilgen_common::text_enum_members(arms)
+            && let Some(members) = ruby_enum_members(arms)
         {
             has_types = true;
             let class = ruby_class_name(&rule.name);
@@ -2183,7 +2266,10 @@ fn enc_tree(
 ) -> String {
     match codec_unwrap(ty) {
         CsilTypeExpression::Builtin(name) => match name.as_str() {
-            "int" | "uint" | "float" | "bool" => expr.to_string(),
+            "int" | "uint" | "bool" => expr.to_string(),
+            // An Integer in a float field would go out as a CBOR integer, which no
+            // decoder accepts for a float.
+            "float" => format!("Float({expr})"),
             "text" | "tstr" => expr.to_string(),
             "bytes" | "bstr" => format!("({expr}).b"),
             "date" => format!("CsilCbor.enc_date({expr})"),
@@ -2286,9 +2372,12 @@ fn dec_tree(
 ) -> String {
     match codec_unwrap(ty) {
         CsilTypeExpression::Builtin(name) => match name.as_str() {
-            "int" | "uint" | "float" | "bool" | "text" | "tstr" | "bytes" | "bstr" => {
-                expr.to_string()
-            }
+            "int" => format!("CsilCbor.dec_int({expr})"),
+            "uint" => format!("CsilCbor.dec_uint({expr})"),
+            "float" => format!("CsilCbor.dec_float({expr})"),
+            "bool" => format!("CsilCbor.dec_bool({expr})"),
+            "text" | "tstr" => format!("CsilCbor.dec_text({expr})"),
+            "bytes" | "bstr" => format!("CsilCbor.dec_bytes({expr})"),
             "date" => format!("CsilCbor.as_date({expr})"),
             "timestamp" => format!("CsilCbor.as_timestamp({expr})"),
             "cddl_time" => format!("CsilCbor.as_cddl_time({expr})"),
@@ -2330,7 +2419,7 @@ fn dec_tree(
             let dk = dec_tree(key, "csil_k", records, aliases, unions);
             let dv = dec_tree(value, "csil_v", records, aliases, unions);
             format!(
-                "({expr}).each_with_object({{}}) {{ |(csil_k, csil_v), csil_h| csil_h[{dk}] = {dv} }}"
+                "CsilCbor.dyn_map({expr}).each_with_object({{}}) {{ |(csil_k, csil_v), csil_h| csil_h[{dk}] = {dv} }}"
             )
         }
         // Positional tuple decode: rebuild the Array from each position's own
@@ -2666,6 +2755,7 @@ fn emit_record_codec(
     out.push_str("  end\n\n");
 
     out.push_str("  def self.csil_from_tree(node)\n");
+    out.push_str(&format!("    CsilCbor.record_map(node, {class:?})\n"));
     if in_order.is_empty() {
         out.push_str("    new\n");
     } else {
@@ -2677,11 +2767,13 @@ fn emit_record_codec(
                 // `member` (escaped when reserved) labels the constructor keyword arg.
                 let field = field_name(entry.key.as_ref().unwrap());
                 let member = ruby_member_name(&field);
-                let access = format!("node[\"{field}\"]");
-                let dec = dec_tree(&entry.value_type, &access, records, aliases, unions);
                 if matches!(entry.occurrence, Some(CsilOccurrence::Optional)) {
+                    let access = format!("node[\"{field}\"]");
+                    let dec = dec_tree(&entry.value_type, &access, records, aliases, unions);
                     format!("      {member}: (node.key?(\"{field}\") ? {dec} : nil)")
                 } else {
+                    let access = format!("CsilCbor.required(node, \"{field}\")");
+                    let dec = dec_tree(&entry.value_type, &access, records, aliases, unions);
                     format!("      {member}: {dec}")
                 }
             })
@@ -2768,7 +2860,8 @@ fn generate_codec_file(spec: &CsilSpecSerialized) -> Option<String> {
         let mut handler = format!(
             "  def encode_{stem}_reply\n    value = yield\n    [{success:?}, encode({enc})]\n"
         );
-        resolve.push_str(&format!("    if service == {service:?} && op == {method:?}\n      case variant\n      when {success:?} then return payload\n"));
+        let wire_service = spec.declared_name(service);
+        resolve.push_str(&format!("    if service == {wire_service:?} && op == {method:?}\n      case variant\n      when {success:?} then return payload\n"));
         for arm in &arms[1..] {
             let name = arm.rpc_variant_name().unwrap();
             let wire = spec.declared_name(name);
@@ -2874,9 +2967,17 @@ module CsilCbor
       put_head(buf, 4, value.length)
       value.each { |item| put(buf, item) }
     when Hash
-      put_head(buf, 5, value.length)
-      value.each do |k, v|
-        put(buf, k)
+      # RFC 8949 section 4.2.1: entries sorted by the bytes of each encoded key, which
+      # is not the order of the Ruby keys ("b" sorts before "aa", 10 before -1).
+      entries = value.map do |k, v|
+        key = "".b
+        put(key, k)
+        [key, v]
+      end
+      entries.sort_by!(&:first)
+      put_head(buf, 5, entries.length)
+      entries.each do |key, v|
+        buf << key
         put(buf, v)
       end
     when Tag
@@ -2885,6 +2986,80 @@ module CsilCbor
     else
       raise ArgumentError, "csilgen: cannot encode #{value.class}"
     end
+  end
+
+  # A decoded dynamic map (`{ * K => V }`): its keys must arrive in canonical order.
+  def dyn_map(node)
+    raise ArgumentError, "csil cbor: expected a map" unless node.is_a?(Hash)
+    unless node.instance_variable_get(:@csil_canonical)
+      raise ArgumentError, "csil cbor: map keys are not in canonical order"
+    end
+
+    node
+  end
+
+  # A decoded record: a map in any key order (`decode` already refused a repeated key).
+  def record_map(node, name)
+    raise ArgumentError, "csil cbor: #{name} is not a map" unless node.is_a?(Hash)
+
+    node
+  end
+
+  def required(node, key)
+    node.fetch(key) { raise ArgumentError, "csil cbor: missing key #{key.inspect}" }
+  end
+
+  def dec_int(value)
+    raise ArgumentError, "csil cbor: expected an integer" unless value.is_a?(Integer)
+
+    value
+  end
+
+  def dec_uint(value)
+    raise ArgumentError, "csil cbor: expected an unsigned integer" unless value.is_a?(Integer) && value >= 0
+
+    value
+  end
+
+  def dec_float(value)
+    raise ArgumentError, "csil cbor: expected a float" unless value.is_a?(Float)
+
+    value
+  end
+
+  def dec_bool(value)
+    raise ArgumentError, "csil cbor: expected a bool" unless [true, false].include?(value)
+
+    value
+  end
+
+  def dec_text(value)
+    unless value.is_a?(String) && value.encoding == Encoding::UTF_8
+      raise ArgumentError, "csil cbor: expected a text string"
+    end
+
+    value
+  end
+
+  def dec_bytes(value)
+    unless value.is_a?(String) && value.encoding == Encoding::BINARY
+      raise ArgumentError, "csil cbor: expected a byte string"
+    end
+
+    value
+  end
+
+  # Two encodings of one key would pass the key-order check as different keys, so a
+  # map key must use the shortest head for its value or length.
+  def shortest_head?(bin, pos)
+    return true if pos >= bin.bytesize
+
+    ib = bin.getbyte(pos)
+    low = ib & 0x1f
+    return true if (ib >> 5) == 7 || low < 24 || low > 27
+
+    arg, = read_arg(bin, pos, low)
+    arg >= { 24 => 24, 25 => 0x100, 26 => 0x10000, 27 => 0x100000000 }[low]
   end
 
   # Decode a binary String to a Ruby value tree.
@@ -2976,11 +3151,24 @@ module CsilCbor
       when 5
         raise ArgumentError, "csilgen: map length exceeds remaining input" if arg > bin.bytesize - p
         hash = {}
+        previous = nil
+        canonical = true
         arg.times do
+          start = p
+          raise ArgumentError, "csil cbor: map key is not in shortest form" unless shortest_head?(bin, start)
+
           k, p = take(bin, p, depth + 1)
+          raise ArgumentError, "csil cbor: duplicate key #{k.inspect}" if hash.key?(k)
+
+          # Each key's encoded bytes are compared to the previous key's only, so the
+          # check stays linear; a record ignores the result, a dynamic map needs it.
+          key = bin.byteslice(start, p - start)
+          canonical &&= previous.nil? || previous < key
+          previous = key
           v, p = take(bin, p, depth + 1)
           hash[k] = v
         end
+        hash.instance_variable_set(:@csil_canonical, canonical)
         [hash, p]
       when 6
         inner, p = take(bin, p, depth + 1)
@@ -3356,7 +3544,7 @@ fn generate_client_file(spec: &CsilSpecSerialized) -> Option<String> {
     for rule in &spec.rules {
         if let CsilRuleType::ServiceDef(service) = &rule.rule_type {
             body.push_str(&emit_client_class(
-                &rule.name, service, &records, &aliases, &unions,
+                spec, &rule.name, service, &records, &aliases, &unions,
             ));
             if let Some(wire_ids) = emit_wire_ids(&rule.name, service) {
                 body.push_str(&wire_ids);
@@ -3391,6 +3579,7 @@ fn generate_client_file(spec: &CsilSpecSerialized) -> Option<String> {
 }
 
 fn emit_client_class(
+    spec: &CsilSpecSerialized,
     name: &str,
     service: &CsilServiceDefinition,
     records: &std::collections::HashSet<String>,
@@ -3399,9 +3588,10 @@ fn emit_client_class(
 ) -> String {
     let base = service_base(name);
     let client = format!("{base}Client");
-    // The wire service string is the CSIL service name verbatim
-    // (docs/csil-rpc-transport.md §1.1) — no case transform may leak onto the wire.
-    let wire_service = name;
+    // The wire service string is the CSIL service name as declared
+    // (docs/csil-rpc-transport.md §1.1): neither a case transform nor a collision
+    // rename may leak onto the wire.
+    let wire_service = spec.declared_name(name);
 
     let mut out = String::new();
     out.push_str(&format!("# Typed client for the {name} service.\n"));
@@ -3853,7 +4043,9 @@ mod tests {
         // Decode gates on the key being present, so a present empty binary stays
         // present rather than collapsing to nil.
         assert!(
-            out.contains("payload: (node.key?(\"payload\") ? node[\"payload\"] : nil)"),
+            out.contains(
+                "payload: (node.key?(\"payload\") ? CsilCbor.dec_bytes(node[\"payload\"]) : nil)"
+            ),
             "decode must gate on key presence:\n{out}"
         );
     }
@@ -3881,7 +4073,9 @@ mod tests {
         let p_state = body.find("\"current_state\"").unwrap();
         assert!(p_tags < p_uuid && p_uuid < p_state);
         // A missing optional decodes to nil.
-        assert!(out.contains("priority: (node.key?(\"priority\") ? node[\"priority\"] : nil)"));
+        assert!(out.contains(
+            "priority: (node.key?(\"priority\") ? CsilCbor.dec_int(node[\"priority\"]) : nil)"
+        ));
     }
 
     #[test]
@@ -3898,7 +4092,7 @@ mod tests {
         let out = emit_record_codec("Evt", &group, &records, &aliases, &unions);
         assert!(out.contains("csil_map[\"when\"] = CsilCbor.enc_timestamp(self.when)"));
         // The keyword is legal as a constructor keyword label, so decode stays bare.
-        assert!(out.contains("when: CsilCbor.as_timestamp(node[\"when\"])"));
+        assert!(out.contains("when: CsilCbor.as_timestamp(CsilCbor.required(node, \"when\"))"));
     }
 
     #[test]
@@ -3934,7 +4128,7 @@ mod tests {
         // Decode's constructor keyword label is the escaped member; the map lookup
         // keys off the verbatim wire field.
         assert!(
-            out.contains("object_id_: node[\"object_id\"]"),
+            out.contains("object_id_: CsilCbor.dec_text(CsilCbor.required(node, \"object_id\"))"),
             "decode must key the constructor arg `object_id_:` off wire \"object_id\", got:\n{out}"
         );
     }
@@ -4005,7 +4199,7 @@ mod tests {
         assert!(out.contains("def dec_union_IdOrName(node)"));
         // The field routes through the union helper rather than passing the bare value.
         assert!(out.contains("csil_map[\"who\"] = CsilCbor.enc_union_IdOrName(who)"));
-        assert!(out.contains("who: CsilCbor.dec_union_IdOrName(node[\"who\"])"));
+        assert!(out.contains("who: CsilCbor.dec_union_IdOrName(CsilCbor.required(node, \"who\"))"));
     }
 
     #[test]
@@ -4108,7 +4302,15 @@ mod tests {
             }],
             wire_id: None,
         };
+        let spec = CsilSpecSerialized {
+            rules: vec![],
+            source_content: None,
+            service_count: 1,
+            fields_with_metadata_count: 0,
+            declared_names: Default::default(),
+        };
         let out = emit_client_class(
+            &spec,
             "CorndogsService",
             &service,
             &["SubmitTaskRequest".into(), "Task".into()].into(),

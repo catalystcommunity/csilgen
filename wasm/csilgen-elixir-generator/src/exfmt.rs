@@ -249,13 +249,12 @@ fn join_flat(items: &[Doc]) -> String {
 }
 
 /// Greedy tuple fill: elements flow onto the current line while their own flat
-/// text fits, otherwise continue at `col + 1` — and a multi-line element always
-/// sends the next element to a fresh line. `reserve` is whatever the tuple's
+/// text fits, otherwise continue at `col + 1`; a multi-line element starts on a
+/// fresh line, and the element after it continues its last line. `reserve` is whatever the tuple's
 /// caller will append right after the closing `}` (e.g. a separating comma).
 fn render_tuple(items: &[Doc], col: usize, reserve: usize) -> String {
     let mut out = String::from("{");
     let mut cur = col + 1;
-    let mut prev_multiline = false;
     for (i, item) in items.iter().enumerate() {
         let first = i == 0;
         let last = i + 1 == items.len();
@@ -270,17 +269,16 @@ fn render_tuple(items: &[Doc], col: usize, reserve: usize) -> String {
         // or an element that just barely fits would let that trailing byte
         // spill past the width mix actually allows.
         let after = if last { 1 + reserve } else { 1 };
-        let fits_here =
-            !item.is_hard() && !prev_multiline && cur + sep + item.flat_len() + after <= MAX_WIDTH;
+        // An element after a multi-line one still continues its last line (`end, x}`)
+        // when it fits there.
+        let fits_here = !item.is_hard() && cur + sep + item.flat_len() + after <= MAX_WIDTH;
         if first && fits_here {
             out.push_str(&item.flat_text());
             cur += item.flat_len();
-            prev_multiline = false;
         } else if fits_here {
             out.push(' ');
             out.push_str(&item.flat_text());
             cur += 1 + item.flat_len();
-            prev_multiline = false;
         } else {
             if !first {
                 out.push('\n');
@@ -292,8 +290,7 @@ fn render_tuple(items: &[Doc], col: usize, reserve: usize) -> String {
             // element's own immediate closer matters from here down.
             let rendered = item.render(col + 1, 0);
             let last_line_len = rendered.split('\n').next_back().map_or(0, str::len);
-            prev_multiline = rendered.contains('\n');
-            cur = if prev_multiline {
+            cur = if rendered.contains('\n') {
                 last_line_len
             } else {
                 col + 1 + last_line_len
@@ -454,9 +451,18 @@ pub(crate) fn attr_list(indent_n: usize, prefix: &str, items: &[String]) -> Stri
     }
     let mut out = format!("{}{prefix}[\n", indent(indent_n));
     for (i, item) in items.iter().enumerate() {
+        let comma = usize::from(i + 1 < items.len());
         out.push_str(&indent(indent_n + 2));
-        out.push_str(item);
-        if i + 1 < items.len() {
+        // A keyword pair that overflows moves its value to the next line at +2.
+        match item.split_once(": ") {
+            Some((key, value))
+                if is_keyword_item(item) && indent_n + 2 + item.len() + comma > MAX_WIDTH =>
+            {
+                out.push_str(&format!("{key}:\n{}{value}", indent(indent_n + 4)));
+            }
+            _ => out.push_str(item),
+        }
+        if comma == 1 {
             out.push(',');
         }
         out.push('\n');
@@ -537,9 +543,16 @@ pub(crate) fn attr_spec(
     } else {
         let mut broken = format!("{}{attr} {fun}(\n", indent(indent_n));
         for (i, arg) in args.iter().enumerate() {
+            let comma = usize::from(i + 1 < args.len());
             broken.push_str(&indent(cont));
-            broken.push_str(arg);
-            if i + 1 < args.len() {
+            // A named argument that overflows moves its type to the next line at +2.
+            match arg.split_once(" :: ") {
+                Some((name, ty)) if cont + arg.len() + comma > MAX_WIDTH => {
+                    broken.push_str(&format!("{name} ::\n{}{ty}", indent(cont + 2)));
+                }
+                _ => broken.push_str(arg),
+            }
+            if comma == 1 {
                 broken.push(',');
             }
             broken.push('\n');
@@ -582,7 +595,7 @@ fn render_ret_piece(piece: &str, col: usize) -> String {
         return piece.to_string();
     };
     if !inner.contains(" | ") {
-        return piece.to_string();
+        return format!("{{{tag},\n{}{inner}}}", indent(col + 1));
     }
     let member_col = col + 1;
     let members: Vec<&str> = inner.split(" | ").collect();
@@ -630,4 +643,76 @@ pub(crate) fn normalize_blank_lines(content: &str) -> String {
     }
     s.push('\n');
     s
+}
+
+/// Render a `def`/`defp` head that opens a `do` block: `def fun(a, b) do` when it
+/// fits, else one argument per line at +6 with `) do` at +4, the way mix breaks a
+/// long head (the arguments of a definition sit two columns past a call's).
+pub(crate) fn def_head(indent_n: usize, kw: &str, fun: &str, args: &[String]) -> String {
+    // Mix measures the head without its trailing ` do`.
+    let flat = format!("{}{kw} {fun}({})", indent(indent_n), args.join(", "));
+    if flat.len() <= MAX_WIDTH {
+        return format!("{flat} do");
+    }
+    let mut out = format!("{}{kw} {fun}(\n", indent(indent_n));
+    let col = indent_n + 6;
+    for (i, arg) in args.iter().enumerate() {
+        let comma = usize::from(i + 1 < args.len());
+        out.push_str(&indent(col));
+        // A `pattern = var` argument that overflows moves `var` to the next line.
+        match arg.rsplit_once(" = ") {
+            Some((pattern, var)) if col + arg.len() + comma > MAX_WIDTH => {
+                out.push_str(&format!("{pattern} =\n{}{var}", indent(col + 2)));
+            }
+            _ => out.push_str(arg),
+        }
+        if comma == 1 {
+            out.push(',');
+        }
+        out.push('\n');
+    }
+    out.push_str(&indent(indent_n + 4));
+    out.push_str(") do");
+    out
+}
+
+/// Render `kw head, rest` (a `raise Mod, value: value` statement): one line when it
+/// fits, else `rest` moves to the next line at +2, as mix breaks a call without
+/// parentheses.
+pub(crate) fn render_no_paren_call(indent_n: usize, head: &str, rest: &str) -> String {
+    let flat = format!("{}{head}, {rest}", indent(indent_n));
+    if flat.len() <= MAX_WIDTH {
+        return flat;
+    }
+    format!(
+        "{}{head},\n{}{rest}",
+        indent(indent_n),
+        indent(indent_n + 2)
+    )
+}
+
+/// Render `@type name :: a | b | c`: one line when it fits, else the union moves
+/// to the next line at +8, and when it still does not fit there, each member gets
+/// its own line with a leading `| ` (mix's break ladder for a type union).
+pub(crate) fn attr_type(indent_n: usize, name: &str, members: &[String]) -> String {
+    let union = members.join(" | ");
+    let flat = format!("{}@type {name} :: {union}", indent(indent_n));
+    if flat.len() <= MAX_WIDTH {
+        return flat;
+    }
+    let cont = indent_n + 8;
+    let mut out = format!("{}@type {name} ::\n{}", indent(indent_n), indent(cont));
+    if cont + union.len() <= MAX_WIDTH {
+        out.push_str(&union);
+        return out;
+    }
+    for (i, member) in members.iter().enumerate() {
+        if i > 0 {
+            out.push('\n');
+            out.push_str(&indent(cont));
+            out.push_str("| ");
+        }
+        out.push_str(member);
+    }
+    out
 }

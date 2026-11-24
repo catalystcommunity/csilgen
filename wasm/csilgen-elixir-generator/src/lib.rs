@@ -18,8 +18,8 @@ use std::collections::{HashMap, HashSet};
 
 mod exfmt;
 use exfmt::{
-    Doc, attr_list, attr_spec, defstruct_list, indent, normalize_blank_lines, render_binding,
-    render_def_kw,
+    Doc, attr_list, attr_spec, attr_type, def_head, defstruct_list, indent, normalize_blank_lines,
+    render_binding, render_def_kw, render_no_paren_call,
 };
 
 #[unsafe(no_mangle)]
@@ -859,7 +859,7 @@ fn first_unary_example(input: &WasmGeneratorInput, config: &ElixirConfig) -> Opt
             {
                 continue;
             }
-            let base = service_base(&rule.name);
+            let base = service_base(&input.csil_spec, &rule.name);
             return Some(UnaryExample {
                 client_module: format!("{}.{base}Client", config.module_root),
                 method: snake_case(&op.name),
@@ -916,12 +916,12 @@ fn first_channel_example(
             if !is_record_ref(&op.input_type, &records) || !is_record_ref(&success, &records) {
                 continue;
             }
-            let base = service_base(&rule.name);
+            let base = service_base(&input.csil_spec, &rule.name);
             return Some(ChannelExample {
                 server_module: format!("{}.{base}Server", config.module_root),
                 handler_fn: snake_case(&op.name),
                 wire_method: op.name.clone(),
-                wire_service: rule.name.clone(),
+                wire_service: input.csil_spec.declared_name(&rule.name).to_string(),
                 encode_fn: format!("encode_{}", snake_case(&op.name)),
                 out_module: config.module(&ref_name(&success)),
                 sample_field: channel_sample_field(input, config, &ref_name(&success)),
@@ -1037,19 +1037,61 @@ const RESERVED_TYPE_NAMES: &[&str] = &[
 
 /// Besides the fixed modules, the package derives `<Service>Client`,
 /// `<Service>Server` and `<ErrorArm>Refusal` modules from schema names, so a rule
-/// that spells one of those out would collide in the same way.
+/// that spells one of those out would collide in the same way. Only the modules this
+/// run emits count (`derived_modules` is the predicate the emitters use too), so a
+/// rule never gets a `Type` suffix for a module that is not in the output.
 ///
 /// A channel router builds `%ServiceError{code: .., message: ..}` itself, so a spec's
 /// own `ServiceError` of any other shape cannot stand in for the framework one
 /// there; it is renamed and the framework record is emitted beside it.
-fn reserved_type_name(spec: &csilgen_common::CsilSpecSerialized) -> impl Fn(&str) -> bool {
+fn reserved_type_name(
+    spec: &csilgen_common::CsilSpecSerialized,
+    surfaces: Surfaces,
+) -> impl Fn(&str) -> bool {
+    let derived = derived_modules(spec, surfaces);
+    move |name| {
+        let module = pascal_case(name);
+        RESERVED_TYPE_NAMES.contains(&module.as_str()) || derived.contains(&module)
+    }
+}
+
+/// Which generated surfaces one run writes. The rename pass and the emitters read
+/// the same value, so a name is reserved exactly when its module is emitted.
+#[derive(Clone, Copy)]
+struct Surfaces {
+    client: bool,
+    server: bool,
+}
+
+impl Surfaces {
+    fn new(surface: &Surface, config: &ElixirConfig) -> Self {
+        // A package's `genquickstart.md` shows both the calling side and the handling
+        // side, so a package carries both surfaces whatever the target named.
+        let pkg = config.emit_elixir_package && !matches!(surface, Surface::TypesOnly);
+        Self {
+            client: matches!(surface, Surface::Client) || pkg,
+            server: matches!(surface, Surface::Server) || pkg,
+        }
+    }
+}
+
+/// The unqualified module names this run derives from services and reply arms.
+fn derived_modules(
+    spec: &csilgen_common::CsilSpecSerialized,
+    surfaces: Surfaces,
+) -> HashSet<String> {
     let mut derived = HashSet::new();
+    let bases = service_bases(spec);
     let mut has_channel = false;
     for rule in &spec.rules {
         if let CsilRuleType::ServiceDef(service) = &rule.rule_type {
-            let base = service_base(&rule.name);
-            derived.insert(format!("{base}Client"));
-            derived.insert(format!("{base}Server"));
+            let base = &bases[&rule.name];
+            if surfaces.client {
+                derived.insert(format!("{base}Client"));
+            }
+            if surfaces.server {
+                derived.insert(format!("{base}Server"));
+            }
             has_channel |= service_has_channel_ops(service);
         }
     }
@@ -1071,25 +1113,147 @@ fn reserved_type_name(spec: &csilgen_common::CsilSpecSerialized) -> impl Fn(&str
             && group.entries.len() == 2
             && keys == HashSet::from(["code", "message"])
     });
-    if has_channel && !framework_shaped {
+    if surfaces.server && has_channel && !framework_shaped {
         derived.insert("ServiceError".to_string());
     }
+    derived.extend(refusal_exceptions(spec).into_keys());
+    derived
+}
+
+/// The `<Arm>Refusal` exception modules `codec.gen.ex` declares, unqualified, with
+/// the wire variant each one carries as its message.
+fn refusal_exceptions(
+    spec: &csilgen_common::CsilSpecSerialized,
+) -> std::collections::BTreeMap<String, String> {
+    let mut exceptions = std::collections::BTreeMap::new();
     for (_, _, arms) in spec.rpc_operations() {
         for arm in &arms[1..] {
             if let Some(variant) = arm.rpc_variant_name() {
-                derived.insert(format!("{}Refusal", pascal_case(variant)));
+                exceptions.insert(
+                    format!("{}Refusal", pascal_case(variant)),
+                    spec.declared_name(variant).to_string(),
+                );
             }
         }
     }
-    move |name| {
-        let module = pascal_case(name);
-        RESERVED_TYPE_NAMES.contains(&module.as_str()) || derived.contains(&module)
+    exceptions
+}
+
+/// The module base (`<Base>Client`, `<Base>Server`) for each service rule. A
+/// trailing `Service` is dropped for readability, but only while no earlier service
+/// already owns the shorter base: services `Foo` and `FooService` would otherwise
+/// both be `FooClient`.
+fn service_bases(spec: &csilgen_common::CsilSpecSerialized) -> HashMap<String, String> {
+    let mut taken = HashSet::new();
+    let mut bases = HashMap::new();
+    for rule in &spec.rules {
+        if !matches!(rule.rule_type, CsilRuleType::ServiceDef(_)) {
+            continue;
+        }
+        let full = pascal_case(&rule.name);
+        let mut base = full
+            .strip_suffix("Service")
+            .filter(|s| !s.is_empty() && !taken.contains(*s))
+            .map(str::to_string)
+            .unwrap_or_else(|| full.clone());
+        // The same digit suffix `rename_ident_collisions` gives a clashing service.
+        let stem = base.clone();
+        let mut n = 2;
+        while taken.contains(&base) {
+            base = format!("{stem}{n}");
+            n += 1;
+        }
+        taken.insert(base.clone());
+        bases.insert(rule.name.clone(), base);
     }
+    bases
+}
+
+/// Give each inline record at an op boundary (`ping: {at: text} <-> {at: text}`) a
+/// named rule `<Service><Op>Input` / `<Service><Op>Output`. The shared hoister leaves
+/// op boundaries alone, and a router needs a module to decode a message into, which
+/// an anonymous group does not have; for the same reason a channel op's inline map,
+/// array or tuple gets a name too. A unary op keeps those inline, because its per-op
+/// helper codes them directly. The wire is unchanged: a record is a map either
+/// way. A digit suffix keeps the name free of every other rule name.
+fn hoist_op_group_boundaries(
+    spec: &csilgen_common::CsilSpecSerialized,
+) -> csilgen_common::CsilSpecSerialized {
+    let key = |name: &str| snake_case(name).replace('_', "");
+    let mut used: HashSet<String> = spec.rules.iter().map(|r| key(&r.name)).collect();
+    let mut out = spec.clone();
+    let mut synth = Vec::new();
+    for rule in &mut out.rules {
+        let CsilRuleType::ServiceDef(service) = &mut rule.rule_type else {
+            continue;
+        };
+        for op in &mut service.operations {
+            for (boundary, suffix) in [
+                (&mut op.input_type, "Input"),
+                (&mut op.output_type, "Output"),
+            ] {
+                let channel = !matches!(op.direction, CsilServiceDirection::Unidirectional);
+                let rule_type = match &*boundary {
+                    CsilTypeExpression::Group(group) => CsilRuleType::GroupDef(group.clone()),
+                    ty @ (CsilTypeExpression::Map { .. }
+                    | CsilTypeExpression::Array { .. }
+                    | CsilTypeExpression::Tuple(_))
+                        if channel =>
+                    {
+                        CsilRuleType::TypeDef(ty.clone())
+                    }
+                    _ => continue,
+                };
+                let base = format!(
+                    "{}{}{suffix}",
+                    pascal_case(&rule.name),
+                    pascal_case(&op.name)
+                );
+                let mut name = base.clone();
+                let mut n = 2;
+                while !used.insert(key(&name)) {
+                    name = format!("{base}{n}");
+                    n += 1;
+                }
+                synth.push(csilgen_common::CsilRule {
+                    name: name.clone(),
+                    rule_type,
+                    position: rule.position.clone(),
+                    doc_comments: Vec::new(),
+                });
+                *boundary = CsilTypeExpression::Reference(name);
+            }
+        }
+    }
+    out.rules.extend(synth);
+    out
 }
 
 fn process_generation(mut input: WasmGeneratorInput) -> Result<WasmGeneratorOutput, i32> {
-    input.csil_spec =
-        csilgen_common::rename_reserved(&input.csil_spec, reserved_type_name(&input.csil_spec));
+    let config = ElixirConfig::from_options(&input.config.options)?;
+    let surface = match input.config.target.as_str() {
+        "elixir" | "elixir-server" => Surface::Server,
+        "elixir-client" => Surface::Client,
+        "elixir-typesonly" => Surface::TypesOnly,
+        _ => return Err(error_codes::GENERATION_ERROR),
+    };
+    let surfaces = Surfaces::new(&surface, &config);
+    // Naming happens before any rename, so a name the hoisters invent goes through
+    // the same reserved-name and collision checks as a rule the user wrote. The
+    // synthesized rules come last in the spec, so a clash renames them and not the
+    // user's rule.
+    input.csil_spec = csilgen_common::hoist_op_union_boundaries(&input.csil_spec);
+    input.csil_spec = hoist_op_group_boundaries(&input.csil_spec);
+    input.csil_spec = csilgen_common::hoist_inline_composites(
+        &input.csil_spec,
+        csilgen_common::HoistOptions::default(),
+    );
+    // Service renames come first: the derived module names depend on them.
+    input.csil_spec = csilgen_common::rename_ident_collisions(&input.csil_spec, pascal_case);
+    input.csil_spec = csilgen_common::rename_reserved(
+        &input.csil_spec,
+        reserved_type_name(&input.csil_spec, surfaces),
+    );
     // A rule is a module (`Value` and `value` are both `<root>.Value`) and also a
     // snake_case function name (`UserId` and `UserID` are both `new_user_id/0` in
     // `Constructors`), so both spellings must be unique.
@@ -1098,13 +1262,6 @@ fn process_generation(mut input: WasmGeneratorInput) -> Result<WasmGeneratorOutp
     let rename_warnings = csilgen_common::rename_warnings(&input.csil_spec, &input.config.target);
     input.csil_spec = csilgen_common::hoist_inline_named_numbers(&input.csil_spec);
     input.csil_spec.supply_implicit_service_error();
-    let config = ElixirConfig::from_options(&input.config.options)?;
-    let surface = match input.config.target.as_str() {
-        "elixir" | "elixir-server" => Surface::Server,
-        "elixir-client" => Surface::Client,
-        "elixir-typesonly" => Surface::TypesOnly,
-        _ => return Err(error_codes::GENERATION_ERROR),
-    };
 
     let mut files = Vec::new();
     let mut warnings = rename_warnings;
@@ -1127,25 +1284,19 @@ fn process_generation(mut input: WasmGeneratorInput) -> Result<WasmGeneratorOutp
         });
     }
 
-    // A package's `genquickstart.md` demonstrates both the calling side (the RPC and
-    // Datagrams sections, over the generated client) and the handling side (the Events
-    // section, over the generated server router), so a package must carry both surfaces
-    // for its own quickstart to compile — regardless of which surface the target named.
-    // A flat (non-package) build stays byte-identical: it emits only the requested
-    // surface. Mirrors the OCaml generator's package-mode all-surfaces rule.
-    let pkg_mode = config.emit_elixir_package;
-    let want_client =
-        matches!(surface, Surface::Client) || (pkg_mode && !matches!(surface, Surface::TypesOnly));
-    let want_server =
-        matches!(surface, Surface::Server) || (pkg_mode && !matches!(surface, Surface::TypesOnly));
+    // A flat (non-package) build emits only the requested surface; see `Surfaces`.
     if input.csil_spec.service_count > 0 {
-        if want_client && let Some(client) = generate_clients(&input, &config) {
+        if surfaces.client
+            && let Some(client) = generate_clients(&input, &config)
+        {
             files.push(GeneratedFile {
                 path: "client.gen.ex".to_string(),
                 content: client,
             });
         }
-        if want_server && let Some(server) = generate_servers(&input, &config) {
+        if surfaces.server
+            && let Some(server) = generate_servers(&input, &config)
+        {
             files.push(GeneratedFile {
                 path: "server.gen.ex".to_string(),
                 content: server,
@@ -1276,27 +1427,50 @@ fn generate_types(
             {
                 let tags = members
                     .iter()
-                    .map(|(name, _)| format!(":{}", name.to_ascii_lowercase()))
+                    .map(|(name, _)| format!(":{}", enum_atom(name)))
                     .collect::<Vec<_>>();
                 content.push_str(&format!(
-                    "defmodule {module} do\n  @type t :: {}\n",
-                    tags.join(" | ")
+                    "defmodule {module} do\n{}\n",
+                    attr_type(2, "t", &tags)
                 ));
+                // Mix separates a multi-line clause from its neighbors with a blank
+                // line; `normalize_blank_lines` folds the doubled ones.
+                let mut clause = |head: String, body: Doc| {
+                    let rendered = render_def_kw(2, &head, &body);
+                    if rendered.contains('\n') {
+                        content.push_str(&format!("\n{rendered}\n\n"));
+                    } else {
+                        content.push_str(&format!("{rendered}\n"));
+                    }
+                };
                 for ((_, wire), tag) in members.iter().zip(&tags) {
                     let literal = literal_to_elixir(&CsilLiteralValue::Text(wire.to_string()));
-                    content.push_str(&format!("  def to_wire({tag}), do: {literal}\n"));
+                    clause(format!("def to_wire({tag})"), Doc::flat(literal));
                 }
                 for ((_, wire), tag) in members.iter().zip(&tags) {
                     let literal = literal_to_elixir(&CsilLiteralValue::Text(wire.to_string()));
-                    content.push_str(&format!("  def from_wire({literal}), do: {tag}\n"));
+                    clause(format!("def from_wire({literal})"), Doc::flat(tag.clone()));
                 }
-                content.push_str(&format!("  def from_wire(value), do: raise(ArgumentError, \"unknown {}: #{{inspect(value)}}\")\n", rule.name));
+                clause(
+                    "def from_wire(value)".to_string(),
+                    Doc::Call {
+                        fun: "raise".to_string(),
+                        args: vec![
+                            Doc::flat("ArgumentError"),
+                            Doc::flat(format!("\"unknown {}: #{{inspect(value)}}\"", rule.name)),
+                        ],
+                        tail_fn: None,
+                    },
+                );
                 if let Some(numbers) = csilgen_common::enum_numbers(arms) {
                     for (index, tag) in numbers.iter().zip(&tags) {
-                        content.push_str(&format!("  def to_number({tag}), do: {index}\n"));
+                        clause(
+                            format!("def to_number({tag})"),
+                            Doc::flat(index.to_string()),
+                        );
                     }
                     for (index, tag) in numbers.iter().zip(&tags) {
-                        content.push_str(&format!("  def from_number({index}), do: {tag}\n"));
+                        clause(format!("def from_number({index})"), Doc::flat(tag.clone()));
                     }
                     content.push_str(
                         "  def from_number(_), do: raise(ArgumentError, \"unknown enum number\")\n",
@@ -1306,16 +1480,53 @@ fn generate_types(
                 emitted = true;
                 continue;
             }
-            let mapped = map_type(type_expr, config);
             content.push_str(&format!("defmodule {module} do\n"));
             content.push_str(&format!("  @moduledoc \"Type alias for {}.\"\n", rule.name));
-            content.push_str(&format!("  @type t :: {mapped}\n"));
+            content.push_str(&attr_type(2, "t", &type_members(type_expr, config)));
+            content.push('\n');
+            if let CsilTypeExpression::Choice(arms) = type_expr
+                && has_union_codec(arms)
+            {
+                emit_union_codec(&mut content, &rule.name, arms, &cx);
+            }
             content.push_str("end\n\n");
             emitted = true;
         }
     }
 
     if emitted { Some(content) } else { None }
+}
+
+/// One `atom: type` line of a struct `@type t`. Mix keeps the pair on one line when
+/// it fits; otherwise a map or list type opens its bracket on the key line and a single-token
+/// type moves to the next line at +2.
+/// The atom of a text enum member, from the shared member name (`CALENDARS_READ`
+/// for `"calendars.read"`). Lowercase words joined by `_` and starting with a letter
+/// always make a plain atom literal, but `:nil`, `:true` and `:false` are the values
+/// `nil`, `true` and `false`, which an optional field and a union guard read as
+/// something else, so those three get a `value_` prefix like a leading digit does.
+fn enum_atom(member: &str) -> String {
+    let atom = member.to_ascii_lowercase();
+    if matches!(atom.as_str(), "nil" | "true" | "false") {
+        format!("value_{atom}")
+    } else {
+        atom
+    }
+}
+
+fn struct_type_field(atom: &str, ty: &str, comma: &str) -> String {
+    let flat = format!("          {atom}: {ty}{comma}");
+    if flat.len() <= exfmt::MAX_WIDTH {
+        return flat;
+    }
+    for (prefix, close) in [("%{", '}'), ("[", ']')] {
+        if let Some(inner) = ty.strip_prefix(prefix).and_then(|t| t.strip_suffix(close)) {
+            return format!(
+                "          {atom}: {prefix}\n            {inner}\n          {close}{comma}"
+            );
+        }
+    }
+    format!("          {atom}:\n            {ty}{comma}")
 }
 
 fn emit_struct_module(
@@ -1376,7 +1587,7 @@ fn emit_struct_module(
                     && let Some(members) = csilgen_common::text_enum_members(arms)
                     && let Some((tag, _)) = members.iter().find(|(_, wire)| wire == text)
                 {
-                    return format!("{atom}: :{}", tag.to_ascii_lowercase());
+                    return format!("{atom}: :{}", enum_atom(tag));
                 }
                 format!("{atom}: {}", default_literal(&e.value_type, value, config))
             })
@@ -1398,7 +1609,8 @@ fn emit_struct_module(
                 ty = format!("{ty} | nil");
             }
             let comma = if i + 1 < keyed.len() { "," } else { "" };
-            content.push_str(&format!("          {atom}: {ty}{comma}\n"));
+            content.push_str(&struct_type_field(atom, &ty, comma));
+            content.push('\n');
         }
         content.push_str("        }\n");
     }
@@ -1678,9 +1890,10 @@ fn enc_enum(name: &str, literals: &[&CsilLiteralValue], expr: &str) -> Doc {
         .collect();
     clauses.push((
         "true".to_string(),
-        Doc::flat(format!(
-            "raise(\"csilgen: value does not match any {name} variant\")"
-        )),
+        call1(
+            "raise",
+            format!("\"csilgen: value does not match any {name} variant\""),
+        ),
     ));
     Doc::Cond { clauses }
 }
@@ -1759,9 +1972,25 @@ fn dec_enum(name: &str, literals: &[&CsilLiteralValue], expr: &str, root: &str) 
 /// A runtime guard selecting a union variant from a bare in-memory value (Elixir
 /// models a union as the underlying value, not a tagged wrapper), so the encoder
 /// picks the first declared variant whose guard matches the value's shape.
-fn union_guard(ty: &CsilTypeExpression, expr: &str) -> String {
+fn union_guard(ty: &CsilTypeExpression, expr: &str, cx: &Codec) -> String {
     match ty {
-        CsilTypeExpression::Constrained { base_type, .. } => union_guard(base_type, expr),
+        CsilTypeExpression::Constrained { base_type, .. } => union_guard(base_type, expr, cx),
+        // A record value is its struct, so the struct names the arm. A plain map does
+        // not, which is why a map arm must not take a struct (see the `Map` guard).
+        CsilTypeExpression::Reference(name) if cx.records.contains(name) => {
+            format!("is_struct({expr}, {})", cx.config.module(name))
+        }
+        CsilTypeExpression::Reference(name) if cx.aliases.contains_key(name) => {
+            union_guard(&cx.aliases[name], expr, cx)
+        }
+        CsilTypeExpression::Reference(name)
+            if cx
+                .choices
+                .get(name)
+                .is_some_and(|arms| csilgen_common::text_enum_members(arms).is_some()) =>
+        {
+            format!("is_atom({expr})")
+        }
         CsilTypeExpression::Builtin(name) => match name.as_str() {
             "int" | "uint" | "nint" => format!("is_integer({expr})"),
             "float" | "double" | "float16" | "float32" | "float64" => format!("is_float({expr})"),
@@ -1769,10 +1998,11 @@ fn union_guard(ty: &CsilTypeExpression, expr: &str) -> String {
             "date" => format!("is_struct({expr}, Date)"),
             "text" | "tstr" | "bytes" | "bstr" => format!("is_binary({expr})"),
             "bool" | "true" | "false" => format!("is_boolean({expr})"),
+            "null" | "nil" | "undefined" => format!("is_nil({expr})"),
             _ => "true".to_string(),
         },
         CsilTypeExpression::Array { .. } => format!("is_list({expr})"),
-        CsilTypeExpression::Map { .. } => format!("is_map({expr})"),
+        CsilTypeExpression::Map { .. } => format!("is_map({expr}) and not is_struct({expr})"),
         CsilTypeExpression::Tuple(_) => format!("is_tuple({expr})"),
         _ => "true".to_string(),
     }
@@ -1852,7 +2082,7 @@ fn enc_choice(name: &str, variants: &[CsilTypeExpression], expr: &str, cx: &Code
                 format!("{expr} === {}", literal_to_elixir(lit)),
                 Doc::flat(enum_enc(lit, expr)),
             ),
-            None => (union_guard(v, expr), enc_value(v, expr, cx)),
+            None => (union_guard(v, expr, cx), enc_value(v, expr, cx)),
         };
         let body = Doc::Tuple(vec![
             Doc::flat(":array"),
@@ -1863,9 +2093,10 @@ fn enc_choice(name: &str, variants: &[CsilTypeExpression], expr: &str, cx: &Code
     }
     clauses.push((
         "true".to_string(),
-        Doc::flat(format!(
-            "raise(\"csilgen: value does not match any {name} variant\")"
-        )),
+        call1(
+            "raise",
+            format!("\"csilgen: value does not match any {name} variant\""),
+        ),
     ));
     Doc::Cond { clauses }
 }
@@ -1886,26 +2117,29 @@ fn call1(fun: impl Into<String>, arg: impl Into<String>) -> Doc {
 /// in-memory type). A shape the codec cannot model (a bare non-record,
 /// non-choice reference) raises at runtime so the module still compiles and the
 /// supported paths stay total.
+/// `{:kind, expr}` as a tuple doc, so a long `expr` breaks the way mix breaks it.
+fn tagged(kind: &str, expr: &str) -> Doc {
+    Doc::Tuple(vec![Doc::flat(format!(":{kind}")), Doc::flat(expr)])
+}
+
 fn enc_value(ty: &CsilTypeExpression, expr: &str, cx: &Codec) -> Doc {
     match ty {
         CsilTypeExpression::Constrained { base_type, .. } => enc_value(base_type, expr, cx),
         CsilTypeExpression::Builtin(name) => match name.as_str() {
-            "int" | "uint" | "nint" => Doc::flat(format!("{{:int, {expr}}}")),
-            "float" | "double" | "float16" | "float32" | "float64" => {
-                Doc::flat(format!("{{:float, {expr}}}"))
-            }
-            "text" | "tstr" => Doc::flat(format!("{{:text, {expr}}}")),
-            "bytes" | "bstr" => Doc::flat(format!("{{:bytes, {expr}}}")),
-            "bool" | "true" | "false" => Doc::flat(format!("{{:bool, {expr}}}")),
-            "date" => Doc::flat(format!("{}.Cbor.enc_date({expr})", cx.config.module_root)),
-            "timestamp" => Doc::flat(format!(
-                "{}.Cbor.enc_timestamp({expr})",
-                cx.config.module_root
-            )),
-            "cddl_time" => Doc::flat(format!(
-                "{}.Cbor.enc_cddl_time({expr})",
-                cx.config.module_root
-            )),
+            "int" | "uint" | "nint" => tagged("int", expr),
+            "float" | "double" | "float16" | "float32" | "float64" => tagged("float", expr),
+            "text" | "tstr" => tagged("text", expr),
+            "bytes" | "bstr" => tagged("bytes", expr),
+            "bool" | "true" | "false" => tagged("bool", expr),
+            "date" => call1(format!("{}.Cbor.enc_date", cx.config.module_root), expr),
+            "timestamp" => call1(
+                format!("{}.Cbor.enc_timestamp", cx.config.module_root),
+                expr,
+            ),
+            "cddl_time" => call1(
+                format!("{}.Cbor.enc_cddl_time", cx.config.module_root),
+                expr,
+            ),
             // CBOR tag 4 exact decimal fraction `[exponent, mantissa]` against the
             // generated self-contained Decimal struct.
             "decimal" => Doc::Tuple(vec![
@@ -1921,7 +2155,9 @@ fn enc_value(ty: &CsilTypeExpression, expr: &str, cx: &Codec) -> Doc {
             ]),
             // `any` rides as the codec's own value tree, so it passes through unchanged.
             "any" => Doc::flat(expr),
-            "null" | "nil" | "undefined" => Doc::flat(format!("(_ = {expr}; :null)")),
+            "null" | "nil" | "undefined" => {
+                call1(format!("{}.Cbor.enc_null", cx.config.module_root), expr)
+            }
             other => enc_named(other, expr, cx),
         },
         CsilTypeExpression::Reference(name) => enc_named(name, expr, cx),
@@ -1939,8 +2175,9 @@ fn enc_value(ty: &CsilTypeExpression, expr: &str, cx: &Codec) -> Doc {
         CsilTypeExpression::Map { key, value, .. } => {
             let ek = enc_value(key, "csil_k", cx);
             let ev = enc_value(value, "csil_v", cx);
+            // `:dynamic_map` makes the runtime sort the entries by encoded key.
             Doc::Tuple(vec![
-                Doc::flat(":map"),
+                Doc::flat(":dynamic_map"),
                 Doc::Call {
                     fun: "Enum.map".to_string(),
                     args: vec![Doc::flat(expr)],
@@ -1996,10 +2233,10 @@ fn enc_named(name: &str, expr: &str, cx: &Codec) -> Doc {
             } else {
                 ("text", "to_wire")
             };
-            Doc::flat(format!(
-                "{{:{kind}, {}.{method}({expr})}}",
-                cx.config.module(name)
-            ))
+            Doc::Tuple(vec![
+                Doc::flat(format!(":{kind}")),
+                call1(format!("{}.{method}", cx.config.module(name)), expr),
+            ])
         } else {
             enc_choice(name, variants, expr, cx)
         }
@@ -2057,9 +2294,10 @@ fn dec_choice(name: &str, variants: &[CsilTypeExpression], expr: &str, cx: &Code
         .collect();
     arms.push((
         "csil_other".to_string(),
-        Doc::flat(format!(
-            "raise(\"csilgen: unknown {name} variant index #{{csil_other}}\")"
-        )),
+        call1(
+            "raise",
+            format!("\"csilgen: unknown {name} variant index #{{csil_other}}\""),
+        ),
     ));
     Doc::Case {
         subject: expr.to_string(),
@@ -2099,7 +2337,7 @@ fn dec_value(ty: &CsilTypeExpression, expr: &str, cx: &Codec) -> Doc {
                 )],
             },
             "any" => Doc::flat(expr),
-            "null" | "nil" | "undefined" => Doc::flat(format!("(_ = {expr}; nil)")),
+            "null" | "nil" | "undefined" => call1(format!("{root}.Cbor.to_null"), expr),
             other => dec_named(other, expr, cx),
         },
         CsilTypeExpression::Reference(name) => dec_named(name, expr, cx),
@@ -2122,17 +2360,30 @@ fn dec_value(ty: &CsilTypeExpression, expr: &str, cx: &Codec) -> Doc {
             let dv = dec_value(value, "csil_v", cx);
             Doc::Case {
                 subject: expr.to_string(),
-                clauses: vec![(
-                    "{:map, csil_kvs}".to_string(),
-                    Doc::Call {
-                        fun: "Map.new".to_string(),
-                        args: vec![Doc::flat("csil_kvs")],
-                        tail_fn: Some((
-                            "{csil_k, csil_v}".to_string(),
-                            Box::new(Doc::Tuple(vec![dk, dv])),
-                        )),
-                    },
-                )],
+                clauses: vec![
+                    (
+                        "{:map, csil_kvs}".to_string(),
+                        Doc::Call {
+                            fun: "Map.new".to_string(),
+                            args: vec![Doc::flat("csil_kvs")],
+                            tail_fn: Some((
+                                "{csil_k, csil_v}".to_string(),
+                                Box::new(Doc::Tuple(vec![dk, dv])),
+                            )),
+                        },
+                    ),
+                    (
+                        "{:unordered_map, _}".to_string(),
+                        Doc::Call {
+                            fun: "raise".to_string(),
+                            args: vec![
+                                Doc::flat("ArgumentError"),
+                                Doc::flat("\"csil cbor: map keys are not in canonical order\""),
+                            ],
+                            tail_fn: None,
+                        },
+                    ),
+                ],
             }
         }
         // Positional tuple decode: bind each array element, rebuild the tuple; a `null`
@@ -2260,6 +2511,11 @@ fn emit_struct_codec(content: &mut String, group: &CsilGroupExpression, cx: &Cod
     content.push_str("\n  @doc \"Reconstructs this struct from a decoded CBOR value tree.\"\n");
     content.push_str("  @spec from_cbor_value(term()) :: t()\n");
     // A fieldless record never reads the decoded pairs, so bind them underscored.
+    // A record takes its fields in any order, so a map that is not in canonical
+    // order is still a record; the decoder has already refused a repeated key.
+    content.push_str(
+        "  def from_cbor_value({:unordered_map, csil_kvs}), do: from_cbor_value({:map, csil_kvs})\n\n",
+    );
     if fields.is_empty() {
         content.push_str("  def from_cbor_value({:map, _csil_kvs}) do\n");
         content.push_str("    %__MODULE__{}\n  end\n");
@@ -2267,8 +2523,7 @@ fn emit_struct_codec(content: &mut String, group: &CsilGroupExpression, cx: &Cod
         content.push_str("  def from_cbor_value({:map, csil_kvs}) do\n");
         // The struct literal below always spans multiple lines, and mix separates a
         // multi-line block expression from its neighbor with one blank line.
-        content.push_str("    csil_fields = Map.new(csil_kvs)\n\n");
-        content.push_str("    %__MODULE__{\n");
+        content.push_str("    csil_fields = Map.new(csil_kvs)\n");
         emit_from_cbor_fields(content, &fields, cx);
         content.push_str("    }\n  end\n");
     }
@@ -2291,8 +2546,8 @@ fn emit_struct_codec(content: &mut String, group: &CsilGroupExpression, cx: &Cod
 /// field's type has no real decoder (a non-record reference falls back to a `raise`),
 /// the bound value is never read, so the binding is underscored to stay warning-clean.
 fn emit_from_cbor_fields(content: &mut String, fields: &[CodecField<'_>], cx: &Codec) {
-    for (i, f) in fields.iter().enumerate() {
-        let doc = if f.optional {
+    let field_doc = |f: &CodecField<'_>, fetched: &str| {
+        if f.optional {
             let dec = dec_value(f.value_type, "csil_v", cx);
             let bind = if dec.mentions("csil_v") {
                 "csil_v"
@@ -2300,35 +2555,63 @@ fn emit_from_cbor_fields(content: &mut String, fields: &[CodecField<'_>], cx: &C
                 "_csil_v"
             };
             Doc::Case {
-                subject: format!("Map.get(csil_fields, {{:text, \"{}\"}})", f.wire),
+                subject: fetched.to_string(),
                 clauses: vec![
                     ("nil".to_string(), Doc::flat("nil")),
                     (bind.to_string(), dec),
                 ],
             }
         } else {
-            let fetch = format!("Map.fetch!(csil_fields, {{:text, \"{}\"}})", f.wire);
-            dec_value(f.value_type, &fetch, cx)
-        };
-        let last = i + 1 == fields.len();
-        content.push_str(&render_binding(
-            6,
-            &format!("{}: ", f.atom),
-            &doc,
-            usize::from(!last),
-        ));
-        if !last {
-            content.push(',');
+            dec_value(f.value_type, fetched, cx)
         }
-        content.push('\n');
+    };
+    let mut bindings: Vec<String> = Vec::new();
+    let mut body = String::new();
+    for (i, f) in fields.iter().enumerate() {
+        let last = i + 1 == fields.len();
+        let head = format!("{}: ", f.atom);
+        let fun = if f.optional { "Map.get" } else { "Map.fetch!" };
+        let key = format!("{{:text, \"{}\"}}", f.wire);
+        let fetch = format!("{fun}(csil_fields, {key})");
+        let mut rendered = render_binding(6, &head, &field_doc(f, &fetch), usize::from(!last));
+        // The lookup is one flat token to the field decoders, so when it pushes a line
+        // past the width, it moves to a binding of its own, where it can break.
+        if rendered.lines().any(|line| line.len() > exfmt::MAX_WIDTH) {
+            let var = format!("csil_f{i}");
+            let lookup = Doc::Call {
+                fun: fun.to_string(),
+                args: vec![Doc::flat("csil_fields"), Doc::flat(key)],
+                tail_fn: None,
+            };
+            bindings.push(render_binding(4, &format!("{var} = "), &lookup, 0));
+            rendered = render_binding(6, &head, &field_doc(f, &var), usize::from(!last));
+        }
+        body.push_str(&rendered);
+        if !last {
+            body.push(',');
+        }
+        body.push('\n');
     }
+    // Mix sets a multi-line statement apart from its neighbors with a blank line.
+    let mut prev_multi = false;
+    for binding in &bindings {
+        let multi = binding.contains('\n');
+        if multi || prev_multi {
+            content.push('\n');
+        }
+        content.push_str(binding);
+        content.push('\n');
+        prev_multi = multi;
+    }
+    content.push_str("\n    %__MODULE__{\n");
+    content.push_str(&body);
 }
 
 /// Build `codec.gen.ex`: the shared self-contained canonical-CBOR value codec the
 /// per-struct `to_cbor`/`from_cbor` build on. `None` when the spec declares no
 /// record types (nothing references the codec).
 fn generate_codec(input: &WasmGeneratorInput, config: &ElixirConfig) -> Option<String> {
-    if record_csil_names(input).is_empty() && input.csil_spec.rpc_operations().next().is_none() {
+    if !codec_emitted(input) {
         return None;
     }
     let mut content = String::new();
@@ -2344,43 +2627,80 @@ fn generate_codec(input: &WasmGeneratorInput, config: &ElixirConfig) -> Option<S
         aliases: &aliases,
         choices: &choices,
     };
-    let mut exceptions = std::collections::BTreeMap::new();
     let mut resolve = String::new();
     for (service, op, arms) in input.csil_spec.rpc_operations() {
         let stem = snake_case(&format!("{service}_{}", op.name));
-        let method = &op.name;
+        let encode_fn = format!("encode_{stem}_reply");
+        // The wire carries the declared service name, not the renamed rule.
+        let wire_service = format!("{:?}", input.csil_spec.declared_name(service));
+        let method = format!("{:?}", op.name);
         let success = input
             .csil_spec
             .declared_name(arms[0].rpc_variant_name().unwrap());
-        let value = enc_value(&arms[0], "value", &cx).render(4, 0);
-        content.push_str(&format!("\n  def encode_{stem}_reply({{:ok, value}}) do\n    {{{success:?}, encode({value})}}\n  end\n"));
-        resolve.push_str(&format!("\n  def resolve_rpc_reply({service:?}, {method:?}, {success:?}, payload), do: payload\n"));
+        content.push_str(&encode_reply_clause(
+            &encode_fn,
+            "{:ok, value}",
+            success,
+            enc_value(&arms[0], "value", &cx),
+        ));
+        let head = |variant: &str, payload: &str| {
+            def_head(
+                2,
+                "def",
+                "resolve_rpc_reply",
+                &[
+                    wire_service.clone(),
+                    method.clone(),
+                    variant.to_string(),
+                    payload.to_string(),
+                ],
+            )
+        };
+        resolve.push_str(&format!(
+            "\n{}\n    payload\n  end\n",
+            head(&format!("{success:?}"), "payload")
+        ));
         for arm in &arms[1..] {
             let variant = arm.rpc_variant_name().unwrap();
             let wire = input.csil_spec.declared_name(variant);
             let tag = snake_case(variant);
             let pattern = if arms.len() == 2 {
-                "value".into()
+                "{:error, value}".to_string()
             } else {
-                format!("{{:{tag}, value}}")
+                format!("{{:error, {{:{tag}, value}}}}")
             };
-            let enc = enc_value(arm, "value", &cx).render(4, 0);
-            let dec = dec_value(arm, "decode(payload)", &cx).render(4, 0);
+            content.push_str(&encode_reply_clause(
+                &encode_fn,
+                &pattern,
+                wire,
+                enc_value(arm, "value", &cx),
+            ));
+            let dec = dec_value(arm, "decode(payload)", &cx);
+            let binding = render_binding(4, "value = ", &dec, 0);
+            let gap = if binding.contains('\n') { "\n" } else { "" };
             let exception = format!("{}Refusal", config.module(variant));
-            exceptions.insert(exception.clone(), wire);
-            content.push_str(&format!("\n  def encode_{stem}_reply({{:error, {pattern}}}) do\n    {{{wire:?}, encode({enc})}}\n  end\n"));
-            resolve.push_str(&format!("\n  def resolve_rpc_reply({service:?}, {method:?}, {wire:?}, payload) do\n    value = {dec}\n    raise {exception}, value: value\n  end\n"));
+            resolve.push_str(&format!(
+                "\n{}\n{binding}\n{gap}{}\n  end\n",
+                head(&format!("{wire:?}"), "payload"),
+                render_no_paren_call(4, &format!("raise {exception}"), "value: value")
+            ));
         }
-        resolve.push_str(&format!("\n  def resolve_rpc_reply({service:?}, {method:?}, variant, _payload) do\n    raise ArgumentError, \"invalid reply variant: #{{inspect(variant)}}\"\n  end\n"));
+        resolve.push_str(&format!(
+            "\n{}\n    raise ArgumentError, \"invalid reply variant: #{{inspect(variant)}}\"\n  end\n",
+            head("variant", "_payload")
+        ));
     }
     content.push_str(&resolve);
     content.push_str("\n  def resolve_rpc_reply(_service, _op, _variant, payload), do: payload\n");
     content.push_str("end\n");
-    for (exception, wire) in exceptions {
+    let root = &config.module_root;
+    for (exception, wire) in refusal_exceptions(&input.csil_spec).into_iter().rev() {
+        let fields = [":value".to_string(), format!("message: {wire:?}")];
         content.insert_str(
             GEN_HEADER.len(),
             &format!(
-                "defmodule {exception} do\n  defexception [:value, message: {wire:?}]\nend\n\n"
+                "defmodule {root}.{exception} do\n{}\nend\n\n",
+                attr_list(2, "defexception ", &fields)
             ),
         );
     }
@@ -2393,6 +2713,83 @@ fn generate_codec(input: &WasmGeneratorInput, config: &ElixirConfig) -> Option<S
         content.push_str("end\n");
     }
     Some(content)
+}
+
+/// Whether `codec.gen.ex` (the `<root>.Cbor` module) is part of the output.
+/// A named union counts, because its module calls the codec (`emit_union_codec`).
+fn codec_emitted(input: &WasmGeneratorInput) -> bool {
+    !record_csil_names(input).is_empty()
+        || input.csil_spec.rpc_operations().next().is_some()
+        || choice_csil_types(input)
+            .values()
+            .any(|arms| has_union_codec(arms))
+}
+
+/// Whether a named choice is a union (tagged sum) rather than an enum, so its module
+/// carries a codec of its own.
+fn has_union_codec(arms: &[CsilTypeExpression]) -> bool {
+    matches!(classify_choice(arms), ChoiceClass::Union(_))
+}
+
+/// The `@type t` members of a type alias: one per distinct arm for a choice.
+fn type_members(type_expr: &CsilTypeExpression, config: &ElixirConfig) -> Vec<String> {
+    let CsilTypeExpression::Choice(choices) = type_expr else {
+        return vec![map_type(type_expr, config)];
+    };
+    let mut seen = Vec::new();
+    for c in choices {
+        let mapped = map_type(c, config);
+        if !seen.contains(&mapped) {
+            seen.push(mapped);
+        }
+    }
+    seen
+}
+
+/// The codec surface of a named union's module, the same four functions a record
+/// module has, so a union can be a top-level payload (an op boundary, a peer test)
+/// and not only a field.
+fn emit_union_codec(content: &mut String, name: &str, arms: &[CsilTypeExpression], cx: &Codec) {
+    let root = &cx.config.module_root;
+    content.push_str("\n  @doc \"Builds the canonical CBOR value tree for this union.\"\n");
+    content.push_str(&format!(
+        "  @spec to_cbor_value(t()) :: {root}.Cbor.value()\n"
+    ));
+    content.push_str("  def to_cbor_value(v) do\n    ");
+    content.push_str(&enc_choice(name, arms, "v", cx).render(4, 0));
+    content.push_str("\n  end\n");
+    content.push_str("\n  @doc \"Reconstructs this union from a decoded CBOR value tree.\"\n");
+    content.push_str("  @spec from_cbor_value(term()) :: t()\n");
+    content.push_str("  def from_cbor_value(csil_value) do\n    ");
+    content.push_str(&dec_choice(name, arms, "csil_value", cx).render(4, 0));
+    content.push_str("\n  end\n");
+    content.push_str("\n  @doc \"Encodes this union to canonical CBOR bytes.\"\n");
+    content.push_str("  @spec to_cbor(t()) :: binary()\n");
+    content.push_str(&format!(
+        "  def to_cbor(v), do: {root}.Cbor.encode(to_cbor_value(v))\n"
+    ));
+    content.push_str("\n  @doc \"Decodes canonical CBOR bytes into this union.\"\n");
+    content.push_str("  @spec from_cbor(binary()) :: t()\n");
+    content.push_str(&format!(
+        "  def from_cbor(bytes), do: from_cbor_value({root}.Cbor.decode(bytes))\n"
+    ));
+}
+
+/// One `encode_<op>_reply/1` clause: the reply variant and the encoded payload.
+fn encode_reply_clause(fun: &str, pattern: &str, variant: &str, value: Doc) -> String {
+    let reply = Doc::Tuple(vec![
+        Doc::flat(format!("{variant:?}")),
+        Doc::Call {
+            fun: "encode".to_string(),
+            args: vec![value],
+            tail_fn: None,
+        },
+    ]);
+    format!(
+        "\n{}\n    {}\n  end\n",
+        def_head(2, "def", fun, &[pattern.to_string()]),
+        reply.render(4, 0)
+    )
 }
 
 /// Whether any record field is the exact-decimal core type (directly, or nested in an
@@ -2503,6 +2900,21 @@ fn is_record_ref(ty: &CsilTypeExpression, records: &HashSet<String>) -> bool {
     matches!(ty, CsilTypeExpression::Reference(name) if records.contains(name))
 }
 
+/// Whether a boundary is a named type whose module has `to_cbor`/`from_cbor`: a
+/// record, or a named union (`emit_union_codec`).
+fn module_codec_ref(ty: &CsilTypeExpression, cx: &Codec) -> bool {
+    match ty {
+        CsilTypeExpression::Reference(name) => {
+            cx.records.contains(name)
+                || cx
+                    .choices
+                    .get(name)
+                    .is_some_and(|arms| has_union_codec(arms))
+        }
+        _ => false,
+    }
+}
+
 /// Whether `enc_value`/`dec_value` model an op-boundary type faithfully, so a per-op
 /// codec helper is correct rather than silently lossy. Records, scalars, transparent
 /// aliases, named choices (enums and unions), inline enums, arrays, maps, and tuples
@@ -2570,15 +2982,16 @@ fn emit_client_module(
 ) {
     let config = cx.config;
     let records = cx.records;
-    let base = service_base(name);
+    let base = service_base(spec, name);
     let module = format!("{}.{base}Client", config.module_root);
     let root = &config.module_root;
     // Canonical wire strings carry the CSIL service/op names verbatim
     // (docs/csil-rpc-transport.md §1.1) — no case transform may leak onto the wire.
-    let wire_service = name;
+    let wire_service = spec.declared_name(name);
     // The shared `<root>.Cbor` module the per-op helpers call is only emitted when the
     // spec declares records; without it a non-record boundary has no (de)serializer.
     let has_codec = !records.is_empty()
+        || cx.choices.values().any(|arms| has_union_codec(arms))
         || service
             .operations
             .iter()
@@ -2619,8 +3032,8 @@ fn emit_client_module(
         // boundary (an inline multi-variant choice with no wire discriminator, or an
         // unmodeled reference) — or any non-record boundary in a spec with no codec — is
         // skipped now; every other op gets a method.
-        let needs_codec = (!null_input && !is_record_ref(&op.input_type, records))
-            || !is_record_ref(&success, records);
+        let needs_codec = (!null_input && !module_codec_ref(&op.input_type, cx))
+            || !module_codec_ref(&success, cx);
         if !req_ok || !resp_ok || (needs_codec && !has_codec) {
             content.push_str(&format!(
                 "\n  # operation {} has a payload csilgen can't (de)serialize; handle it manually\n",
@@ -2632,11 +3045,11 @@ fn emit_client_module(
         let wire_method = &op.name;
         // A record success reuses its module's `from_cbor`; any other shape gets a per-op
         // decoder built from the same value builders the record codec uses.
-        let (out_ty, decode_resp) = if is_record_ref(&success, records) {
+        let (out_ty, decode_resp) = if module_codec_ref(&success, cx) {
             let resp_mod = config.module(&ref_name(&success));
             (
                 format!("{resp_mod}.t()"),
-                format!("{resp_mod}.from_cbor(resp)"),
+                call1(format!("{resp_mod}.from_cbor"), "resp"),
             )
         } else {
             let dec = dec_value(&success, "csil_root", cx);
@@ -2649,22 +3062,30 @@ fn emit_client_module(
             ));
             (
                 map_type(&success, config),
-                format!("decode_{func}_response(resp)"),
+                call1(format!("decode_{func}_response"), "resp"),
             )
         };
         content.push('\n');
-        let (spec_args, def_head, encode_req) = if null_input {
+        let (spec_args, head_line, encode_req) = if null_input {
             (
                 vec!["t()".to_string()],
-                format!("  def {func}(%__MODULE__{{transport: transport}}) do\n"),
-                "<<>>".to_string(),
+                def_head(
+                    2,
+                    "def",
+                    &func,
+                    &["%__MODULE__{transport: transport}".to_string()],
+                ),
+                Doc::flat("<<>>"),
             )
         } else {
             // A record request reuses its module's `to_cbor`; any other shape gets a
             // per-op encoder over the shared value builders.
-            let (in_ty, encode_req) = if is_record_ref(&op.input_type, records) {
+            let (in_ty, encode_req) = if module_codec_ref(&op.input_type, cx) {
                 let req_mod = config.module(&ref_name(&op.input_type));
-                (format!("{req_mod}.t()"), format!("{req_mod}.to_cbor(req)"))
+                (
+                    format!("{req_mod}.t()"),
+                    call1(format!("{req_mod}.to_cbor"), "req"),
+                )
             } else {
                 let enc = Doc::Call {
                     fun: format!("{root}.Cbor.encode"),
@@ -2678,18 +3099,27 @@ fn emit_client_module(
                 ));
                 (
                     map_type(&op.input_type, config),
-                    format!("encode_{func}_request(req)"),
+                    call1(format!("encode_{func}_request"), "req"),
                 )
             };
             (
                 vec!["t()".to_string(), in_ty],
-                format!("  def {func}(%__MODULE__{{transport: transport}}, req) do\n"),
+                def_head(
+                    2,
+                    "def",
+                    &func,
+                    &[
+                        "%__MODULE__{transport: transport}".to_string(),
+                        "req".to_string(),
+                    ],
+                ),
                 encode_req,
             )
         };
         content.push_str(&attr_spec(2, "@spec", &func, &spec_args, &[out_ty]));
         content.push('\n');
-        content.push_str(&def_head);
+        content.push_str(&head_line);
+        content.push('\n');
         let service_lit = || Doc::flat(format!("\"{wire_service}\""));
         let method_lit = || Doc::flat(format!("\"{wire_method}\""));
         // A multi-arm reply needs its variant to pick the arm, which `call/4`'s bare
@@ -2705,7 +3135,7 @@ fn emit_client_module(
                 Doc::flat("transport"),
                 service_lit(),
                 method_lit(),
-                Doc::flat(encode_req),
+                encode_req,
             ],
             tail_fn: None,
         };
@@ -2723,7 +3153,7 @@ fn emit_client_module(
             };
             statements.push(render_binding(4, "resp = ", &resolve, 0));
         }
-        statements.push(format!("    {decode_resp}"));
+        statements.push(format!("    {}", decode_resp.render(4, 0)));
         // Mix separates a multi-line expression from the next statement with a blank.
         for (i, statement) in statements.iter().enumerate() {
             let multi = statement.contains('\n')
@@ -2814,7 +3244,7 @@ fn emit_server_module(
     config: &ElixirConfig,
     spec: &csilgen_common::CsilSpecSerialized,
 ) {
-    let base = service_base(name);
+    let base = service_base(spec, name);
     let module = format!("{}.{base}Server", config.module_root);
 
     content.push_str(&format!("defmodule {module} do\n"));
@@ -3100,7 +3530,8 @@ fn generate_validation(input: &WasmGeneratorInput, config: &ElixirConfig) -> Opt
             &[":ok".to_string(), "{:error, String.t()}".to_string()],
         ));
         body.push('\n');
-        body.push_str(&format!("  def {func}(%{module}{{}} = v) do\n"));
+        body.push_str(&def_head(2, "def", &func, &[format!("%{module}{{}} = v")]));
+        body.push('\n');
 
         let mut checks: Vec<Doc> = Vec::new();
         for entry in &group.entries {
@@ -3708,16 +4139,12 @@ fn service_has_channel_ops(def: &CsilServiceDefinition) -> bool {
         .any(|op| !matches!(op.direction, CsilServiceDirection::Unidirectional))
 }
 
-/// Strip a trailing `Service` suffix and PascalCase, used only for Elixir module
-/// identifiers (`<Base>Client`/`<Base>Server`). Wire strings carry the verbatim CSIL
-/// service name instead (docs/csil-rpc-transport.md §1.1).
-fn service_base(name: &str) -> String {
-    let pascal = pascal_case(name);
-    pascal
-        .strip_suffix("Service")
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
-        .unwrap_or(pascal)
+/// The module base of one service; see `service_bases`. Wire strings carry the
+/// declared CSIL service name instead (docs/csil-rpc-transport.md section 1.1).
+fn service_base(spec: &csilgen_common::CsilSpecSerialized, name: &str) -> String {
+    service_bases(spec)
+        .remove(name)
+        .unwrap_or_else(|| pascal_case(name))
 }
 
 fn pascal_case(s: &str) -> String {
@@ -3829,6 +4256,8 @@ const CODEC_RUNTIME_ELIXIR: &str = r#"  @moduledoc """
           | {:bytes, binary()}
           | {:array, [value()]}
           | {:map, [{value(), value()}]}
+          | {:dynamic_map, [{value(), value()}]}
+          | {:unordered_map, [{value(), value()}]}
           | {:tag, non_neg_integer(), value()}
 
   @doc "Encodes a CBOR value tree to canonical bytes."
@@ -3847,6 +4276,20 @@ const CODEC_RUNTIME_ELIXIR: &str = r#"  @moduledoc """
 
   defp enc({:map, kvs}),
     do: [head(5, length(kvs)) | Enum.map(kvs, fn {k, v} -> [enc(k), enc(v)] end)]
+
+  # A decoded map that is not in canonical order goes back out as it came in.
+  defp enc({:unordered_map, kvs}), do: enc({:map, kvs})
+
+  # A dynamic map sorts by the bytes of each encoded key (RFC 8949 section 4.2.1).
+  # Binary term order is bytewise with a shorter prefix first, so it is that order.
+  defp enc({:dynamic_map, kvs}) do
+    entries =
+      kvs
+      |> Enum.map(fn {k, v} -> {IO.iodata_to_binary(enc(k)), enc(v)} end)
+      |> Enum.sort_by(&elem(&1, 0))
+
+    [head(5, length(entries)) | Enum.map(entries, fn {k, v} -> [k, v] end)]
+  end
 
   defp enc({:tag, t, v}), do: [head(6, t), enc(v)]
 
@@ -3916,7 +4359,7 @@ const CODEC_RUNTIME_ELIXIR: &str = r#"  @moduledoc """
 
       5 ->
         if arg > byte_size(rest), do: raise("csilgen: map length exceeds remaining input")
-        dec_map(arg, rest, [], depth + 1)
+        dec_map(arg, rest, [], [], true, depth + 1)
 
       6 ->
         {inner, r} = dec(rest, depth + 1)
@@ -3937,13 +4380,69 @@ const CODEC_RUNTIME_ELIXIR: &str = r#"  @moduledoc """
     dec_array(n - 1, r, [v | acc], depth)
   end
 
-  defp dec_map(0, rest, acc, _depth), do: {{:map, Enum.reverse(acc)}, rest}
+  # A map whose raw keys are strictly ascending is `:map`. Any other map is
+  # `:unordered_map`, which a record accepts and a dynamic map refuses, so the
+  # order is checked here once, against the previous key only.
+  defp dec_map(0, rest, acc, _raws, true, _depth), do: {{:map, Enum.reverse(acc)}, rest}
 
-  defp dec_map(n, rest, acc, depth) do
-    {k, r1} = dec(rest, depth)
-    {v, r2} = dec(r1, depth)
-    dec_map(n - 1, r2, [{k, v} | acc], depth)
+  defp dec_map(0, rest, acc, raws, false, _depth) do
+    unique_keys!(raws, MapSet.new())
+    {{:unordered_map, Enum.reverse(acc)}, rest}
   end
+
+  defp dec_map(n, rest, acc, raws, ordered, depth) do
+    {k, r1} = dec(rest, depth)
+    raw = binary_part(rest, 0, byte_size(rest) - byte_size(r1))
+    shortest_key!(raw)
+    {v, r2} = dec(r1, depth)
+    ordered = ordered and (raws == [] or hd(raws) < raw)
+    dec_map(n - 1, r2, [{k, v} | acc], [raw | raws], ordered, depth)
+  end
+
+  # Map key order compares raw bytes, so a key must have one byte form: its head
+  # carries its argument in the fewest bytes. Major type 7 heads are floats and
+  # simple values, which have their own encoding rules.
+  defp shortest_key!(<<major::size(3), 24::size(5), n::size(8), _::binary>>)
+       when major != 7 and n < 24,
+       do: long_key!()
+
+  defp shortest_key!(<<major::size(3), 25::size(5), n::size(16), _::binary>>)
+       when major != 7 and n < 0x100,
+       do: long_key!()
+
+  defp shortest_key!(<<major::size(3), 26::size(5), n::size(32), _::binary>>)
+       when major != 7 and n < 0x10000,
+       do: long_key!()
+
+  defp shortest_key!(<<major::size(3), 27::size(5), n::size(64), _::binary>>)
+       when major != 7 and n < 0x100000000,
+       do: long_key!()
+
+  defp shortest_key!(_raw), do: :ok
+
+  defp long_key!, do: raise(ArgumentError, "csil cbor: map key is not in shortest form")
+
+  defp unique_keys!([], _seen), do: :ok
+
+  defp unique_keys!([raw | raws], seen) do
+    if MapSet.member?(seen, raw), do: raise(ArgumentError, duplicate_key_message(raw))
+    unique_keys!(raws, MapSet.put(seen, raw))
+  end
+
+  defp duplicate_key_message(raw) do
+    case dec(raw, 0) do
+      {{:text, text}, ""} -> "csil cbor: duplicate key #{inspect(text)}"
+      _ -> "csil cbor: duplicate key 0x#{Base.encode16(raw, case: :lower)}"
+    end
+  end
+
+  @doc "Encodes a `null` field; the value is always `nil`."
+  @spec enc_null(nil) :: value()
+  def enc_null(nil), do: :null
+
+  @doc "Unwraps a CBOR null item."
+  @spec to_null(value()) :: nil
+  def to_null(:null), do: nil
 
   @doc "Unwraps a CBOR integer item."
   @spec to_int(value()) :: integer()

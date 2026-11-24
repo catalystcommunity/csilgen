@@ -39,7 +39,14 @@ LANGUAGES = (
     Language("swift", "swift", "interop_api", 6400),
 )
 TRANSPORTS = ("rpc", "events", "datagrams")
-FIXTURES = ("timestamp-vectors", "epoch-vectors", "typed-replies", "repo-specs")
+FIXTURES = (
+    "timestamp-vectors",
+    "epoch-vectors",
+    "typed-replies",
+    "repo-specs",
+    "wire-vectors",
+    "formatting",
+)
 # These targets have per-target fixtures but no matrix harness. One shard runs
 # them, so each PR checks them once.
 FIXTURE_ONLY_TARGETS = ("php",)

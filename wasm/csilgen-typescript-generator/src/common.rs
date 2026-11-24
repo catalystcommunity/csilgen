@@ -288,8 +288,9 @@ pub fn ts_type(type_expr: &CsilTypeExpression, mapping: DecimalMapping) -> Strin
         CsilTypeExpression::Array { element_type, .. } => {
             format!("{}[]", ts_type(element_type, mapping))
         }
-        CsilTypeExpression::Map { value, .. } => {
-            format!("Record<string, {}>", ts_type(value, mapping))
+        CsilTypeExpression::Map { key, value, .. } => {
+            let key = if int_map_key(key) { "number" } else { "string" };
+            format!("Record<{key}, {}>", ts_type(value, mapping))
         }
         CsilTypeExpression::Choice(choices) => choices
             .iter()
@@ -409,11 +410,13 @@ fn tuple_type(group: &CsilGroupExpression, mapping: DecimalMapping) -> String {
 
 fn builtin(name: &str, mapping: DecimalMapping) -> String {
     match name {
-        "text" | "string" => "string".to_string(),
+        "text" | "tstr" | "string" => "string".to_string(),
         "int" | "uint" | "nint" | "integer" | "float" | "float16" | "float32" | "float64"
         | "double" | "number" => "number".to_string(),
         "bool" | "boolean" => "boolean".to_string(),
-        "bytes" => "Uint8Array".to_string(),
+        "bytes" | "bstr" => "Uint8Array".to_string(),
+        "true" => "true".to_string(),
+        "false" => "false".to_string(),
         "date" => "string".to_string(),
         // `timestamp` is CBOR tag 0 on the wire; in TS it is a UTC-based Date.
         "timestamp" => "Date".to_string(),
@@ -424,7 +427,9 @@ fn builtin(name: &str, mapping: DecimalMapping) -> String {
             DecimalMapping::Csil => "CsilDecimal".to_string(),
             DecimalMapping::Library => "Decimal".to_string(),
         },
-        "null" => "null".to_string(),
+        // The decoder reads CBOR `undefined` as `null`, and the value tree has no
+        // `undefined` node, so a TypeScript `undefined` could not be encoded.
+        "null" | "nil" | "undefined" => "null".to_string(),
         "any" => "any".to_string(),
         _ => "unknown".to_string(),
     }
@@ -549,6 +554,66 @@ pub fn to_pascal(name: &str) -> String {
     out
 }
 
+/// Whether a map key is an integer on the wire. Its object keys are numbers then,
+/// so the codec converts them back from the property-name strings `Object.entries`
+/// returns.
+pub fn int_map_key(key: &CsilTypeExpression) -> bool {
+    match key {
+        CsilTypeExpression::Builtin(name) => matches!(name.as_str(), "int" | "uint" | "nint"),
+        CsilTypeExpression::Range { .. } => true,
+        CsilTypeExpression::Constrained { base_type, .. } => int_map_key(base_type),
+        _ => false,
+    }
+}
+
+/// The member keys of a text enum's `const` object, paired with each wire value:
+/// `UPPER_SNAKE` words from the shared splitter, so `"calendars.read"` is
+/// `CALENDARS_READ`. A key is read as `Scope.KEY`, so it must be an identifier: a
+/// leading digit gets the word `v` first (`"2fa"` is `V_2FA`). A reserved word is
+/// legal after a dot, and every key is upper case, so no keyword or
+/// `Object.prototype` member can clash. `None` when the choice is not a text enum.
+pub fn text_enum_members(choices: &[CsilTypeExpression]) -> Option<Vec<(String, &str)>> {
+    let values: Vec<&str> = csilgen_common::text_enum_members(choices)?
+        .into_iter()
+        .map(|(_, value)| value)
+        .collect();
+    let idents = csilgen_common::member_idents(
+        &values,
+        |words| words.join("_").to_ascii_uppercase(),
+        |name| !name.starts_with(|c: char| c.is_ascii_digit()),
+    );
+    Some(idents.into_iter().zip(values).collect())
+}
+
+/// A record member as a property key: the camelCase name, quoted when it is not an
+/// identifier. A literal text key such as `"a.b"` or `"2x"` camelCases to a name
+/// that `{ a.b: number }` cannot hold.
+pub fn member_key(member: &str) -> String {
+    if is_ident(member) {
+        member.to_string()
+    } else {
+        ts_string_literal(member)
+    }
+}
+
+/// Read the record member `member` of `expr`: `expr.member`, or `expr["a.b"]` for
+/// a member that is not an identifier.
+pub fn member_access(expr: &str, member: &str) -> String {
+    if is_ident(member) {
+        format!("{expr}.{member}")
+    } else {
+        format!("{expr}[{}]", ts_string_literal(member))
+    }
+}
+
+fn is_ident(name: &str) -> bool {
+    let mut chars = name.chars();
+    chars
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_' || c == '$')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$')
+}
+
 /// camelCase for field and method names.
 pub fn to_camel(name: &str) -> String {
     let pascal = to_pascal(name);
@@ -573,8 +638,8 @@ pub fn service_base(name: &str) -> String {
 /// verbatim, so a transport can place it on the wire unmodified (see
 /// docs/cbor-wire-contract.md "RPC call naming"). Any lossy derivation (the old
 /// lowercase-and-strip-Service) could not be reversed at the transport seam.
-pub fn service_wire(name: &str) -> String {
-    name.to_string()
+pub fn service_wire(spec: &CsilSpecSerialized, name: &str) -> String {
+    spec.declared_name(name).to_string()
 }
 
 /// The string passed to the transport for a method: the CSIL operation name

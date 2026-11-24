@@ -52,7 +52,7 @@ pub fn generate(input: &WasmGeneratorInput) -> String {
     for rule in &spec.rules {
         if let CsilRuleType::TypeDef(CsilTypeExpression::Choice(arms))
         | CsilRuleType::TypeChoice(arms) = &rule.rule_type
-            && let Some(members) = csilgen_common::text_enum_members(arms)
+            && let Some(members) = common::text_enum_members(arms)
         {
             let name = common::to_pascal(&rule.name);
             out.push_str(&format!("export const {name} = {{\n"));
@@ -286,7 +286,9 @@ fn interface(
 fn field_line(entry: &CsilGroupEntry, mapping: DecimalMapping) -> Option<String> {
     let field_name = match &entry.key {
         Some(CsilGroupKey::Bare(name)) => common::to_camel(name),
-        Some(CsilGroupKey::Literal(CsilLiteralValue::Text(name))) => common::to_camel(name),
+        Some(CsilGroupKey::Literal(CsilLiteralValue::Text(name))) => {
+            common::member_key(&common::to_camel(name))
+        }
         _ => return None,
     };
 
@@ -386,7 +388,9 @@ fn inline_object(group: &CsilGroupExpression, mapping: DecimalMapping) -> String
         .filter_map(|entry| {
             let name = match &entry.key {
                 Some(CsilGroupKey::Bare(n)) => common::to_camel(n),
-                Some(CsilGroupKey::Literal(CsilLiteralValue::Text(n))) => common::to_camel(n),
+                Some(CsilGroupKey::Literal(CsilLiteralValue::Text(n))) => {
+                    common::member_key(&common::to_camel(n))
+                }
                 _ => return None,
             };
             let optional = if common::is_optional(&entry.occurrence) {
@@ -522,7 +526,7 @@ fn group_checks(
             Some(CsilGroupKey::Literal(CsilLiteralValue::Text(n))) => common::to_camel(n),
             _ => continue,
         };
-        let access = format!("value.{field}");
+        let access = common::member_access("value", &field);
         let constraints: &[CsilControlOperator] = match &entry.value_type {
             CsilTypeExpression::Constrained { constraints, .. } => constraints,
             _ => &[],

@@ -2698,7 +2698,7 @@ fn hash_code_tiers_follow_the_formatter() {
 }
 
 #[test]
-fn over_width_list_decode_splits_method_chain() {
+fn over_width_list_decode_splits_arguments() {
     let list_of_records = CsilTypeExpression::Array {
         element_type: Box::new(reference("RevocationCertificate")),
         occurrence: None,
@@ -2723,9 +2723,9 @@ fn over_width_list_decode_splits_method_chain() {
     let code = types_file(&files);
     assert!(
         code.contains(
-            "      revocationCertificates: (map['revocation_certificates'] as List)\n          .map((csilE) => RevocationCertificate.fromCborValue(csilE))\n          .cast<RevocationCertificate>()\n          .toList(),"
+            "      revocationCertificates: CsilCbor.listOf(\n        map['revocation_certificates'],\n        (csilE) => RevocationCertificate.fromCborValue(csilE),\n      ),"
         ),
-        "over-width decode chain splits one call per line: {code}"
+        "over-width decode call splits one argument per line: {code}"
     );
 }
 

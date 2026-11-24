@@ -998,8 +998,9 @@ fn test_struct_codec_canonical_order_and_shapes() {
         "if(is_nil(v.priority), do: nil, else: {{:text, \"priority\"}, {:int, v.priority}}),"
     ));
     // map/list encode through the value tree; a nested record delegates.
+    assert!(types.contains("{:dynamic_map,\n"));
     assert!(types.contains(
-        "{:map, Enum.map(v.labels, fn {csil_k, csil_v} -> {{:text, csil_k}, {:int, csil_v}} end)}"
+        "Enum.map(v.labels, fn {csil_k, csil_v} -> {{:text, csil_k}, {:int, csil_v}} end)}"
     ));
     assert!(types.contains("{:array, Enum.map(v.tags, fn csil_e -> {:text, csil_e} end)}"));
     assert!(types.contains("Csilgen.Generated.Task.to_cbor_value(v.task)"));
@@ -1781,7 +1782,7 @@ true = raised_grade
 true = fields[{:text, "priority"}] == {:text, "medium"}
 true = fields[{:text, "colors"}] == {:array, [{:text, "red"}, {:text, "blue"}]}
 true = fields[{:text, "flags"}] ==
-         {:map, [{{:text, "a"}, {:text, "on"}}, {{:text, "b"}, {:text, "off"}}]}
+         {:dynamic_map, [{{:text, "a"}, {:text, "on"}}, {{:text, "b"}, {:text, "off"}}]}
 true = fields[{:text, "pair"}] == {:array, [{:text, "hi"}, {:text, "yes"}]}
 
 bad_tree = {:map, [
@@ -3012,19 +3013,26 @@ fn spec_service_error_yields_to_the_channel_router_only_when_its_shape_differs()
 }
 
 /// `Msg / ServiceError / [* text]` is not an RPC reply (one arm has no variant name),
-/// so `success_type` strips the `ServiceError` half for the `{:ok, _}` type. That
-/// must hold whether the spec's `ServiceError` kept its name or was renamed out of
-/// the channel router's way, while a member renamed for any other reason is a real
-/// payload type and stays.
+/// so the whole union is the payload: it becomes the named union `ChatAskOutput`, and
+/// no arm is dropped, whether the spec's `ServiceError` kept its name or was renamed
+/// out of the channel router's way.
 #[test]
-fn success_type_drops_service_error_by_declared_name() {
+fn mixed_output_union_keeps_every_arm() {
     let cases = [
-        ("ServiceError", "message", None),
-        ("ServiceError", "detail", None),
+        (
+            "ServiceError",
+            "message",
+            "Csilgen.Generated.ServiceError.t()",
+        ),
+        (
+            "ServiceError",
+            "detail",
+            "Csilgen.Generated.ServiceErrorType.t()",
+        ),
         (
             "Transport",
             "message",
-            Some("Csilgen.Generated.TransportType.t()"),
+            "Csilgen.Generated.TransportType.t()",
         ),
     ];
     for (error_rule, second_field, kept) in cases {
@@ -3079,12 +3087,15 @@ fn success_type_drops_service_error_by_declared_name() {
         let ok_start = start + server[start..].find("{:ok,").unwrap();
         let ok_end = ok_start + server[ok_start..].find("{:error,").unwrap();
         let ok = &server[ok_start..ok_end];
-        assert!(ok.contains("Csilgen.Generated.Msg.t()"), "{ok}");
-        assert!(ok.contains("[String.t()]"), "{ok}");
-        assert!(!ok.contains("ServiceError"), "{ok}");
-        if let Some(member) = kept {
-            assert!(ok.contains(member), "{ok}");
-        }
+        assert!(ok.contains("Csilgen.Generated.ChatAskOutput.t()"), "{ok}");
+        let types = file(&out, "types.gen.ex");
+        let start = types
+            .find("defmodule Csilgen.Generated.ChatAskOutput do")
+            .expect("named output union");
+        let union = &types[start..start + types[start..].find("@doc").unwrap()];
+        assert!(union.contains("Csilgen.Generated.Msg.t()"), "{union}");
+        assert!(union.contains("[String.t()]"), "{union}");
+        assert!(union.contains(kept), "{union}");
     }
 }
 
@@ -3181,4 +3192,655 @@ fn renamed_rules_are_reported_as_warnings() {
             .iter()
             .any(|m| m.contains("`Cbor` is generated as `CborType` for elixir-client"))
     );
+}
+
+fn pos() -> CsilPosition {
+    CsilPosition {
+        line: 1,
+        column: 1,
+        offset: 0,
+    }
+}
+
+fn rref(name: &str) -> CsilTypeExpression {
+    CsilTypeExpression::Reference(name.to_string())
+}
+
+fn builtin(name: &str) -> CsilTypeExpression {
+    CsilTypeExpression::Builtin(name.to_string())
+}
+
+fn rule(name: &str, rule_type: CsilRuleType) -> CsilRule {
+    CsilRule {
+        name: name.to_string(),
+        rule_type,
+        position: pos(),
+        doc_comments: vec![],
+    }
+}
+
+fn record(name: &str, fields: &[(&str, CsilTypeExpression)]) -> CsilRule {
+    rule(
+        name,
+        CsilRuleType::GroupDef(CsilGroupExpression {
+            entries: fields
+                .iter()
+                .map(|(field, ty)| bare_entry(field, ty.clone()))
+                .collect(),
+        }),
+    )
+}
+
+fn unary(
+    name: &str,
+    input: CsilTypeExpression,
+    output: CsilTypeExpression,
+) -> CsilServiceOperation {
+    CsilServiceOperation {
+        input_type: input,
+        ..make_op(name, "", output, CsilServiceDirection::Unidirectional, None)
+    }
+}
+
+fn service(name: &str, operations: Vec<CsilServiceOperation>) -> CsilRule {
+    rule(
+        name,
+        CsilRuleType::ServiceDef(CsilServiceDefinition {
+            operations,
+            wire_id: None,
+        }),
+    )
+}
+
+fn spec_input(rules: Vec<CsilRule>, target: &str) -> WasmGeneratorInput {
+    let service_count = rules
+        .iter()
+        .filter(|r| matches!(r.rule_type, CsilRuleType::ServiceDef(_)))
+        .count();
+    WasmGeneratorInput {
+        csil_spec: CsilSpecSerialized {
+            rules,
+            source_content: None,
+            service_count,
+            fields_with_metadata_count: 0,
+            declared_names: Default::default(),
+        },
+        config: GeneratorConfig {
+            target: target.to_string(),
+            output_dir: "/tmp".to_string(),
+            options: HashMap::new(),
+        },
+        generator_metadata: meta(),
+    }
+}
+
+/// Load every generated module into `elixir` and run `driver` after them. `None`
+/// when no `elixir` is on PATH; otherwise the script's stdout, after asserting that
+/// it exited cleanly and printed no compiler warning.
+fn run_generated_elixir(out: &WasmGeneratorOutput, tag: &str, driver: &str) -> Option<String> {
+    use std::process::Command;
+    if Command::new("elixir").arg("--version").output().is_err() {
+        eprintln!("skipping: no elixir on PATH");
+        return None;
+    }
+    let dir = std::env::temp_dir().join(format!("csilgen-elixir-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut script = String::new();
+    for name in ["codec", "types", "client", "server", "validation"] {
+        let path = format!("{name}.gen.ex");
+        if let Some(f) = out.files.iter().find(|f| f.path == path) {
+            std::fs::write(dir.join(&path), &f.content).unwrap();
+        }
+    }
+    // One parallel require resolves the modules' calls into each other, so a warning
+    // left over is a real one.
+    script.push_str(
+        "{:ok, _, _} =\n  Kernel.ParallelCompiler.require(Path.wildcard(Path.join(__DIR__, \"*.gen.ex\")),\n    return_diagnostics: true\n  )\n",
+    );
+    script.push_str(driver);
+    std::fs::write(dir.join("driver.exs"), script).unwrap();
+    let run = Command::new("elixir")
+        .arg(dir.join("driver.exs"))
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&run.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&run.stderr).to_string();
+    assert!(
+        run.status.success() && !stderr.contains("warning"),
+        "generated Elixir failed to load or run:\n{stdout}\n{stderr}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+    Some(stdout)
+}
+
+fn defmodule_count(out: &WasmGeneratorOutput, module: &str) -> usize {
+    let needle = format!("defmodule {module} do");
+    out.files
+        .iter()
+        .map(|f| f.content.matches(&needle).count())
+        .sum()
+}
+
+/// The linkkeys request: an op whose boundaries are its own records. Elixir derives
+/// no module from an operation, so the records keep their names and are declared
+/// once, for every surface.
+#[test]
+fn op_boundary_records_keep_their_names() {
+    for target in ["elixir", "elixir-client"] {
+        let rules = vec![
+            record(
+                "RpIssueAttestationRequest",
+                &[
+                    ("claim_type", builtin("text")),
+                    ("claim_value", builtin("bytes")),
+                ],
+            ),
+            record(
+                "RpIssueAttestationResponse",
+                &[("deposited", builtin("bool"))],
+            ),
+            service(
+                "Rp",
+                vec![unary(
+                    "issue-attestation",
+                    rref("RpIssueAttestationRequest"),
+                    rref("RpIssueAttestationResponse"),
+                )],
+            ),
+        ];
+        let out = process_generation(spec_input(rules, target)).unwrap();
+        assert!(out.warnings.is_empty(), "{target}: {:?}", out.warnings);
+        assert_eq!(
+            defmodule_count(&out, "Csilgen.Generated.RpIssueAttestationRequest"),
+            1
+        );
+        run_generated_elixir(&out, &format!("rp-{target}"), "IO.puts(\"ok\")\n");
+    }
+}
+
+/// The request's second schema. A `MemberID` boundary gets a private per-op helper
+/// inside the client module (`encode_get_member_request/1`), which cannot clash with a
+/// type module, so Elixir has no real clash here and renames nothing.
+#[test]
+fn per_op_helpers_never_clash_with_type_modules() {
+    let rules = vec![
+        rule("MemberID", CsilRuleType::TypeDef(builtin("text"))),
+        record("MemberGetMemberRequest", &[("id", builtin("text"))]),
+        service(
+            "Member",
+            vec![unary("get-member", rref("MemberID"), rref("MemberID"))],
+        ),
+    ];
+    let out = process_generation(spec_input(rules, "elixir-client")).unwrap();
+    assert!(out.warnings.is_empty(), "{:?}", out.warnings);
+    assert!(file(&out, "client.gen.ex").contains("defp encode_get_member_request(req) do"));
+    assert_eq!(
+        defmodule_count(&out, "Csilgen.Generated.MemberGetMemberRequest"),
+        1
+    );
+    run_generated_elixir(&out, "member", "IO.puts(\"ok\")\n");
+}
+
+/// A rule named like a derived module is renamed only when this run emits that
+/// module: `RpClient` clashes with the client surface, not with a server-only or a
+/// types-only build.
+#[test]
+fn derived_module_names_are_reserved_only_when_emitted() {
+    let rules = || {
+        vec![
+            record("RpClient", &[("id", builtin("text"))]),
+            record("Ping", &[("id", builtin("text"))]),
+            service("Rp", vec![unary("ping", rref("Ping"), rref("RpClient"))]),
+        ]
+    };
+    let out = process_generation(spec_input(rules(), "elixir-client")).unwrap();
+    assert_eq!(out.warnings.len(), 1, "{:?}", out.warnings);
+    assert!(
+        out.warnings[0]
+            .message
+            .contains("`RpClient` is generated as `RpClientType`")
+    );
+    assert_eq!(defmodule_count(&out, "Csilgen.Generated.RpClient"), 1);
+    assert_eq!(defmodule_count(&out, "Csilgen.Generated.RpClientType"), 1);
+    run_generated_elixir(&out, "rpclient", "IO.puts(\"ok\")\n");
+    for target in ["elixir", "elixir-typesonly"] {
+        let out = process_generation(spec_input(rules(), target)).unwrap();
+        assert!(out.warnings.is_empty(), "{target}: {:?}", out.warnings);
+        assert_eq!(defmodule_count(&out, "Csilgen.Generated.RpClient"), 1);
+    }
+}
+
+/// `UserSvc` and `user-svc` are one Elixir identifier. The second service gets other
+/// module names, and both keep their declared names on the wire.
+#[test]
+fn clashing_service_identifiers_keep_their_wire_names() {
+    let rules = vec![
+        record("Ping", &[("id", builtin("text"))]),
+        service("UserSvc", vec![unary("ping", rref("Ping"), rref("Ping"))]),
+        service("user-svc", vec![unary("ping", rref("Ping"), rref("Ping"))]),
+    ];
+    let mut input = spec_input(rules, "elixir-client");
+    input.config.options = opts(&[("emit_packages", serde_json::json!(["elixir"]))]);
+    let out = process_generation(input).unwrap();
+    assert!(
+        out.warnings.iter().any(|w| w
+            .message
+            .contains("service `user-svc` is generated as `user-svc2`")),
+        "{:?}",
+        out.warnings
+    );
+    let client = file(&out, "lib/client.gen.ex");
+    assert!(client.contains("defmodule Csilgen.Generated.UserSvcClient do"));
+    assert!(client.contains("defmodule Csilgen.Generated.UserSvc2Client do"));
+    assert!(client.contains("\"UserSvc\""));
+    assert!(client.contains("\"user-svc\""));
+    assert!(!client.contains("\"user-svc2\""));
+    let server = file(&out, "lib/server.gen.ex");
+    assert!(server.contains("defmodule Csilgen.Generated.UserSvc2Server do"));
+    let flat = WasmGeneratorOutput {
+        files: out
+            .files
+            .iter()
+            .filter(|f| f.path.ends_with(".gen.ex"))
+            .map(|f| GeneratedFile {
+                path: f.path.trim_start_matches("lib/").to_string(),
+                content: f.content.clone(),
+            })
+            .collect(),
+        ..out
+    };
+    let driver = r##"
+defmodule Recorder do
+  defstruct [:pid]
+  def call(%{pid: pid}, service, method, req) do
+    send(pid, {:wire, service, method})
+    req
+  end
+end
+
+ping = struct(Csilgen.Generated.Ping, id: "x")
+t = struct(Recorder, pid: self())
+^ping = Csilgen.Generated.UserSvcClient.ping(Csilgen.Generated.UserSvcClient.new(t), ping)
+^ping = Csilgen.Generated.UserSvc2Client.ping(Csilgen.Generated.UserSvc2Client.new(t), ping)
+receive do {:wire, s, m} -> IO.puts("#{s}/#{m}") end
+receive do {:wire, s, m} -> IO.puts("#{s}/#{m}") end
+"##;
+    if let Some(stdout) = run_generated_elixir(&flat, "svc-clash", driver) {
+        assert_eq!(stdout, "UserSvc/ping\nuser-svc/ping\n");
+    }
+}
+
+/// A name the hoister invents goes through the reserved-name check like any rule:
+/// the inline record of field `refusal` on `Bad` is `Bad_refusal`, the same module as
+/// the `BadRefusal` exception of the `Bad` reply arm, so the synthesized rule is
+/// renamed and the user's rules keep their names.
+#[test]
+fn hoisted_names_are_checked_against_derived_modules() {
+    let inline = CsilTypeExpression::Group(CsilGroupExpression {
+        entries: vec![bare_entry("x", builtin("int"))],
+    });
+    let rules = vec![
+        record("Good", &[("v", builtin("int"))]),
+        record("Bad", &[("refusal", inline)]),
+        service(
+            "S",
+            vec![unary(
+                "go",
+                rref("Good"),
+                CsilTypeExpression::Choice(vec![rref("Good"), rref("Bad")]),
+            )],
+        ),
+    ];
+    let out = process_generation(spec_input(rules, "elixir-client")).unwrap();
+    assert_eq!(out.warnings.len(), 1, "{:?}", out.warnings);
+    assert!(
+        out.warnings[0]
+            .message
+            .contains("`Bad_refusal` is generated as `Bad_refusalType`"),
+        "{:?}",
+        out.warnings
+    );
+    assert_eq!(defmodule_count(&out, "Csilgen.Generated.BadRefusal"), 1);
+    assert_eq!(defmodule_count(&out, "Csilgen.Generated.BadRefusalType"), 1);
+    assert_eq!(defmodule_count(&out, "Csilgen.Generated.Bad"), 1);
+    run_generated_elixir(&out, "hoist-clash", "IO.puts(\"ok\")\n");
+}
+
+/// The shapes of `tests/interop/wire-vectors/wire.csil` after `//=` merging: a record
+/// union, dynamic maps, and an op output with an inline map arm.
+fn wire_vector_rules() -> Vec<CsilRule> {
+    let map = |k: &str, v: &str| CsilTypeExpression::Map {
+        key: Box::new(builtin(k)),
+        value: Box::new(builtin(v)),
+        occurrence: None,
+    };
+    let group = |fields: &[(&str, &str)]| {
+        CsilTypeExpression::Group(CsilGroupExpression {
+            entries: fields
+                .iter()
+                .map(|(f, t)| bare_entry(f, builtin(t)))
+                .collect(),
+        })
+    };
+    vec![
+        rule("Counts", CsilRuleType::TypeDef(map("text", "int"))),
+        rule("Labels", CsilRuleType::TypeDef(map("int", "text"))),
+        record(
+            "Holder",
+            &[("counts", rref("Counts")), ("labels", rref("Labels"))],
+        ),
+        rule(
+            "Contact",
+            CsilRuleType::TypeDef(CsilTypeExpression::Choice(vec![
+                group(&[("id", "int"), ("name", "text")]),
+                group(&[("id", "int")]),
+                group(&[("email", "text")]),
+            ])),
+        ),
+        record("Err", &[("message", builtin("text"))]),
+        service(
+            "Lookup",
+            vec![unary(
+                "read-counts",
+                rref("Holder"),
+                CsilTypeExpression::Choice(vec![map("text", "int"), rref("Err")]),
+            )],
+        ),
+    ]
+}
+
+/// The mixed output is the named union `LookupReadCountsOutput` with both arms, in
+/// the client and in the server behaviour.
+#[test]
+fn mixed_op_output_is_a_named_union_with_every_arm() {
+    let mut input = spec_input(wire_vector_rules(), "elixir");
+    input.config.options = opts(&[("emit_packages", serde_json::json!(["elixir"]))]);
+    let out = process_generation(input).unwrap();
+    let types = file(&out, "lib/types.gen.ex");
+    assert!(
+        types.contains(
+            "@type t :: %{optional(String.t()) => integer()} | Csilgen.Generated.Err.t()"
+        )
+    );
+    assert!(
+        file(&out, "lib/client.gen.ex")
+            .contains("Csilgen.Generated.LookupReadCountsOutput.from_cbor(resp)")
+    );
+    assert!(
+        file(&out, "lib/server.gen.ex")
+            .contains("{:ok, Csilgen.Generated.LookupReadCountsOutput.t()}")
+    );
+}
+
+/// Elixir values carry their arm: a record arm is its struct, so the encoder picks
+/// the arm whose struct the value is, and a map arm never takes a struct. Decode
+/// dispatches by index, refuses an unsorted dynamic map and a repeated key, and
+/// accepts record fields in any order.
+#[test]
+fn unions_and_maps_follow_the_wire_contract() {
+    let out = process_generation(spec_input(wire_vector_rules(), "elixir")).unwrap();
+    let driver = r#"
+alias Csilgen.Generated.{Contact, Contact0, Contact1, Holder, LookupReadCountsOutput, Err}
+hex = &Base.encode16(&1, case: :lower)
+"8200a262696401646e616d656178" = hex.(Contact.to_cbor(struct(Contact0, id: 1, name: "x")))
+"8201a162696401" = hex.(Contact.to_cbor(struct(Contact1, id: 1)))
+"8201a1676d6573736167656178" = hex.(LookupReadCountsOutput.to_cbor(struct(Err, message: "x")))
+"8200a261620162616102" = hex.(LookupReadCountsOutput.to_cbor(%{"aa" => 2, "b" => 1}))
+h = struct(Holder, counts: %{"aa" => 2, "b" => 1}, labels: %{-1 => "m", 10 => "t", 1 => "o"})
+^h = Holder.from_cbor(Holder.to_cbor(h))
+"a266636f756e7473a261620162616102666c6162656c73a301616f0a61742061" <> "6d" = hex.(Holder.to_cbor(h))
+rejects = fn bin ->
+  try do
+    Holder.from_cbor(Base.decode16!(bin, case: :lower))
+    "accepted"
+  rescue
+    e -> Exception.message(e)
+  end
+end
+"csil cbor: map keys are not in canonical order" =
+  rejects.("a266636f756e7473a262616102616201666c6162656c73a0")
+"csil cbor: duplicate key \"a\"" = rejects.("a266636f756e7473a2616101616102666c6162656c73a0")
+"csil cbor: duplicate key \"counts\"" =
+  rejects.("a366636f756e7473a066636f756e7473a0666c6162656c73a0")
+for bin <- [
+      "a266636f756e7473a178016101666c6162656c73a0",
+      "a266636f756e7473a0666c6162656c73a11801636f6e65",
+      "a27806636f756e7473a0666c6162656c73a0"
+    ] do
+  "csil cbor: map key is not in shortest form" = rejects.(bin)
+end
+true = is_struct(Holder.from_cbor(Base.decode16!("a2666c6162656c73a066636f756e7473a0", case: :lower)), Holder)
+IO.puts("ok")
+"#;
+    if let Some(stdout) = run_generated_elixir(&out, "wire", driver) {
+        assert_eq!(stdout.trim(), "ok");
+    }
+}
+
+/// Mix allows a line past its width only when nothing on it can break: one token,
+/// or a definition head that is one long name.
+fn unbreakable(line: &str) -> bool {
+    let t = line.trim();
+    !t.contains(' ')
+        || (t.starts_with('"') && t.ends_with('"') && t.matches('"').count() == 2)
+        || t.split_once(' ').is_some_and(|(attr, rest)| {
+            attr.starts_with('@')
+                && rest.starts_with('"')
+                && rest.ends_with('"')
+                && rest.matches('"').count() == 2
+        })
+        || (t.starts_with("defmodule ") && t.ends_with(" do") && t.matches(' ').count() == 2)
+        || ((t.starts_with("def ") || t.starts_with("defp "))
+            && t.ends_with('(')
+            && t.matches(' ').count() == 1)
+        || (t.starts_with("raise ") && t.ends_with(',') && t.matches(' ').count() == 1)
+}
+
+/// No generated line is wider than mix's width, for long names and large enums,
+/// except a line with nothing on it that mix could break.
+#[test]
+fn no_line_is_wider_than_mix_allows() {
+    let long_record = "ExtraordinarilyLongRecordNameForFormatterChecksAcrossEveryTargetLanguage";
+    let long_field = "this_field_name_is_long_enough_to_push_any_signature_past_the_line_limit";
+    let text_enum = |names: &[&str]| {
+        CsilTypeExpression::Choice(
+            names
+                .iter()
+                .map(|n| CsilTypeExpression::Literal(CsilLiteralValue::Text(n.to_string())))
+                .collect(),
+        )
+    };
+    let mut rules = wire_vector_rules();
+    rules.extend([
+        rule(
+            "ClaimValueType",
+            CsilRuleType::TypeDef(text_enum(&[
+                "text",
+                "url",
+                "email",
+                "bool",
+                "int",
+                "float",
+                "decimal",
+                "date",
+                "timestamp",
+                "opaque",
+            ])),
+        ),
+        rule(
+            "NotificationChannelKindWithAnUnusuallyLongDescriptiveTypeNameForTesting",
+            CsilRuleType::TypeDef(text_enum(&[
+                "electronic-mail-address-delivery",
+                "short-message-service-delivery",
+                "push-notification-delivery-to-registered-device",
+                "allow-always-for-this-application-and-all-of-its-registered-domains-x",
+            ])),
+        ),
+        record(
+            long_record,
+            &[
+                (
+                    long_field,
+                    rref("NotificationChannelKindWithAnUnusuallyLongDescriptiveTypeNameForTesting"),
+                ),
+                (
+                    "map_from_identifier_to_holder_with_a_very_long_field_name",
+                    CsilTypeExpression::Map {
+                        key: Box::new(builtin("text")),
+                        value: Box::new(rref("Holder")),
+                        occurrence: None,
+                    },
+                ),
+                (
+                    "timestamp_of_the_last_modification_made_by_any_user",
+                    builtin("timestamp"),
+                ),
+                (
+                    "list_of_extraordinarily_long_records_for_the_type_spec",
+                    CsilTypeExpression::Array {
+                        element_type: Box::new(rref(long_record)),
+                        occurrence: None,
+                    },
+                ),
+                ("kind", rref("ClaimValueType")),
+            ],
+        ),
+        record("ErrorForLongOperations", &[("message", builtin("text"))]),
+        service(
+            "ServiceWithAnExceedinglyLongNameUsedOnlyForFormatterChecks",
+            vec![
+                unary(
+                    "operation-with-an-exceedingly-long-name-that-returns-a-choice",
+                    rref(long_record),
+                    CsilTypeExpression::Choice(vec![
+                        rref(long_record),
+                        rref("ErrorForLongOperations"),
+                    ]),
+                ),
+                unary(
+                    "read-mixed-output-with-an-inline-map-arm",
+                    rref("Holder"),
+                    CsilTypeExpression::Choice(vec![
+                        CsilTypeExpression::Map {
+                            key: Box::new(builtin("text")),
+                            value: Box::new(builtin("int")),
+                            occurrence: None,
+                        },
+                        rref("ErrorForLongOperations"),
+                    ]),
+                ),
+            ],
+        ),
+    ]);
+    let mut input = spec_input(rules, "elixir");
+    input.config.options = opts(&[("emit_packages", serde_json::json!(["elixir"]))]);
+    let out = process_generation(input).unwrap();
+    for f in out.files.iter().filter(|f| f.path.ends_with(".ex")) {
+        for line in f.content.lines() {
+            assert!(
+                line.len() <= exfmt::MAX_WIDTH || unbreakable(line),
+                "{}: line wider than {}: {line}",
+                f.path,
+                exfmt::MAX_WIDTH
+            );
+        }
+    }
+    let types = file(&out, "lib/types.gen.ex");
+    assert!(types.contains(
+        "  @type t ::\n          :text | :url | :email | :bool | :int | :float | :decimal | :date | :timestamp | :opaque\n"
+    ));
+}
+
+/// A channel op with inline boundaries decodes into named modules: a router hands
+/// the codec a module, and `map()` is a type, not a value.
+#[test]
+fn inline_channel_boundaries_get_modules() {
+    let group = CsilTypeExpression::Group(CsilGroupExpression {
+        entries: vec![bare_entry("at", builtin("text"))],
+    });
+    let map = CsilTypeExpression::Map {
+        key: Box::new(builtin("text")),
+        value: Box::new(builtin("int")),
+        occurrence: None,
+    };
+    let mut ping = make_op(
+        "ping",
+        "",
+        group.clone(),
+        CsilServiceDirection::Bidirectional,
+        None,
+    );
+    ping.input_type = group;
+    let mut tally = make_op(
+        "tally",
+        "",
+        map.clone(),
+        CsilServiceDirection::Bidirectional,
+        None,
+    );
+    tally.input_type = map;
+    let out = process_generation(spec_input(
+        vec![service("Chat", vec![ping, tally])],
+        "elixir",
+    ))
+    .unwrap();
+    let server = file(&out, "server.gen.ex");
+    assert!(server.contains("codec.decode(data, Csilgen.Generated.ChatPingInput)"));
+    assert!(server.contains("codec.decode(data, Csilgen.Generated.ChatTallyInput)"));
+    assert!(!server.contains("decode(data, map())"), "{server}");
+    run_generated_elixir(&out, "channel-inline", "IO.puts(\"ok\")\n");
+}
+
+/// Text enum values that are not identifiers become plain atoms, and each value
+/// keeps its wire text: a dot, a hyphen and a space, a leading digit, a keyword,
+/// and the three words whose atoms are the values `nil`, `true` and `false`.
+#[test]
+fn text_enum_values_make_plain_atoms_and_round_trip() {
+    let values = [
+        "calendars.read",
+        "events.write",
+        "a-b c",
+        "2fa",
+        "class",
+        "nil",
+        "true",
+        "false",
+    ];
+    let scope = CsilTypeExpression::Choice(
+        values
+            .iter()
+            .map(|v| CsilTypeExpression::Literal(CsilLiteralValue::Text(v.to_string())))
+            .collect(),
+    );
+    let rules = vec![
+        rule("Scope", CsilRuleType::TypeDef(scope)),
+        record("Grant", &[("scope", rref("Scope"))]),
+    ];
+    let out = process_generation(spec_input(rules, "elixir-typesonly")).unwrap();
+    let types = file(&out, "types.gen.ex");
+    for atom in [
+        ":calendars_read",
+        ":a_b_c",
+        ":value_2fa",
+        ":class",
+        ":value_nil",
+        ":value_false",
+    ] {
+        assert!(types.contains(&format!("def to_wire({atom})")), "{types}");
+    }
+    let driver = r#"
+alias Csilgen.Generated.Grant
+atoms = [:calendars_read, :events_write, :a_b_c, :value_2fa, :class, :value_nil, :value_true, :value_false]
+wires = ["calendars.read", "events.write", "a-b c", "2fa", "class", "nil", "true", "false"]
+for {atom, wire} <- Enum.zip(atoms, wires) do
+  bytes = Grant.to_cbor(struct(Grant, scope: atom))
+  {:map, [{{:text, "scope"}, {:text, ^wire}}]} = Csilgen.Generated.Cbor.decode(bytes)
+  ^atom = Grant.from_cbor(bytes).scope
+end
+IO.puts("ok")
+"#;
+    if let Some(stdout) = run_generated_elixir(&out, "enum-atoms", driver) {
+        assert_eq!(stdout.trim(), "ok");
+    }
 }

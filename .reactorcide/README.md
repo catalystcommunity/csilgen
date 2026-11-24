@@ -66,7 +66,8 @@ The pull request workflow expands the interoperability job into four shards.
 Each shard tests all clients and transports against a group of server
 languages. After the matrix, each shard runs `tests/interop/timestamp-vectors/check.sh`,
 `tests/interop/epoch-vectors/check.sh`, `tests/interop/typed-replies/check.sh`,
-and `tests/interop/repo-specs/check.sh` for its server languages. The shard
+`tests/interop/repo-specs/check.sh`, `tests/interop/wire-vectors/check.sh` and
+`tests/interop/formatting/check.sh` for its server languages. The shard
 that has `rust` also runs them for PHP, which has no matrix harness. Swift is
 a matrix language. It builds with the Linux `swift` in the CI toolchain image.
 The workflow succeeds only when all shards succeed. The job timeout

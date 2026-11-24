@@ -55,18 +55,50 @@ done
 This check generates every valid `.csil` file in the repository for one
 target. Then it compiles the output with the strict checks of that target. The
 check skips a file that `csilgen validate` refuses, because that file is a
-negative fixture. Rust runs `rustfmt --check` and `cargo clippy -D warnings`
-on one workspace of all packages. Swift runs
-`swiftc -typecheck -warnings-as-errors`. The other targets have no compile
-check yet, and the script skips them.
+negative fixture. Each of the 15 targets has a strict check, with warnings as
+errors: Rust `rustfmt --check` and `cargo clippy -D warnings`, Swift `swiftc
+-typecheck`, C `cc -Werror`, Zig `zig test` over every declaration, Go `go vet`,
+TypeScript strict `tsc`, Python import and a round trip of each record, Java
+`javac -Werror`, Kotlin Gradle with `allWarningsAsErrors`, C# `dotnet build
+-warnaserror`, OCaml `dune build`, Elixir `elixirc --warnings-as-errors`, Dart
+`dart analyze --fatal-infos`, Ruby `ruby -W` load, and PHP load with every notice
+as an error. `dotted-enum-values.csil` in this directory is a spec for these
+checks.
 
 ```bash
 tests/interop/repo-specs/check.sh rust
-tests/interop/repo-specs/check.sh swift
+tests/interop/repo-specs/check.sh kotlin
 ```
 
 A new fixture spec is part of this check automatically. When a generator
 writes code that does not compile for a valid spec, this check fails.
+
+## Wire vectors
+
+`wire-vectors/vectors.tsv` holds CBOR inputs for the shapes in `wire.csil`. Each
+language's peer decodes every row as the type that its kind names. A row marked
+`err` must fail to decode. A row marked `ok` must re-encode to exactly the
+canonical bytes. The rows check dynamic map key order and duplicate keys, record
+fields in any order, a record union made with `//=` across an include (its arm
+indexes follow declaration order), and an operation output with an inline arm.
+`make-vectors.py` writes the file and explains each row.
+
+```bash
+tests/interop/wire-vectors/check.sh go
+```
+
+## Formatting
+
+This check generates `formatting/stress.csil` (long names, large enums, long
+signatures) and every valid repository spec as packages. Then it runs the
+toolchain formatter of the target in check mode with default settings: rustfmt
+(style editions 2021 and 2024), gofmt, `zig fmt`, `dart format`, `mix format` with
+the emitted `.formatter.exs`, `dotnet format whitespace` and swift-format. Targets
+without a toolchain formatter are skipped.
+
+```bash
+tests/interop/formatting/check.sh dart
+```
 
 ## Transports & carriers
 

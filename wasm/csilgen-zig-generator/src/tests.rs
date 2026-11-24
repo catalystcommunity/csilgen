@@ -1164,32 +1164,26 @@ fn named_map_alias_field_codes_through_the_map_codec_not_the_stub() {
             .contains("pub const StringInt64Map = std.StringHashMapUnmanaged(i64);")
     );
 
-    // Encode side: the alias field iterates the map and writes a map head, exactly as
-    // an inline map would — not `try w_null(out)`.
-    assert!(codec.content.contains("var csil_mi = v.scores.iterator();"));
+    // Both sides go through the map codec pair, exactly as an inline map would,
+    // not `try w_null(out)` or the `_ = csil_fv;` discard of the stub.
+    assert!(codec.content.contains("(out, &(v.scores));"));
+    assert!(codec.content.contains("(alloc, csil_fv, &(out.scores));"));
     assert!(
         codec
             .content
-            .contains("try w_map_head(out, v.scores.count());")
+            .contains("try csil_w_sorted_map(csil_dst, out.items, csil_spans.items);")
     );
-    // Decode side: it reads the field as a `.map` and puts entries, rather than the
-    // `_ = csil_fv;` discard the stub emitted.
     assert!(
         codec
             .content
-            .contains("try out.scores.put(alloc, csil_k, csil_val);")
+            .contains("try csil_check_canonical(csil_src.map);")
     );
-
     // The map-of-record alias resolves its value type through the per-record codec.
+    assert!(codec.content.contains("(out, &(v.related));"));
     assert!(
         codec
             .content
-            .contains("var csil_mi = v.related.iterator();")
-    );
-    assert!(
-        codec
-            .content
-            .contains("try dec_Task(alloc, csil_kv.val, &csil_val);")
+            .contains("try dec_Task(alloc, csil_kv.val, &(csil_val));")
     );
 }
 
@@ -3105,4 +3099,552 @@ fn rule_clashes_are_renamed_warned_and_analyze() {
         String::from_utf8_lossy(&run.stderr)
     );
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+fn reference(name: &str) -> CsilTypeExpression {
+    CsilTypeExpression::Reference(name.to_string())
+}
+
+fn map_of(key: CsilTypeExpression, value: CsilTypeExpression) -> CsilTypeExpression {
+    CsilTypeExpression::Map {
+        key: Box::new(key),
+        value: Box::new(value),
+        occurrence: None,
+    }
+}
+
+fn unary(
+    name: &str,
+    input: CsilTypeExpression,
+    output: CsilTypeExpression,
+) -> CsilServiceOperation {
+    op(
+        name,
+        input,
+        output,
+        CsilServiceDirection::Unidirectional,
+        None,
+    )
+}
+
+fn file<'a>(out: &'a WasmGeneratorOutput, path: &str) -> &'a str {
+    &out.files
+        .iter()
+        .find(|f| f.path == path)
+        .unwrap_or_else(|| panic!("{path} emitted"))
+        .content
+}
+
+/// Write the generated files to a scratch directory and run `driver` there with
+/// `zig run`, which compiles every declaration the driver references. Returns the
+/// driver's stdout, or `None` when no `zig` is on PATH.
+fn run_zig(tag: &str, out: &WasmGeneratorOutput, driver: &str) -> Option<String> {
+    if std::process::Command::new("zig")
+        .arg("version")
+        .output()
+        .is_err()
+    {
+        eprintln!("skipping: no zig on PATH");
+        return None;
+    }
+    let dir = std::env::temp_dir().join(format!("csilgen-zig-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    for file in &out.files {
+        std::fs::write(dir.join(&file.path), &file.content).unwrap();
+    }
+    std::fs::write(dir.join("driver.zig"), driver).unwrap();
+    let fmt = std::process::Command::new("zig")
+        .arg("fmt")
+        .arg("--check")
+        .arg("--exclude")
+        .arg(dir.join("driver.zig"))
+        .arg(&dir)
+        .output()
+        .unwrap();
+    assert!(
+        fmt.status.success(),
+        "zig fmt --check failed:\n{}{}",
+        String::from_utf8_lossy(&fmt.stdout),
+        String::from_utf8_lossy(&fmt.stderr)
+    );
+    let run = std::process::Command::new("zig")
+        .arg("run")
+        .arg(dir.join("driver.zig"))
+        .arg("--cache-dir")
+        .arg(dir.join("zig-cache"))
+        .output()
+        .unwrap();
+    assert!(
+        run.status.success(),
+        "zig run failed:\n{}{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+    Some(String::from_utf8_lossy(&run.stdout).trim().to_string())
+}
+
+/// A driver that makes Zig analyze every declaration of the generated files.
+const LOAD_ALL_ZIG: &str = r#"const std = @import("std");
+pub fn main() void {
+    std.testing.refAllDeclsRecursive(@import("types.gen.zig"));
+    std.testing.refAllDeclsRecursive(@import("codec.gen.zig"));
+    std.testing.refAllDeclsRecursive(@import("client.gen.zig"));
+    std.io.getStdOut().writer().print("ok\n", .{}) catch {};
+}
+"#;
+
+fn record(name: &str, field: &str) -> CsilRule {
+    group_rule(name, vec![bare_entry(field, builtin("text"))])
+}
+
+#[test]
+fn an_op_boundary_record_keeps_its_name() {
+    // The linkkeys schema, and its Zig spelling: Zig derives `<Service><Op>Reply`
+    // names, so `RpIssueAttestationReplyRequest` is the name that could clash. As the
+    // op's own input it has the only `encode_RpIssueAttestationReplyRequest`.
+    let rules = vec![
+        record("RpIssueAttestationRequest", "claim_type"),
+        record("RpIssueAttestationResponse", "claim"),
+        record("RpIssueAttestationReplyRequest", "claim_type"),
+        record("RpIssueAttestationReplyResponse", "claim"),
+        // No op of `Rp` has reply variants, so no `RpIssueAttestationReply` is emitted.
+        record("RpIssueAttestationReply", "x"),
+        service_rule(
+            "Rp",
+            vec![
+                unary(
+                    "issue-attestation",
+                    reference("RpIssueAttestationReplyRequest"),
+                    reference("RpIssueAttestationReplyResponse"),
+                ),
+                unary(
+                    "other",
+                    reference("RpIssueAttestationRequest"),
+                    reference("RpIssueAttestationResponse"),
+                ),
+            ],
+            None,
+        ),
+    ];
+    let out = process_generation(input_with_rules(rules, "zig-client", HashMap::new())).unwrap();
+    assert!(out.warnings.is_empty(), "{:?}", out.warnings);
+    let types = file(&out, "types.gen.zig");
+    let codec = file(&out, "codec.gen.zig");
+    for name in [
+        "RpIssueAttestationRequest",
+        "RpIssueAttestationReplyRequest",
+        "RpIssueAttestationReplyResponse",
+        "RpIssueAttestationReply",
+    ] {
+        assert_eq!(types.matches(&format!("pub const {name} = ")).count(), 1);
+        assert_eq!(codec.matches(&format!("pub fn encode_{name}(")).count(), 1);
+    }
+    if let Some(stdout) = run_zig("t1-keep", &out, LOAD_ALL_ZIG) {
+        assert_eq!(stdout, "ok");
+    }
+}
+
+#[test]
+fn a_rule_named_like_an_emitted_op_codec_is_renamed() {
+    // `MemberID` is no codec'd type, so the op gets its own
+    // `encode_MemberGetMemberReplyRequest`, and the rule of that name must move.
+    let rules = vec![
+        typedef_rule("MemberID", builtin("text")),
+        record("MemberGetMemberReplyRequest", "id"),
+        // The Rust-style name is no Zig derived name, so it keeps its name.
+        record("MemberGetMemberRequest", "id"),
+        service_rule(
+            "Member",
+            vec![unary(
+                "get-member",
+                reference("MemberID"),
+                reference("MemberID"),
+            )],
+            None,
+        ),
+    ];
+    let out = process_generation(input_with_rules(rules, "zig-client", HashMap::new())).unwrap();
+    assert_eq!(out.warnings.len(), 1, "{:?}", out.warnings);
+    assert!(out.warnings[0].message.contains(
+        "rule `MemberGetMemberReplyRequest` is generated as `MemberGetMemberReplyRequestType`"
+    ));
+    let codec = file(&out, "codec.gen.zig");
+    assert_eq!(
+        codec
+            .matches("pub fn encode_MemberGetMemberReplyRequest(")
+            .count(),
+        1
+    );
+    assert!(codec.contains("pub fn encode_MemberGetMemberReplyRequestType("));
+    assert!(codec.contains("pub fn encode_MemberGetMemberRequest("));
+    if let Some(stdout) = run_zig("t1-rename", &out, LOAD_ALL_ZIG) {
+        assert_eq!(stdout, "ok");
+    }
+}
+
+fn lookup_rules() -> Vec<CsilRule> {
+    vec![
+        group_rule(
+            "Holder",
+            vec![bare_entry(
+                "counts",
+                map_of(builtin("text"), builtin("int")),
+            )],
+        ),
+        record("Err", "message"),
+        service_rule(
+            "Lookup",
+            vec![unary(
+                "read-counts",
+                reference("Holder"),
+                CsilTypeExpression::Choice(vec![
+                    map_of(builtin("text"), builtin("int")),
+                    reference("Err"),
+                ]),
+            )],
+            None,
+        ),
+    ]
+}
+
+#[test]
+fn a_mixed_op_output_is_the_whole_named_union() {
+    let out = process_generation(input_with_rules(
+        lookup_rules(),
+        "zig-client",
+        HashMap::new(),
+    ))
+    .unwrap();
+    let types = file(&out, "types.gen.zig");
+    assert!(types.contains(
+        "pub const LookupReadCountsOutput = union(enum) {\n    choice0: std.StringHashMapUnmanaged(i64),\n    err: Err,\n"
+    ));
+    let client = file(&out, "client.gen.zig");
+    assert!(client.contains("out: *types.LookupReadCountsOutput) anyerror!void"));
+    assert!(client.contains("try codec.decode_LookupReadCountsOutput(alloc, csil_respb, out);"));
+    let server =
+        process_generation(input_with_rules(lookup_rules(), "zig", HashMap::new())).unwrap();
+    assert!(
+        file(&server, "server.gen.zig")
+            .contains("resp: *types.LookupReadCountsOutput) anyerror!void")
+    );
+    let driver = r#"const std = @import("std");
+const types = @import("types.gen.zig");
+const codec = @import("codec.gen.zig");
+pub fn main() !void {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var counts = std.StringHashMapUnmanaged(i64){};
+    try counts.put(a, "aa", 2);
+    try counts.put(a, "b", 1);
+    const map_arm = types.LookupReadCountsOutput{ .choice0 = counts };
+    const err_arm = types.LookupReadCountsOutput{ .err = .{ .message = "boom" } };
+    const w = std.io.getStdOut().writer();
+    for ([_]types.LookupReadCountsOutput{ map_arm, err_arm }) |v| {
+        const bytes = try codec.encode_LookupReadCountsOutput(a, &v);
+        var back: types.LookupReadCountsOutput = undefined;
+        try codec.decode_LookupReadCountsOutput(a, bytes, &back);
+        try w.print("{s} {s}\n", .{ std.fmt.fmtSliceHexLower(bytes), back.variant_name() });
+    }
+}
+"#;
+    if let Some(stdout) = run_zig("t2", &out, driver) {
+        // The shorter key sorts first; the error arm keeps its index.
+        assert_eq!(
+            stdout,
+            "8200a261620162616102 Choice0\n8201a1676d65737361676564626f6f6d Err"
+        );
+    }
+}
+
+#[test]
+fn services_with_one_identifier_keep_their_wire_names() {
+    let ping = || unary("ping", reference("Ping"), reference("Ping"));
+    let rules = vec![
+        group_rule("Ping", vec![bare_entry("n", builtin("int"))]),
+        service_rule("UserSvc", vec![ping()], None),
+        service_rule("user-svc", vec![ping()], None),
+    ];
+    let out = process_generation(input_with_rules(rules, "zig-client", HashMap::new())).unwrap();
+    assert_eq!(out.warnings.len(), 1, "{:?}", out.warnings);
+    assert!(
+        out.warnings[0]
+            .message
+            .starts_with("service `user-svc` is generated as")
+    );
+    let client = file(&out, "client.gen.zig");
+    assert!(client.contains("pub const UserSvcClient = struct {"));
+    assert!(client.contains("pub const UserSvc2Client = struct {"));
+    assert!(client.contains("alloc, \"UserSvc\", \"ping\", csil_reqb)"));
+    assert!(client.contains("alloc, \"user-svc\", \"ping\", csil_reqb)"));
+    let driver = r#"const std = @import("std");
+const types = @import("types.gen.zig");
+const codec = @import("codec.gen.zig");
+const client = @import("client.gen.zig");
+fn call(ptr: *anyopaque, alloc: std.mem.Allocator, service: []const u8, op: []const u8, req: []const u8) anyerror![]u8 {
+    _ = ptr;
+    try std.io.getStdOut().writer().print("{s}/{s}\n", .{ service, op });
+    return alloc.dupe(u8, req);
+}
+pub fn main() !void {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var ctx: u8 = 0;
+    const t = client.CsilgenTransport{ .ptr = &ctx, .call = call };
+    var out: types.Ping = undefined;
+    try client.UserSvcClient.init(t).ping(a, &.{ .n = 1 }, &out);
+    try client.UserSvc2Client.init(t).ping(a, &.{ .n = 2 }, &out);
+}
+"#;
+    if let Some(stdout) = run_zig("t3", &out, driver) {
+        assert_eq!(stdout, "UserSvc/ping\nuser-svc/ping");
+    }
+}
+
+#[test]
+fn a_synthesized_name_that_is_reserved_is_renamed() {
+    // The hoister names the inline record of field `int` in `c` as `c_int`, a Zig
+    // primitive type. The synthesized rule moves, the user rule `c` keeps its name.
+    let inner = CsilTypeExpression::Group(CsilGroupExpression {
+        entries: vec![bare_entry("a", builtin("int"))],
+    });
+    let rules = vec![group_rule("c", vec![bare_entry("int", inner)])];
+    let out = process_generation(input_with_rules(rules, "zig-client", HashMap::new())).unwrap();
+    assert_eq!(out.warnings.len(), 1, "{:?}", out.warnings);
+    assert!(
+        out.warnings[0]
+            .message
+            .contains("rule `c_int` is generated as `c_intType`")
+    );
+    let types = file(&out, "types.gen.zig");
+    assert!(types.contains("pub const c_intType = struct {"));
+    assert!(types.contains("pub const c = struct {\n    int: c_intType,\n};"));
+    let driver = r#"const std = @import("std");
+pub fn main() void {
+    std.testing.refAllDeclsRecursive(@import("types.gen.zig"));
+    std.testing.refAllDeclsRecursive(@import("codec.gen.zig"));
+    std.io.getStdOut().writer().print("ok\n", .{}) catch {};
+}
+"#;
+    if let Some(stdout) = run_zig("t4", &out, driver) {
+        assert_eq!(stdout, "ok");
+    }
+}
+
+#[test]
+fn dynamic_maps_encode_sorted_and_decode_only_canonical_order() {
+    // A map nested in an array and in another map, an int-keyed map, and an
+    // optional map field all go through the map codec pair.
+    let inner = map_of(builtin("int"), builtin("text"));
+    let rules = vec![group_rule(
+        "Box",
+        vec![
+            bare_entry(
+                "nested",
+                map_of(
+                    builtin("text"),
+                    CsilTypeExpression::Array {
+                        element_type: Box::new(inner.clone()),
+                        occurrence: None,
+                    },
+                ),
+            ),
+            CsilGroupEntry {
+                occurrence: Some(CsilOccurrence::Optional),
+                ..bare_entry("maybe", inner)
+            },
+        ],
+    )];
+    let out = process_generation(input_with_rules(rules, "zig-typesonly", HashMap::new())).unwrap();
+    let driver = r#"const std = @import("std");
+const types = @import("types.gen.zig");
+const codec = @import("codec.gen.zig");
+fn hex(a: std.mem.Allocator, s: []const u8) ![]u8 {
+    const b = try a.alloc(u8, s.len / 2);
+    _ = try std.fmt.hexToBytes(b, s);
+    return b;
+}
+pub fn main() !void {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var ints = std.AutoHashMapUnmanaged(i64, []const u8){};
+    try ints.put(a, -1, "m");
+    try ints.put(a, 10, "t");
+    try ints.put(a, 1, "o");
+    var list = [_]std.AutoHashMapUnmanaged(i64, []const u8){ints};
+    var nested = std.StringHashMapUnmanaged([]std.AutoHashMapUnmanaged(i64, []const u8)){};
+    try nested.put(a, "aa", &list);
+    try nested.put(a, "b", &.{});
+    const v = types.Box{ .nested = nested, .maybe = ints };
+    const bytes = try codec.encode_Box(a, &v);
+    const w = std.io.getStdOut().writer();
+    try w.print("{s}\n", .{std.fmt.fmtSliceHexLower(bytes)});
+    var back: types.Box = undefined;
+    try codec.decode_Box(a, bytes, &back);
+    const again = try codec.encode_Box(a, &back);
+    std.debug.assert(std.mem.eql(u8, bytes, again));
+    // Keys out of order, a repeated map key and a repeated record key.
+    for ([_][]const u8{
+        "a1666e6573746564a2626161806162 80",
+        "a1666e6573746564a2616280616280",
+        "a2666e6573746564a0666e6573746564a0",
+    }) |bad| {
+        const clean = try std.mem.replaceOwned(u8, a, bad, " ", "");
+        if (codec.decode_Box(a, try hex(a, clean), &back)) |_| {
+            try w.print("accepted {s}\n", .{clean});
+        } else |err| try w.print("{s}\n", .{@errorName(err)});
+    }
+}
+"#;
+    if let Some(stdout) = run_zig("t5", &out, driver) {
+        // Record fields keep their order; every map sorts by key bytes: "b" before
+        // "aa", and 1, 10, -1. A repeated key is caught before the order check.
+        let lines: Vec<&str> = stdout.lines().collect();
+        assert_eq!(
+            lines,
+            [
+                "a2656d61796265a301616f0a617420616d666e6573746564a261628062616181a301616f0a617420616d",
+                "NonCanonicalMapOrder",
+                "DuplicateKey",
+                "DuplicateKey",
+            ]
+        );
+    }
+}
+
+#[test]
+fn generated_blocks_open_on_their_own_line() {
+    // zig fmt has no line width; it only splits a block that holds a statement on
+    // the line of its opening brace. No emitted line may do that.
+    let date = CsilTypeExpression::Constrained {
+        base_type: Box::new(builtin("date")),
+        constraints: vec![CsilControlOperator::GreaterEqual(CsilLiteralValue::Text(
+            "2000-01-01".to_string(),
+        ))],
+    };
+    let rules = vec![group_rule(
+        "Order",
+        vec![CsilGroupEntry {
+            occurrence: Some(CsilOccurrence::Optional),
+            ..bare_entry("due", date)
+        }],
+    )];
+    let out = process_generation(input_with_rules(rules, "zig", HashMap::new())).unwrap();
+    for file in &out.files {
+        for line in file.content.lines() {
+            let code = line.split("//").next().unwrap_or_default();
+            if let Some(at) = code.find("| {") {
+                assert!(
+                    code[at + 3..].trim().is_empty()
+                        || code[at + 3..].trim_start().starts_with('}'),
+                    "{}: {line}",
+                    file.path
+                );
+            }
+        }
+    }
+    let validation = file(&out, "validation.gen.zig");
+    assert!(validation.contains("    if (v.due) |day| {\n        if ("));
+}
+
+#[test]
+fn map_keys_must_use_the_shortest_head() {
+    let rules = vec![group_rule(
+        "Holder",
+        vec![
+            bare_entry("counts", map_of(builtin("text"), builtin("int"))),
+            bare_entry("labels", map_of(builtin("int"), builtin("text"))),
+        ],
+    )];
+    let out = process_generation(input_with_rules(rules, "zig-typesonly", HashMap::new())).unwrap();
+    let driver = r#"const std = @import("std");
+const types = @import("types.gen.zig");
+const codec = @import("codec.gen.zig");
+pub fn main() !void {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const w = std.io.getStdOut().writer();
+    // Canonical; a long record key; a long text key; a long int key.
+    for ([_][]const u8{
+        "a266636f756e7473a1616101666c6162656c73a1016161",
+        "a27806636f756e7473a0666c6162656c73a0",
+        "a266636f756e7473a178016101666c6162656c73a0",
+        "a266636f756e7473a0666c6162656c73a118016161",
+    }) |text| {
+        const bytes = try a.alloc(u8, text.len / 2);
+        _ = try std.fmt.hexToBytes(bytes, text);
+        var v: types.Holder = undefined;
+        if (codec.decode_Holder(a, bytes, &v)) |_| {
+            try w.print("ok\n", .{});
+        } else |err| try w.print("{s}\n", .{@errorName(err)});
+    }
+}
+"#;
+    if let Some(stdout) = run_zig("shortest", &out, driver) {
+        assert_eq!(
+            stdout,
+            "ok\nNonShortestMapKey\nNonShortestMapKey\nNonShortestMapKey"
+        );
+    }
+}
+
+/// Text enum values that are not identifiers get word-based member names, and each
+/// value round-trips through the codec as written.
+#[test]
+fn text_enum_values_get_legal_member_names_and_round_trip() {
+    let values = [
+        "calendars.read",
+        "events.write",
+        "a-b c",
+        "2fa",
+        "class",
+        "error",
+    ];
+    let rules = vec![typedef_rule(
+        "Scope",
+        CsilTypeExpression::Choice(values.iter().map(|v| text_lit(v)).collect()),
+    )];
+    let out = process_generation(input_with_rules(rules, "zig-typesonly", HashMap::new())).unwrap();
+    let types = &out
+        .files
+        .iter()
+        .find(|f| f.path.ends_with("types.gen.zig"))
+        .unwrap()
+        .content;
+    for member in [
+        "    calendars_read,",
+        "    events_write,",
+        "    a_b_c,",
+        "    v_2fa,",
+        "    class,",
+        "    @\"error\",",
+    ] {
+        assert!(types.contains(member), "{member}\n{types}");
+    }
+    let driver = r#"const std = @import("std");
+const types = @import("types.gen.zig");
+const codec = @import("codec.gen.zig");
+pub fn main() !void {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const w = std.io.getStdOut().writer();
+    for ([_]types.Scope{ .calendars_read, .events_write, .a_b_c, .v_2fa, .class, .@"error" }) |member| {
+        const bytes = try codec.encode_Scope(a, &member);
+        var back: types.Scope = undefined;
+        try codec.decode_Scope(a, bytes, &back);
+        if (back != member) return error.Mismatch;
+        try w.print("{s} ", .{back.wire_name()});
+    }
+}
+"#;
+    if let Some(stdout) = run_zig("text-enum", &out, driver) {
+        assert_eq!(stdout, "calendars.read events.write a-b c 2fa class error");
+    }
 }

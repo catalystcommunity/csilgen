@@ -275,10 +275,10 @@ fn codec_list_fields_reference_the_local_field_variable() {
         "            $out['aliases'] = array_map(function ($item) { return $item; }, $field === null ? array() : $field);"
     ));
     assert!(codec.contains(
-        "'items' => array_key_exists('items', $value) ? array_map(function ($item) { return self::fromCborItem($item); }, $value['items'] === null ? array() : $value['items']) : null,"
+        "'items' => array_key_exists('items', $value) ? array_map(function ($item) { return self::fromCborItem($item); }, self::csilList($value['items'])) : null,"
     ));
     assert!(codec.contains(
-        "'tags' => array_key_exists('tags', $value) ? array_map(function ($item) { return $item; }, $value['tags'] === null ? array() : $value['tags']) : null,"
+        "'tags' => array_key_exists('tags', $value) ? array_map(function ($item) { return $item; }, self::csilList($value['tags'])) : null,"
     ));
 }
 
@@ -301,7 +301,7 @@ fn codec_nested_lists_and_maps_of_lists_reference_enclosing_locals() {
     ));
     // Map of lists: the inner array_map iterates the enclosing foreach's $v.
     assert!(codec.contains(
-        "$out[$k] = array_map(function ($item) { return $item; }, $v === null ? array() : $v);"
+        "$entries[] = array((string) $k, array_map(function ($item) { return $item; }, $v === null ? array() : $v));"
     ));
 }
 
@@ -324,7 +324,7 @@ fn alias_list_codec_maps_over_the_value_parameter() {
         "return array_map(function ($item) { return self::toCborItem($item); }, $value === null ? array() : $value);"
     ));
     assert!(codec.contains(
-        "return array_map(function ($item) { return self::fromCborItem($item); }, $value === null ? array() : $value);"
+        "return array_map(function ($item) { return self::fromCborItem($item); }, self::csilList($value));"
     ));
 }
 
@@ -380,9 +380,7 @@ fn mixed_union_choice_emits_tagged_sum_with_literal_first_precedence() {
 
     // Decode: dispatches by index; a literal arm validates equality against its
     // declared literal rather than trusting the payload.
-    assert!(codec.contains(
-        "if (!is_array($value) || count($value) !== 2) {\n            throw new CodecException('csil cbor: OrderStatus union expects a 2-element array');\n        }"
-    ));
+    assert!(codec.contains("$value = self::csilTagged($value, 'OrderStatus');"));
     assert!(codec.contains("if ($csilIdx === 0) {\n            return $csilVal;\n        }"));
     assert!(
         codec.contains("if ($csilIdx === 1) {\n            return self::expectLiteral($csilVal, 'pending');\n        }")

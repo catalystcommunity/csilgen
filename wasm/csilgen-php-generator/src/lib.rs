@@ -9,7 +9,7 @@ use csilgen_common::{
     CsilGroupEntry, CsilGroupExpression, CsilGroupKey, CsilLiteralValue, CsilOccurrence,
     CsilRuleType, CsilServiceDefinition, CsilServiceDirection, CsilSpecSerialized,
     CsilTypeExpression, GeneratedFile, GeneratedFiles, GenerationStats, GeneratorCapability,
-    GeneratorConfig, GeneratorMetadata, WasmGeneratorInput, WasmGeneratorOutput,
+    GeneratorConfig, GeneratorMetadata, HoistOptions, WasmGeneratorInput, WasmGeneratorOutput,
     choice_arm_literal, wasm_interface::*,
 };
 use std::collections::{HashMap, HashSet};
@@ -91,12 +91,13 @@ fn process_generation(input_ptr: *const u8, input_len: usize) -> Result<WasmGene
 /// Generate the files for one wasm request, with one warning per renamed rule.
 pub fn run_generation(input: &WasmGeneratorInput) -> Result<WasmGeneratorOutput, i32> {
     let files = generate_php_code_from_serialized(&input.csil_spec, &input.config)?;
+    let surface = Surface::of(&input.config)?;
     let total_size = files.iter().map(|f| f.content.len()).sum();
     let files_generated = files.len();
     Ok(WasmGeneratorOutput {
         files,
         warnings: csilgen_common::rename_warnings(
-            &prepare_spec(&input.csil_spec),
+            &prepare_spec(&input.csil_spec, &surface),
             &input.config.target,
         ),
         stats: GenerationStats {
@@ -110,18 +111,17 @@ pub fn run_generation(input: &WasmGeneratorInput) -> Result<WasmGeneratorOutput,
     })
 }
 
-/// Class names the generated package declares itself, plus the names PHP does
-/// not allow as a class name. Compared in lower case, because PHP class names
-/// are case-insensitive. `cbor` is here because `codec.php` imports
+/// Class names the generated package always declares itself, plus the names PHP
+/// does not allow as a class name. Compared in lower case, because PHP class
+/// names are case-insensitive. `cbor` is here because `codec.php` imports
 /// `Csilgen\Transport\CBOR`, so a `Cbor` record there silently resolves to the
 /// import and its codec reads every field as null.
 const RESERVED_TYPE_NAMES: &[&str] = &[
     "bool",
     "cbor",
-    "clienterror",
     "codec",
     "codecexception",
-    "csilreplytransport",
+    "csilmap",
     "false",
     "float",
     "int",
@@ -139,63 +139,177 @@ const RESERVED_TYPE_NAMES: &[&str] = &[
     "void",
 ];
 
-/// Rename each rule whose class is reserved or equals a class or `Codec` method
-/// stem the generator derives from a service, an operation, or an RPC error arm
-/// (`<Base>Client`, `<Base>Handler`, `<Base>Router`, `<Arm>Refusal`,
-/// `encode<Service><Op>Reply`). Each of these is a fatal redeclaration at load.
-fn rename_reserved_php_names(spec: &CsilSpecSerialized) -> CsilSpecSerialized {
-    let mut derived = std::collections::HashSet::new();
+/// Which files a target emits. The emitters and the derived-name reservation both
+/// read it, so a name is reserved exactly when the item that owns it is emitted.
+struct Surface {
+    client: bool,
+    server: bool,
+}
+
+impl Surface {
+    fn of(config: &GeneratorConfig) -> Result<Self, i32> {
+        let pkg = emit_packages_includes(config, "php");
+        match config.target.as_str() {
+            "php" | "php-server" => Ok(Self {
+                client: pkg,
+                server: true,
+            }),
+            "php-client" => Ok(Self {
+                client: true,
+                server: pkg,
+            }),
+            "php-typesonly" => Ok(Self {
+                client: false,
+                server: false,
+            }),
+            _ => Err(error_codes::GENERATION_ERROR),
+        }
+    }
+
+    fn client_file(&self, spec: &CsilSpecSerialized) -> bool {
+        self.client && spec.service_count > 0
+    }
+
+    fn server_file(&self, spec: &CsilSpecSerialized) -> bool {
+        self.server && spec.service_count > 0
+    }
+}
+
+/// Whether a rule declares a PHP class (a record, or a text enum's constant
+/// class). Every other rule only has `Codec` methods, so it cannot clash with a
+/// derived class name.
+fn rule_declares_class(rule: &csilgen_common::CsilRule) -> bool {
+    match &rule.rule_type {
+        CsilRuleType::GroupDef(_) | CsilRuleType::TypeDef(CsilTypeExpression::Group(_)) => true,
+        CsilRuleType::TypeDef(CsilTypeExpression::Choice(arms))
+        | CsilRuleType::TypeChoice(arms) => php_enum_members(arms).is_some(),
+        _ => false,
+    }
+}
+
+/// The class names (lower case) the emitted files derive from services,
+/// operations and RPC error arms, for the files `surface` emits.
+fn derived_class_names(spec: &CsilSpecSerialized, surface: &Surface) -> HashSet<String> {
+    let mut derived = HashSet::new();
+    if surface.client_file(spec) {
+        derived.insert("clienterror".to_string());
+        if spec.rpc_operations().next().is_some() {
+            derived.insert("csilreplytransport".to_string());
+        }
+    }
     for rule in &spec.rules {
         if matches!(rule.rule_type, CsilRuleType::ServiceDef(_)) {
             let base = service_base(&rule.name);
-            for suffix in ["Client", "Handler", "Router"] {
-                derived.insert(format!("{base}{suffix}").to_ascii_lowercase());
+            if surface.client_file(spec) {
+                derived.insert(format!("{base}Client").to_ascii_lowercase());
+            }
+            if surface.server_file(spec) {
+                derived.insert(format!("{base}Handler").to_ascii_lowercase());
+                derived.insert(format!("{base}Router").to_ascii_lowercase());
             }
         }
     }
-    for (service, op, arms) in spec.rpc_operations() {
-        derived.insert(
-            format!("{}{}Reply", php_class(service), php_class(&op.name)).to_ascii_lowercase(),
-        );
-        for arm in &arms[1..] {
-            if let Some(name) = arm.rpc_variant_name() {
-                derived.insert(format!("{}Refusal", php_class(name)).to_ascii_lowercase());
-            }
-        }
-    }
+    derived.extend(
+        refusal_classes(spec)
+            .into_keys()
+            .map(|c| c.to_ascii_lowercase()),
+    );
+    derived
+}
+
+/// The `<Arm>Refusal` exception classes `codec.php` declares, one per error arm,
+/// each with the arm's wire name.
+fn refusal_classes(spec: &CsilSpecSerialized) -> std::collections::BTreeMap<String, &str> {
+    spec.rpc_operations()
+        .flat_map(|(_, _, arms)| arms[1..].iter())
+        .filter_map(|arm| arm.rpc_variant_name())
+        .map(|name| {
+            (
+                format!("{}Refusal", php_class(name)),
+                spec.declared_name(name),
+            )
+        })
+        .collect()
+}
+
+/// The `Codec` method stem of the reply codec an RPC operation with error arms
+/// gets: `encode<Stem>Reply`. A rule's own codec is `encode<Class>`, so a rule
+/// whose class equals the stem clashes with it.
+fn reply_codec_stem(service: &str, op: &str) -> String {
+    format!("{}{}Reply", php_class(service), php_class(op))
+}
+
+/// Rename each rule whose class is reserved or equals a class or `Codec` method
+/// stem that the emitted files derive (`<Base>Client`, `<Base>Handler`,
+/// `<Base>Router`, `<Arm>Refusal`, `encode<Service><Op>Reply`). Each of these is a
+/// fatal redeclaration at load. A derived name of a file the target does not
+/// emit is not reserved, and a class name clashes only with a rule that declares
+/// a class.
+fn rename_reserved_php_names(spec: &CsilSpecSerialized, surface: &Surface) -> CsilSpecSerialized {
+    let classes = derived_class_names(spec, surface);
+    let methods: HashSet<String> = spec
+        .rpc_operations()
+        .map(|(service, op, _)| reply_codec_stem(service, &op.name).to_ascii_lowercase())
+        .collect();
+    let declares_class: HashMap<&str, bool> = spec
+        .rules
+        .iter()
+        .map(|rule| (rule.name.as_str(), rule_declares_class(rule)))
+        .collect();
     csilgen_common::rename_reserved(spec, |name| {
         let class = php_class(name).to_ascii_lowercase();
-        RESERVED_TYPE_NAMES.contains(&class.as_str()) || derived.contains(&class)
+        // A candidate rename has no entry; treat it as a class to stay safe.
+        let is_class = declares_class.get(name).copied().unwrap_or(true);
+        RESERVED_TYPE_NAMES.contains(&class.as_str())
+            || methods.contains(&class)
+            || (is_class && classes.contains(&class))
     })
 }
 
-/// The spec the generator works on: reserved and derived names renamed first,
-/// then rules whose classes are equal. PHP class and method names are
+/// Rename rules whose generated names are equal. PHP class and method names are
 /// case-insensitive, so `Value` and `VALUE` clash as well as `user_id` and
-/// `UserId`.
-fn prepare_spec(spec: &CsilSpecSerialized) -> CsilSpecSerialized {
-    csilgen_common::rename_ident_collisions(&rename_reserved_php_names(spec), |name| {
+/// `UserId`. A service has no class of its own: it is compared by the base of its
+/// derived classes, in a separate name space, so a record `Foo` and a service
+/// `FooService` both keep their names.
+fn rename_php_collisions(spec: &CsilSpecSerialized) -> CsilSpecSerialized {
+    let services: HashSet<&str> = spec
+        .rules
+        .iter()
+        .filter(|rule| matches!(rule.rule_type, CsilRuleType::ServiceDef(_)))
+        .map(|rule| rule.name.as_str())
+        .collect();
+    let rules: HashSet<&str> = spec.rules.iter().map(|rule| rule.name.as_str()).collect();
+    csilgen_common::rename_ident_collisions(spec, |name| {
+        // A service's rename candidate is its name plus a number, and is not a rule yet.
+        let unnumbered = name.trim_end_matches(|c: char| c.is_ascii_digit());
+        let candidate = !rules.contains(name) && services.contains(unnumbered);
+        if services.contains(name) || candidate {
+            return format!("service:{}", service_base(name).to_ascii_lowercase());
+        }
         php_class(name).to_ascii_lowercase()
     })
 }
 
-enum Surface {
-    Server,
-    Client,
-    TypesOnly,
+/// The spec the generator works on. The op-boundary unions and the inline
+/// composites are named first, so the synthesized rules get the same rename
+/// checks as declared ones; a synthesized rule comes after every declared rule,
+/// so in a clash it is the one renamed. The collision pass runs again after the
+/// reserved pass, because a `<Name>Type` rename can clash with another class
+/// name only in PHP's case-insensitive sense.
+fn prepare_spec(spec: &CsilSpecSerialized, surface: &Surface) -> CsilSpecSerialized {
+    let spec = csilgen_common::hoist_op_union_boundaries(spec);
+    let spec = csilgen_common::hoist_inline_composites(&spec, HoistOptions::default());
+    let spec = rename_php_collisions(&spec);
+    let spec = rename_reserved_php_names(&spec, surface);
+    rename_php_collisions(&spec)
 }
 
 pub fn generate_php_code_from_serialized(
     spec: &CsilSpecSerialized,
     config: &GeneratorConfig,
 ) -> Result<GeneratedFiles, i32> {
-    let spec = &csilgen_common::hoist_inline_named_numbers(&prepare_spec(spec));
-    let surface = match config.target.as_str() {
-        "php" | "php-server" => Surface::Server,
-        "php-client" => Surface::Client,
-        "php-typesonly" => Surface::TypesOnly,
-        _ => return Err(error_codes::GENERATION_ERROR),
-    };
+    let surface = Surface::of(config)?;
+    let spec = &prepare_spec(spec, &surface);
 
     let namespace = php_namespace(config);
     let mut files = vec![
@@ -209,30 +323,22 @@ pub fn generate_php_code_from_serialized(
         },
     ];
 
-    let pkg_mode = emit_packages_includes(config, "php");
-    if spec.service_count > 0 {
-        let want_client = matches!(surface, Surface::Client)
-            || (pkg_mode && !matches!(surface, Surface::TypesOnly));
-        let want_server = matches!(surface, Surface::Server)
-            || (pkg_mode && !matches!(surface, Surface::TypesOnly));
-        if want_client {
-            files.push(GeneratedFile {
-                path: "client.php".to_string(),
-                content: generate_client_file(spec, &namespace),
-            });
-        }
-        if want_server {
-            files.push(GeneratedFile {
-                path: "server.php".to_string(),
-                content: generate_server_file(spec, &namespace),
-            });
-        }
+    if surface.client_file(spec) {
+        files.push(GeneratedFile {
+            path: "client.php".to_string(),
+            content: generate_client_file(spec, &namespace),
+        });
+    }
+    if surface.server_file(spec) {
+        files.push(GeneratedFile {
+            path: "server.php".to_string(),
+            content: generate_server_file(spec, &namespace),
+        });
     }
 
-    if pkg_mode {
-        let rpc = files
-            .iter()
-            .any(|f| f.path == "client.php")
+    if emit_packages_includes(config, "php") {
+        let rpc = surface
+            .client_file(spec)
             .then(|| first_unary_client(spec))
             .flatten();
         Ok(wrap_as_composer_package(files, config, &namespace, rpc))
@@ -414,7 +520,7 @@ fn generate_types_file(spec: &CsilSpecSerialized, namespace: &str) -> String {
             }
             CsilRuleType::TypeDef(CsilTypeExpression::Choice(arms))
             | CsilRuleType::TypeChoice(arms) => {
-                if let Some(members) = csilgen_common::text_enum_members(arms) {
+                if let Some(members) = php_enum_members(arms) {
                     let class = php_class(&rule.name);
                     out.push_str(&format!("final class {class}\n{{\n"));
                     for (member, wire) in &members {
@@ -443,6 +549,32 @@ fn generate_types_file(spec: &CsilSpecSerialized, namespace: &str) -> String {
         }
     }
     out
+}
+
+/// The constant name and wire value of each member of a text enum. A constant is
+/// the value's words in upper snake case (`calendars.read` gives
+/// `CALENDARS_READ`). The enum is a class of constants, not a PHP 8.1 enum, so
+/// only a leading digit and `class` (reserved for `Name::class`, in any case) are
+/// refused; its methods and properties live in other name spaces.
+fn php_enum_members(arms: &[CsilTypeExpression]) -> Option<Vec<(String, &str)>> {
+    let values: Vec<&str> = arms
+        .iter()
+        .map(|arm| match choice_arm_literal(arm)? {
+            CsilLiteralValue::Text(value) => Some(value.as_str()),
+            _ => None,
+        })
+        .collect::<Option<_>>()?;
+    if values.is_empty() {
+        return None;
+    }
+    let names = csilgen_common::member_idents(
+        &values,
+        |words| words.join("_").to_ascii_uppercase(),
+        |name| {
+            !name.starts_with(|c: char| c.is_ascii_digit()) && !name.eq_ignore_ascii_case("class")
+        },
+    );
+    Some(names.into_iter().zip(values).collect())
 }
 
 fn emit_class(out: &mut String, name: &str, group: &CsilGroupExpression) {
@@ -482,24 +614,18 @@ fn generate_codec_file(spec: &CsilSpecSerialized, namespace: &str) -> String {
     out.push_str(
         "/** Raised when decoded CBOR does not match the declared CSIL shape (unknown enum\n * member, tagged-sum literal-arm mismatch, or malformed union envelope). */\nclass CodecException extends \\RuntimeException {}\n\n",
     );
-    let mut refusals = std::collections::BTreeSet::new();
-    for (_, _, arms) in spec.rpc_operations() {
-        for arm in &arms[1..] {
-            let name = arm.rpc_variant_name().unwrap();
-            let wire = spec.declared_name(name);
-            let class = format!("{}Refusal", php_class(name));
-            if refusals.insert(class.clone()) {
-                out.push_str(&format!("class {class} extends \\RuntimeException\n{{\n    public $value;\n\n    public function __construct($value)\n    {{\n        parent::__construct('{}');\n        $this->value = $value;\n    }}\n}}\n\n", php_string_body(wire)));
-            }
-        }
+    out.push_str(PHP_CSIL_MAP);
+    for (class, wire) in refusal_classes(spec) {
+        out.push_str(&format!("class {class} extends \\RuntimeException\n{{\n    public $value;\n\n    public function __construct($value)\n    {{\n        parent::__construct('{}');\n        $this->value = $value;\n    }}\n}}\n\n", php_string_body(wire)));
     }
     out.push_str("class Codec\n{\n");
     out.push_str(
-        "    public static function encode_value($value)\n    {\n        return CBOR::encode($value);\n    }\n\n    public static function decode_value($bytes)\n    {\n        return CBOR::decode($bytes);\n    }\n\n",
+        "    public static function encode_value($value)\n    {\n        return CBOR::encode($value);\n    }\n\n    public static function decode_value($bytes)\n    {\n        return self::csilPlain(self::csilDecode($bytes));\n    }\n\n",
     );
     out.push_str(
         "    /** A literal-typed union/enum arm carries no shape of its own on the wire — the\n     * variant index (or the bare value itself for an enum) already selects it — so\n     * decode only needs to confirm the payload equals the declared literal. */\n    public static function expectLiteral($value, $expected)\n    {\n        if ($value !== $expected) {\n            throw new CodecException('csil cbor: literal mismatch, expected ' . var_export($expected, true) . ', got ' . var_export($value, true));\n        }\n        return $value;\n    }\n\n",
     );
+    out.push_str(PHP_CBOR_DECODER);
     if spec.uses_builtin("date") {
         out.push_str(
             r#"    private static function calendarDate($text)
@@ -518,7 +644,7 @@ fn generate_codec_file(spec: &CsilSpecSerialized, namespace: &str) -> String {
 
     public static function decode_calendar_date($bytes)
     {
-        return self::readDate(CBOR::decode($bytes));
+        return self::readDate(self::csilDecode($bytes));
     }
 
     private static function readDate($value)
@@ -538,12 +664,13 @@ fn generate_codec_file(spec: &CsilSpecSerialized, namespace: &str) -> String {
     if spec.uses_builtin("cddl_time") {
         out.push_str(PHP_CDDL_TIME_CODEC);
     }
-    let class_names: HashSet<String> = spec
+    let class_names: ClassFields = spec
         .rules
         .iter()
         .filter_map(|r| match &r.rule_type {
-            CsilRuleType::GroupDef(_) | CsilRuleType::TypeDef(CsilTypeExpression::Group(_)) => {
-                Some(r.name.clone())
+            CsilRuleType::GroupDef(group)
+            | CsilRuleType::TypeDef(CsilTypeExpression::Group(group)) => {
+                Some((r.name.clone(), required_keys(group)))
             }
             _ => None,
         })
@@ -626,12 +753,13 @@ fn generate_codec_file(spec: &CsilSpecSerialized, namespace: &str) -> String {
             "    public static function resolveRpcReply($service, $op, $variant, $payload)\n    {\n",
         );
         for (service, op, arms) in spec.rpc_operations() {
-            let stem = format!("{}{}", php_class(service), php_class(&op.name));
-            let method = &op.name;
+            let stem = reply_codec_stem(service, &op.name);
+            let wire_service = php_string(spec.declared_name(service));
+            let wire_op = php_string(&op.name);
             let success = php_string_body(spec.declared_name(arms[0].rpc_variant_name().unwrap()));
             let enc = codec_suffix(&arms[0]);
-            out.push_str(&format!("    public static function encode{stem}Reply(callable $handler)\n    {{\n        try {{\n            return ['variant' => '{success}', 'payload' => self::encode{enc}($handler())];\n"));
-            resolve.push_str(&format!("        if ($service === '{service}' && $op === '{method}') {{\n            if ($variant === '{success}') return $payload;\n"));
+            out.push_str(&format!("    public static function encode{stem}(callable $handler)\n    {{\n        try {{\n            return ['variant' => '{success}', 'payload' => self::encode{enc}($handler())];\n"));
+            resolve.push_str(&format!("        if ($service === {wire_service} && $op === {wire_op}) {{\n            if ($variant === '{success}') return $payload;\n"));
             for arm in &arms[1..] {
                 let name = arm.rpc_variant_name().unwrap();
                 let wire = php_string_body(spec.declared_name(name));
@@ -652,6 +780,252 @@ fn generate_codec_file(spec: &CsilSpecSerialized, namespace: &str) -> String {
     out
 }
 
+/// The generated decoder. The transport's `CBOR::decode` tree cannot be used:
+/// a PHP array keeps only the last value of a repeated key, holds a map with
+/// keys 0..n-1 the same as an array, and does not keep the key bytes. This tree
+/// holds a map as `CsilMap` with its raw keys in wire order, so a repeated key
+/// (also one PHP would merge, text `"1"` and int `1`), a key head that is not in
+/// shortest form, and a map where an array must be are each refused, and
+/// `csilCanonicalMap` compares raw key bytes in O(n).
+/// A decoded CBOR map: `items` by PHP key, `keys` the raw encoded keys in wire order.
+const PHP_CSIL_MAP: &str = r#"/** A decoded CBOR map, apart from a CBOR array. */
+final class CsilMap
+{
+    public $items;
+    public $keys;
+
+    public function __construct(array $items, array $keys)
+    {
+        $this->items = $items;
+        $this->keys = $keys;
+    }
+}
+
+"#;
+
+const PHP_CBOR_DECODER: &str = r#"    private static function csilDecode($bytes)
+    {
+        if (!is_string($bytes)) {
+            throw new CodecException('csil cbor: expected a byte string');
+        }
+        $pos = 0;
+        $value = self::csilItem($bytes, $pos, 0);
+        if ($pos !== strlen($bytes)) {
+            throw new CodecException('csil cbor: trailing bytes after CBOR item');
+        }
+        return $value;
+    }
+
+    private static function csilItem($bytes, &$pos, $depth)
+    {
+        if ($depth > 64) {
+            throw new CodecException('csil cbor: nesting limit exceeded');
+        }
+        self::csilNeed($bytes, $pos, 1);
+        $initial = ord($bytes[$pos++]);
+        $major = $initial >> 5;
+        $info = $initial & 0x1f;
+        if ($major === 7) {
+            if ($info === 20) {
+                return false;
+            }
+            if ($info === 21) {
+                return true;
+            }
+            if ($info === 22) {
+                return null;
+            }
+            if ($info === 25) {
+                self::csilNeed($bytes, $pos, 2);
+                $half = unpack('n', substr($bytes, $pos, 2))[1];
+                $pos += 2;
+                $exponent = ($half >> 10) & 0x1f;
+                $mantissa = $half & 0x3ff;
+                if ($exponent === 0) {
+                    $value = $mantissa * (2.0 ** -24);
+                } elseif ($exponent === 31) {
+                    $value = $mantissa === 0 ? INF : NAN;
+                } else {
+                    $value = ($mantissa + 1024) * (2.0 ** ($exponent - 25));
+                }
+                return ($half & 0x8000) ? -$value : $value;
+            }
+            if ($info === 26) {
+                self::csilNeed($bytes, $pos, 4);
+                $value = unpack('G', substr($bytes, $pos, 4))[1];
+                $pos += 4;
+                return $value;
+            }
+            if ($info === 27) {
+                self::csilNeed($bytes, $pos, 8);
+                $value = unpack('E', substr($bytes, $pos, 8))[1];
+                $pos += 8;
+                return $value;
+            }
+            throw new CodecException('csil cbor: unsupported simple value');
+        }
+        $arg = self::csilArgument($bytes, $pos, $info);
+        if ($major === 0) {
+            return $arg;
+        }
+        if ($major === 1) {
+            return -1 - $arg;
+        }
+        if ($major === 2 || $major === 3) {
+            self::csilNeed($bytes, $pos, $arg);
+            $text = substr($bytes, $pos, $arg);
+            $pos += $arg;
+            if ($major === 3 && preg_match('//u', $text) !== 1) {
+                throw new CodecException('csil cbor: invalid UTF-8 text string');
+            }
+            return $text;
+        }
+        if ($major === 4 || $major === 5) {
+            // Each element takes at least one byte, so a longer count is malformed.
+            if ($arg > strlen($bytes) - $pos) {
+                throw new CodecException('csil cbor: length exceeds remaining input');
+            }
+            $items = array();
+            $keys = array();
+            for ($i = 0; $i < $arg; $i++) {
+                if ($major === 4) {
+                    $items[] = self::csilItem($bytes, $pos, $depth + 1);
+                    continue;
+                }
+                $start = $pos;
+                $key = self::csilItem($bytes, $pos, $depth + 1);
+                if (!is_int($key) && !is_string($key)) {
+                    throw new CodecException('csil cbor: unsupported map key type');
+                }
+                $raw = substr($bytes, $start, $pos - $start);
+                if (!self::csilShortest($raw)) {
+                    throw new CodecException('csil cbor: map key is not in shortest form');
+                }
+                if (array_key_exists($key, $items)) {
+                    throw new CodecException('csil cbor: duplicate key "' . addcslashes((string) $key, "\0..\37\"\\") . '"');
+                }
+                $items[$key] = self::csilItem($bytes, $pos, $depth + 1);
+                $keys[] = $raw;
+            }
+            return $major === 4 ? $items : new CsilMap($items, $keys);
+        }
+        if ($major === 6) {
+            // PHP holds byte and text strings in one type, so check the content major type here.
+            if (($arg === 0 || $arg === 1004) && (!isset($bytes[$pos]) || ord($bytes[$pos]) >> 5 !== 3)) {
+                throw new CodecException('csil cbor: tag ' . $arg . ' requires text');
+            }
+            return new \Csilgen\Transport\Tag($arg, self::csilItem($bytes, $pos, $depth + 1));
+        }
+        throw new CodecException('csil cbor: unsupported major type ' . $major);
+    }
+
+    private static function csilArgument($bytes, &$pos, $info)
+    {
+        if ($info < 24) {
+            return $info;
+        }
+        $widths = array(24 => 1, 25 => 2, 26 => 4, 27 => 8);
+        if (!isset($widths[$info])) {
+            throw new CodecException('csil cbor: unsupported additional-info value ' . $info);
+        }
+        $n = $widths[$info];
+        self::csilNeed($bytes, $pos, $n);
+        $value = 0;
+        for ($i = 0; $i < $n; $i++) {
+            $value = $value * 256 + ord($bytes[$pos++]);
+        }
+        return $value;
+    }
+
+    private static function csilNeed($bytes, $pos, $n)
+    {
+        if ($pos + $n > strlen($bytes)) {
+            throw new CodecException('csil cbor: unexpected end of input');
+        }
+    }
+
+    /** Whether the head of an encoded item uses the fewest argument bytes. */
+    private static function csilShortest($raw)
+    {
+        $info = ord($raw[0]) & 0x1f;
+        if ($info < 24) {
+            return true;
+        }
+        $widths = array(24 => 1, 25 => 2, 26 => 4, 27 => 8);
+        $value = 0;
+        for ($i = 1; $i <= $widths[$info]; $i++) {
+            $value = $value * 256 + ord($raw[$i]);
+        }
+        $floors = array(24 => 24, 25 => 0x100, 26 => 0x10000, 27 => 0x100000000);
+        return $value >= $floors[$info];
+    }
+
+    /** A dynamic map: its raw keys must be strictly ascending, bytewise. */
+    private static function csilCanonicalMap($map)
+    {
+        if (!($map instanceof CsilMap)) {
+            throw new CodecException('csil cbor: expected a map');
+        }
+        $previous = null;
+        foreach ($map->keys as $key) {
+            if ($previous !== null && strcmp($previous, $key) >= 0) {
+                throw new CodecException('csil cbor: map keys are not in canonical order');
+            }
+            $previous = $key;
+        }
+        return $map->items;
+    }
+
+    private static function csilList($value)
+    {
+        if ($value === null) {
+            return array();
+        }
+        if (!is_array($value)) {
+            throw new CodecException('csil cbor: expected an array');
+        }
+        return $value;
+    }
+
+    /** The decoded tree with each map as a plain PHP array, for an untyped value. */
+    private static function csilPlain($value)
+    {
+        if ($value instanceof CsilMap) {
+            $value = $value->items;
+        } elseif ($value instanceof \Csilgen\Transport\Tag) {
+            return new \Csilgen\Transport\Tag($value->tag, self::csilPlain($value->value));
+        }
+        if (is_array($value)) {
+            foreach ($value as $key => $item) {
+                $value[$key] = self::csilPlain($item);
+            }
+        }
+        return $value;
+    }
+
+    private static function csilRecord($value, $name, array $required)
+    {
+        if (!($value instanceof CsilMap)) {
+            throw new CodecException('csil cbor: ' . $name . ' expects a map');
+        }
+        foreach ($required as $key) {
+            if (!array_key_exists($key, $value->items)) {
+                throw new CodecException('csil cbor: ' . $name . ' is missing field "' . $key . '"');
+            }
+        }
+        return $value->items;
+    }
+
+    private static function csilTagged($value, $name)
+    {
+        if (!is_array($value) || count($value) !== 2 || !array_key_exists(0, $value) || !array_key_exists(1, $value)) {
+            throw new CodecException('csil cbor: ' . $name . ' union expects a 2-element array');
+        }
+        return $value;
+    }
+
+"#;
+
 /// Strict `timestamp` (tag 0) codec per docs/cbor-wire-contract.md. The value type
 /// is `\DateTimeImmutable` because it is PHP's standard instant type and holds
 /// microseconds; digits 7-9 must be zero, since the contract forbids rounding. The
@@ -664,7 +1038,7 @@ const PHP_TIMESTAMP_CODEC: &str = r#"    public static function encode_timestamp
 
     public static function decode_timestamp($bytes)
     {
-        return self::timestampFromCbor(CBOR::decode($bytes));
+        return self::timestampFromCbor(self::csilDecode($bytes));
     }
 
     private static function timestampToCbor($value)
@@ -746,7 +1120,7 @@ const PHP_CDDL_TIME_CODEC: &str = r#"    public static function encode_cddl_time
 
     public static function decode_cddl_time($bytes)
     {
-        return self::cddlTimeFromCbor(CBOR::decode($bytes));
+        return self::cddlTimeFromCbor(self::csilDecode($bytes));
     }
 
     private static function cddlTimeToCbor($value)
@@ -875,7 +1249,7 @@ fn emit_choice_codec(
     out: &mut String,
     name: &str,
     choices: &[CsilTypeExpression],
-    class_names: &HashSet<String>,
+    class_names: &ClassFields,
     unions: &HashSet<String>,
     enums: &HashSet<String>,
 ) {
@@ -916,7 +1290,7 @@ fn emit_enum_codec(
         "    public static function encode{suffix}($value)\n    {{\n        return CBOR::encode(self::toCbor{suffix}($value));\n    }}\n\n"
     ));
     out.push_str(&format!(
-        "    public static function decode{suffix}($bytes)\n    {{\n        return self::fromCbor{suffix}(CBOR::decode($bytes));\n    }}\n\n"
+        "    public static function decode{suffix}($bytes)\n    {{\n        return self::fromCbor{suffix}(self::csilDecode($bytes));\n    }}\n\n"
     ));
     let members = literals
         .iter()
@@ -955,7 +1329,7 @@ fn emit_enum_codec(
 /// `null` never satisfies — the null arm's branch would be dead code, and encoding
 /// an actual `null` for that field would fall through every dispatch check and hit
 /// the union's final "no matching variant" throw instead of encoding successfully.
-fn php_union_dispatch_key(variant: &CsilTypeExpression, class_names: &HashSet<String>) -> String {
+fn php_union_dispatch_key(variant: &CsilTypeExpression, class_names: &ClassFields) -> String {
     match variant {
         CsilTypeExpression::Constrained { base_type, .. } => {
             php_union_dispatch_key(base_type, class_names)
@@ -968,7 +1342,7 @@ fn php_union_dispatch_key(variant: &CsilTypeExpression, class_names: &HashSet<St
             "timestamp" | "cddl_time" => "object:\\DateTimeInterface".to_string(),
             _ => "string".to_string(),
         },
-        CsilTypeExpression::Reference(name) if class_names.contains(name) => {
+        CsilTypeExpression::Reference(name) if class_names.contains_key(name) => {
             format!("object:{}", php_class(name))
         }
         CsilTypeExpression::Array { .. }
@@ -1027,7 +1401,7 @@ fn union_encode_body(
     variants: &[CsilTypeExpression],
     value_expr: &str,
     ctx: &str,
-    class_names: &HashSet<String>,
+    class_names: &ClassFields,
     unions: &HashSet<String>,
 ) -> String {
     let mut out = String::new();
@@ -1045,7 +1419,20 @@ fn union_encode_body(
     // last, or it would shadow every real check that follows it.
     type_order.sort_by_key(|k| (k == "mixed") as u8);
 
+    let mut plain_arrays_done = false;
     for key in &type_order {
+        if key == "array" {
+            continue;
+        }
+        if key == "mixed" && !plain_arrays_done {
+            out.push_str(&plain_array_dispatch(
+                variants,
+                value_expr,
+                class_names,
+                unions,
+            ));
+            plain_arrays_done = true;
+        }
         let idxs = &groups[key];
         let mut literal_idxs = Vec::new();
         let mut general_idx = None;
@@ -1112,9 +1499,66 @@ fn union_encode_body(
         }
         out.push_str("}\n");
     }
+    if !plain_arrays_done {
+        out.push_str(&plain_array_dispatch(
+            variants,
+            value_expr,
+            class_names,
+            unions,
+        ));
+    }
     out.push_str(&format!(
         "throw new CodecException('csil cbor: value does not match any {ctx} variant');\n"
     ));
+    out
+}
+
+/// The encode checks for a value that is a plain PHP array, in declaration
+/// order. A record class instance was matched by `instanceof` before this. A
+/// plain array carries no arm, so it takes the first record arm whose required
+/// keys are all present and whose fields encode, or the first map/array arm.
+fn plain_array_dispatch(
+    variants: &[CsilTypeExpression],
+    value_expr: &str,
+    class_names: &ClassFields,
+    unions: &HashSet<String>,
+) -> String {
+    let mut out = String::new();
+    let is_array_arm = |v: &CsilTypeExpression| php_union_dispatch_key(v, class_names) == "array";
+    for (i, variant) in variants.iter().enumerate() {
+        if is_array_arm(variant)
+            && let Some(lit) = choice_arm_literal(variant)
+        {
+            let enc = to_cbor_expr(value_expr, variant, class_names, unions);
+            out.push_str(&format!(
+                "if ({value_expr} === {}) {{\n    return array({i}, {enc});\n}}\n",
+                php_literal(lit)
+            ));
+        }
+    }
+    let mut seen = HashSet::new();
+    for (i, variant) in variants.iter().enumerate() {
+        let enc = to_cbor_expr(value_expr, variant, class_names, unions);
+        if let CsilTypeExpression::Reference(name) = variant
+            && let Some(required) = class_names.get(name)
+        {
+            if !seen.insert(name.as_str()) {
+                continue;
+            }
+            let mut check = format!("is_array({value_expr})");
+            for key in required {
+                check.push_str(&format!(" && array_key_exists({key}, {value_expr})"));
+            }
+            out.push_str(&format!(
+                "if ({check}) {{\n    try {{\n        return array({i}, {enc});\n    }} catch (CodecException $csilMiss) {{\n    }}\n}}\n"
+            ));
+        } else if is_array_arm(variant) && choice_arm_literal(variant).is_none() {
+            out.push_str(&format!(
+                "if (is_array({value_expr})) {{\n    return array({i}, {enc});\n}}\n"
+            ));
+            break;
+        }
+    }
     out
 }
 
@@ -1126,7 +1570,7 @@ fn union_decode_body(
     idx_expr: &str,
     val_expr: &str,
     ctx: &str,
-    class_names: &HashSet<String>,
+    class_names: &ClassFields,
     unions: &HashSet<String>,
     enums: &HashSet<String>,
 ) -> String {
@@ -1173,7 +1617,7 @@ fn emit_union_codec(
     out: &mut String,
     name: &str,
     variants: &[CsilTypeExpression],
-    class_names: &HashSet<String>,
+    class_names: &ClassFields,
     unions: &HashSet<String>,
     enums: &HashSet<String>,
 ) {
@@ -1182,7 +1626,7 @@ fn emit_union_codec(
         "    public static function encode{suffix}($value)\n    {{\n        return CBOR::encode(self::toCbor{suffix}($value));\n    }}\n\n"
     ));
     out.push_str(&format!(
-        "    public static function decode{suffix}($bytes)\n    {{\n        return self::fromCbor{suffix}(CBOR::decode($bytes));\n    }}\n\n"
+        "    public static function decode{suffix}($bytes)\n    {{\n        return self::fromCbor{suffix}(self::csilDecode($bytes));\n    }}\n\n"
     ));
 
     out.push_str(&format!(
@@ -1196,7 +1640,8 @@ fn emit_union_codec(
         "    public static function fromCbor{suffix}($value)\n    {{\n"
     ));
     out.push_str(&format!(
-        "        if (!is_array($value) || count($value) !== 2) {{\n            throw new CodecException('csil cbor: {name} union expects a 2-element array');\n        }}\n"
+        "        $value = self::csilTagged($value, {});\n",
+        php_string(name)
     ));
     out.push_str("        $csilIdx = $value[0];\n        $csilVal = $value[1];\n");
     let dec_body = union_decode_body(
@@ -1216,7 +1661,7 @@ fn emit_group_codec(
     out: &mut String,
     name: &str,
     group: &CsilGroupExpression,
-    class_names: &HashSet<String>,
+    class_names: &ClassFields,
     unions: &HashSet<String>,
     enums: &HashSet<String>,
 ) {
@@ -1225,7 +1670,7 @@ fn emit_group_codec(
         "    public static function encode{suffix}($value)\n    {{\n        return CBOR::encode(self::toCbor{suffix}($value));\n    }}\n\n"
     ));
     out.push_str(&format!(
-        "    public static function decode{suffix}($bytes)\n    {{\n        return self::fromCbor{suffix}(CBOR::decode($bytes));\n    }}\n\n"
+        "    public static function decode{suffix}($bytes)\n    {{\n        return self::fromCbor{suffix}(self::csilDecode($bytes));\n    }}\n\n"
     ));
     out.push_str(&format!(
         "    public static function toCbor{suffix}($value)\n    {{\n        $out = array();\n"
@@ -1251,9 +1696,12 @@ fn emit_group_codec(
             ));
         }
     }
-    out.push_str("        return $out;\n    }\n\n");
+    // An empty PHP array encodes as a CBOR array, so an empty record goes as map entries.
+    out.push_str("        return $out === array() ? CBOR::mapEntries(array()) : $out;\n    }\n\n");
     out.push_str(&format!(
-        "    public static function fromCbor{suffix}($value)\n    {{\n        return new {suffix}(array(\n"
+        "    public static function fromCbor{suffix}($value)\n    {{\n        $value = self::csilRecord($value, {}, array({}));\n        return new {suffix}(array(\n",
+        php_string(name),
+        required_keys(group).join(", ")
     ));
     for entry in keyed_entries(group) {
         let field = field_name(entry);
@@ -1276,7 +1724,7 @@ fn emit_alias_codec(
     out: &mut String,
     name: &str,
     expr: &CsilTypeExpression,
-    class_names: &HashSet<String>,
+    class_names: &ClassFields,
     unions: &HashSet<String>,
     enums: &HashSet<String>,
 ) {
@@ -1285,7 +1733,7 @@ fn emit_alias_codec(
         "    public static function encode{suffix}($value)\n    {{\n        return CBOR::encode(self::toCbor{suffix}($value));\n    }}\n\n"
     ));
     out.push_str(&format!(
-        "    public static function decode{suffix}($bytes)\n    {{\n        return self::fromCbor{suffix}(CBOR::decode($bytes));\n    }}\n\n"
+        "    public static function decode{suffix}($bytes)\n    {{\n        return self::fromCbor{suffix}(self::csilDecode($bytes));\n    }}\n\n"
     ));
     out.push_str(&format!(
         "    public static function toCbor{suffix}($value)\n    {{\n        return {};\n    }}\n\n",
@@ -1315,12 +1763,12 @@ fn php_date_bounds(expr: &str, controls: &[csilgen_common::CsilControlOperator])
 fn to_cbor_expr(
     var: &str,
     expr: &CsilTypeExpression,
-    class_names: &HashSet<String>,
+    class_names: &ClassFields,
     unions: &HashSet<String>,
 ) -> String {
     match expr {
         CsilTypeExpression::Reference(name)
-            if class_names.contains(name) || unions.contains(name) =>
+            if class_names.contains_key(name) || unions.contains(name) =>
         {
             format!("self::toCbor{}({var})", php_class(name))
         }
@@ -1340,18 +1788,20 @@ fn to_cbor_expr(
             "array_map(function ($item) {{ return {}; }}, {var} === null ? array() : {var})",
             to_cbor_expr("$item", element_type, class_names, unions)
         ),
+        // Always map entries: a PHP array with keys 0..n-1 would encode as a CBOR
+        // array, and PHP turns a numeric text key into an int key. The transport
+        // sorts the entries by their encoded keys.
         CsilTypeExpression::Map { key, value, .. } => {
-            let k = to_cbor_expr("$k", key, class_names, unions);
-            let v = to_cbor_expr("$v", value, class_names, unions);
-            if k == "$k" {
-                format!(
-                    "(function ($m) {{ $out = array(); foreach (($m === null ? array() : $m) as $k => $v) {{ $out[$k] = {v}; }} return $out; }})({var})"
-                )
+            let key_var = if is_text_key(key) {
+                "(string) $k"
             } else {
-                format!(
-                    "(function ($m) {{ $entries = array(); foreach (($m === null ? array() : $m) as $k => $v) {{ $entries[] = array({k}, {v}); }} return CBOR::mapEntries($entries); }})({var})"
-                )
-            }
+                "$k"
+            };
+            let k = to_cbor_expr(key_var, key, class_names, unions);
+            let v = to_cbor_expr("$v", value, class_names, unions);
+            format!(
+                "(function ($m) {{ $entries = array(); foreach (($m === null ? array() : $m) as $k => $v) {{ $entries[] = array({k}, {v}); }} return CBOR::mapEntries($entries); }})({var})"
+            )
         }
         CsilTypeExpression::Constrained {
             base_type,
@@ -1422,7 +1872,7 @@ fn to_cbor_expr(
 fn from_cbor_expr(
     var: &str,
     expr: &CsilTypeExpression,
-    class_names: &HashSet<String>,
+    class_names: &ClassFields,
     unions: &HashSet<String>,
     enums: &HashSet<String>,
 ) -> String {
@@ -1435,16 +1885,16 @@ fn from_cbor_expr(
             format!("self::cddlTimeFromCbor({var})")
         }
         CsilTypeExpression::Reference(name)
-            if class_names.contains(name) || unions.contains(name) || enums.contains(name) =>
+            if class_names.contains_key(name) || unions.contains(name) || enums.contains(name) =>
         {
             format!("self::fromCbor{}({var})", php_class(name))
         }
         CsilTypeExpression::Array { element_type, .. } => format!(
-            "array_map(function ($item) {{ return {}; }}, {var} === null ? array() : {var})",
+            "array_map(function ($item) {{ return {}; }}, self::csilList({var}))",
             from_cbor_expr("$item", element_type, class_names, unions, enums)
         ),
         CsilTypeExpression::Map { key, value, .. } => format!(
-            "(function ($m) {{ $out = array(); foreach (($m === null ? array() : $m) as $k => $v) {{ $out[{}] = {}; }} return $out; }})({var})",
+            "(function ($m) {{ $out = array(); foreach (self::csilCanonicalMap($m) as $k => $v) {{ $out[{}] = {}; }} return $out; }})({var})",
             from_cbor_expr("$k", key, class_names, unions, enums),
             from_cbor_expr("$v", value, class_names, unions, enums)
         ),
@@ -1468,7 +1918,7 @@ fn from_cbor_expr(
                 .iter()
                 .enumerate()
                 .map(|(i, e)| {
-                    let elem = format!("({var})[{i}]");
+                    let elem = format!("self::csilList({var})[{i}]");
                     let dec = from_cbor_expr(&elem, &e.value_type, class_names, unions, enums);
                     if is_optional(e) {
                         format!("(({elem}) === null ? null : ({dec}))")
@@ -1509,7 +1959,7 @@ fn from_cbor_expr(
                     enums,
                 );
                 format!(
-                    "(function ($value) {{\n    if (!is_array($value) || count($value) !== 2) {{\n        throw new CodecException('csil cbor: inline union expects a 2-element array');\n    }}\n    $csilIdx = $value[0];\n    $csilVal = $value[1];\n{}}})({var})",
+                    "(function ($value) {{\n    $value = self::csilTagged($value, 'inline');\n    $csilIdx = $value[0];\n    $csilVal = $value[1];\n{}}})({var})",
                     reindent(&body, "    ")
                 )
             } else {
@@ -1519,8 +1969,35 @@ fn from_cbor_expr(
         CsilTypeExpression::Literal(lit) => {
             format!("self::expectLiteral({var}, {})", php_literal(lit))
         }
-        _ => var.to_string(),
+        CsilTypeExpression::Builtin(name) if is_php_scalar(name) => var.to_string(),
+        // Any other shape is passed through as the decoded tree, so a map in it
+        // becomes a plain array again.
+        _ => format!("self::csilPlain({var})"),
     }
+}
+
+/// Built-ins whose decoded value is a PHP scalar or null, never a map.
+fn is_php_scalar(name: &str) -> bool {
+    matches!(
+        name,
+        "int"
+            | "uint"
+            | "nint"
+            | "integer"
+            | "unsigned"
+            | "float"
+            | "float16"
+            | "float32"
+            | "float64"
+            | "double"
+            | "text"
+            | "tstr"
+            | "bytes"
+            | "bstr"
+            | "bool"
+            | "null"
+            | "nil"
+    )
 }
 
 fn generate_client_file(spec: &CsilSpecSerialized, namespace: &str) -> String {
@@ -1531,14 +2008,20 @@ fn generate_client_file(spec: &CsilSpecSerialized, namespace: &str) -> String {
     }
     for rule in &spec.rules {
         if let CsilRuleType::ServiceDef(service) = &rule.rule_type {
-            emit_client_class(&mut out, &rule.name, service);
+            emit_client_class(&mut out, spec, &rule.name, service);
         }
     }
     out
 }
 
-fn emit_client_class(out: &mut String, service_name: &str, service: &CsilServiceDefinition) {
+fn emit_client_class(
+    out: &mut String,
+    spec: &CsilSpecSerialized,
+    service_name: &str,
+    service: &CsilServiceDefinition,
+) {
     let class = format!("{}Client", service_base(service_name));
+    let wire_service = php_string(spec.declared_name(service_name));
     // Only a service with a multi-arm reply needs the variant, so only it requires
     // the interface; every other client keeps today's duck-typed `call` seam.
     let multi_arm = service
@@ -1564,7 +2047,6 @@ fn emit_client_class(out: &mut String, service_name: &str, service: &CsilService
         // The wire pair is the verbatim CSIL service/op names (cbor-wire-contract.md
         // "RPC call naming"): any case transform is lossy at the transport seam.
         if op.rpc_reply_arms().is_some() {
-            let wire_service = php_string(service_name);
             let wire_op = php_string(&op.name);
             out.push_str(&format!(
                 "    public function {method}($request)\n    {{\n        $payload = Codec::encode{in_suffix}($request);\n        $reply = $this->transport->callReply({wire_service}, {wire_op}, $payload);\n        if (!is_array($reply) || !array_key_exists('variant', $reply) || !array_key_exists('payload', $reply)) {{\n            throw new CodecException('callReply must return array(\\'variant\\' => ?string, \\'payload\\' => string)');\n        }}\n        return Codec::decode{out_suffix}(Codec::resolveRpcReply({wire_service}, {wire_op}, $reply['variant'], $reply['payload']));\n    }}\n\n"
@@ -1572,8 +2054,7 @@ fn emit_client_class(out: &mut String, service_name: &str, service: &CsilService
             continue;
         }
         out.push_str(&format!(
-            "    public function {method}($request)\n    {{\n        $payload = Codec::encode{in_suffix}($request);\n        $reply = $this->transport->call({}, {}, $payload);\n        return Codec::decode{out_suffix}($reply);\n    }}\n\n",
-            php_string(service_name),
+            "    public function {method}($request)\n    {{\n        $payload = Codec::encode{in_suffix}($request);\n        $reply = $this->transport->call({wire_service}, {}, $payload);\n        return Codec::decode{out_suffix}($reply);\n    }}\n\n",
             php_string(&op.name)
         ));
     }
@@ -1638,8 +2119,8 @@ fn emit_server_class(out: &mut String, service_name: &str, service: &CsilService
         let out_suffix = codec_suffix(op.success_output());
         let method = php_method(&op.name);
         if op.rpc_reply_arms().is_some() {
-            let stem = format!("{}{}", php_class(service_name), php_class(&op.name));
-            out.push_str(&format!("            case {}:\n                $request = Codec::decode{in_suffix}($payload);\n                return Codec::encode{stem}Reply(function () use ($request) {{ return $this->handler->{method}($request); }});\n", php_string(&op.name)));
+            let stem = reply_codec_stem(service_name, &op.name);
+            out.push_str(&format!("            case {}:\n                $request = Codec::decode{in_suffix}($payload);\n                return Codec::encode{stem}(function () use ($request) {{ return $this->handler->{method}($request); }});\n", php_string(&op.name)));
             continue;
         }
         out.push_str(&format!(
@@ -1661,6 +2142,26 @@ fn codec_suffix(expr: &CsilTypeExpression) -> String {
         // A Pascal-case rule class never starts with `_`, so the generic codec
         // cannot share a method name with a rule's codec (a rule named `Value`).
         _ => "_value".to_string(),
+    }
+}
+
+/// Each record class with the PHP string literals of its required keys.
+type ClassFields = HashMap<String, Vec<String>>;
+
+fn required_keys(group: &CsilGroupExpression) -> Vec<String> {
+    keyed_entries(group)
+        .filter(|entry| !is_optional(entry))
+        .map(|entry| php_string(&field_name(entry)))
+        .collect()
+}
+
+/// Whether a map key is text. PHP turns a numeric text key into an int key, so
+/// the encoder casts a text key back before it encodes it.
+fn is_text_key(key: &CsilTypeExpression) -> bool {
+    match key {
+        CsilTypeExpression::Constrained { base_type, .. } => is_text_key(base_type),
+        CsilTypeExpression::Builtin(name) => name == "text" || name == "tstr",
+        _ => false,
     }
 }
 
@@ -1722,11 +2223,10 @@ fn php_method(name: &str) -> String {
     php_prop(name)
 }
 
+/// The stem of a service's derived classes: `UserService` gives `UserClient`.
 fn service_base(name: &str) -> String {
-    php_class(name)
-        .strip_suffix("Service")
-        .unwrap_or(&php_class(name))
-        .to_string()
+    let class = php_class(name);
+    class.strip_suffix("Service").unwrap_or(&class).to_string()
 }
 
 fn php_string(value: &str) -> String {
