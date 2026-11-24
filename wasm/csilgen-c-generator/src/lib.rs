@@ -1743,6 +1743,84 @@ fn emit_enc_array_body(
 
 /// Emit the key + CBOR map head + per-entry encode loop for a map field. The map's
 /// key and value types travel together as `kv` to keep the argument count down.
+/// Emit the entries of a CBOR map whose head is already written: each key and
+/// value is encoded in place, and `csilc_sort_map_entries` then reorders the
+/// entries into canonical order (bytewise on the encoded keys), so the wire form
+/// does not depend on the order of the in-memory arrays.
+fn emit_enc_map_entries(
+    out: &mut String,
+    indent: &str,
+    count: &str,
+    kv: (&str, &str),
+    types: (&CsilTypeExpression, &CsilTypeExpression),
+    scope: &CodecScope,
+    warnings: &mut Vec<GeneratorWarning>,
+) {
+    let (key_expr, value_expr) = kv;
+    let (key, value) = types;
+    let inner = format!("{indent}        ");
+    let mut entry = String::new();
+    emit_enc_value(&mut entry, &inner, key, key_expr, scope, warnings);
+    let mut value_code = String::new();
+    emit_enc_value(&mut value_code, &inner, value, value_expr, scope, warnings);
+    // The value emitters return on failure; free the mark array on that path too.
+    let release = |code: &str| code.replace("return -1;", "{ free(csilc_marks); return -1; }");
+    out.push_str(&format!(
+        "{indent}if ({count}) {{
+"
+    ));
+    out.push_str(&format!(
+        "{indent}    if ({count} > (SIZE_MAX / sizeof(size_t) - 1) / 2) return -1;
+"
+    ));
+    out.push_str(&format!(
+        "{indent}    size_t *csilc_marks = (size_t *)malloc((2 * {count} + 1) * sizeof(size_t));
+"
+    ));
+    out.push_str(&format!(
+        "{indent}    if (!csilc_marks) return -1;
+"
+    ));
+    out.push_str(&format!(
+        "{indent}    for (size_t csilc_i = 0; csilc_i < {count}; csilc_i++) {{
+"
+    ));
+    out.push_str(&format!(
+        "{indent}        csilc_marks[2 * csilc_i] = b->len;
+"
+    ));
+    out.push_str(&release(&entry));
+    out.push_str(&format!(
+        "{indent}        csilc_marks[2 * csilc_i + 1] = b->len;
+"
+    ));
+    out.push_str(&release(&value_code));
+    out.push_str(&format!(
+        "{indent}    }}
+"
+    ));
+    out.push_str(&format!(
+        "{indent}    csilc_marks[2 * {count}] = b->len;
+"
+    ));
+    out.push_str(&format!(
+        "{indent}    int csilc_sorted = csilc_sort_map_entries(b, csilc_marks, {count});
+"
+    ));
+    out.push_str(&format!(
+        "{indent}    free(csilc_marks);
+"
+    ));
+    out.push_str(&format!(
+        "{indent}    if (csilc_sorted) return -1;
+"
+    ));
+    out.push_str(&format!(
+        "{indent}}}
+"
+    ));
+}
+
 fn emit_enc_map_body(
     out: &mut String,
     indent: &str,
@@ -1761,27 +1839,18 @@ fn emit_enc_map_body(
     out.push_str(&format!(
         "{indent}if (csilc_w_map_head(b, v->{member}_count)) return -1;\n"
     ));
-    out.push_str(&format!(
-        "{indent}for (size_t csilc_i = 0; csilc_i < v->{member}_count; csilc_i++) {{\n"
-    ));
-    let inner = format!("{indent}    ");
-    emit_enc_value(
+    emit_enc_map_entries(
         out,
-        &inner,
-        key,
-        &format!("v->{member}_keys[csilc_i]"),
+        indent,
+        &format!("v->{member}_count"),
+        (
+            &format!("v->{member}_keys[csilc_i]"),
+            &format!("v->{member}_values[csilc_i]"),
+        ),
+        (key, value),
         scope,
         warnings,
     );
-    emit_enc_value(
-        out,
-        &inner,
-        value,
-        &format!("v->{member}_values[csilc_i]"),
-        scope,
-        warnings,
-    );
-    out.push_str(&format!("{indent}}}\n"));
 }
 
 /// Emit the encode of one record field (key + value), honoring optionality and the
@@ -2137,17 +2206,16 @@ fn emit_map_alias_codec(
         "static inline int csilc_enc_{name}(csilc_buf *b, const {name} *v) {{\n"
     ));
     out.push_str("    if (csilc_w_map_head(b, v->count)) return -1;\n");
-    out.push_str("    for (size_t csilc_i = 0; csilc_i < v->count; csilc_i++) {\n");
-    emit_enc_value(out, "        ", key, "v->keys[csilc_i]", scope, warnings);
-    emit_enc_value(
+    emit_enc_map_entries(
         out,
-        "        ",
-        value,
-        "v->values[csilc_i]",
+        "    ",
+        "v->count",
+        ("v->keys[csilc_i]", "v->values[csilc_i]"),
+        (key, value),
         scope,
         warnings,
     );
-    out.push_str("    }\n    return 0;\n}\n\n");
+    out.push_str("    return 0;\n}\n\n");
 
     out.push_str(&format!(
         "/* csilc_dec_{name} reads {name} from a decoded CBOR map (arena-borrowed). */\n"
@@ -2690,6 +2758,23 @@ fn generate_codec(
                         warnings,
                     ),
                     SynthBoundary::Null => synth_bodies.push_str(NULL_BOUNDARY_CODEC_C),
+                    SynthBoundary::Map(key, value) => {
+                        emit_map_alias_struct(
+                            &mut synth_structs,
+                            &boundary.codec_name,
+                            &key,
+                            &value,
+                            config,
+                        );
+                        emit_map_alias_codec(
+                            &mut synth_bodies,
+                            &boundary.codec_name,
+                            &key,
+                            &value,
+                            &scope,
+                            warnings,
+                        );
+                    }
                     SynthBoundary::Array(element) => {
                         emit_list_alias_struct(
                             &mut synth_structs,
@@ -2854,6 +2939,7 @@ fn spec_has_unidirectional_ops(input: &WasmGeneratorInput) -> bool {
 enum SynthBoundary {
     Scalar(CsilTypeExpression),
     Array(CsilTypeExpression),
+    Map(CsilTypeExpression, CsilTypeExpression),
     Null,
 }
 
@@ -2910,14 +2996,23 @@ fn classify_boundary(
                 synth: Some(SynthBoundary::Array((**element_type).clone())),
             }
         }
+        CsilTypeExpression::Map { key, value, .. } => {
+            let name = map_boundary_name(key, value);
+            OpBoundary {
+                is_null: false,
+                codec_name: name.clone(),
+                c_type: name,
+                synth: Some(SynthBoundary::Map((**key).clone(), (**value).clone())),
+            }
+        }
         builtin @ CsilTypeExpression::Builtin(n) => OpBoundary {
             is_null: false,
             codec_name: n.clone(),
             c_type: base_c_type(builtin, config),
             synth: Some(SynthBoundary::Scalar(builtin.clone())),
         },
-        // A bare map or other unrepresentable boundary degrades to a value the codec
-        // warns about and encodes as null, so the output still compiles.
+        // Any other unrepresentable boundary degrades to a value the codec warns
+        // about and encodes as null, so the output still compiles.
         other => OpBoundary {
             is_null: false,
             codec_name: "CsilUnsupportedBoundary".to_string(),
@@ -2931,7 +3026,17 @@ fn classify_boundary(
 /// element keeps its name, a builtin element is capitalized, and anything else
 /// collapses to `Value`; the `Csil…List` shape avoids colliding with user types.
 fn array_boundary_name(element: &CsilTypeExpression) -> String {
-    let token = match unwrap_constrained(element) {
+    format!("Csil{}List", boundary_token(element))
+}
+
+/// The synthesized codec/struct name for a bare `{* K => V}` op boundary, built
+/// from the key and value tokens the same way `array_boundary_name` builds a list.
+fn map_boundary_name(key: &CsilTypeExpression, value: &CsilTypeExpression) -> String {
+    format!("Csil{}{}Map", boundary_token(key), boundary_token(value))
+}
+
+fn boundary_token(element: &CsilTypeExpression) -> String {
+    match unwrap_constrained(element) {
         CsilTypeExpression::Reference(n) => n.clone(),
         CsilTypeExpression::Builtin(n) => {
             let mut chars = n.chars();
@@ -2941,13 +3046,9 @@ fn array_boundary_name(element: &CsilTypeExpression) -> String {
             }
         }
         _ => "Value".to_string(),
-    };
-    format!("Csil{token}List")
+    }
 }
 
-/// Emit the encode + decode bodies for a synthetic scalar op boundary: a single
-/// CBOR value with no map wrapper, so the wire form matches what a record field of
-/// the same type would write.
 /// The value codec of a `null` op boundary. The value is never read: the wire
 /// form is the constant CBOR null, and decode accepts only that.
 const NULL_BOUNDARY_CODEC_C: &str = "\
@@ -2967,6 +3068,9 @@ static inline int csilc_dec_null(const csilc_value *m, CsilCodecArena *a, void *
 
 ";
 
+/// Emit the encode + decode bodies for a synthetic scalar op boundary: a single
+/// CBOR value with no map wrapper, so the wire form matches what a record field of
+/// the same type would write.
 fn emit_scalar_boundary_codec(
     out: &mut String,
     name: &str,
@@ -3145,9 +3249,10 @@ fn generate_server(
 ) -> Option<String> {
     let mut body = String::new();
     let mut emitted = false;
+    let mut uses_boundary_structs = false;
     for rule in &input.csil_spec.rules {
         if let CsilRuleType::ServiceDef(service) = &rule.rule_type {
-            emit_handlers_struct(&mut body, &rule.name, service, config);
+            uses_boundary_structs |= emit_handlers_struct(&mut body, &rule.name, service, config);
             emit_wire_ids(&mut body, &rule.name, service);
             if service_has_channel_ops(service) {
                 emit_channel_router(&mut body, &rule.name, service);
@@ -3161,17 +3266,22 @@ fn generate_server(
         return None;
     }
     let _ = warnings;
+    let mut includes = vec![
+        "<stddef.h>".to_string(),
+        "<stdint.h>".to_string(),
+        "<string.h>".to_string(),
+        "\"types.gen.h\"".to_string(),
+    ];
+    // A bare list or map op boundary is a struct the codec header synthesizes.
+    if uses_boundary_structs {
+        includes.push("\"codec.gen.h\"".to_string());
+    }
     let mut content = String::new();
     header_open(
         &mut content,
         "CSILGEN_SERVER_GEN_H",
         "Generated service handler structs and routers.",
-        &[
-            "<stddef.h>".to_string(),
-            "<stdint.h>".to_string(),
-            "<string.h>".to_string(),
-            "\"types.gen.h\"".to_string(),
-        ],
+        &includes,
     );
     // The codec is consumer-supplied so the runtime never owns serialization.
     content.push_str(&doc_comment(&[
@@ -3195,12 +3305,15 @@ fn rpc_reply_type(service: &str, op: &csilgen_common::CsilServiceOperation) -> S
     format!("{}{}Reply", simple_pascal(service), simple_pascal(&op.name))
 }
 
+/// Emit the handlers struct; true when a handler takes or returns a synthesized
+/// list or map boundary struct, which lives in the codec header.
 fn emit_handlers_struct(
     content: &mut String,
     name: &str,
     service: &CsilServiceDefinition,
     config: &CConfig,
-) {
+) -> bool {
+    let mut uses_boundary_structs = false;
     let base = service_base(name);
     content.push_str(&format!(
         "/* {base}Handlers is the host's implementation of the {name} service. */\n"
@@ -3211,11 +3324,16 @@ fn emit_handlers_struct(
         match op.direction {
             CsilServiceDirection::Unidirectional => {
                 let in_type = op_in_type(&op.input_type, config);
+                // The same success type the client decodes, so a handler's
+                // response encodes with the codec the client reads it with.
+                let success = success_type(op.success_output());
                 let out_type = if op.rpc_reply_arms().is_some() {
                     rpc_reply_type(name, op)
                 } else {
-                    base_c_type(op.success_output(), config)
+                    boundary_c_type(&success, config)
                 };
+                uses_boundary_structs |= is_aggregate_boundary(&op.input_type)
+                    || (op.rpc_reply_arms().is_none() && is_aggregate_boundary(&success));
                 if in_type == "void" {
                     content.push_str(&format!(
                         "    int (*{method})(void *ctx, {out_type} *resp);\n"
@@ -3239,6 +3357,7 @@ fn emit_handlers_struct(
         }
     }
     content.push_str(&format!("}} {base}Handlers;\n\n"));
+    uses_boundary_structs
 }
 
 /// Emit `#define` wire-id ordinals exposing the `@wire-id(N)` values. Purely
@@ -3400,7 +3519,27 @@ fn op_in_type(input_type: &CsilTypeExpression, config: &CConfig) -> String {
     if op_input_is_null(input_type) {
         "void".to_string()
     } else {
-        base_c_type(input_type, config)
+        boundary_c_type(input_type, config)
+    }
+}
+
+/// Whether an op boundary is a bare list or map, which the codec carries in a
+/// synthesized struct (see `classify_boundary`).
+fn is_aggregate_boundary(ty: &CsilTypeExpression) -> bool {
+    matches!(
+        unwrap_constrained(ty),
+        CsilTypeExpression::Array { .. } | CsilTypeExpression::Map { .. }
+    )
+}
+
+/// The C type an op boundary has on the client, the server handler and the
+/// quickstart: the synthesized struct for a bare list or map, since a bare
+/// pointer carries no length.
+fn boundary_c_type(ty: &CsilTypeExpression, config: &CConfig) -> String {
+    match unwrap_constrained(ty) {
+        CsilTypeExpression::Array { element_type, .. } => array_boundary_name(element_type),
+        CsilTypeExpression::Map { key, value, .. } => map_boundary_name(key, value),
+        _ => base_c_type(ty, config),
     }
 }
 
@@ -3822,8 +3961,8 @@ fn first_unary_example(input: &WasmGeneratorInput, config: &CConfig) -> Option<C
             fn_name: format!("csil_{prefix}_{}", to_snake(&op.name)),
             wire_service: rule.name.clone(),
             wire_op: op.name.clone(),
-            req_type: base_c_type(&op.input_type, config),
-            resp_type: base_c_type(&success, config),
+            req_type: boundary_c_type(&op.input_type, config),
+            resp_type: boundary_c_type(&success, config),
             has_request,
             req_literal: if has_request {
                 c_request_literal(input, &op.input_type, config)
@@ -4732,6 +4871,60 @@ static inline int csilc_buf_append(csilc_buf *b, const uint8_t *p, size_t n) {
     if (csilc_buf_reserve(b, n)) return -1;
     memcpy(b->data + b->len, p, n);
     b->len += n;
+    return 0;
+}
+
+/* The bytewise order of the encoded keys of map entries i and j (RFC 8949 4.2.1).
+ * marks[2k] is where entry k's key starts and marks[2k+1] where its value starts. */
+static inline int csilc_key_cmp(const uint8_t *base, const size_t *marks, size_t i, size_t j) {
+    size_t li = marks[2 * i + 1] - marks[2 * i];
+    size_t lj = marks[2 * j + 1] - marks[2 * j];
+    int c = memcmp(base + marks[2 * i], base + marks[2 * j], li < lj ? li : lj);
+    if (c) return c;
+    return li < lj ? -1 : (li > lj ? 1 : 0);
+}
+
+/* Reorder the n map entries already written into b (bounded by marks, with
+ * marks[2n] the end of the last entry) into canonical key order. A bottom-up merge
+ * sort needs no comparator context, which qsort cannot carry. Two equal keys are
+ * an error: canonical CBOR has no duplicate map keys. */
+static inline int csilc_sort_map_entries(csilc_buf *b, const size_t *marks, size_t n) {
+    if (n < 2) return 0;
+    if (n > SIZE_MAX / (2 * sizeof(size_t))) return -1;
+    size_t *order = (size_t *)malloc(2 * n * sizeof(size_t));
+    if (!order) return -1;
+    size_t *tmp = order + n;
+    for (size_t i = 0; i < n; i++) order[i] = i;
+    for (size_t w = 1; w < n; w = w > n / 2 ? n : w * 2) {
+        for (size_t lo = 0; lo < n; lo += 2 * w) {
+            size_t mid = w < n - lo ? lo + w : n;
+            size_t hi = 2 * w < n - lo ? lo + 2 * w : n;
+            size_t i = lo, j = mid, k = lo;
+            while (i < mid && j < hi) {
+                tmp[k++] = csilc_key_cmp(b->data, marks, order[j], order[i]) < 0 ? order[j++] : order[i++];
+            }
+            while (i < mid) tmp[k++] = order[i++];
+            while (j < hi) tmp[k++] = order[j++];
+        }
+        memcpy(order, tmp, n * sizeof(size_t));
+    }
+    for (size_t i = 1; i < n; i++) {
+        if (csilc_key_cmp(b->data, marks, order[i - 1], order[i]) == 0) { free(order); return -1; }
+    }
+    size_t start = marks[0];
+    size_t total = marks[2 * n] - start;
+    uint8_t *copy = (uint8_t *)malloc(total);
+    if (!copy) { free(order); return -1; }
+    memcpy(copy, b->data + start, total);
+    size_t at = start;
+    for (size_t i = 0; i < n; i++) {
+        size_t e = order[i];
+        size_t len = marks[2 * e + 2] - marks[2 * e];
+        memcpy(b->data + at, copy + (marks[2 * e] - start), len);
+        at += len;
+    }
+    free(copy);
+    free(order);
     return 0;
 }
 
