@@ -225,7 +225,7 @@ fn run_command(cli: &Cli, reporter: &ErrorReporter) -> Result<(), csilgen_common
                     );
 
                     if !reporter.config.quiet {
-                        println!("\n{summary}");
+                        csilgen::outln!("\n{summary}");
                     }
 
                     if result.error_count > 0 {

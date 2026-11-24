@@ -99,13 +99,27 @@ fn process_generation(input: WasmGeneratorInput) -> Result<WasmGeneratorOutput, 
     // OCaml/Kotlin do.
     let input = {
         let mut input = input;
+        // An op boundary such as `Holder -> { * text => int } / Err` becomes a named
+        // union first, so its inline arms hoist like any union's and the new name
+        // goes through the reserved and collision renames below.
+        input.csil_spec = csilgen_common::hoist_op_union_boundaries(&input.csil_spec);
         input.csil_spec = hoist_inline_groups(&input.csil_spec);
         // Hoisting first means the derived names below see the records the codec
         // will see, and synthesized names are checked like declared ones.
-        let derived = derived_go_names(&input);
-        input.csil_spec = csilgen_common::rename_reserved(&input.csil_spec, |name| {
-            let ident = pascal_case(name);
-            RESERVED_GO_NAMES.contains(&ident.as_str()) || derived.contains(&ident)
+        // The generator writes a rule name as its Go identifier, so a CDDL name such
+        // as `open-group` must become a legal identifier first.
+        let legal = csilgen_common::rule_renames(&input.csil_spec, is_go_ident, pascal_case);
+        input.csil_spec = csilgen_common::rename_rules(&input.csil_spec, &legal);
+        let derived = derived_go_names(&input)?;
+        let spec = input.csil_spec.clone();
+        input.csil_spec = csilgen_common::rename_reserved(&spec, |name| {
+            RESERVED_GO_NAMES.contains(&pascal_case(name).as_str())
+                || GO_PREDECLARED.contains(&name)
+                || rule_go_idents(&spec, name).iter().any(|ident| {
+                    derived.get(ident).is_some_and(|owners| {
+                        owners.iter().any(|owner| owner.as_deref() != Some(name))
+                    })
+                })
         });
         input.csil_spec = csilgen_common::rename_ident_collisions(&input.csil_spec, pascal_case);
         input
@@ -159,29 +173,13 @@ fn process_generation(input: WasmGeneratorInput) -> Result<WasmGeneratorOutput, 
     // the server interface; `go-client` emits a transport-agnostic client;
     // `go-typesonly` emits the types (and their validation/constructors) alone.
     // An unrecognized sub-target is an error, not a silent fall-through.
-    enum Surface {
-        Server,
-        Client,
-        TypesOnly,
-    }
-    let surface = match input.config.target.as_str() {
-        "go" | "go-server" => Surface::Server,
-        "go-client" => Surface::Client,
-        "go-typesonly" => Surface::TypesOnly,
-        _ => return Err(error_codes::GENERATION_ERROR),
-    };
-
     // In self-contained package mode the genquickstart demonstrates both the calling
     // side (CSIL-RPC/Datagrams over the typed client) and the handling side (CSIL-Events
     // over the channel router), so the package must carry both surfaces for its own
     // quickstart to compile — regardless of which surface the target requested. Flat
     // (non-package) output stays byte-identical: it emits only the requested surface.
     // Mirrors the OCaml generator.
-    let pkg_mode = emit_packages_includes_go(&input.config.options);
-    let want_client =
-        matches!(surface, Surface::Client) || (pkg_mode && !matches!(surface, Surface::TypesOnly));
-    let want_server =
-        matches!(surface, Surface::Server) || (pkg_mode && !matches!(surface, Surface::TypesOnly));
+    let (want_client, want_server) = go_surfaces(&input)?;
     if input.csil_spec.service_count > 0 {
         if want_client
             && let Some(client_content) = generate_client(&input, &config, &mut warnings)?
@@ -284,6 +282,30 @@ fn process_generation(input: WasmGeneratorInput) -> Result<WasmGeneratorOutput, 
     })
 }
 
+/// Whether the output carries the client and the server surface. The base `go` (and
+/// explicit `go-server`) target emits the server interface; `go-client` emits a
+/// transport-agnostic client; `go-typesonly` emits the types alone. An unrecognized
+/// sub-target is an error, not a silent fall-through.
+fn go_surfaces(input: &WasmGeneratorInput) -> Result<(bool, bool), i32> {
+    enum Surface {
+        Server,
+        Client,
+        TypesOnly,
+    }
+    let surface = match input.config.target.as_str() {
+        "go" | "go-server" => Surface::Server,
+        "go-client" => Surface::Client,
+        "go-typesonly" => Surface::TypesOnly,
+        _ => return Err(error_codes::GENERATION_ERROR),
+    };
+    let pkg_mode = emit_packages_includes_go(&input.config.options);
+    let want_client =
+        matches!(surface, Surface::Client) || (pkg_mode && !matches!(surface, Surface::TypesOnly));
+    let want_server =
+        matches!(surface, Surface::Server) || (pkg_mode && !matches!(surface, Surface::TypesOnly));
+    Ok((want_client, want_server))
+}
+
 /// Run the full Go generation for a prepared input and return the emitted files.
 /// This is the exact path the wasm `generate` export drives; it is exposed so the
 /// crate's own tests can run generation — and compile the emitted module — without
@@ -354,7 +376,9 @@ fn default_package_token(input: &WasmGeneratorInput) -> String {
         .rules
         .iter()
         .find_map(|rule| match &rule.rule_type {
-            CsilRuleType::ServiceDef(_) => Some(go_service_base(&rule.name).to_lowercase()),
+            CsilRuleType::ServiceDef(_) => {
+                Some(go_service_base(&input.csil_spec, &rule.name).to_lowercase())
+            }
             _ => None,
         })
         .filter(|token| !token.is_empty())
@@ -521,7 +545,7 @@ fn first_unary_go_example(input: &WasmGeneratorInput, config: &GoConfig) -> Opti
         let CsilRuleType::ServiceDef(service) = &rule.rule_type else {
             continue;
         };
-        let base = go_service_base(&rule.name);
+        let base = go_service_base(&input.csil_spec, &rule.name);
         for op in &service.operations {
             if !matches!(op.direction, CsilServiceDirection::Unidirectional) {
                 continue;
@@ -578,10 +602,10 @@ fn first_channel_go_example(
             // router + encoder: the router decodes the op's input (inbound, handed to a
             // handler) and the encoder serializes the op's success output (outbound).
             return Some(GoChannelExample {
-                service_iface: rule.name.clone(),
+                service_iface: go_service_ident(&rule.name),
                 // The wire carries the CSIL service name verbatim
                 // (docs/cbor-wire-contract.md "RPC call naming").
-                wire_service: rule.name.clone(),
+                wire_service: input.csil_spec.declared_name(&rule.name).to_string(),
                 method: go_method_name(&op.name),
                 inbound_type: type_ref_name(&op.input_type),
                 outbound_type: type_ref_name(&success),
@@ -1370,6 +1394,7 @@ fn generate_types(
     warnings: &mut Vec<GeneratorWarning>,
 ) -> Result<Option<String>, i32> {
     let mut content = String::new();
+    let records = record_names(input);
 
     // Package-level documentation
     let package_description = input
@@ -1464,6 +1489,10 @@ fn generate_types(
                             comments.push(format!("// depends-on: {depends}"));
                         }
 
+                        // The direction goes in a comment: text after the pairs of a
+                        // struct tag breaks `reflect.StructTag.Get` and `go vet`.
+                        comments.extend(visibility_comment(&entry.metadata));
+
                         // Add struct tags
                         let mut tag_parts = Vec::new();
 
@@ -1478,22 +1507,16 @@ fn generate_types(
                                 tag_parts.push(format!("json:\"{}\"", json_name));
                             }
 
-                            // Check field visibility
-                            let visibility = get_field_visibility(&entry.metadata);
-                            match visibility {
-                                CsilFieldVisibility::SendOnly => {
-                                    tag_parts.push("json:\"-\" # send-only".to_string());
-                                    warnings.push(GeneratorWarning {
+                            if matches!(
+                                get_field_visibility(&entry.metadata),
+                                CsilFieldVisibility::SendOnly
+                            ) {
+                                warnings.push(GeneratorWarning {
                                         level: WarningLevel::Info,
                                         message: format!("Field '{field_name}' marked as send-only, consider separate request/response types"),
                                         location: None,
                                         suggestion: Some("Create separate request and response structs for better type safety".to_string()),
                                     });
-                                }
-                                CsilFieldVisibility::ReceiveOnly => {
-                                    tag_parts.push("# receive-only".to_string());
-                                }
-                                _ => {}
                             }
                         }
 
@@ -1569,6 +1592,7 @@ fn generate_types(
                             if let Some(depends) = get_depends_comment(&entry.metadata) {
                                 comments.push(format!("// depends-on: {depends}"));
                             }
+                            comments.extend(visibility_comment(&entry.metadata));
 
                             let mut tag_parts = Vec::new();
 
@@ -1615,7 +1639,15 @@ fn generate_types(
                         0,
                     );
                     content.push_str(&format!("// {} is a type alias\n", rule.name));
-                    content.push_str(&format!("type {} {}\n\n", rule.name, go_type));
+                    // A record alias is a Go alias (`=`): the codec passes the value
+                    // straight to the record's encoder, and a defined type would need
+                    // a conversion at every use.
+                    let eq = if is_record_ref(codec_unwrap_constrained(type_expr), &records) {
+                        "= "
+                    } else {
+                        ""
+                    };
+                    content.push_str(&format!("type {} {eq}{}\n\n", rule.name, go_type));
                 }
             }
             _ => {} // Services handled separately
@@ -1974,9 +2006,6 @@ fn hoist_inline_groups(spec: &CsilSpecSerialized) -> CsilSpecSerialized {
             _ => {}
         }
     }
-    if drop_choices.is_empty() && rename_groups.is_empty() {
-        return hoisted;
-    }
     let rewrite = HoistRewrite {
         drop_choices,
         rename_groups,
@@ -2096,6 +2125,16 @@ impl HoistRewrite {
             } => CsilTypeExpression::Constrained {
                 base_type: Box::new(self.ty(base_type)),
                 constraints: constraints.clone(),
+            },
+            // CDDL builtins Go has no type for. Every float width decodes through
+            // the float64 path, the boolean literal types are literals, and
+            // `undefined` is carried like `null`.
+            CsilTypeExpression::Builtin(name) => match name.as_str() {
+                "float16" | "float32" => CsilTypeExpression::Builtin("float".to_string()),
+                "true" => CsilTypeExpression::Literal(CsilLiteralValue::Bool(true)),
+                "false" => CsilTypeExpression::Literal(CsilLiteralValue::Bool(false)),
+                "undefined" => CsilTypeExpression::Builtin("null".to_string()),
+                _ => ty.clone(),
             },
             other => other.clone(),
         }
@@ -3395,6 +3434,17 @@ fn emit_union_codec(
     out.push_str(&format!(
         "\tdefault:\n\t\tvar csilZero {name}\n\t\treturn csilZero, fmt.Errorf(\"csil cbor: unknown {name} variant %d\", csilIdx)\n\t}}\n}}\n\n"
     ));
+    // Exported like a record's pair, so a union is a payload a caller can put on
+    // the wire without an op around it.
+    out.push_str(&format!(
+        "// Encode{name} encodes a {name} to canonical CSIL CBOR bytes.\n\
+         func Encode{name}(csilV {name}) ([]byte, error) {{\n\treturn cborEncodeE(csilEnc{name}(csilV, 0))\n}}\n\n\
+         // Decode{name} decodes canonical CSIL CBOR bytes into a {name}.\n\
+         func Decode{name}(csilData []byte) ({name}, error) {{\n\
+         \tcsilRoot, csilErr := cborDecode(csilData)\n\
+         \tif csilErr != nil {{\n\t\tvar csilZero {name}\n\t\treturn csilZero, csilErr\n\t}}\n\
+         \treturn csilDec{name}(csilRoot)\n}}\n\n"
+    ));
     out
 }
 
@@ -3408,21 +3458,19 @@ fn go_op_boundary_expressible(
     ty: &CsilTypeExpression,
     records: &std::collections::HashSet<String>,
     aliases: &std::collections::HashMap<String, CsilTypeExpression>,
-    config: &GoConfig,
+    unions: &std::collections::HashSet<String>,
 ) -> bool {
     match codec_unwrap_constrained(ty) {
         CsilTypeExpression::Builtin(_) => true,
         CsilTypeExpression::Reference(name) => {
-            records.contains(name)
-                || aliases.contains_key(name)
-                || config.union_names.contains(name)
+            records.contains(name) || aliases.contains_key(name) || unions.contains(name)
         }
         CsilTypeExpression::Array { element_type, .. } => {
-            go_op_boundary_expressible(element_type, records, aliases, config)
+            go_op_boundary_expressible(element_type, records, aliases, unions)
         }
         CsilTypeExpression::Map { key, value, .. } => {
-            go_op_boundary_expressible(key, records, aliases, config)
-                && go_op_boundary_expressible(value, records, aliases, config)
+            go_op_boundary_expressible(key, records, aliases, unions)
+                && go_op_boundary_expressible(value, records, aliases, unions)
         }
         CsilTypeExpression::Tuple(_) => true,
         _ => false,
@@ -3431,12 +3479,52 @@ fn go_op_boundary_expressible(
 
 /// The `<Base><Method>` stem shared by an op's per-op codec helpers and the client
 /// method that calls them, so the two never drift.
-fn op_codec_stem(service_name: &str, op: &CsilServiceOperation) -> String {
+fn op_codec_stem(
+    spec: &CsilSpecSerialized,
+    service_name: &str,
+    op: &CsilServiceOperation,
+) -> String {
     format!(
         "{}{}",
-        go_service_base(service_name),
+        go_service_base(spec, service_name),
         go_method_name(&op.name)
     )
+}
+
+/// Which per-op `Encode`/`Decode` pairs `emit_op_codecs` writes for one unary op.
+/// The derived-name reservation reads the same plan, so a name is reserved exactly
+/// where the codec declares it.
+struct OpCodecPlan {
+    request: bool,
+    response: bool,
+}
+
+/// `None` when the op has a boundary the codec cannot express, so it has no per-op
+/// helpers at all. A null request has no payload, and a boundary that is a bare
+/// record reference reuses the record's own `Encode<T>`/`Decode<T>` pair: a second,
+/// op-keyed pair would be redundant, and when the record is named exactly
+/// `<Base><Method>Request` it would redeclare the record's functions.
+fn op_codec_plan(
+    op: &CsilServiceOperation,
+    records: &std::collections::HashSet<String>,
+    aliases: &std::collections::HashMap<String, CsilTypeExpression>,
+    unions: &std::collections::HashSet<String>,
+) -> Option<OpCodecPlan> {
+    if !matches!(op.direction, CsilServiceDirection::Unidirectional) {
+        return None;
+    }
+    let success = go_success_type(op.success_output());
+    let null_input = op_input_is_null(&op.input_type);
+    let req_is_record = !null_input && is_record_ref(&op.input_type, records);
+    let resp_is_record = is_record_ref(&success, records);
+    let req_ok = null_input
+        || req_is_record
+        || go_op_boundary_expressible(&op.input_type, records, aliases, unions);
+    let resp_ok = resp_is_record || go_op_boundary_expressible(&success, records, aliases, unions);
+    (req_ok && resp_ok).then_some(OpCodecPlan {
+        request: !null_input && !req_is_record,
+        response: !resp_is_record,
+    })
 }
 
 /// Exported per-op CBOR helpers so a server in another package can compose a
@@ -3457,37 +3545,12 @@ fn emit_op_codecs(
             continue;
         };
         for op in &service.operations {
-            if !matches!(op.direction, CsilServiceDirection::Unidirectional) {
+            let Some(plan) = op_codec_plan(op, records, aliases, &config.union_names) else {
                 continue;
-            }
+            };
             let success = go_success_type(op.success_output());
-            let null_input = op_input_is_null(&op.input_type);
-            // A bare reference to an already-defined record already has its own
-            // Encode<T>/Decode<T> pair from the record-codec emission pass (see
-            // `is_record_ref` callers elsewhere in this file, and the analogous
-            // guard in csilgen-rust-generator's / csilgen-python-generator's
-            // `emit_op_codecs`). Synthesizing a second, op-keyed pair for that
-            // same shape is always redundant, and when an operation's request or
-            // response type happens to be named exactly `<ServiceBase><Method>`
-            // (e.g. service `Rp`, op `issue-attestation`, type
-            // `RpIssueAttestationRequest`) the synthesized helper name collides
-            // byte-for-byte with the real type's own Encode/Decode functions,
-            // producing a Go "redeclared in this block" compile error. Skip
-            // synthesis whenever the boundary type is already a record
-            // reference, exactly as the other two generators do.
-            let req_is_record = !null_input && is_record_ref(&op.input_type, records);
-            let resp_is_record = is_record_ref(&success, records);
-            let req_ok = null_input
-                || req_is_record
-                || go_op_boundary_expressible(&op.input_type, records, aliases, config);
-            if !req_ok
-                || !(resp_is_record
-                    || go_op_boundary_expressible(&success, records, aliases, config))
-            {
-                continue;
-            }
-            let stem = op_codec_stem(&rule.name, op);
-            if !null_input && !req_is_record {
+            let stem = op_codec_stem(&input.csil_spec, &rule.name, op);
+            if plan.request {
                 out.push_str(&emit_op_codec_pair(
                     &format!("{stem}Request"),
                     &op.input_type,
@@ -3496,7 +3559,7 @@ fn emit_op_codecs(
                     config,
                 ));
             }
-            if !resp_is_record {
+            if plan.response {
                 out.push_str(&emit_op_codec_pair(
                     &format!("{stem}Response"),
                     &success,
@@ -3576,12 +3639,13 @@ fn emit_rpc_replies(
         "// ResolveRPCReply turns a status-zero reply into its success payload or the declared\n// error arm. Generated clients call it with the reply from Transport.CallReply.\nfunc ResolveRPCReply(service, op string, variant *string, payload []byte) ([]byte, error) {\n\tswitch {\n",
     );
     for (service, op, arms) in input.csil_spec.rpc_operations() {
-        let stem = op_codec_stem(service, op);
+        let stem = op_codec_stem(&input.csil_spec, service, op);
         let success = map_csil_type_to_go(&arms[0], &None, config.decimal_go_type());
         let mut encoder = format!(
             "func Encode{stem}Reply(value {success}, err error) (string, []byte, error) {{\n"
         );
-        dispatch.push_str(&format!("\tcase service == {service:?} && op == {:?}:\n\t\tif variant == nil {{\n\t\t\treturn nil, &RPCDecodeError{{fmt.Errorf(\"missing RPC reply variant\")}}\n\t\t}}\n\t\tswitch *variant {{\n", op.name));
+        let wire_service = input.csil_spec.declared_name(service);
+        dispatch.push_str(&format!("\tcase service == {wire_service:?} && op == {:?}:\n\t\tif variant == nil {{\n\t\t\treturn nil, &RPCDecodeError{{fmt.Errorf(\"missing RPC reply variant\")}}\n\t\t}}\n\t\tswitch *variant {{\n", op.name));
         for (i, arm) in arms.iter().enumerate() {
             let ident = arm.rpc_variant_name().unwrap();
             let wire = input.csil_spec.declared_name(ident);
@@ -3659,6 +3723,7 @@ fn generate_codec(input: &WasmGeneratorInput, config: &GoConfig) -> Option<Strin
     }
     content.push_str(&format!("{}\"fmt\"\n", config.indent_style));
     content.push_str(&format!("{}\"math\"\n", config.indent_style));
+    content.push_str(&format!("{}\"sort\"\n", config.indent_style));
     content.push_str(&format!("{}\"unicode/utf8\"\n", config.indent_style));
     if uses_timestamp || uses_cddl_time || uses_date {
         content.push_str(&format!("{}\"time\"\n", config.indent_style));
@@ -3838,6 +3903,11 @@ type cborEntry struct {
 	val cborValue
 }
 type cborMap []cborEntry
+
+// cborUnorderedMap is a decoded map whose keys are not in canonical order. A record
+// accepts its fields in any order, but a dynamic map refuses it, so the decoder keeps
+// the order fact in the type and never sorts or compares again.
+type cborUnorderedMap []cborEntry
 type cborTag struct {
 	num   uint64
 	inner cborValue
@@ -3900,6 +3970,8 @@ func (cborBytes) isCbor() {}
 func (cborArray) isCbor() {}
 func (cborMap) isCbor()   {}
 func (cborTag) isCbor()   {}
+
+func (cborUnorderedMap) isCbor() {}
 
 // cborEncode serializes a value tree to canonical CBOR bytes.
 func cborEncode(v cborValue) []byte {
@@ -4011,6 +4083,8 @@ func cborEnc(v cborValue, out *[]byte) {
 			cborEnc(e.key, out)
 			cborEnc(e.val, out)
 		}
+	case cborUnorderedMap:
+		cborEnc(cborMap(x), out)
 	case cborTag:
 		cborHead(6, x.num, out)
 		cborEnc(x.inner, out)
@@ -4207,18 +4281,45 @@ func cborDec(b []byte, pos *int, depth int) (cborValue, error) {
 			reserve = csilCborPreallocLimit
 		}
 		entries := make(cborMap, 0, reserve)
+		// Compare each key's raw bytes with the previous key's: strictly ascending
+		// raw keys are the canonical order of RFC 8949 section 4.2.1 and cannot
+		// repeat, so only an out-of-order map pays for the duplicate check.
+		raws := make([][]byte, 0, reserve)
+		ordered := true
 		for i := 0; i < n; i++ {
+			start := *pos
 			k, err := cborDec(b, pos, depth+1)
 			if err != nil {
 				return nil, err
 			}
+			raw := b[start:*pos]
+			if !cborRtShortestHead(raw) {
+				return nil, fmt.Errorf("csil cbor: map key is not in shortest form")
+			}
+			if len(raws) > 0 && cborRtKeyCompare(raws[len(raws)-1], raw) >= 0 {
+				ordered = false
+			}
+			raws = append(raws, raw)
 			val, err := cborDec(b, pos, depth+1)
 			if err != nil {
 				return nil, err
 			}
 			entries = append(entries, cborEntry{k, val})
 		}
-		return entries, nil
+		if ordered {
+			return entries, nil
+		}
+		seen := make(map[string]struct{}, len(raws))
+		for i, raw := range raws {
+			if _, dup := seen[string(raw)]; dup {
+				if text, ok := entries[i].key.(cborText); ok {
+					return nil, fmt.Errorf("csil cbor: duplicate key %q", string(text))
+				}
+				return nil, fmt.Errorf("csil cbor: duplicate key 0x%x", raw)
+			}
+			seen[string(raw)] = struct{}{}
+		}
+		return cborUnorderedMap(entries), nil
 	case 6:
 		inner, err := cborDec(b, pos, depth+1)
 		if err != nil {
@@ -4243,11 +4344,12 @@ func cborEncArray[E any](xs []E, f func(E) (cborValue, error)) (cborValue, error
 	return items, nil
 }
 
-// cborEncMap maps a typed map to a CBOR map. Go map iteration is unordered, so the
-// inner map's entry order is not canonicalized; the record's own keys (laid down at
-// generation time) are what the cross-language wire contract pins.
+// cborEncMap maps a typed map to a CBOR map with its entries in canonical order: the
+// bytewise order of each encoded key (RFC 8949 section 4.2.1). Go map iteration is
+// random, and an ordered key type would still sort by value, not by encoding.
 func cborEncMap[K comparable, V any](m map[K]V, kf func(K) (cborValue, error), vf func(V) (cborValue, error)) (cborValue, error) {
 	entries := make(cborMap, 0, len(m))
+	raws := make([][]byte, 0, len(m))
 	for k, v := range m {
 		key, err := kf(k)
 		if err != nil {
@@ -4258,8 +4360,64 @@ func cborEncMap[K comparable, V any](m map[K]V, kf func(K) (cborValue, error), v
 			return nil, err
 		}
 		entries = append(entries, cborEntry{key, val})
+		raws = append(raws, cborEncode(key))
 	}
-	return entries, nil
+	order := make([]int, len(entries))
+	for i := range order {
+		order[i] = i
+	}
+	sort.Slice(order, func(a, b int) bool { return cborRtKeyCompare(raws[order[a]], raws[order[b]]) < 0 })
+	sorted := make(cborMap, len(entries))
+	for i, j := range order {
+		sorted[i] = entries[j]
+	}
+	return sorted, nil
+}
+
+// cborRtShortestHead reports whether an encoded item starts with the shortest head
+// for its value or length. A longer head gives one key a second byte form, and the
+// order check would then accept a map that no canonical encoder writes. A float
+// (major type 7) has no shorter integer head, so it is not checked here. The caller
+// has decoded the item, so every argument byte the head names is present.
+func cborRtShortestHead(raw []byte) bool {
+	if len(raw) == 0 || raw[0]>>5 == 7 {
+		return true
+	}
+	var arg uint64
+	var least uint64
+	switch low := raw[0] & 0x1f; low {
+	case 24:
+		arg, least = uint64(raw[1]), 24
+	case 25:
+		arg, least = uint64(raw[1])<<8|uint64(raw[2]), 0x100
+	case 26:
+		for _, c := range raw[1:5] {
+			arg = arg<<8 | uint64(c)
+		}
+		least = 0x10000
+	case 27:
+		for _, c := range raw[1:9] {
+			arg = arg<<8 | uint64(c)
+		}
+		least = 0x100000000
+	default:
+		return true
+	}
+	return arg >= least
+}
+
+// cborRtKeyCompare orders two encoded keys bytewise; a key that is a prefix of
+// another sorts first.
+func cborRtKeyCompare(a, b []byte) int {
+	for i := 0; i < len(a) && i < len(b); i++ {
+		if a[i] != b[i] {
+			if a[i] < b[i] {
+				return -1
+			}
+			return 1
+		}
+	}
+	return len(a) - len(b)
 }
 
 func cborDecArray[E any](v cborValue, f func(cborValue) (E, error)) ([]E, error) {
@@ -4279,6 +4437,9 @@ func cborDecArray[E any](v cborValue, f func(cborValue) (E, error)) ([]E, error)
 }
 
 func cborDecMap[K comparable, V any](v cborValue, kf func(cborValue) (K, error), vf func(cborValue) (V, error)) (map[K]V, error) {
+	if _, unordered := v.(cborUnorderedMap); unordered {
+		return nil, fmt.Errorf("csil cbor: map keys are not in canonical order")
+	}
 	entries, err := cborAsMap(v)
 	if err != nil {
 		return nil, err
@@ -4293,12 +4454,19 @@ func cborDecMap[K comparable, V any](v cborValue, kf func(cborValue) (K, error),
 		if err != nil {
 			return nil, err
 		}
+		// Two distinct encodings can still decode to one Go key.
+		if _, dup := out[k]; dup {
+			return nil, fmt.Errorf("csil cbor: duplicate key %v", k)
+		}
 		out[k] = val
 	}
 	return out, nil
 }
 
 func cborMapGet(v cborValue, key string) (cborValue, bool) {
+	if u, ok := v.(cborUnorderedMap); ok {
+		v = cborMap(u)
+	}
 	if m, ok := v.(cborMap); ok {
 		for _, e := range m {
 			if k, ok := e.key.(cborText); ok && string(k) == key {
@@ -4386,8 +4554,11 @@ func cborAsArray(v cborValue) ([]cborValue, error) {
 }
 
 func cborAsMap(v cborValue) (cborMap, error) {
-	if m, ok := v.(cborMap); ok {
+	switch m := v.(type) {
+	case cborMap:
 		return m, nil
+	case cborUnorderedMap:
+		return cborMap(m), nil
 	}
 	return nil, fmt.Errorf("csil cbor: expected map, got %T", v)
 }
@@ -4717,17 +4888,34 @@ func csilAsDecimal(v cborValue) (decimal.Decimal, error) {
 }
 "#;
 
-/// Strip a trailing `Service` suffix and PascalCase the remainder — the Go
-/// identifier stem for generated names (`CorndogsService` -> `CorndogsClient`),
-/// matching the sibling generators. Wire strings never derive from this: they
-/// carry the CSIL names verbatim (docs/cbor-wire-contract.md "RPC call naming").
+/// The constant names of a text enum, one per member in declaration order: the type
+/// name and the PascalCase words of the value (`calendars.read` gives
+/// `ScopeCalendarsRead`). The type-name prefix makes every member a legal, unique
+/// package identifier, so only a leading digit needs a word in front; it is `Value`,
+/// not the helper's `v`, to keep the names earlier releases emitted (`ScopeValue2fa`).
+fn go_text_enum_constants(name: &str, arms: &[CsilTypeExpression]) -> Vec<String> {
+    let values: Vec<&str> = csilgen_common::text_enum_members(arms)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(_, value)| value)
+        .collect();
+    let render = |words: &[String]| {
+        let lead = words
+            .first()
+            .is_some_and(|w| w.starts_with(|c: char| c.is_ascii_digit()));
+        let member: String = words
+            .iter()
+            .map(|word| pascal_case(&word.to_ascii_lowercase()))
+            .collect();
+        format!("{name}{}{member}", if lead { "Value" } else { "" })
+    };
+    csilgen_common::member_idents(&values, render, |_| true)
+}
+
 fn go_text_enum(name: &str, arms: &[CsilTypeExpression]) -> String {
     let members = csilgen_common::text_enum_members(arms).expect("text enum");
     let mut out = String::new();
-    let constants = members
-        .iter()
-        .map(|(member, _)| format!("{name}{}", pascal_case(&member.to_ascii_lowercase())))
-        .collect::<Vec<_>>();
+    let constants = go_text_enum_constants(name, arms);
     let width = constants.iter().map(String::len).max().unwrap_or_default();
     if let Some(numbers) = csilgen_common::enum_numbers(arms) {
         out.push_str(&format!("type {name} int64\n\nconst (\n"));
@@ -4735,7 +4923,7 @@ fn go_text_enum(name: &str, arms: &[CsilTypeExpression]) -> String {
             out.push_str(&format!("\t{constant:width$} {name} = {n}\n"));
         }
         out.push_str(&format!(
-            ")\n\nfunc (v {name}) ToNumber() int64 {{ return int64(v) }}\n\n"
+            ")\n\nfunc (v {name}) ToNumber() int64 {{\n\treturn int64(v)\n}}\n\n"
         ));
         let public_name = pascal_case(name);
         let cases = constants.join(", ");
@@ -4766,13 +4954,43 @@ fn go_text_enum(name: &str, arms: &[CsilTypeExpression]) -> String {
     out
 }
 
-fn go_service_base(name: &str) -> String {
-    let pascal = pascal_case(name);
-    pascal
-        .strip_suffix("Service")
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
-        .unwrap_or(pascal)
+/// The prefix of a service's client and per-op names: its identifier without a
+/// `Service` suffix. The suffix stays when dropping it gives another service's
+/// identifier or base: services `Foo` and `FooService` have distinct identifiers, so
+/// the collision rename keeps both, but both would make `FooClient`.
+fn go_service_base(spec: &CsilSpecSerialized, name: &str) -> String {
+    let services: Vec<&str> = spec
+        .rules
+        .iter()
+        .filter(|rule| matches!(rule.rule_type, CsilRuleType::ServiceDef(_)))
+        .map(|rule| rule.name.as_str())
+        .collect();
+    let idents: std::collections::HashSet<String> =
+        services.iter().map(|name| pascal_case(name)).collect();
+    let mut taken = std::collections::HashSet::new();
+    for service in services.iter().copied().chain(std::iter::once(name)) {
+        let pascal = pascal_case(service);
+        let base = match pascal.strip_suffix("Service") {
+            Some(stripped)
+                if !stripped.is_empty()
+                    && !idents.contains(stripped)
+                    && !taken.contains(stripped) =>
+            {
+                stripped.to_string()
+            }
+            _ => pascal,
+        };
+        if service == name {
+            return base;
+        }
+        taken.insert(base);
+    }
+    unreachable!("the chain ends with `name`")
+}
+
+/// The Go identifier of a service's interface, router and channel encoders.
+fn go_service_ident(name: &str) -> String {
+    pascal_case(name)
 }
 
 fn generate_client(
@@ -4808,6 +5026,7 @@ fn generate_client(
         if let CsilRuleType::ServiceDef(service) = &rule.rule_type {
             emit_client_struct(
                 &mut content,
+                &input.csil_spec,
                 &rule.name,
                 service,
                 config,
@@ -4833,18 +5052,19 @@ fn is_record_ref(ty: &CsilTypeExpression, records: &std::collections::HashSet<St
 
 fn emit_client_struct(
     content: &mut String,
+    spec: &CsilSpecSerialized,
     name: &str,
     service: &CsilServiceDefinition,
     config: &GoConfig,
     records: &std::collections::HashSet<String>,
     aliases: &std::collections::HashMap<String, CsilTypeExpression>,
 ) {
-    let base = go_service_base(name);
+    let base = go_service_base(spec, name);
     let client = format!("{base}Client");
     // Canonical wire strings (docs/cbor-wire-contract.md "RPC call naming"): the CSIL
     // service and operation names verbatim, so a transport places them on the wire
     // unmodified — no casing transform a receiver would have to undo.
-    let wire_service = name;
+    let wire_service = spec.declared_name(name);
 
     content.push_str(&format!(
         "// {client} is a typed client for the {name} service. The client owns\n\
@@ -4876,11 +5096,16 @@ fn emit_client_struct(
         let success = go_success_type(operation.success_output());
         let null_input = op_input_is_null(&operation.input_type);
         let req_ok = null_input
-            || go_op_boundary_expressible(&operation.input_type, records, aliases, config);
+            || go_op_boundary_expressible(
+                &operation.input_type,
+                records,
+                aliases,
+                &config.union_names,
+            );
         // Only a genuinely inexpressible boundary (an inline multi-variant choice with no
         // wire discriminator, or an unmodeled reference) is skipped now; scalar/array/map
         // shapes ride the per-op codec helpers, so every other op gets a method.
-        if !req_ok || !go_op_boundary_expressible(&success, records, aliases, config) {
+        if !req_ok || !go_op_boundary_expressible(&success, records, aliases, &config.union_names) {
             content.push_str(&format!(
                 "// operation {} has a payload csilgen can't (de)serialize; handle it manually\n\n",
                 operation.name
@@ -4889,7 +5114,7 @@ fn emit_client_struct(
         }
         let method_name = go_method_name(&operation.name);
         let wire_op = &operation.name;
-        let stem = op_codec_stem(name, operation);
+        let stem = op_codec_stem(spec, name, operation);
         let output_type = map_csil_type_to_go(&success, &None, config.decimal_go_type());
         let params = if null_input {
             "ctx context.Context".to_string()
@@ -5014,15 +5239,16 @@ fn generate_services(
 
     for rule in &input.csil_spec.rules {
         if let CsilRuleType::ServiceDef(service) = &rule.rule_type {
-            emit_service_interface(&mut content, &rule.name, service, config);
-            emit_wire_ids(&mut content, &rule.name, service);
+            let ident = go_service_ident(&rule.name);
+            emit_service_interface(&mut content, &ident, service, config);
+            emit_wire_ids(&mut content, &ident, service);
 
             if service_has_channel_ops(service) {
-                emit_channel_router(&mut content, &rule.name, service, config);
+                emit_channel_router(&mut content, &ident, service, config);
                 // Compact-profile twin, emitted only for wire-id-bearing services
                 // so wire-id-free specs stay byte-identical.
-                emit_channel_router_compact(&mut content, &rule.name, service, config);
-                emit_channel_encoders(&mut content, &rule.name, service, config);
+                emit_channel_router_compact(&mut content, &ident, service, config);
+                emit_channel_encoders(&mut content, &ident, service, config);
             }
         }
     }
@@ -5903,6 +6129,14 @@ fn emit_regex_check(content: &mut String, config: &GoConfig, field: FieldRef, pa
     push_optional_guard(content, config, field, &chk);
 }
 
+/// Whether a record gets a `New<Record>` constructor: some keyed field has a default.
+fn record_has_defaults(group: &CsilGroupExpression) -> bool {
+    group
+        .entries
+        .iter()
+        .any(|entry| entry.key.is_some() && entry_default_value(entry).is_some())
+}
+
 fn generate_constructors(
     input: &WasmGeneratorInput,
     config: &GoConfig,
@@ -5923,6 +6157,9 @@ fn generate_constructors(
             _ => None,
         };
         let Some(group) = group else { continue };
+        if !record_has_defaults(group) {
+            continue;
+        }
 
         // A default arrives either as the `@default(...)` annotation or the
         // `.default(...)` control operator on the field's type; both feed the same
@@ -6607,6 +6844,55 @@ fn go_method_name(name: &str) -> String {
 /// of these names would declare it twice, so it is renamed before generation. The
 /// codec's own unexported names use the `csilRt` prefix instead, which no per-type
 /// `csilEnc<Type>`/`csilDec<Type>` name can have.
+/// Go's predeclared identifiers. The generator writes a rule name verbatim, and a
+/// rule named `error` would shadow the built-in type every codec signature uses.
+const GO_PREDECLARED: &[&str] = &[
+    "any",
+    "append",
+    "bool",
+    "byte",
+    "cap",
+    "clear",
+    "close",
+    "comparable",
+    "complex",
+    "complex128",
+    "complex64",
+    "copy",
+    "delete",
+    "error",
+    "false",
+    "float32",
+    "float64",
+    "imag",
+    "int",
+    "int16",
+    "int32",
+    "int64",
+    "int8",
+    "iota",
+    "len",
+    "make",
+    "max",
+    "min",
+    "new",
+    "nil",
+    "panic",
+    "print",
+    "println",
+    "real",
+    "recover",
+    "rune",
+    "string",
+    "true",
+    "uint",
+    "uint16",
+    "uint32",
+    "uint64",
+    "uint8",
+    "uintptr",
+];
+
 const RESERVED_GO_NAMES: &[&str] = &[
     "Transport",
     "WireReply",
@@ -6618,44 +6904,139 @@ const RESERVED_GO_NAMES: &[&str] = &[
     "RPCApplicationError",
 ];
 
-/// Type-level names the package builds from services and operations: the client
-/// struct and its constructor, and the per-op codec stems (`Encode<Stem>Request`,
-/// `Decode<Stem>Response`, `Encode<Stem>Reply`, `Encode<Stem>Error<N>`). A record of
-/// one of these names would declare its own `Encode<Name>` and clash. A stem is
-/// reserved only where the package emits it, so a record that is its own op's
-/// request keeps its name.
-fn derived_go_names(input: &WasmGeneratorInput) -> std::collections::HashSet<String> {
+/// Package-level identifiers the generated code declares in addition to each rule's
+/// own type, mapped to the rule that owns them (`None` for names built from a
+/// service). Each entry uses the predicate of the emitter that writes it, so a name
+/// is reserved only where the package declares it: a record that is its own op's
+/// request keeps its name, while a record named like the per-op helper of a scalar
+/// boundary is renamed.
+fn derived_go_names(
+    input: &WasmGeneratorInput,
+) -> Result<HashMap<String, Vec<Option<String>>>, i32> {
+    let (want_client, want_server) = go_surfaces(input)?;
     let records = record_names(input);
-    let mut names = std::collections::HashSet::new();
-    for rule in &input.csil_spec.rules {
+    let aliases = codec_aliases(input);
+    let unions: std::collections::HashSet<String> =
+        union_defs(input).into_iter().map(|(n, _)| n).collect();
+    let config = GoConfig::from_options(&input.config.options)?;
+    let spec = &input.csil_spec;
+    let mut names: HashMap<String, Vec<Option<String>>> = HashMap::new();
+    let mut add = |name: String, owner: Option<String>| names.entry(name).or_default().push(owner);
+    let mut service_name = |name: String| add(name, None);
+    let pair = |stem: &str| [format!("Encode{stem}"), format!("Decode{stem}")];
+    for rule in &spec.rules {
         let CsilRuleType::ServiceDef(service) = &rule.rule_type else {
             continue;
         };
-        let base = go_service_base(&rule.name);
-        names.insert(format!("{base}Client"));
-        names.insert(format!("New{base}Client"));
+        let base = go_service_base(spec, &rule.name);
+        if want_client {
+            service_name(format!("{base}Client"));
+            service_name(format!("New{base}Client"));
+        }
         for op in &service.operations {
-            if !matches!(op.direction, CsilServiceDirection::Unidirectional) {
-                continue;
-            }
-            let stem = op_codec_stem(&rule.name, op);
-            if !op_input_is_null(&op.input_type) && !is_record_ref(&op.input_type, &records) {
-                names.insert(format!("{stem}Request"));
-            }
-            if !is_record_ref(&go_success_type(op.success_output()), &records) {
-                names.insert(format!("{stem}Response"));
+            let stem = op_codec_stem(spec, &rule.name, op);
+            if let Some(plan) = op_codec_plan(op, &records, &aliases, &unions) {
+                if plan.request {
+                    pair(&format!("{stem}Request"))
+                        .into_iter()
+                        .for_each(&mut service_name);
+                }
+                if plan.response {
+                    pair(&format!("{stem}Response"))
+                        .into_iter()
+                        .for_each(&mut service_name);
+                }
             }
             if let Some(arms) = op.rpc_reply_arms() {
-                names.insert(format!("{stem}Reply"));
+                service_name(format!("Encode{stem}Reply"));
                 for (i, arm) in arms.iter().enumerate().skip(1) {
                     if !is_record_ref(arm, &records) {
-                        names.insert(format!("{stem}Error{i}"));
+                        pair(&format!("{stem}Error{i}"))
+                            .into_iter()
+                            .for_each(&mut service_name);
+                    }
+                }
+            }
+        }
+        if want_server {
+            let ident = go_service_ident(&rule.name);
+            if service.wire_id.is_some() {
+                service_name(format!("{ident}ServiceWireID"));
+            }
+            for op in &service.operations {
+                if op.wire_id.is_some() && service.wire_id.is_some() {
+                    service_name(format!("{ident}Op{}WireID", go_method_name(&op.name)));
+                }
+            }
+            if service_has_channel_ops(service) {
+                service_name("Codec".to_string());
+                service_name(format!("Route{ident}Channel"));
+                if service.wire_id.is_some() {
+                    service_name(format!("Route{ident}ChannelCompact"));
+                }
+                for op in &service.operations {
+                    if !matches!(op.direction, CsilServiceDirection::Unidirectional) {
+                        service_name(format!("Encode{ident}{}", go_method_name(&op.name)));
                     }
                 }
             }
         }
     }
-    names
+    for rule in &spec.rules {
+        let mut owned = |name: String| add(name, Some(rule.name.clone()));
+        match &rule.rule_type {
+            CsilRuleType::TypeDef(CsilTypeExpression::Choice(arms))
+            | CsilRuleType::TypeChoice(arms)
+                if csilgen_common::is_text_enum(arms) =>
+            {
+                go_text_enum_constants(&rule.name, arms)
+                    .into_iter()
+                    .for_each(&mut owned);
+                if csilgen_common::enum_numbers(arms).is_some() {
+                    owned(format!("{}FromNumber", pascal_case(&rule.name)));
+                }
+            }
+            CsilRuleType::GroupDef(group)
+            | CsilRuleType::TypeDef(CsilTypeExpression::Group(group)) => {
+                pair(&rule.name).into_iter().for_each(&mut owned);
+                if config.generate_constructors && record_has_defaults(group) {
+                    owned(format!("New{}", rule.name));
+                }
+            }
+            _ if unions.contains(&rule.name) => pair(&rule.name).into_iter().for_each(owned),
+            _ => {}
+        }
+    }
+    Ok(names)
+}
+
+/// The identifiers a rule declares for itself: its type, plus the `Encode`/`Decode`
+/// pair of a record or union. A name that is not a rule (a rename candidate) is
+/// checked with the pair, so a candidate never lands on a derived codec name.
+fn rule_go_idents(spec: &CsilSpecSerialized, name: &str) -> Vec<String> {
+    let ident = pascal_case(name);
+    let has_pair = match spec.rules.iter().find(|rule| rule.name == name) {
+        None => true,
+        Some(rule) => match &rule.rule_type {
+            CsilRuleType::GroupDef(_) | CsilRuleType::TypeDef(CsilTypeExpression::Group(_)) => true,
+            CsilRuleType::TypeDef(CsilTypeExpression::Choice(arms))
+            | CsilRuleType::TypeChoice(arms) => !choice_all_literal(arms),
+            _ => false,
+        },
+    };
+    if has_pair {
+        vec![format!("Encode{name}"), format!("Decode{name}"), ident]
+    } else {
+        vec![ident]
+    }
+}
+
+fn is_go_ident(name: &str) -> bool {
+    let mut chars = name.chars();
+    chars
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 fn pascal_case(s: &str) -> String {
@@ -6668,6 +7049,14 @@ fn pascal_case(s: &str) -> String {
             }
         })
         .collect()
+}
+
+fn visibility_comment(metadata: &[CsilFieldMetadata]) -> Option<String> {
+    match get_field_visibility(metadata) {
+        CsilFieldVisibility::SendOnly => Some("// send-only".to_string()),
+        CsilFieldVisibility::ReceiveOnly => Some("// receive-only".to_string()),
+        _ => None,
+    }
 }
 
 fn get_field_visibility(metadata: &[CsilFieldMetadata]) -> CsilFieldVisibility {

@@ -262,7 +262,7 @@ $sample = array(
 $tree = Codec::toCborTorture($sample);
 assert_eq($tree['grade'], 'low', 'grade-wire');
 
-$back = Codec::fromCborTorture($tree);
+$back = Codec::decodeTorture(\Csilgen\Transport\CBOR::encode($tree));
 assert_eq($back->grade, 'low', 'grade-round-trip');
 assert_eq($back->status, 'queued', 'status-round-trip');
 assert_eq($back->priority, 'medium', 'priority-round-trip');
@@ -280,7 +280,7 @@ foreach ($wantIdx as $level => $idx) {
     $v['level'] = $level;
     $tree = Codec::toCborTorture($v);
     assert_eq($tree['level'], array($idx, $level), "level-idx-$level");
-    $back = Codec::fromCborTorture($tree);
+    $back = Codec::decodeTorture(\Csilgen\Transport\CBOR::encode($tree));
     assert_eq($back->level, $level, "level-round-trip-$level");
 }
 
@@ -298,14 +298,14 @@ $bad = array(
     'status' => array(1, 'queued'),
     'priority' => 'low',
     'colors' => array(),
-    'flags' => array(),
+    'flags' => \Csilgen\Transport\CBOR::mapEntries(array()),
     'pair' => array('hi', 'yes'),
     'grade' => 'low',
     'level' => array(2, 'not-high'),
 );
 $raised = false;
 try {
-    Codec::fromCborTorture($bad);
+    Codec::decodeTorture(\Csilgen\Transport\CBOR::encode($bad));
 } catch (CodecException $e) {
     $raised = true;
 }
@@ -320,7 +320,7 @@ $badGrade['grade'] = 'unknown';
 $badGrade['level'] = array(1, 'low');
 $raisedGrade = false;
 try {
-    Codec::fromCborTorture($badGrade);
+    Codec::decodeTorture(\Csilgen\Transport\CBOR::encode($badGrade));
 } catch (CodecException $e) {
     $raisedGrade = true;
 }
@@ -336,7 +336,7 @@ $badPriority['priority'] = 'unknown';
 $badPriority['level'] = array(1, 'low');
 $raisedPriority = false;
 try {
-    Codec::fromCborTorture($badPriority);
+    Codec::decodeTorture(\Csilgen\Transport\CBOR::encode($badPriority));
 } catch (CodecException $e) {
     $raisedPriority = true;
 }

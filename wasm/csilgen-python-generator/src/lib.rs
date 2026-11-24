@@ -98,6 +98,8 @@ fn process_generation(
 pub fn run_generation(input: &WasmGeneratorInput) -> std::result::Result<WasmGeneratorOutput, i32> {
     let files = generate_python_code_from_serialized(&input.csil_spec, &input.config)
         .map_err(|_| error_codes::GENERATION_ERROR)?;
+    let prepared =
+        prepare_spec(&input.csil_spec, &input.config).map_err(|_| error_codes::GENERATION_ERROR)?;
 
     let stats = GenerationStats {
         files_generated: files.len(),
@@ -108,7 +110,7 @@ pub fn run_generation(input: &WasmGeneratorInput) -> std::result::Result<WasmGen
         peak_memory_bytes: None,
     };
     let warnings: Vec<GeneratorWarning> =
-        csilgen_common::rename_warnings(&prepare_spec(&input.csil_spec), &input.config.target);
+        csilgen_common::rename_warnings(&prepared, &input.config.target);
     Ok(WasmGeneratorOutput {
         files,
         warnings,
@@ -291,7 +293,7 @@ fn dataclass_field_has_default(entry: &CsilGroupEntry) -> bool {
     let has_explicit_default = control_operators(&entry.value_type)
         .iter()
         .any(|op| matches!(op, CsilControlOperator::Default(_)));
-    is_optional || has_explicit_default
+    is_optional || has_explicit_default || single_literal_default(entry).is_some()
 }
 
 /// The Python attribute name for a group entry, or `None` when no stable name
@@ -379,18 +381,149 @@ pub fn generate_python_code_from_serialized(
     spec: &CsilSpecSerialized,
     config: &GeneratorConfig,
 ) -> Result<GeneratedFiles> {
-    let spec = prepare_spec(spec);
+    let spec = prepare_spec(spec, config)?;
     let mut generator = PythonGenerator::new(config);
     generator.generate(&csilgen_common::hoist_inline_named_numbers(&spec))
 }
 
-/// The spec the generator works on: reserved and derived names renamed first,
-/// then rules whose class names are equal (`user_id` and `UserId`), because the
-/// second class would silently replace the first.
-fn prepare_spec(spec: &CsilSpecSerialized) -> CsilSpecSerialized {
-    csilgen_common::rename_ident_collisions(&rename_reserved_python_names(spec), |name| {
+/// The spec the generator works on. The hoists run first, so the names they
+/// synthesize get the same reserved, derived and collision checks as declared rules;
+/// the collision pass keeps the earlier rule, and synthesized rules come last, so a
+/// clash renames the synthesized rule. Reserved and derived names are renamed before
+/// equal class names (`user_id` and `UserId`), because the second class would
+/// silently replace the first.
+fn prepare_spec(spec: &CsilSpecSerialized, config: &GeneratorConfig) -> Result<CsilSpecSerialized> {
+    let surfaces = Surfaces::from_config(config)?;
+    let hoisted = csilgen_common::hoist_inline_composites(
+        &csilgen_common::hoist_op_union_boundaries(spec),
+        csilgen_common::HoistOptions::default(),
+    );
+    let distinct =
+        csilgen_common::rename_ident_collisions(&hoisted, |name| name.to_case(Case::Pascal));
+    // A service renamed above changes the classes derived from it, so the derived
+    // names are computed on the renamed spec; a second collision pass then covers a
+    // `<Name>Type` that the reserved pass made equal to another class.
+    let reserved = rename_reserved_python_names(&distinct, surfaces);
+    Ok(csilgen_common::rename_ident_collisions(&reserved, |name| {
         name.to_case(Case::Pascal)
-    })
+    }))
+}
+
+/// Which modules a run emits. The emitter and the derived-name reservation both read
+/// it, so a class is reserved exactly when some module declares it.
+#[derive(Clone, Copy)]
+struct Surfaces {
+    client: bool,
+    server: bool,
+    client_style: ClientStyle,
+}
+
+impl Surfaces {
+    fn from_config(config: &GeneratorConfig) -> Result<Self> {
+        let client_style = parse_client_style(config)?;
+        let (client, server) = match config.target.as_str() {
+            "python" | "python-server" => (false, true),
+            "python-client" => (true, false),
+            "python-typesonly" => (false, false),
+            other => {
+                return Err(CsilgenError::GenerationError(format!(
+                    "Unknown python sub-target '{other}'. Supported: python, python-server, python-client, python-typesonly"
+                )));
+            }
+        };
+        // A package's `genquickstart.md` exercises the calling side (RPC + Datagrams,
+        // over the typed client) AND the handling side (Events, over the generated
+        // channel router), so a publishable package carries BOTH surfaces for its own
+        // quickstart to compile, whichever sub-target was requested. A flat build
+        // emits only the requested surface.
+        let typesonly = !client && !server;
+        let pkg = package_mode(config) && !typesonly;
+        Ok(Surfaces {
+            client: client || pkg,
+            server: server || pkg,
+            client_style,
+        })
+    }
+
+    /// The client shapes emitted, each to its own module.
+    fn client_shapes(self) -> Vec<(&'static str, ClientShape)> {
+        if !self.client {
+            return Vec::new();
+        }
+        let sync = ClientShape {
+            is_async: false,
+            marker: "",
+        };
+        match self.client_style {
+            ClientStyle::Sync => vec![("client.py", sync)],
+            ClientStyle::Async => vec![(
+                "client.py",
+                ClientShape {
+                    is_async: true,
+                    marker: "",
+                },
+            )],
+            ClientStyle::Both => vec![
+                ("client.py", sync),
+                (
+                    "client_async.py",
+                    ClientShape {
+                        is_async: true,
+                        marker: "Async",
+                    },
+                ),
+            ],
+        }
+    }
+}
+
+/// Whether `emit_packages` opts Python in. Parsing is deliberately tolerant: a
+/// missing key, a non-array value, or an array without `"python"` all mean "not in
+/// package mode", so an unrelated `emit_packages` payload never destabilizes Python
+/// output.
+fn package_mode(config: &GeneratorConfig) -> bool {
+    config
+        .options
+        .get("emit_packages")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().any(|e| e.as_str() == Some("python")))
+        .unwrap_or(false)
+}
+
+/// The class-name base of each service (`FooService` gives `Foo`), in spec order. A
+/// base that an earlier service already took keeps the full class name, so
+/// services `Foo` and `FooService`, whose identifiers do not clash, do not both
+/// declare `FooClient`.
+fn service_bases(spec: &CsilSpecSerialized) -> HashMap<String, String> {
+    let mut taken = HashSet::new();
+    let mut bases = HashMap::new();
+    for rule in &spec.rules {
+        if !matches!(rule.rule_type, CsilRuleType::ServiceDef(_)) {
+            continue;
+        }
+        let class = rule.name.to_case(Case::Pascal);
+        let stripped = class
+            .strip_suffix("Service")
+            .filter(|s| !s.is_empty())
+            .unwrap_or(&class)
+            .to_string();
+        let mut base = stripped;
+        if taken.contains(&base) {
+            base = class.clone();
+        }
+        while taken.contains(&base) {
+            base.push_str("Service");
+        }
+        taken.insert(base.clone());
+        bases.insert(rule.name.clone(), base);
+    }
+    bases
+}
+
+fn service_base(spec: &CsilSpecSerialized, service: &str) -> String {
+    service_bases(spec)
+        .remove(service)
+        .unwrap_or_else(|| service.to_case(Case::Pascal))
 }
 
 /// Class names the generated modules declare themselves, import unqualified, or
@@ -403,6 +536,7 @@ fn prepare_spec(spec: &CsilSpecSerialized) -> CsilSpecSerialized {
 /// framework exception, and the package root re-exports the record.
 const RESERVED_TYPE_NAMES: &[&str] = &[
     "Any",
+    "Literal",
     "AsyncTransport",
     "BaseModel",
     "CborTag",
@@ -424,13 +558,27 @@ const RESERVED_TYPE_NAMES: &[&str] = &[
     "ValueError",
 ];
 
-/// Rename each rule whose class name is reserved, or equals a class the
-/// generator derives from a service, an RPC error arm, or a group choice
-/// (`<Base>Client`, `<Base>AsyncClient`, `<Service>Handlers`, `<Arm>Refusal`,
-/// `<Choice>Choice<N>`). The service and arm classes are defined after the star
-/// import of `types.py` and hide the record; a choice arm class redefines it.
-fn rename_reserved_python_names(spec: &CsilSpecSerialized) -> CsilSpecSerialized {
+/// Rename each rule whose class name is reserved, or equals a class the generator
+/// declares in a module this run emits (`<Base>Client`, `<Base>AsyncClient`,
+/// `<Service>Handlers`, `<Arm>Refusal`). The service and arm classes are defined
+/// after the star import of `types.py` and hide the record. A class that no module
+/// declares clashes with nothing, so it reserves nothing.
+fn rename_reserved_python_names(
+    spec: &CsilSpecSerialized,
+    surfaces: Surfaces,
+) -> CsilSpecSerialized {
+    let derived = derived_class_names(spec, surfaces);
+    csilgen_common::rename_reserved(spec, |name| {
+        let class = name.to_case(Case::Pascal);
+        RESERVED_TYPE_NAMES.contains(&class.as_str()) || derived.contains(&class)
+    })
+}
+
+/// Every class the services, clients and codec of this run declare, from the same
+/// predicates the emitters use.
+fn derived_class_names(spec: &CsilSpecSerialized, surfaces: Surfaces) -> HashSet<String> {
     let mut derived = HashSet::new();
+    let bases = service_bases(spec);
     for rule in &spec.rules {
         if let CsilRuleType::GroupChoice(choices) = &rule.rule_type {
             for i in 1..=choices.len() {
@@ -438,27 +586,30 @@ fn rename_reserved_python_names(spec: &CsilSpecSerialized) -> CsilSpecSerialized
             }
         }
         if matches!(rule.rule_type, CsilRuleType::ServiceDef(_)) {
-            let service_class = rule.name.to_case(Case::Pascal);
-            let base = service_class
-                .strip_suffix("Service")
-                .filter(|s| !s.is_empty())
-                .unwrap_or(&service_class);
-            derived.insert(format!("{base}Client"));
-            derived.insert(format!("{base}AsyncClient"));
-            derived.insert(format!("{service_class}Handlers"));
+            for (_, shape) in surfaces.client_shapes() {
+                derived.insert(shape.client_class_name(&bases[&rule.name]));
+            }
+            if surfaces.server {
+                derived.insert(handler_class_name(&rule.name));
+            }
         }
     }
     for (_, _, arms) in spec.rpc_operations() {
         for arm in &arms[1..] {
             if let Some(name) = arm.rpc_variant_name() {
-                derived.insert(format!("{}Refusal", name.to_case(Case::Pascal)));
+                derived.insert(refusal_class_name(name));
             }
         }
     }
-    csilgen_common::rename_reserved(spec, |name| {
-        let class = name.to_case(Case::Pascal);
-        RESERVED_TYPE_NAMES.contains(&class.as_str()) || derived.contains(&class)
-    })
+    derived
+}
+
+fn handler_class_name(service: &str) -> String {
+    format!("{}Handlers", service.to_case(Case::Pascal))
+}
+
+fn refusal_class_name(arm: &str) -> String {
+    format!("{}Refusal", arm.to_case(Case::Pascal))
 }
 
 /// Reduce an operation output to its success type by dropping a top-level
@@ -1057,12 +1208,7 @@ fn first_unary_example(
         let CsilRuleType::ServiceDef(service) = &rule.rule_type else {
             continue;
         };
-        let service_class = rule.name.to_case(Case::Pascal);
-        let base = service_class
-            .strip_suffix("Service")
-            .filter(|s| !s.is_empty())
-            .unwrap_or(&service_class)
-            .to_string();
+        let base = service_base(spec, &rule.name);
         for op in &service.operations {
             if !matches!(op.direction, CsilServiceDirection::Unidirectional) {
                 continue;
@@ -1128,7 +1274,6 @@ fn first_channel_example(
         let CsilRuleType::ServiceDef(service) = &rule.rule_type else {
             continue;
         };
-        let service_class = rule.name.to_case(Case::Pascal);
         for op in &service.operations {
             if !matches!(op.direction, CsilServiceDirection::Bidirectional) {
                 continue;
@@ -1150,9 +1295,9 @@ fn first_channel_example(
             return Some(ChannelExample {
                 // The $hello / Event service string is the CSIL service rule name
                 // verbatim, matching what the generated client and routers use.
-                service_wire: rule.name.clone(),
+                service_wire: spec.declared_name(&rule.name).to_string(),
                 route_fn: format!("route_{snake}_channel"),
-                handler_class: format!("{service_class}Handlers"),
+                handler_class: handler_class_name(&rule.name),
                 encode_fn: format!("encode_{snake}_{}", op.name.to_case(Case::Snake)),
                 method: op.name.to_case(Case::Snake),
                 inbound_type,
@@ -1301,42 +1446,10 @@ impl PythonGenerator {
             }
         }
 
-        // Validate-early, like `decimal_mapping` above: a bad `client_style` fails
-        // the whole run before any file is emitted, regardless of the requested
-        // sub-target. Absent value defaults to `Both`.
-        let client_style = parse_client_style(&self.config)?;
-
-        // Dispatch on target: the base `python` (and explicit `python-server`)
-        // target emits server-side handler ABCs; `python-client` emits
-        // transport-agnostic clients; `python-typesonly` emits the dataclasses
-        // alone. An unrecognized sub-target is an error, not a silent fall-through.
-        enum Surface {
-            Server,
-            Client,
-            TypesOnly,
-        }
-        let surface = match self.config.target.as_str() {
-            "python" | "python-server" => Surface::Server,
-            "python-client" => Surface::Client,
-            "python-typesonly" => Surface::TypesOnly,
-            other => {
-                return Err(CsilgenError::GenerationError(format!(
-                    "Unknown python sub-target '{other}'. Supported: python, python-server, python-client, python-typesonly"
-                )));
-            }
-        };
-
-        // A package's `genquickstart.md` exercises the calling side (RPC + Datagrams, over
-        // the typed client) AND the handling side (Events, over the generated channel
-        // router), so a publishable package must carry BOTH surfaces for its own quickstart
-        // to compile — regardless of which sub-target was requested. This mirrors the OCaml
-        // generator, which emits both `client.ml` and `services.ml` in package mode. A flat
-        // (non-package) build stays byte-identical: it emits only the requested surface.
-        let pkg_mode = self.resolve_package_layout().is_some();
-        let want_client = matches!(surface, Surface::Client)
-            || (pkg_mode && !matches!(surface, Surface::TypesOnly));
-        let want_server = matches!(surface, Surface::Server)
-            || (pkg_mode && !matches!(surface, Surface::TypesOnly));
+        // Validate-early, like `decimal_mapping` above: a bad `client_style` or
+        // sub-target fails the whole run before any file is emitted.
+        let surfaces = Surfaces::from_config(&self.config)?;
+        let want_server = surfaces.server;
 
         let mut files = Vec::new();
 
@@ -1369,7 +1482,7 @@ impl PythonGenerator {
 
         let mut prelude_emitted = false;
 
-        let mut ordered = spec.rules.iter().collect::<Vec<_>>();
+        let mut ordered = dependency_order(spec);
         ordered.sort_by_key(|r| !self.enum_choices.contains_key(&r.name));
         for rule in ordered {
             match &rule.rule_type {
@@ -1431,33 +1544,15 @@ impl PythonGenerator {
         // `Both` (default) emits the sync client plus an async twin at
         // `client_async.py` whose public symbols carry an `Async` marker so the two
         // coexist in one package. A spec with no services yields no client file.
-        if want_client {
-            let sync = ClientShape {
-                is_async: false,
-                marker: "",
-            };
-            let async_drop_in = ClientShape {
-                is_async: true,
-                marker: "",
-            };
-            let async_twin = ClientShape {
-                is_async: true,
-                marker: "Async",
-            };
-            let mut push_client = |this: &Self, path: &str, shape: ClientShape| -> Result<()> {
-                let body = this.generate_client_body(spec, &records, shape)?;
-                if !body.is_empty() {
-                    files.push(this.generate_client_module_file(path, body, has_codec)?);
-                }
-                Ok(())
-            };
-            match client_style {
-                ClientStyle::Sync => push_client(self, "client.py", sync)?,
-                ClientStyle::Async => push_client(self, "client.py", async_drop_in)?,
-                ClientStyle::Both => {
-                    push_client(self, "client.py", sync)?;
-                    push_client(self, "client_async.py", async_twin)?;
-                }
+        // `Sync`/`Async` each emit one file at the canonical `client.py` (the async
+        // one is a drop-in with identical symbol names); `Both` (default) adds an
+        // async twin at `client_async.py` whose public symbols carry an `Async`
+        // marker so the two coexist in one package. A spec with no services yields
+        // no client file.
+        for (path, shape) in surfaces.client_shapes() {
+            let body = self.generate_client_body(spec, &records, shape)?;
+            if !body.is_empty() {
+                files.push(self.generate_client_module_file(path, body, has_codec)?);
             }
         }
 
@@ -1512,14 +1607,7 @@ impl PythonGenerator {
     /// array without `"python"` all mean "not in package mode" rather than an error,
     /// so an unrelated `emit_packages` payload never destabilizes Python output.
     fn resolve_package_layout(&self) -> Option<PythonPackage> {
-        let opts_in = self
-            .config
-            .options
-            .get("emit_packages")
-            .and_then(|v| v.as_array())
-            .map(|arr| arr.iter().any(|e| e.as_str() == Some("python")))
-            .unwrap_or(false);
-        if !opts_in {
+        if !package_mode(&self.config) {
             return None;
         }
 
@@ -1800,7 +1888,10 @@ impl PythonGenerator {
             let default_value = match explicit_default {
                 Some(rendered) => format!(" = {rendered}"),
                 None if is_optional => " = None".to_string(),
-                None => String::new(),
+                None => match single_literal_default(entry) {
+                    Some(literal) => format!(" = {literal}"),
+                    None => String::new(),
+                },
             };
             field_definition.push_str(&format!("    {field_name}: {field_type}{default_value}\n"));
         }
@@ -2597,23 +2688,15 @@ impl PythonGenerator {
         self.generated_types.insert(class.clone());
         self.imports.insert("from enum import Enum as _Enum".into());
         let mut code = format!("class {class}(str, _Enum):\n    __str__ = str.__str__\n");
-        let mut members = HashSet::new();
-        for value in &values {
-            let words = value
-                .split(|c: char| !c.is_ascii_alphanumeric())
-                .filter(|word| !word.is_empty())
-                .collect::<Vec<_>>()
-                .join("_");
-            let mut base = words.to_case(Case::UpperSnake);
-            if !base.starts_with(|c: char| c.is_ascii_alphabetic()) {
-                base = format!("VALUE_{base}");
-            }
-            let mut member = base.clone();
-            let mut n = 2;
-            while !members.insert(member.clone()) {
-                member = format!("{base}_{n}");
-                n += 1;
-            }
+        let texts: Vec<&str> = values.iter().map(|value| value.as_str()).collect();
+        // UPPER_SNAKE names never equal a Python keyword or the lowercase `name`/
+        // `value` an Enum member carries, so only a leading digit is refused.
+        let idents = csilgen_common::member_idents(
+            &texts,
+            |words| words.join("_").to_case(Case::UpperSnake),
+            |name| name.starts_with(|c: char| c.is_ascii_alphabetic()),
+        );
+        for (value, member) in values.iter().zip(&idents) {
             let literal = serde_json::to_string(value).expect("serialize text literal");
             code.push_str(&format!("    {member} = {literal}\n"));
         }
@@ -2802,24 +2885,24 @@ impl PythonGenerator {
     /// and deserializes the typed success response. The carrier only moves bytes.
     fn generate_client_class(
         &self,
-        name: &str,
-        service: &CsilServiceDefinition,
+        spec: &CsilSpecSerialized,
+        rule: &csilgen_common::CsilRule,
         records: &HashSet<String>,
         aliases: &HashMap<String, CsilTypeExpression>,
         unions: &HashSet<String>,
         shape: ClientShape,
     ) -> Result<String> {
-        let service_class = name.to_case(Case::Pascal);
-        let base = service_class
-            .strip_suffix("Service")
-            .filter(|s| !s.is_empty())
-            .unwrap_or(&service_class);
-        let client_class = shape.client_class_name(base);
+        let CsilRuleType::ServiceDef(service) = &rule.rule_type else {
+            return Ok(String::new());
+        };
+        let name = rule.name.as_str();
+        let base = service_base(spec, name);
+        let client_class = shape.client_class_name(&base);
         let transport = shape.transport_name();
-        // The wire service is the CSIL service rule name verbatim (no lowercasing,
-        // no Service-suffix stripping) so a transport can put it on the CSIL-RPC
-        // envelope unmodified (docs/cbor-wire-contract.md "RPC call naming").
-        let wire_service = name;
+        // The wire service is the CSIL service name as declared (no lowercasing, no
+        // Service-suffix stripping, no clash rename) so a transport can put it on the
+        // CSIL-RPC envelope unmodified (docs/cbor-wire-contract.md "RPC call naming").
+        let wire_service = spec.declared_name(name);
 
         let mut out = String::new();
         out.push_str(&format!("class {client_class}:\n"));
@@ -2898,7 +2981,7 @@ impl PythonGenerator {
                 }
                 out.push_str("\"\"\"\n");
             }
-            let stem = op_codec_stem(name, &op.name);
+            let stem = op_codec_stem(spec, name, &op.name);
             // A null input sends empty bytes; a record reuses its `to_cbor`; any other
             // shape uses the op's per-op request encoder.
             let payload = if !has_input {
@@ -2952,10 +3035,7 @@ impl PythonGenerator {
         // The client composes per-op codecs for non-record boundaries from the same
         // alias/union resolution the record codec uses, so the two agree on the wire.
         let aliases = codec_aliases(spec);
-        let unions: HashSet<String> = python_union_defs(spec)
-            .into_iter()
-            .map(|(name, _)| name)
-            .collect();
+        let unions = coded_choice_names(spec);
         let mut body = String::new();
         let mut prelude_emitted = false;
         for rule in &spec.rules {
@@ -2965,9 +3045,9 @@ impl PythonGenerator {
                     body.push_str(&Self::generate_client_prelude(shape, needs_reply));
                     prelude_emitted = true;
                 }
-                body.push_str(&self.generate_client_class(
-                    &rule.name, service, records, &aliases, &unions, shape,
-                )?);
+                body.push_str(
+                    &self.generate_client_class(spec, rule, records, &aliases, &unions, shape)?,
+                );
                 if shape.marker.is_empty()
                     && let Some(wire_ids) = Self::generate_wire_ids(&rule.name, service)
                 {
@@ -2995,6 +3075,11 @@ impl PythonGenerator {
             content.push_str(import);
             content.push('\n');
         }
+        // `typing.Literal` is imported only where a literal type is used, so other
+        // modules keep their import lines.
+        if body_code.contains("Literal[") {
+            content.push_str("from typing import Literal\n");
+        }
         content.push_str("from .types import *\n");
         // The client calls each record's `to_cbor`/`from_cbor`, which the codec
         // module binds onto the dataclasses on import, so the client imports it.
@@ -3019,8 +3104,7 @@ impl PythonGenerator {
         name: &str,
         service: &CsilServiceDefinition,
     ) -> Result<String> {
-        let service_class = name.to_case(Case::Pascal);
-        let handler_class = format!("{service_class}Handlers");
+        let handler_class = handler_class_name(name);
         let mut out = String::new();
 
         // Server-side handlers ABC: unidirectional ops return Output; <->
@@ -3204,6 +3288,11 @@ impl PythonGenerator {
     }
 
     fn map_type_expression(&self, type_expr: &CsilTypeExpression) -> Result<String> {
+        if matches!(type_expr, CsilTypeExpression::Literal(_))
+            && let Some(literal) = python_literal_type(std::slice::from_ref(type_expr))
+        {
+            return Ok(literal);
+        }
         match type_expr {
             CsilTypeExpression::Builtin(name) => self.map_builtin_type(name),
             CsilTypeExpression::Reference(name) => Ok(name.to_case(Case::Pascal)),
@@ -3255,6 +3344,9 @@ impl PythonGenerator {
                 Ok(format!("Tuple[{}]", parts?.join(", ")))
             }
             CsilTypeExpression::Choice(choices) => {
+                if let Some(literal) = python_literal_type(choices) {
+                    return Ok(literal);
+                }
                 let choice_types: Result<Vec<String>> = choices
                     .iter()
                     .map(|choice| self.map_type_expression(choice))
@@ -3327,6 +3419,11 @@ impl PythonGenerator {
             content.push_str(import);
             content.push('\n');
         }
+        // `typing.Literal` is imported only where a literal type is used, so other
+        // modules keep their import lines.
+        if types_code.contains("Literal[") {
+            content.push_str("from typing import Literal\n");
+        }
 
         content.push_str("\n\n");
         // Each JSON helper is emitted only when a `to_dict`/`from_dict` calls it, so a
@@ -3370,6 +3467,11 @@ impl PythonGenerator {
         for import in &self.imports {
             content.push_str(import);
             content.push('\n');
+        }
+        // `typing.Literal` is imported only where a literal type is used, so other
+        // modules keep their import lines.
+        if body_code.contains("Literal[") {
+            content.push_str("from typing import Literal\n");
         }
         content.push_str("from .types import *\n");
         // The client calls each record's `to_cbor`/`from_cbor`, which the codec module
@@ -3472,6 +3574,114 @@ impl PythonGenerator {
 /// The function-name suffix for a record's generated codec helpers. The CSIL rule
 /// name snake-cases the same way the dataclass field/attribute names do, so a
 /// reference to a record resolves to the same `_encode_<suffix>_value` everywhere.
+/// The rules in an order where each rule comes after the rules it refers to, else in
+/// spec order. `types.py` evaluates a `Union[...]` alias, a pre-3.14 annotation and a
+/// default at import, so a name the hoists append after its user must be defined
+/// first. A reference cycle keeps spec order inside the cycle.
+fn dependency_order(spec: &CsilSpecSerialized) -> Vec<&csilgen_common::CsilRule> {
+    fn refs_ty(ty: &CsilTypeExpression, out: &mut Vec<String>) {
+        match ty {
+            CsilTypeExpression::Reference(name) => out.push(name.clone()),
+            CsilTypeExpression::Array { element_type, .. } => refs_ty(element_type, out),
+            CsilTypeExpression::Map { key, value, .. } => {
+                refs_ty(key, out);
+                refs_ty(value, out);
+            }
+            CsilTypeExpression::Group(group) | CsilTypeExpression::Tuple(group) => {
+                refs_group(group, out)
+            }
+            CsilTypeExpression::Choice(arms) => arms.iter().for_each(|arm| refs_ty(arm, out)),
+            CsilTypeExpression::Constrained { base_type, .. } => refs_ty(base_type, out),
+            _ => {}
+        }
+    }
+    fn refs_group(group: &CsilGroupExpression, out: &mut Vec<String>) {
+        for entry in &group.entries {
+            if let Some(CsilGroupKey::Type(key)) = &entry.key {
+                refs_ty(key, out);
+            }
+            refs_ty(&entry.value_type, out);
+        }
+    }
+    fn visit<'a>(
+        index: usize,
+        spec: &'a CsilSpecSerialized,
+        by_name: &HashMap<&str, usize>,
+        seen: &mut [bool],
+        out: &mut Vec<&'a csilgen_common::CsilRule>,
+    ) {
+        if seen[index] {
+            return;
+        }
+        seen[index] = true;
+        let rule = &spec.rules[index];
+        let mut refs = Vec::new();
+        match &rule.rule_type {
+            CsilRuleType::TypeDef(ty) => refs_ty(ty, &mut refs),
+            CsilRuleType::GroupDef(group) => refs_group(group, &mut refs),
+            CsilRuleType::TypeChoice(arms) => arms.iter().for_each(|arm| refs_ty(arm, &mut refs)),
+            CsilRuleType::GroupChoice(groups) => {
+                groups.iter().for_each(|group| refs_group(group, &mut refs))
+            }
+            CsilRuleType::ServiceDef(_) => {}
+        }
+        for name in refs {
+            if let Some(&dep) = by_name.get(name.as_str()) {
+                visit(dep, spec, by_name, seen, out);
+            }
+        }
+        out.push(rule);
+    }
+    let by_name: HashMap<&str, usize> = spec
+        .rules
+        .iter()
+        .enumerate()
+        .map(|(i, rule)| (rule.name.as_str(), i))
+        .collect();
+    let mut seen = vec![false; spec.rules.len()];
+    let mut out = Vec::with_capacity(spec.rules.len());
+    for index in 0..spec.rules.len() {
+        visit(index, spec, &by_name, &mut seen, &mut out);
+    }
+    out
+}
+
+/// `Literal[...]` for a choice of text, int or bool literals, so a type
+/// checker and a sample builder see the declared values. `None` for any other
+/// choice: `typing.Literal` takes no float, and bytes, `None` and array literals
+/// keep their plain types.
+fn python_literal_type(arms: &[CsilTypeExpression]) -> Option<String> {
+    if arms.is_empty() || !all_literal(arms) {
+        return None;
+    }
+    let mut members: Vec<String> = Vec::new();
+    for arm in arms {
+        let literal = choice_arm_literal(arm)?;
+        if !matches!(
+            literal,
+            CsilLiteralValue::Text(_) | CsilLiteralValue::Integer(_) | CsilLiteralValue::Bool(_)
+        ) {
+            return None;
+        }
+        let rendered = csil_literal_to_python_str(literal);
+        if !members.contains(&rendered) {
+            members.push(rendered);
+        }
+    }
+    Some(format!("Literal[{}]", members.join(", ")))
+}
+
+/// The value a field typed as one literal always holds, so the dataclass can
+/// default to it and a default-built record encodes.
+fn single_literal_default(entry: &CsilGroupEntry) -> Option<String> {
+    match unwrap_constrained(&entry.value_type) {
+        CsilTypeExpression::Literal(literal) if !matches!(literal, CsilLiteralValue::Array(_)) => {
+            Some(csil_literal_to_python_str(literal))
+        }
+        _ => None,
+    }
+}
+
 fn record_suffix(name: &str) -> String {
     name.to_case(Case::Snake)
 }
@@ -3528,12 +3738,8 @@ fn py_op_boundary_expressible(
 
 /// The `<base>_<method>` snake stem shared by an op's per-op codec helpers and the
 /// client method that calls them, so the two never drift.
-fn op_codec_stem(service_name: &str, op_name: &str) -> String {
-    let service_class = service_name.to_case(Case::Pascal);
-    let base = service_class
-        .strip_suffix("Service")
-        .filter(|s| !s.is_empty())
-        .unwrap_or(&service_class);
+fn op_codec_stem(spec: &CsilSpecSerialized, service_name: &str, op_name: &str) -> String {
+    let base = service_base(spec, service_name);
     format!(
         "{}_{}",
         base.to_case(Case::Snake),
@@ -3556,7 +3762,7 @@ fn emit_op_codec_pair(
     let enc = py_enc_value(ty, "csil_value", records, aliases, unions);
     let dec = py_dec_value(ty, "csil_tree", records, aliases, unions, enums);
     format!(
-        "def encode_{helper}(csil_value) -> bytes:\n    return cbor_encode({enc})\n\n\n\
+        "def encode_{helper}(csil_value) -> bytes:\n    return _csil_encode_tree(lambda: {enc})\n\n\n\
          def decode_{helper}(data: bytes):\n    csil_tree = cbor_decode(data)\n    return {dec}\n\n\n"
     )
 }
@@ -3588,7 +3794,7 @@ fn emit_op_codecs(
             if !req_ok || !py_op_boundary_expressible(&success, records, aliases, unions) {
                 continue;
             }
-            let stem = op_codec_stem(&rule.name, &op.name);
+            let stem = op_codec_stem(spec, &rule.name, &op.name);
             if !null_input && !is_record_ref(&op.input_type, records) {
                 out.push_str(&emit_op_codec_pair(
                     &format!("{stem}_request"),
@@ -3702,9 +3908,8 @@ fn is_identity_type(
         CsilTypeExpression::Array { element_type, .. } => {
             is_identity_type(element_type, records, aliases)
         }
-        CsilTypeExpression::Map { key, value, .. } => {
-            is_identity_type(key, records, aliases) && is_identity_type(value, records, aliases)
-        }
+        // A dynamic map is never the identity: the encoder marks it for canonical key
+        // order and the decoder checks that order.
         _ => false,
     }
 }
@@ -3759,19 +3964,21 @@ fn py_enc_value(
         CsilTypeExpression::Map { key, value, .. } => {
             if is_identity_type(key, records, aliases) && is_identity_type(value, records, aliases)
             {
-                expr.to_string()
+                format!("_CsilDynMap({expr})")
             } else {
                 let ek = py_enc_value(key, "csil_k", records, aliases, unions);
                 let ev = py_enc_value(value, "csil_v", records, aliases, unions);
-                format!("{{{ek}: {ev} for csil_k, csil_v in {expr}.items()}}")
+                format!("_CsilDynMap({{{ek}: {ev} for csil_k, csil_v in {expr}.items()}})")
             }
         }
         // A fixed-shape tuple encodes positionally into a list; an absent optional
         // element stays None (encoded as null) so the array length is fixed.
         CsilTypeExpression::Tuple(group) => {
-            let mut parts = Vec::with_capacity(group.entries.len());
+            let arity = group.entries.len();
+            let checked = format!("_csil_enc_tuple({expr}, {arity})");
+            let mut parts = Vec::with_capacity(arity);
             for (i, entry) in group.entries.iter().enumerate() {
-                let elem = format!("{expr}[{i}]");
+                let elem = format!("{checked}[{i}]");
                 let enc = py_enc_value(&entry.value_type, &elem, records, aliases, unions);
                 if matches!(entry.occurrence, Some(CsilOccurrence::Optional)) {
                     parts.push(format!("(None if {elem} is None else {enc})"));
@@ -3784,7 +3991,12 @@ fn py_enc_value(
         // A literal-typed union variant re-emits its own declared value rather than
         // the passed-in expression, so the wire byte is the canonical literal even
         // if a caller somehow got here with something merely `==`-equal to it.
-        CsilTypeExpression::Literal(lit) => csil_literal_to_python_str(lit),
+        CsilTypeExpression::Literal(lit) => {
+            format!(
+                "_csil_enc_literal({expr}, {})",
+                csil_literal_to_python_str(lit)
+            )
+        }
         // An inline (anonymous) choice — a record field, array element, map value,
         // or tuple element typed directly as `a / b / c` rather than through a
         // named rule — gets exactly the wire shape a reference to an equivalent
@@ -3795,7 +4007,13 @@ fn py_enc_value(
         // classification `emit_union_codec` uses for a named union).
         CsilTypeExpression::Choice(choices) => {
             if all_literal(choices) {
-                expr.to_string()
+                let members: Vec<String> = choices
+                    .iter()
+                    .filter_map(choice_arm_literal)
+                    .map(csil_literal_to_python_str)
+                    .collect();
+                let trailing = if members.len() == 1 { "," } else { "" };
+                format!("_csil_enc_enum({expr}, ({}{trailing}))", members.join(", "))
             } else {
                 py_choice_enc_call(choices, expr, records, aliases, unions)
             }
@@ -3865,7 +4083,7 @@ fn py_dec_value(
         CsilTypeExpression::Map { key, value, .. } => {
             let dk = py_dec_value(key, "csil_k", records, aliases, unions, enums);
             let dv = py_dec_value(value, "csil_v", records, aliases, unions, enums);
-            format!("{{{dk}: {dv} for csil_k, csil_v in _csil_expect_map({expr}).items()}}")
+            format!("{{{dk}: {dv} for csil_k, csil_v in _csil_expect_dyn_map({expr}).items()}}")
         }
         // Reconstruct a fixed-shape tuple positionally from the decoded array, after
         // confirming it actually is an array of the declared arity.
@@ -4127,7 +4345,7 @@ fn emit_record_codec(
     // `req.to_cbor()` / `Type.from_cbor(bytes)` directly.
     out.push_str(&format!("def _{suffix}_to_cbor(self) -> bytes:\n"));
     out.push_str(&format!(
-        "    return cbor_encode(_encode_{suffix}_value(self))\n\n\n"
+        "    return _csil_encode_tree(lambda: _encode_{suffix}_value(self))\n\n\n"
     ));
     out.push_str(&format!(
         "def _{suffix}_from_cbor(data: bytes) -> \"{class_name}\":\n"
@@ -4226,6 +4444,17 @@ fn python_union_defs(spec: &CsilSpecSerialized) -> Vec<(String, Vec<CsilTypeExpr
             }
             Some((record_suffix(&rule.name), choices.clone()))
         })
+        .collect()
+}
+
+/// The named choices with their own `_encode_<rule>_value`/`_decode_<rule>_value`:
+/// every union and every enum. An enum encoder checks membership, so a value the
+/// decoder would refuse is refused before it goes on the wire.
+fn coded_choice_names(spec: &CsilSpecSerialized) -> HashSet<String> {
+    python_union_defs(spec)
+        .into_iter()
+        .map(|(name, _)| name)
+        .chain(python_enum_defs(spec).into_iter().map(|(name, _)| name))
         .collect()
 }
 
@@ -4421,10 +4650,15 @@ fn emit_enum_codec(name: &str, literals: &[CsilLiteralValue], numbers: Option<Ve
     let literal_refs: Vec<&CsilLiteralValue> = literals.iter().collect();
     let expect_fn = uniform_enum_expect_fn(&literal_refs);
     let mut out = String::new();
+    let members: Vec<String> = literals.iter().map(csil_literal_to_python_str).collect();
+    let trailing = if members.len() == 1 { "," } else { "" };
 
+    out.push_str(&format!(
+        "def _encode_{suffix}_value(csil_v):\n    return _csil_enc_enum(csil_v, ({}{trailing}))\n\n\n",
+        members.join(", ")
+    ));
     out.push_str(&format!("def _decode_{suffix}_value(csil_v):\n"));
     out.push_str(&format!("    csil_v = {expect_fn}(csil_v)\n"));
-    let members: Vec<String> = literals.iter().map(csil_literal_to_python_str).collect();
     out.push_str(&format!(
         "    if csil_v not in ({}{}):\n",
         members.join(", "),
@@ -4457,18 +4691,19 @@ fn emit_rpc_replies(
     let mut emitted = HashSet::new();
     let mut resolve = String::from("def resolve_rpc_reply(service, op, variant, payload):\n");
     for (service, op, arms) in spec.rpc_operations() {
+        let wire_service = spec.declared_name(service);
         let mut encode = format!(
             "def encode_{}_reply(handler, *args, **kwargs):\n    try:\n        value = handler(*args, **kwargs)\n",
-            op_codec_stem(service, &op.name)
+            op_codec_stem(spec, service, &op.name)
         );
         resolve.push_str(&format!(
-            "    if (service, op) == ({service:?}, {:?}):\n",
+            "    if (service, op) == ({wire_service:?}, {:?}):\n",
             op.name
         ));
         for (index, arm) in arms.iter().enumerate() {
             let name = arm.rpc_variant_name().unwrap();
             let wire = spec.declared_name(name);
-            let exception = format!("{}Refusal", name.to_case(Case::Pascal));
+            let exception = refusal_class_name(name);
             resolve.push_str(&format!("        if variant == {wire:?}:\n"));
             if index == 0 {
                 resolve.push_str("            return payload\n");
@@ -4516,7 +4751,7 @@ fn generate_codec_file(
     let mut needs_re = false;
     let mut needs_tuple = false;
     let union_defs = python_union_defs(spec);
-    let unions: HashSet<String> = union_defs.iter().map(|(n, _)| n.clone()).collect();
+    let unions = coded_choice_names(spec);
     let enum_defs = python_enum_defs(spec);
     let enums: HashSet<String> = enum_defs.iter().map(|(n, _)| n.clone()).collect();
     let mut body = String::new();
@@ -4935,6 +5170,19 @@ def _csil_enc(v: Any, out: bytearray) -> None:
     elif isinstance(v, CborTag):
         _csil_head(6, v.tag, out)
         _csil_enc(v.value, out)
+    elif isinstance(v, _CsilDynMap):
+        # RFC 8949 section 4.2.1: a dynamic map is written in the bytewise order of
+        # its encoded keys, which is not Python's string or number order.
+        pairs = []
+        for key, val in v.items():
+            key_out = bytearray()
+            _csil_enc(key, key_out)
+            pairs.append((bytes(key_out), val))
+        pairs.sort(key=lambda pair: pair[0])
+        _csil_head(5, len(pairs), out)
+        for key_bytes, val in pairs:
+            out += key_bytes
+            _csil_enc(val, out)
     elif isinstance(v, dict):
         _csil_head(5, len(v), out)
         for key, val in v.items():
@@ -4953,6 +5201,44 @@ def cbor_encode(value: Any) -> bytes:
     out = bytearray()
     _csil_enc(value, out)
     return bytes(out)
+
+
+# Every encode entry point refuses a bad value with ValueError only, so a caller
+# needs one `except`. A value of the wrong shape (None for a map, a short tuple)
+# otherwise fails as whatever the tree builder happens to touch first.
+def _csil_encode_tree(build: Any) -> bytes:
+    try:
+        return cbor_encode(build())
+    except ValueError:
+        raise
+    except (TypeError, AttributeError, IndexError, KeyError, OverflowError) as exc:
+        raise ValueError(f"csil cbor: cannot encode value: {exc!r}") from exc
+
+
+# `True == 1` in Python, but CSIL bool and int are distinct wire types.
+def _csil_same_literal(v: Any, expected: Any) -> bool:
+    return isinstance(v, bool) == isinstance(expected, bool) and v == expected
+
+
+# The decoder refuses a literal field or enum value outside the declared set, so
+# the encoder refuses it too instead of writing bytes no peer accepts.
+def _csil_enc_literal(v: Any, expected: Any) -> Any:
+    if not _csil_same_literal(v, expected):
+        raise ValueError(f"csil cbor: expected literal {expected!r}, got {v!r}")
+    return expected
+
+
+def _csil_enc_enum(v: Any, members: Any) -> Any:
+    for member in members:
+        if _csil_same_literal(v, member):
+            return member
+    raise ValueError(f"csil cbor: {v!r} is not a member of the declared enum")
+
+
+def _csil_enc_tuple(v: Any, arity: int) -> Any:
+    if not isinstance(v, (list, tuple)) or len(v) != arity:
+        raise ValueError(f"csil cbor: expected a {arity}-element tuple, got {v!r}")
+    return v
 
 
 class CsilDecodeError(ValueError):
@@ -4982,6 +5268,21 @@ def _csil_read_arg(b: bytes, pos: int, low: int):
     if low == 27:
         return int.from_bytes(b[pos + 1 : pos + 9], "big"), pos + 9
     raise CsilDecodeError("csilgen: bad head")
+
+
+# The smallest argument each long head form may carry; a smaller one fits a
+# shorter head. Only the key heads are checked: a key with two byte forms would
+# defeat the canonical-order check.
+_CSIL_HEAD_MINIMUM = {24: 24, 25: 0x100, 26: 0x10000, 27: 0x100000000}
+
+
+def _csil_head_is_shortest(b: bytes, pos: int) -> bool:
+    ib = b[pos]
+    minimum = _CSIL_HEAD_MINIMUM.get(ib & 0x1F)
+    if minimum is None or ib >> 5 == 7:
+        return True
+    arg, _ = _csil_read_arg(b, pos, ib & 0x1F)
+    return arg >= minimum
 
 
 def _csil_dec(b: bytes, pos: int, depth: int):
@@ -5035,14 +5336,27 @@ def _csil_dec(b: bytes, pos: int, depth: int):
     if major == 5:
         if arg > len(b) - pos:
             raise CsilDecodeError("csilgen: map length exceeds remaining input")
-        result: Dict[Any, Any] = {}
+        result = _CsilWireMap()
+        previous = None
         for _ in range(arg):
+            start = pos
             key, pos = _csil_dec(b, pos, depth + 1)
+            if not _csil_head_is_shortest(b, start):
+                raise CsilDecodeError("csil cbor: map key is not in shortest form")
+            # Comparing each raw key with the one before keeps the order check O(n);
+            # a dynamic-map decoder reads the flag, a record decoder ignores it.
+            raw = b[start:pos]
+            if previous is not None and raw <= previous:
+                result.canonical = False
+            previous = raw
             val, pos = _csil_dec(b, pos, depth + 1)
             try:
-                result[key] = val
+                repeated = key in result
             except TypeError:
                 raise CsilDecodeError("csilgen: map key is not hashable") from None
+            if repeated:
+                raise CsilDecodeError(f"csil cbor: duplicate key {key!r}")
+            result[key] = val
         return result, pos
     if major == 6:
         inner, pos = _csil_dec(b, pos, depth + 1)
@@ -5112,6 +5426,24 @@ class _CsilMap(dict):
     # fail as a decode error, not as a bare KeyError.
     def __missing__(self, key: Any) -> Any:
         raise CsilDecodeError(f"csil cbor: missing field {key!r}")
+
+
+class _CsilWireMap(dict):
+    # A decoded CBOR map, with whether its keys arrived in canonical order.
+    canonical = True
+
+
+class _CsilDynMap(dict):
+    # Marks a dynamic map (`{ * K => V }`) for the encoder, which writes its keys in
+    # canonical order; a record keeps the order the codec builds it in.
+    pass
+
+
+def _csil_expect_dyn_map(v: Any) -> dict:
+    v = _csil_expect_map(v)
+    if not getattr(v, "canonical", True):
+        raise CsilDecodeError("csil cbor: map keys are not in canonical order")
+    return v
 
 
 def _csil_expect_map(v: Any) -> dict:
@@ -10449,6 +10781,680 @@ print("ok")
             output.warnings[0]
                 .message
                 .contains("rule `refused` is generated as `refusedType` for python-client")
+        );
+    }
+
+    // ---- linkkeys cleanup: derived names, op unions, services, hoists, maps ----
+
+    fn text_ty() -> CsilTypeExpression {
+        CsilTypeExpression::Builtin("text".to_string())
+    }
+
+    fn int_ty() -> CsilTypeExpression {
+        CsilTypeExpression::Builtin("int".to_string())
+    }
+
+    fn ref_ty(name: &str) -> CsilTypeExpression {
+        CsilTypeExpression::Reference(name.to_string())
+    }
+
+    fn text_map() -> CsilTypeExpression {
+        CsilTypeExpression::Map {
+            key: Box::new(text_ty()),
+            value: Box::new(int_ty()),
+            occurrence: None,
+        }
+    }
+
+    fn inline_group(fields: Vec<(&str, CsilTypeExpression)>) -> CsilTypeExpression {
+        CsilTypeExpression::Group(CsilGroupExpression {
+            entries: fields
+                .into_iter()
+                .map(|(key, value_type)| bare(key, value_type))
+                .collect(),
+        })
+    }
+
+    fn service_rule(
+        name: &str,
+        ops: Vec<(&str, CsilTypeExpression, CsilTypeExpression)>,
+    ) -> CsilRule {
+        CsilRule {
+            name: name.to_string(),
+            rule_type: CsilRuleType::ServiceDef(CsilServiceDefinition {
+                operations: ops
+                    .into_iter()
+                    .map(|(op, input_type, output_type)| CsilServiceOperation {
+                        name: op.to_string(),
+                        input_type,
+                        output_type,
+                        direction: CsilServiceDirection::Unidirectional,
+                        position: create_test_position(),
+                        doc_comments: Vec::new(),
+                        wire_id: None,
+                    })
+                    .collect(),
+                wire_id: None,
+            }),
+            position: create_test_position(),
+            doc_comments: Vec::new(),
+        }
+    }
+
+    fn spec_of(rules: Vec<CsilRule>) -> CsilSpecSerialized {
+        let service_count = rules
+            .iter()
+            .filter(|r| matches!(r.rule_type, CsilRuleType::ServiceDef(_)))
+            .count();
+        CsilSpecSerialized {
+            rules,
+            source_content: None,
+            service_count,
+            fields_with_metadata_count: 0,
+            declared_names: Default::default(),
+        }
+    }
+
+    fn target_config(target: &str) -> GeneratorConfig {
+        let mut config = create_test_config(false);
+        config.target = target.to_string();
+        config
+    }
+
+    fn warnings_for(spec: &CsilSpecSerialized, config: &GeneratorConfig) -> Vec<String> {
+        let input = WasmGeneratorInput {
+            csil_spec: spec.clone(),
+            config: config.clone(),
+            generator_metadata: GeneratorMetadata {
+                name: "python-generator".to_string(),
+                version: "0".to_string(),
+                description: String::new(),
+                target: "python".to_string(),
+                capabilities: Vec::new(),
+                author: None,
+                homepage: None,
+            },
+        };
+        run_generation(&input)
+            .unwrap()
+            .warnings
+            .into_iter()
+            .map(|w| w.message)
+            .collect()
+    }
+
+    fn file_of<'a>(files: &'a [GeneratedFile], path: &str) -> &'a str {
+        &files
+            .iter()
+            .find(|f| f.path == path || f.path.ends_with(&format!("/{path}")))
+            .unwrap_or_else(|| panic!("no {path}"))
+            .content
+    }
+
+    /// The linkkeys schema: each rule is the record boundary of the op whose
+    /// `<Service><Op>Request/Response` name it has, so nothing clashes.
+    fn rp_spec() -> CsilSpecSerialized {
+        spec_of(vec![
+            record_rule(
+                "RpIssueAttestationRequest",
+                vec![("claim_type", text_ty()), ("claim_value", text_ty())],
+            ),
+            record_rule("RpIssueAttestationResponse", vec![("deposited", int_ty())]),
+            service_rule(
+                "Rp",
+                vec![(
+                    "issue-attestation",
+                    ref_ty("RpIssueAttestationRequest"),
+                    ref_ty("RpIssueAttestationResponse"),
+                )],
+            ),
+        ])
+    }
+
+    #[test]
+    fn op_record_boundaries_keep_their_names() {
+        let spec = rp_spec();
+        for target in [
+            "python",
+            "python-client",
+            "python-server",
+            "python-typesonly",
+        ] {
+            let config = target_config(target);
+            assert!(warnings_for(&spec, &config).is_empty(), "{target}");
+            let files = generate_python_code_from_serialized(&spec, &config).unwrap();
+            let types = file_of(&files, "types.py");
+            assert_eq!(types.matches("class RpIssueAttestationRequest:").count(), 1);
+            assert_eq!(
+                types.matches("class RpIssueAttestationResponse:").count(),
+                1
+            );
+            assert!(!types.contains("RpIssueAttestationRequestType"));
+        }
+        let files =
+            generate_python_code_from_serialized(&spec, &target_config("python-client")).unwrap();
+        run_python_driver(
+            &files,
+            "rp-names",
+            r#"from pk.client import RpClient
+from pk.types import RpIssueAttestationRequest, RpIssueAttestationResponse
+
+class Fake:
+    def call(self, service, op, req):
+        assert (service, op) == ("Rp", "issue-attestation")
+        got = RpIssueAttestationRequest.from_cbor(req)
+        assert got.claim_type == "email"
+        return RpIssueAttestationResponse(deposited=1).to_cbor()
+
+out = RpClient(Fake()).issue_attestation(RpIssueAttestationRequest(claim_type="email", claim_value="x"))
+assert out == RpIssueAttestationResponse(deposited=1)
+print("ok")
+"#,
+        );
+    }
+
+    /// The request's second schema. Python names a record codec
+    /// `_encode_<rule>_value` and an op codec `encode_<service>_<op>_request`, so
+    /// the record `MemberGetMemberRequest` and the `MemberID` op codec are two
+    /// different names: nothing is renamed, and both work.
+    #[test]
+    fn non_record_boundary_codec_does_not_clash_with_record_codec() {
+        let spec = spec_of(vec![
+            CsilRule {
+                name: "MemberID".to_string(),
+                rule_type: CsilRuleType::TypeDef(text_ty()),
+                position: create_test_position(),
+                doc_comments: Vec::new(),
+            },
+            record_rule("MemberGetMemberRequest", vec![("id", text_ty())]),
+            service_rule(
+                "Member",
+                vec![("get-member", ref_ty("MemberID"), ref_ty("MemberID"))],
+            ),
+        ]);
+        let config = target_config("python-client");
+        assert!(warnings_for(&spec, &config).is_empty());
+        let files = generate_python_code_from_serialized(&spec, &config).unwrap();
+        let codec = file_of(&files, "codec.py");
+        assert_eq!(
+            codec
+                .matches("def encode_member_get_member_request(")
+                .count(),
+            1
+        );
+        assert_eq!(
+            codec
+                .matches("def _encode_member_get_member_request_value(")
+                .count(),
+            1
+        );
+        run_python_driver(
+            &files,
+            "member-names",
+            r#"from pk.codec import encode_member_get_member_request, decode_member_get_member_request
+from pk.types import MemberGetMemberRequest
+
+assert decode_member_get_member_request(encode_member_get_member_request("m1")) == "m1"
+v = MemberGetMemberRequest(id="m1")
+assert MemberGetMemberRequest.from_cbor(v.to_cbor()) == v
+print("ok")
+"#,
+        );
+    }
+
+    /// `<Base>Client` exists only in client modules, `<Base>AsyncClient` only in
+    /// the async twin, and `<Service>Handlers` only in the server module; a rule
+    /// with one of those names is renamed only for a run that emits the class.
+    #[test]
+    fn derived_classes_are_reserved_only_where_emitted() {
+        let mut spec = rp_spec();
+        for name in ["RpClient", "RpAsyncClient", "RpHandlers"] {
+            spec.rules
+                .insert(0, record_rule(name, vec![("a", int_ty())]));
+        }
+        let renamed = |config: &GeneratorConfig| {
+            let types = generate_python_code_from_serialized(&spec, config).unwrap();
+            let types = file_of(&types, "types.py").to_string();
+            ["RpClient", "RpAsyncClient", "RpHandlers"]
+                .into_iter()
+                .filter(|name| types.contains(&format!("class {name}Type:")))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            renamed(&target_config("python-client")),
+            ["RpClient", "RpAsyncClient"]
+        );
+        assert_eq!(renamed(&target_config("python-server")), ["RpHandlers"]);
+        assert!(renamed(&target_config("python-typesonly")).is_empty());
+        let mut sync = target_config("python-client");
+        sync.options
+            .insert("client_style".to_string(), serde_json::json!("sync"));
+        assert_eq!(renamed(&sync), ["RpClient"]);
+        let mut pkg = target_config("python-typesonly");
+        pkg.options
+            .insert("emit_packages".to_string(), serde_json::json!(["python"]));
+        assert!(renamed(&pkg).is_empty());
+        pkg.target = "python".to_string();
+        assert_eq!(renamed(&pkg), ["RpClient", "RpAsyncClient", "RpHandlers"]);
+    }
+
+    /// `read-counts: Holder -> { * text => int } / Err` exposes the whole union in
+    /// the client and the handler, and its payload is the tagged sum.
+    #[test]
+    fn mixed_op_output_is_a_named_union() {
+        let spec = spec_of(vec![
+            record_rule("Holder", vec![("counts", text_map())]),
+            record_rule("Err", vec![("message", text_ty())]),
+            service_rule(
+                "Lookup",
+                vec![(
+                    "read-counts",
+                    ref_ty("Holder"),
+                    CsilTypeExpression::Choice(vec![text_map(), ref_ty("Err")]),
+                )],
+            ),
+        ]);
+        let server = generate_python_code_from_serialized(&spec, &target_config("python")).unwrap();
+        assert!(
+            file_of(&server, "types.py")
+                .contains("LookupReadCountsOutput = Union[Dict[str, int], Err]")
+        );
+        assert!(file_of(&server, "services.py").contains("-> LookupReadCountsOutput:"));
+        let files =
+            generate_python_code_from_serialized(&spec, &target_config("python-client")).unwrap();
+        assert!(!file_of(&files, "client.py").contains("handle it manually"));
+        run_python_driver(
+            &files,
+            "op-union",
+            r#"from pk.client import LookupClient
+from pk.codec import cbor_encode, CsilDecodeError
+from pk.types import Holder, Err
+
+class Fake:
+    reply = None
+    def call(self, service, op, req):
+        assert (service, op) == ("Lookup", "read-counts")
+        return self.reply
+
+fake = Fake()
+client = LookupClient(fake)
+fake.reply = cbor_encode([0, {"a": 1}])
+assert client.read_counts(Holder(counts={})) == {"a": 1}
+fake.reply = cbor_encode([1, {"message": "boom"}])
+assert client.read_counts(Holder(counts={})) == Err(message="boom")
+fake.reply = cbor_encode({"a": 1})
+try:
+    client.read_counts(Holder(counts={}))
+    raise SystemExit("an untagged payload decoded")
+except CsilDecodeError:
+    pass
+print("ok")
+"#,
+        );
+    }
+
+    /// `UserSvc` and `user-svc` get distinct classes, and each puts its declared
+    /// name on the wire.
+    #[test]
+    fn clashing_service_identifiers_keep_their_wire_names() {
+        let spec = spec_of(vec![
+            record_rule("Ping", vec![("n", int_ty())]),
+            service_rule("UserSvc", vec![("get", ref_ty("Ping"), ref_ty("Ping"))]),
+            service_rule("user-svc", vec![("put", ref_ty("Ping"), ref_ty("Ping"))]),
+        ]);
+        let config = target_config("python-client");
+        let warnings = warnings_for(&spec, &config);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("service `user-svc` is generated as `user-svc2`"));
+        let server = generate_python_code_from_serialized(&spec, &target_config("python")).unwrap();
+        let services = file_of(&server, "services.py");
+        assert!(services.contains("class UserSvcHandlers(ABC):"));
+        assert!(services.contains("class UserSvc2Handlers(ABC):"));
+        let files = generate_python_code_from_serialized(&spec, &config).unwrap();
+        run_python_driver(
+            &files,
+            "service-clash",
+            r#"from pk.client import UserSvcClient, UserSvc2Client
+from pk.types import Ping
+
+seen = []
+class Fake:
+    def call(self, service, op, req):
+        seen.append((service, op))
+        return req
+
+assert UserSvcClient(Fake()).get(Ping(n=1)) == Ping(n=1)
+assert UserSvc2Client(Fake()).put(Ping(n=2)) == Ping(n=2)
+assert seen == [("UserSvc", "get"), ("user-svc", "put")], seen
+print("ok")
+"#,
+        );
+    }
+
+    /// A hoisted name never takes a user rule's class (the hoister picks a free
+    /// name), and one that equals a derived class is renamed with a warning; the
+    /// user rule keeps its name.
+    #[test]
+    fn hoisted_names_that_clash_are_renamed() {
+        let spec = spec_of(vec![
+            record_rule("Owner", vec![("x", inline_group(vec![("a", int_ty())]))]),
+            record_rule("OwnerX", vec![("b", text_ty())]),
+            record_rule(
+                "Holder",
+                vec![("rp_client", inline_group(vec![("c", int_ty())]))],
+            ),
+            service_rule("HolderRp", vec![]),
+        ]);
+        let config = target_config("python-client");
+        let warnings = warnings_for(&spec, &config);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("rule `Holder_rp_client` is generated as"))
+        );
+        let files = generate_python_code_from_serialized(&spec, &config).unwrap();
+        let types = file_of(&files, "types.py");
+        assert_eq!(types.matches("class OwnerX:").count(), 1);
+        assert!(types.contains("class OwnerX2:"));
+        assert!(types.contains("class HolderRpClientType:"));
+        run_python_driver(
+            &files,
+            "hoist-clash",
+            r#"from pk.types import Owner, OwnerX, OwnerX2, Holder, HolderRpClientType
+from pk.client import HolderRpClient
+
+o = Owner(x=OwnerX2(a=1))
+assert Owner.from_cbor(o.to_cbor()) == o
+assert OwnerX.from_cbor(OwnerX(b="t").to_cbor()) == OwnerX(b="t")
+h = Holder(rp_client=HolderRpClientType(c=2))
+assert Holder.from_cbor(h.to_cbor()) == h
+assert HolderRpClient is not HolderRpClientType
+print("ok")
+"#,
+        );
+    }
+
+    /// Dynamic maps encode in the bytewise order of their encoded keys and must
+    /// arrive in that order; a key twice, or a key head that is not the shortest
+    /// form, fails in a map and in a record.
+    #[test]
+    fn dynamic_maps_are_canonical_and_keys_are_unique() {
+        let labels = CsilTypeExpression::Map {
+            key: Box::new(int_ty()),
+            value: Box::new(text_ty()),
+            occurrence: None,
+        };
+        let spec = spec_of(vec![record_rule(
+            "Holder",
+            vec![
+                ("counts", text_map()),
+                ("labels", labels),
+                (
+                    "nested",
+                    CsilTypeExpression::Array {
+                        element_type: Box::new(text_map()),
+                        occurrence: None,
+                    },
+                ),
+            ],
+        )]);
+        let files = generate_python_code_from_serialized(&spec, &target_config("python")).unwrap();
+        run_python_driver(
+            &files,
+            "map-order",
+            r#"from pk.codec import CsilDecodeError
+from pk.types import Holder
+
+v = Holder(counts={"aa": 2, "b": 1}, labels={-1: "m", 10: "t", 1: "o"}, nested=[{"aa": 1, "b": 2}])
+data = v.to_cbor()
+want = bytes.fromhex(
+    "a3"
+    "66636f756e7473" "a2" "616201" "62616102"
+    "666c6162656c73" "a3" "01616f" "0a6174" "20616d"
+    "666e6573746564" "81" "a2" "616202" "62616101"
+)
+assert data == want, data.hex()
+assert Holder.from_cbor(data) == v
+
+def refused(hex_text, message):
+    try:
+        Holder.from_cbor(bytes.fromhex(hex_text))
+    except CsilDecodeError as exc:
+        assert message in str(exc), str(exc)
+        return
+    raise SystemExit("accepted " + hex_text)
+
+# counts in string order ("aa" before "b"), then a duplicate map key, then a
+# duplicate record key.
+refused("a366636f756e7473a262616102616201666c6162656c73a0666e657374656480", "not in canonical order")
+refused("a366636f756e7473a2616101616102666c6162656c73a0666e657374656480", "duplicate key 'a'")
+refused("a466636f756e7473a066636f756e7473a0666c6162656c73a0666e657374656480", "duplicate key 'counts'")
+refused("a366636f756e7473a0666c6162656c73a0666e657374656481a2616201616102", "not in canonical order")
+# A key head longer than its value needs: text key, int key, record key.
+refused("a366636f756e7473a178016101666c6162656c73a0666e657374656480", "not in shortest form")
+refused("a366636f756e7473a0666c6162656c73a11801616f666e657374656480", "not in shortest form")
+refused("a37806636f756e7473a0666c6162656c73a0666e657374656480", "not in shortest form")
+# Record fields may come in any order.
+assert Holder.from_cbor(bytes.fromhex("a3666e657374656480666c6162656c73a066636f756e7473a0")) == Holder(counts={}, labels={}, nested=[])
+print("ok")
+"#,
+        );
+    }
+
+    /// A record union (what `//=` produces) stays the tagged sum. Each Python arm
+    /// is its own class, so the encoder takes the arm of the value's class, and the
+    /// first declared arm wins for two arms of one class.
+    #[test]
+    fn record_unions_are_tagged_by_declaration_order() {
+        let spec = spec_of(vec![CsilRule {
+            name: "Contact".to_string(),
+            rule_type: CsilRuleType::TypeDef(CsilTypeExpression::Choice(vec![
+                inline_group(vec![("id", int_ty()), ("name", text_ty())]),
+                inline_group(vec![("id", int_ty())]),
+                inline_group(vec![("email", text_ty())]),
+            ])),
+            position: create_test_position(),
+            doc_comments: Vec::new(),
+        }]);
+        let files = generate_python_code_from_serialized(&spec, &target_config("python")).unwrap();
+        let types = file_of(&files, "types.py");
+        let union = types
+            .find("Contact = Union[Contact0, Contact1, Contact2]")
+            .unwrap();
+        assert!(types.find("class Contact2:").unwrap() < union);
+        run_python_driver(
+            &files,
+            "record-union",
+            r#"from pk.codec import _encode_contact_value, _decode_contact_value, CsilDecodeError
+from pk.types import Contact0, Contact1, Contact2
+
+assert _encode_contact_value(Contact0(id=1, name="x")) == [0, {"id": 1, "name": "x"}]
+assert _encode_contact_value(Contact1(id=1)) == [1, {"id": 1}]
+assert _decode_contact_value([1, {"id": 1, "name": "x"}]) == Contact1(id=1)
+assert _decode_contact_value([2, {"email": "e"}]) == Contact2(email="e")
+for tree in ([3, {"id": 1}], [0, {"id": 1}], {"id": 1, "name": "x"}):
+    try:
+        _decode_contact_value(tree)
+        raise SystemExit(f"accepted {tree!r}")
+    except CsilDecodeError:
+        pass
+print("ok")
+"#,
+        );
+    }
+
+    /// The encoder refuses, with ValueError only, every value its own decoder
+    /// would refuse: a literal field that does not hold its literal, a value
+    /// outside an enum, a tuple of the wrong arity, and a wrong shape. A literal
+    /// field defaults to its literal, so a default-built record encodes.
+    #[test]
+    fn encoders_refuse_what_decoders_refuse_with_value_error() {
+        let text_lit = |v: &str| CsilTypeExpression::Literal(CsilLiteralValue::Text(v.to_string()));
+        let int_lit = |v: i64| CsilTypeExpression::Literal(CsilLiteralValue::Integer(v));
+        let spec = spec_of(vec![
+            CsilRule {
+                name: "Priority".to_string(),
+                rule_type: CsilRuleType::TypeDef(CsilTypeExpression::Choice(vec![
+                    int_lit(1),
+                    int_lit(2),
+                ])),
+                position: create_test_position(),
+                doc_comments: Vec::new(),
+            },
+            CsilRule {
+                name: "Color".to_string(),
+                rule_type: CsilRuleType::TypeChoice(vec![text_lit("red"), text_lit("blue")]),
+                position: create_test_position(),
+                doc_comments: Vec::new(),
+            },
+            record_rule(
+                "Shape",
+                vec![
+                    ("type", text_lit("circle")),
+                    (
+                        "size",
+                        CsilTypeExpression::Choice(vec![text_lit("s"), text_lit("l")]),
+                    ),
+                    ("prio", ref_ty("Priority")),
+                    ("color", ref_ty("Color")),
+                    (
+                        "pair",
+                        CsilTypeExpression::Tuple(CsilGroupExpression {
+                            entries: vec![bare("a", int_ty()), bare("b", text_ty())],
+                        }),
+                    ),
+                    ("counts", text_map()),
+                ],
+            ),
+        ]);
+        let files = generate_python_code_from_serialized(&spec, &target_config("python")).unwrap();
+        let types = file_of(&files, "types.py");
+        assert!(types.contains("from typing import Literal\n"));
+        assert!(types.contains("Priority = Literal[1, 2]"));
+        assert!(types.contains("    size: Literal[\"s\", \"l\"]\n"));
+        assert!(types.contains("    type: Literal[\"circle\"] = \"circle\"\n"));
+        run_python_driver(
+            &files,
+            "encode-refusals",
+            r#"from pk.types import Shape, Color
+
+good = Shape(size="s", prio=2, color=Color("blue"), pair=(1, "x"), counts={"a": 1})
+assert good.type == "circle"
+assert Shape.from_cbor(good.to_cbor()) == good
+
+def refused(**change):
+    fields = dict(size="s", prio=2, color="blue", pair=(1, "x"), counts={"a": 1})
+    fields.update(change)
+    try:
+        Shape(**fields).to_cbor()
+    except ValueError:
+        return
+    except Exception as exc:
+        raise SystemExit(f"{change}: raised {exc!r}, not ValueError")
+    raise SystemExit(f"{change}: encoded")
+
+refused(type="square")
+refused(size="")
+refused(size=True)
+refused(prio=0)
+refused(prio=True)
+refused(color="")
+refused(pair=(1,))
+refused(pair=None)
+refused(counts=None)
+print("ok")
+"#,
+        );
+    }
+
+    /// `Foo` and `FooService` are different identifiers, so neither is renamed,
+    /// but both have the base `Foo`: the later one keeps its full name for its
+    /// client and op codecs.
+    #[test]
+    fn services_with_one_base_get_distinct_clients() {
+        let spec = spec_of(vec![
+            record_rule("Ping", vec![("n", int_ty())]),
+            service_rule("Foo", vec![("get", int_ty(), int_ty())]),
+            service_rule("FooService", vec![("get", int_ty(), int_ty())]),
+        ]);
+        let config = target_config("python-client");
+        assert!(warnings_for(&spec, &config).is_empty());
+        let files = generate_python_code_from_serialized(&spec, &config).unwrap();
+        let codec = file_of(&files, "codec.py");
+        assert!(codec.contains("def encode_foo_get_request("));
+        assert!(codec.contains("def encode_foo_service_get_request("));
+        run_python_driver(
+            &files,
+            "service-base",
+            r#"from pk.client import FooClient, FooServiceClient
+
+seen = []
+class Fake:
+    def call(self, service, op, req):
+        seen.append(service)
+        return req
+
+assert FooClient(Fake()).get(1) == 1
+assert FooServiceClient(Fake()).get(2) == 2
+assert seen == ["Foo", "FooService"], seen
+print("ok")
+"#,
+        );
+    }
+
+    /// Text enum values that are not identifiers get legal member names from the
+    /// shared `member_idents`, and each value round-trips through the codec.
+    #[test]
+    fn text_enum_members_are_legal_identifiers() {
+        let text_lit = |v: &str| CsilTypeExpression::Literal(CsilLiteralValue::Text(v.to_string()));
+        let values = [
+            "calendars.read",
+            "events.write",
+            "a-b c",
+            "2fa",
+            "class",
+            "pending",
+            "a.b",
+            "a_b",
+        ];
+        let spec = spec_of(vec![
+            CsilRule {
+                name: "Scope".to_string(),
+                rule_type: CsilRuleType::TypeChoice(values.iter().map(|v| text_lit(v)).collect()),
+                position: create_test_position(),
+                doc_comments: Vec::new(),
+            },
+            record_rule("Grant", vec![("scope", ref_ty("Scope"))]),
+        ]);
+        let files = generate_python_code_from_serialized(&spec, &target_config("python")).unwrap();
+        let types = file_of(&files, "types.py");
+        for member in [
+            "    CALENDARS_READ = \"calendars.read\"\n",
+            "    EVENTS_WRITE = \"events.write\"\n",
+            "    A_B_C = \"a-b c\"\n",
+            "    CLASS = \"class\"\n",
+            "    PENDING = \"pending\"\n",
+            "    A_B = \"a.b\"\n",
+            "    A_B_2 = \"a_b\"\n",
+        ] {
+            assert!(types.contains(member), "{member}\n{types}");
+        }
+        assert!(types.contains("= \"2fa\"\n"));
+        run_python_driver(
+            &files,
+            "enum-members",
+            r#"from pk.types import Grant, Scope
+
+values = ["calendars.read", "events.write", "a-b c", "2fa", "class", "pending", "a.b", "a_b"]
+assert [m.value for m in Scope] == values
+assert Scope.V_2_FA.value == "2fa"
+for value in values:
+    g = Grant(scope=Scope(value))
+    assert Grant.from_cbor(g.to_cbor()) == g
+    assert Grant.from_cbor(g.to_cbor()).scope.value == value
+print("ok")
+"#,
         );
     }
 }

@@ -260,7 +260,7 @@ fn named_number_key(ty: &CsilTypeExpression, ctx: &Ctx) -> bool {
 
 fn named_numbers(arms: &[CsilTypeExpression]) -> String {
     let numbers = csilgen_common::enum_numbers(arms).unwrap();
-    let labels = csilgen_common::text_enum_members(arms).unwrap();
+    let labels = common::text_enum_members(arms).unwrap();
     labels
         .iter()
         .zip(numbers)
@@ -296,7 +296,7 @@ fn ts_enc_value(
                     format!("{{ tag: 4, value: csilDecToTag4({expr}) }}")
                 }
             },
-            "null" | "nil" => "null".to_string(),
+            "null" | "nil" | "undefined" => "null".to_string(),
             _ => expr.to_string(),
         },
         CsilTypeExpression::Choice(arms) if csilgen_common::enum_numbers(arms).is_some() => {
@@ -353,8 +353,13 @@ fn ts_enc_value(
                     "enumNumberMap(Object.entries({expr}).map(([csilK, csilV]): [bigint, CborValue] => [{number}, {inner}]))"
                 )
             } else {
+                let key = if common::int_map_key(key) {
+                    "Number(csilK)"
+                } else {
+                    "csilK"
+                };
                 format!(
-                    "new Map<CborValue, CborValue>(Object.entries({expr}).map(([csilK, csilV]): [CborValue, CborValue] => [csilK, {inner}]))"
+                    "new Map<CborValue, CborValue>(Object.entries({expr}).map(([csilK, csilV]): [CborValue, CborValue] => [{key}, {inner}]))"
                 )
             }
         }
@@ -437,7 +442,11 @@ fn ts_dec_value(
                 }
             },
             "any" => expr.to_string(),
-            "null" | "nil" => "null".to_string(),
+            "null" | "nil" | "undefined" => "null".to_string(),
+            "true" | "false" => {
+                imports.insert("asLiteral".to_string());
+                format!("asLiteral<{name}>({expr}, {name})")
+            }
             _ => {
                 imports.insert("asString".to_string());
                 format!("asString({expr})")
@@ -473,16 +482,19 @@ fn ts_dec_value(
             format!("asArray({expr}).map((csilE) => {inner})")
         }
         CsilTypeExpression::Map { key, value, .. } => {
-            imports.insert("asMap".to_string());
-            let key = if named_number_key(key, ctx) {
-                ts_dec_value(key, "csilK", ctx, imports)
+            imports.insert("asDynamicMap".to_string());
+            let (key, key_type) = if named_number_key(key, ctx) {
+                (ts_dec_value(key, "csilK", ctx, imports), "string")
+            } else if common::int_map_key(key) {
+                imports.insert("asNumber".to_string());
+                ("asNumber(csilK)".into(), "number")
             } else {
                 imports.insert("asString".to_string());
-                "asString(csilK)".into()
+                ("asString(csilK)".into(), "string")
             };
             let inner = ts_dec_value(value, "csilV", ctx, imports);
             format!(
-                "Object.fromEntries(Array.from(asMap({expr}), ([csilK, csilV]): [string, {}] => [{key}, {inner}]))",
+                "Object.fromEntries(Array.from(asDynamicMap({expr}), ([csilK, csilV]): [{key_type}, {}] => [{key}, {inner}]))",
                 common::ts_type(value, ctx.mapping)
             )
         }
@@ -657,7 +669,8 @@ fn ts_variant_predicate(ty: &CsilTypeExpression, expr: &str, ctx: &Ctx) -> Strin
             "text" | "tstr" => format!("typeof {expr} === \"string\""),
             "bytes" | "bstr" => format!("{expr} instanceof Uint8Array"),
             "bool" => format!("typeof {expr} === \"boolean\""),
-            "null" | "nil" => format!("{expr} === null"),
+            "true" | "false" => format!("{expr} === {name}"),
+            "null" | "nil" | "undefined" => format!("{expr} === null"),
             "decimal" => match ctx.mapping {
                 DecimalMapping::Csil => format!("{expr} instanceof CsilDecimal"),
                 DecimalMapping::Library => format!("{expr} instanceof Decimal"),
@@ -711,6 +724,108 @@ fn ts_variant_predicate(ty: &CsilTypeExpression, expr: &str, ctx: &Ctx) -> Strin
     }
 }
 
+/// How deep `ts_arm_fits` looks into nested records and containers. A recursive
+/// type would otherwise expand forever; below this depth a record only needs to be
+/// a plain object.
+const FIT_DEPTH: usize = 2;
+
+const PLAIN_OBJECT: &str = "typeof {e} === \"object\" && {e} !== null && !Array.isArray({e}) && !({e} instanceof Uint8Array) && !({e} instanceof Map) && !({e} instanceof Date)";
+
+/// A runtime boolean expression that is true when the plain in-memory value `expr`
+/// fits the arm `ty`: for a record, every required field is present and every
+/// present field fits its type; for a map or array, every value fits. A union
+/// value carries no arm, so the encoder takes the first declared arm that fits.
+/// A record arm that only checked its required keys would take a value that
+/// belongs to a later arm with the same keys but other field types, and a map arm
+/// would take every object.
+fn ts_arm_fits(ty: &CsilTypeExpression, expr: &str, ctx: &Ctx, depth: usize) -> String {
+    let plain = PLAIN_OBJECT.replace("{e}", expr);
+    match unwrap_constrained(ty) {
+        CsilTypeExpression::Reference(name) => {
+            let pascal = common::to_pascal(name);
+            if let Some(underlying) = ctx.aliases.get(&pascal) {
+                return ts_arm_fits(underlying, expr, ctx, depth);
+            }
+            // A nested union is a tagged sum only on the wire; in memory it is the
+            // value of one of its arms.
+            if let Some(arms) = ctx.unions.get(&pascal) {
+                if depth >= FIT_DEPTH {
+                    return "true".to_string();
+                }
+                let fits: Vec<String> = arms
+                    .iter()
+                    .map(|arm| ts_arm_fits(arm, expr, ctx, depth + 1))
+                    .collect();
+                if fits.iter().any(|fit| fit == "true") {
+                    return "true".to_string();
+                }
+                return fits
+                    .iter()
+                    .map(|fit| format!("({fit})"))
+                    .collect::<Vec<_>>()
+                    .join(" || ");
+            }
+            let Some(group) = ctx.record_groups.get(&pascal) else {
+                return ts_variant_predicate(ty, expr, ctx);
+            };
+            let mut checks = vec![plain];
+            for field in codec_fields(group) {
+                let member = ts_string_literal(&field.member);
+                if !field.optional {
+                    checks.push(format!(
+                        "Object.prototype.hasOwnProperty.call({expr}, {member})"
+                    ));
+                }
+                if depth >= FIT_DEPTH {
+                    continue;
+                }
+                let access = format!("({expr} as unknown as Record<string, unknown>)[{member}]");
+                let fits = ts_arm_fits(field.value_type, &access, ctx, depth + 1);
+                if fits == "true" {
+                    continue;
+                }
+                if field.optional {
+                    checks.push(format!("({access} === undefined || {fits})"));
+                } else {
+                    checks.push(format!("({fits})"));
+                }
+            }
+            checks.join(" && ")
+        }
+        CsilTypeExpression::Map { value, .. } => {
+            let item = format!("csilFit{depth}");
+            let fits = if depth >= FIT_DEPTH {
+                "true".to_string()
+            } else {
+                ts_arm_fits(value, &item, ctx, depth + 1)
+            };
+            if fits == "true" {
+                plain
+            } else {
+                format!(
+                    "{plain} && Object.values({expr} as object).every(({item}: unknown) => {fits})"
+                )
+            }
+        }
+        CsilTypeExpression::Array { element_type, .. } => {
+            let item = format!("csilFit{depth}");
+            let fits = if depth >= FIT_DEPTH {
+                "true".to_string()
+            } else {
+                ts_arm_fits(element_type, &item, ctx, depth + 1)
+            };
+            if fits == "true" {
+                format!("Array.isArray({expr})")
+            } else {
+                format!(
+                    "Array.isArray({expr}) && ({expr} as unknown[]).every(({item}: unknown) => {fits})"
+                )
+            }
+        }
+        _ => ts_variant_predicate(ty, expr, ctx),
+    }
+}
+
 /// Emit the per-union codec: a tagged-sum (`[variant_index, value]`) encoder and
 /// decoder plus the byte-level `to<T>Cbor`/`from<T>Cbor`. The variant index is the
 /// 0-based declaration order, matching the Rust/Go/Python reference so a union is
@@ -743,7 +858,7 @@ fn emit_union_codec(name: &str, choices: &[CsilTypeExpression], ctx: &Ctx) -> St
     let order = union_encode_order(&arm_kinds);
     for &i in &order {
         let variant = &choices[i];
-        let pred = ts_variant_predicate(variant, "v", ctx);
+        let pred = ts_arm_fits(variant, "v", ctx, 0);
         let cast = common::ts_type(variant, ctx.mapping);
         let enc = ts_enc_value(variant, "csilV", ctx, &mut ignored_imports);
         out.push_str(&format!(
@@ -952,7 +1067,7 @@ fn emit_record_codec(name: &str, group: &CsilGroupExpression, ctx: &Ctx) -> Stri
     encode_fields.sort_by(|a, b| a.key_bytes.cmp(&b.key_bytes));
     for field in &encode_fields {
         let wire = ts_string_literal(&field.wire);
-        let access = format!("v.{}", field.member);
+        let access = common::member_access("v", &field.member);
         let enc = ts_enc_value(field.value_type, &access, ctx, &mut ignored_imports);
         if field.optional {
             // The `!== undefined` guard narrows the member to its non-optional type
@@ -969,10 +1084,11 @@ fn emit_record_codec(name: &str, group: &CsilGroupExpression, ctx: &Ctx) -> Stri
     out.push_str(&format!(
         "export function from{type_name}CborValue(value: CborValue): {type_name} {{\n"
     ));
+    // A record is a map on the wire; without this check a record of optional
+    // fields would accept any value.
+    out.push_str("  asMap(value);\n");
     if fields.is_empty() {
-        out.push_str(&format!(
-            "  void value;\n  return {{}} as {type_name};\n}}\n\n"
-        ));
+        out.push_str(&format!("  return {{}} as {type_name};\n}}\n\n"));
     } else {
         out.push_str("  return {\n");
         // Decode keeps declaration order; only the encode is canonically sorted.
@@ -982,7 +1098,7 @@ fn emit_record_codec(name: &str, group: &CsilGroupExpression, ctx: &Ctx) -> Stri
                 let dec = ts_dec_value(field.value_type, "csilV", ctx, &mut ignored_imports);
                 out.push_str(&format!(
                     "    {}: ((csilV: CborValue | undefined) => csilV === undefined ? undefined : {dec})(mapGet(value, {wire})),\n",
-                    field.member
+                    common::member_key(&field.member)
                 ));
             } else {
                 let dec = ts_dec_value(
@@ -991,7 +1107,10 @@ fn emit_record_codec(name: &str, group: &CsilGroupExpression, ctx: &Ctx) -> Stri
                     ctx,
                     &mut ignored_imports,
                 );
-                out.push_str(&format!("    {}: {dec},\n", field.member));
+                out.push_str(&format!(
+                    "    {}: {dec},\n",
+                    common::member_key(&field.member)
+                ));
             }
         }
         out.push_str("  };\n}\n\n");
@@ -1004,6 +1123,11 @@ fn emit_record_codec(name: &str, group: &CsilGroupExpression, ctx: &Ctx) -> Stri
         "export function from{type_name}Cbor(bytes: Uint8Array): {type_name} {{\n  return from{type_name}CborValue(decode(bytes));\n}}\n\n"
     ));
     out
+}
+
+/// The error class thrown for a declared RPC error arm.
+pub(crate) fn refusal_name(arm: &str) -> String {
+    format!("{}Refusal", common::to_pascal(arm))
 }
 
 fn rpc_replies(spec: &CsilSpecSerialized, ctx: &Ctx) -> String {
@@ -1024,13 +1148,14 @@ fn rpc_replies(spec: &CsilSpecSerialized, ctx: &Ctx) -> String {
             "export async function encode{stem}Reply(handler: () => Promise<{success}> | {success}): Promise<RpcReply> {{\n  try {{\n    const value = await handler();\n"
         );
         resolve.push_str(&format!(
-            "  if (service === {service:?} && op === {:?}) {{\n    switch (variant) {{\n",
+            "  if (service === {:?} && op === {:?}) {{\n    switch (variant) {{\n",
+            spec.declared_name(service),
             op.name
         ));
         for (index, arm) in arms.iter().enumerate() {
             let name = arm.rpc_variant_name().unwrap();
             let wire = spec.declared_name(name);
-            let cls = format!("{}Refusal", common::to_pascal(name));
+            let cls = refusal_name(name);
             if index == 0 {
                 let value = ts_enc_value(arm, "value", ctx, &mut imports);
                 encode.push_str(&format!("    return {{ variant: {wire:?}, payload: encodeValue({value}) }};\n  }} catch (error) {{\n"));
@@ -1325,9 +1450,13 @@ function encInto(v: CborValue, out: number[]): void {
     head(4, v.length, out);
     for (const x of v) encInto(x, out);
   } else if (v instanceof Map) {
-    head(5, v.size, out);
-    for (const [k, val] of v) {
-      encInto(k, out);
+    // RFC 8949 section 4.2.1: entries go in bytewise order of the encoded keys, so
+    // every peer emits the same bytes and a decoder can check the order in one pass.
+    const entries = Array.from(v, ([k, val]): [Uint8Array, CborValue] => [encodeValue(k), val]);
+    entries.sort(([a], [b]) => csilCompareBytes(a, b));
+    head(5, entries.length, out);
+    for (const [k, val] of entries) {
+      for (const b of k) out.push(b);
       encInto(val, out);
     }
   } else {
@@ -1341,6 +1470,34 @@ export function encodeValue(value: CborValue): Uint8Array {
   const out: number[] = [];
   encInto(value, out);
   return Uint8Array.from(out);
+}
+
+function csilCompareBytes(a: Uint8Array, b: Uint8Array): number {
+  const n = Math.min(a.length, b.length);
+  for (let i = 0; i < n; i++) {
+    if (a[i] !== b[i]) return a[i] - b[i];
+  }
+  return a.length - b.length;
+}
+
+// A record accepts its fields in any order, so the decoder only marks a map whose
+// keys are out of canonical order; a dynamic-map reader refuses a marked map.
+const csilUnorderedMaps = new WeakSet<Map<CborValue, CborValue>>();
+
+// A key with a longer head than needed is a second byte form of the same key, so
+// the order and duplicate checks on raw bytes would miss it.
+function csilShortestHead(b: Uint8Array, at: number): boolean {
+  const major = b[at] >> 5;
+  const low = b[at] & 0x1f;
+  if (major === 7 || low < 24) return true;
+  if (low === 24) return b[at + 1] >= 24;
+  if (low === 25) return b[at + 1] !== 0;
+  if (low === 26) return b[at + 1] !== 0 || b[at + 2] !== 0;
+  return b[at + 1] !== 0 || b[at + 2] !== 0 || b[at + 3] !== 0 || b[at + 4] !== 0;
+}
+
+function csilKeyLabel(key: CborValue): string {
+  return typeof key === "string" ? JSON.stringify(key) : String(key);
 }
 
 type Cursor = { b: Uint8Array; pos: number };
@@ -1467,8 +1624,21 @@ function decInto(st: Cursor, depth: number): CborValue {
       if (arg > BigInt(st.b.length - st.pos)) throw new Error("CBOR map length exceeds remaining input");
       const n = Number(arg);
       const m = new Map<CborValue, CborValue>();
+      // Raw key bytes catch a repeated byte-string key and a key encoded twice in
+      // different widths, which a JS `Map` cannot tell apart from distinct keys.
+      const seen = new Set<string>();
+      let prev: Uint8Array | null = null;
       for (let i = 0; i < n; i++) {
+        const start = st.pos;
         const k = decInto(st, depth + 1);
+        if (!csilShortestHead(st.b, start)) throw new Error("csil cbor: map key is not in shortest form");
+        const raw = st.b.subarray(start, st.pos);
+        let id = "";
+        for (const b of raw) id += String.fromCharCode(b);
+        if (seen.has(id) || m.has(k)) throw new Error(`csil cbor: duplicate key ${csilKeyLabel(k)}`);
+        seen.add(id);
+        if (prev !== null && csilCompareBytes(prev, raw) > 0) csilUnorderedMaps.add(m);
+        prev = raw;
         const val = decInto(st, depth + 1);
         m.set(k, val);
       }
@@ -1532,6 +1702,13 @@ export function asArray(value: CborValue): CborValue[] {
 export function asMap(value: CborValue): Map<CborValue, CborValue> {
   if (value instanceof Map) return value;
   throw new Error("expected a map");
+}
+
+/** A `{ * K => V }` map: its keys must arrive in canonical order (RFC 8949 section 4.2.1). */
+export function asDynamicMap(value: CborValue): Map<CborValue, CborValue> {
+  const m = asMap(value);
+  if (csilUnorderedMaps.has(m)) throw new Error("csil cbor: map keys are not in canonical order");
+  return m;
 }
 
 /** A decoded integer may surface as `bigint` (see `decInto`'s large-value path), so a

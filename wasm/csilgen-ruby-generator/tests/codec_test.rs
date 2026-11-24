@@ -397,7 +397,7 @@ sample = Torture.new(
 # wire, not a tagged-sum array.
 raise "grade-wire" unless sample.csil_to_tree["grade"] == "low"
 
-back = Torture.csil_from_tree(sample.csil_to_tree)
+back = Torture.from_cbor(CsilCbor.encode(sample.csil_to_tree))
 raise "round-trip" unless back == sample
 
 # Level's constrained last arm ("high" .default "normal") keeps its own declared
@@ -407,7 +407,7 @@ raise "round-trip" unless back == sample
   v = Torture.new(**sample.to_h.merge(level: level))
   tree = v.csil_to_tree
   raise "level-idx-#{level}" unless tree["level"] == [want_idx, level]
-  raise "level-round-trip-#{level}" unless Torture.csil_from_tree(tree).level == level
+  raise "level-round-trip-#{level}" unless Torture.from_cbor(CsilCbor.encode(tree)).level == level
 end
 
 # Inline all-literal choices (priority / array element / map value / tuple
@@ -435,7 +435,7 @@ bad = {
   "level" => [2, "not-high"]
 }
 raised = begin
-  Torture.csil_from_tree(bad)
+  Torture.from_cbor(CsilCbor.encode(bad))
   false
 rescue ArgumentError
   true
@@ -445,7 +445,7 @@ raise "expected raise on bad level literal" unless raised
 # Grade decode validates enum membership: an unknown literal must raise.
 bad_grade = bad.merge("grade" => "unknown", "level" => [1, "low"])
 raised_grade = begin
-  Torture.csil_from_tree(bad_grade)
+  Torture.from_cbor(CsilCbor.encode(bad_grade))
   false
 rescue ArgumentError
   true
@@ -455,7 +455,7 @@ raise "expected raise on bad grade literal" unless raised_grade
 # Inline all-literal choices reject an unknown literal on decode too.
 bad_priority = bad.merge("grade" => "low", "priority" => "unknown", "level" => [1, "low"])
 raised_priority = begin
-  Torture.csil_from_tree(bad_priority)
+  Torture.from_cbor(CsilCbor.encode(bad_priority))
   false
 rescue ArgumentError
   true
@@ -541,7 +541,7 @@ const MIXED_KIND_ENUM_DRIVER_RUBY: &str = r#"require_relative "codec"
   item = Item.new(id: 1, priority: value)
   tree = item.csil_to_tree
   raise "wire-#{value}" unless tree["priority"] == want
-  back = Item.csil_from_tree(tree)
+  back = Item.from_cbor(CsilCbor.encode(tree))
   raise "roundtrip-#{value}" unless back.priority == want
 end
 
@@ -550,7 +550,7 @@ end
 # any string through.
 bad_text = { "id" => 1, "priority" => "medium" }
 raised_text = begin
-  Item.csil_from_tree(bad_text)
+  Item.from_cbor(CsilCbor.encode(bad_text))
   false
 rescue ArgumentError
   true
@@ -560,7 +560,7 @@ raise "expected raise on out-of-vocabulary text" unless raised_text
 # Likewise for an out-of-vocabulary INTEGER value.
 bad_int = { "id" => 1, "priority" => 6 }
 raised_int = begin
-  Item.csil_from_tree(bad_int)
+  Item.from_cbor(CsilCbor.encode(bad_int))
   false
 rescue ArgumentError
   true
@@ -1164,5 +1164,116 @@ fn renamed_rules_are_reported_as_warnings() {
         output.warnings[0]
             .message
             .contains("rule `UserId` is generated as `UserIdType` for ruby")
+    );
+}
+
+#[test]
+fn dynamic_maps_encode_and_decode_in_canonical_key_order() {
+    let map = |key: &str, value: &str| CsilTypeExpression::Map {
+        key: Box::new(builtin(key)),
+        value: Box::new(builtin(value)),
+        occurrence: None,
+    };
+    let s = spec(vec![group_rule(
+        "Holder",
+        vec![
+            bare_entry("counts", map("text", "int")),
+            bare_entry("labels", map("int", "text")),
+        ],
+    )]);
+    let files = generate_ruby_code_from_serialized(&s, &config("ruby-typesonly"))
+        .expect("generation succeeded");
+    run_ruby_driver(
+        &files,
+        "map-order",
+        r##"require_relative "codec"
+# Insertion order is not the wire order: keys sort by their encoded bytes.
+h = Holder.new(counts: { "aa" => 2, "b" => 1 }, labels: { -1 => "m", 10 => "t", 1 => "o" })
+want = "a266636f756e7473a261620162616102666c6162656c73a301616f0a61742061" + "6d"
+raise "encode #{h.to_cbor.unpack1("H*")}" unless h.to_cbor.unpack1("H*") == want
+raise "round trip" unless Holder.from_cbor(h.to_cbor) == h
+# A record keeps any field order on decode, but a repeated key is refused.
+reordered = ["a2666c6162656c73a066636f756e7473a0"].pack("H*")
+raise "reordered" unless Holder.from_cbor(reordered) == Holder.new(counts: {}, labels: {})
+[
+  ["a266636f756e7473a262616102616201666c6162656c73a0", "not in canonical order"],
+  ["a266636f756e7473a2616101616102666c6162656c73a0", "duplicate key"],
+  ["a366636f756e7473a066636f756e7473a0666c6162656c73a0", "duplicate key"],
+  ["a166636f756e7473a0", "missing key"],
+  ["a266636f756e7473a1780161610a666c6162656c73a0", "not in shortest form"],
+  ["a266636f756e7473a0666c6162656c73a1180163616f6e65", "not in shortest form"],
+  ["a27806636f756e7473a0666c6162656c73a0", "not in shortest form"]
+].each do |hex, message|
+  begin
+    Holder.from_cbor([hex].pack("H*"))
+  rescue ArgumentError => e
+    raise "#{hex}: #{e.message}" unless e.message.include?(message)
+    next
+  end
+  raise "#{hex} decoded"
+end
+puts "ok"
+"##,
+    );
+}
+
+#[test]
+fn text_enum_values_that_are_not_identifiers_round_trip() {
+    let text = |v: &str| CsilTypeExpression::Literal(CsilLiteralValue::Text(v.to_string()));
+    let values = [
+        "calendars.read",
+        "events.write",
+        "a-b c",
+        "2fa",
+        "class",
+        "numbers",
+    ];
+    let s = spec(vec![
+        type_def_rule(
+            "Scope",
+            CsilTypeExpression::Choice(values.iter().map(|v| text(v)).collect()),
+        ),
+        group_rule(
+            "Grant",
+            vec![
+                bare_entry("scope", reference("Scope")),
+                bare_entry(
+                    "extra",
+                    CsilTypeExpression::Array {
+                        element_type: Box::new(reference("Scope")),
+                        occurrence: None,
+                    },
+                ),
+            ],
+        ),
+    ]);
+    let files = generate_ruby_code_from_serialized(&s, &config("ruby-typesonly"))
+        .expect("generation succeeded");
+    let types = &files.iter().find(|f| f.path == "types.rb").unwrap().content;
+    for constant in [
+        "CALENDARS_READ = new(\"calendars.read\")",
+        "EVENTS_WRITE = new(\"events.write\")",
+        "A_B_C = new(\"a-b c\")",
+        "V_2FA = new(\"2fa\")",
+        "CLASS = new(\"class\")",
+        "V_NUMBERS = new(\"numbers\")",
+    ] {
+        assert!(types.contains(constant), "{constant} missing:\n{types}");
+    }
+    run_ruby_driver(
+        &files,
+        "dotted-enum",
+        r##"$VERBOSE = true
+require_relative "codec"
+all = [Scope::CALENDARS_READ, Scope::EVENTS_WRITE, Scope::A_B_C, Scope::V_2FA, Scope::CLASS, Scope::V_NUMBERS]
+want = ["calendars.read", "events.write", "a-b c", "2fa", "class", "numbers"]
+raise "wire values" unless all == want
+all.each do |scope|
+  grant = Grant.new(scope: scope, extra: all)
+  back = Grant.from_cbor(grant.to_cbor)
+  raise "round trip #{scope}" unless back == grant && back.scope.equal?(scope)
+end
+puts "ok"
+"##,
     );
 }

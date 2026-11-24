@@ -2,6 +2,47 @@
 
 pub mod dependency_report;
 
+/// Print a line to stdout. A reader that closes the pipe early (`csilgen ... | head`)
+/// ends the process with the usual SIGPIPE status, 141. `println!` panics there
+/// instead, and with `panic = "abort"` that leaves a core file.
+#[macro_export]
+macro_rules! outln {
+    () => {
+        $crate::write_line(false, format_args!(""))
+    };
+    ($($arg:tt)*) => {
+        $crate::write_line(false, format_args!($($arg)*))
+    };
+}
+
+/// Print a line to stderr, with the same closed-pipe handling as [`outln!`].
+#[macro_export]
+macro_rules! errln {
+    () => {
+        $crate::write_line(true, format_args!(""))
+    };
+    ($($arg:tt)*) => {
+        $crate::write_line(true, format_args!($($arg)*))
+    };
+}
+
+#[doc(hidden)]
+pub fn write_line(to_stderr: bool, args: std::fmt::Arguments<'_>) {
+    use std::io::Write;
+    let result = if to_stderr {
+        let mut err = std::io::stderr().lock();
+        err.write_fmt(args).and_then(|()| err.write_all(b"\n"))
+    } else {
+        let mut out = std::io::stdout().lock();
+        out.write_fmt(args).and_then(|()| out.write_all(b"\n"))
+    };
+    if let Err(error) = result
+        && error.kind() == std::io::ErrorKind::BrokenPipe
+    {
+        std::process::exit(141);
+    }
+}
+
 use csilgen_common::GeneratorConfig;
 use csilgen_core::{
     CsilSpec, FileDependencyGraph, ImportResolver, LiteralValue, parse_csil_file,
@@ -87,13 +128,13 @@ fn report_generator_warnings(
             .as_ref()
             .map(|l| format!(" (declared at line {})", l.line))
             .unwrap_or_default();
-        eprintln!(
+        crate::errln!(
             "Warning ({target}): {}: {}{location}",
             input_file.display(),
             warning.message
         );
         if let Some(suggestion) = &warning.suggestion {
-            eprintln!("  suggestion: {suggestion}");
+            crate::errln!("  suggestion: {suggestion}");
         }
     }
 }
@@ -389,6 +430,7 @@ fn process_entry_points(
     let mut total_size = 0;
     let mut processed_count = 0;
     let mut error_count = 0;
+    let mut pending = Vec::with_capacity(entry_points.len());
 
     for (i, input_file) in entry_points.iter().enumerate() {
         processed_count += 1;
@@ -406,14 +448,14 @@ fn process_entry_points(
             Err(e) => {
                 let detailed_error =
                     format!("Failed to parse CSIL file {}: {}", input_file.display(), e);
-                eprintln!("{detailed_error}");
+                crate::errln!("{detailed_error}");
                 error_count += 1;
                 continue;
             }
         };
 
         if let Err(e) = validate_spec_optimized(&spec) {
-            eprintln!("Validation failed for {}: {}", input_file.display(), e);
+            crate::errln!("Validation failed for {}: {}", input_file.display(), e);
             error_count += 1;
             continue;
         }
@@ -421,7 +463,7 @@ fn process_entry_points(
         let schema_path = match schema_output_path(input_file, output_dir) {
             Ok(path) => path,
             Err(e) => {
-                eprintln!(
+                crate::errln!(
                     "Failed to derive schema path for {}: {}",
                     input_file.display(),
                     e
@@ -434,7 +476,7 @@ fn process_entry_points(
             match build_schema_descriptor(input_file, &spec) {
                 Ok(bytes) => Some(bytes),
                 Err(e) => {
-                    eprintln!(
+                    crate::errln!(
                         "Failed to create schema descriptor for {}: {}",
                         input_file.display(),
                         e
@@ -474,7 +516,7 @@ fn process_entry_points(
                     input_file.display(),
                     e
                 );
-                eprintln!("{detailed_error}");
+                crate::errln!("{detailed_error}");
                 error_count += 1;
                 continue;
             }
@@ -488,7 +530,7 @@ fn process_entry_points(
                 &schema_path,
             )
         {
-            eprintln!(
+            crate::errln!(
                 "Failed to reserve the schema descriptor path for {}: {}",
                 input_file.display(),
                 e
@@ -498,10 +540,23 @@ fn process_entry_points(
         }
 
         if let Some(pb) = &progress_bar {
-            pb.set_message(format!("Writing {} files", generated_files.len()));
             pb.set_position((i * 3 + 2) as u64);
         }
 
+        pending.push((input_file, generated_files, schema_path, schema_bytes));
+    }
+
+    // Write only when every entry point generated: a partial set of files from a
+    // failed run looks complete to a build that does not read the error.
+    if error_count > 0 {
+        crate::errln!("No files were written, because {error_count} entry point(s) failed");
+        pending.clear();
+    }
+
+    for (input_file, generated_files, schema_path, schema_bytes) in pending {
+        if let Some(pb) = &progress_bar {
+            pb.set_message(format!("Writing {} files", generated_files.len()));
+        }
         match write_generated_files(&generator_id, &generated_files, output_dir) {
             Ok((files_written, size)) => {
                 total_files_written += files_written;
@@ -513,7 +568,7 @@ fn process_entry_points(
                             total_size += schema_bytes.len();
                         }
                         Err(e) => {
-                            eprintln!(
+                            crate::errln!(
                                 "Failed to write schema descriptor for {}: {}",
                                 input_file.display(),
                                 e
@@ -524,17 +579,13 @@ fn process_entry_points(
                 }
             }
             Err(e) => {
-                eprintln!(
+                crate::errln!(
                     "Failed to write generated files for {}: {}",
                     input_file.display(),
                     e
                 );
                 error_count += 1;
             }
-        }
-
-        if let Some(pb) = &progress_bar {
-            pb.set_position((i * 3 + 3) as u64);
         }
     }
 
@@ -905,7 +956,7 @@ mod tests {
         assert!(result.is_err());
         let error_msg = result.unwrap_err().to_string();
         // Debug print to see actual error message
-        eprintln!("Actual error message: {error_msg}");
+        crate::errln!("Actual error message: {error_msg}");
         assert!(error_msg.contains("does not exist") || error_msg.contains("No CSIL files found"));
     }
 
@@ -923,6 +974,34 @@ mod tests {
         assert!(result.is_err());
         let error_msg = result.unwrap_err().to_string();
         assert!(error_msg.contains("Unknown target"));
+    }
+
+    #[test]
+    fn test_generate_code_writes_nothing_when_one_entry_point_fails() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let input_dir = temp_dir.path().join("input");
+        let output_dir = temp_dir.path().join("output");
+        fs::create_dir_all(&input_dir).expect("Failed to create input dir");
+        create_test_csil_file(&input_dir, "good.csil", "User = { name: text }");
+        create_test_csil_file(&input_dir, "bad.csil", "Dup = int\nDup = text");
+
+        let pattern = input_dir.join("*.csil").to_string_lossy().to_string();
+        match generate_code(&pattern, "noop", &output_dir) {
+            Ok(result) => assert_eq!(result.error_count, 1),
+            Err(e) => {
+                let error_str = e.to_string();
+                assert!(
+                    error_str.contains("Generator")
+                        || error_str.contains("WASM")
+                        || error_str.contains("runtime"),
+                    "Unexpected error: {error_str}"
+                );
+            }
+        }
+        let written: Vec<_> = fs::read_dir(&output_dir)
+            .map(|entries| entries.flatten().map(|e| e.path()).collect())
+            .unwrap_or_default();
+        assert!(written.is_empty(), "partial output written: {written:?}");
     }
 
     #[test]

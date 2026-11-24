@@ -92,13 +92,18 @@ impl OpenApiGenerator {
                         CsilTypeExpression::Choice(choices.clone()),
                     );
                 }
+                // Every record arm is a valid value, not only the first.
                 CsilRuleType::GroupChoice(groups) => {
-                    if let Some(first_group) = groups.first() {
-                        type_definitions.insert(
-                            rule.name.clone(),
-                            CsilTypeExpression::Group(first_group.clone()),
-                        );
-                    }
+                    type_definitions.insert(
+                        rule.name.clone(),
+                        CsilTypeExpression::Choice(
+                            groups
+                                .iter()
+                                .cloned()
+                                .map(CsilTypeExpression::Group)
+                                .collect(),
+                        ),
+                    );
                 }
             }
         }
@@ -405,13 +410,14 @@ impl OpenApiGenerator {
                         distinct.push(entry_schema);
                     }
                 }
-                // A `oneOf` requires at least one branch and is pointless for a
+                // An `anyOf` requires at least one branch and is pointless for a
                 // single distinct type, so collapse those cases to a plain
-                // schema (or an unconstrained schema for the empty tuple).
+                // schema (or an unconstrained schema for the empty tuple). Not
+                // `oneOf`: an integer item matches both `integer` and `number`.
                 let items = match distinct.len() {
                     0 => json!({}),
                     1 => distinct.pop().unwrap(),
-                    _ => json!({ "oneOf": distinct }),
+                    _ => json!({ "anyOf": distinct }),
                 };
                 Ok(json!({
                     "type": "array",
@@ -441,8 +447,11 @@ impl OpenApiGenerator {
                     .map(|choice| self.type_expression_to_schema(choice, type_definitions))
                     .collect();
 
+                // A CSIL choice is untagged and decodes by the first arm that fits,
+                // so a value can match more than one arm (a record union whose
+                // arms share fields). `oneOf` would reject that valid value.
                 Ok(json!({
-                    "oneOf": choice_schemas?
+                    "anyOf": choice_schemas?
                 }))
             }
             CsilTypeExpression::Range {
@@ -1336,9 +1345,9 @@ mod tests {
         let openapi_json: Value = serde_json::from_str(&result[0].content).unwrap();
 
         let choice_schema = &openapi_json["components"]["schemas"]["StringOrInt"];
-        assert!(choice_schema["oneOf"].is_array());
+        assert!(choice_schema["anyOf"].is_array());
 
-        let choices = choice_schema["oneOf"].as_array().unwrap();
+        let choices = choice_schema["anyOf"].as_array().unwrap();
         assert_eq!(choices.len(), 2);
         assert_eq!(choices[0]["type"], "string");
         assert_eq!(choices[1]["type"], "integer");
@@ -1348,6 +1357,37 @@ mod tests {
     // cannot ride as a numeric `minimum`/`maximum` (that would be an invalid
     // OpenAPI schema), so it must survive as a string-valued vendor extension
     // rather than being silently dropped.
+    #[test]
+    fn record_union_with_shared_fields_uses_any_of() {
+        let field = |name: &str| CsilGroupEntry {
+            key: Some(CsilGroupKey::Bare(name.to_string())),
+            value_type: CsilTypeExpression::Builtin("int".to_string()),
+            occurrence: None,
+            metadata: vec![],
+            doc_comments: Vec::new(),
+        };
+        let record = |names: &[&str]| {
+            CsilTypeExpression::Group(CsilGroupExpression {
+                entries: names.iter().map(|name| field(name)).collect(),
+            })
+        };
+        let spec = spec_from_rules(vec![CsilRule {
+            name: "Contact".to_string(),
+            rule_type: CsilRuleType::TypeDef(CsilTypeExpression::Choice(vec![
+                record(&["id", "name"]),
+                record(&["id"]),
+            ])),
+            position: create_test_position(),
+            doc_comments: Vec::new(),
+        }]);
+        let (result, _warnings) = generate_openapi_spec(&spec, &create_test_config()).unwrap();
+        let openapi_json: Value = serde_json::from_str(&result[0].content).unwrap();
+        let contact = &openapi_json["components"]["schemas"]["Contact"];
+        // `{id, name}` fits both arms, so only `anyOf` accepts it.
+        assert_eq!(contact["anyOf"].as_array().map(Vec::len), Some(2));
+        assert!(contact.get("oneOf").is_none());
+    }
+
     #[test]
     fn string_typed_comparison_bounds_use_vendor_extension() {
         let spec = spec_from_rules(vec![CsilRule {
@@ -2024,7 +2064,7 @@ mod tests {
         assert_eq!(schema["type"], "array");
         assert_eq!(schema["minItems"], 3);
         assert_eq!(schema["maxItems"], 3);
-        let one_of = schema["items"]["oneOf"].as_array().unwrap();
+        let one_of = schema["items"]["anyOf"].as_array().unwrap();
         // Three distinct value types produce three union branches.
         assert_eq!(one_of.len(), 3);
         assert!(one_of.iter().any(|s| s["type"] == "string"));
@@ -2043,8 +2083,8 @@ mod tests {
         );
         assert_eq!(schema["minItems"], 2);
         assert_eq!(schema["maxItems"], 2);
-        // One distinct type means no pointless single-branch `oneOf`.
-        assert!(schema["items"].get("oneOf").is_none());
+        // One distinct type means no pointless single-branch `anyOf`.
+        assert!(schema["items"].get("anyOf").is_none());
         assert_eq!(schema["items"]["type"], "string");
     }
 
@@ -2055,8 +2095,8 @@ mod tests {
         assert_eq!(schema["minItems"], 0);
         assert_eq!(schema["maxItems"], 0);
         // An empty tuple's items schema is unconstrained, never an invalid
-        // empty `oneOf`.
-        assert!(schema["items"].get("oneOf").is_none());
+        // empty `anyOf`.
+        assert!(schema["items"].get("anyOf").is_none());
     }
 
     #[test]
@@ -2072,7 +2112,7 @@ mod tests {
         );
         assert_eq!(schema["type"], "array");
         assert_eq!(schema["minItems"], 2);
-        let one_of = schema["items"]["oneOf"].as_array().unwrap();
+        let one_of = schema["items"]["anyOf"].as_array().unwrap();
         // `any` is the empty schema, distinct from the `text` branch.
         assert_eq!(one_of.len(), 2);
         assert!(one_of.iter().any(|s| s["type"] == "string"));

@@ -3004,7 +3004,7 @@ fn codec_walks_named_map_alias_fields() {
     );
     assert!(
         codec.contains(
-            "queueCounts: Object.fromEntries(Array.from(asMap(requireKey(value, \"queue_counts\"))"
+            "queueCounts: Object.fromEntries(Array.from(asDynamicMap(requireKey(value, \"queue_counts\"))"
         ),
         "named map alias not walked on decode:\n{codec}"
     );
@@ -5282,4 +5282,695 @@ fn cddl_time_codec_passes_shared_vectors() {
         String::from_utf8_lossy(&run.stderr)
     );
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---------------------------------------------------------------------------
+// Derived names, mixed op boundaries, service clashes, hoisted-name clashes,
+// canonical maps and record-union arm choice
+// ---------------------------------------------------------------------------
+
+fn service_rule(name: &str, operations: Vec<CsilServiceOperation>) -> CsilRule {
+    CsilRule {
+        name: name.to_string(),
+        rule_type: CsilRuleType::ServiceDef(CsilServiceDefinition {
+            operations,
+            wire_id: None,
+        }),
+        position: pos(),
+        doc_comments: vec![],
+    }
+}
+
+fn typedef(name: &str, ty: CsilTypeExpression) -> CsilRule {
+    CsilRule {
+        name: name.to_string(),
+        rule_type: CsilRuleType::TypeDef(ty),
+        position: pos(),
+        doc_comments: vec![],
+    }
+}
+
+fn text_map(value: &str) -> CsilTypeExpression {
+    CsilTypeExpression::Map {
+        key: Box::new(builtin("text")),
+        value: Box::new(builtin(value)),
+        occurrence: None,
+    }
+}
+
+fn run_output(input: &WasmGeneratorInput) -> WasmGeneratorOutput {
+    let json = serde_json::to_vec(input).expect("serialize");
+    crate::process_generation(json.as_ptr(), json.len()).expect("generate")
+}
+
+fn count(haystack: &str, needle: &str) -> usize {
+    haystack.matches(needle).count()
+}
+
+/// Write `files` plus `driver` to a fresh directory, type-check everything with
+/// strict `tsc`, then run the driver under node. Returns the driver's stdout, or
+/// `None` when node/npx are not on PATH.
+fn typecheck_and_run(label: &str, files: &[GeneratedFile], driver: &str) -> Option<String> {
+    if !have_node_npx() {
+        eprintln!("skipping: node/npx not on PATH");
+        return None;
+    }
+    let dir = std::env::temp_dir().join(format!("csilgen-ts-{label}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    for f in files {
+        std::fs::write(dir.join(&f.path), &f.content).unwrap();
+    }
+    std::fs::write(dir.join("driver.ts"), driver).unwrap();
+    std::fs::write(
+        dir.join("tsconfig.json"),
+        r#"{"compilerOptions":{"target":"es2020","module":"nodenext","moduleResolution":"nodenext","strict":true,"skipLibCheck":true,"allowImportingTsExtensions":true,"noEmit":true,"lib":["es2020","dom"],"types":[]},"include":["*.ts"]}"#,
+    )
+    .unwrap();
+    let build = run_tsc(&dir, &[]);
+    assert!(
+        build.status.success(),
+        "tsc failed for {label}:\n{}{}",
+        String::from_utf8_lossy(&build.stdout),
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let run = std::process::Command::new("node")
+        .arg("driver.ts")
+        .current_dir(&dir)
+        .output()
+        .unwrap();
+    assert!(
+        run.status.success(),
+        "node failed for {label}:\n{}{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+    Some(String::from_utf8_lossy(&run.stdout).into_owned())
+}
+
+/// The first linkkeys schema of `rust-false-op-codec-clash-renames.md`: the op's
+/// own record boundaries clash with nothing the TypeScript output declares.
+fn linkkeys_attestation_spec() -> CsilSpecSerialized {
+    spec_of(vec![
+        record_typedef(
+            "RpIssueAttestationRequest",
+            vec![
+                field("claim_type", builtin("text"), false),
+                field("claim_value", builtin("bytes"), false),
+            ],
+        ),
+        record_typedef(
+            "RpIssueAttestationResponse",
+            vec![field("deposited", builtin("bool"), false)],
+        ),
+        service_rule(
+            "Rp",
+            vec![op(
+                "issue-attestation",
+                "RpIssueAttestationRequest",
+                "RpIssueAttestationResponse",
+                vec![],
+            )],
+        ),
+    ])
+}
+
+#[test]
+fn op_boundary_records_keep_their_names() {
+    let input = input_with_spec("typescript", linkkeys_attestation_spec());
+    let output = run_output(&input);
+    assert!(output.warnings.is_empty(), "{:?}", output.warnings);
+    let types = file(&output.files, "types.gen.ts");
+    assert_eq!(
+        count(types, "export interface RpIssueAttestationRequest "),
+        1,
+        "{types}"
+    );
+    let codec = file(&output.files, "codec.gen.ts");
+    assert_eq!(
+        count(codec, "export function toRpIssueAttestationRequestCbor("),
+        1,
+        "{codec}"
+    );
+    let driver = r#"import { RpClient } from "./client.gen.ts";
+import { fromRpIssueAttestationRequestCbor, toRpIssueAttestationRequestCbor } from "./codec.gen.ts";
+import type { RpIssueAttestationRequest } from "./types.gen.ts";
+const req: RpIssueAttestationRequest = { claimType: "email", claimValue: new Uint8Array([1]) };
+const back = fromRpIssueAttestationRequestCbor(toRpIssueAttestationRequestCbor(req));
+void RpClient;
+console.log(back.claimType);
+"#;
+    if let Some(out) = typecheck_and_run("linkkeys-records", &output.files, driver) {
+        assert_eq!(out.trim(), "email");
+    }
+}
+
+/// The second schema of the request. TypeScript derives no per-operation codec
+/// name (op boundaries go through `to<T>Cbor` of the boundary type), so
+/// `MemberGetMemberRequest` clashes with nothing here and keeps its name; the
+/// clash it has in Rust does not exist in this target.
+#[test]
+fn op_codec_shaped_rule_keeps_its_name_without_a_typescript_clash() {
+    let spec = spec_of(vec![
+        typedef("MemberID", builtin("text")),
+        record_typedef(
+            "MemberGetMemberRequest",
+            vec![field("id", builtin("text"), false)],
+        ),
+        service_rule(
+            "Member",
+            vec![op("get-member", "MemberID", "MemberID", vec![])],
+        ),
+    ]);
+    let output = run_output(&input_with_spec("typescript", spec));
+    assert!(output.warnings.is_empty(), "{:?}", output.warnings);
+    let types = file(&output.files, "types.gen.ts");
+    assert!(
+        types.contains("export interface MemberGetMemberRequest "),
+        "{types}"
+    );
+}
+
+/// A real clash with a derived name is still renamed with a warning, but only when
+/// the derived item is emitted: `MemberClient` is the client class, which exists
+/// for the `typescript` target and not for `typescript-typesonly`.
+#[test]
+fn derived_name_is_reserved_only_where_it_is_emitted() {
+    let spec = spec_of(vec![
+        typedef("MemberID", builtin("text")),
+        record_typedef("MemberClient", vec![field("id", builtin("text"), false)]),
+        record_typedef("MemberWireIds", vec![field("id", builtin("text"), false)]),
+        service_rule(
+            "Member",
+            vec![op("get-member", "MemberID", "MemberID", vec![])],
+        ),
+    ]);
+    let full = run_output(&input_with_spec("typescript", spec.clone()));
+    assert_eq!(full.warnings.len(), 1, "{:?}", full.warnings);
+    assert!(
+        full.warnings[0]
+            .message
+            .starts_with("rule `MemberClient` is generated as `MemberClientType`"),
+        "{:?}",
+        full.warnings
+    );
+    let types = file(&full.files, "types.gen.ts");
+    assert!(
+        types.contains("export interface MemberClientType "),
+        "{types}"
+    );
+    // The service has no wire id, so no `MemberWireIds` const exists to clash with.
+    assert!(types.contains("export interface MemberWireIds "), "{types}");
+    typecheck_emitted_package(
+        "derived-clash",
+        &package_input_with_spec("typescript", spec.clone()),
+    );
+
+    let typesonly = run_output(&input_with_spec("typescript-typesonly", spec));
+    assert!(typesonly.warnings.is_empty(), "{:?}", typesonly.warnings);
+    let types = file(&typesonly.files, "types.gen.ts");
+    assert!(types.contains("export interface MemberClient "), "{types}");
+}
+
+/// The shape of `tests/interop/wire-vectors/wire.csil`'s service: an output with an
+/// inline map arm and a record arm has no reply variants.
+fn mixed_output_spec() -> CsilSpecSerialized {
+    spec_of(vec![
+        record_typedef("Holder", vec![field("counts", text_map("int"), false)]),
+        record_typedef("Err", vec![field("message", builtin("text"), false)]),
+        service_rule(
+            "Lookup",
+            vec![CsilServiceOperation {
+                name: "read-counts".to_string(),
+                input_type: reference("Holder"),
+                output_type: CsilTypeExpression::Choice(vec![text_map("int"), reference("Err")]),
+                direction: CsilServiceDirection::Unidirectional,
+                position: pos(),
+                doc_comments: vec![],
+                wire_id: None,
+            }],
+        ),
+    ])
+}
+
+#[test]
+fn mixed_op_output_is_one_named_union_in_client_and_server() {
+    let output = run_output(&input_with_spec("typescript", mixed_output_spec()));
+    let types = file(&output.files, "types.gen.ts");
+    assert!(
+        types.contains("export type LookupReadCountsOutput = Record<string, number> | Err;"),
+        "{types}"
+    );
+    let client = file(&output.files, "client.gen.ts");
+    assert!(
+        client.contains("readCounts(req: Holder): LookupReadCountsOutput {"),
+        "{client}"
+    );
+    assert!(
+        client.contains("fromLookupReadCountsOutputCborValue("),
+        "{client}"
+    );
+    let server = file(&output.files, "server.gen.ts");
+    assert!(
+        server.contains(
+            "readCounts(req: Holder, ctx: RequestContext): Promise<LookupReadCountsOutput>;"
+        ),
+        "{server}"
+    );
+    // Both arms travel: the map arm is index 0, the error record index 1.
+    let driver = r#"import { fromLookupReadCountsOutputCbor, toLookupReadCountsOutputCbor } from "./codec.gen.ts";
+const hex = (b: Uint8Array) => Array.from(b, (x) => x.toString(16).padStart(2, "0")).join("");
+const map = toLookupReadCountsOutputCbor({ a: 1 });
+const err = toLookupReadCountsOutputCbor({ message: "boom" });
+console.log(hex(map), hex(err), JSON.stringify(fromLookupReadCountsOutputCbor(err)));
+"#;
+    if let Some(out) = typecheck_and_run("mixed-output", &output.files, driver) {
+        assert_eq!(
+            out.trim(),
+            "8200a1616101 8201a1676d65737361676564626f6f6d {\"message\":\"boom\"}"
+        );
+    }
+}
+
+#[test]
+fn services_with_one_identifier_keep_their_wire_names() {
+    let spec = spec_of(vec![
+        record_typedef("Ping", vec![field("msg", builtin("text"), false)]),
+        service_rule("UserSvc", vec![op("ping", "Ping", "Ping", vec![])]),
+        service_rule("user-svc", vec![op("ping", "Ping", "Ping", vec![])]),
+        // A different identifier, but the same `<Base>` once `Service` is stripped.
+        service_rule("Echo", vec![op("ping", "Ping", "Ping", vec![])]),
+        service_rule("EchoService", vec![op("ping", "Ping", "Ping", vec![])]),
+    ]);
+    let output = run_output(&input_with_spec("typescript", spec.clone()));
+    assert_eq!(output.warnings.len(), 2, "{:?}", output.warnings);
+    for service in ["user-svc", "EchoService"] {
+        assert!(
+            output.warnings.iter().any(|w| w
+                .message
+                .starts_with(&format!("service `{service}` is generated as"))),
+            "{:?}",
+            output.warnings
+        );
+    }
+    let client = file(&output.files, "client.gen.ts");
+    assert!(client.contains("export class UserSvcClient "), "{client}");
+    assert!(client.contains("export class UserSvc2Client "), "{client}");
+    assert!(
+        client.contains("this.t.call(\"UserSvc\", \"ping\""),
+        "{client}"
+    );
+    assert!(
+        client.contains("this.t.call(\"user-svc\", \"ping\""),
+        "{client}"
+    );
+    let server = file(&output.files, "server.gen.ts");
+    assert!(server.contains("case \"UserSvc\": {"), "{server}");
+    assert!(server.contains("case \"user-svc\": {"), "{server}");
+    assert!(!server.contains("\"user-svc2"), "{server}");
+    assert!(client.contains("export class EchoClient "), "{client}");
+    assert!(
+        client.contains("export class EchoService2Client "),
+        "{client}"
+    );
+    assert!(server.contains("case \"EchoService\": {"), "{server}");
+    typecheck_emitted_package(
+        "service-clash",
+        &package_input_with_spec("typescript", spec),
+    );
+}
+
+/// The hoister names `Request`'s inline `context` record `Request_context`. It
+/// keeps clear of rule names, but its TypeScript type `RequestContext` is the
+/// server's own context interface; renamed before the hoist, the clash went
+/// unchecked and `index.ts` hid one of the two. The synthesized rule moves.
+#[test]
+fn hoisted_name_that_clashes_is_renamed() {
+    let spec = spec_of(vec![
+        record_typedef(
+            "Request",
+            vec![field(
+                "context",
+                CsilTypeExpression::Group(CsilGroupExpression {
+                    entries: vec![field("a", builtin("int"), false)],
+                }),
+                false,
+            )],
+        ),
+        service_rule("Echo", vec![op("echo", "Request", "Request", vec![])]),
+    ]);
+    let output = run_output(&input_with_spec("typescript", spec.clone()));
+    assert_eq!(output.warnings.len(), 1, "{:?}", output.warnings);
+    assert!(
+        output.warnings[0]
+            .message
+            .starts_with("rule `Request_context` is generated as `Request_contextType`"),
+        "{:?}",
+        output.warnings
+    );
+    let types = file(&output.files, "types.gen.ts");
+    assert!(
+        types.contains("export interface RequestContextType {\n  a: number;"),
+        "{types}"
+    );
+    assert!(types.contains("context: RequestContextType;"), "{types}");
+    typecheck_emitted_package("hoist-clash", &package_input_with_spec("typescript", spec));
+}
+
+#[test]
+fn dynamic_maps_are_canonical_and_records_refuse_duplicate_keys() {
+    let spec = spec_of(vec![record_typedef(
+        "Holder",
+        vec![
+            field("counts", text_map("int"), false),
+            field(
+                "labels",
+                CsilTypeExpression::Map {
+                    key: Box::new(builtin("int")),
+                    value: Box::new(builtin("text")),
+                    occurrence: None,
+                },
+                false,
+            ),
+        ],
+    )]);
+    let output = run_output(&input_with_spec("typescript", spec));
+    let types = file(&output.files, "types.gen.ts");
+    assert!(types.contains("labels: Record<number, string>;"), "{types}");
+    let driver = r#"import { fromHolderCbor, toHolderCbor } from "./codec.gen.ts";
+const hex = (b: Uint8Array) => Array.from(b, (x) => x.toString(16).padStart(2, "0")).join("");
+const bytes = (h: string) => Uint8Array.from(h.match(/../g) ?? [], (p) => parseInt(p, 16));
+const error = (h: string) => { try { fromHolderCbor(bytes(h)); return "accepted"; } catch (e) { return (e as Error).message; } };
+// Insertion order is "aa" then "b", and -1, 10, 1; the wire order is "b", "aa" and 1, 10, -1.
+console.log(hex(toHolderCbor({ counts: { aa: 2, b: 1 }, labels: { [-1]: "m", 10: "t", 1: "o" } })));
+console.log(error("a266636f756e7473a262616102616201666c6162656c73a0"));
+console.log(error("a266636f756e7473a2616101616102666c6162656c73a0"));
+console.log(error("a366636f756e7473a066636f756e7473a0666c6162656c73a0"));
+console.log(JSON.stringify(fromHolderCbor(bytes("a2666c6162656c73a10a6174" + "66636f756e7473a0"))));
+"#;
+    if let Some(out) = typecheck_and_run("canonical-maps", &output.files, driver) {
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(
+            lines,
+            [
+                "a266636f756e7473a261620162616102666c6162656c73a301616f0a61742061 6d"
+                    .replace(' ', "")
+                    .as_str(),
+                "csil cbor: map keys are not in canonical order",
+                "csil cbor: duplicate key \"a\"",
+                "csil cbor: duplicate key \"counts\"",
+                "{\"counts\":{},\"labels\":{\"10\":\"t\"}}",
+            ]
+        );
+    }
+}
+
+/// A union value carries no arm in memory, so the encoder takes the first declared
+/// arm that fits: all required fields present and every field of the right type.
+#[test]
+fn record_union_encoder_takes_the_first_arm_that_fits() {
+    let record = |entries| CsilTypeExpression::Group(CsilGroupExpression { entries });
+    let spec = spec_of(vec![
+        typedef(
+            "Contact",
+            CsilTypeExpression::Choice(vec![
+                record(vec![
+                    field("id", builtin("int"), false),
+                    field("name", builtin("text"), false),
+                ]),
+                record(vec![field("id", builtin("int"), false)]),
+            ]),
+        ),
+        typedef(
+            "Tagged",
+            CsilTypeExpression::Choice(vec![
+                record(vec![field("v", builtin("int"), false)]),
+                record(vec![field("v", builtin("text"), false)]),
+            ]),
+        ),
+    ]);
+    let output = run_output(&input_with_spec("typescript", spec));
+    let driver = r#"import { fromContactCbor, toContactCbor, toTaggedCbor } from "./codec.gen.ts";
+const hex = (b: Uint8Array) => Array.from(b, (x) => x.toString(16).padStart(2, "0")).join("");
+console.log(hex(toContactCbor({ id: 1, name: "x" })));
+console.log(hex(toContactCbor({ id: 1 })));
+console.log(hex(toTaggedCbor({ v: 1 })), hex(toTaggedCbor({ v: "s" })));
+try { fromContactCbor(Uint8Array.from([0x82, 0x00, 0xa1, 0x62, 0x69, 0x64, 0x01])); console.log("accepted"); } catch { console.log("refused"); }
+"#;
+    if let Some(out) = typecheck_and_run("union-first-fit", &output.files, driver) {
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(
+            lines,
+            [
+                "8200a262696401646e616d656178",
+                "8201a162696401",
+                "8200a1617601 8201a161766173",
+                "refused",
+            ]
+        );
+    }
+}
+
+/// An op with an inline record input (`get-profile: {user_id: int} -> Profile`)
+/// gets a named record, so the client encodes a real map instead of passing a
+/// plain object to `encodeValue`.
+#[test]
+fn inline_record_op_boundary_gets_a_named_record() {
+    let spec = spec_of(vec![
+        record_typedef("Profile", vec![field("name", builtin("text"), false)]),
+        service_rule(
+            "Auth",
+            vec![CsilServiceOperation {
+                name: "get-profile".to_string(),
+                input_type: CsilTypeExpression::Group(CsilGroupExpression {
+                    entries: vec![field("user_id", builtin("int"), false)],
+                }),
+                output_type: reference("Profile"),
+                direction: CsilServiceDirection::Unidirectional,
+                position: pos(),
+                doc_comments: vec![],
+                wire_id: None,
+            }],
+        ),
+    ]);
+    let output = run_output(&input_with_spec("typescript", spec.clone()));
+    let client = file(&output.files, "client.gen.ts");
+    assert!(
+        client.contains("getProfile(req: AuthGetProfileInput): Profile {"),
+        "{client}"
+    );
+    let driver = r#"import { toAuthGetProfileInputCbor } from "./codec.gen.ts";
+const hex = (b: Uint8Array) => Array.from(b, (x) => x.toString(16).padStart(2, "0")).join("");
+console.log(hex(toAuthGetProfileInputCbor({ userId: 7 })));
+"#;
+    if let Some(out) = typecheck_and_run("inline-op-record", &output.files, driver) {
+        assert_eq!(out.trim(), "a167757365725f696407");
+    }
+    typecheck_emitted_package(
+        "inline-op-record",
+        &package_input_with_spec("typescript", spec),
+    );
+}
+
+/// A service `Api` derives `ApiClient`, the default aggregate class in the same
+/// file. The service moves; its wire name stays `Api`.
+#[test]
+fn service_named_like_the_aggregate_client_is_renamed() {
+    let spec = spec_of(vec![
+        record_typedef("Ping", vec![field("msg", builtin("text"), false)]),
+        service_rule("Api", vec![op("ping", "Ping", "Ping", vec![])]),
+    ]);
+    let output = run_output(&input_with_spec("typescript", spec.clone()));
+    assert_eq!(output.warnings.len(), 1, "{:?}", output.warnings);
+    let client = file(&output.files, "client.gen.ts");
+    assert_eq!(count(client, "export class ApiClient "), 1, "{client}");
+    assert!(client.contains("export class Api2Client "), "{client}");
+    assert!(client.contains("this.t.call(\"Api\", \"ping\""), "{client}");
+    typecheck_emitted_package(
+        "aggregate-clash",
+        &package_input_with_spec("typescript", spec),
+    );
+}
+
+/// A union arm that names another union matches that union's in-memory arms (the
+/// nested tagged sum exists only on the wire), and `tstr`/`bstr`/`true`/`false`/
+/// `undefined` fields have real types.
+#[test]
+fn nested_union_arms_and_cddl_builtins_type_check() {
+    let any_array = CsilTypeExpression::Array {
+        element_type: Box::new(builtin("any")),
+        occurrence: None,
+    };
+    let any_map = CsilTypeExpression::Map {
+        key: Box::new(builtin("text")),
+        value: Box::new(builtin("any")),
+        occurrence: None,
+    };
+    let spec = spec_of(vec![
+        typedef(
+            "value",
+            CsilTypeExpression::Choice(vec![reference("simple_value"), reference("complex_value")]),
+        ),
+        typedef(
+            "simple_value",
+            CsilTypeExpression::Choice(vec![builtin("int"), builtin("text"), builtin("bool")]),
+        ),
+        typedef(
+            "complex_value",
+            CsilTypeExpression::Choice(vec![any_array, any_map]),
+        ),
+        record_typedef(
+            "Scalars",
+            vec![
+                field("t", builtin("tstr"), false),
+                field("b", builtin("bstr"), false),
+                field("yes", builtin("true"), false),
+                field("no", builtin("false"), false),
+                field("nothing", builtin("undefined"), false),
+            ],
+        ),
+    ]);
+    let output = run_output(&input_with_spec("typescript", spec));
+    let types = file(&output.files, "types.gen.ts");
+    assert!(
+        types.contains("  yes: true;\n  no: false;\n  nothing: null;"),
+        "{types}"
+    );
+    let driver = r#"import { fromScalarsCbor, toScalarsCbor, toValueCbor } from "./codec.gen.ts";
+const hex = (b: Uint8Array) => Array.from(b, (x) => x.toString(16).padStart(2, "0")).join("");
+console.log(hex(toValueCbor(5)), hex(toValueCbor([1])));
+const s = fromScalarsCbor(toScalarsCbor({ t: "x", b: new Uint8Array([1]), yes: true, no: false, nothing: null }));
+console.log(s.t, s.yes, s.no, s.nothing);
+"#;
+    if let Some(out) = typecheck_and_run("nested-unions", &output.files, driver) {
+        assert_eq!(
+            out.lines().collect::<Vec<_>>(),
+            ["8200820005 820182008101", "x true false null"]
+        );
+    }
+}
+
+/// A map key with a longer head than its value needs (`18 01` for 1, `78 01 61`
+/// for "a") is refused, in a dynamic map and in a record.
+#[test]
+fn map_keys_must_use_the_shortest_head() {
+    let spec = spec_of(vec![record_typedef(
+        "Holder",
+        vec![
+            field("counts", text_map("int"), false),
+            field(
+                "labels",
+                CsilTypeExpression::Map {
+                    key: Box::new(builtin("int")),
+                    value: Box::new(builtin("text")),
+                    occurrence: None,
+                },
+                false,
+            ),
+        ],
+    )]);
+    let output = run_output(&input_with_spec("typescript", spec));
+    let driver = r#"import { fromHolderCbor } from "./codec.gen.ts";
+const bytes = (h: string) => Uint8Array.from(h.match(/../g) ?? [], (p) => parseInt(p, 16));
+const error = (h: string) => { try { fromHolderCbor(bytes(h)); return "accepted"; } catch (e) { return (e as Error).message; } };
+console.log(error("a266636f756e7473a178016101666c6162656c73a0"));
+console.log(error("a266636f756e7473a0666c6162656c73a1180161" + "6f"));
+console.log(error("a2780666636f756e7473a0666c6162656c73a0"));
+console.log(error("a266636f756e7473a1616101666c6162656c73a1186461" + "6f"));
+"#;
+    if let Some(out) = typecheck_and_run("shortest-keys", &output.files, driver) {
+        assert_eq!(
+            out.lines().collect::<Vec<_>>(),
+            [
+                "csil cbor: map key is not in shortest form",
+                "csil cbor: map key is not in shortest form",
+                "csil cbor: map key is not in shortest form",
+                "accepted",
+            ]
+        );
+    }
+}
+
+/// Text enum values that are not identifiers get legal `const` keys from the shared
+/// splitter, and every value round-trips through the codec exactly as written.
+#[test]
+fn dotted_text_enum_values_get_legal_keys_and_round_trip() {
+    let text = |v: &str| CsilTypeExpression::Literal(CsilLiteralValue::Text(v.to_string()));
+    let spec = spec_of(vec![
+        typedef(
+            "Scope",
+            CsilTypeExpression::Choice(
+                [
+                    "calendars.read",
+                    "events.write",
+                    "a-b c",
+                    "2fa",
+                    "class",
+                    "pending",
+                ]
+                .into_iter()
+                .map(text)
+                .collect(),
+            ),
+        ),
+        record_typedef("Grant", vec![field("scope", reference("Scope"), false)]),
+    ]);
+    let output = run_output(&input_with_spec("typescript", spec));
+    let types = file(&output.files, "types.gen.ts");
+    for line in [
+        "  CALENDARS_READ: \"calendars.read\",",
+        "  EVENTS_WRITE: \"events.write\",",
+        "  A_B_C: \"a-b c\",",
+        "  V_2FA: \"2fa\",",
+        "  CLASS: \"class\",",
+        "  PENDING: \"pending\",",
+    ] {
+        assert!(types.contains(line), "{line}\n{types}");
+    }
+    let driver = r#"import { fromGrantCbor, toGrantCbor } from "./codec.gen.ts";
+import { Scope } from "./types.gen.ts";
+for (const scope of Object.values(Scope)) {
+  const back = fromGrantCbor(toGrantCbor({ scope })).scope;
+  if (back !== scope) throw new Error(`${scope} came back as ${back}`);
+}
+console.log(Scope.V_2FA, Scope.CALENDARS_READ);
+"#;
+    if let Some(out) = typecheck_and_run("dotted-enum", &output.files, driver) {
+        assert_eq!(out.trim(), "2fa calendars.read");
+    }
+}
+
+/// A literal text record key that is not an identifier (`"a.b"`, `"2x"`) becomes a
+/// quoted property, read with brackets; the wire key stays as written.
+#[test]
+fn literal_record_keys_that_are_not_identifiers_are_quoted() {
+    let key = |name: &str, ty: &str| CsilGroupEntry {
+        key: Some(CsilGroupKey::Literal(CsilLiteralValue::Text(
+            name.to_string(),
+        ))),
+        value_type: builtin(ty),
+        occurrence: None,
+        metadata: vec![],
+        doc_comments: vec![],
+    };
+    let spec = spec_of(vec![record_typedef(
+        "R",
+        vec![key("a.b", "int"), key("2x", "text"), key("class", "bool")],
+    )]);
+    let output = run_output(&input_with_spec("typescript", spec));
+    let types = file(&output.files, "types.gen.ts");
+    assert!(
+        types.contains("  \"a.b\": number;\n  \"2x\": string;\n  class: boolean;"),
+        "{types}"
+    );
+    let driver = r#"import { fromRCbor, toRCbor } from "./codec.gen.ts";
+const hex = (b: Uint8Array) => Array.from(b, (x) => x.toString(16).padStart(2, "0")).join("");
+const bytes = toRCbor({ "a.b": 1, "2x": "y", class: true });
+const back = fromRCbor(bytes);
+console.log(hex(bytes), back["a.b"], back["2x"], back.class);
+"#;
+    if let Some(out) = typecheck_and_run("literal-keys", &output.files, driver) {
+        assert_eq!(out.trim(), "a3623278617963612e620165636c617373f5 1 y true");
+    }
 }

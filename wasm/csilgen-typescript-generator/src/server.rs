@@ -18,7 +18,9 @@ use crate::{
     common::{self, BidiTransport, DecimalMapping},
     types,
 };
-use csilgen_common::{CsilServiceDefinition, CsilServiceOperation, WasmGeneratorInput};
+use csilgen_common::{
+    CsilServiceDefinition, CsilServiceOperation, CsilSpecSerialized, WasmGeneratorInput,
+};
 
 const TYPES_STEM: &str = "types.gen";
 
@@ -107,14 +109,14 @@ pub fn generate(input: &WasmGeneratorInput) -> Result<String, String> {
             out.push('\n');
         }
         if mode == BidiTransport::Connection && common::service_has_channel_ops(def) {
-            out.push_str(&channel_block(name, def, mapping));
+            out.push_str(&channel_block(spec, name, def, mapping));
             out.push('\n');
         }
     }
 
     out.push_str(&server_handlers(&services));
     out.push('\n');
-    out.push_str(&dispatch(&services, mode, mapping));
+    out.push_str(&dispatch(spec, &services, mode, mapping));
 
     // Compact-profile twin, emitted only when the spec carries wire-ids so
     // wire-id-free specs stay byte-identical.
@@ -126,12 +128,27 @@ pub fn generate(input: &WasmGeneratorInput) -> Result<String, String> {
     Ok(out)
 }
 
+/// The `XxxWireIds` const name for a service rule.
+pub(crate) fn wire_ids_name(service: &str) -> String {
+    format!("{}WireIds", common::service_base(service))
+}
+
+/// The `XxxHandlers` interface name for a service rule.
+pub(crate) fn handlers_name(service: &str) -> String {
+    format!("{}Handlers", common::service_base(service))
+}
+
+/// The server's `XxxChannelHandlers` interface name for a service base.
+pub(crate) fn channel_handlers_name(base: &str) -> String {
+    format!("{base}ChannelHandlers")
+}
+
 /// Emit a `XxxWireIds` const exposing the `@wire-id(N)` ordinals so a host can
 /// reference them instead of hardcoding. Purely additive: returns `None` unless
 /// the service carries a wire-id, keeping wire-id-free output byte-identical.
 fn wire_ids_const(name: &str, def: &CsilServiceDefinition) -> Option<String> {
     let service_id = def.wire_id?;
-    let const_name = format!("{}WireIds", common::service_base(name));
+    let const_name = wire_ids_name(name);
     let mut out = format!("export const {const_name} = {{\n");
     out.push_str(&format!("  service: {service_id},\n"));
     // Operations are nested under `ops` so an op named `service` keys into
@@ -154,7 +171,7 @@ fn handlers_interface(
     mode: BidiTransport,
     mapping: DecimalMapping,
 ) -> String {
-    let iface = format!("{}Handlers", common::service_base(name));
+    let iface = handlers_name(name);
     let mut out = format!("export interface {iface} {{\n");
     for op in &def.operations {
         match (mode, &op.direction) {
@@ -221,10 +238,15 @@ fn pascal_from_camel(s: &str) -> String {
 
 /// Connection-mode emission for the server side of channel ops:
 /// inbound handlers (for `<->` only) + router + outbound encoders.
-fn channel_block(name: &str, def: &CsilServiceDefinition, mapping: DecimalMapping) -> String {
+fn channel_block(
+    spec: &CsilSpecSerialized,
+    name: &str,
+    def: &CsilServiceDefinition,
+    mapping: DecimalMapping,
+) -> String {
     let base = common::service_base(name);
-    let handlers_iface = format!("{base}ChannelHandlers");
-    let wire_service = common::service_wire(name);
+    let handlers_iface = channel_handlers_name(&base);
+    let wire_service = common::service_wire(spec, name);
 
     let inbound_ops: Vec<&CsilServiceOperation> = def
         .operations
@@ -357,7 +379,7 @@ fn server_handlers(services: &[(&str, &CsilServiceDefinition)]) -> String {
     let mut out = String::from("export interface ServerHandlers {\n");
     for (svc, _) in services {
         let field = common::to_camel(&common::service_base(svc));
-        let iface = format!("{}Handlers", common::service_base(svc));
+        let iface = handlers_name(svc);
         out.push_str(&format!("  {field}: {iface};\n"));
     }
     out.push_str("}\n");
@@ -365,6 +387,7 @@ fn server_handlers(services: &[(&str, &CsilServiceDefinition)]) -> String {
 }
 
 fn dispatch(
+    spec: &CsilSpecSerialized,
     services: &[(&str, &CsilServiceDefinition)],
     mode: BidiTransport,
     mapping: DecimalMapping,
@@ -397,7 +420,7 @@ fn dispatch(
         );
     }
     for (name, def) in services {
-        let wire_service = common::service_wire(name);
+        let wire_service = common::service_wire(spec, name);
         let field = common::to_camel(&common::service_base(name));
         out.push_str(&format!("    case \"{wire_service}\": {{\n"));
         out.push_str("      switch (method) {\n");

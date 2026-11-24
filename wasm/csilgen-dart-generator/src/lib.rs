@@ -207,26 +207,38 @@ fn dart_type_name(name: &str) -> String {
     escape_reserved(&name.to_case(Case::Pascal))
 }
 
-/// A Dart member name: `lowerCamelCase`, with a reserved-word guard.
-fn dart_enum_member(name: &str) -> String {
-    let value = dart_member_name(name);
-    if [
-        "values",
-        "index",
-        "name",
-        "wireValue",
-        "fromWire",
-        "hashCode",
-        "runtimeType",
-        "toString",
-        "noSuchMethod",
-    ]
-    .contains(&value.as_str())
-    {
-        format!("{value}_")
-    } else {
-        value
-    }
+/// The members a generated Dart enum already has: the `Enum` built-ins and the
+/// members the generator declares on it.
+const DART_ENUM_TAKEN: &[&str] = &[
+    "values",
+    "index",
+    "name",
+    "hashCode",
+    "runtimeType",
+    "toString",
+    "noSuchMethod",
+    "wireValue",
+    "wireNumber",
+    "fromWire",
+    "fromNumber",
+    "toJson",
+    "_byNumber",
+];
+
+/// One `lowerCamelCase` member identifier for each text enum value. The words are
+/// joined the way earlier output named them (`calendars.read` is
+/// `calendarsRead`), so a plain value keeps its name. A keyword, a leading digit
+/// or a member the enum already has gets the word `v` first (`vClass`, `v2fa`).
+fn dart_enum_members(values: &[&str]) -> Vec<String> {
+    csilgen_common::member_idents(
+        values,
+        |words| words.join("_").to_ascii_uppercase().to_case(Case::Camel),
+        |ident| {
+            ident.starts_with(|c: char| c.is_ascii_alphabetic())
+                && !DART_RESERVED.contains(&ident)
+                && !DART_ENUM_TAKEN.contains(&ident)
+        },
+    )
 }
 
 fn dart_text_enum<'a>(
@@ -348,6 +360,42 @@ impl ClientShape {
     }
 }
 
+/// The client files `style` emits, in file order. The emitter and the derived-name
+/// reservation both read this, so a class name is reserved only when it is emitted.
+fn client_shapes(style: ClientStyle) -> Vec<ClientShape> {
+    match style {
+        ClientStyle::Sync => vec![ClientShape {
+            is_async: false,
+            marker: "",
+        }],
+        ClientStyle::Async => vec![ClientShape {
+            is_async: true,
+            marker: "",
+        }],
+        ClientStyle::Both => vec![
+            ClientShape {
+                is_async: false,
+                marker: "",
+            },
+            ClientShape {
+                is_async: true,
+                marker: "Async",
+            },
+        ],
+    }
+}
+
+/// Whether the client and the server surface are emitted. A package carries both,
+/// because its genquickstart uses both. The emitter and the derived-name reservation
+/// share this, so a handler or client name is reserved only when it is emitted.
+fn emitted_surfaces(surface: &Surface, pkg_mode: bool) -> (bool, bool) {
+    let both = pkg_mode && !matches!(surface, Surface::TypesOnly);
+    (
+        matches!(surface, Surface::Client) || both,
+        matches!(surface, Surface::Server) || both,
+    )
+}
+
 struct DartConfig {
     decimal_mapping: DecimalMapping,
     library_name: String,
@@ -390,7 +438,8 @@ fn map_type(
             // `any`/`null`/`nil` carry no single static type — `Object?` is Dart's
             // top type and is already nullable, so the occurrence guard below won't
             // double the `?`.
-            "any" | "nil" | "null" => "Object?".to_string(),
+            "any" | "nil" | "null" | "undefined" => "Object?".to_string(),
+            "true" | "false" => "bool".to_string(),
             other => dart_type_name(other),
         },
         CsilTypeExpression::Reference(name) => dart_type_name(name),
@@ -801,26 +850,33 @@ fn mentions(body: &str, ident: &str) -> bool {
     })
 }
 
+/// Which generated surfaces declare classes named after services.
+#[derive(Clone, Copy)]
+struct Emitted {
+    client: bool,
+    server: bool,
+    client_style: ClientStyle,
+}
+
 /// The class names the generator builds from other rules: the per-service
 /// client and handler names, `<ErrorArm>Refusal`, and each union arm class. A
 /// rule that takes one of them would collide with the class made for its owner.
-/// Union arm names are read from the hoisted spec, because hoisting turns inline
-/// arms into the named rules the arm classes are named after.
-fn derived_type_names(spec: &CsilSpecSerialized) -> HashSet<String> {
-    let hoisted = csilgen_common::hoist_inline_composites(
-        spec,
-        csilgen_common::HoistOptions {
-            hoist_all_literal_choices: false,
-        },
-    );
+/// A name is in the set only when the emitter declares it for this target, so a
+/// rule never moves for a class the output does not have.
+fn derived_type_names(spec: &CsilSpecSerialized, emitted: Emitted) -> HashSet<String> {
     let mut names = HashSet::new();
-    for rule in &hoisted.rules {
+    for rule in &spec.rules {
         match &rule.rule_type {
             CsilRuleType::ServiceDef(_) => {
-                let base = service_base_name(&rule.name);
-                names.insert(format!("{base}Client"));
-                names.insert(format!("{base}AsyncClient"));
-                names.insert(format!("{}Handler", dart_type_name(&rule.name)));
+                if emitted.client {
+                    let base = service_base_name(spec, &rule.name);
+                    for shape in client_shapes(emitted.client_style) {
+                        names.insert(shape.client_name(&base));
+                    }
+                }
+                if emitted.server {
+                    names.insert(format!("{}Handler", dart_type_name(&rule.name)));
+                }
             }
             CsilRuleType::GroupChoice(groups) => {
                 let base = dart_type_name(&rule.name);
@@ -829,7 +885,7 @@ fn derived_type_names(spec: &CsilSpecSerialized) -> HashSet<String> {
             _ => {}
         }
     }
-    for (name, choices) in union_choices(&hoisted) {
+    for (name, choices) in union_choices(spec) {
         let base = dart_type_name(&name);
         names.extend(
             choices
@@ -838,7 +894,7 @@ fn derived_type_names(spec: &CsilSpecSerialized) -> HashSet<String> {
                 .map(|(i, choice)| union_arm_name(&base, i, choice)),
         );
     }
-    for (_, _, arms) in hoisted.rpc_operations() {
+    for (_, _, arms) in spec.rpc_operations() {
         for arm in &arms[1..] {
             if let Some(name) = arm.rpc_variant_name() {
                 names.insert(format!("{}Refusal", dart_type_name(name)));
@@ -848,15 +904,38 @@ fn derived_type_names(spec: &CsilSpecSerialized) -> HashSet<String> {
     names
 }
 
+/// The spec the emitter walks: mixed op boundaries and inline composites hoisted to
+/// named rules first, so the rename passes below check the synthesized names too.
+/// A synthesized rule comes after the user rules, so a clash renames it, not the
+/// user rule.
+fn prepare_spec(
+    spec: &CsilSpecSerialized,
+    decimal_type: &str,
+    emitted: Emitted,
+) -> CsilSpecSerialized {
+    let spec = csilgen_common::hoist_op_union_boundaries(spec);
+    let spec = csilgen_common::hoist_inline_composites(
+        &spec,
+        csilgen_common::HoistOptions {
+            hoist_all_literal_choices: false,
+        },
+    );
+    rename_spec(&spec, decimal_type, emitted)
+}
+
 /// Rename every rule whose Dart class name is reserved, derived from another
 /// rule, or equal to an earlier rule's class name. A rename changes the names
 /// derived from the renamed rule (its `Refusal` class, the union arm classes
 /// named after it), so it repeats until no rule moves.
-fn rename_spec(spec: &CsilSpecSerialized, decimal_type: &str) -> CsilSpecSerialized {
+fn rename_spec(
+    spec: &CsilSpecSerialized,
+    decimal_type: &str,
+    emitted: Emitted,
+) -> CsilSpecSerialized {
     let mut spec = spec.clone();
     loop {
         let before = spec.declared_names.len();
-        let derived = derived_type_names(&spec);
+        let derived = derived_type_names(&spec, emitted);
         spec = csilgen_common::rename_reserved(&spec, |name| {
             let ident = dart_type_name(name);
             ident == decimal_type
@@ -900,9 +979,6 @@ pub fn generate_dart_output(
         DecimalMapping::Csil => "CsilDecimal",
         DecimalMapping::Library => "Decimal",
     };
-    let renamed = rename_spec(spec, decimal_type);
-    let warnings = csilgen_common::rename_warnings(&renamed, &config.target);
-    let spec = &renamed;
     // Validated early (before any file is emitted) so a misconfigured value fails
     // loudly rather than silently degrading. Absent -> Both: the blocking client is
     // preserved and the async twin comes for free.
@@ -977,6 +1053,15 @@ pub fn generate_dart_output(
             )));
         }
     };
+    let (client, server) = emitted_surfaces(&surface, emit_dart_package);
+    let emitted = Emitted {
+        client,
+        server,
+        client_style,
+    };
+    let renamed = prepare_spec(spec, decimal_type, emitted);
+    let warnings = csilgen_common::rename_warnings(&renamed, &config.target);
+    let spec = &renamed;
 
     let cfg = DartConfig {
         decimal_mapping,
@@ -1088,16 +1173,30 @@ fn pubspec_yaml(name: &str, version: &str) -> String {
 // Package README with a copy-paste CSIL-RPC Quickstart
 // ---------------------------------------------------------------------------
 
-/// The service base name (trailing `Service` stripped, PascalCased) — the free-fn
-/// twin of `DartGenerator::service_base`, used to name the client class the README's
-/// example call constructs.
-fn service_base_name(name: &str) -> String {
+/// The service base name the client classes are named after: PascalCased, with a
+/// trailing `Service` stripped. The suffix stays when stripping it would give the
+/// base of another service (`Foo` and `FooService` would both be `FooClient`),
+/// because two services must not share one client class.
+fn service_base_name(spec: &CsilSpecSerialized, name: &str) -> String {
+    let strip = |n: &str| {
+        let pascal = n.to_case(Case::Pascal);
+        pascal
+            .strip_suffix("Service")
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .unwrap_or(pascal)
+    };
     let pascal = name.to_case(Case::Pascal);
-    pascal
-        .strip_suffix("Service")
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
-        .unwrap_or(pascal)
+    let base = strip(name);
+    if base == pascal {
+        return base;
+    }
+    let taken = spec.rules.iter().any(|rule| {
+        rule.name != name
+            && matches!(rule.rule_type, CsilRuleType::ServiceDef(_))
+            && (rule.name.to_case(Case::Pascal) == base || strip(&rule.name) == base)
+    });
+    if taken { pascal } else { base }
 }
 
 /// Which transport sections the consumer wants in `genquickstart.md`. The
@@ -1182,7 +1281,7 @@ fn dart_first_unary_example(
             .iter()
             .find(|op| matches!(op.direction, CsilServiceDirection::Unidirectional))
         {
-            let base = service_base_name(name);
+            let base = service_base_name(spec, name);
             let has_request = !is_null_input(&op.input_type);
             let success = success_type(op.success_output());
             return Some(DartUnaryExample {
@@ -1286,7 +1385,7 @@ fn dart_first_channel_example(
                 continue;
             }
             return Some(DartChannelExample {
-                service_wire: name.to_string(),
+                service_wire: spec.declared_name(name).to_string(),
                 op_wire: op.name.clone(),
                 handler_iface: format!("{}Handler", dart_type_name(name)),
                 route_fn: format!("route{}Channel", dart_type_name(name)),
@@ -1934,7 +2033,11 @@ impl DartGenerator {
                     );
                 }
                 CsilRuleType::TypeChoice(choices) => {
-                    types_code.push_str(&self.generate_sealed_choice(&rule.name, choices));
+                    types_code.push_str(
+                        &self.generate_sealed_choice(
+                            &rule.name, choices, &records, &aliases, &unions,
+                        ),
+                    );
                 }
                 CsilRuleType::GroupChoice(groups) => {
                     types_code.push_str(&self.generate_group_choice(&rule.name, groups));
@@ -1953,21 +2056,50 @@ impl DartGenerator {
             let stem = format!("{}{}", dart_type_name(service), dart_type_name(method));
             let success = spec.declared_name(arms[0].rpc_variant_name().unwrap());
             let ty = map_type(&arms[0], &None, decimal);
-            let enc = dart_to_cbor_expr(&arms[0], "value", &records, &aliases, &unions).flat();
-            let mut handler = format!(
-                "(String, Uint8List) encode{stem}Reply({ty} Function() handler) {{\n  try {{\n    final value = handler();\n    return ('{success}', CsilCbor.encodeValue({enc}));\n"
+            let enc = dart_to_cbor_expr(&arms[0], "value", &records, &aliases, &unions);
+            let mut handler = dart_signature(
+                0,
+                &format!("(String, Uint8List) encode{stem}Reply"),
+                &[format!("{ty} Function() handler")],
+                " {",
             );
-            resolve.push_str(&format!("  if (service == '{service}' && op == '{method}') {{\n    switch (variant) {{\n      case '{success}':\n        return payload;\n"));
+            handler.push_str("  try {\n    final value = handler();\n");
+            handler.push_str(&dart_reply_return(success, enc));
+            let wire_service = spec.declared_name(service);
+            let cond = format!("  if (service == '{wire_service}' && op == '{method}') {{");
+            if cond.len() <= DART_WIDTH {
+                resolve.push_str(&format!("{cond}\n"));
+            } else {
+                resolve.push_str(&format!(
+                    "  if (service == '{wire_service}' &&\n      op == '{method}') {{\n"
+                ));
+            }
+            resolve.push_str(&format!(
+                "    switch (variant) {{\n      case '{success}':\n        return payload;\n"
+            ));
             for arm in &arms[1..] {
                 let name = arm.rpc_variant_name().unwrap();
                 let wire = spec.declared_name(name);
                 let ty = map_type(arm, &None, decimal);
                 let class = format!("{}Refusal", dart_type_name(name));
                 if refusals.insert(class.clone()) {
-                    types_code.push_str(&format!("final class {class} implements Exception {{\n  final {ty} value;\n  const {class}(this.value);\n}}\n\n"));
+                    types_code.push_str(&dart_class_header(
+                        0,
+                        "final class",
+                        &class,
+                        "implements",
+                        "Exception",
+                    ));
+                    types_code.push_str(&dart_field(2, &ty, "value"));
+                    types_code.push_str(&dart_ctor_signature(
+                        2,
+                        &format!("const {class}"),
+                        &["this.value".to_string()],
+                        ";",
+                    ));
+                    types_code.push_str("}\n\n");
                 }
-                let enc =
-                    dart_to_cbor_expr(arm, "refusal.value", &records, &aliases, &unions).flat();
+                let enc = dart_to_cbor_expr(arm, "refusal.value", &records, &aliases, &unions);
                 let dec = dart_from_cbor_expr(
                     arm,
                     "CsilCbor.decode(payload)",
@@ -1975,11 +2107,18 @@ impl DartGenerator {
                     decimal,
                     &aliases,
                     &unions,
-                )
-                .flat();
-                handler.push_str(&format!("  }} on {class} catch (refusal) {{\n    return ('{wire}', CsilCbor.encodeValue({enc}));\n"));
-                resolve.push_str(&format!(
-                    "      case '{wire}':\n        throw {class}({dec});\n"
+                );
+                handler.push_str(&format!("  }} on {class} catch (refusal) {{\n"));
+                handler.push_str(&dart_reply_return(wire, enc));
+                resolve.push_str(&format!("      case '{wire}':\n"));
+                resolve.push_str(&dart_stmt(
+                    8,
+                    "throw ",
+                    &DExpr::Call {
+                        callee: class.clone(),
+                        args: vec![dec],
+                    },
+                    ";",
                 ));
             }
             types_code.push_str(&handler);
@@ -1990,8 +2129,8 @@ impl DartGenerator {
             types_code.push_str(&resolve);
             types_code.push_str("  return payload;\n}\n");
         }
-        let has_types = !types_code.is_empty();
-        if has_types {
+        let type_symbols = declared_symbols(&types_code);
+        if !types_code.is_empty() {
             files.push(GeneratedFile {
                 path: "types.gen.dart".to_string(),
                 content: self.file_header("Generated CSIL types.", &[], &types_code),
@@ -2014,7 +2153,11 @@ impl DartGenerator {
         // whenever there are records to (de)serialize, so the output stays standalone.
         // It learns `CsilDecimal` (CBOR tag 4) only when that helper is emitted, so a
         // spec without `decimal` keeps a dependency-free codec.
-        if !records.is_empty() || spec.rpc_operations().next().is_some() {
+        let has_services = spec
+            .rules
+            .iter()
+            .any(|r| matches!(r.rule_type, CsilRuleType::ServiceDef(_)));
+        if types_code.contains("CsilCbor.") || has_services {
             files.push(GeneratedFile {
                 path: "csil_cbor.gen.dart".to_string(),
                 content: csil_cbor_dart(csil_decimal),
@@ -2029,10 +2172,7 @@ impl DartGenerator {
             // requested target names. A flat (non-package) build stays byte-identical: it emits
             // only the requested surface. This mirrors the OCaml generator's
             // all-surfaces-in-package-mode rule.
-            let want_client = matches!(surface, Surface::Client)
-                || (pkg_mode && !matches!(surface, Surface::TypesOnly));
-            let want_server = matches!(surface, Surface::Server)
-                || (pkg_mode && !matches!(surface, Surface::TypesOnly));
+            let (want_client, want_server) = emitted_surfaces(&surface, pkg_mode);
 
             if want_server {
                 let mut services_code = String::new();
@@ -2048,8 +2188,8 @@ impl DartGenerator {
                     body.push('\n');
                     body.push_str(&services_code);
                     // The routers/handlers name the generated request/response
-                    // types, so the services file must import the types library.
-                    let extra = if has_types {
+                    // types; an import they do not use fails `dart analyze`.
+                    let extra = if type_symbols.iter().any(|t| mentions(&body, t)) {
                         vec!["types.gen.dart".to_string()]
                     } else {
                         Vec::new()
@@ -2078,69 +2218,26 @@ impl DartGenerator {
                 } else {
                     ("services.gen.dart", "services.async.gen.dart", true)
                 };
-                match self.cfg.client_style {
-                    ClientStyle::Sync => {
-                        let shape = ClientShape {
-                            is_async: false,
-                            marker: "",
-                        };
-                        if let Some(f) = self.build_client_file(
-                            spec,
-                            shape,
-                            sync_path,
-                            client_wire_ids,
-                            &records,
-                            &aliases,
-                            &unions,
-                            has_types,
-                        ) {
-                            files.push(f);
-                        }
-                    }
-                    ClientStyle::Async => {
-                        let shape = ClientShape {
-                            is_async: true,
-                            marker: "",
-                        };
-                        if let Some(f) = self.build_client_file(
-                            spec,
-                            shape,
-                            sync_path,
-                            client_wire_ids,
-                            &records,
-                            &aliases,
-                            &unions,
-                            has_types,
-                        ) {
-                            files.push(f);
-                        }
-                    }
-                    ClientStyle::Both => {
-                        let sync = ClientShape {
-                            is_async: false,
-                            marker: "",
-                        };
-                        if let Some(f) = self.build_client_file(
-                            spec,
-                            sync,
-                            sync_path,
-                            client_wire_ids,
-                            &records,
-                            &aliases,
-                            &unions,
-                            has_types,
-                        ) {
-                            files.push(f);
-                        }
-                        let twin = ClientShape {
-                            is_async: true,
-                            marker: "Async",
-                        };
-                        if let Some(f) = self.build_client_file(
-                            spec, twin, async_path, false, &records, &aliases, &unions, has_types,
-                        ) {
-                            files.push(f);
-                        }
+                let shapes = client_shapes(self.cfg.client_style);
+                for (index, shape) in shapes.into_iter().enumerate() {
+                    // Only the first file carries the wire-id consts, so a twin never
+                    // declares them a second time.
+                    let (path, wire_ids) = if index == 0 {
+                        (sync_path, client_wire_ids)
+                    } else {
+                        (async_path, false)
+                    };
+                    if let Some(f) = self.build_client_file(
+                        spec,
+                        shape,
+                        path,
+                        wire_ids,
+                        &records,
+                        &aliases,
+                        &unions,
+                        &type_symbols,
+                    ) {
+                        files.push(f);
                     }
                 }
             }
@@ -2228,7 +2325,7 @@ impl DartGenerator {
             return self.generate_record(name, group, records, aliases, unions);
         }
         if let CsilTypeExpression::Choice(choices) = type_expr {
-            return self.generate_sealed_choice(name, choices);
+            return self.generate_sealed_choice(name, choices, records, aliases, unions);
         }
         let class_name = dart_type_name(name);
         let dart_type = map_type(type_expr, &None, self.cfg.decimal_dart_type());
@@ -2262,10 +2359,10 @@ impl DartGenerator {
                 if index > 0 {
                     out.push('\n');
                 }
-                out.push_str(&format!("  /// {desc}\n"));
+                out.push_str(&dart_comment(2, "///", desc));
             }
             let ty = map_type(&entry.value_type, &entry.occurrence, decimal);
-            out.push_str(&format!("  final {ty} {member};\n"));
+            out.push_str(&dart_field(2, &ty, member));
         }
         if named.is_empty() {
             out.push_str("  // (no named fields)\n");
@@ -2325,6 +2422,7 @@ impl DartGenerator {
                 continue;
             }
             let wire_lit = dart_string_lit(wire);
+            let member = &field_read(member);
             let optional = matches!(entry.occurrence, Some(CsilOccurrence::Optional));
             let access = if optional {
                 format!("{member}!")
@@ -2347,8 +2445,11 @@ impl DartGenerator {
         out.push_str("    return map;\n  }\n\n");
 
         out.push_str("  /// Reconstruct this record from a decoded CBOR dynamic tree.\n");
-        out.push_str(&format!(
-            "  factory {class_name}.fromCborValue(Object? cbor) {{\n"
+        out.push_str(&dart_ctor_signature(
+            2,
+            &format!("factory {class_name}.fromCborValue"),
+            &["Object? cbor".to_string()],
+            " {",
         ));
         // A fieldless record reads nothing, so binding `map` would land as an
         // unused local that `dart analyze` rejects; only bind it when a field uses it.
@@ -2396,22 +2497,7 @@ impl DartGenerator {
         out.push_str("  /// Encode this record to canonical CSIL CBOR bytes.\n");
         out.push_str("  Uint8List toCbor() => CsilCbor.encodeValue(toCborValue());\n\n");
         out.push_str("  /// Decode a CSIL CBOR byte payload into this record.\n");
-        let from_cbor_flat = format!(
-            "  factory {class_name}.fromCbor(List<int> bytes) => {class_name}.fromCborValue(CsilCbor.decode(bytes));"
-        );
-        let arrow_body = format!("      {class_name}.fromCborValue(CsilCbor.decode(bytes));");
-        if from_cbor_flat.len() <= DART_WIDTH {
-            out.push_str(&from_cbor_flat);
-            out.push('\n');
-        } else if arrow_body.len() <= DART_WIDTH {
-            out.push_str(&format!(
-                "  factory {class_name}.fromCbor(List<int> bytes) =>\n{arrow_body}\n"
-            ));
-        } else {
-            out.push_str(&format!(
-                "  factory {class_name}.fromCbor(List<int> bytes) =>\n      {class_name}.fromCborValue(\n        CsilCbor.decode(bytes),\n      );\n"
-            ));
-        }
+        out.push_str(&dart_from_cbor_factory(class_name));
         out
     }
 
@@ -2434,13 +2520,23 @@ impl DartGenerator {
                 continue;
             }
             let wire_lit = dart_string_lit(wire);
+            let member = &field_read(member);
             if dart_text_enum(&entry.value_type, aliases).is_some() {
                 if matches!(entry.occurrence, Some(CsilOccurrence::Optional)) {
-                    out.push_str(&format!(
-                        "    if ({member} != null) map[{wire_lit}] = {member}!.wireValue;\n"
+                    out.push_str(&dart_if_stmt(
+                        4,
+                        &format!("{member} != null"),
+                        &format!("map[{wire_lit}] = "),
+                        &DExpr::Atom(format!("{member}!.wireValue")),
+                        ";",
                     ));
                 } else {
-                    out.push_str(&format!("    map[{wire_lit}] = {member}.wireValue;\n"));
+                    out.push_str(&dart_stmt(
+                        4,
+                        &format!("map[{wire_lit}] = "),
+                        &DExpr::Atom(format!("{member}.wireValue")),
+                        ";",
+                    ));
                 }
                 continue;
             }
@@ -2453,7 +2549,12 @@ impl DartGenerator {
                     ";",
                 ));
             } else {
-                out.push_str(&format!("    map[{wire_lit}] = {member};\n"));
+                out.push_str(&dart_stmt(
+                    4,
+                    &format!("map[{wire_lit}] = "),
+                    &DExpr::Atom(member.clone()),
+                    ";",
+                ));
             }
         }
         out.push_str("    return map;\n  }\n\n");
@@ -2468,7 +2569,7 @@ impl DartGenerator {
     ) -> String {
         let decimal = self.cfg.decimal_dart_type();
         let mut out = String::new();
-        out.push_str(&dart_signature(
+        out.push_str(&dart_ctor_signature(
             2,
             &format!("factory {class_name}.fromMap"),
             &["Map<String, Object?> map".to_string()],
@@ -2488,15 +2589,19 @@ impl DartGenerator {
                 // bare `Atom`) so a long hoisted/synthesized `ty` still splits the way
                 // `dart format` would rather than overflowing the page width.
                 let value = if let Some(name) = dart_text_enum(&entry.value_type, aliases) {
-                    let decode = format!("{}.fromWire(map[{wire_lit}])", dart_type_name(name));
-                    DExpr::Atom(
-                        if matches!(entry.occurrence, Some(CsilOccurrence::Optional)) {
-                            format!("map[{wire_lit}] == null ? null : {decode}")
-                        } else {
-                            decode
-                        },
-                    )
-                } else if ty == "Object?" {
+                    let decode = DExpr::Call {
+                        callee: format!("{}.fromWire", dart_type_name(name)),
+                        args: vec![DExpr::Atom(format!("map[{wire_lit}]"))],
+                    };
+                    if matches!(entry.occurrence, Some(CsilOccurrence::Optional)) {
+                        DExpr::CondNull {
+                            cond: format!("map[{wire_lit}] == null"),
+                            else_: Box::new(decode),
+                        }
+                    } else {
+                        decode
+                    }
+                } else if is_object_type(&entry.value_type, aliases, decimal) {
                     DExpr::Atom(format!("map[{wire_lit}]"))
                 } else {
                     DExpr::Cast {
@@ -2856,7 +2961,7 @@ impl DartGenerator {
         let has_bytes = named.iter().any(|(_, _, e)| is_bytes_type(&e.value_type));
         let mut out = String::new();
         out.push_str("  @override\n  bool operator ==(Object other) {\n");
-        out.push_str(&format!("    if (other is! {class_name}) return false;\n"));
+        out.push_str(&dart_type_guard(class_name));
         out.push_str("    return ");
         if named.is_empty() {
             out.push_str("true");
@@ -2879,7 +2984,24 @@ impl DartGenerator {
             if 4 + "return ".len() + joined.len() + ";".len() <= DART_WIDTH {
                 out.push_str(&joined);
             } else {
-                out.push_str(&parts.join(" &&\n        "));
+                let last = parts.len() - 1;
+                let lines: Vec<String> = parts
+                    .iter()
+                    .enumerate()
+                    .map(|(i, part)| {
+                        let col = if i == 0 { 4 + "return ".len() } else { 8 };
+                        let tail = if i == last { 1 } else { 3 };
+                        // An operand too wide for its line breaks after `==`, the
+                        // right side four columns past the operand lines.
+                        match part.split_once(" == ") {
+                            Some((left, right)) if col + part.len() + tail > DART_WIDTH => {
+                                format!("{left} ==\n{}{right}", pad(12))
+                            }
+                            _ => part.clone(),
+                        }
+                    })
+                    .collect();
+                out.push_str(&lines.join(" &&\n        "));
             }
         }
         out.push_str(";\n  }\n\n");
@@ -2941,39 +3063,76 @@ impl DartGenerator {
     /// arm per reference member, so the host pattern-matches exhaustively. Inline
     /// (non-reference) arms are collapsed to a single `Other` arm carrying the raw
     /// value, since they have no nameable Dart type.
-    fn generate_sealed_choice(&self, name: &str, choices: &[CsilTypeExpression]) -> String {
+    fn generate_sealed_choice(
+        &self,
+        name: &str,
+        choices: &[CsilTypeExpression],
+        records: &std::collections::HashSet<String>,
+        aliases: &std::collections::HashMap<String, CsilTypeExpression>,
+        unions: &std::collections::HashMap<String, Vec<CsilTypeExpression>>,
+    ) -> String {
         let base = dart_type_name(name);
         if let Some(members) = csilgen_common::text_enum_members(choices) {
             let numbers = csilgen_common::enum_numbers(choices);
-            let fields = members
-                .iter()
-                .enumerate()
-                .map(|(i, (name, label))| {
-                    let number = numbers
-                        .as_ref()
-                        .map(|ns| format!(", {}", ns[i]))
-                        .unwrap_or_default();
-                    format!(
-                        "  {}({}{number})",
-                        dart_enum_member(name),
-                        dart_string_lit(label)
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join(",\n");
-            let (param, extra) = if numbers.is_some() {
-                (
-                    ", this.wireNumber",
-                    format!(
-                        "  final int wireNumber;\n  static final _byNumber = <int, {base}>{{for (final member in values) member.wireNumber: member}};\n\n  static {base} fromNumber(Object? value) {{\n    final member = value is int ? _byNumber[value] : null;\n    if (member != null) return member;\n    throw FormatException('unknown {base} number', value);\n  }}\n"
-                    ),
-                )
-            } else {
-                ("", String::new())
-            };
-            return format!(
-                "enum {base} {{\n{fields};\n\n  const {base}(this.wireValue{param});\n  final String wireValue;\n{extra}\n  String toJson() => wireValue;\n\n  static {base} fromWire(Object? value) {{\n    for (final member in values) {{\n      if (member.wireValue == value) return member;\n    }}\n    throw FormatException('unknown {base} value', value);\n  }}\n}}\n\n"
-            );
+            let count = members.len();
+            let labels: Vec<&str> = members.iter().map(|(_, label)| *label).collect();
+            let idents = dart_enum_members(&labels);
+            let mut out = format!("enum {base} {{\n");
+            for (i, ((_, label), ident)) in members.iter().zip(&idents).enumerate() {
+                let mut args = vec![DExpr::Atom(dart_string_lit(label))];
+                if let Some(ns) = &numbers {
+                    args.push(DExpr::Atom(ns[i].to_string()));
+                }
+                let end = if i + 1 == count { ";" } else { "," };
+                out.push_str(&dart_stmt(
+                    2,
+                    "",
+                    &DExpr::Call {
+                        callee: ident.clone(),
+                        args,
+                    },
+                    end,
+                ));
+            }
+            out.push('\n');
+            let mut params = vec!["this.wireValue".to_string()];
+            if numbers.is_some() {
+                params.push("this.wireNumber".to_string());
+            }
+            out.push_str(&dart_ctor_signature(
+                2,
+                &format!("const {base}"),
+                &params,
+                ";",
+            ));
+            out.push_str("  final String wireValue;\n");
+            if numbers.is_some() {
+                out.push_str("  final int wireNumber;\n");
+                out.push_str(&dart_by_number(&base));
+                out.push('\n');
+                out.push_str(&dart_signature(
+                    2,
+                    &format!("static {base} fromNumber"),
+                    &["Object? value".to_string()],
+                    " {",
+                ));
+                out.push_str("    final member = value is int ? _byNumber[value] : null;\n");
+                out.push_str("    if (member != null) return member;\n");
+                out.push_str(&dart_throw_format(4, &format!("unknown {base} number")));
+                out.push_str("  }\n");
+            }
+            out.push_str("\n  String toJson() => wireValue;\n\n");
+            out.push_str(&dart_signature(
+                2,
+                &format!("static {base} fromWire"),
+                &["Object? value".to_string()],
+                " {",
+            ));
+            out.push_str("    for (final member in values) {\n");
+            out.push_str("      if (member.wireValue == value) return member;\n    }\n");
+            out.push_str(&dart_throw_format(4, &format!("unknown {base} value")));
+            out.push_str("  }\n}\n\n");
+            return out;
         }
         // A closed int set is likewise a bare-integer alias (an int enum): the wire
         // carries the integer itself, which is its own discriminant.
@@ -2993,17 +3152,94 @@ impl DartGenerator {
         // in declaration order, so the host pattern-matches exhaustively and the
         // arm's position is the tagged-sum discriminant the codec writes.
         let mut out = String::new();
-        out.push_str(&format!(
-            "sealed class {base} {{\n  const {base}();\n}}\n\n"
-        ));
+        out.push_str(&format!("sealed class {base} {{\n  const {base}();\n"));
+        out.push_str(&self.union_codec(&base, choices, records, aliases, unions));
+        out.push_str("}\n\n");
         for (index, choice) in choices.iter().enumerate() {
             let arm = union_arm_name(&base, index, choice);
             let inner = map_type(choice, &None, self.cfg.decimal_dart_type());
-            out.push_str(&dart_class_header(0, "final class", &arm, &base));
-            out.push_str(&format!(
-                "  final {inner} value;\n  const {arm}(this.value);\n}}\n\n"
+            out.push_str(&dart_class_header(0, "final class", &arm, "extends", &base));
+            out.push_str(&dart_field(2, &inner, "value"));
+            out.push_str(&dart_ctor_signature(
+                2,
+                &format!("const {arm}"),
+                &["this.value".to_string()],
+                ";",
+            ));
+            // Each arm writes its own index, so the encoder never chooses an arm.
+            let val = dart_to_cbor_expr(choice, "value", records, aliases, unions);
+            out.push_str("\n  @override\n  List<Object?> toCborValue() {\n");
+            out.push_str(&dart_stmt(
+                4,
+                "return ",
+                &DExpr::ListLit {
+                    prefix: "<Object?>".to_string(),
+                    elems: vec![DExpr::Atom(index.to_string()), val],
+                },
+                ";",
+            ));
+            out.push_str("  }\n}\n\n");
+        }
+        out
+    }
+
+    /// The tagged-sum codec of a union, on its sealed base class: the value is the
+    /// pair `[variant_index, value]`, the index the arm's place in declaration
+    /// order. The arm class carries the index, so the encoder never guesses an arm,
+    /// and the decoder dispatches on the index and decodes the value as that arm.
+    fn union_codec(
+        &self,
+        base: &str,
+        choices: &[CsilTypeExpression],
+        records: &std::collections::HashSet<String>,
+        aliases: &std::collections::HashMap<String, CsilTypeExpression>,
+        unions: &std::collections::HashMap<String, Vec<CsilTypeExpression>>,
+    ) -> String {
+        let decimal = self.cfg.decimal_dart_type();
+        let mut out = String::new();
+        out.push_str("\n  /// The CBOR-encodable dynamic tree: `[variant_index, value]`.\n");
+        out.push_str("  List<Object?> toCborValue();\n\n");
+        out.push_str("  /// Reconstruct this union from a decoded CBOR dynamic tree.\n");
+        out.push_str(&dart_ctor_signature(
+            2,
+            &format!("factory {base}.fromCborValue"),
+            &["Object? cbor".to_string()],
+            " {",
+        ));
+        // A switch statement, not a switch expression: an arm class name can be
+        // wider than the page, and a statement wraps the same way at any width.
+        out.push_str("    final csilU = CsilCbor.unionPair(cbor);\n    switch (csilU[0]) {\n");
+        for (i, choice) in choices.iter().enumerate() {
+            let arm = union_arm_name(base, i, choice);
+            let val = dart_from_cbor_expr(choice, "csilU[1]", records, decimal, aliases, unions);
+            out.push_str(&format!("      case {i}:\n"));
+            out.push_str(&dart_stmt(
+                8,
+                "return ",
+                &DExpr::Call {
+                    callee: arm,
+                    args: vec![val],
+                },
+                ";",
             ));
         }
+        out.push_str("      default:\n");
+        out.push_str(&dart_stmt(
+            8,
+            "throw ",
+            &DExpr::Call {
+                callee: "FormatException".to_string(),
+                args: vec![DExpr::Atom(dart_string_lit(&format!(
+                    "csil cbor: unknown {base} variant"
+                )))],
+            },
+            ";",
+        ));
+        out.push_str("    }\n  }\n\n");
+        out.push_str("  /// Encode this union to canonical CSIL CBOR bytes.\n");
+        out.push_str("  Uint8List toCbor() => CsilCbor.encodeValue(toCborValue());\n\n");
+        out.push_str("  /// Decode a CSIL CBOR byte payload into this union.\n");
+        out.push_str(&dart_from_cbor_factory(base));
         out
     }
 
@@ -3016,7 +3252,7 @@ impl DartGenerator {
         for (i, group) in groups.iter().enumerate() {
             let arm = format!("{base}Variant{i}");
             // Each variant is its own record-shaped final class extending the base.
-            out.push_str(&dart_class_header(0, "final class", &arm, &base));
+            out.push_str(&dart_class_header(0, "final class", &arm, "extends", &base));
             let named: Vec<(String, String, &CsilGroupEntry)> = group
                 .entries
                 .iter()
@@ -3028,7 +3264,7 @@ impl DartGenerator {
                     &entry.occurrence,
                     self.cfg.decimal_dart_type(),
                 );
-                out.push_str(&format!("  final {ty} {member};\n"));
+                out.push_str(&dart_field(2, &ty, member));
             }
             let params: Vec<String> = named
                 .iter()
@@ -3048,15 +3284,6 @@ impl DartGenerator {
 
     // -- Clients ------------------------------------------------------------
 
-    fn service_base(&self, name: &str) -> String {
-        let pascal = name.to_case(Case::Pascal);
-        pascal
-            .strip_suffix("Service")
-            .filter(|s| !s.is_empty())
-            .map(str::to_string)
-            .unwrap_or(pascal)
-    }
-
     /// Build one client file for the given `shape` at `filename`. `include_wire_ids`
     /// is true only for the canonical (sync) file so the async twin never re-declares
     /// the top-level `const` ordinals the sync file already owns. Returns `None` when
@@ -3071,13 +3298,15 @@ impl DartGenerator {
         records: &std::collections::HashSet<String>,
         aliases: &std::collections::HashMap<String, CsilTypeExpression>,
         unions: &std::collections::HashMap<String, Vec<CsilTypeExpression>>,
-        has_types: bool,
+        type_symbols: &[String],
     ) -> Option<GeneratedFile> {
         let mut services_code = String::new();
         for rule in &spec.rules {
             if let CsilRuleType::ServiceDef(service) = &rule.rule_type {
                 services_code.push_str(
-                    &self.generate_client(&rule.name, service, records, aliases, unions, shape),
+                    &self.generate_client(
+                        spec, &rule.name, service, records, aliases, unions, shape,
+                    ),
                 );
                 if include_wire_ids {
                     services_code.push_str(&self.generate_wire_ids(&rule.name, service));
@@ -3094,9 +3323,9 @@ impl DartGenerator {
         ));
         body.push('\n');
         body.push_str(&services_code);
-        // The clients name the generated request/response types, so the client file
-        // must import the types library.
-        let extra = if has_types {
+        // The clients name the generated request/response types; an import they
+        // do not use fails `dart analyze`.
+        let extra = if type_symbols.iter().any(|t| mentions(&body, t)) {
             vec!["types.gen.dart".to_string()]
         } else {
             Vec::new()
@@ -3107,8 +3336,10 @@ impl DartGenerator {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn generate_client(
         &self,
+        spec: &CsilSpecSerialized,
         name: &str,
         service: &CsilServiceDefinition,
         records: &std::collections::HashSet<String>,
@@ -3116,7 +3347,7 @@ impl DartGenerator {
         unions: &std::collections::HashMap<String, Vec<CsilTypeExpression>>,
         shape: ClientShape,
     ) -> String {
-        let base = self.service_base(name);
+        let base = service_base_name(spec, name);
         let client = shape.client_name(&base);
         let transport = shape.transport_name();
         let decimal = self.cfg.decimal_dart_type();
@@ -3125,13 +3356,24 @@ impl DartGenerator {
         // Wire strings carry the verbatim CSIL service and op names
         // (csil-rpc-transport.md §1.1), so a Dart client reaches the same
         // endpoint as a Go/Python/TS peer.
-        let wire_service = dart_string_lit(name);
+        let wire_service = dart_string_lit(spec.declared_name(name));
         let mut out = String::new();
-        out.push_str(&format!(
-            "/// A typed, transport-agnostic client for the {name} service. The client owns\n/// (de)serialization; the carrier only moves bytes.\nfinal class {client} {{\n"
+        out.push_str(&dart_comment(
+            0,
+            "///",
+            &format!(
+                "A typed, transport-agnostic client for the {name} service. The client owns (de)serialization; the carrier only moves bytes."
+            ),
         ));
-        out.push_str(&format!("  final {transport} transport;\n"));
-        out.push_str(&format!("  const {client}(this.transport);\n\n"));
+        out.push_str(&format!("final class {client} {{\n"));
+        out.push_str(&dart_field(2, &transport, "transport"));
+        out.push_str(&dart_ctor_signature(
+            2,
+            &format!("const {client}"),
+            &["this.transport".to_string()],
+            ";",
+        ));
+        out.push('\n');
 
         for op in &service.operations {
             if !matches!(op.direction, CsilServiceDirection::Unidirectional) {
@@ -3246,16 +3488,26 @@ impl DartGenerator {
         let mut out = String::new();
 
         // Handler interface — host implements one method per operation.
-        out.push_str(&format!(
-            "/// The {name} service contract. A host `implements` this; the router\n/// dispatches decoded requests/messages to it.\nabstract interface class {handler} {{\n"
+        out.push_str(&dart_comment(
+            0,
+            "///",
+            &format!(
+                "The {name} service contract. A host `implements` this; the router dispatches decoded requests/messages to it."
+            ),
         ));
+        out.push_str(&format!("abstract interface class {handler} {{\n"));
         for op in &service.operations {
             let method = dart_member_name(&op.name);
             match op.direction {
                 CsilServiceDirection::Unidirectional => {
                     let out_type = map_type(&success_type(op.success_output()), &None, decimal);
                     if is_null_input(&op.input_type) {
-                        out.push_str(&format!("  {out_type} {method}();\n"));
+                        out.push_str(&dart_signature(
+                            2,
+                            &format!("{out_type} {method}"),
+                            &[],
+                            ";",
+                        ));
                     } else {
                         let in_type = map_type(&op.input_type, &None, decimal);
                         out.push_str(&dart_signature(
@@ -3301,8 +3553,12 @@ impl DartGenerator {
         let decimal = self.cfg.decimal_dart_type();
         let fn_name = format!("route{}Channel", dart_type_name(name));
         let mut out = String::new();
-        out.push_str(&format!(
-            "/// Decode one inbound channel frame and dispatch to the matching {name}\n/// method by its verbatim wire op name (verbose profile).\n"
+        out.push_str(&dart_comment(
+            0,
+            "///",
+            &format!(
+                "Decode one inbound channel frame and dispatch to the matching {name} method by its verbatim wire op name (verbose profile)."
+            ),
         ));
         out.push_str(&dart_signature(
             0,
@@ -3328,7 +3584,7 @@ impl DartGenerator {
                 "",
                 &DExpr::Call {
                     callee: format!("handler.{method}"),
-                    args: vec![DExpr::Atom(format!("codec.decode(data) as {in_type}"))],
+                    args: vec![DExpr::Atom(decode_cast("codec.decode(data)", &in_type))],
                 },
                 ";",
             ));
@@ -3349,9 +3605,13 @@ impl DartGenerator {
         let decimal = self.cfg.decimal_dart_type();
         let fn_name = format!("route{}ChannelCompact", dart_type_name(name));
         let mut out = String::new();
-        out.push_str(&format!(
-            "/// Compact-profile twin of route{0}Channel: dispatch by @wire-id ordinal.\n/// The profile is negotiated on the wire, so a host keeps both routers.\n",
-            dart_type_name(name)
+        out.push_str(&dart_comment(
+            0,
+            "///",
+            &format!(
+                "Compact-profile twin of route{}Channel: dispatch by @wire-id ordinal. The profile is negotiated on the wire, so a host keeps both routers.",
+                dart_type_name(name)
+            ),
         ));
         out.push_str(&dart_signature(
             0,
@@ -3378,7 +3638,7 @@ impl DartGenerator {
                 "",
                 &DExpr::Call {
                     callee: format!("handler.{method}"),
-                    args: vec![DExpr::Atom(format!("codec.decode(data) as {in_type}"))],
+                    args: vec![DExpr::Atom(decode_cast("codec.decode(data)", &in_type))],
                 },
                 ";",
             ));
@@ -3398,8 +3658,10 @@ impl DartGenerator {
         };
         let prefix = dart_member_name(name);
         let mut out = String::new();
-        out.push_str(&format!(
-            "// Wire-id ordinals for the {name} service (compact profiles).\n"
+        out.push_str(&dart_comment(
+            0,
+            "//",
+            &format!("Wire-id ordinals for the {name} service (compact profiles)."),
         ));
         out.push_str(&format!(
             "const int {prefix}ServiceWireId = {service_id};\n"
@@ -3413,6 +3675,86 @@ impl DartGenerator {
         out.push('\n');
         out
     }
+}
+
+/// `static final _byNumber = <int, Base>{...};`, wrapped as the formatter wraps a
+/// map literal: the entries split first, and when the opening line is still too
+/// wide the literal moves below the `=`.
+fn dart_by_number(base: &str) -> String {
+    let entry = "for (final member in values) member.wireNumber: member";
+    let open = format!("  static final _byNumber = <int, {base}>{{");
+    let flat = format!("{open}{entry}}};");
+    if flat.len() <= DART_WIDTH {
+        return format!("{flat}\n");
+    }
+    if open.len() <= DART_WIDTH {
+        return format!("{open}\n    {entry},\n  }};\n");
+    }
+    format!("  static final _byNumber =\n      <int, {base}>{{\n        {entry},\n      }};\n")
+}
+
+/// `throw FormatException('<message>', value);` at `indent`.
+fn dart_throw_format(indent: usize, message: &str) -> String {
+    dart_stmt(
+        indent,
+        "throw ",
+        &DExpr::Call {
+            callee: "FormatException".to_string(),
+            args: vec![
+                DExpr::Atom(dart_string_lit(message)),
+                DExpr::Atom("value".to_string()),
+            ],
+        },
+        ";",
+    )
+}
+
+/// `return ('<variant>', CsilCbor.encodeValue(<value>));` inside a reply encoder.
+fn dart_reply_return(variant: &str, value: DExpr) -> String {
+    dart_stmt(
+        4,
+        "return ",
+        &DExpr::RecordLit {
+            elems: vec![
+                DExpr::Atom(dart_string_lit(variant)),
+                DExpr::Call {
+                    callee: "CsilCbor.encodeValue".to_string(),
+                    args: vec![value],
+                },
+            ],
+            trailing: false,
+        },
+        ";",
+    )
+}
+
+/// `if (other is! Class) return false;`, wrapped as the formatter wraps it.
+fn dart_type_guard(class_name: &str) -> String {
+    let cond = format!("    if (other is! {class_name})");
+    if cond.len() + " return false;".len() <= DART_WIDTH {
+        format!("{cond} return false;\n")
+    } else if cond.len() <= DART_WIDTH {
+        format!("{cond}\n      return false;\n")
+    } else {
+        format!("    if (other\n        is! {class_name})\n      return false;\n")
+    }
+}
+
+/// `factory <Class>.fromCbor(...)`, wrapped the way `dart format` wraps it.
+fn dart_from_cbor_factory(class_name: &str) -> String {
+    let head = format!("factory {class_name}.fromCbor");
+    let params = ["List<int> bytes".to_string()];
+    let body = DExpr::Call {
+        callee: format!("{class_name}.fromCborValue"),
+        args: vec![DExpr::Atom("CsilCbor.decode(bytes)".to_string())],
+    };
+    let flat = format!("  {head}(List<int> bytes) => {};", body.flat());
+    if flat.len() <= DART_WIDTH {
+        return format!("{flat}\n");
+    }
+    let mut out = dart_ctor_signature(2, &head, &params, " =>");
+    out.push_str(&dart_stmt(6, "", &body, ";"));
+    out
 }
 
 fn is_bytes_type(type_expr: &CsilTypeExpression) -> bool {
@@ -3430,7 +3772,7 @@ fn is_bytes_type(type_expr: &CsilTypeExpression) -> bool {
 // would choose: fully-split argument lists with a trailing comma, method
 // chains one call per line at +4, conditional operands on their own lines at
 // +4 (a chain nested in a branch lands at +6 from the operand, matching the
-// formatter's extra expression indent), block-formatted trailing switch /
+// formatter's extra expression indent), block-formatted trailing
 // collection arguments, and always-split statement blocks (an IIFE body never
 // stays on one line even when it would fit).
 
@@ -3446,15 +3788,22 @@ fn pad(n: usize) -> String {
 /// A synthesized (hoisted) union arm's name is `<Owner>_<field>Variant<N>`-
 /// shaped and routinely overflows the page width, so this can't just be a
 /// bare `format!`.
-fn dart_class_header(indent: usize, kw: &str, name: &str, base: &str) -> String {
-    let flat = format!("{kw} {name} extends {base} {{");
+fn dart_class_header(indent: usize, kw: &str, name: &str, clause: &str, base: &str) -> String {
+    let flat = format!("{kw} {name} {clause} {base} {{");
     if indent + flat.len() <= DART_WIDTH {
         format!("{}{flat}\n", pad(indent))
-    } else {
+    } else if indent + 4 + clause.len() + base.len() + 3 <= DART_WIDTH {
         format!(
-            "{}{kw} {name}\n{}extends {base} {{\n",
+            "{}{kw} {name}\n{}{clause} {base} {{\n",
             pad(indent),
             pad(indent + 4)
+        )
+    } else {
+        format!(
+            "{}{kw} {name}\n{}{clause}\n{}{base} {{\n",
+            pad(indent),
+            pad(indent + 4),
+            pad(indent + 8)
         )
     }
 }
@@ -3478,19 +3827,13 @@ enum DExpr {
     Call { callee: String, args: Vec<DExpr> },
     /// `recv.m1(args).m2(args)...` — a method chain (splits every call at once).
     Chain {
-        recv: String,
+        recv: Box<DExpr>,
         calls: Vec<(String, Vec<DExpr>)>,
     },
     /// `params => body`.
     Lambda { params: String, body: Box<DExpr> },
     /// `cond ? null : else` — the optional-field guard.
     CondNull { cond: String, else_: Box<DExpr> },
-    /// `switch (head) { pat => value, ... }`, parenthesized in value position.
-    Switch {
-        head: String,
-        arms: Vec<(String, DExpr)>,
-        parens: bool,
-    },
     /// `(() { bind return ret; })()` — statement blocks always split.
     Iife { bind: String, ret: Box<DExpr> },
     /// `prefix[elems...]`.
@@ -3509,7 +3852,7 @@ impl DExpr {
             DExpr::Named { name, value } => format!("{name}: {}", value.flat()),
             DExpr::Call { callee, args } => format!("{callee}({})", join_flat(args)),
             DExpr::Chain { recv, calls } => {
-                let mut out = recv.clone();
+                let mut out = recv.flat();
                 for (name, args) in calls {
                     out.push_str(&format!(".{name}({})", join_flat(args)));
                 }
@@ -3517,14 +3860,6 @@ impl DExpr {
             }
             DExpr::Lambda { params, body } => format!("{params} => {}", body.flat()),
             DExpr::CondNull { cond, else_ } => format!("{cond} ? null : {}", else_.flat()),
-            DExpr::Switch { head, arms, parens } => {
-                let body: Vec<String> = arms
-                    .iter()
-                    .map(|(pat, val)| format!("{pat} => {}", val.flat()))
-                    .collect();
-                let inner = format!("switch ({head}) {{ {} }}", body.join(", "));
-                if *parens { format!("({inner})") } else { inner }
-            }
             DExpr::Iife { bind, ret } => {
                 format!("(() {{ {bind} return {}; }})()", ret.flat())
             }
@@ -3548,29 +3883,30 @@ impl DExpr {
             DExpr::Cast { expr, .. } => expr.force_split(),
             DExpr::Named { value, .. } => value.force_split(),
             DExpr::Call { args, .. } => args.iter().any(DExpr::force_split),
-            DExpr::Chain { calls, .. } => calls
-                .iter()
-                .any(|(_, args)| args.iter().any(DExpr::force_split)),
+            DExpr::Chain { recv, calls } => {
+                recv.force_split()
+                    || calls
+                        .iter()
+                        .any(|(_, args)| args.iter().any(DExpr::force_split))
+            }
             DExpr::Lambda { body, .. } => body.force_split(),
             DExpr::CondNull { else_, .. } => else_.force_split(),
-            DExpr::Switch { arms, .. } => arms.iter().any(|(_, v)| v.force_split()),
             DExpr::Iife { .. } => true,
-            DExpr::ListLit { elems, .. } | DExpr::RecordLit { elems, .. } => {
-                elems.iter().any(DExpr::force_split)
-            }
+            // The formatter always splits a collection that holds a non-empty
+            // collection literal.
+            DExpr::ListLit { elems, .. } => elems.iter().any(|e| {
+                e.force_split() || matches!(e, DExpr::ListLit { elems, .. } if !elems.is_empty())
+            }),
+            DExpr::RecordLit { elems, .. } => elems.iter().any(DExpr::force_split),
         }
     }
 
     /// The opening line a "block argument" contributes when the formatter keeps
-    /// a call's leading arguments in place and splits only its trailing switch /
+    /// a call's leading arguments in place and splits only its trailing
     /// collection / lambda-over-block argument. `None` for shapes the formatter
     /// refuses to block-format (an IIFE is an invocation, not a block).
     fn block_head(&self) -> Option<String> {
         match self {
-            DExpr::Switch { head, parens, .. } => {
-                let open = if *parens { "(" } else { "" };
-                Some(format!("{open}switch ({head}) {{"))
-            }
             DExpr::ListLit { prefix, .. } => Some(format!("{prefix}[")),
             // A lambda argument is never block-head-merged into the
             // enclosing call: `dart format` always fully splits a call whose
@@ -3635,18 +3971,32 @@ impl DExpr {
                         pad(cont + 4)
                     );
                 }
+                let inline = value.render(li, col + name.len() + 2, tail, li + 4);
+                if first_line_fits(&inline, col + name.len() + 2, tail) {
+                    return format!("{name}: {inline}");
+                }
+                // The formatter moves a value whose first line overflows to its own
+                // line; a conditional keeps `?`/`:` at the value's column there.
+                let cont = if matches!(value.as_ref(), DExpr::CondNull { .. }) {
+                    li + 4
+                } else {
+                    li + 8
+                };
                 format!(
-                    "{name}: {}",
-                    value.render(li, col + name.len() + 2, tail, li + 4)
+                    "{name}:\n{}{}",
+                    pad(li + 4),
+                    value.render(li + 4, li + 4, tail, cont)
                 )
             }
             DExpr::Call { callee, args } => render_call(li, col, tail, callee, args),
             DExpr::Chain { recv, calls } => {
-                if calls.len() == 1 {
+                if calls.len() == 1 && matches!(recv.as_ref(), DExpr::Atom(_)) {
                     let (name, args) = &calls[0];
-                    return render_call(li, col, tail, &format!("{recv}.{name}"), args);
+                    return render_call(li, col, tail, &format!("{}.{name}", recv.flat()), args);
                 }
-                let mut out = recv.clone();
+                // A receiver too wide for its line splits its own arguments one
+                // level deeper than the chain's continuation indent.
+                let mut out = recv.render(cont, col, 0, cont + 4);
                 for (i, (name, args)) in calls.iter().enumerate() {
                     let seg_tail = if i + 1 == calls.len() { tail } else { 0 };
                     out.push_str(&format!("\n{}.", pad(cont)));
@@ -3654,10 +4004,18 @@ impl DExpr {
                 }
                 out
             }
-            DExpr::Lambda { params, body } => format!(
-                "{params} => {}",
-                body.render(li, col + params.len() + 4, tail, li + 4)
-            ),
+            // The formatter prefers the whole body on the next line over a split
+            // body after the arrow.
+            DExpr::Lambda { params, body } => {
+                let body_flat = body.flat();
+                if !body.force_split() && li + 4 + body_flat.len() + tail <= DART_WIDTH {
+                    return format!("{params} =>\n{}{body_flat}", pad(li + 4));
+                }
+                format!(
+                    "{params} => {}",
+                    body.render(li, col + params.len() + 4, tail, li + 4)
+                )
+            }
             DExpr::CondNull { cond, else_ } => format!(
                 "{cond}\n{}? null\n{}: {}",
                 pad(cont),
@@ -3669,7 +4027,6 @@ impl DExpr {
                 // the column its opening line actually started at.
                 else_.render(cont + 2, cont + 2, tail, cont + 6)
             ),
-            DExpr::Switch { .. } => self.render_block(li),
             DExpr::Iife { bind, ret } => format!(
                 "(() {{\n{}{bind}\n{}return {};\n{}}})()",
                 pad(li + 2),
@@ -3685,20 +4042,6 @@ impl DExpr {
     /// closing delimiter back at `li`.
     fn render_block(&self, li: usize) -> String {
         match self {
-            DExpr::Switch { head, arms, parens } => {
-                let open = if *parens { "(" } else { "" };
-                let close = if *parens { ")" } else { "" };
-                let mut out = format!("{open}switch ({head}) {{\n");
-                for (pat, val) in arms {
-                    out.push_str(&format!(
-                        "{}{pat} => {},\n",
-                        pad(li + 2),
-                        val.render(li + 2, li + 2 + pat.len() + 4, 1, li + 6)
-                    ));
-                }
-                out.push_str(&format!("{}}}{close}", pad(li)));
-                out
-            }
             DExpr::ListLit { prefix, elems } => {
                 let mut out = format!("{prefix}[\n");
                 for e in elems {
@@ -3741,13 +4084,22 @@ impl DExpr {
     }
 }
 
+/// Whether the first line of `rendered`, starting at column `col`, fits the page.
+/// `tail` counts only when the rendering is a single line.
+fn first_line_fits(rendered: &str, col: usize, tail: usize) -> bool {
+    match rendered.split_once('\n') {
+        Some((first, _)) => col + first.len() <= DART_WIDTH,
+        None => col + rendered.len() + tail <= DART_WIDTH,
+    }
+}
+
 fn join_flat(args: &[DExpr]) -> String {
     let parts: Vec<String> = args.iter().map(DExpr::flat).collect();
     parts.join(", ")
 }
 
 /// `callee(args)` starting at `col` on a line indented `li`: flat when it fits;
-/// block-formatted when only a trailing switch/collection argument overflows;
+/// block-formatted when only a trailing collection argument overflows;
 /// otherwise fully split, one argument per line with a trailing comma.
 fn render_call(li: usize, col: usize, tail: usize, callee: &str, args: &[DExpr]) -> String {
     let flat_args = join_flat(args);
@@ -3789,11 +4141,19 @@ fn dart_stmt(indent: usize, prefix: &str, expr: &DExpr, suffix: &str) -> String 
     if !expr.force_split() && indent + prefix.len() + flat.len() + suffix.len() <= DART_WIDTH {
         return format!("{}{prefix}{flat}{suffix}\n", pad(indent));
     }
-    format!(
-        "{}{prefix}{}{suffix}\n",
-        pad(indent),
-        expr.render(indent, indent + prefix.len(), suffix.len(), indent + 4)
-    )
+    let inline = expr.render(indent, indent + prefix.len(), suffix.len(), indent + 4);
+    // An assignment whose right side cannot start on the `=` line moves the whole
+    // right side to the next line, four columns in.
+    if prefix.ends_with("= ") && !first_line_fits(&inline, indent + prefix.len(), suffix.len()) {
+        return format!(
+            "{}{}\n{}{}{suffix}\n",
+            pad(indent),
+            prefix.trim_end(),
+            pad(indent + 4),
+            expr.render(indent + 4, indent + 4, suffix.len(), indent + 8)
+        );
+    }
+    format!("{}{prefix}{inline}{suffix}\n", pad(indent))
 }
 
 /// A braceless `if (cond) prefix expr suffix;` guard: one line when it fits,
@@ -3812,19 +4172,200 @@ fn dart_if_stmt(indent: usize, cond: &str, prefix: &str, expr: &DExpr, suffix: &
     )
 }
 
-/// A declaration signature `head(params)tail` at `indent`: flat when it fits,
-/// otherwise each parameter on its own line with a trailing comma.
-fn dart_signature(indent: usize, head: &str, params: &[String], tail: &str) -> String {
-    let flat = format!("{}{head}({}){tail}\n", pad(indent), params.join(", "));
-    if params.is_empty() || flat.len() - 1 <= DART_WIDTH {
-        return flat;
+/// The byte offsets of the spaces in `text` that are outside `<>`, `()`, `[]`
+/// and `{}`: the places where the formatter may break a type or a declaration.
+fn top_level_spaces(text: &str) -> Vec<usize> {
+    let mut depth = 0usize;
+    let mut out = Vec::new();
+    for (at, c) in text.char_indices() {
+        match c {
+            '<' | '(' | '[' | '{' => depth += 1,
+            '>' | ')' | ']' | '}' => depth = depth.saturating_sub(1),
+            ' ' if depth == 0 => out.push(at),
+            _ => {}
+        }
     }
-    let mut out = format!("{}{head}(\n", pad(indent));
+    out
+}
+
+/// One parameter (or field type plus name) at `indent`. When it is too wide, the
+/// formatter puts each top-level word on its own line at the same indent.
+fn dart_split_words(indent: usize, text: &str, tail: &str) -> String {
+    if indent + text.len() + tail.len() <= DART_WIDTH {
+        return format!("{}{text}{tail}\n", pad(indent));
+    }
+    let mut out = String::new();
+    let mut from = 0;
+    for at in top_level_spaces(text) {
+        out.push_str(&format!("{}{}\n", pad(indent), &text[from..at]));
+        from = at + 1;
+    }
+    out.push_str(&format!("{}{}{tail}\n", pad(indent), &text[from..]));
+    out
+}
+
+/// `name(params)tail` at `indent`, with the parameters one per line when the
+/// flat form is too wide.
+fn dart_params(indent: usize, name: &str, params: &[String], tail: &str) -> String {
+    let flat = format!("{}{name}({}){tail}", pad(indent), params.join(", "));
+    if params.is_empty() || flat.len() <= DART_WIDTH {
+        return format!("{flat}\n");
+    }
+    let mut out = format!("{}{name}(\n", pad(indent));
     for p in params {
-        out.push_str(&format!("{}{p},\n", pad(indent + 2)));
+        out.push_str(&dart_split_words(indent + 2, p, ","));
     }
     out.push_str(&format!("{}){tail}\n", pad(indent)));
     out
+}
+
+/// A declaration signature `head(params)tail` at `indent`, where `head` ends with
+/// the declared name and may start with modifiers and a return type. Wrapped as
+/// the formatter wraps it: the parameters split first; when `head(` alone is too
+/// wide, the return type goes on its own line, and a too-wide generic return type
+/// splits inside its angle brackets.
+fn dart_signature(indent: usize, head: &str, params: &[String], tail: &str) -> String {
+    let flat = format!("{}{head}({}){tail}", pad(indent), params.join(", "));
+    if flat.len() <= DART_WIDTH {
+        return format!("{flat}\n");
+    }
+    let Some(&at) = top_level_spaces(head).last() else {
+        return dart_params(indent, head, params, tail);
+    };
+    if indent + head.len() < DART_WIDTH && !params.is_empty() {
+        return dart_params(indent, head, params, tail);
+    }
+    let (ret, name) = (&head[..at], &head[at + 1..]);
+    let mut out = dart_return_type(indent, ret);
+    out.push_str(&dart_params(indent, name, params, tail));
+    out
+}
+
+/// A return type (with its modifiers) on its own line.
+fn dart_return_type(indent: usize, ret: &str) -> String {
+    if indent + ret.len() <= DART_WIDTH {
+        return format!("{}{ret}\n", pad(indent));
+    }
+    let word = top_level_spaces(ret).last().map_or(0, |at| at + 1);
+    let (mods, ty) = ret.split_at(word);
+    match (ty.find('<'), ty.strip_suffix('>')) {
+        (Some(open), Some(body)) => format!(
+            "{}{mods}{}\n{}{}\n{}>\n",
+            pad(indent),
+            &ty[..=open],
+            pad(indent + 2),
+            &body[open + 1..],
+            pad(indent)
+        ),
+        _ => format!("{}{ret}\n", pad(indent)),
+    }
+}
+
+/// A constructor or factory signature: the head never splits, only the
+/// parameters do.
+fn dart_ctor_signature(indent: usize, head: &str, params: &[String], tail: &str) -> String {
+    dart_params(indent, head, params, tail)
+}
+
+/// `text` as comment lines at `indent`, wrapped at word breaks to the page width.
+/// The formatter never wraps a comment, so the generator must.
+fn dart_comment(indent: usize, marker: &str, text: &str) -> String {
+    let lead = format!("{}{marker} ", pad(indent));
+    let mut out = String::new();
+    let mut line = lead.clone();
+    for word in text.split_whitespace() {
+        if line.len() > lead.len() && line.chars().count() + 1 + word.chars().count() > DART_WIDTH {
+            out.push_str(line.trim_end());
+            out.push('\n');
+            line = lead.clone();
+        }
+        if line.len() > lead.len() {
+            line.push(' ');
+        }
+        line.push_str(word);
+    }
+    out.push_str(line.trim_end());
+    out.push('\n');
+    out
+}
+
+/// The top-level names `types.gen.dart` declares, so another file imports it only
+/// when it uses one of them.
+fn declared_symbols(types_code: &str) -> Vec<String> {
+    let ident = |text: &str| -> String {
+        text.chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '$')
+            .collect()
+    };
+    let mut out = Vec::new();
+    for line in types_code.lines() {
+        if line.starts_with([' ', '/', '}']) {
+            continue;
+        }
+        for kw in ["class ", "enum ", "typedef "] {
+            if let Some(at) = line.find(kw) {
+                out.push(ident(&line[at + kw.len()..]));
+            }
+        }
+        for word in line.split([' ', '(']) {
+            if word == "resolveRpcReply" || (word.starts_with("encode") && word.ends_with("Reply"))
+            {
+                out.push(word.to_string());
+            }
+        }
+    }
+    out.retain(|name| !name.is_empty());
+    out
+}
+
+/// `expr as ty`, without the cast when `ty` is `Object?`: the analyzer flags a
+/// cast that changes nothing.
+fn decode_cast(expr: &str, ty: &str) -> String {
+    if ty == "Object?" {
+        expr.to_string()
+    } else {
+        format!("{expr} as {ty}")
+    }
+}
+
+/// Whether `ty` is `Object?` in Dart, also through a typedef chain such as
+/// `typedef Mixed = Object?;`.
+fn is_object_type(
+    ty: &CsilTypeExpression,
+    aliases: &std::collections::HashMap<String, CsilTypeExpression>,
+    decimal: &str,
+) -> bool {
+    let mut ty = ty;
+    for _ in 0..32 {
+        match ty {
+            CsilTypeExpression::Reference(name) => match aliases.get(name) {
+                Some(target) => ty = target,
+                None => return false,
+            },
+            CsilTypeExpression::Constrained { base_type, .. } => ty = base_type,
+            other => return map_type(other, &None, decimal) == "Object?",
+        }
+    }
+    false
+}
+
+/// How `toMap`/`toCborValue` read a field: a field named `map` would otherwise
+/// read the local map those methods build.
+fn field_read(member: &str) -> String {
+    if member == "map" {
+        "this.map".to_string()
+    } else {
+        member.to_string()
+    }
+}
+
+/// `final Type name;` at `indent`, with the name on the next line when too wide.
+fn dart_field(indent: usize, ty: &str, name: &str) -> String {
+    let flat = format!("{}final {ty} {name};", pad(indent));
+    if flat.len() <= DART_WIDTH {
+        return format!("{flat}\n");
+    }
+    format!("{}final {ty}\n{}{name};\n", pad(indent), pad(indent))
 }
 
 /// A const constructor with named parameters: flat when it fits, otherwise one
@@ -3844,7 +4385,7 @@ fn dart_ctor_decl(indent: usize, class_name: &str, params: &[String]) -> String 
     }
     let mut out = format!("{}const {class_name}({{\n", pad(indent));
     for p in params {
-        out.push_str(&format!("{}{p},\n", pad(indent + 2)));
+        out.push_str(&dart_split_words(indent + 2, p, ","));
     }
     out.push_str(&format!("{}}});\n", pad(indent)));
     out
@@ -3924,15 +4465,30 @@ fn contains_record(
         CsilTypeExpression::Array { element_type, .. } => {
             contains_record(element_type, records, aliases, unions)
         }
-        CsilTypeExpression::Map { key, value, .. } => {
-            contains_record(key, records, aliases, unions)
-                || contains_record(value, records, aliases, unions)
-        }
+        // A dynamic map is written with its keys sorted, so it always needs the
+        // transform.
+        CsilTypeExpression::Map { .. } => true,
         CsilTypeExpression::Constrained { base_type, .. } => {
             contains_record(base_type, records, aliases, unions)
         }
         _ => false,
     }
+}
+
+/// The CDDL prelude names constants as types (`true = #7.21`). They go through the
+/// literal codec, so `literal_true: true` writes 0xf5. `undefined` reads and
+/// writes as null, as in every other target.
+fn prelude_literal(ty: &CsilTypeExpression) -> Option<CsilTypeExpression> {
+    let CsilTypeExpression::Builtin(name) = ty else {
+        return None;
+    };
+    let literal = match name.as_str() {
+        "true" => CsilLiteralValue::Bool(true),
+        "false" => CsilLiteralValue::Bool(false),
+        "undefined" => CsilLiteralValue::Null,
+        _ => return None,
+    };
+    Some(CsilTypeExpression::Literal(literal))
 }
 
 /// A Dart expression turning `expr` (a typed value) into the dynamic tree the CBOR
@@ -3946,6 +4502,9 @@ fn dart_to_cbor_expr(
     aliases: &std::collections::HashMap<String, CsilTypeExpression>,
     unions: &std::collections::HashMap<String, Vec<CsilTypeExpression>>,
 ) -> DExpr {
+    if let Some(literal) = prelude_literal(ty) {
+        return dart_to_cbor_expr(&literal, expr, records, aliases, unions);
+    }
     match ty {
         CsilTypeExpression::Builtin(name) if name == "date" => {
             DExpr::Atom(format!("CsilCbor.dateValue({expr})"))
@@ -3966,41 +4525,9 @@ fn dart_to_cbor_expr(
         CsilTypeExpression::Reference(name) if records.contains(&dart_type_name(name)) => {
             DExpr::Atom(format!("{expr}.toCborValue()"))
         }
-        // A union is a tagged sum on the wire: `[variant_index, value]`, the index in
-        // declaration order, the value that variant's own lowered form (recursive).
+        // A union lowers itself to its tagged sum (see `union_codec`).
         CsilTypeExpression::Reference(name) if unions.contains_key(name) => {
-            let base = dart_type_name(name);
-            let arms: Vec<(String, DExpr)> = unions[name]
-                .iter()
-                .enumerate()
-                .map(|(i, choice)| {
-                    let arm = union_arm_name(&base, i, choice);
-                    let val = dart_to_cbor_expr(choice, "csilV.value", records, aliases, unions);
-                    // A literal arm's own codec ignores the bound value (its
-                    // wire byte is the literal's own canonical value, not
-                    // whatever `.value` happens to hold) — binding `csilV`
-                    // for it would be an unused-variable warning under `dart
-                    // analyze`, so only bind the pattern variable when the
-                    // arm's codec actually reads it.
-                    let binding = if val.flat().contains("csilV") {
-                        "csilV"
-                    } else {
-                        "_"
-                    };
-                    (
-                        format!("{arm} {binding}"),
-                        DExpr::ListLit {
-                            prefix: "<Object?>".to_string(),
-                            elems: vec![DExpr::Atom(i.to_string()), val],
-                        },
-                    )
-                })
-                .collect();
-            DExpr::Switch {
-                head: expr.to_string(),
-                arms,
-                parens: true,
-            }
+            DExpr::Atom(format!("{expr}.toCborValue()"))
         }
         // A transparent alias is typed as its underlying shape, so the value flowing
         // here IS that shape: recurse into it (a map-of-record alias then maps each
@@ -4051,7 +4578,7 @@ fn dart_to_cbor_expr(
         {
             let inner = dart_to_cbor_expr(element_type, "csilE", records, aliases, unions);
             DExpr::Chain {
-                recv: expr.to_string(),
+                recv: Box::new(DExpr::Atom(expr.to_string())),
                 calls: vec![
                     (
                         "map".to_string(),
@@ -4064,24 +4591,30 @@ fn dart_to_cbor_expr(
                 ],
             }
         }
-        CsilTypeExpression::Map { key, value, .. }
-            if contains_record(key, records, aliases, unions)
-                || contains_record(value, records, aliases, unions) =>
-        {
+        // A dynamic map is written in canonical key order (RFC 8949 section 4.2.1).
+        CsilTypeExpression::Map { key, value, .. } => {
             let k = dart_to_cbor_expr(key, "csilK", records, aliases, unions);
             let v = dart_to_cbor_expr(value, "csilV", records, aliases, unions);
-            DExpr::Chain {
-                recv: expr.to_string(),
-                calls: vec![(
-                    "map".to_string(),
-                    vec![DExpr::Lambda {
-                        params: "(csilK, csilV)".to_string(),
-                        body: Box::new(DExpr::Call {
-                            callee: "MapEntry".to_string(),
-                            args: vec![k, v],
-                        }),
-                    }],
-                )],
+            let entries = if k.flat() == "csilK" && v.flat() == "csilV" {
+                DExpr::Atom(expr.to_string())
+            } else {
+                DExpr::Chain {
+                    recv: Box::new(DExpr::Atom(expr.to_string())),
+                    calls: vec![(
+                        "map".to_string(),
+                        vec![DExpr::Lambda {
+                            params: "(csilK, csilV)".to_string(),
+                            body: Box::new(DExpr::Call {
+                                callee: "MapEntry".to_string(),
+                                args: vec![k, v],
+                            }),
+                        }],
+                    )],
+                }
+            };
+            DExpr::Call {
+                callee: "CsilCbor.sortedMap".to_string(),
+                args: vec![entries],
             }
         }
         // Scalars, bytes, DateTime, decimal, string-choices, and record-free
@@ -4100,23 +4633,38 @@ fn dart_from_cbor_expr(
     aliases: &std::collections::HashMap<String, CsilTypeExpression>,
     unions: &std::collections::HashMap<String, Vec<CsilTypeExpression>>,
 ) -> DExpr {
+    if let Some(literal) = prelude_literal(ty) {
+        return dart_from_cbor_expr(&literal, expr, records, decimal, aliases, unions);
+    }
     match ty {
         CsilTypeExpression::Constrained { base_type, .. } => {
             dart_from_cbor_expr(base_type, expr, records, decimal, aliases, unions)
         }
-        CsilTypeExpression::Builtin(name) => DExpr::Atom(match name.as_str() {
-            // `nint` is signed; the codec decodes the negative major to a Dart int.
-            "int" | "uint" | "nint" => format!("{expr} as int"),
-            "float" | "float16" | "float32" | "float64" => format!("({expr} as num).toDouble()"),
-            "text" | "tstr" => format!("{expr} as String"),
-            "bytes" | "bstr" => format!("{expr} as Uint8List"),
-            "bool" => format!("{expr} as bool"),
-            "date" => format!("CsilCbor.asDate({expr})"),
-            "timestamp" => format!("{expr} as DateTime"),
-            "cddl_time" => format!("CsilCbor.asCddlTime({expr})"),
-            "decimal" => format!("{expr} as {decimal}"),
-            _ => expr.to_string(),
-        }),
+        CsilTypeExpression::Builtin(name) => {
+            let cast = |ty: &str| DExpr::Cast {
+                expr: Box::new(DExpr::Atom(expr.to_string())),
+                ty: ty.to_string(),
+            };
+            let call = |callee: &str| DExpr::Call {
+                callee: callee.to_string(),
+                args: vec![DExpr::Atom(expr.to_string())],
+            };
+            match name.as_str() {
+                // `nint` is signed; the codec decodes the negative major to a Dart int.
+                "int" | "uint" | "nint" => cast("int"),
+                "float" | "float16" | "float32" | "float64" => {
+                    DExpr::Atom(format!("({expr} as num).toDouble()"))
+                }
+                "text" | "tstr" => cast("String"),
+                "bytes" | "bstr" => cast("Uint8List"),
+                "bool" => cast("bool"),
+                "date" => call("CsilCbor.asDate"),
+                "timestamp" => cast("DateTime"),
+                "cddl_time" => call("CsilCbor.asCddlTime"),
+                "decimal" => cast(decimal),
+                _ => DExpr::Atom(expr.to_string()),
+            }
+        }
         CsilTypeExpression::Reference(name) if dart_text_enum(ty, aliases).is_some() => {
             DExpr::Call {
                 callee: format!(
@@ -4138,49 +4686,11 @@ fn dart_from_cbor_expr(
                 args: vec![DExpr::Atom(expr.to_string())],
             }
         }
-        // A union decodes from its tagged sum `[variant_index, value]`: read the index,
-        // dispatch to that variant's constructor over its own decoded value.
-        CsilTypeExpression::Reference(name) if unions.contains_key(name) => {
-            let base = dart_type_name(name);
-            let mut arms: Vec<(String, DExpr)> = unions[name]
-                .iter()
-                .enumerate()
-                .map(|(i, choice)| {
-                    let arm = union_arm_name(&base, i, choice);
-                    let val =
-                        dart_from_cbor_expr(choice, "csilU[1]", records, decimal, aliases, unions);
-                    (
-                        i.to_string(),
-                        DExpr::Call {
-                            callee: arm,
-                            args: vec![val],
-                        },
-                    )
-                })
-                .collect();
-            arms.push((
-                "_".to_string(),
-                // A `Call` (not a bare `Atom`) so a long hoisted/synthesized
-                // base name still renders `dart format`-clean — an `Atom`
-                // never splits, but this message routinely overflows the
-                // page width once the base name is a hoisted
-                // `<Owner>_<field>`-style synthesized name.
-                DExpr::Call {
-                    callee: "throw ArgumentError".to_string(),
-                    args: vec![DExpr::Atom(dart_string_lit(&format!(
-                        "unknown {base} variant"
-                    )))],
-                },
-            ));
-            DExpr::Iife {
-                bind: format!("final csilU = {expr} as List;"),
-                ret: Box::new(DExpr::Switch {
-                    head: "csilU[0] as int".to_string(),
-                    arms,
-                    parens: false,
-                }),
-            }
-        }
+        // A union decodes itself from its tagged sum (see `union_codec`).
+        CsilTypeExpression::Reference(name) if unions.contains_key(name) => DExpr::Call {
+            callee: format!("{}.fromCborValue", dart_type_name(name)),
+            args: vec![DExpr::Atom(expr.to_string())],
+        },
         // A transparent alias decodes as its underlying shape (the field is typed as
         // that shape), so a map-of-record alias reconstructs each value through
         // `fromCborValue` and casts to the named-typed map rather than yielding the
@@ -4240,44 +4750,37 @@ fn dart_from_cbor_expr(
                 ret: Box::new(DExpr::RecordLit { elems, trailing }),
             }
         }
+        // Helper calls instead of `.map(...).cast<T>()` chains: the element type is
+        // inferred from the lambdas, and a call wraps the same way at every width.
         CsilTypeExpression::Array { element_type, .. } => {
             let inner =
                 dart_from_cbor_expr(element_type, "csilE", records, decimal, aliases, unions);
-            let et = map_type(element_type, &None, decimal);
-            DExpr::Chain {
-                recv: format!("({expr} as List)"),
-                calls: vec![
-                    (
-                        "map".to_string(),
-                        vec![DExpr::Lambda {
-                            params: "(csilE)".to_string(),
-                            body: Box::new(inner),
-                        }],
-                    ),
-                    (format!("cast<{et}>"), vec![]),
-                    ("toList".to_string(), vec![]),
+            DExpr::Call {
+                callee: "CsilCbor.listOf".to_string(),
+                args: vec![
+                    DExpr::Atom(expr.to_string()),
+                    DExpr::Lambda {
+                        params: "(csilE)".to_string(),
+                        body: Box::new(inner),
+                    },
                 ],
             }
         }
         CsilTypeExpression::Map { key, value, .. } => {
-            let kt = map_type(key, &None, decimal);
-            let vt = map_type(value, &None, decimal);
             let k = dart_from_cbor_expr(key, "csilK", records, decimal, aliases, unions);
             let v = dart_from_cbor_expr(value, "csilV", records, decimal, aliases, unions);
-            DExpr::Chain {
-                recv: format!("({expr} as Map)"),
-                calls: vec![
-                    (
-                        "map".to_string(),
-                        vec![DExpr::Lambda {
-                            params: "(csilK, csilV)".to_string(),
-                            body: Box::new(DExpr::Call {
-                                callee: "MapEntry".to_string(),
-                                args: vec![k, v],
-                            }),
-                        }],
-                    ),
-                    (format!("cast<{kt}, {vt}>"), vec![]),
+            DExpr::Call {
+                callee: "CsilCbor.mapOf".to_string(),
+                args: vec![
+                    DExpr::Atom(expr.to_string()),
+                    DExpr::Lambda {
+                        params: "(csilK)".to_string(),
+                        body: Box::new(k),
+                    },
+                    DExpr::Lambda {
+                        params: "(csilV)".to_string(),
+                        body: Box::new(v),
+                    },
                 ],
             }
         }
@@ -4347,6 +4850,11 @@ fn client_prelude(shape: ClientShape, has_reply: bool) -> String {
     } else {
         "List<int>"
     };
+    let seam_params = [
+        "String service".to_string(),
+        "String op".to_string(),
+        "List<int> request".to_string(),
+    ];
     let reply = if !has_reply {
         String::new()
     } else {
@@ -4356,23 +4864,25 @@ fn client_prelude(shape: ClientShape, has_reply: bool) -> String {
             "(String?, Uint8List)"
         };
         format!(
-            "\n  /// Perform the (service, op) call for an operation with more than one reply
-  /// arm and return the reply variant (null when absent) with the payload bytes.
-  {reply_ret} callReply(String service, String op, List<int> request);
-"
+            "\n  /// Perform the (service, op) call for an operation with more than one
+  /// reply arm and return the reply variant (null when absent) with the
+  /// payload bytes.
+{}",
+            dart_signature(2, &format!("{reply_ret} callReply"), &seam_params, ";")
         )
     };
     format!(
         "\
-/// The carrier seam a generated client delegates to. The generated client owns
-/// (de)serialization — it encodes the typed request to CBOR and decodes the typed
-/// response — so the carrier only moves bytes for the named (service, op).
+/// The carrier seam a generated client delegates to. The generated client
+/// owns (de)serialization — it encodes the typed request to CBOR and decodes
+/// the typed response — so the carrier only moves bytes for the named
+/// (service, op).
 abstract interface class {name} {{
   /// Perform the (service, op) call with the already-encoded request bytes and
   /// return the response bytes.
-  {ret} call(String service, String op, List<int> request);
-{reply}}}
-"
+{call}{reply}}}
+",
+        call = dart_signature(2, &format!("{ret} call"), &seam_params, ";")
     )
 }
 
@@ -4396,14 +4906,15 @@ const CSIL_DECIMAL_DART: &str = r#"// The exact, base-10 `decimal` core type (CB
 // Code generated by csilgen; DO NOT EDIT.
 
 /// An exact base-10 decimal. The value is `mantissa * 10^exponent`, kept as
-/// exact integers so no float rounding can occur. Interop with package:decimal is
-/// via [toString]/[parse] (the canonical decimal-text form both agree on).
+/// exact integers so no float rounding can occur. Interop with package:decimal
+/// is via [toString]/[parse] (the canonical decimal-text form both agree on).
 final class CsilDecimal implements Comparable<CsilDecimal> {
   final int exponent;
   final BigInt mantissa;
   const CsilDecimal(this.exponent, this.mantissa);
 
-  /// Parse canonical decimal text (what [toString] produces) into an exact value.
+  /// Parse canonical decimal text (what [toString] produces) into an exact
+  /// value.
   static CsilDecimal parse(String s) {
     var text = s.trim();
     var negative = false;
@@ -4521,9 +5032,9 @@ fn csil_cbor_dart(emit_decimal: bool) -> String {
 const CSIL_CBOR_DECIMAL_HELPERS: &str = r#"  static final BigInt _minI64 = BigInt.parse('-9223372036854775808');
   static final BigInt _maxI64 = BigInt.parse('9223372036854775807');
 
-  // A mantissa that fits a 64-bit machine integer rides as a plain CBOR integer
-  // (what the reference codecs emit); a larger magnitude uses a CBOR bignum (tag 2
-  // non-negative, tag 3 negative) per RFC 8949 section 3.4.3.
+  // A mantissa that fits a 64-bit machine integer rides as a plain CBOR
+  // integer (what the reference codecs emit); a larger magnitude uses a CBOR
+  // bignum (tag 2 non-negative, tag 3 negative) per RFC 8949 section 3.4.3.
   static void _encBigInt(BytesBuilder b, BigInt m) {
     if (m >= _minI64 && m <= _maxI64) {
       _enc(b, m.toInt());
@@ -4583,10 +5094,11 @@ class _CsilDate {
   int get hashCode => text.hashCode;
 }
 
-// Tag 1 decodes to this wrapper, not to a bare DateTime, so that a `timestamp` field
-// still refuses tag 1 and a `cddl_time` field still refuses tag 0. It keeps the raw
-// content unchecked so that tag 1 inside an `any` value round-trips; only a declared
-// `cddl_time` field applies the wire rule, in asCddlTime.
+// Tag 1 decodes to this wrapper, not to a bare DateTime, so that a `timestamp`
+// field still refuses tag 1 and a `cddl_time` field still refuses tag 0. It
+// keeps the raw content unchecked so that tag 1 inside an `any` value
+// round-trips; only a declared `cddl_time` field applies the wire rule, in
+// asCddlTime.
 class _CsilEpoch {
   final Object? content;
   const _CsilEpoch(this.content);
@@ -4605,13 +5117,16 @@ class _CsilEpoch {
 /// records call this behind their toCbor/fromCbor.
 class CsilCbor {
   static Object dateValue(Object? text) {
-    if (text is String && text.length == 10 && RegExp(r'^\d{4}-\d{2}-\d{2}$').hasMatch(text)) {
+    if (text is String &&
+        text.length == 10 &&
+        RegExp(r'^\d{4}-\d{2}-\d{2}$').hasMatch(text)) {
       final y = int.parse(text.substring(0, 4));
       final m = int.parse(text.substring(5, 7));
       final d = int.parse(text.substring(8));
       final leap = y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
       final days = [31, leap ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
-      if (m >= 1 && m <= 12 && d >= 1 && d <= days[m - 1]) return _CsilDate(text);
+      if (m >= 1 && m <= 12 && d >= 1 && d <= days[m - 1])
+        return _CsilDate(text);
     }
     throw FormatException('expected YYYY-MM-DD');
   }
@@ -4642,16 +5157,32 @@ class CsilCbor {
       return n;
     }
 
-    if (!digits(0, 4) || c.length < 20 || c[4] != 45 || !digits(5, 7) || c[7] != 45 ||
-        !digits(8, 10) || (c[10] != 84 && c[10] != 116) || !digits(11, 13) ||
-        c[13] != 58 || !digits(14, 16) || c[16] != 58 || !digits(17, 19)) {
+    if (!digits(0, 4) ||
+        c.length < 20 ||
+        c[4] != 45 ||
+        !digits(5, 7) ||
+        c[7] != 45 ||
+        !digits(8, 10) ||
+        (c[10] != 84 && c[10] != 116) ||
+        !digits(11, 13) ||
+        c[13] != 58 ||
+        !digits(14, 16) ||
+        c[16] != 58 ||
+        !digits(17, 19)) {
       return null;
     }
     final y = value(0, 4), mo = value(5, 7), d = value(8, 10);
     final h = value(11, 13), mi = value(14, 16), sec = value(17, 19);
     final leap = y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
     final days = [31, leap ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
-    if (y < 1 || mo < 1 || mo > 12 || d < 1 || d > days[mo - 1] || h > 23 || mi > 59 || sec > 59) {
+    if (y < 1 ||
+        mo < 1 ||
+        mo > 12 ||
+        d < 1 ||
+        d > days[mo - 1] ||
+        h > 23 ||
+        mi > 59 ||
+        sec > 59) {
       return null;
     }
     var i = 19;
@@ -4670,8 +5201,11 @@ class CsilCbor {
     var offset = 0;
     if (i == c.length - 1 && (c[i] == 90 || c[i] == 122)) {
       offset = 0;
-    } else if (i == c.length - 6 && (c[i] == 43 || c[i] == 45) && digits(i + 1, i + 3) &&
-        c[i + 3] == 58 && digits(i + 4, i + 6)) {
+    } else if (i == c.length - 6 &&
+        (c[i] == 43 || c[i] == 45) &&
+        digits(i + 1, i + 3) &&
+        c[i + 3] == 58 &&
+        digits(i + 4, i + 6)) {
       final oh = value(i + 1, i + 3), om = value(i + 4, i + 6);
       if (oh > 23 || om > 59) return null;
       offset = (oh * 60 + om) * (c[i] == 43 ? 1 : -1);
@@ -4681,9 +5215,20 @@ class CsilCbor {
     // A fraction finer than DateTime holds must fail, never round.
     if (nanos % 1000 != 0) return null;
     final micros = nanos ~/ 1000;
-    final t = DateTime.utc(y, mo, d, h, mi, sec, 0, micros).subtract(Duration(minutes: offset));
+    final t = DateTime.utc(
+      y,
+      mo,
+      d,
+      h,
+      mi,
+      sec,
+      0,
+      micros,
+    ).subtract(Duration(minutes: offset));
     // Web DateTime keeps only milliseconds, so a lost microsecond shows here.
-    if (t.year < 1 || t.year > 9999 || t.millisecond * 1000 + t.microsecond != micros) {
+    if (t.year < 1 ||
+        t.year > 9999 ||
+        t.millisecond * 1000 + t.microsecond != micros) {
       return null;
     }
     return t;
@@ -4749,7 +5294,10 @@ class CsilCbor {
     if (seconds < _cddlTimeFirst || seconds > _cddlTimeLast) {
       throw FormatException('cddl_time year outside 0001-9999');
     }
-    return DateTime.fromMicrosecondsSinceEpoch(seconds * 1000000 + units, isUtc: true);
+    return DateTime.fromMicrosecondsSinceEpoch(
+      seconds * 1000000 + units,
+      isUtc: true,
+    );
   }
 
   static num _cddlTimeNumber(DateTime v) {
@@ -4864,6 +5412,77 @@ class CsilCbor {
     }
   }
 
+  // Marks each decoded map whose keys are out of canonical order, so the
+  // reader of a dynamic map can refuse it without sorting.
+  static final _nonCanonical = Expando<bool>('csil-non-canonical-map');
+
+  /// A decoded dynamic map (`{ * K => V }`). Its keys must be in the canonical
+  /// order of RFC 8949 section 4.2.1: bytewise order of the encoded keys.
+  static Map canonicalMap(Object? value) {
+    final map = value as Map;
+    if (_nonCanonical[map] == true) {
+      throw FormatException('csil cbor: map keys are not in canonical order');
+    }
+    return map;
+  }
+
+  /// [map] with its entries in the canonical order a dynamic map is written in:
+  /// bytewise order of the encoded keys, so `"b"` comes before `"aa"`.
+  static Map<Object?, Object?> sortedMap(Map map) {
+    final keyed = [for (final e in map.entries) (encodeValue(e.key), e)];
+    keyed.sort(
+      (x, y) => _compareBytes(x.$1, 0, x.$1.length, y.$1, 0, y.$1.length),
+    );
+    return {for (final (_, e) in keyed) e.key: e.value};
+  }
+
+  /// A decoded array as a typed list, each element converted by [element].
+  static List<T> listOf<T>(Object? value, T Function(Object?) element) => [
+    for (final e in value as List) element(e),
+  ];
+
+  /// A decoded dynamic map as a typed map. The keys must be in canonical order.
+  static Map<K, V> mapOf<K, V>(
+    Object? value,
+    K Function(Object?) key,
+    V Function(Object?) item,
+  ) => {for (final e in canonicalMap(value).entries) key(e.key): item(e.value)};
+
+  /// A decoded union: the pair `[variant_index, value]`.
+  static List unionPair(Object? value) {
+    if (value is List && value.length == 2 && value[0] is int) return value;
+    throw FormatException('csil cbor: a union must be [variant_index, value]');
+  }
+
+  // A key in a longer head than its value needs would sort apart from the same
+  // key in its shortest head, so the canonical order check needs shortest keys.
+  static bool _shortestHead(Uint8List b, int pos) {
+    if (b[pos] >> 5 == 7) return true;
+    final low = b[pos] & 0x1f;
+    if (low < 24) return true;
+    final a = _readArg(b, pos, low).value;
+    return switch (low) {
+      24 => a >= 24,
+      25 => a >= 0x100,
+      26 => a >= 0x10000,
+      _ => a >= 0x100000000,
+    };
+  }
+
+  static int _compareBytes(
+    Uint8List a,
+    int i,
+    int aEnd,
+    Uint8List b,
+    int j,
+    int bEnd,
+  ) {
+    for (; i < aEnd && j < bEnd; i++, j++) {
+      if (a[i] != b[j]) return a[i] - b[j];
+    }
+    return (aEnd - i) - (bEnd - j);
+  }
+
   static Object? decode(List<int> bytes) {
     final b = Uint8List.fromList(bytes);
     final r = _dec(b, 0, 0);
@@ -4934,8 +5553,8 @@ class CsilCbor {
       return _CsilRead(v, pos + 5);
     }
     if (low == 27) {
-      // A Dart int holds 64 signed bits, so an argument of 2^63 or more would wrap
-      // to a wrong value; refusing it is the only exact answer.
+      // A Dart int holds 64 signed bits, so an argument of 2^63 or more would
+      // wrap to a wrong value; refusing it is the only exact answer.
       if (b[pos + 1] >= 0x80) {
         throw FormatException('CsilCbor: argument exceeds 2^63 - 1');
       }
@@ -4962,7 +5581,10 @@ class CsilCbor {
       if (low == 25) {
         if (b.length - pos < 3)
           throw ArgumentError('CsilCbor: truncated float');
-        return _CsilDecoded(_halfToDouble((b[pos + 1] << 8) | b[pos + 2]), pos + 3);
+        return _CsilDecoded(
+          _halfToDouble((b[pos + 1] << 8) | b[pos + 2]),
+          pos + 3,
+        );
       }
       if (low == 26) {
         if (b.length - pos < 5)
@@ -5010,12 +5632,31 @@ class CsilCbor {
           throw ArgumentError('CsilCbor: map length exceeds remaining input');
         final map = <Object?, Object?>{};
         var off5 = p;
+        var prevKey = -1;
+        var prevKeyEnd = -1;
+        var canonical = true;
         for (var i = 0; i < arg; i++) {
           final k = _dec(b, off5, depth + 1);
+          if (!_shortestHead(b, off5)) {
+            throw FormatException('csil cbor: map key is not in shortest form');
+          }
+          // Comparing each key's encoded bytes with the previous key's keeps
+          // the check O(n); a record accepts any field order, so the order is
+          // only recorded here and enforced where a dynamic map is read.
+          final order = prevKey < 0
+              ? -1
+              : _compareBytes(b, prevKey, prevKeyEnd, b, off5, k.next);
+          if (order == 0 || map.containsKey(k.value)) {
+            throw FormatException('csil cbor: duplicate key "${k.value}"');
+          }
+          if (order > 0) canonical = false;
           final v = _dec(b, k.next, depth + 1);
           map[k.value] = v.value;
+          prevKey = off5;
+          prevKeyEnd = k.next;
           off5 = v.next;
         }
+        if (!canonical) _nonCanonical[map] = true;
         return _CsilDecoded(map, off5);
       case 6:
         if (arg == 1004 && (p >= b.length || b[p] >> 5 != 3)) {
@@ -5025,9 +5666,12 @@ class CsilCbor {
           throw FormatException('timestamp tag 0 requires text');
         }
         final inner = _dec(b, p, depth + 1);
-        if (arg == 1004) return _CsilDecoded(dateValue(inner.value), inner.next);
-        if (inner.value is _CsilDate) throw FormatException('unexpected nested date tag');
-        if (arg == 0) return _CsilDecoded(timestampValue(inner.value), inner.next);
+        if (arg == 1004)
+          return _CsilDecoded(dateValue(inner.value), inner.next);
+        if (inner.value is _CsilDate)
+          throw FormatException('unexpected nested date tag');
+        if (arg == 0)
+          return _CsilDecoded(timestampValue(inner.value), inner.next);
         if (arg == 1) return _CsilDecoded(_CsilEpoch(inner.value), inner.next);
         return _CsilDecoded(inner.value, inner.next);
       default:

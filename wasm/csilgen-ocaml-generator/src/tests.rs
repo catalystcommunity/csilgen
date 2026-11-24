@@ -262,7 +262,7 @@ fn attestation_service() -> CsilServiceDefinition {
 
 #[test]
 fn server_module_emits_handler_and_routers() {
-    let out = emit_service_module("Attestation", &attestation_service());
+    let out = emit_service_module("Attestation", &attestation_service(), &Default::default());
     assert!(out.contains("module Attestation = struct"));
     // Wire-id ordinals.
     assert!(out.contains("let service_wire_id = 3L"));
@@ -283,7 +283,7 @@ fn compact_router_absent_without_wire_id() {
     let mut svc = attestation_service();
     svc.wire_id = None;
     svc.operations[0].wire_id = None;
-    let out = emit_service_module("Attestation", &svc);
+    let out = emit_service_module("Attestation", &svc, &Default::default());
     assert!(!out.contains("route_compact"));
     assert!(!out.contains("service_wire_id"));
     // The verbose router is always present.
@@ -304,7 +304,7 @@ fn push_op_handler_takes_unit_payload() {
         }],
         wire_id: None,
     };
-    let out = emit_service_module("Feed", &svc);
+    let out = emit_service_module("Feed", &svc, &Default::default());
     assert!(out.contains("| \"subscribe\" -> ignore payload; h.subscribe Bytes.empty"));
 }
 
@@ -2581,4 +2581,695 @@ fn renamed_rules_are_reported_as_warnings() {
             .iter()
             .any(|m| m.contains("`Result` is generated as `ResultType` for ocaml"))
     );
+}
+
+// --- derived names, service clashes, hoisted names, canonical maps ----------
+
+fn unary_op(
+    name: &str,
+    input: CsilTypeExpression,
+    output: CsilTypeExpression,
+) -> CsilServiceOperation {
+    CsilServiceOperation {
+        name: name.into(),
+        input_type: input,
+        output_type: output,
+        direction: CsilServiceDirection::Unidirectional,
+        position: pos(),
+        doc_comments: vec![],
+        wire_id: None,
+    }
+}
+
+fn service_rule(name: &str, operations: Vec<CsilServiceOperation>) -> CsilRule {
+    CsilRule {
+        name: name.into(),
+        rule_type: CsilRuleType::ServiceDef(CsilServiceDefinition {
+            operations,
+            wire_id: None,
+        }),
+        position: pos(),
+        doc_comments: vec![],
+    }
+}
+
+fn spec_of(rules: Vec<CsilRule>) -> CsilSpecSerialized {
+    CsilSpecSerialized {
+        service_count: rules
+            .iter()
+            .filter(|r| matches!(r.rule_type, CsilRuleType::ServiceDef(_)))
+            .count(),
+        rules,
+        source_content: None,
+        fields_with_metadata_count: 0,
+        declared_names: Default::default(),
+    }
+}
+
+fn either(arms: &[&str]) -> CsilTypeExpression {
+    CsilTypeExpression::Choice(arms.iter().map(|arm| reference(arm)).collect())
+}
+
+/// Generate `spec` as a package with both surfaces and return its files and warnings.
+fn package_output(spec: CsilSpecSerialized) -> (Vec<GeneratedFile>, Vec<String>) {
+    let out = generate_output(&WasmGeneratorInput {
+        csil_spec: spec,
+        config: package_config("ocaml", Some(serde_json::json!(["ocaml"]))),
+        generator_metadata: meta(),
+    })
+    .unwrap();
+    let warnings = out.warnings.into_iter().map(|w| w.message).collect();
+    (out.files, warnings)
+}
+
+/// Build a generated package with dune. Skips when dune is absent.
+fn assert_package_builds(files: &[GeneratedFile], tag: &str) {
+    if !tool_on_path("dune") {
+        eprintln!("skipping: no dune on PATH");
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("csilgen-ocaml-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    for f in files {
+        let path = dir.join(&f.path);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, &f.content).unwrap();
+    }
+    let run = std::process::Command::new("dune")
+        .args(["build", "--profile", "release", "--root"])
+        .arg(&dir)
+        .output()
+        .unwrap();
+    assert!(
+        run.status.success(),
+        "dune build of {tag} failed:\n{}{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The linkkeys request: `RpIssueAttestationRequest` is the op's own input record.
+fn rp_spec() -> CsilSpecSerialized {
+    spec_of(vec![
+        record_typedef("Claim", vec![bare_entry("id", builtin("text"))]),
+        record_typedef(
+            "RpIssueAttestationRequest",
+            vec![
+                bare_entry("claim_type", builtin("text")),
+                bare_entry("claim_value", builtin("bytes")),
+            ],
+        ),
+        record_typedef(
+            "RpIssueAttestationResponse",
+            vec![
+                bare_entry("claim", reference("Claim")),
+                bare_entry("deposited", builtin("bool")),
+            ],
+        ),
+        service_rule(
+            "Rp",
+            vec![
+                unary_op(
+                    "issue-attestation",
+                    reference("RpIssueAttestationRequest"),
+                    either(&["RpIssueAttestationResponse", "ServiceError"]),
+                ),
+                unary_op(
+                    "issue-plain",
+                    reference("RpIssueAttestationRequest"),
+                    reference("RpIssueAttestationResponse"),
+                ),
+            ],
+        ),
+    ])
+}
+
+#[test]
+fn op_boundary_record_keeps_its_name() {
+    let (files, warnings) = package_output(rp_spec());
+    assert!(warnings.is_empty(), "{warnings:?}");
+    let types = content(&files, "lib/types.ml");
+    assert!(types.contains("rp_issue_attestation_request = {"));
+    assert!(!types.contains("rp_issue_attestation_request_type"));
+    let codec = content(&files, "lib/codec.ml");
+    assert_eq!(
+        codec
+            .matches("encode_rp_issue_attestation_request (")
+            .count(),
+        1
+    );
+    assert_eq!(
+        codec
+            .matches("decode_rp_issue_attestation_request (")
+            .count(),
+        1
+    );
+    assert!(!codec.contains("let encode_rp_issue_attestation_request value"));
+    let client = content(&files, "lib/client.ml");
+    assert!(client.contains("(Codec.encode_rp_issue_attestation_request_bytes req)"));
+    let services = content(&files, "lib/services.ml");
+    assert!(services.contains("Codec.decode_rp_issue_attestation_request_bytes payload"));
+    assert_package_builds(&files, "rp-boundary");
+}
+
+#[test]
+fn rule_clashing_with_an_emitted_op_helper_is_renamed() {
+    let member = |output: CsilTypeExpression| {
+        spec_of(vec![
+            CsilRule {
+                name: "MemberID".into(),
+                rule_type: CsilRuleType::TypeDef(builtin("text")),
+                position: pos(),
+                doc_comments: vec![],
+            },
+            record_typedef(
+                "MemberGetMemberRequest",
+                vec![bare_entry("id", builtin("text"))],
+            ),
+            service_rule(
+                "Member",
+                vec![unary_op("get-member", reference("MemberID"), output)],
+            ),
+        ])
+    };
+    // A single-arm op has no per-op helpers in OCaml, so nothing clashes.
+    let (files, warnings) = package_output(member(reference("MemberID")));
+    assert!(warnings.is_empty(), "{warnings:?}");
+    assert!(content(&files, "lib/types.ml").contains("member_get_member_request = {"));
+    assert_package_builds(&files, "member-plain");
+
+    let (files, warnings) = package_output(member(either(&["MemberID", "ServiceError"])));
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert!(warnings[0].contains(
+        "rule `MemberGetMemberRequest` is generated as `MemberGetMemberRequestType` for ocaml"
+    ));
+    let codec = content(&files, "lib/codec.ml");
+    assert!(codec.contains("let encode_member_get_member_request value = Cbor.encode"));
+    assert!(
+        codec
+            .contains("encode_member_get_member_request_type (v : member_get_member_request_type)")
+    );
+    assert_package_builds(&files, "member-variant");
+}
+
+#[test]
+fn package_names_are_reserved_only_when_emitted() {
+    let rule = |name: &str| record_typedef(name, vec![bare_entry("x", builtin("int"))]);
+    // No service: there is no `client`, `handler`, `outcome` or error tag.
+    let (_, warnings) = package_output(spec_of(vec![
+        rule("Client"),
+        rule("Handler"),
+        rule("Outcome"),
+        rule("Transport"),
+    ]));
+    assert!(warnings.is_empty(), "{warnings:?}");
+    // `Transport` is not an error arm, so only the package types clash.
+    let mut rules = vec![
+        rule("Client"),
+        rule("Transport"),
+        rule("Decode"),
+        rule("Box"),
+    ];
+    rules.push(service_rule(
+        "Svc",
+        vec![unary_op(
+            "get",
+            reference("Transport"),
+            either(&["Box", "Decode"]),
+        )],
+    ));
+    let (files, warnings) = package_output(spec_of(rules));
+    assert_eq!(warnings.len(), 2, "{warnings:?}");
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.contains("`Client` is generated as `ClientType`"))
+    );
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.contains("`Decode` is generated as `DecodeType`"))
+    );
+    assert_package_builds(&files, "reserved");
+}
+
+#[test]
+fn services_with_one_identifier_keep_their_wire_names() {
+    let ping = record_typedef("Ping", vec![bare_entry("n", builtin("int"))]);
+    let spec = spec_of(vec![
+        ping,
+        service_rule(
+            "UserSvc",
+            vec![unary_op(
+                "ping",
+                reference("Ping"),
+                either(&["Ping", "ServiceError"]),
+            )],
+        ),
+        service_rule(
+            "user-svc",
+            vec![unary_op("pong", reference("Ping"), reference("Ping"))],
+        ),
+    ]);
+    let (files, warnings) = package_output(spec);
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert!(warnings[0].contains("service `user-svc` is generated as `user-svc2`"));
+    let client = content(&files, "lib/client.ml");
+    assert!(client.contains("module User_svc = struct"));
+    assert!(client.contains("module User_svc_2 = struct"));
+    assert!(client.contains("c.call_reply ~service:\"UserSvc\" ~op:\"ping\""));
+    assert!(client.contains("c.call ~service:\"user-svc\" ~op:\"pong\""));
+    let codec = content(&files, "lib/codec.ml");
+    assert!(codec.contains("| \"UserSvc\", \"ping\", Some \"Ping\" -> payload"));
+    let services = content(&files, "lib/services.ml");
+    assert!(services.contains("module User_svc_2 = struct"));
+    assert_package_builds(&files, "service-clash");
+}
+
+#[test]
+fn hoisted_name_clashing_with_a_derived_name_is_renamed() {
+    // The hoister names the inline field type `Thing_bytes`, whose own codec would be
+    // `encode_thing_bytes`: the bytes wrapper of `Thing`.
+    let spec = spec_of(vec![
+        record_typedef(
+            "Thing",
+            vec![
+                bare_entry(
+                    "bytes",
+                    CsilTypeExpression::Choice(vec![text_literal("a"), text_literal("b")]),
+                ),
+                bare_entry("n", builtin("int")),
+            ],
+        ),
+        service_rule(
+            "S",
+            vec![unary_op("get", reference("Thing"), reference("Thing"))],
+        ),
+    ]);
+    let (files, warnings) = package_output(spec);
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert!(warnings[0].contains("rule `Thing_bytes` is generated as `Thing_bytesType`"));
+    let types = content(&files, "lib/types.ml");
+    assert!(types.contains("bytes : thing_bytes_type;"));
+    assert_package_builds(&files, "hoisted-clash");
+}
+
+#[test]
+fn mixed_op_output_is_one_named_union() {
+    let spec = spec_of(vec![
+        record_typedef("Holder", vec![bare_entry("n", builtin("int"))]),
+        record_typedef("Err", vec![bare_entry("message", builtin("text"))]),
+        service_rule(
+            "Lookup",
+            vec![unary_op(
+                "read-counts",
+                reference("Holder"),
+                CsilTypeExpression::Choice(vec![
+                    CsilTypeExpression::Map {
+                        key: Box::new(builtin("text")),
+                        value: Box::new(builtin("int")),
+                        occurrence: Some(CsilOccurrence::ZeroOrMore),
+                    },
+                    reference("Err"),
+                ]),
+            )],
+        ),
+    ]);
+    let (files, warnings) = package_output(spec);
+    assert!(warnings.is_empty(), "{warnings:?}");
+    let types = content(&files, "lib/types.ml");
+    assert!(
+        types.contains("lookup_read_counts_output = Other of (string * int64) list | Err of err")
+    );
+    let client = content(&files, "lib/client.ml");
+    assert!(client.contains("(req : holder) : (lookup_read_counts_output, string) result"));
+    assert_package_builds(&files, "mixed-output");
+}
+
+#[test]
+fn dynamic_maps_decode_only_in_canonical_order() {
+    let ty = CsilTypeExpression::Map {
+        key: Box::new(builtin("text")),
+        value: Box::new(builtin("int")),
+        occurrence: Some(CsilOccurrence::ZeroOrMore),
+    };
+    let dec = dec_value(
+        &ty,
+        "root",
+        &Default::default(),
+        &Default::default(),
+        &Default::default(),
+    );
+    assert!(dec.contains("(Cbor.canonical_map csil_kvs)"));
+    assert!(CSIL_CBOR_OCAML.contains("csil cbor: map keys are not in canonical order"));
+    assert!(CSIL_CBOR_OCAML.contains("csil cbor: duplicate key %S"));
+    assert!(CSIL_CBOR_OCAML.contains("unique_keys raw;"));
+}
+
+/// Run the map-key rules of the runtime on raw bytes with dune. Skips without dune.
+#[test]
+fn map_keys_are_checked_on_raw_bytes_in_shortest_form() {
+    if !tool_on_path("dune") {
+        eprintln!("skipping: no dune on PATH");
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("csilgen-ocaml-map-keys-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("csil_cbor.ml"), CSIL_CBOR_OCAML).unwrap();
+    std::fs::write(dir.join("dune-project"), "(lang dune 3.0)\n").unwrap();
+    std::fs::write(
+        dir.join("dune"),
+        "(executable (name test) (modules csil_cbor test))\n",
+    )
+    .unwrap();
+    std::fs::write(dir.join("test.ml"), MAP_KEY_DRIVER_OCAML).unwrap();
+    let run = std::process::Command::new("dune")
+        .args(["exec", "--profile", "release", "--root"])
+        .arg(&dir)
+        .arg("./test.exe")
+        .output()
+        .unwrap();
+    assert!(
+        run.status.success(),
+        "ocaml map key proof failed:\n{}{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&run.stdout).trim(), "ok");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+const MAP_KEY_DRIVER_OCAML: &str = r#"module C = Csil_cbor
+
+let decode hex =
+  let b = Bytes.init (String.length hex / 2) (fun i -> Char.chr (int_of_string ("0x" ^ String.sub hex (i * 2) 2))) in
+  C.decode b
+
+let refused hex want =
+  match decode hex with
+  | Error e when e = want -> ()
+  | Error e -> failwith (hex ^ ": wrong error " ^ e)
+  | Ok _ -> failwith (hex ^ ": accepted")
+
+(* The dynamic-map check, as a generated decoder applies it to a decoded map. *)
+let dynamic hex =
+  match decode hex with
+  | Ok (C.Map kvs) -> (match C.canonical_map kvs with _ -> Ok () | exception Failure e -> Error e)
+  | Ok _ -> failwith (hex ^ ": not a map")
+  | Error e -> Error e
+
+let () =
+  (* A record may arrive in any key order. *)
+  (match decode "a2616201616102" with Ok _ -> () | Error e -> failwith e);
+  refused "a2616101616102" "csil cbor: duplicate key \"a\"";
+  refused "a2616201616201" "csil cbor: duplicate key \"b\"";
+  (* A long-form head on a key is refused in every map; on a value it is not. *)
+  refused "a178016101" "csil cbor: map key is not in shortest form";
+  refused "a1180101" "csil cbor: map key is not in shortest form";
+  refused "a119000501" "csil cbor: map key is not in shortest form";
+  refused "a11a0000ffff01" "csil cbor: map key is not in shortest form";
+  refused "a11b00000000ffffffff01" "csil cbor: map key is not in shortest form";
+  (match decode "a161611801" with Ok _ -> () | Error e -> failwith e);
+  (* Dynamic maps: bytewise order of the raw keys, so "b" before "aa", 1 before -1. *)
+  assert (dynamic "a261620162616102" = Ok ());
+  assert (dynamic "a262616101616202" = Error "csil cbor: map keys are not in canonical order");
+  assert (dynamic "a2016161206162" = Ok ());
+  assert (dynamic "a2206161016162" = Error "csil cbor: map keys are not in canonical order");
+  (* A float key keeps its raw width: the raw f9 bytes are ordered, not a re-encoding. *)
+  assert (dynamic "a2f93c0001f9400002" = Ok ());
+  refused "a2f9400001f93c0002" "csil cbor: map keys are not in canonical order";
+  print_endline "ok"
+"#;
+
+/// Shapes the repo specs use that once had no OCaml type or codec: a tuple arm with
+/// a literal slot, `true`/`false` fields, an inline record op input, and an `any`
+/// type with no record beside it.
+fn shapes_spec() -> CsilSpecSerialized {
+    let tuple = |name: &str, tag: &str, value: (&str, CsilTypeExpression)| CsilRule {
+        name: name.into(),
+        rule_type: CsilRuleType::TypeDef(CsilTypeExpression::Tuple(CsilGroupExpression {
+            entries: vec![
+                bare_entry(
+                    "tag",
+                    CsilTypeExpression::Literal(CsilLiteralValue::Text(tag.into())),
+                ),
+                bare_entry(value.0, value.1),
+            ],
+        })),
+        position: pos(),
+        doc_comments: vec![],
+    };
+    spec_of(vec![
+        tuple("Success", "success", ("data", builtin("any"))),
+        tuple("Failure", "error", ("message", builtin("text"))),
+        CsilRule {
+            name: "Outcome2".into(),
+            rule_type: CsilRuleType::TypeDef(either(&["Success", "Failure"])),
+            position: pos(),
+            doc_comments: vec![],
+        },
+        record_typedef(
+            "Flags",
+            vec![
+                bare_entry("yes", builtin("true")),
+                bare_entry("no", builtin("false")),
+                bare_entry("result", reference("Outcome2")),
+            ],
+        ),
+        service_rule(
+            "Shop",
+            vec![unary_op(
+                "get",
+                CsilTypeExpression::Group(CsilGroupExpression {
+                    entries: vec![bare_entry("id", builtin("int"))],
+                }),
+                reference("Flags"),
+            )],
+        ),
+    ])
+}
+
+const SHAPES_DRIVER_OCAML: &str = r#"open Shapes
+
+let hex b =
+  String.concat "" (List.init (Bytes.length b) (fun i -> Printf.sprintf "%02x" (Char.code (Bytes.get b i))))
+
+let () =
+  let flags = { Types.yes = (); no = (); result = Types.Failure ((), "boom") } in
+  let bytes = Codec.encode_flags_bytes flags in
+  (* {"no": false, "yes": true, "result": [1, ["error", "boom"]]} in canonical key order. *)
+  let want = "a3626e6ff463796573f566726573756c74820182656572726f7264626f6f6d" in
+  if hex bytes <> want then failwith ("encoded " ^ hex bytes);
+  if Codec.decode_flags_bytes bytes <> flags then failwith "round trip changed the value";
+  (match Codec.decode_flags_bytes (Bytes.of_string "\xa3\x62no\xf5\x63yes\xf5\x66result\x82\x01\x82\x65error\x64boom") with
+   | exception Failure _ -> ()
+   | _ -> failwith "accepted no = true");
+  (match Codec.decode_flags_bytes (Bytes.of_string "\xa3\x62no\xf4\x63yes\xf5\x66result\x82\x01\x82\x65other\x64boom") with
+   | exception Failure _ -> ()
+   | _ -> failwith "accepted a wrong literal tag");
+  let input = { Types.id = 7L } in
+  if Codec.decode_shop_get_input_bytes (Codec.encode_shop_get_input_bytes input) <> input then
+    failwith "inline input round trip";
+  print_endline "ok"
+"#;
+
+#[test]
+fn literal_slots_and_inline_inputs_build_warning_clean_and_round_trip() {
+    let mut cfg = package_config("ocaml", Some(serde_json::json!(["ocaml"])));
+    cfg.options
+        .insert("package_name".into(), serde_json::json!("shapes"));
+    let out = generate_output(&WasmGeneratorInput {
+        csil_spec: shapes_spec(),
+        config: cfg,
+        generator_metadata: meta(),
+    })
+    .unwrap();
+    let types = content(&out.files, "lib/types.ml");
+    assert!(
+        types.contains("and success = unit * Csil_cbor.t")
+            || types.contains("success = (unit * Csil_cbor.t)")
+    );
+    assert!(types.contains("yes : unit;"));
+    assert!(types.contains("shop_get_input = { id : int64 }"));
+    let codec = content(&out.files, "lib/codec.ml");
+    assert!(!codec.contains("no codec for"));
+    if !tool_on_path("dune") {
+        eprintln!("skipping: no dune on PATH");
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("csilgen-ocaml-shapes-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    for f in &out.files {
+        let path = dir.join(&f.path);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, &f.content).unwrap();
+    }
+    std::fs::create_dir_all(dir.join("drv")).unwrap();
+    std::fs::write(dir.join("drv/main.ml"), SHAPES_DRIVER_OCAML).unwrap();
+    std::fs::write(
+        dir.join("drv/dune"),
+        "(executable (name main) (libraries shapes))\n",
+    )
+    .unwrap();
+    // The default (dev) profile makes every warning an error, as a consumer's build does.
+    let run = std::process::Command::new("dune")
+        .args(["exec", "--root"])
+        .arg(&dir)
+        .arg("./drv/main.exe")
+        .output()
+        .unwrap();
+    assert!(
+        run.status.success(),
+        "dev-profile build or round trip failed:\n{}{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&run.stdout).trim(), "ok");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn any_without_a_codec_still_ships_the_value_model() {
+    let spec = spec_of(vec![CsilRule {
+        name: "Hello".into(),
+        rule_type: CsilRuleType::TypeDef(builtin("any")),
+        position: pos(),
+        doc_comments: vec![],
+    }]);
+    let files = generate_ocaml(&spec, &package_config("ocaml", None)).unwrap();
+    let paths: Vec<&str> = files.iter().map(|f| f.path.as_str()).collect();
+    assert!(paths.contains(&"csil_cbor.ml"), "{paths:?}");
+    assert!(!paths.contains(&"codec.ml"));
+}
+
+#[test]
+fn codec_group_is_rec_only_when_it_recurses() {
+    let lone = generate_codec(&spec_of(vec![record_typedef(
+        "User",
+        vec![bare_entry("n", builtin("int"))],
+    )]))
+    .unwrap();
+    assert!(lone.contains("let encode_user (v : user)"));
+    assert!(!lone.contains("let rec"));
+    let nested = generate_codec(&spec_of(vec![
+        record_typedef("User", vec![bare_entry("p", reference("Profile"))]),
+        record_typedef("Profile", vec![bare_entry("n", builtin("int"))]),
+    ]))
+    .unwrap();
+    assert!(nested.contains("let rec encode_user (v : user)"));
+    assert!(nested.contains("let rec decode_user (csil_c : Cbor.t)"));
+}
+
+#[test]
+fn enum_member_ctors_are_legal_and_keep_plain_names() {
+    let plain = [
+        "pending",
+        "in-progress",
+        "a b",
+        "class",
+        "404",
+        "HTTPServer",
+        "snake_case",
+    ];
+    let ctors = enum_member_ctors(&plain);
+    for (value, ctor) in plain.iter().zip(&ctors) {
+        assert_eq!(ctor, &ocaml_ctor_name(value), "{value}");
+    }
+    assert_eq!(
+        enum_member_ctors(&[
+            "calendars.read",
+            "events.write",
+            "a-b c",
+            "2fa",
+            "class",
+            "a.b",
+            "a-b"
+        ]),
+        [
+            "Calendars_read",
+            "Events_write",
+            "A_b_c",
+            "V_2_fa",
+            "Class",
+            "A_b",
+            "A_b_2"
+        ]
+    );
+}
+
+fn scope_spec() -> CsilSpecSerialized {
+    spec_of(vec![
+        CsilRule {
+            name: "Scope".into(),
+            rule_type: CsilRuleType::TypeDef(CsilTypeExpression::Choice(
+                SCOPE_VALUES.iter().map(|v| text_literal(v)).collect(),
+            )),
+            position: pos(),
+            doc_comments: vec![],
+        },
+        record_typedef("Grant", vec![bare_entry("scope", reference("Scope"))]),
+    ])
+}
+
+const SCOPE_VALUES: [&str; 5] = ["calendars.read", "events.write", "a-b c", "2fa", "class"];
+
+const SCOPE_DRIVER_OCAML: &str = r#"open Scopes
+
+let () =
+  List.iter
+    (fun (scope, wire) ->
+      let bytes = Codec.encode_grant_bytes { Types.scope } in
+      let want = Csil_cbor.encode (Csil_cbor.Map [ (Csil_cbor.Text "scope", Csil_cbor.Text wire) ]) in
+      if bytes <> want then failwith ("wrong wire for " ^ wire);
+      if (Codec.decode_grant_bytes bytes).Types.scope <> scope then failwith ("round trip " ^ wire))
+    [ (Types.Calendars_read, "calendars.read"); (Types.Events_write, "events.write");
+      (Types.A_b_c, "a-b c"); (Types.V_2_fa, "2fa"); (Types.Class, "class") ];
+  print_endline "ok"
+"#;
+
+#[test]
+fn text_enum_values_round_trip_with_legal_constructors() {
+    let mut cfg = package_config("ocaml", Some(serde_json::json!(["ocaml"])));
+    cfg.options
+        .insert("package_name".into(), serde_json::json!("scopes"));
+    let files = generate_ocaml(&scope_spec(), &cfg).unwrap();
+    let types = content(&files, "lib/types.ml");
+    assert!(
+        types.contains("Calendars_read | Events_write | A_b_c | V_2_fa | Class"),
+        "{types}"
+    );
+    if !tool_on_path("dune") {
+        eprintln!("skipping: no dune on PATH");
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("csilgen-ocaml-scopes-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    for f in &files {
+        let path = dir.join(&f.path);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, &f.content).unwrap();
+    }
+    std::fs::create_dir_all(dir.join("drv")).unwrap();
+    std::fs::write(dir.join("drv/main.ml"), SCOPE_DRIVER_OCAML).unwrap();
+    std::fs::write(
+        dir.join("drv/dune"),
+        "(executable (name main) (libraries scopes))\n",
+    )
+    .unwrap();
+    let run = std::process::Command::new("dune")
+        .args(["exec", "--root"])
+        .arg(&dir)
+        .arg("./drv/main.exe")
+        .output()
+        .unwrap();
+    assert!(
+        run.status.success(),
+        "scope round trip failed:\n{}{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&run.stdout).trim(), "ok");
+    let _ = std::fs::remove_dir_all(&dir);
 }

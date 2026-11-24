@@ -1,0 +1,2 @@
+; The last arm of `Contact` (index 2): it comes after the arms of wire.csil.
+Contact //= { email: text }

@@ -200,10 +200,53 @@ const RESERVED_TYPE_NAMES: &[&str] = &[
     "t",
 ];
 
-/// The spec every emitter reads: reserved rule names renamed first (so the hoister
-/// names its synthesized rules against the final names), then every inline
-/// composite hoisted to a named rule.
-fn prepare_spec(spec: &CsilSpecSerialized) -> CsilSpecSerialized {
+/// The spec every emitter reads. A mixed op boundary becomes a named union first, so
+/// that it gets the same name checks as any rule. Then the declared rules are renamed
+/// where C needs it, every inline composite is hoisted to a named rule, and the
+/// same renames run again, so a name the hoister invents is checked too.
+/// `validation` is whether `validation.gen.h` is emitted, because only then does a
+/// record declare `<Name>_validate`.
+fn prepare_spec(spec: &CsilSpecSerialized, validation: bool) -> CsilSpecSerialized {
+    let spec = csilgen_common::hoist_op_union_boundaries(spec);
+    // Renaming the declared rules before the hoist keeps each synthesized name built
+    // from the final owner name, as before this pass ran twice.
+    let declared = rename_for_c(&spec, validation);
+    let declared_rules: std::collections::HashSet<String> = declared
+        .rules
+        .iter()
+        .map(|rule| rule.name.clone())
+        .collect();
+    let hoisted = hoist_nested_aggregates(&hoist_inline_composites(
+        &declared,
+        HoistOptions {
+            hoist_all_literal_choices: true,
+        },
+    ));
+    // A synthesized rule whose own derived names (`<Name>Tag`, ...) take the name of
+    // another rule is renamed itself, so the user's rule keeps its name. Any other
+    // clash of a synthesized name is resolved by the second pass below, which
+    // renames the later rule, and synthesized rules come last.
+    let names: std::collections::HashSet<String> =
+        hoisted.rules.iter().map(|rule| rule.name.clone()).collect();
+    let synth_clear = rename_reserved(&hoisted, |name| {
+        if declared_rules.contains(name) {
+            return false;
+        }
+        let Some(rule) = hoisted.rules.iter().find(|rule| rule.name == name) else {
+            return false;
+        };
+        let own = DerivedNames::of_rules(&hoisted, std::slice::from_ref(rule), validation);
+        names
+            .iter()
+            .any(|other| other != name && own.contains(other))
+    });
+    rename_for_c(&synth_clear, validation)
+}
+
+/// One pass of the renames C needs: names that are no C identifier, names the
+/// generated headers or the C library declare, and names that collide once C
+/// derives its identifiers from them.
+fn rename_for_c(spec: &CsilSpecSerialized, validation: bool) -> CsilSpecSerialized {
     // C emits a rule name as written, so a name that is no C identifier
     // (`open-group`) takes `_` for each illegal character first.
     let renames = csilgen_common::rule_renames(spec, is_c_ident, |name| {
@@ -218,7 +261,7 @@ fn prepare_spec(spec: &CsilSpecSerialized) -> CsilSpecSerialized {
         }
     });
     let legal = csilgen_common::rename_rules(spec, &renames);
-    let derived = DerivedNames::of(&legal);
+    let derived = DerivedNames::of_rules(&legal, &legal.rules, validation);
     let reserved = rename_reserved(&legal, |name| {
         RESERVED_TYPE_NAMES.contains(&name)
             || C_RESERVED_MEMBER_NAMES.contains(&name)
@@ -228,19 +271,183 @@ fn prepare_spec(spec: &CsilSpecSerialized) -> CsilSpecSerialized {
     // `as_<snake>` and the constant `<UNION>_<ARM>`; two arms of one union whose
     // snake_case names agree (`Value` and `value`) would declare both twice.
     let arm_clashes = snake_clashing_arms(&reserved);
-    let renamed = csilgen_common::rename_ident_collisions(&reserved, |name| {
-        if arm_clashes.contains(name) {
+    let services: std::collections::HashSet<&str> = reserved
+        .rules
+        .iter()
+        .filter(|rule| matches!(rule.rule_type, CsilRuleType::ServiceDef(_)))
+        .map(|rule| rule.name.as_str())
+        .collect();
+    csilgen_common::rename_ident_collisions(&reserved, |name| {
+        // A service declares its names from `service_base` (`user-svc` and
+        // `UserSvc` both give `UserSvcHandlers`), and none of them is the bare
+        // base, so a service only clashes with another service.
+        // A renamed service is its name with one or more `Service` suffixes.
+        let service = services.iter().any(|service| {
+            name.strip_prefix(service).is_some_and(|rest| {
+                rest.len() % "Service".len() == 0
+                    && rest.as_bytes().chunks(7).all(|c| c == b"Service")
+            })
+        });
+        if service {
+            format!("service {}", service_base(name))
+        } else if arm_clashes.contains(name) {
             to_snake(name)
         } else {
             name.to_string()
         }
-    });
-    hoist_inline_composites(
-        &renamed,
-        HoistOptions {
-            hoist_all_literal_choices: true,
-        },
-    )
+    })
+}
+
+/// Give a name to each list or map that C cannot hold in place: a union arm, an
+/// array element, a map key or value, or a tuple slot. C carries a list or map in a
+/// struct with a length, and only a field, a rule body or an op boundary expands to
+/// one; anywhere else the codec had no shape for it and wrote null. A named alias
+/// rule gets the same struct and codec as `Counts = { * text => int }`.
+fn hoist_nested_aggregates(spec: &CsilSpecSerialized) -> CsilSpecSerialized {
+    struct Hoist {
+        used: std::collections::HashSet<String>,
+        synth: Vec<csilgen_common::CsilRule>,
+    }
+    fn key(name: &str) -> String {
+        name.chars()
+            .filter(char::is_ascii_alphanumeric)
+            .map(|c| c.to_ascii_lowercase())
+            .collect()
+    }
+    impl Hoist {
+        fn name(&mut self, base: &str) -> String {
+            let mut candidate = base.to_string();
+            let mut n = 2;
+            while !self.used.insert(key(&candidate)) {
+                candidate = format!("{base}_{n}");
+                n += 1;
+            }
+            candidate
+        }
+        /// A position that must hold a value C can name: a list or map here moves to
+        /// its own rule.
+        fn nested(&mut self, ty: &CsilTypeExpression, name: &str) -> CsilTypeExpression {
+            match unwrap_constrained(ty) {
+                CsilTypeExpression::Array { .. } | CsilTypeExpression::Map { .. } => {
+                    let synth = self.name(name);
+                    let body = self.inner(unwrap_constrained(ty), &synth);
+                    self.synth.push(csilgen_common::CsilRule {
+                        name: synth.clone(),
+                        rule_type: CsilRuleType::TypeDef(body),
+                        position: csilgen_common::CsilPosition {
+                            line: 0,
+                            column: 0,
+                            offset: 0,
+                        },
+                        doc_comments: Vec::new(),
+                    });
+                    rewrap(ty, CsilTypeExpression::Reference(synth))
+                }
+                _ => self.inner(ty, name),
+            }
+        }
+        /// A position that may hold a list or map itself; only its parts are nested.
+        fn inner(&mut self, ty: &CsilTypeExpression, name: &str) -> CsilTypeExpression {
+            match ty {
+                CsilTypeExpression::Array {
+                    element_type,
+                    occurrence,
+                } => CsilTypeExpression::Array {
+                    element_type: Box::new(self.nested(element_type, &format!("{name}_item"))),
+                    occurrence: occurrence.clone(),
+                },
+                CsilTypeExpression::Map {
+                    key,
+                    value,
+                    occurrence,
+                } => CsilTypeExpression::Map {
+                    key: Box::new(self.nested(key, &format!("{name}_key"))),
+                    value: Box::new(self.nested(value, &format!("{name}_value"))),
+                    occurrence: occurrence.clone(),
+                },
+                CsilTypeExpression::Tuple(group) => {
+                    let mut group = group.clone();
+                    for (i, entry) in group.entries.iter_mut().enumerate() {
+                        entry.value_type = self.nested(&entry.value_type, &format!("{name}_{i}"));
+                    }
+                    CsilTypeExpression::Tuple(group)
+                }
+                CsilTypeExpression::Choice(arms) => CsilTypeExpression::Choice(
+                    arms.iter()
+                        .enumerate()
+                        .map(|(i, arm)| self.nested(arm, &format!("{name}_{i}")))
+                        .collect(),
+                ),
+                CsilTypeExpression::Constrained {
+                    base_type,
+                    constraints,
+                } => CsilTypeExpression::Constrained {
+                    base_type: Box::new(self.inner(base_type, name)),
+                    constraints: constraints.clone(),
+                },
+                other => other.clone(),
+            }
+        }
+        fn group(&mut self, group: &CsilGroupExpression, owner: &str) -> CsilGroupExpression {
+            let mut group = group.clone();
+            for entry in &mut group.entries {
+                if let Some(field) = entry_field_name(&entry.key) {
+                    entry.value_type = self.inner(&entry.value_type, &format!("{owner}_{field}"));
+                }
+            }
+            group
+        }
+    }
+    fn rewrap(ty: &CsilTypeExpression, replacement: CsilTypeExpression) -> CsilTypeExpression {
+        match ty {
+            CsilTypeExpression::Constrained {
+                base_type,
+                constraints,
+            } => CsilTypeExpression::Constrained {
+                base_type: Box::new(rewrap(base_type, replacement)),
+                constraints: constraints.clone(),
+            },
+            _ => replacement,
+        }
+    }
+    let mut hoist = Hoist {
+        used: spec.rules.iter().map(|rule| key(&rule.name)).collect(),
+        synth: Vec::new(),
+    };
+    let mut rules: Vec<csilgen_common::CsilRule> = spec
+        .rules
+        .iter()
+        .map(|rule| {
+            let rule_type = match &rule.rule_type {
+                CsilRuleType::GroupDef(group) => {
+                    CsilRuleType::GroupDef(hoist.group(group, &rule.name))
+                }
+                CsilRuleType::TypeDef(CsilTypeExpression::Group(group)) => {
+                    CsilRuleType::TypeDef(CsilTypeExpression::Group(hoist.group(group, &rule.name)))
+                }
+                CsilRuleType::TypeDef(ty) => CsilRuleType::TypeDef(hoist.inner(ty, &rule.name)),
+                CsilRuleType::TypeChoice(arms) => CsilRuleType::TypeChoice(
+                    arms.iter()
+                        .enumerate()
+                        .map(|(i, arm)| hoist.nested(arm, &format!("{}_{i}", rule.name)))
+                        .collect(),
+                ),
+                other => other.clone(),
+            };
+            csilgen_common::CsilRule {
+                rule_type,
+                ..rule.clone()
+            }
+        })
+        .collect();
+    if hoist.synth.is_empty() {
+        return spec.clone();
+    }
+    rules.extend(hoist.synth);
+    CsilSpecSerialized {
+        rules,
+        ..spec.clone()
+    }
 }
 
 fn is_c_ident(name: &str) -> bool {
@@ -249,8 +456,10 @@ fn is_c_ident(name: &str) -> bool {
         && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
-/// The names the generated headers build from other rules, services and
-/// operations. A rule that takes one of them would redeclare it.
+/// The names the generated headers build from rules, services and operations. A
+/// rule that takes one of them would redeclare it. Each name is collected under the
+/// same predicate the emitter that declares it uses, so a rule is renamed only for a
+/// name that is really emitted.
 struct DerivedNames {
     exact: std::collections::HashSet<String>,
     /// `<NAME>_`: the prefix of every enumerator an enum or union emits. Only an
@@ -259,62 +468,120 @@ struct DerivedNames {
 }
 
 impl DerivedNames {
-    fn of(spec: &CsilSpecSerialized) -> Self {
+    /// The names derived from `rules`, which are rules of `spec`.
+    fn of_rules(
+        spec: &CsilSpecSerialized,
+        rules: &[csilgen_common::CsilRule],
+        validation: bool,
+    ) -> Self {
         let mut exact = std::collections::HashSet::new();
         let mut enumerator_prefixes = Vec::new();
-        let config = default_config();
-        for rule in &spec.rules {
+        let codec_names = codec_type_names_of(spec);
+        let aliases = codec_aliases_of(spec);
+        let codec = |exact: &mut std::collections::HashSet<String>, name: &str| {
+            for function in ["csilc_enc_", "csilc_dec_", "csil_encode_", "csil_decode_"] {
+                exact.insert(format!("{function}{name}"));
+            }
+        };
+        for rule in rules {
             let name = &rule.name;
             if let CsilRuleType::ServiceDef(service) = &rule.rule_type {
                 let base = service_base(name);
                 let prefix = to_snake(&base);
                 let upper = to_upper_snake(&base);
                 exact.insert(format!("{base}Handlers"));
-                exact.insert(format!("route_{prefix}_channel"));
-                exact.insert(format!("route_{prefix}_channel_compact"));
-                exact.insert(format!("{upper}_SERVICE_WIRE_ID"));
+                if service_has_channel_ops(service) {
+                    exact.insert(format!("route_{prefix}_channel"));
+                    if service.wire_id.is_some() {
+                        exact.insert(format!("route_{prefix}_channel_compact"));
+                    }
+                }
+                if service.wire_id.is_some() {
+                    exact.insert(format!("{upper}_SERVICE_WIRE_ID"));
+                }
                 for op in &service.operations {
                     let method = to_snake(&op.name);
-                    exact.insert(format!("csil_{prefix}_{method}"));
-                    exact.insert(format!("encode_{prefix}_{method}"));
-                    exact.insert(format!("{upper}_OP_{}_WIRE_ID", to_upper_snake(&op.name)));
-                    if !matches!(op.direction, CsilServiceDirection::Unidirectional) {
+                    if service.wire_id.is_some() && op.wire_id.is_some() {
+                        exact.insert(format!("{upper}_OP_{}_WIRE_ID", to_upper_snake(&op.name)));
+                    }
+                    if emits_push_encoder(op) && service_has_channel_ops(service) {
+                        exact.insert(format!("encode_{prefix}_{method}"));
+                    }
+                    if !emits_rpc_call(op) {
                         continue;
                     }
-                    if let Some(arms) = op.rpc_reply_arms() {
-                        let reply = rpc_reply_type(name, op);
-                        for arm in arms {
-                            if let Some(ident) = arm.rpc_variant_name() {
-                                exact.insert(format!("{reply}_as_{}", to_snake(ident)));
-                            }
-                        }
-                        exact.insert(reply);
-                    }
-                    let success = success_type(op.success_output());
-                    for ty in [&op.input_type, &success] {
-                        if is_aggregate_boundary(ty) {
-                            exact.insert(boundary_c_type(ty, &config));
-                        }
-                    }
+                    exact.insert(format!("csil_{prefix}_{method}"));
                 }
                 continue;
             }
             match classify_rule(&rule.rule_type) {
-                Some(TypeKind::Struct(_)) => {
-                    exact.insert(format!("{name}_validate"));
+                Some(TypeKind::Struct(group)) => {
+                    if validation && emits_validate(group, &aliases) {
+                        exact.insert(format!("{name}_validate"));
+                    }
                 }
-                Some(TypeKind::Union(_) | TypeKind::MixedEnum(_) | TypeKind::GroupUnion(_)) => {
+                Some(TypeKind::Union(_) | TypeKind::MixedEnum(_)) => {
                     exact.insert(format!("{name}Tag"));
                     enumerator_prefixes.push(format!("{}_", to_upper_snake(name)));
                 }
-                Some(TypeKind::Enum(_) | TypeKind::IntEnum(_)) => {
-                    for helper in ["label", "to_number", "from_number"] {
-                        exact.insert(format!("csil_{name}_{helper}"));
+                Some(TypeKind::GroupUnion(arms)) => {
+                    exact.insert(format!("{name}Tag"));
+                    for i in 0..arms.len() {
+                        exact.insert(format!("{name}Arm{i}"));
                     }
+                    enumerator_prefixes.push(format!("{}_", to_upper_snake(name)));
+                }
+                Some(TypeKind::Enum(_)) => {
+                    if csilgen_common::rule_enum_numbers(rule).is_some() {
+                        for helper in ["label", "to_number", "from_number"] {
+                            exact.insert(format!("csil_{name}_{helper}"));
+                        }
+                    } else {
+                        exact.insert(format!("csilc_{name}_names"));
+                    }
+                    enumerator_prefixes.push(format!("{}_", to_upper_snake(name)));
+                }
+                Some(TypeKind::IntEnum(_)) => {
                     enumerator_prefixes.push(format!("{}_", to_upper_snake(name)));
                 }
                 _ => {}
             }
+            if codec_names.contains(name) {
+                codec(&mut exact, name);
+            }
+        }
+        // The reply types and the synthesized op boundary codecs belong to the
+        // services; collect them only when the services are among `rules`.
+        let services: std::collections::HashSet<&str> = rules
+            .iter()
+            .filter(|rule| matches!(rule.rule_type, CsilRuleType::ServiceDef(_)))
+            .map(|rule| rule.name.as_str())
+            .collect();
+        for (service, op, arms) in spec.rpc_operations() {
+            if !services.contains(service) {
+                continue;
+            }
+            let reply = rpc_reply_type(service, op);
+            for arm in arms {
+                if let Some(ident) = arm.rpc_variant_name() {
+                    exact.insert(format!("{reply}_as_{}", to_snake(ident)));
+                }
+            }
+            codec(&mut exact, &reply);
+            exact.insert(reply);
+        }
+        let config = default_config();
+        for (service, boundary) in synth_boundaries(spec, &codec_names, &config) {
+            if !services.contains(service) {
+                continue;
+            }
+            if matches!(
+                boundary.synth,
+                Some(SynthBoundary::Map(..) | SynthBoundary::Array(_))
+            ) {
+                exact.insert(boundary.c_type.clone());
+            }
+            codec(&mut exact, &boundary.codec_name);
         }
         Self {
             exact,
@@ -386,7 +653,7 @@ fn process_generation(mut input: WasmGeneratorInput) -> Result<WasmGeneratorOutp
     // rendering path — so an all-literal choice needs the same synthesized name a
     // mixed-kind or type-bearing choice does (`hoist_all_literal_choices: true`,
     // matching OCaml's setting and rationale, not TypeScript's).
-    input.csil_spec = prepare_spec(&input.csil_spec);
+    input.csil_spec = prepare_spec(&input.csil_spec, config.generate_validation);
     let surface = match input.config.target.as_str() {
         "c" | "c-server" => Surface::Server,
         "c-client" => Surface::Client,
@@ -705,13 +972,15 @@ fn generate_types(input: &WasmGeneratorInput, config: &CConfig) -> Option<String
     let struct_kind_names: std::collections::HashSet<&str> = typed
         .iter()
         .filter(|(_, k)| {
+            // A map or list alias is a struct too, and a record or union holds it
+            // by value.
             matches!(
                 k,
                 TypeKind::Struct(_)
                     | TypeKind::Union(_)
                     | TypeKind::GroupUnion(_)
                     | TypeKind::MixedEnum(_)
-            )
+            ) || alias_aggregate(k).is_some()
         })
         .map(|(n, _)| n.as_str())
         .collect();
@@ -736,11 +1005,11 @@ fn generate_types(input: &WasmGeneratorInput, config: &CConfig) -> Option<String
                     .and_then(csilgen_common::rule_enum_numbers)
                 {
                     enums.push_str(&format!("static inline const char *csil_{name}_label({name} value) {{\n    switch (value) {{\n"));
-                    for label in variants {
+                    let suffixes = text_enum_suffixes(variants);
+                    for (label, suffix) in variants.iter().zip(&suffixes) {
                         enums.push_str(&format!(
-                            "    case {}_{}: return \"{}\";\n",
+                            "    case {}_{suffix}: return \"{}\";\n",
                             to_upper_snake(name),
-                            to_upper_snake(label),
                             c_escape(label)
                         ));
                     }
@@ -751,8 +1020,8 @@ fn generate_types(input: &WasmGeneratorInput, config: &CConfig) -> Option<String
                     let mut from = format!(
                         "static inline bool csil_{name}_from_number(int64_t number, {name} *out) {{\n    switch (number) {{\n"
                     );
-                    for (label, n) in variants.iter().zip(numbers) {
-                        let member = format!("{}_{}", to_upper_snake(name), to_upper_snake(label));
+                    for (suffix, n) in suffixes.iter().zip(numbers) {
+                        let member = format!("{}_{suffix}", to_upper_snake(name));
                         let n = if n == i64::MIN {
                             "INT64_MIN".into()
                         } else {
@@ -965,12 +1234,8 @@ fn topo_emit(
 fn emit_enum(content: &mut String, name: &str, variants: &[String]) {
     content.push_str(&format!("/* {name} is an enumeration. */\n"));
     content.push_str(&format!("typedef enum {name} {{\n"));
-    for variant in variants {
-        content.push_str(&format!(
-            "    {}_{},\n",
-            to_upper_snake(name),
-            to_upper_snake(variant)
-        ));
+    for suffix in text_enum_suffixes(variants) {
+        content.push_str(&format!("    {}_{suffix},\n", to_upper_snake(name)));
     }
     content.push_str(&format!("}} {name};\n\n"));
 }
@@ -1224,7 +1489,7 @@ fn generate_validation(input: &WasmGeneratorInput) -> Option<String> {
             _ => None,
         };
         if let Some(group) = group
-            && group.entries.iter().any(entry_has_check)
+            && emits_validate(group, &aliases)
         {
             emit_validate_fn(&mut body, &rule.name, group, &aliases);
         }
@@ -1260,6 +1525,34 @@ fn emit_validate_fn(
     group: &CsilGroupExpression,
     aliases: &HashMap<String, CsilTypeExpression>,
 ) {
+    let checks = validate_checks(group, aliases);
+    if checks.is_empty() {
+        return;
+    }
+    content.push_str(&format!(
+        "/* {name}_validate returns false on the first failed constraint. */\n"
+    ));
+    content.push_str(&format!(
+        "static inline bool {name}_validate(const {name} *v) {{\n"
+    ));
+    content.push_str(&checks);
+    content.push_str("    return true;\n}\n\n");
+}
+
+/// Whether a record gets a `<Name>_validate` function.
+fn emits_validate(
+    group: &CsilGroupExpression,
+    aliases: &HashMap<String, CsilTypeExpression>,
+) -> bool {
+    group.entries.iter().any(entry_has_check) && !validate_checks(group, aliases).is_empty()
+}
+
+/// The check lines of a record's `<Name>_validate`; empty when the record has no
+/// check C can express, and then no function is emitted.
+fn validate_checks(
+    group: &CsilGroupExpression,
+    aliases: &HashMap<String, CsilTypeExpression>,
+) -> String {
     let mut checks = String::new();
     for entry in &group.entries {
         if let Some(field) = entry_field_name(&entry.key) {
@@ -1284,17 +1577,7 @@ fn emit_validate_fn(
             }
         }
     }
-    if checks.is_empty() {
-        return;
-    }
-    content.push_str(&format!(
-        "/* {name}_validate returns false on the first failed constraint. */\n"
-    ));
-    content.push_str(&format!(
-        "static inline bool {name}_validate(const {name} *v) {{\n"
-    ));
-    content.push_str(&checks);
-    content.push_str("    return true;\n}\n\n");
+    checks
 }
 
 /// What a length-style constraint (`.size`, minlength/maxlength) measures on a
@@ -1542,9 +1825,13 @@ impl CodecScope<'_> {
 fn codec_aliases(
     input: &WasmGeneratorInput,
 ) -> std::collections::HashMap<String, CsilTypeExpression> {
-    input
-        .csil_spec
-        .rules
+    codec_aliases_of(&input.csil_spec)
+}
+
+fn codec_aliases_of(
+    spec: &CsilSpecSerialized,
+) -> std::collections::HashMap<String, CsilTypeExpression> {
+    spec.rules
         .iter()
         .filter_map(|rule| match &rule.rule_type {
             CsilRuleType::TypeDef(t) => match unwrap_constrained(t) {
@@ -2144,7 +2431,9 @@ fn emit_dec_field(
         CsilTypeExpression::Map { key, value, .. } => {
             let kt = base_c_type(key, &default_config());
             let vt = base_c_type(value, &default_config());
-            out.push_str("    if (!csilc_f || csilc_f->kind != CSILC_MAP) return -1;\n");
+            out.push_str(
+                "    if (!csilc_f || csilc_f->kind != CSILC_MAP || !csilc_f->as.map.canonical) return -1;\n",
+            );
             out.push_str(&format!(
                 "    out->{member}_count = csilc_f->as.map.count;\n"
             ));
@@ -2339,7 +2628,11 @@ fn emit_record_codec(
     } else {
         out.push_str("    const csilc_value *csilc_f;\n");
     }
-    out.push_str("    if (!m || m->kind != CSILC_MAP) return -1;\n");
+    // Field order is free, but a key twice would make the value ambiguous, and a
+    // key in a longer head than needed has two byte forms.
+    out.push_str(
+        "    if (!m || m->kind != CSILC_MAP || m->as.map.duplicate || m->as.map.long_key) return -1;\n",
+    );
     for field in &fields {
         emit_dec_field(out, field, scope, warnings);
     }
@@ -2385,7 +2678,9 @@ fn emit_map_alias_codec(
     out.push_str(&format!(
         "static inline int csilc_dec_{name}(const csilc_value *m, CsilCodecArena *a, {name} *out) {{\n"
     ));
-    out.push_str("    if (!m || m->kind != CSILC_MAP) return -1;\n");
+    // A dynamic map must arrive in canonical key order, which also excludes a
+    // repeated key; checking the decoded flag keeps this O(n).
+    out.push_str("    if (!m || m->kind != CSILC_MAP || !m->as.map.canonical) return -1;\n");
     out.push_str("    out->count = m->as.map.count;\n");
     out.push_str("    out->keys = NULL;\n    out->values = NULL;\n");
     out.push_str("    if (out->count) {\n");
@@ -2886,76 +3181,49 @@ fn generate_codec(
     let mut synth_structs = String::new();
     let mut synth_bodies = String::new();
     let mut synth_public = String::new();
-    let mut synth_seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for rule in &input.csil_spec.rules {
-        let CsilRuleType::ServiceDef(service) = &rule.rule_type else {
+    for (_, boundary) in synth_boundaries(&input.csil_spec, &codec_names, config) {
+        let Some(synth) = boundary.synth else {
             continue;
         };
-        for op in &service.operations {
-            if !matches!(op.direction, CsilServiceDirection::Unidirectional) {
-                continue;
+        match synth {
+            SynthBoundary::Scalar(scalar_ty) => emit_scalar_boundary_codec(
+                &mut synth_bodies,
+                &boundary.codec_name,
+                &boundary.c_type,
+                &scalar_ty,
+                &scope,
+                warnings,
+            ),
+            SynthBoundary::Null => synth_bodies.push_str(NULL_BOUNDARY_CODEC_C),
+            SynthBoundary::Map(key, value) => {
+                emit_map_alias_struct(
+                    &mut synth_structs,
+                    &boundary.codec_name,
+                    &key,
+                    &value,
+                    config,
+                );
+                emit_map_alias_codec(
+                    &mut synth_bodies,
+                    &boundary.codec_name,
+                    &key,
+                    &value,
+                    &scope,
+                    warnings,
+                );
             }
-            let success = success_type(op.success_output());
-            for ty in std::iter::once(&op.input_type).chain(
-                op.rpc_reply_arms()
-                    .unwrap_or(std::slice::from_ref(&success)),
-            ) {
-                let boundary = classify_boundary(ty, &codec_names, config);
-                let Some(synth) = boundary.synth else {
-                    continue;
-                };
-                if boundary.is_null && std::ptr::eq(ty, &op.input_type) {
-                    continue;
-                }
-                if !synth_seen.insert(boundary.codec_name.clone()) {
-                    continue;
-                }
-                match synth {
-                    SynthBoundary::Scalar(scalar_ty) => emit_scalar_boundary_codec(
-                        &mut synth_bodies,
-                        &boundary.codec_name,
-                        &boundary.c_type,
-                        &scalar_ty,
-                        &scope,
-                        warnings,
-                    ),
-                    SynthBoundary::Null => synth_bodies.push_str(NULL_BOUNDARY_CODEC_C),
-                    SynthBoundary::Map(key, value) => {
-                        emit_map_alias_struct(
-                            &mut synth_structs,
-                            &boundary.codec_name,
-                            &key,
-                            &value,
-                            config,
-                        );
-                        emit_map_alias_codec(
-                            &mut synth_bodies,
-                            &boundary.codec_name,
-                            &key,
-                            &value,
-                            &scope,
-                            warnings,
-                        );
-                    }
-                    SynthBoundary::Array(element) => {
-                        emit_list_alias_struct(
-                            &mut synth_structs,
-                            &boundary.codec_name,
-                            &element,
-                            config,
-                        );
-                        emit_list_alias_codec(
-                            &mut synth_bodies,
-                            &boundary.codec_name,
-                            &element,
-                            &scope,
-                            warnings,
-                        );
-                    }
-                }
-                emit_public_wrappers(&mut synth_public, &boundary.codec_name, &boundary.c_type);
+            SynthBoundary::Array(element) => {
+                emit_list_alias_struct(&mut synth_structs, &boundary.codec_name, &element, config);
+                emit_list_alias_codec(
+                    &mut synth_bodies,
+                    &boundary.codec_name,
+                    &element,
+                    &scope,
+                    warnings,
+                );
             }
         }
+        emit_public_wrappers(&mut synth_public, &boundary.codec_name, &boundary.c_type);
     }
 
     let mut content = String::new();
@@ -3062,9 +3330,11 @@ fn emit_public_wrappers(public: &mut String, name: &str, c_type: &str) {
 /// The named types that carry a generated codec: records, enums, and named map/list
 /// aliases. A reference to any of these resolves to its `csil_encode_*`/`csil_decode_*`.
 fn codec_type_names(input: &WasmGeneratorInput) -> std::collections::HashSet<String> {
-    input
-        .csil_spec
-        .rules
+    codec_type_names_of(&input.csil_spec)
+}
+
+fn codec_type_names_of(spec: &CsilSpecSerialized) -> std::collections::HashSet<String> {
+    spec.rules
         .iter()
         .filter_map(|rule| {
             let kind = classify_rule(&rule.rule_type)?;
@@ -3093,6 +3363,54 @@ fn spec_has_unidirectional_ops(input: &WasmGeneratorInput) -> bool {
                 .any(|op| matches!(op.direction, CsilServiceDirection::Unidirectional)),
             _ => false,
         })
+}
+
+/// Whether an operation gets a typed RPC client call: only a unary request/response
+/// operation does; channel operations ride the router.
+fn emits_rpc_call(op: &csilgen_common::CsilServiceOperation) -> bool {
+    matches!(op.direction, CsilServiceDirection::Unidirectional)
+}
+
+/// Whether an operation gets an `encode_<service>_<op>` push encoder (in a service
+/// with channel operations): the server pushes its messages to a peer.
+fn emits_push_encoder(op: &csilgen_common::CsilServiceOperation) -> bool {
+    matches!(
+        op.direction,
+        CsilServiceDirection::Bidirectional | CsilServiceDirection::Reverse
+    )
+}
+
+/// The op boundaries that need a codec no named type provides, once per codec name,
+/// with the service that first needs each.
+fn synth_boundaries<'a>(
+    spec: &'a CsilSpecSerialized,
+    codec_names: &std::collections::HashSet<String>,
+    config: &CConfig,
+) -> Vec<(&'a str, OpBoundary)> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for rule in &spec.rules {
+        let CsilRuleType::ServiceDef(service) = &rule.rule_type else {
+            continue;
+        };
+        for op in service.operations.iter().filter(|op| emits_rpc_call(op)) {
+            let success = op.success_output().clone();
+            for ty in std::iter::once(&op.input_type).chain(
+                op.rpc_reply_arms()
+                    .unwrap_or(std::slice::from_ref(&success)),
+            ) {
+                let boundary = classify_boundary(ty, codec_names, config);
+                if boundary.synth.is_none()
+                    || (boundary.is_null && std::ptr::eq(ty, &op.input_type))
+                    || !seen.insert(boundary.codec_name.clone())
+                {
+                    continue;
+                }
+                out.push((rule.name.as_str(), boundary));
+            }
+        }
+    }
+    out
 }
 
 /// A synthetic per-op-boundary codec the client needs but no named type provides:
@@ -3247,12 +3565,10 @@ fn emit_scalar_boundary_codec(
     out.push_str(&format!(
         "static inline int csilc_enc_{name}(csilc_buf *b, const {c_type} *v) {{\n"
     ));
-    // The unsupported stub writes null and reads no value; `-Wextra` flags the
-    // unread parameters otherwise.
-    let stub = name == "CsilUnsupportedBoundary";
-    if stub {
-        out.push_str("    (void)v;\n");
-    }
+    // A value with no C shape (the unsupported stub, a tuple alias) is written as
+    // null and never read; `-Wextra` flags the unread parameters otherwise. The
+    // cast is harmless where the parameter is read.
+    out.push_str("    (void)v;\n");
     emit_enc_value(out, "    ", ty, "(*v)", scope, warnings);
     out.push_str("    return 0;\n}\n\n");
     out.push_str(&format!(
@@ -3261,10 +3577,7 @@ fn emit_scalar_boundary_codec(
     out.push_str(&format!(
         "static inline int csilc_dec_{name}(const csilc_value *m, CsilCodecArena *a, {c_type} *out) {{\n"
     ));
-    out.push_str("    (void)a;\n");
-    if stub {
-        out.push_str("    (void)out;\n");
-    }
+    out.push_str("    (void)a;\n    (void)out;\n");
     emit_dec_value(out, "    ", ty, "m", "(*out)", scope, warnings);
     out.push_str("    return 0;\n}\n\n");
 }
@@ -3301,7 +3614,8 @@ fn generate_client(input: &WasmGeneratorInput, config: &CConfig) -> Option<Strin
     let mut emitted = false;
     for rule in &input.csil_spec.rules {
         if let CsilRuleType::ServiceDef(service) = &rule.rule_type {
-            emit_client_calls(&mut body, &rule.name, service, &codec_names, config);
+            let wire = input.csil_spec.declared_name(&rule.name);
+            emit_client_calls(&mut body, (&rule.name, wire), service, &codec_names, config);
             emitted = true;
         }
     }
@@ -3328,19 +3642,22 @@ fn generate_client(input: &WasmGeneratorInput, config: &CConfig) -> Option<Strin
     Some(content)
 }
 
+/// `names` is the service's rule name, which the generated identifiers use, and its
+/// declared name, which the wire carries.
 fn emit_client_calls(
     content: &mut String,
-    name: &str,
+    names: (&str, &str),
     service: &CsilServiceDefinition,
     codec_names: &std::collections::HashSet<String>,
     config: &CConfig,
 ) {
+    let (name, wire) = names;
     let base = service_base(name);
     let prefix = to_snake(&base);
     for op in &service.operations {
         // Only unary request/response ops belong on the RPC client; channel ops
         // ride the router surface the server target emits.
-        if !matches!(op.direction, CsilServiceDirection::Unidirectional) {
+        if !emits_rpc_call(op) {
             content.push_str(&format!(
                 "/* channel operation {} is not part of the RPC client */\n",
                 op.name
@@ -3349,7 +3666,7 @@ fn emit_client_calls(
         }
         let fn_name = format!("csil_{prefix}_{}", to_snake(&op.name));
         let wire_op = &op.name;
-        let success = success_type(op.success_output());
+        let success = op.success_output().clone();
         let resp = classify_boundary(&success, codec_names, config);
         let req = classify_boundary(&op.input_type, codec_names, config);
         let typed = op.rpc_reply_arms().is_some();
@@ -3362,7 +3679,7 @@ fn emit_client_calls(
         let req_type = req.c_type;
 
         content.push_str(&doc_comment(&[
-            &format!("Invoke {name}/{wire_op} with a typed request and decode the typed"),
+            &format!("Invoke {wire}/{wire_op} with a typed request and decode the typed"),
             "response. *resp_owner holds the response's backing storage; free it once",
             "with csil_codec_arena_free when done with *resp. Returns non-zero on failure.",
         ]));
@@ -3385,11 +3702,11 @@ fn emit_client_calls(
         }
         content.push_str("    uint8_t *csil_respb = NULL;\n    size_t csil_respn = 0;\n");
         if typed {
-            content.push_str(&format!("    char *variant = NULL;\n    int rc = t->call_reply ? t->call_reply(t->self, \"{name}\", \"{wire_op}\", csil_reqb, csil_reqn, &csil_respb, &csil_respn, &variant) : -1;\n    free(csil_reqb);\n    if (!rc) rc = csil_decode_{resp_type}(variant, csil_respb, csil_respn, resp, resp_owner);\n    free(variant);\n    free(csil_respb);\n    return rc;\n}}\n\n"));
+            content.push_str(&format!("    char *variant = NULL;\n    int rc = t->call_reply ? t->call_reply(t->self, \"{wire}\", \"{wire_op}\", csil_reqb, csil_reqn, &csil_respb, &csil_respn, &variant) : -1;\n    free(csil_reqb);\n    if (!rc) rc = csil_decode_{resp_type}(variant, csil_respb, csil_respn, resp, resp_owner);\n    free(variant);\n    free(csil_respb);\n    return rc;\n}}\n\n"));
             continue;
         }
         content.push_str(&format!(
-            "    int csil_rc = t->call(t->self, \"{name}\", \"{wire_op}\", csil_reqb, csil_reqn, &csil_respb, &csil_respn);\n"
+            "    int csil_rc = t->call(t->self, \"{wire}\", \"{wire_op}\", csil_reqb, csil_reqn, &csil_respb, &csil_respn);\n"
         ));
         content.push_str("    free(csil_reqb);\n");
         content.push_str("    if (csil_rc != 0) { free(csil_respb); return csil_rc; }\n");
@@ -3482,13 +3799,13 @@ fn emit_handlers_struct(
     ));
     content.push_str(&format!("typedef struct {base}Handlers {{\n"));
     for op in &service.operations {
-        let method = to_snake(&op.name);
+        let method = handler_member(op);
         match op.direction {
             CsilServiceDirection::Unidirectional => {
                 let in_type = op_in_type(&op.input_type, config);
                 // The same success type the client decodes, so a handler's
                 // response encodes with the codec the client reads it with.
-                let success = success_type(op.success_output());
+                let success = op.success_output().clone();
                 let out_type = if op.rpc_reply_arms().is_some() {
                     rpc_reply_type(name, op)
                 } else {
@@ -3563,7 +3880,7 @@ fn emit_channel_router(content: &mut String, name: &str, service: &CsilServiceDe
         if !matches!(op.direction, CsilServiceDirection::Bidirectional) {
             continue;
         }
-        let method = to_snake(&op.name);
+        let method = handler_member(op);
         let wire_op = &op.name;
         content.push_str(&format!("    if (strcmp(method, \"{wire_op}\") == 0) {{\n"));
         content.push_str("        void *msg = NULL;\n");
@@ -3603,7 +3920,7 @@ fn emit_channel_router_compact(content: &mut String, name: &str, service: &CsilS
         let Some(op_id) = op.wire_id else {
             continue;
         };
-        let method = to_snake(&op.name);
+        let method = handler_member(op);
         content.push_str(&format!("    case {op_id}u: {{\n"));
         content.push_str("        void *msg = NULL;\n");
         content
@@ -3618,10 +3935,7 @@ fn emit_channel_router_compact(content: &mut String, name: &str, service: &CsilS
 
 fn emit_push_encoders(content: &mut String, name: &str, service: &CsilServiceDefinition) {
     for op in &service.operations {
-        if !matches!(
-            op.direction,
-            CsilServiceDirection::Bidirectional | CsilServiceDirection::Reverse
-        ) {
+        if !emits_push_encoder(op) {
             continue;
         }
         let method = to_snake(&op.name);
@@ -3709,9 +4023,10 @@ fn op_input_is_null(input_type: &CsilTypeExpression) -> bool {
     matches!(unwrap_constrained(input_type), CsilTypeExpression::Builtin(n) if n == "null" || n == "nil")
 }
 
-/// The success arm of a `Res / ServiceError` output choice: a typed client/server
-/// returns the success type, not the whole choice. A non-choice output is its own
-/// success type.
+/// The message a channel example pushes for a `Res / ServiceError` output. An RPC
+/// operation does not come here: `CsilServiceOperation::success_output` gives its
+/// type, because `hoist_op_union_boundaries` has made every other union output a
+/// named rule.
 fn success_type(output_type: &CsilTypeExpression) -> CsilTypeExpression {
     if let CsilTypeExpression::Choice(arms) = output_type {
         for arm in arms {
@@ -3876,7 +4191,11 @@ fn arm_member(arm: &CsilTypeExpression, index: usize) -> String {
 /// `Value<N>`, matching `arm_name`'s `Choice<N>` fallback for a non-nameable arm.
 fn mixed_arm_name(lit: &CsilLiteralValue, index: usize) -> String {
     match lit {
-        CsilLiteralValue::Text(s) => s.clone(),
+        CsilLiteralValue::Text(s) => csilgen_common::member_words(s)
+            .iter()
+            .map(|word| to_snake(word))
+            .collect::<Vec<_>>()
+            .join("_"),
         CsilLiteralValue::Integer(n) => int_variant_suffix(*n),
         CsilLiteralValue::Bool(b) => b.to_string(),
         CsilLiteralValue::Float(_)
@@ -3997,6 +4316,27 @@ fn to_snake(s: &str) -> String {
     out
 }
 
+/// The enumerator suffix of each text enum value (`calendars.read` gives
+/// `CALENDARS_READ`). The value is split into words by the shared rule, each word
+/// keeps today's upper snake case (`inProgress` stays `IN_PROGRESS`), and a repeat
+/// gets a number. The type-name prefix makes every suffix legal, so a leading digit
+/// (`2fa`) or a keyword (`class`) needs no change. The wire keeps the value as
+/// written.
+fn text_enum_suffixes(variants: &[String]) -> Vec<String> {
+    let values: Vec<&str> = variants.iter().map(String::as_str).collect();
+    csilgen_common::member_idents(
+        &values,
+        |words| {
+            words
+                .iter()
+                .map(|word| to_upper_snake(word))
+                .collect::<Vec<_>>()
+                .join("_")
+        },
+        |_| true,
+    )
+}
+
 fn to_upper_snake(s: &str) -> String {
     to_snake(s).to_uppercase()
 }
@@ -4011,6 +4351,12 @@ const C_RESERVED_MEMBER_NAMES: &[&str] = &[
     "restrict", "return", "short", "signed", "sizeof", "static", "struct", "switch", "typedef",
     "union", "unsigned", "void", "volatile", "while", "bool", "true", "false",
 ];
+
+/// The handlers-struct member of an operation. An op named after a C keyword
+/// (`register`) takes the keyword escape, so the struct still declares.
+fn handler_member(op: &csilgen_common::CsilServiceOperation) -> String {
+    c_member(&to_snake(&op.name))
+}
 
 /// A C member identifier for a derived name: reserved words take a trailing
 /// underscore (`int` -> `int_`) so a CSIL field or choice arm named after a C
@@ -4116,12 +4462,12 @@ fn first_unary_example(input: &WasmGeneratorInput, config: &CConfig) -> Option<C
         };
         let base = service_base(&rule.name);
         let prefix = to_snake(&base);
-        let success = success_type(op.success_output());
+        let success = op.success_output().clone();
         let has_request = !op_input_is_null(&op.input_type);
         return Some(CUnaryExample {
             rpc_reply: op.rpc_reply_arms().map(|_| rpc_reply_type(&rule.name, op)),
             fn_name: format!("csil_{prefix}_{}", to_snake(&op.name)),
-            wire_service: rule.name.clone(),
+            wire_service: input.csil_spec.declared_name(&rule.name).to_string(),
             wire_op: op.name.clone(),
             req_type: boundary_c_type(&op.input_type, config),
             resp_type: boundary_c_type(&success, config),
@@ -4197,10 +4543,10 @@ fn first_channel_example(input: &WasmGeneratorInput, config: &CConfig) -> Option
             return Some(CChannelExample {
                 handlers_struct: format!("{base}Handlers"),
                 service_snake: snake.clone(),
-                wire_service: rule.name.clone(),
+                wire_service: input.csil_spec.declared_name(&rule.name).to_string(),
                 route_fn: format!("route_{snake}_channel"),
                 encode_fn: format!("encode_{snake}_{method}"),
-                handler_method: method,
+                handler_method: c_member(&method),
                 inbound_type: inbound,
                 outbound_type: outbound,
                 outbound_wire_op: op.name.clone(),
@@ -5244,6 +5590,11 @@ typedef struct csilc_value csilc_value;
 typedef struct csilc_pair {
     csilc_value *key;
     csilc_value *val;
+    /* Where the key's encoded bytes start, relative to the map's own first byte,
+     * and how many there are. Offsets, not pointers, because the input buffer does
+     * not outlive the decode call. */
+    size_t key_at;
+    size_t key_len;
 } csilc_pair;
 
 struct csilc_value {
@@ -5264,6 +5615,15 @@ struct csilc_value {
         struct {
             csilc_pair *pairs;
             size_t count;
+            /* The encoded keys are strictly ascending in bytewise order (RFC 8949
+             * 4.2.1). A dynamic map must arrive so; a record may not. */
+            bool canonical;
+            /* Some encoded key occurs twice. Only computed when not canonical. */
+            bool duplicate;
+            /* Some key's head is longer than its value or length needs
+             * ("csil cbor: map key is not in shortest form"). Such a map is not
+             * canonical either, because one key would have two byte forms. */
+            bool long_key;
         } map;
         struct {
             uint64_t num;
@@ -5364,6 +5724,58 @@ static inline double csilc_half_to_double(uint16_t h) {
     return (double)f;
 }
 
+/* Whether the head of the already decoded item at b uses the shortest argument for
+ * its value or length (RFC 8949 4.2.1). A float (major 7) has no such rule. */
+static inline bool csilc_shortest_head(const uint8_t *b) {
+    uint8_t major = b[0] >> 5;
+    uint8_t low = b[0] & 0x1f;
+    if (major == 7 || low < 24) return true;
+    uint64_t arg = 0;
+    size_t width = (size_t)1 << (low - 24);
+    for (size_t i = 1; i <= width; i++) arg = (arg << 8) | (uint64_t)b[i];
+    static const uint64_t floor_of[] = {24u, 0x100u, 0x10000u, 0x100000000u};
+    return arg >= floor_of[low - 24];
+}
+
+/* The bytewise order of two encoded map keys of one map that starts at base. */
+static inline int csilc_span_cmp(const uint8_t *base, const csilc_pair *x, const csilc_pair *y) {
+    size_t n = x->key_len < y->key_len ? x->key_len : y->key_len;
+    int c = memcmp(base + x->key_at, base + y->key_at, n);
+    if (c) return c;
+    return x->key_len < y->key_len ? -1 : (x->key_len > y->key_len ? 1 : 0);
+}
+
+/* 1 when two of the n keys have the same encoding, 0 when not, -1 when out of
+ * memory. A merge sort of the key spans keeps this O(n log n) for a hostile map
+ * that is not in canonical order; a canonical map never comes here. */
+static inline int csilc_has_duplicate_key(const uint8_t *base, const csilc_pair *pairs, size_t n) {
+    if (n < 2) return 0;
+    if (n > SIZE_MAX / (2 * sizeof(size_t))) return -1;
+    size_t *order = (size_t *)malloc(2 * n * sizeof(size_t));
+    if (!order) return -1;
+    size_t *tmp = order + n;
+    for (size_t i = 0; i < n; i++) order[i] = i;
+    for (size_t w = 1; w < n; w = w > n / 2 ? n : w * 2) {
+        for (size_t lo = 0; lo < n; lo += 2 * w) {
+            size_t mid = w < n - lo ? lo + w : n;
+            size_t hi = 2 * w < n - lo ? lo + 2 * w : n;
+            size_t i = lo, j = mid, k = lo;
+            while (i < mid && j < hi) {
+                tmp[k++] = csilc_span_cmp(base, &pairs[order[j]], &pairs[order[i]]) < 0 ? order[j++] : order[i++];
+            }
+            while (i < mid) tmp[k++] = order[i++];
+            while (j < hi) tmp[k++] = order[j++];
+        }
+        memcpy(order, tmp, n * sizeof(size_t));
+    }
+    int dup = 0;
+    for (size_t i = 1; i < n && !dup; i++) {
+        if (csilc_span_cmp(base, &pairs[order[i - 1]], &pairs[order[i]]) == 0) dup = 1;
+    }
+    free(order);
+    return dup;
+}
+
 static inline int csilc_decode_value(CsilCodecArena *a, const uint8_t *b, size_t len,
                               csilc_value *out, size_t *consumed, size_t depth) {
     if (depth > 64) return -1;
@@ -5434,6 +5846,8 @@ static inline int csilc_decode_value(CsilCodecArena *a, const uint8_t *b, size_t
             if (!pairs) return -1;
         }
         size_t off = head;
+        bool canonical = true;
+        bool long_key = false;
         for (uint64_t i = 0; i < arg; i++) {
             if (i == cap) {
                 size_t grown = cap * 2 < (size_t)arg ? cap * 2 : (size_t)arg;
@@ -5446,6 +5860,11 @@ static inline int csilc_decode_value(CsilCodecArena *a, const uint8_t *b, size_t
             if (!k || !v) return -1;
             size_t m = 0;
             if (csilc_decode_value(a, b + off, len - off, k, &m, depth + 1)) return -1;
+            pairs[i].key_at = off;
+            pairs[i].key_len = m;
+            if (!csilc_shortest_head(b + off)) long_key = true;
+            /* Comparing each key with the one before keeps the order check O(n). */
+            if (canonical && i > 0 && csilc_span_cmp(b, &pairs[i - 1], &pairs[i]) >= 0) canonical = false;
             off += m;
             if (csilc_decode_value(a, b + off, len - off, v, &m, depth + 1)) return -1;
             off += m;
@@ -5455,6 +5874,15 @@ static inline int csilc_decode_value(CsilCodecArena *a, const uint8_t *b, size_t
         out->kind = CSILC_MAP;
         out->as.map.pairs = pairs;
         out->as.map.count = (size_t)arg;
+        if (long_key) canonical = false;
+        out->as.map.canonical = canonical;
+        out->as.map.duplicate = false;
+        out->as.map.long_key = long_key;
+        if (!canonical) {
+            int dup = csilc_has_duplicate_key(b, pairs, (size_t)arg);
+            if (dup < 0) return -1;
+            out->as.map.duplicate = dup == 1;
+        }
         *consumed = off;
         return 0;
     }

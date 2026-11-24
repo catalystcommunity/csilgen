@@ -229,9 +229,13 @@ impl Parser {
                 let first_group = self.parse_group_expression()?;
                 let mut groups = vec![first_group];
 
-                while self.match_token(&TokenType::Choice) {
+                self.skip_whitespace_and_comments();
+                while self.match_token(&TokenType::Choice)
+                    || self.match_token(&TokenType::GroupChoiceInfix)
+                {
                     self.skip_whitespace_and_comments();
                     groups.push(self.parse_group_expression()?);
+                    self.skip_whitespace_and_comments();
                 }
 
                 RuleType::GroupChoice(groups)

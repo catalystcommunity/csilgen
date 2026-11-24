@@ -612,7 +612,7 @@ fn first_channel_example(input: &WasmGeneratorInput) -> Option<ChannelExample> {
                     .unwrap_or_default()
             };
             return Some(ChannelExample {
-                service_wire: common::service_wire(name),
+                service_wire: common::service_wire(&input.csil_spec, name),
                 route_fn: format!("route{base}Channel"),
                 handlers_iface: format!("{base}ChannelHandlers"),
                 encode_fn: format!("encode{base}{pascal}"),

@@ -1,0 +1,41 @@
+; Long names, large enums and long signatures. Generated code must pass each
+; toolchain formatter's check for every name length and enum size. The first
+; block is the schema from the linkkeys request.
+ApplicationKeyChallengePurpose = &(add-key: 1, renew-attestation: 2)
+ClaimValueType = "text" / "url" / "email" / "bool" / "int" / "float" / "decimal" / "date" / "timestamp" / "opaque"
+Holder = { purpose: ApplicationKeyChallengePurpose, kind: ClaimValueType }
+
+ConsentRowPolicyForApplicationsThatRequestVeryLongNamesEverywhere = &(
+    allow-once: 1,
+    allow-always-for-this-application-and-all-of-its-registered-domains: 2,
+    deny-and-remember-this-decision-for-future-requests-from-this-origin: 3,
+)
+NotificationChannelKindWithAnUnusuallyLongDescriptiveTypeNameForTesting = "electronic-mail-address-delivery" / "short-message-service-delivery" / "push-notification-delivery-to-registered-device" / "in-application-inbox-message" / "web-hook-callback-to-registered-endpoint" / "postal-mail" / "telephone-voice-call" / "pager"
+TinyEnum = "a" / "b"
+
+;;; A record whose fields have long names, long type names, maps, arrays, optional
+;;; values and constraints, so that every signature and every decoder line is long.
+ExtraordinarilyLongRecordNameForFormatterChecksAcrossEveryTargetLanguage = {
+    this_field_name_is_long_enough_to_push_any_signature_past_the_line_limit: ConsentRowPolicyForApplicationsThatRequestVeryLongNamesEverywhere,
+    channel_kind_for_notifications_sent_to_the_account_holder: NotificationChannelKindWithAnUnusuallyLongDescriptiveTypeNameForTesting,
+    ? optional_list_of_extraordinarily_long_record_references: [* Holder],
+    map_from_identifier_to_holder_with_a_very_long_field_name: { * text => Holder },
+    bounded_integer_with_a_long_name_and_two_constraints: int .ge 0 .le 4294967295,
+    regex_constrained_text_with_a_long_field_name_for_checks: text .regex "^[a-z0-9-]{1,63}$",
+    timestamp_of_the_last_modification_made_by_any_user: timestamp,
+    decimal_balance_of_the_account_holder_in_minor_units: decimal,
+}
+
+ShortRecord = { a: int }
+ErrorForLongOperations = { code: uint, message: text }
+
+service ServiceWithAnExceedinglyLongNameUsedOnlyForFormatterChecks {
+    call-something-with-a-long-name: Holder -> Holder,
+    operation-with-an-exceedingly-long-name-that-returns-a-choice: ExtraordinarilyLongRecordNameForFormatterChecksAcrossEveryTargetLanguage -> ExtraordinarilyLongRecordNameForFormatterChecksAcrossEveryTargetLanguage / ErrorForLongOperations,
+    get-short: ShortRecord -> ShortRecord,
+    read-mixed-output-with-an-inline-map-arm: ShortRecord -> { * text => int } / ErrorForLongOperations,
+}
+
+service S {
+    x: ShortRecord -> ShortRecord,
+}

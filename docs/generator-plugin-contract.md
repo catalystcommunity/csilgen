@@ -410,6 +410,40 @@ name. For each renamed rule, the generator returns one warning from
 lint` also warns about rule names that differ only in case, `_` or `-`
 (`lint_name_collisions`).
 
+A generator reserves a name it builds from a service or an operation only when it
+emits that item for that operation. For example, a per-operation codec
+`encode_<service>_<op>_request` that is emitted only for a boundary that is not a
+named record does not rename the record `<Service><Op>Request` when that record is
+the boundary: the record's own codec is then the boundary codec. Compute the
+reserved set with the same predicate that decides what to emit, so the two cannot
+drift.
+
+The names that a hoist pass synthesizes (`<Owner>_<field>` and others) get the
+same checks as rule names, so a synthesized name never clashes with a reserved,
+derived or other name. The synthesized rule is the one that is renamed.
+
+Two services with one identifier (`UserSvc` and `user-svc`) also collide.
+`rename_ident_collisions` renames the later service to `<Name>2` (a digit, because
+several generators strip a trailing `Service` to make `<Base>Client`) and records
+the declared name. A generator writes `spec.declared_name(..)` for every service
+name that goes on the wire (RPC service string, event and datagram names, wire-id
+tables, router keys).
+
+**Union boundaries.** A generator calls
+`csilgen_common::hoist_op_union_boundaries` before it renames. It turns an
+operation input or output that is a choice with an inline arm into a named union
+rule `<Service><Op>Input`/`<Service><Op>Output`, so all generators expose the
+whole union (see `csil-spec.md`, "Inline arms make one union value").
+
+**Formatter-clean output.** A consumer can check generated files in, and run its
+formatter over them. So for each target with a toolchain formatter, every
+generated file must pass that formatter's check with its default settings, for
+every name length and enum size: rustfmt (style editions 2021 and 2024), gofmt,
+`zig fmt`, `dart format`, `mix format` (with the `.formatter.exs` that the
+generator emits), `dotnet format whitespace`, and swift-format. A WASM generator
+cannot run a formatter, so it must emit the formatted text. The
+`tests/interop/formatting` fixture checks this in CI.
+
 ## 5. Minimal walkthrough
 
 Two starting points, both verified to build and run against the actual host:

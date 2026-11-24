@@ -167,6 +167,8 @@ struct FileLintConfig<'a> {
     empty_service: Option<LintSeverity>,
     nesting_depth: Option<LintSeverity>,
     name_collisions: Option<LintSeverity>,
+    record_unions: Option<LintSeverity>,
+    union_boundaries: Option<LintSeverity>,
 }
 
 impl<'a> FileLintConfig<'a> {
@@ -228,6 +230,8 @@ impl<'a> FileLintConfig<'a> {
                 base.check_complexity.then_some(LintSeverity::Warning),
             ),
             name_collisions: policy("lint_name_collisions", warn),
+            record_unions: policy("lint_record_unions", warn),
+            union_boundaries: policy("lint_union_boundaries", warn),
         }
     }
 }
@@ -249,6 +253,14 @@ pub fn lint_spec(spec: &CsilSpec, config: &LintConfig) -> Result<LintResult> {
 
     if let Some(severity) = config.name_collisions {
         check_name_collisions(spec, severity, &mut result);
+    }
+
+    if let Some(severity) = config.record_unions {
+        check_record_unions(spec, severity, &mut result);
+    }
+
+    if let Some(severity) = config.union_boundaries {
+        check_union_boundaries(spec, severity, &mut result);
     }
 
     Ok(result)
@@ -609,6 +621,76 @@ fn check_name_collisions(spec: &CsilSpec, severity: LintSeverity, result: &mut L
             ),
             None => {
                 first.insert(key, &rule.name);
+            }
+        }
+    }
+}
+
+/// A union of inline records (`A = {..} // {..}`, or `A //= {..}`) encodes each value
+/// with the arm's variant index, which is its place in declaration order across files
+/// and includes. Reordering, or a new `//=` arm in front of others, changes the index
+/// of the later arms and so breaks the wire. An encoder that must pick the arm for a
+/// plain value takes the first that fits, so an earlier arm can take a value that was
+/// meant for a later one.
+fn check_record_unions(spec: &CsilSpec, severity: LintSeverity, result: &mut LintResult) {
+    for rule in &spec.rules {
+        let records = match &rule.rule_type {
+            RuleType::TypeDef(TypeExpression::Choice(arms)) => arms
+                .iter()
+                .filter(|arm| matches!(arm, TypeExpression::Group(_)))
+                .count(),
+            RuleType::GroupChoice(groups) => groups.len() + 1,
+            _ => 0,
+        };
+        if records >= 2 {
+            result.add_issue_with_suggestion(
+                severity,
+                rule.name.clone(),
+                "Record union: each arm's wire index is its place in declaration order across \
+                 files and includes, so a reordered or added `//=` arm breaks the wire, and an \
+                 encoder that picks the first arm that fits can take a value meant for a later arm"
+                    .to_string(),
+                "Prefer one record with a kind field, or named records as the arms of an \
+                 operation output; avoid `//=`"
+                    .to_string(),
+                false,
+            );
+        }
+    }
+}
+
+/// An operation boundary such as `Ev -> {* text => int} / Err` has an inline arm, so
+/// the reply has no variant: the payload is one named union, `[variant_index, value]`.
+fn check_union_boundaries(spec: &CsilSpec, severity: LintSeverity, result: &mut LintResult) {
+    for rule in &spec.rules {
+        let RuleType::ServiceDef(service) = &rule.rule_type else {
+            continue;
+        };
+        for op in &service.operations {
+            for (side, ty) in [("input", &op.input_type), ("output", &op.output_type)] {
+                let TypeExpression::Choice(arms) = ty else {
+                    continue;
+                };
+                let inline = arms.iter().any(|arm| {
+                    !matches!(
+                        arm,
+                        TypeExpression::Reference(_) | TypeExpression::Builtin(_)
+                    )
+                });
+                if inline {
+                    result.add_issue_with_suggestion(
+                        severity,
+                        format!("{}.{}", rule.name, op.name),
+                        format!(
+                            "Operation {side} has an inline arm, so the reply carries no \
+                             variant: the generated code treats it as one named union value, \
+                             `[variant_index, value]` on the wire"
+                        ),
+                        "Give each arm a rule name so the reply variant selects the arm"
+                            .to_string(),
+                        false,
+                    );
+                }
             }
         }
     }
@@ -1299,6 +1381,41 @@ Other = text";
                 .issues
                 .iter()
                 .any(|issue| issue.message.contains("only in case"))
+        );
+    }
+
+    #[test]
+    fn record_unions_and_union_boundaries_warn() {
+        let schema = "Contact = { id: int } // { email: text }
+Err = { message: text }
+Ok = { a: int }
+service Svc {
+    read: Ok -> { * text => int } / Err,
+    fine: Ok -> Ok / Err,
+}";
+        let spec = crate::parse_csil(schema).unwrap();
+        let result = lint_spec(&spec, &LintConfig::default()).unwrap();
+        let unions: Vec<_> = result
+            .issues
+            .iter()
+            .filter(|issue| {
+                issue.message.contains("carries no variant")
+                    || issue.message.contains("Record union")
+            })
+            .map(|issue| issue.rule_name.as_str())
+            .collect();
+        assert_eq!(unions, vec!["Contact", "Svc.read"], "{:?}", result.issues);
+
+        let off = crate::parse_csil(&format!(
+            "options {{ lint_record_unions: \"off\", lint_union_boundaries: \"off\" }}\n{schema}"
+        ))
+        .unwrap();
+        let result = lint_spec(&off, &LintConfig::default()).unwrap();
+        assert!(
+            !result
+                .issues
+                .iter()
+                .any(|issue| issue.message.contains("union"))
         );
     }
 

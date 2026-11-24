@@ -7,6 +7,8 @@
 //! string (service / op / event / field key) stays verbatim, so a Swift peer agrees
 //! byte-for-byte with the Rust/Go/Python/TypeScript clients.
 
+mod swiftfmt;
+
 use convert_case::{Case, Casing};
 use csilgen_common::{
     ChoiceClass, CsilControlOperator, CsilFieldMetadata, CsilGroupEntry, CsilGroupExpression,
@@ -230,27 +232,77 @@ const RESERVED_TYPE_NAMES: &[&str] = &[
     "Regex",
 ];
 
+/// The client files a run emits, each with its shape and path. Both the emitter and
+/// the reserved-name check read this one list, so a `<Service>Client` or
+/// `<Service>AsyncClient` name is reserved exactly when that struct is emitted.
+fn client_files(
+    surface: &Surface,
+    style: ClientStyle,
+    pkg_mode: bool,
+) -> Vec<(ClientShape, &'static str)> {
+    let want_client =
+        matches!(surface, Surface::Client) || (pkg_mode && !matches!(surface, Surface::TypesOnly));
+    if !want_client {
+        return Vec::new();
+    }
+    let sync = ClientShape {
+        is_async: false,
+        marker: "",
+    };
+    let async_drop_in = ClientShape {
+        is_async: true,
+        marker: "",
+    };
+    let async_twin = ClientShape {
+        is_async: true,
+        marker: "Async",
+    };
+    match style {
+        ClientStyle::Sync => vec![(sync, "Client.swift")],
+        ClientStyle::Async => vec![(async_drop_in, "Client.swift")],
+        ClientStyle::Both => vec![(sync, "Client.swift"), (async_twin, "ClientAsync.swift")],
+    }
+}
+
+/// The `<Arm>Refusal` error struct names `generate_codec` declares, one per reply arm
+/// after the first. The codec and the reserved-name check share this function.
+fn refusal_names(spec: &CsilSpecSerialized) -> Vec<String> {
+    let mut names = Vec::new();
+    for (_, _, arms) in spec.rpc_operations() {
+        for arm in &arms[1..] {
+            if let Some(variant) = arm.rpc_variant_name() {
+                names.push(refusal_name(variant));
+            }
+        }
+    }
+    names
+}
+
+fn refusal_name(variant: &str) -> String {
+    format!("{}Refusal", swift_type_name(variant))
+}
+
 /// Besides the fixed names, the package derives `<Service>Client`,
 /// `<Service>AsyncClient` and `<ErrorArm>Refusal` from schema names, so a rule that
-/// spells one of those out would be a redeclaration. `<Service>WireID` and `UTF8`
-/// need no entry: `swift_type_name` turns a rule spelled that way into `...WireId`
-/// and `Utf8`.
-fn reserved_type_name(spec: &CsilSpecSerialized) -> impl Fn(&str) -> bool {
+/// spells one of those out would be a redeclaration. A derived name is reserved only
+/// when this run emits it. `<Service>WireID` and `UTF8` need no entry:
+/// `swift_type_name` turns a rule spelled that way into `...WireId` and `Utf8`. The
+/// per-operation codecs are free functions with lower-case names, which never equal a
+/// type name.
+fn reserved_type_name(
+    spec: &CsilSpecSerialized,
+    clients: &[(ClientShape, &'static str)],
+) -> impl Fn(&str) -> bool {
     let mut derived = std::collections::HashSet::new();
     for rule in &spec.rules {
         if matches!(rule.rule_type, CsilRuleType::ServiceDef(_)) {
             let base = service_base(&rule.name);
-            derived.insert(format!("{base}Client"));
-            derived.insert(format!("{base}AsyncClient"));
-        }
-    }
-    for (_, _, arms) in spec.rpc_operations() {
-        for arm in &arms[1..] {
-            if let Some(variant) = arm.rpc_variant_name() {
-                derived.insert(format!("{}Refusal", swift_type_name(variant)));
+            for (shape, _) in clients {
+                derived.insert(shape.client_name(&base));
             }
         }
     }
+    derived.extend(refusal_names(spec));
     move |name| {
         let ty = swift_type_name(name);
         RESERVED_TYPE_NAMES.contains(&ty.as_str()) || derived.contains(&ty)
@@ -259,9 +311,44 @@ fn reserved_type_name(spec: &CsilSpecSerialized) -> impl Fn(&str) -> bool {
 
 /// Renames every rule whose Swift type name is reserved, derived from another
 /// rule, or equal to another rule's (`Value` and `value`, `user_id` and `UserId`).
-fn rename_for_swift(spec: &CsilSpecSerialized) -> CsilSpecSerialized {
-    let reserved = csilgen_common::rename_reserved(spec, reserved_type_name(spec));
+fn rename_for_swift(
+    spec: &CsilSpecSerialized,
+    clients: &[(ClientShape, &'static str)],
+) -> CsilSpecSerialized {
+    let services = rename_service_bases(spec);
+    let reserved =
+        csilgen_common::rename_reserved(&services, reserved_type_name(&services, clients));
     csilgen_common::rename_ident_collisions(&reserved, swift_type_name)
+}
+
+/// The client of a service is named after `service_base`, which drops a `Service`
+/// suffix, so `Foo` and `FooService` would both declare `FooClient`. A later service
+/// whose base is taken gets a digit suffix, as the shared collision pass gives it
+/// (`user-svc` after `UserSvc` becomes `user-svc2`). Distinct bases also give
+/// distinct protocol names. The wire keeps the declared name.
+fn rename_service_bases(spec: &CsilSpecSerialized) -> CsilSpecSerialized {
+    let mut names: std::collections::HashSet<String> =
+        spec.rules.iter().map(|rule| rule.name.clone()).collect();
+    let mut bases = std::collections::HashSet::new();
+    let mut renames = std::collections::HashMap::new();
+    for rule in &spec.rules {
+        if !matches!(rule.rule_type, CsilRuleType::ServiceDef(_)) {
+            continue;
+        }
+        if bases.insert(service_base(&rule.name)) {
+            continue;
+        }
+        let mut n = 2;
+        let mut candidate = format!("{}{n}", rule.name);
+        while names.contains(&candidate) || bases.contains(&service_base(&candidate)) {
+            n += 1;
+            candidate = format!("{}{n}", rule.name);
+        }
+        names.insert(candidate.clone());
+        bases.insert(service_base(&candidate));
+        renames.insert(rule.name.clone(), candidate);
+    }
+    csilgen_common::rename_rules(spec, &renames)
 }
 
 #[cfg(test)]
@@ -283,26 +370,32 @@ fn build_files_with_warnings(
     // requested surface, mirroring the TypeScript generator's option validation.
     let style = client_style(&input.config.options).map_err(|_| error_codes::GENERATION_ERROR)?;
 
-    // Rewrite inline (anonymous) composite field types to synthesized named rules so
-    // every emitter below sees them as ordinary references and routes them through the
-    // named-rule machinery (types, codec, client, services all read from this one
-    // hoisted view). `hoist_all_literal_choices: true` because this generator's own
-    // pre-shared-classifier hoister (`inline_choice`) hoisted EVERY inline choice, all-
-    // literal or not — Swift has no other route for an inline choice in a field
-    // position, so leaving one inline was never an option here (unlike TypeScript,
-    // which renders a bare-literal enum in place). See
-    // `csilgen_common::hoist_inline_composites`.
+    let pkg_mode = emit_packages_includes(&input.config.options, "swift");
+    let clients = client_files(&surface, style, pkg_mode);
     let warnings;
     let hoisted = {
         let mut cloned = input.clone();
-        let renamed = rename_for_swift(&input.csil_spec);
-        warnings = csilgen_common::rename_warnings(&renamed, &input.config.target);
-        cloned.csil_spec = csilgen_common::hoist_inline_composites(
-            &renamed,
+        // Rewrite inline (anonymous) composite field types to synthesized named rules so
+        // every emitter below sees them as ordinary references and routes them through the
+        // named-rule machinery (types, codec, client, services all read from this one
+        // hoisted view). `hoist_all_literal_choices: true` because this generator's own
+        // pre-shared-classifier hoister (`inline_choice`) hoisted EVERY inline choice, all-
+        // literal or not — Swift has no other route for an inline choice in a field
+        // position, so leaving one inline was never an option here (unlike TypeScript,
+        // which renders a bare-literal enum in place). See
+        // `csilgen_common::hoist_inline_composites`.
+        // Name mixed op boundaries and inline composites first, so the rename passes
+        // below also check every name the hoisters invent. The hoisters append their
+        // rules after the user's, so on a clash the synthesized rule is the one renamed.
+        let unions = csilgen_common::hoist_op_union_boundaries(&input.csil_spec);
+        let composites = csilgen_common::hoist_inline_composites(
+            &unions,
             csilgen_common::HoistOptions {
                 hoist_all_literal_choices: true,
             },
         );
+        cloned.csil_spec = rename_for_swift(&composites, &clients);
+        warnings = csilgen_common::rename_warnings(&cloned.csil_spec, &input.config.target);
         cloned.csil_spec.supply_implicit_service_error();
         key_unhashable_maps_by_value(&mut cloned.csil_spec);
         cloned
@@ -334,59 +427,14 @@ fn build_files_with_warnings(
         // must carry BOTH surfaces for its own quickstart to compile — regardless of which
         // (sub-)target was requested. A flat (non-package) build stays byte-identical: it
         // emits only the requested surface. Mirrors the OCaml generator.
-        let pkg_mode = emit_packages_includes(&input.config.options, "swift");
-        let want_client = matches!(surface, Surface::Client)
-            || (pkg_mode && !matches!(surface, Surface::TypesOnly));
         let want_server = matches!(surface, Surface::Server)
             || (pkg_mode && !matches!(surface, Surface::TypesOnly));
-
-        if want_client {
-            // `Both` (the default) ships the blocking client at `Client.swift` and an
-            // `async` twin at `ClientAsync.swift`; `Async` makes the `async` client a
-            // drop-in at `Client.swift` (canonical names); `Sync` is today's output.
-            let sync = ClientShape {
-                is_async: false,
-                marker: "",
-            };
-            let async_drop_in = ClientShape {
-                is_async: true,
-                marker: "",
-            };
-            let async_twin = ClientShape {
-                is_async: true,
-                marker: "Async",
-            };
-            match style {
-                ClientStyle::Sync => {
-                    if let Some(client) = generate_client(input, sync, !want_server) {
-                        files.push(GeneratedFile {
-                            path: "Client.swift".to_string(),
-                            content: client,
-                        });
-                    }
-                }
-                ClientStyle::Async => {
-                    if let Some(client) = generate_client(input, async_drop_in, !want_server) {
-                        files.push(GeneratedFile {
-                            path: "Client.swift".to_string(),
-                            content: client,
-                        });
-                    }
-                }
-                ClientStyle::Both => {
-                    if let Some(client) = generate_client(input, sync, !want_server) {
-                        files.push(GeneratedFile {
-                            path: "Client.swift".to_string(),
-                            content: client,
-                        });
-                    }
-                    if let Some(client) = generate_client(input, async_twin, !want_server) {
-                        files.push(GeneratedFile {
-                            path: "ClientAsync.swift".to_string(),
-                            content: client,
-                        });
-                    }
-                }
+        for (shape, path) in &clients {
+            if let Some(client) = generate_client(input, *shape, !want_server) {
+                files.push(GeneratedFile {
+                    path: path.to_string(),
+                    content: client,
+                });
             }
         }
 
@@ -415,6 +463,11 @@ fn build_files_with_warnings(
         }
     }
 
+    for file in &mut files {
+        if file.path.ends_with(".swift") {
+            file.content = swiftfmt::tidy(&file.content);
+        }
+    }
     Ok((files, warnings))
 }
 
@@ -617,10 +670,10 @@ let package = Package(\n\
 \x20   name: {name_lit},\n\
 {platforms}\
 \x20   products: [\n\
-\x20       .library(name: {name_lit}, targets: [{target_lit}]),\n\
+\x20       .library(name: {name_lit}, targets: [{target_lit}])\n\
 \x20   ],\n\
 \x20   targets: [\n\
-\x20       .target(name: {target_lit}),\n\
+\x20       .target(name: {target_lit})\n\
 \x20   ]\n\
 )\n"
     )
@@ -816,7 +869,7 @@ fn first_swift_channel_example(input: &WasmGeneratorInput) -> Option<SwiftChanne
             let method_pascal = swift_type_name(&op.name);
             return Some(SwiftChannelExample {
                 handler_protocol: type_name.clone(),
-                service_wire: rule.name.clone(),
+                service_wire: input.csil_spec.declared_name(&rule.name).to_string(),
                 route_fn: format!("route{type_name}Channel"),
                 encode_fn: format!("encode{type_name}{method_pascal}"),
                 handler_method: swift_ident(&op.name),
@@ -1822,6 +1875,11 @@ fn emit_struct(
         out.push_str("    /// CBOR wire keys (verbatim) keyed by Swift property name.\n");
         out.push_str("    public static let wireKeys: [String: String] = [\n");
         out.push_str(&wire_pairs.join(",\n"));
+        // swift-format ends a literal of several lines with a comma when it has more
+        // than one element.
+        if wire_pairs.len() > 1 {
+            out.push(',');
+        }
         out.push_str("\n    ]\n");
     }
 
@@ -1962,7 +2020,41 @@ fn classify_enum_literals(literals: &[&CsilLiteralValue]) -> SwiftChoiceShape {
 /// A closed set of string literals as a `String`-backed Swift enum: the raw value is the
 /// wire string verbatim (so case order/spelling never drifts onto the wire), the case
 /// name is the camelCased label, and `CaseIterable` is free and conventional here.
+/// Names a text enum's own declarations use, which a case of the same name would
+/// redeclare or shadow.
+const ENUM_MEMBER_NAMES: &[&str] = &[
+    "rawValue",
+    "allCases",
+    "hashValue",
+    "init",
+    "self",
+    "wireNumber",
+    "toCborValue",
+    "toCbor",
+    "fromCbor",
+];
+
+/// The case identifiers of a text enum, one per wire value, in order. Every text enum
+/// member goes through here, so the declaration, `wireNumber`, the defaults and any
+/// other place that names a case agree. A plain value keeps the lowerCamelCase name
+/// it always had (`allow-once` is `allowOnce`); a keyword keeps its backticks, which
+/// make it legal. A dot or another separator only splits words (`calendars.read` is
+/// `calendarsRead`), and a leading digit or a name the enum itself declares gets a
+/// `v` first (`2fa` is `v2Fa`).
+fn text_case_names<S: AsRef<str>>(labels: &[S]) -> Vec<String> {
+    let values: Vec<&str> = labels.iter().map(AsRef::as_ref).collect();
+    csilgen_common::member_idents(
+        &values,
+        |words| escape_ident(&words.join("_").to_case(Case::Camel)),
+        |name| {
+            let bare = name.trim_matches('`');
+            !bare.starts_with(|c: char| c.is_ascii_digit()) && !ENUM_MEMBER_NAMES.contains(&bare)
+        },
+    )
+}
+
 fn emit_string_enum(type_name: &str, labels: &[String], numbers: Option<Vec<i64>>) -> String {
+    let cases = text_case_names(labels);
     let codable = if numbers.is_some() { ", Codable" } else { "" };
     let mut out = String::new();
     out.push_str(&format!(
@@ -1971,27 +2063,17 @@ fn emit_string_enum(type_name: &str, labels: &[String], numbers: Option<Vec<i64>
     out.push_str(&format!(
         "public enum {type_name}: String, Equatable, Sendable, CaseIterable{codable} {{\n"
     ));
-    for label in labels {
-        out.push_str(&format!(
-            "    case {} = {}\n",
-            swift_ident(label),
-            swift_string_lit(label)
-        ));
+    for (label, case) in labels.iter().zip(&cases) {
+        out.push_str(&format!("    case {case} = {}\n", swift_string_lit(label)));
     }
     if let Some(numbers) = numbers {
         out.push_str("\n    public var wireNumber: Int64 {\n        switch self {\n");
-        for (label, n) in labels.iter().zip(&numbers) {
-            out.push_str(&format!(
-                "        case .{}: return {n}\n",
-                swift_ident(label)
-            ));
+        for (case, n) in cases.iter().zip(&numbers) {
+            out.push_str(&format!("        case .{case}: return {n}\n"));
         }
         out.push_str("        }\n    }\n\n    public init?(wireNumber: Int64) {\n        switch wireNumber {\n");
-        for (label, n) in labels.iter().zip(&numbers) {
-            out.push_str(&format!(
-                "        case {n}: self = .{}\n",
-                swift_ident(label)
-            ));
+        for (case, n) in cases.iter().zip(&numbers) {
+            out.push_str(&format!("        case {n}: self = .{case}\n"));
         }
         out.push_str("        default: return nil\n        }\n    }\n");
     }
@@ -2061,7 +2143,7 @@ fn scalar_enum_case_names(lits: &[CsilLiteralValue]) -> Vec<String> {
 /// literal-itself naming.
 fn mixed_enum_case_name(lit: &CsilLiteralValue, index: usize) -> String {
     match lit {
-        CsilLiteralValue::Text(s) => swift_ident(s),
+        CsilLiteralValue::Text(s) => text_case_names(&[s]).swap_remove(0),
         other => scalar_enum_case_name(other, index),
     }
 }
@@ -2336,7 +2418,9 @@ fn eq_expr(
                     )
                 })
                 .collect();
-            format!("({})", parts.join(" && "))
+            // `&&` is associative, so the conjuncts need no parentheses, which
+            // swift-format would not let a line break follow.
+            parts.join(" && ")
         }
         CsilTypeExpression::Array { element_type, .. } => {
             let inner = eq_expr(element_type, false, &l, &r, aliases, depth + 1);
@@ -2384,18 +2468,14 @@ fn enum_default_swift(
             _ => return None,
         }
     };
-    if let Some(label) = csilgen_common::enum_number_label(choices, value) {
-        return Some(format!(".{}", swift_ident(label)));
-    }
     let case = match swift_choice_shape(choices) {
         SwiftChoiceShape::StringEnum(labels) => {
-            let CsilLiteralValue::Text(label) = value else {
-                return None;
+            let label = match value {
+                CsilLiteralValue::Text(label) => label.as_str(),
+                _ => csilgen_common::enum_number_label(choices, value)?,
             };
-            labels
-                .iter()
-                .find(|candidate| *candidate == label)
-                .map(|s| swift_ident(s))?
+            let index = labels.iter().position(|candidate| candidate == label)?;
+            text_case_names(&labels).swap_remove(index)
         }
         SwiftChoiceShape::ScalarEnum(lits) => {
             let index = lits.iter().position(|lit| lit == value)?;
@@ -3034,7 +3114,7 @@ fn swift_enc_tuple_slot(
         choice_codecs,
     );
     let mark = try_mark(&inner);
-    format!("({mark}{expr}.map {{ (csilSome) -> CsilCborValue in {inner} }} ?? CsilCborValue.null)")
+    format!("{mark}{expr}.map {{ (csilSome) -> CsilCborValue in {inner} }} ?? CsilCborValue.null")
 }
 
 /// Decodes one tuple position; see `swift_enc_tuple_slot` for the optional form.
@@ -3117,13 +3197,15 @@ fn swift_dec_value(
             let vt = map_type(value, false);
             let k = swift_dec_value(key, "$1.0", records, aliases, choice_codecs);
             let v = swift_dec_value(value, "$1.1", records, aliases, choice_codecs);
-            format!("try CsilCbor.asMap({expr}).reduce(into: [{kt}: {vt}]()) {{ $0[{k}] = {v} }}")
+            format!(
+                "try CsilCbor.asCanonicalMap({expr}).reduce(into: [{kt}: {vt}]()) {{ $0[{k}] = {v} }}"
+            )
         }
         // Mirrors the encoder: a fixed-shape CBOR array, positionally decoded; a
         // single-element tuple decodes straight to its one element (no field access),
         // matching `map_tuple`'s Swift-side collapse.
         CsilTypeExpression::Tuple(group) if group.entries.len() == 1 => {
-            let elem_access = format!("(try CsilCbor.item({expr}, 0, of: 1))");
+            let elem_access = format!("try CsilCbor.item({expr}, 0, of: 1)");
             swift_dec_tuple_slot(
                 &group.entries[0],
                 &elem_access,
@@ -3139,7 +3221,7 @@ fn swift_dec_value(
                 .iter()
                 .enumerate()
                 .map(|(index, entry)| {
-                    let elem_access = format!("(try CsilCbor.item({expr}, {index}, of: {count}))");
+                    let elem_access = format!("try CsilCbor.item({expr}, {index}, of: {count})");
                     let dec =
                         swift_dec_tuple_slot(entry, &elem_access, records, aliases, choice_codecs);
                     format!("{}: {dec}", tuple_field_label(group, index))
@@ -3227,7 +3309,7 @@ fn emit_struct_codec(
         } else {
             let dec = swift_dec_value(
                 ty,
-                &format!("(try CsilCbor.require(cborValue, {wire_lit}))"),
+                &format!("try CsilCbor.require(cborValue, {wire_lit})"),
                 records,
                 aliases,
                 choice_codecs,
@@ -3778,12 +3860,13 @@ fn generate_codec(input: &WasmGeneratorInput) -> Option<String> {
             let mut encode = format!(
                 "/// Runs the handler and encodes the reply arm it chose. A thrown error, from the\n/// handler or from a reply value that cannot be encoded, means there is no typed\n/// reply: answer with transport status 6 (internal).\npublic func encode{stem}Reply(_ handler: () throws -> {success}) throws -> (variant: String, payload: [UInt8]) {{\n    do {{\n        let value = try handler()\n"
             );
-            resolve.push_str(&format!("    if service == \"{service}\" && op == \"{method}\" {{\n        switch variant {{\n"));
+            let wire_service = input.csil_spec.declared_name(service);
+            resolve.push_str(&format!("    if service == \"{wire_service}\" && op == \"{method}\" {{\n        switch variant {{\n"));
             for (i, arm) in arms.iter().enumerate() {
                 let variant = arm.rpc_variant_name().unwrap();
                 let wire = input.csil_spec.declared_name(variant);
                 let ty = map_type(arm, false);
-                let exception = format!("{}Refusal", swift_type_name(variant));
+                let exception = refusal_name(variant);
                 let source = if i == 0 { "value" } else { "refusal.value" };
                 let enc = swift_enc_value(arm, source, &records, &aliases, &choice_codecs);
                 if i == 0 {
@@ -3897,6 +3980,7 @@ fn generate_client(
         if let CsilRuleType::ServiceDef(service) = &rule.rule_type {
             body.push_str(&emit_client_struct(
                 &rule.name,
+                input.csil_spec.declared_name(&rule.name),
                 service,
                 &records,
                 &aliases,
@@ -3926,6 +4010,7 @@ fn generate_client(
 
 fn emit_client_struct(
     name: &str,
+    wire_service: &str,
     service: &CsilServiceDefinition,
     records: &std::collections::HashSet<String>,
     aliases: &std::collections::HashMap<String, CsilTypeExpression>,
@@ -3938,8 +4023,8 @@ fn emit_client_struct(
     let effects = shape.effects();
     let await_kw = shape.await_kw();
     // Canonical wire strings: the verbatim CSIL service and op names
-    // (csil-rpc-transport.md §1.1).
-    let wire_service = name;
+    // (csil-rpc-transport.md §1.1). `wire_service` is the declared name, which a
+    // rename for a Swift identifier clash does not change.
     let mut out = String::new();
     out.push_str(&format!(
         "/// {client} is a typed client for the {name} service. The client owns\n/// (de)serialization; the carrier only moves bytes.\n"
@@ -4291,7 +4376,8 @@ public enum CsilEq {
     }
 
     public static func map<K, V>(_ a: [K: V], _ b: [K: V], _ eq: (V, V) -> Bool) -> Bool {
-        a.count == b.count && a.allSatisfy { entry in b[entry.key].map { eq(entry.value, $0) } ?? false }
+        a.count == b.count
+            && a.allSatisfy { entry in b[entry.key].map { eq(entry.value, $0) } ?? false }
     }
 }
 ";
@@ -4363,11 +4449,26 @@ public indirect enum CsilCborValue: Hashable, Sendable {
 /// itself, so it survives a round trip unchanged.
 public typealias AnyCsilValue = CsilCborValue
 
-public enum CsilCborError: Swift.Error {
+public enum CsilCborError: Swift.Error, CustomStringConvertible {
     case malformed
     case trailingBytes
     case missingField(String)
     case typeMismatch
+    case duplicateKey(String)
+    case mapKeyOrder
+    case longFormKey
+
+    public var description: String {
+        switch self {
+        case .malformed: return "csil cbor: malformed input"
+        case .trailingBytes: return "csil cbor: trailing bytes after the value"
+        case .missingField(let key): return "csil cbor: missing field \"\(key)\""
+        case .typeMismatch: return "csil cbor: value does not match its type"
+        case .duplicateKey(let key): return "csil cbor: duplicate key \(key)"
+        case .mapKeyOrder: return "csil cbor: map keys are not in canonical order"
+        case .longFormKey: return "csil cbor: map key is not in shortest form"
+        }
+    }
 }
 
 public enum CsilCbor {
@@ -4391,11 +4492,17 @@ public enum CsilCbor {
         } else if n < 0x1_0000_0000 {
             out.append(mt | 26)
             var i = 24
-            while i >= 0 { out.append(UInt8((n >> UInt64(i)) & 0xff)); i -= 8 }
+            while i >= 0 {
+                out.append(UInt8((n >> UInt64(i)) & 0xff))
+                i -= 8
+            }
         } else {
             out.append(mt | 27)
             var i = 56
-            while i >= 0 { out.append(UInt8((n >> UInt64(i)) & 0xff)); i -= 8 }
+            while i >= 0 {
+                out.append(UInt8((n >> UInt64(i)) & 0xff))
+                i -= 8
+            }
         }
     }
 
@@ -4410,7 +4517,10 @@ public enum CsilCbor {
             out.append(0xfb)
             let bits = d.bitPattern
             var i = 56
-            while i >= 0 { out.append(UInt8((bits >> UInt64(i)) & 0xff)); i -= 8 }
+            while i >= 0 {
+                out.append(UInt8((bits >> UInt64(i)) & 0xff))
+                i -= 8
+            }
         case .text(let s):
             let u = Array(s.utf8)
             head(3, UInt64(u.count), &out)
@@ -4428,11 +4538,35 @@ public enum CsilCbor {
             // iteration order.
             let sorted = kvs.map { (encode($0.0), $0.1) }
                 .sorted { $0.0.lexicographicallyPrecedes($1.0) }
-            for (k, val) in sorted { out.append(contentsOf: k); enc(val, &out) }
+            for (k, val) in sorted {
+                out.append(contentsOf: k)
+                enc(val, &out)
+            }
         case .tag(let t, let inner):
             head(6, t, &out)
             enc(inner, &out)
         }
+    }
+
+    /// A key whose shortest-form encoding is the only one, so its raw bytes are
+    /// exactly what `encode` writes for it.
+    static func plainKey(_ k: CsilCborValue) -> Bool {
+        switch k {
+        case .uint, .int, .text, .bytes, .bool, .null: return true
+        default: return false
+        }
+    }
+
+    /// Whether the head of an encoded data item uses the shortest argument width.
+    static func shortestHead(_ item: [UInt8]) -> Bool {
+        guard let first = item.first, first >> 5 != 7 else { return true }
+        let low = first & 0x1f
+        guard (24...27).contains(low) else { return true }
+        let width = 1 << Int(low - 24)
+        guard item.count > width else { return false }
+        let arg = item[1...width].reduce(UInt64(0)) { $0 << 8 | UInt64($1) }
+        let floor: [UInt64] = [24, 0x100, 0x1_0000, 0x1_0000_0000]
+        return arg >= floor[Int(low - 24)]
     }
 
     public static func decode(_ b: [UInt8]) throws -> CsilCborValue {
@@ -4443,7 +4577,10 @@ public enum CsilCbor {
     }
 
     static func readArg(_ b: [UInt8], _ pos: inout Int, _ low: UInt8) throws -> UInt64 {
-        if low < 24 { pos += 1; return UInt64(low) }
+        if low < 24 {
+            pos += 1
+            return UInt64(low)
+        }
         let width: Int
         switch low {
         case 24: width = 1
@@ -4455,17 +4592,23 @@ public enum CsilCbor {
         guard pos < b.count, b.count - pos - 1 >= width else { throw CsilCborError.malformed }
         switch low {
         case 24:
-            let v = UInt64(b[pos + 1]); pos += 2; return v
+            let v = UInt64(b[pos + 1])
+            pos += 2
+            return v
         case 25:
-            let v = (UInt64(b[pos + 1]) << 8) | UInt64(b[pos + 2]); pos += 3; return v
+            let v = (UInt64(b[pos + 1]) << 8) | UInt64(b[pos + 2])
+            pos += 3
+            return v
         case 26:
             var v: UInt64 = 0
             for i in 1...4 { v = (v << 8) | UInt64(b[pos + i]) }
-            pos += 5; return v
+            pos += 5
+            return v
         case 27:
             var v: UInt64 = 0
             for i in 1...8 { v = (v << 8) | UInt64(b[pos + i]) }
-            pos += 9; return v
+            pos += 9
+            return v
         default:
             throw CsilCborError.malformed
         }
@@ -4478,9 +4621,15 @@ public enum CsilCbor {
         let low = ib & 0x1f
         if major == 7 {
             switch low {
-            case 20: pos += 1; return .bool(false)
-            case 21: pos += 1; return .bool(true)
-            case 22, 23: pos += 1; return .null
+            case 20:
+                pos += 1
+                return .bool(false)
+            case 21:
+                pos += 1
+                return .bool(true)
+            case 22, 23:
+                pos += 1
+                return .null
             case 25:
                 // Built by hand because `Float16` is missing on macOS x86_64.
                 let half = try readArg(b, &pos, low)
@@ -4515,7 +4664,8 @@ public enum CsilCbor {
         case 2:
             guard arg <= UInt64(b.count - pos) else { throw CsilCborError.malformed }
             let n = Int(arg)
-            let slice = Array(b[pos..<pos + n]); pos += n
+            let slice = Array(b[pos..<pos + n])
+            pos += n
             return .bytes(slice)
         case 3:
             guard arg <= UInt64(b.count - pos) else { throw CsilCborError.malformed }
@@ -4536,11 +4686,34 @@ public enum CsilCbor {
             guard arg <= UInt64(b.count - pos) else { throw CsilCborError.malformed }
             let n = Int(arg)
             var kvs: [(CsilCborValue, CsilCborValue)] = []
+            // A map with a key twice is not valid CBOR, and a record decoder that read
+            // the first or the last copy would disagree with a peer that read the other.
+            var seen = Set<[UInt8]>()
+            var previous: [UInt8]? = nil
+            var ascending = true
+            var plain = true
             for _ in 0..<n {
+                let start = pos
                 let k = try dec(b, &pos, depth + 1)
+                let raw = Array(b[start..<pos])
+                // A long-form head would let one key arrive in two spellings, so it
+                // could hide a repeated key or sort in another place.
+                guard shortestHead(raw) else { throw CsilCborError.longFormKey }
+                if let previous, !previous.lexicographicallyPrecedes(raw) { ascending = false }
+                previous = raw
+                plain = plain && plainKey(k)
+                guard seen.insert(raw).inserted else {
+                    if case .text(let s) = k { throw CsilCborError.duplicateKey("\"\(s)\"") }
+                    throw CsilCborError.duplicateKey(raw.map { String($0, radix: 16) }.joined())
+                }
                 let v = try dec(b, &pos, depth + 1)
                 kvs.append((k, v))
             }
+            // A float, tag, array or map key can arrive in a spelling the encoder does
+            // not write, so `asCanonicalMap` cannot check its order on re-encoded
+            // bytes. No record has such keys, so the order of the raw bytes is
+            // checked here, and `asCanonicalMap` leaves the map alone.
+            if !plain && !ascending { throw CsilCborError.mapKeyOrder }
             return .map(kvs)
         case 6:
             let inner = try dec(b, &pos, depth + 1)
@@ -4564,7 +4737,9 @@ public enum CsilCbor {
         return x
     }
 
-    public static func expectLiteral<T>(_ actual: CsilCborValue, _ expected: CsilCborValue, _ value: T) throws -> T {
+    public static func expectLiteral<T>(
+        _ actual: CsilCborValue, _ expected: CsilCborValue, _ value: T
+    ) throws -> T {
         guard valueEquals(actual, expected) else { throw CsilCborError.typeMismatch }
         return value
     }
@@ -4649,6 +4824,24 @@ public enum CsilCbor {
         throw CsilCborError.typeMismatch
     }
 
+    /// The entries of a dynamic map (`{ * K => V }`). The wire contract requires its
+    /// keys in strictly ascending order of their encoded bytes (RFC 8949 section
+    /// 4.2.1), so each key is compared with the one before it, not sorted.
+    public static func asCanonicalMap(_ v: CsilCborValue) throws -> [(CsilCborValue, CsilCborValue)] {
+        let kvs = try asMap(v)
+        // `dec` already checked the raw bytes of a map with another kind of key.
+        guard kvs.allSatisfy({ plainKey($0.0) }) else { return kvs }
+        var previous: [UInt8]? = nil
+        for (k, _) in kvs {
+            let key = encode(k)
+            if let previous, !previous.lexicographicallyPrecedes(key) {
+                throw CsilCborError.mapKeyOrder
+            }
+            previous = key
+        }
+        return kvs
+    }
+
     static func validDate(_ text: String) -> Bool {
         let s = Array(text.utf8)
         guard s.count == 10, s[4] == 45, s[7] == 45 else { return false }
@@ -4658,7 +4851,9 @@ public enum CsilCbor {
         func number(_ range: Range<Int>) -> Int {
             s[range].reduce(0) { $0 * 10 + Int($1 - 48) }
         }
-        let year = number(0..<4), month = number(5..<7), day = number(8..<10)
+        let year = number(0..<4)
+        let month = number(5..<7)
+        let day = number(8..<10)
         let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0)
         let days = [31, leap ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
         return (1...12).contains(month) && (1...days[month - 1]).contains(day)
@@ -4707,8 +4902,8 @@ public enum CsilCbor {
     }
 
     /// `0001-01-01T00:00:00Z` and `9999-12-31T23:59:59Z` as epoch seconds.
-    static let epochFirst = -62135596800
-    static let epochLast = 253402300799
+    static let epochFirst = -62_135_596_800
+    static let epochLast = 253_402_300_799
 
     /// Reads the strict RFC 3339 form into UTC epoch seconds and nanoseconds. The
     /// year must be 0001 to 9999 after conversion to UTC.
@@ -4721,15 +4916,19 @@ public enum CsilCbor {
             s[r].reduce(0) { $0 * 10 + Int($1 - 48) }
         }
         guard s.count >= 20, digits(0..<4), s[4] == 45, digits(5..<7), s[7] == 45, digits(8..<10),
-              s[10] == 84 || s[10] == 116, digits(11..<13), s[13] == 58, digits(14..<16),
-              s[16] == 58, digits(17..<19)
+            s[10] == 84 || s[10] == 116, digits(11..<13), s[13] == 58, digits(14..<16),
+            s[16] == 58, digits(17..<19)
         else { return nil }
-        let year = number(0..<4), month = number(5..<7), day = number(8..<10)
-        let hour = number(11..<13), minute = number(14..<16), second = number(17..<19)
+        let year = number(0..<4)
+        let month = number(5..<7)
+        let day = number(8..<10)
+        let hour = number(11..<13)
+        let minute = number(14..<16)
+        let second = number(17..<19)
         let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0)
         let monthDays = [31, leap ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
         guard year >= 1, (1...12).contains(month), (1...monthDays[month - 1]).contains(day),
-              hour <= 23, minute <= 59, second <= 59
+            hour <= 23, minute <= 59, second <= 59
         else { return nil }
         var i = 19
         var nanos = 0
@@ -4745,14 +4944,17 @@ public enum CsilCbor {
         if i == s.count - 1, s[i] == 90 || s[i] == 122 {
             offset = 0
         } else if i == s.count - 6, s[i] == 43 || s[i] == 45, digits((i + 1)..<(i + 3)),
-                  s[i + 3] == 58, digits((i + 4)..<(i + 6)) {
-            let oh = number((i + 1)..<(i + 3)), om = number((i + 4)..<(i + 6))
+            s[i + 3] == 58, digits((i + 4)..<(i + 6))
+        {
+            let oh = number((i + 1)..<(i + 3))
+            let om = number((i + 4)..<(i + 6))
             guard oh <= 23, om <= 59 else { return nil }
             offset = (oh * 60 + om) * 60 * (s[i] == 43 ? 1 : -1)
         } else {
             return nil
         }
-        let total = daysFromCivil(year, month, day) * 86400 + hour * 3600 + minute * 60 + second - offset
+        let total =
+            daysFromCivil(year, month, day) * 86400 + hour * 3600 + minute * 60 + second - offset
         guard (epochFirst...epochLast).contains(total) else { return nil }
         return (total, nanos)
     }
@@ -4851,7 +5053,9 @@ public enum CsilCbor {
     }
 
     /// Decodes an optional tuple position, where null means absent.
-    public static func orNull<T>(_ v: CsilCborValue, _ decode: (CsilCborValue) throws -> T) rethrows -> T? {
+    public static func orNull<T>(_ v: CsilCborValue, _ decode: (CsilCborValue) throws -> T) rethrows
+        -> T?
+    {
         if case .null = v { return nil }
         return try decode(v)
     }

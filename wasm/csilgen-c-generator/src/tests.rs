@@ -75,7 +75,7 @@ fn input_with_rules(
 /// caller going through `process_generation` would see.
 fn hoisted(input: WasmGeneratorInput) -> WasmGeneratorInput {
     let mut input = input;
-    input.csil_spec = prepare_spec(&input.csil_spec);
+    input.csil_spec = prepare_spec(&input.csil_spec, true);
     input
 }
 
@@ -3332,7 +3332,14 @@ fn rule_clash_rules() -> Vec<CsilRule> {
         doc_comments: vec![],
     };
     vec![
-        record("Value"),
+        // A check, so `Value_validate` is emitted and really clashes.
+        group_rule(
+            "Value",
+            vec![bare_entry(
+                "x",
+                size_constrained("text", CsilSizeConstraint::Exact(3)),
+            )],
+        ),
         record("value"),
         record("Some-Thing"),
         union,
@@ -3432,4 +3439,541 @@ fn rule_clashes_are_renamed_warned_and_compile() {
     assert!(compile.status.success(), "compile failed:\n{stderr}");
     assert!(stderr.is_empty(), "compiler warnings:\n{stderr}");
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+fn reference(name: &str) -> CsilTypeExpression {
+    CsilTypeExpression::Reference(name.to_string())
+}
+
+fn text_map() -> CsilTypeExpression {
+    CsilTypeExpression::Map {
+        key: Box::new(builtin("text")),
+        value: Box::new(builtin("int")),
+        occurrence: None,
+    }
+}
+
+fn unary(
+    name: &str,
+    input: CsilTypeExpression,
+    output: CsilTypeExpression,
+) -> CsilServiceOperation {
+    op(
+        name,
+        input,
+        output,
+        CsilServiceDirection::Unidirectional,
+        None,
+    )
+}
+
+/// Generate `rules` for `c` (server) and `c-client`, so every header exists once.
+fn generate_both(rules: Vec<CsilRule>) -> (Vec<GeneratedFile>, Vec<GeneratorWarning>) {
+    let server = process_generation(input_with_rules(rules.clone(), "c", HashMap::new())).unwrap();
+    let client = process_generation(input_with_rules(rules, "c-client", HashMap::new())).unwrap();
+    let mut files = server.files;
+    files.extend(
+        client
+            .files
+            .into_iter()
+            .filter(|f| f.path == "client.gen.h"),
+    );
+    (files, server.warnings)
+}
+
+/// Compile `driver` against the generated headers with -Werror and run it. Returns
+/// None when no C compiler is on PATH.
+fn compile_and_run(files: &[GeneratedFile], driver: &str, tag: &str) -> Option<String> {
+    let cc = ["cc", "gcc", "clang"].into_iter().find(|c| {
+        std::process::Command::new(c)
+            .arg("--version")
+            .output()
+            .is_ok()
+    })?;
+    let dir = std::env::temp_dir().join(format!("csilgen-c-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    for file in files {
+        std::fs::write(dir.join(&file.path), &file.content).unwrap();
+    }
+    std::fs::write(dir.join("driver.c"), driver).unwrap();
+    let bin = dir.join("driver");
+    let compile = std::process::Command::new(cc)
+        .args(["-std=c11", "-Wall", "-Wextra", "-Werror", "-O1", "-I"])
+        .arg(&dir)
+        .arg(dir.join("driver.c"))
+        .arg("-o")
+        .arg(&bin)
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&compile.stderr);
+    assert!(compile.status.success(), "compile failed:\n{stderr}");
+    let run = std::process::Command::new(&bin).output().unwrap();
+    let stdout = String::from_utf8_lossy(&run.stdout).to_string();
+    assert!(run.status.success(), "driver failed:\n{stdout}");
+    let _ = std::fs::remove_dir_all(&dir);
+    Some(stdout)
+}
+
+fn includes(files: &[GeneratedFile]) -> String {
+    files
+        .iter()
+        .filter(|f| f.path.ends_with(".h"))
+        .map(|f| format!("#include \"{}\"\n", f.path))
+        .collect()
+}
+
+fn count(files: &[GeneratedFile], needle: &str) -> usize {
+    files
+        .iter()
+        .map(|f| f.content.matches(needle).count())
+        .sum()
+}
+
+/// The linkkeys request: an op's own input and output records are the op's
+/// boundary codecs, so nothing is renamed.
+#[test]
+fn op_boundary_records_keep_their_names() {
+    let rules = vec![
+        record_typedef(
+            "RpIssueAttestationRequest",
+            vec![bare_entry("claim_type", builtin("text"))],
+        ),
+        record_typedef(
+            "RpIssueAttestationResponse",
+            vec![bare_entry("deposited", builtin("bool"))],
+        ),
+        service_rule(
+            "Rp",
+            vec![unary(
+                "issue-attestation",
+                reference("RpIssueAttestationRequest"),
+                reference("RpIssueAttestationResponse"),
+            )],
+            None,
+        ),
+    ];
+    let (files, warnings) = generate_both(rules);
+    assert!(warnings.is_empty(), "{warnings:?}");
+    assert_eq!(count(&files, "} RpIssueAttestationRequest;"), 1);
+    assert_eq!(
+        count(
+            &files,
+            "static inline int csil_encode_RpIssueAttestationRequest("
+        ),
+        1
+    );
+    let driver = format!("{}int main(void) {{ return 0; }}\n", includes(&files));
+    compile_and_run(&files, &driver, "t1-records");
+}
+
+/// A name is reserved only where it is emitted: a unary op has no push encoder, a
+/// record without checks has no validator. An emitted name is still a clash.
+#[test]
+fn only_emitted_derived_names_rename_a_rule() {
+    let rules = vec![
+        alias_rule("MemberID", builtin("text")),
+        record_typedef(
+            "encode_member_get_member",
+            vec![bare_entry("id", builtin("text"))],
+        ),
+        record_typedef("Plain_validate", vec![bare_entry("id", builtin("text"))]),
+        record_typedef("Plain", vec![bare_entry("id", builtin("text"))]),
+        record_typedef(
+            "csil_encode_MemberID",
+            vec![bare_entry("id", builtin("text"))],
+        ),
+        service_rule(
+            "Member",
+            vec![unary(
+                "get-member",
+                reference("MemberID"),
+                reference("MemberID"),
+            )],
+            None,
+        ),
+    ];
+    let (files, warnings) = generate_both(rules);
+    let renamed: Vec<&str> = warnings
+        .iter()
+        .filter_map(|w| w.location.as_ref()?.context.as_deref())
+        .collect();
+    assert_eq!(renamed, vec!["csil_encode_MemberID"], "{warnings:?}");
+    assert_eq!(count(&files, "} encode_member_get_member;"), 1);
+    assert_eq!(count(&files, "} Plain_validate;"), 1);
+    assert_eq!(count(&files, "} csil_encode_MemberIDType;"), 1);
+    let driver = format!("{}int main(void) {{ return 0; }}\n", includes(&files));
+    compile_and_run(&files, &driver, "t1-clash");
+}
+
+/// `read-counts: Holder -> { * text => int } / Err` returns the whole union, with
+/// the map arm and the error arm, on the client and the server.
+#[test]
+fn mixed_op_output_is_a_named_union_with_every_arm() {
+    let rules = vec![
+        record_typedef("Holder", vec![bare_entry("counts", text_map())]),
+        record_typedef("Err", vec![bare_entry("message", builtin("text"))]),
+        service_rule(
+            "Lookup",
+            vec![unary(
+                "read-counts",
+                reference("Holder"),
+                CsilTypeExpression::Choice(vec![text_map(), reference("Err")]),
+            )],
+            None,
+        ),
+    ];
+    let (files, warnings) = generate_both(rules);
+    assert!(warnings.is_empty(), "{warnings:?}");
+    let types = file_named(&files, "types.gen.h");
+    assert!(types.contains("LOOKUP_READ_COUNTS_OUTPUT_ERR,"), "{types}");
+    assert!(types.contains("        Err err;"), "{types}");
+    assert!(types.contains("        LookupReadCountsOutput_0 lookup_read_counts_output_0;"));
+    let server = file_named(&files, "server.gen.h");
+    assert!(
+        server.contains("const Holder *req, LookupReadCountsOutput *resp"),
+        "{server}"
+    );
+    let client = file_named(&files, "client.gen.h");
+    assert!(client.contains("LookupReadCountsOutput *resp"), "{client}");
+    let driver = format!(
+        "{}#include <stdio.h>
+int main(void) {{
+    /* [1, {{\"message\": \"boom\"}}] decodes as the error arm and re-encodes the same. */
+    static const uint8_t in[] = {{0x82, 0x01, 0xa1, 0x67, 'm', 'e', 's', 's', 'a', 'g', 'e', 0x64, 'b', 'o', 'o', 'm'}};
+    LookupReadCountsOutput out;
+    CsilCodecArena *owner = NULL;
+    if (csil_decode_LookupReadCountsOutput(in, sizeof in, &out, &owner)) return 1;
+    if (out.tag != LOOKUP_READ_COUNTS_OUTPUT_ERR) return 2;
+    uint8_t *enc = NULL;
+    size_t n = 0;
+    if (csil_encode_LookupReadCountsOutput(&out, &enc, &n) || n != sizeof in || memcmp(enc, in, n)) return 3;
+    free(enc);
+    csil_codec_arena_free(owner);
+    printf(\"ok\\n\");
+    return 0;
+}}
+",
+        includes(&files)
+    );
+    if let Some(out) = compile_and_run(&files, &driver, "t2") {
+        assert_eq!(out, "ok\n");
+    }
+}
+
+/// Two services with one C identifier: the later one is renamed, and both wire
+/// strings stay as declared.
+#[test]
+fn clashing_services_keep_their_wire_names() {
+    let rules = vec![
+        record_typedef("A", vec![bare_entry("x", builtin("int"))]),
+        service_rule(
+            "UserSvc",
+            vec![unary("get", reference("A"), reference("A"))],
+            None,
+        ),
+        service_rule(
+            "user-svc",
+            vec![unary("put", reference("A"), reference("A"))],
+            None,
+        ),
+    ];
+    let (files, warnings) = generate_both(rules);
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert!(warnings[0].message.starts_with("service `user-svc`"));
+    let client = file_named(&files, "client.gen.h");
+    assert!(
+        client.contains("t->call(t->self, \"UserSvc\", \"get\""),
+        "{client}"
+    );
+    assert!(
+        client.contains("t->call(t->self, \"user-svc\", \"put\""),
+        "{client}"
+    );
+    assert_eq!(count(&files, "typedef struct UserSvcHandlers {"), 1);
+    let driver = format!("{}int main(void) {{ return 0; }}\n", includes(&files));
+    compile_and_run(&files, &driver, "t3");
+}
+
+/// The hoister names the inline choice of `Rec.nl` `Rec_nl`, whose tag enum is
+/// `Rec_nlTag`, the name of a user rule. The synthesized rule is renamed, not the
+/// user's rule.
+#[test]
+fn synthesized_name_that_clashes_is_renamed_instead_of_the_user_rule() {
+    let rules = vec![
+        record_typedef(
+            "Rec",
+            vec![bare_entry(
+                "nl",
+                CsilTypeExpression::Choice(vec![
+                    CsilTypeExpression::Literal(CsilLiteralValue::Text("a".to_string())),
+                    builtin("int"),
+                ]),
+            )],
+        ),
+        record_typedef("Rec_nlTag", vec![bare_entry("x", builtin("int"))]),
+    ];
+    let (files, warnings) = generate_both(rules);
+    let renamed: Vec<&str> = warnings
+        .iter()
+        .filter_map(|w| w.location.as_ref()?.context.as_deref())
+        .collect();
+    assert_eq!(renamed, vec!["Rec_nl"], "{warnings:?}");
+    assert_eq!(count(&files, "} Rec_nlTag;"), 1);
+    assert_eq!(count(&files, "} Rec_nlTypeTag;"), 1);
+    let driver = format!("{}int main(void) {{ return 0; }}\n", includes(&files));
+    compile_and_run(&files, &driver, "t4");
+}
+
+/// A dynamic map encodes in canonical key order and decodes only in that order; a
+/// record accepts any field order but no key twice.
+#[test]
+fn dynamic_maps_are_canonical_and_records_reject_duplicate_keys() {
+    let labels = CsilTypeExpression::Map {
+        key: Box::new(builtin("int")),
+        value: Box::new(builtin("text")),
+        occurrence: None,
+    };
+    let rules = vec![
+        alias_rule("Counts", text_map()),
+        record_typedef(
+            "Holder",
+            vec![
+                bare_entry("counts", reference("Counts")),
+                bare_entry("labels", labels),
+                bare_entry(
+                    "nested",
+                    CsilTypeExpression::Array {
+                        element_type: Box::new(text_map()),
+                        occurrence: None,
+                    },
+                ),
+            ],
+        ),
+    ];
+    let (files, warnings) = generate_both(rules);
+    assert!(warnings.is_empty(), "{warnings:?}");
+    let driver = format!(
+        "{}#include <stdio.h>
+static int decodes(const uint8_t *in, size_t n) {{
+    Holder h;
+    CsilCodecArena *owner = NULL;
+    int rc = csil_decode_Holder(in, n, &h, &owner);
+    if (!rc) csil_codec_arena_free(owner);
+    return rc == 0;
+}}
+#define CHECK(want, ...) do {{ static const uint8_t in[] = {{__VA_ARGS__}}; \\
+    if (decodes(in, sizeof in) != (want)) {{ printf(\"line %d\\n\", __LINE__); return 1; }} }} while (0)
+int main(void) {{
+    /* counts {{\"b\": 1, \"aa\": 2}}, labels {{1, 10, -1}}, nested [{{\"b\": 1, \"aa\": 2}}] */
+    CHECK(1, 0xa3, 0x66, 'c','o','u','n','t','s', 0xa2, 0x61,'b', 1, 0x62,'a','a', 2,
+          0x66, 'l','a','b','e','l','s', 0xa3, 0x01, 0x60, 0x0a, 0x60, 0x20, 0x60,
+          0x66, 'n','e','s','t','e','d', 0x81, 0xa2, 0x61,'b', 1, 0x62,'a','a', 2);
+    /* counts in string order */
+    CHECK(0, 0xa3, 0x66, 'c','o','u','n','t','s', 0xa2, 0x62,'a','a', 2, 0x61,'b', 1,
+          0x66, 'l','a','b','e','l','s', 0xa0, 0x66, 'n','e','s','t','e','d', 0x80);
+    /* labels in number order */
+    CHECK(0, 0xa3, 0x66, 'c','o','u','n','t','s', 0xa0,
+          0x66, 'l','a','b','e','l','s', 0xa2, 0x20, 0x60, 0x01, 0x60, 0x66, 'n','e','s','t','e','d', 0x80);
+    /* a nested map with a repeated key */
+    CHECK(0, 0xa3, 0x66, 'c','o','u','n','t','s', 0xa0, 0x66, 'l','a','b','e','l','s', 0xa0,
+          0x66, 'n','e','s','t','e','d', 0x81, 0xa2, 0x61,'a', 1, 0x61,'a', 2);
+    /* record fields in another order */
+    CHECK(1, 0xa3, 0x66, 'n','e','s','t','e','d', 0x80, 0x66, 'l','a','b','e','l','s', 0xa0,
+          0x66, 'c','o','u','n','t','s', 0xa0);
+    /* a record key twice */
+    CHECK(0, 0xa4, 0x66, 'n','e','s','t','e','d', 0x80, 0x66, 'l','a','b','e','l','s', 0xa0,
+          0x66, 'c','o','u','n','t','s', 0xa0, 0x66, 'c','o','u','n','t','s', 0xa0);
+    /* The encoder sorts entries it holds in another order. */
+    char *keys[] = {{\"aa\", \"b\"}};
+    int64_t values[] = {{2, 1}};
+    Counts c = {{keys, values, 2}};
+    uint8_t *enc = NULL;
+    size_t n = 0;
+    static const uint8_t want[] = {{0xa2, 0x61, 'b', 1, 0x62, 'a', 'a', 2}};
+    if (csil_encode_Counts(&c, &enc, &n) || n != sizeof want || memcmp(enc, want, n)) return 2;
+    free(enc);
+    printf(\"ok\\n\");
+    return 0;
+}}
+",
+        includes(&files)
+    );
+    if let Some(out) = compile_and_run(&files, &driver, "t5") {
+        assert_eq!(out, "ok\n");
+    }
+}
+
+/// A map key, in a dynamic map or a record, must use the shortest head for its
+/// value or length; otherwise one key has two byte forms.
+#[test]
+fn map_keys_in_a_longer_head_are_rejected() {
+    let labels = CsilTypeExpression::Map {
+        key: Box::new(builtin("int")),
+        value: Box::new(builtin("text")),
+        occurrence: None,
+    };
+    let rules = vec![record_typedef(
+        "Holder",
+        vec![
+            bare_entry("counts", text_map()),
+            bare_entry("labels", labels),
+        ],
+    )];
+    let (files, warnings) = generate_both(rules);
+    assert!(warnings.is_empty(), "{warnings:?}");
+    let driver = format!(
+        "{}#include <stdio.h>
+static int decodes(const uint8_t *in, size_t n) {{
+    Holder h;
+    CsilCodecArena *owner = NULL;
+    int rc = csil_decode_Holder(in, n, &h, &owner);
+    if (!rc) csil_codec_arena_free(owner);
+    return rc == 0;
+}}
+#define CHECK(want, ...) do {{ static const uint8_t in[] = {{__VA_ARGS__}}; \\
+    if (decodes(in, sizeof in) != (want)) {{ printf(\"line %d\\n\", __LINE__); return 1; }} }} while (0)
+int main(void) {{
+    /* counts {{\"a\": 1}}, labels {{1: \"\"}} in shortest form */
+    CHECK(1, 0xa2, 0x66, 'c','o','u','n','t','s', 0xa1, 0x61, 'a', 1,
+          0x66, 'l','a','b','e','l','s', 0xa1, 0x01, 0x60);
+    /* text key \"a\" as 78 01 61 */
+    CHECK(0, 0xa2, 0x66, 'c','o','u','n','t','s', 0xa1, 0x78, 0x01, 'a', 1,
+          0x66, 'l','a','b','e','l','s', 0xa1, 0x01, 0x60);
+    /* int key 1 as 18 01 */
+    CHECK(0, 0xa2, 0x66, 'c','o','u','n','t','s', 0xa1, 0x61, 'a', 1,
+          0x66, 'l','a','b','e','l','s', 0xa1, 0x18, 0x01, 0x60);
+    /* int key 1 as 19 00 01 */
+    CHECK(0, 0xa2, 0x66, 'c','o','u','n','t','s', 0xa1, 0x61, 'a', 1,
+          0x66, 'l','a','b','e','l','s', 0xa1, 0x19, 0x00, 0x01, 0x60);
+    /* record key \"counts\" as 78 06 ... */
+    CHECK(0, 0xa2, 0x78, 0x06, 'c','o','u','n','t','s', 0xa0, 0x66, 'l','a','b','e','l','s', 0xa0);
+    /* An int key that needs one extra byte is shortest as 18 18. */
+    CHECK(1, 0xa2, 0x66, 'c','o','u','n','t','s', 0xa0,
+          0x66, 'l','a','b','e','l','s', 0xa1, 0x18, 0x18, 0x60);
+    printf(\"ok\\n\");
+    return 0;
+}}
+",
+        includes(&files)
+    );
+    if let Some(out) = compile_and_run(&files, &driver, "t5-short") {
+        assert_eq!(out, "ok\n");
+    }
+}
+
+/// An operation named after a C keyword gets an escaped handler member, and a
+/// tuple-alias boundary stub compiles without unused-parameter warnings.
+#[test]
+fn keyword_op_and_tuple_alias_boundary_compile() {
+    let pair = CsilTypeExpression::Tuple(CsilGroupExpression {
+        entries: vec![
+            bare_entry("tag", builtin("text")),
+            bare_entry("value", builtin("int")),
+        ],
+    });
+    let rules = vec![
+        alias_rule("Pair", pair),
+        record_typedef("A", vec![bare_entry("x", builtin("int"))]),
+        service_rule(
+            "Svc",
+            vec![
+                unary("register", reference("A"), reference("A")),
+                unary("pair", reference("Pair"), reference("A")),
+                op(
+                    "default",
+                    reference("A"),
+                    reference("A"),
+                    CsilServiceDirection::Bidirectional,
+                    Some(1),
+                ),
+            ],
+            Some(1),
+        ),
+    ];
+    let (files, _) = generate_both(rules);
+    let server = file_named(&files, "server.gen.h");
+    assert!(server.contains("int (*register_)(void *ctx"), "{server}");
+    assert!(server.contains("return h->default_(ctx, msg);"), "{server}");
+    let driver = format!("{}int main(void) {{ return 0; }}\n", includes(&files));
+    compile_and_run(&files, &driver, "keyword-op");
+}
+
+/// Text enum values that are not identifiers (a dot, a hyphen and space, a leading
+/// digit, a keyword) get legal enumerators, and each one round-trips through the
+/// codec with its value as written on the wire.
+#[test]
+fn dotted_text_enum_values_get_legal_enumerators() {
+    let text = |s: &str| CsilTypeExpression::Literal(CsilLiteralValue::Text(s.to_string()));
+    let rules = vec![
+        alias_rule(
+            "Scope",
+            CsilTypeExpression::Choice(vec![
+                text("calendars.read"),
+                text("events.write"),
+                text("a-b c"),
+                text("2fa"),
+                text("class"),
+                text("inProgress"),
+            ]),
+        ),
+        record_typedef(
+            "Grant",
+            vec![bare_entry(
+                "scope",
+                CsilTypeExpression::Reference("Scope".into()),
+            )],
+        ),
+    ];
+    let (files, warnings) = generate_both(rules);
+    assert!(warnings.is_empty(), "{warnings:?}");
+    let types = files
+        .iter()
+        .find(|f| f.path.ends_with("types.gen.h"))
+        .map(|f| f.content.clone())
+        .unwrap_or_default();
+    for member in [
+        "SCOPE_CALENDARS_READ,",
+        "SCOPE_EVENTS_WRITE,",
+        "SCOPE_A_B_C,",
+        "SCOPE_2FA,",
+        "SCOPE_CLASS,",
+        "SCOPE_IN_PROGRESS,",
+    ] {
+        assert!(types.contains(member), "{member}\n{types}");
+    }
+    let driver = format!(
+        "{}#include <stdio.h>
+static int round_trip(Scope s, const char *wire) {{
+    Grant g = {{ .scope = s }};
+    uint8_t *buf = NULL;
+    size_t len = 0;
+    if (csil_encode_Grant(&g, &buf, &len)) return 0;
+    size_t n = strlen(wire);
+    int found = 0;
+    for (size_t i = 0; i + n <= len; i++) if (memcmp(buf + i, wire, n) == 0) found = 1;
+    Grant back;
+    CsilCodecArena *owner = NULL;
+    int rc = csil_decode_Grant(buf, len, &back, &owner);
+    free(buf);
+    if (rc) return 0;
+    csil_codec_arena_free(owner);
+    return found && back.scope == s;
+}}
+int main(void) {{
+    if (!round_trip(SCOPE_CALENDARS_READ, \"calendars.read\")) return 1;
+    if (!round_trip(SCOPE_EVENTS_WRITE, \"events.write\")) return 2;
+    if (!round_trip(SCOPE_A_B_C, \"a-b c\")) return 3;
+    if (!round_trip(SCOPE_2FA, \"2fa\")) return 4;
+    if (!round_trip(SCOPE_CLASS, \"class\")) return 5;
+    if (!round_trip(SCOPE_IN_PROGRESS, \"inProgress\")) return 6;
+    printf(\"ok\\n\");
+    return 0;
+}}
+",
+        includes(&files)
+    );
+    if let Some(out) = compile_and_run(&files, &driver, "dotted-enum") {
+        assert_eq!(out, "ok\n");
+    }
 }

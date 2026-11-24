@@ -80,6 +80,11 @@ fn hoist(spec: &CsilSpecSerialized, options: Option<HoistOptions>) -> CsilSpecSe
         // regression test).
         used: spec.rules.iter().map(|r| canonical_key(&r.name)).collect(),
         options,
+        owner_position: CsilPosition {
+            line: 0,
+            column: 0,
+            offset: 0,
+        },
     };
     let mut rules: Vec<CsilRule> = spec.rules.iter().map(|r| hoister.rewrite_rule(r)).collect();
     rules.extend(hoister.synth);
@@ -168,10 +173,14 @@ struct Hoister {
     synth: Vec<CsilRule>,
     used: HashSet<String>,
     options: Option<HoistOptions>,
+    // A synthesized rule takes the position of the rule it came from, so a rename
+    // warning for it points at real source.
+    owner_position: CsilPosition,
 }
 
 impl Hoister {
     fn rewrite_rule(&mut self, rule: &CsilRule) -> CsilRule {
+        self.owner_position = rule.position.clone();
         let rule_type = match &rule.rule_type {
             CsilRuleType::GroupDef(g) => CsilRuleType::GroupDef(self.rewrite_group(g, &rule.name)),
             CsilRuleType::TypeDef(CsilTypeExpression::Group(g)) => {
@@ -324,11 +333,7 @@ impl Hoister {
         self.synth.push(CsilRule {
             name: name.to_string(),
             rule_type,
-            position: CsilPosition {
-                line: 0,
-                column: 0,
-                offset: 0,
-            },
+            position: self.owner_position.clone(),
             doc_comments: Vec::new(),
         });
     }

@@ -122,13 +122,14 @@ ranged = [1*10 person]      ;; 1 to 10 persons
 status = "active" / "inactive" / "pending"
 result = int / text / bool
 
-;; Type augmentation
-base_user = {
+;; Group choice: `//=` adds another record shape (an alternative, not more
+;; fields). See "Group Choice Extension (`//=`)".
+contact = {
     id: int,
     name: text
 }
 
-base_user //= {
+contact //= {
     email: text
 }
 
@@ -371,9 +372,53 @@ Status /= "approved" / "rejected"
 ;; ...is equivalent to: Status = "pending" / "approved" / "rejected"
 ```
 
-A genuine collision — two real `=` (or `//=`/`service`) definitions sharing a
-name — is **not** an extension; it is a hard `DuplicateRule` validation error.
-Only `/=` rules merge; repeating `=` never does.
+A genuine collision — two real `=` (or `service`) definitions sharing a name —
+is **not** an extension; it is a hard `DuplicateRule` validation error. Only
+`/=` and `//=` rules merge; repeating `=` never does. This also applies when the
+two definitions are in one included file.
+
+#### Group Choice Extension (`//=`)
+
+`//=` follows CDDL (RFC 8610 §3.8): it adds another **group** (record shape) as an
+alternative. It does not add fields to the existing record.
+
+```csil
+Contact = { id: int, name: text }
+Contact //= { id: int }
+Contact //= { email: text } // { phone: text }
+;; ...is equivalent to:
+;; Contact = { id: int, name: text } // { id: int } // { email: text } // { phone: text }
+```
+
+The result is a union of records. Its base must be a record or a union of records.
+A `//=` on a scalar type or a service is a `DuplicateRule` error. A `//=` with no
+`=` base becomes the base itself, as for `/=`.
+
+**Arm order.** The order of the arms is part of the wire contract, because each
+arm's union `variant_index` is its place in this order (see
+[`cbor-wire-contract.md`](cbor-wire-contract.md), "Choices"):
+
+1. The base (`=`) rule is always arm 0.
+2. Then the `//=` arms of the file that includes, in their order in that file.
+3. Then the `//=` arms of each included file, in `include` order. The resolver
+   puts the rules of an included file after the rules of the file that includes it.
+
+An encoder that must select the arm for a plain value that does not carry its
+arm (for example a TypeScript object) uses the first arm in this order whose
+required fields are all present. The test
+`test_group_choice_extension_across_include_merges_in_declaration_order` and the
+`tests/interop/wire-vectors` fixture check this order in every language.
+
+**Recommendation: do not use `//=`.** The order of arms then depends on which
+file declares an arm and on the order of `include` lines. If you move an arm,
+add an arm before another arm, or change an include, the variant index of the
+other arms changes, and peers that were generated from the old schema read the
+wrong arm. Also, an encoder that selects the first arm that fits can use an earlier
+arm for a value that you meant for a later arm, when the earlier arm has fewer
+required fields. Use one record with a kind field, or named records as the arms
+of an operation output (`op: Req -> Created / Rejected`), where the reply variant
+selects the arm by name. Lint rule `lint_record_unions` warns about each union of
+inline records.
 
 ## Control Operators
 
@@ -631,6 +676,41 @@ service UserService {
 }
 ```
 
+When every arm of a unary output is a rule name or a built-in type, as above, the
+RPC reply carries a `variant` with the name of the chosen arm, and the client
+selects the arm from it (see [`csil-rpc-transport.md`](csil-rpc-transport.md)).
+
+#### Inline arms make one union value
+
+An operation input or output with an inline arm has no reply variants:
+
+```csil
+service Lookup {
+    read-counts: Holder -> { * text => int } / Err,
+}
+```
+
+The variant names the chosen arm by its rule name, and an inline arm has no rule
+name. So every generator treats such a boundary exactly like a named union:
+`read-counts` behaves as if the schema had `LookupReadCountsOutput = { * text => int }
+/ Err` and `read-counts: Holder -> LookupReadCountsOutput`. The generated type is
+`<Service><Op>Output` (or `<Service><Op>Input`), and the generator adds a digit when
+that name is taken. The payload is the union encoding `[variant_index, value]`.
+
+It must be so for two reasons:
+
+- **One wire form in every language.** Before, Rust exposed the whole union, but C
+  and Zig kept only the first arm, so an `Err` reply from a Rust server could not
+  be received in C. A named union already has one wire form and one
+  implementation in all 14 languages.
+- **No invented variant names.** Another possible design gives the inline arm an
+  invented rule name, so that the reply has variants. But then a name that is not
+  in the schema goes on the wire, and it changes if the generator changes how it
+  makes names.
+
+Lint rule `lint_union_boundaries` warns about such boundaries. To get
+reply-variant dispatch, give each arm a rule name.
+
 ### Complex Service Example
 
 ```csil
@@ -847,6 +927,8 @@ status 1 for a warning or an error.
 | `lint_empty_service` | warn | A service has no operations. |
 | `lint_nesting_depth` | warn | A type exceeds five levels of nesting. |
 | `lint_name_collisions` | warn | Two rule names differ only in case, `_` or `-`, such as `Value` and `value`. Generators rename the later rule to `<Name>Type` where both names become one identifier. |
+| `lint_record_unions` | warn | A rule is a union of two or more inline records (from `//=` or `//`). The variant index of each arm depends on declaration order across files. |
+| `lint_union_boundaries` | warn | An operation input or output is a choice with an inline arm, such as `Ev -> {* text => int} / Err`. The reply has no variant. Name each arm to get reply-variant dispatch. |
 
 ## Code Generation
 

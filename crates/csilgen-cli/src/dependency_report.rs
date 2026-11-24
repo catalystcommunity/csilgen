@@ -8,10 +8,10 @@ pub fn report_dependency_strategy(graph: &FileDependencyGraph, entry_points: &[P
     let dependency_files = graph.get_dependency_files();
 
     if !dependency_files.is_empty() {
-        println!("📊 Dependency analysis completed:");
-        println!("   Entry points: {} files", entry_points.len());
-        println!("   Dependencies: {} files", dependency_files.len());
-        println!("   Generating code from entry points only to avoid duplicates.\n");
+        crate::outln!("📊 Dependency analysis completed:");
+        crate::outln!("   Entry points: {} files", entry_points.len());
+        crate::outln!("   Dependencies: {} files", dependency_files.len());
+        crate::outln!("   Generating code from entry points only to avoid duplicates.\n");
 
         if std::env::var("CSIL_VERBOSE").is_ok() {
             print_detailed_analysis(graph, entry_points);
@@ -21,18 +21,18 @@ pub fn report_dependency_strategy(graph: &FileDependencyGraph, entry_points: &[P
 
 /// Print detailed dependency analysis information
 fn print_detailed_analysis(graph: &FileDependencyGraph, entry_points: &[PathBuf]) {
-    println!("Entry Points:");
+    crate::outln!("Entry Points:");
     for entry in entry_points {
-        println!("  📄 {}", format_file_name(entry));
+        crate::outln!("  📄 {}", format_file_name(entry));
         print_dependency_tree(graph, entry, 1);
     }
 
     let dependencies = graph.get_dependency_files();
     if !dependencies.is_empty() {
-        println!("\nDependency Files:");
+        crate::outln!("\nDependency Files:");
         for dep in dependencies {
             let importers = graph.get_reverse_dependencies(&dep);
-            println!(
+            crate::outln!(
                 "  📦 {} (imported by: {})",
                 format_file_name(&dep),
                 importers
@@ -44,7 +44,7 @@ fn print_detailed_analysis(graph: &FileDependencyGraph, entry_points: &[PathBuf]
         }
     }
 
-    println!();
+    crate::outln!();
 }
 
 /// Print a hierarchical dependency tree for a file
@@ -54,7 +54,7 @@ fn print_dependency_tree(graph: &FileDependencyGraph, file: &Path, depth: usize)
         let is_last = i == deps.len() - 1;
         let prefix = if is_last { "└─" } else { "├─" };
 
-        println!(
+        crate::outln!(
             "{}{}📦 {}",
             "  ".repeat(depth),
             prefix,
@@ -119,25 +119,25 @@ pub fn report_generation_summary(
     dependency_files: &[PathBuf],
 ) {
     if dependency_files.is_empty() {
-        println!("🔄 Processing {total_files} independent CSIL files");
+        crate::outln!("🔄 Processing {total_files} independent CSIL files");
     } else {
-        println!(
+        crate::outln!(
             "🔄 Processing {} entry points from {total_files} total files:",
             entry_points.len()
         );
 
         for entry in entry_points {
-            println!("   📄 {}", format_file_name(entry));
+            crate::outln!("   📄 {}", format_file_name(entry));
         }
 
         if !dependency_files.is_empty() {
-            println!(
+            crate::outln!(
                 "   (Skipping {} dependency files to avoid duplicates)",
                 dependency_files.len()
             );
         }
     }
-    println!();
+    crate::outln!();
 }
 
 #[cfg(test)]

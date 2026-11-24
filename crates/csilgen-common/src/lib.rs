@@ -3,6 +3,8 @@
 pub mod choice;
 pub mod error;
 pub mod hoist;
+pub mod member_names;
+pub mod op_union;
 pub mod packaging;
 pub mod rename;
 pub mod splice;
@@ -17,6 +19,8 @@ pub mod testing;
 pub use choice::*;
 pub use error::*;
 pub use hoist::*;
+pub use member_names::*;
+pub use op_union::*;
 pub use packaging::*;
 pub use rename::*;
 pub use splice::*;
