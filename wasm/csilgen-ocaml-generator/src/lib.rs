@@ -89,8 +89,13 @@ fn process_generation(input_ptr: *const u8, input_len: usize) -> Result<WasmGene
     let input: WasmGeneratorInput =
         serde_json::from_str(input_str).map_err(|_| error_codes::SERIALIZATION_ERROR)?;
 
-    let files = generate_ocaml(&input.csil_spec, &input.config)
-        .map_err(|_| error_codes::GENERATION_ERROR)?;
+    generate_output(&input)
+}
+
+fn generate_output(input: &WasmGeneratorInput) -> Result<WasmGeneratorOutput, i32> {
+    let renamed = rename_for_ocaml(&input.csil_spec);
+    let files =
+        generate_renamed(&renamed, &input.config).map_err(|_| error_codes::GENERATION_ERROR)?;
 
     let stats = GenerationStats {
         files_generated: files.len(),
@@ -102,7 +107,7 @@ fn process_generation(input_ptr: *const u8, input_len: usize) -> Result<WasmGene
     };
     Ok(WasmGeneratorOutput {
         files,
-        warnings: Vec::new(),
+        warnings: csilgen_common::rename_warnings(&renamed, &input.config.target),
         stats,
     })
 }
@@ -150,7 +155,51 @@ const RESERVED_TYPE_NAMES: &[&str] = &[
     "decode",
 ];
 
+/// Value names the codec derives from other rules: the `_bytes` wrappers of every
+/// type and the per-RPC-op request/success/reply helpers. A rule whose own
+/// `encode_`/`decode_` functions take one of those names breaks the build (`_bytes`
+/// wrappers) or is silently shadowed in `Codec` by the op helper defined after it.
+/// `<Arm>_refusal` is not here: exceptions live in `Codec` and choice constructors
+/// in `Types`, so the two never meet.
+fn derived_value_names(spec: &CsilSpecSerialized) -> std::collections::HashSet<String> {
+    let mut derived = std::collections::HashSet::new();
+    for rule in &spec.rules {
+        if !matches!(rule.rule_type, CsilRuleType::ServiceDef(_)) {
+            derived.insert(format!("{}_bytes", ocaml_type_name(&rule.name)));
+        }
+    }
+    for (service, op, _) in spec.rpc_operations() {
+        let stem = ocaml_ident(&format!("{service}_{}", op.name));
+        for suffix in ["request", "success", "reply"] {
+            derived.insert(format!("{stem}_{suffix}"));
+        }
+    }
+    derived
+}
+
+/// Renames every rule whose OCaml name is reserved, derived from another rule, or
+/// equal to another rule's (`Value` and `value` are both type `value`; error arms
+/// `Foo_bar` and `FooBar` would both be module/tag `Foo_bar`, which is the
+/// capitalized type name, so one comparison covers both).
+fn rename_for_ocaml(spec: &CsilSpecSerialized) -> CsilSpecSerialized {
+    let derived = derived_value_names(spec);
+    let reserved = csilgen_common::rename_reserved(spec, |name| {
+        let ident = ocaml_type_name(name);
+        RESERVED_TYPE_NAMES.contains(&ident.as_str()) || derived.contains(&ident)
+    });
+    csilgen_common::rename_ident_collisions(&reserved, ocaml_type_name)
+}
+
+#[cfg(test)]
 fn generate_ocaml(
+    spec: &CsilSpecSerialized,
+    config: &GeneratorConfig,
+) -> Result<Vec<GeneratedFile>, i32> {
+    generate_renamed(&rename_for_ocaml(spec), config)
+}
+
+/// `spec` must already be through `rename_for_ocaml`.
+fn generate_renamed(
     spec: &CsilSpecSerialized,
     config: &GeneratorConfig,
 ) -> Result<Vec<GeneratedFile>, i32> {
@@ -165,11 +214,8 @@ fn generate_ocaml(
     // because OCaml has no anonymous sum-type field syntax at all — even a closed
     // all-literal choice (`Pending | Shipped | Delivered`) must be a *named* `type`
     // (see the crate's original hoist-pass module doc, preserved in git history).
-    let renamed = csilgen_common::rename_reserved(spec, |name| {
-        RESERVED_TYPE_NAMES.contains(&name.to_case(Case::Snake).as_str())
-    });
     let mut hoisted_spec = csilgen_common::hoist_inline_composites(
-        &renamed,
+        spec,
         csilgen_common::HoistOptions {
             hoist_all_literal_choices: true,
         },

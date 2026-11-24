@@ -3087,3 +3087,98 @@ fn success_type_drops_service_error_by_declared_name() {
         }
     }
 }
+
+/// `Svc.get: Holder -> Holder / <error_arm>` over `Holder = { <field>: <rule> }`
+/// records, one record per name in `records`.
+fn clash_input(records: &[&str], error_arm: &str) -> WasmGeneratorInput {
+    let reply = CsilTypeExpression::Choice(vec![
+        CsilTypeExpression::Reference("Holder".to_string()),
+        CsilTypeExpression::Reference(error_arm.to_string()),
+    ]);
+    let mut input = service_input(
+        "Svc",
+        vec![make_op(
+            "get",
+            "Holder",
+            reply,
+            CsilServiceDirection::Unidirectional,
+            None,
+        )],
+        None,
+        "elixir-client",
+    );
+    let fields = records
+        .iter()
+        .enumerate()
+        .map(|(i, name)| {
+            bare_entry(
+                &format!("f{i}"),
+                CsilTypeExpression::Reference(name.to_string()),
+            )
+        })
+        .collect();
+    let mut rules = vec![group_input("Holder", fields, HashMap::new())];
+    for name in records {
+        let code = CsilTypeExpression::Builtin("uint".to_string());
+        rules.push(group_input(
+            name,
+            vec![bare_entry("code", code)],
+            HashMap::new(),
+        ));
+    }
+    for rule in rules {
+        input.csil_spec.rules.extend(rule.csil_spec.rules);
+    }
+    input
+}
+
+#[test]
+fn rule_named_like_a_derived_module_is_renamed() {
+    let out = process_generation(clash_input(&["Foo", "FooRefusal", "SvcClient"], "Foo")).unwrap();
+    let types = file(&out, "types.gen.ex");
+    assert!(types.contains("defmodule Csilgen.Generated.FooRefusalType do"));
+    assert!(types.contains("defmodule Csilgen.Generated.SvcClientType do"));
+    let codec = file(&out, "codec.gen.ex");
+    assert!(codec.contains("defmodule Csilgen.Generated.FooRefusal do"));
+    assert!(codec.contains("{\"Foo\", encode(Csilgen.Generated.Foo.to_cbor_value(value))}"));
+    assert!(file(&out, "client.gen.ex").contains("defmodule Csilgen.Generated.SvcClient do"));
+}
+
+#[test]
+fn rules_with_the_same_module_or_function_name_are_told_apart() {
+    let out = process_generation(clash_input(
+        &["Value", "value", "UserId", "UserID"],
+        "value",
+    ))
+    .unwrap();
+    let types = file(&out, "types.gen.ex");
+    for module in ["Value", "ValueType", "UserId", "UserIDType"] {
+        assert!(
+            types.contains(&format!("defmodule Csilgen.Generated.{module} do")),
+            "{module}"
+        );
+    }
+    let codec = file(&out, "codec.gen.ex");
+    assert!(
+        codec.contains("{\"value\", encode(Csilgen.Generated.ValueType.to_cbor_value(value))}")
+    );
+    assert!(codec.contains("def resolve_rpc_reply(\"Svc\", \"get\", \"value\", payload) do"));
+    assert!(codec.contains("raise Csilgen.Generated.ValueTypeRefusal, value: value"));
+}
+
+#[test]
+fn renamed_rules_are_reported_as_warnings() {
+    let out = process_generation(clash_input(&["Value", "value", "Cbor"], "value")).unwrap();
+    let messages: Vec<&str> = out.warnings.iter().map(|w| w.message.as_str()).collect();
+    assert_eq!(messages.len(), 2, "{messages:?}");
+    assert!(
+        messages
+            .iter()
+            .any(|m| m.contains("`value` is generated as `valueType` for elixir-client"))
+    );
+    assert!(
+        messages
+            .iter()
+            .any(|m| m.contains("`Cbor` is generated as `CborType` for elixir-client"))
+    );
+}

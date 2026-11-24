@@ -3318,3 +3318,118 @@ fn map_boundaries_compile_and_round_trip_through_gcc() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Rules named like names the headers derive from other rules (`<Union>Tag`,
+/// `<Service><Op>Reply`, `<Record>_validate`), two reply arms with one
+/// snake_case name, and a name that is no C identifier.
+fn rule_clash_rules() -> Vec<CsilRule> {
+    let reference = |name: &str| CsilTypeExpression::Reference(name.to_string());
+    let record = |name: &str| group_rule(name, vec![bare_entry("x", builtin("text"))]);
+    let union = CsilRule {
+        name: "Shape".to_string(),
+        rule_type: CsilRuleType::TypeChoice(vec![reference("Value"), reference("Some-Thing")]),
+        position: pos(),
+        doc_comments: vec![],
+    };
+    vec![
+        record("Value"),
+        record("value"),
+        record("Some-Thing"),
+        union,
+        record("ShapeTag"),
+        record("SvcGetReply"),
+        record("Value_validate"),
+        group_rule(
+            "Holder",
+            vec![
+                bare_entry("s", reference("Shape")),
+                bare_entry("t", reference("ShapeTag")),
+                bare_entry("r", reference("SvcGetReply")),
+                bare_entry("v", reference("Value_validate")),
+                bare_entry("w", reference("value")),
+            ],
+        ),
+        service_rule(
+            "Svc",
+            vec![op(
+                "get",
+                reference("Holder"),
+                CsilTypeExpression::Choice(vec![
+                    reference("Holder"),
+                    reference("Value"),
+                    reference("value"),
+                ]),
+                CsilServiceDirection::Unidirectional,
+                None,
+            )],
+            None,
+        ),
+    ]
+}
+
+#[test]
+fn rule_clashes_are_renamed_warned_and_compile() {
+    let mut options = HashMap::new();
+    options.insert("emit_packages".to_string(), serde_json::json!(["c"]));
+    let out = process_generation(input_with_rules(rule_clash_rules(), "c", options)).unwrap();
+    let all: String = out.files.iter().map(|f| f.content.as_str()).collect();
+    for renamed in [
+        "typedef struct ShapeTagType {",
+        "typedef struct SvcGetReplyType {",
+        "typedef struct Value_validateType {",
+        "typedef struct valueType {",
+        "typedef struct Some_Thing {",
+    ] {
+        assert!(all.contains(renamed), "missing {renamed}:\n{all}");
+    }
+    // Both arms keep their declared names on the wire.
+    assert!(all.contains("*variant = \"Value\";"), "{all}");
+    assert!(all.contains("*variant = \"value\";"), "{all}");
+    assert!(all.contains("strcmp(variant, \"value\") == 0"), "{all}");
+    for declared in [
+        "ShapeTag",
+        "SvcGetReply",
+        "Value_validate",
+        "value",
+        "Some-Thing",
+    ] {
+        assert!(
+            out.warnings.iter().any(|w| w
+                .message
+                .contains(&format!("rule `{declared}` is generated as"))),
+            "no warning for {declared}: {:?}",
+            out.warnings
+        );
+    }
+
+    let cc = ["cc", "gcc", "clang"].into_iter().find(|c| {
+        std::process::Command::new(c)
+            .arg("--version")
+            .output()
+            .is_ok()
+    });
+    let Some(cc) = cc else {
+        eprintln!("skipping compile: no C compiler on PATH");
+        return;
+    };
+    let dir = std::env::temp_dir().join(format!("csilgen-c-clash-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut all_c = String::new();
+    for file in &out.files {
+        std::fs::write(dir.join(&file.path), &file.content).unwrap();
+        if file.path.ends_with(".h") {
+            all_c.push_str(&format!("#include \"{}\"\n", file.path));
+        }
+    }
+    std::fs::write(dir.join("all.c"), all_c).unwrap();
+    let compile = std::process::Command::new(cc)
+        .args(["-std=c11", "-Wall", "-Wextra", "-fsyntax-only"])
+        .arg(dir.join("all.c"))
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&compile.stderr);
+    assert!(compile.status.success(), "compile failed:\n{stderr}");
+    assert!(stderr.is_empty(), "compiler warnings:\n{stderr}");
+    let _ = std::fs::remove_dir_all(&dir);
+}

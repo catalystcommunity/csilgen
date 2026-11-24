@@ -13,12 +13,15 @@ mod package;
 mod server;
 mod types;
 
+use std::collections::HashSet;
+
 #[cfg(test)]
 mod tests;
 
 use csilgen_common::{
-    GeneratedFile, GenerationStats, GeneratorCapability, GeneratorMetadata, GeneratorWarning,
-    WasmGeneratorInput, WasmGeneratorOutput, wasm_interface::*,
+    CsilRuleType, CsilSpecSerialized, GeneratedFile, GenerationStats, GeneratorCapability,
+    GeneratorMetadata, GeneratorWarning, WasmGeneratorInput, WasmGeneratorOutput,
+    wasm_interface::*,
 };
 
 /// Get generator metadata (WASM export)
@@ -123,7 +126,7 @@ fn process_generation(input_ptr: *const u8, input_len: usize) -> Result<WasmGene
     let input: WasmGeneratorInput =
         serde_json::from_str(input_str).map_err(|_| error_codes::SERIALIZATION_ERROR)?;
 
-    let files = generate_files(&input).map_err(|_| error_codes::GENERATION_ERROR)?;
+    let (files, warnings) = generate_output(&input).map_err(|_| error_codes::GENERATION_ERROR)?;
 
     let stats = GenerationStats {
         files_generated: files.len(),
@@ -136,7 +139,7 @@ fn process_generation(input_ptr: *const u8, input_len: usize) -> Result<WasmGene
 
     Ok(WasmGeneratorOutput {
         files,
-        warnings: Vec::<GeneratorWarning>::new(),
+        warnings,
         stats,
     })
 }
@@ -144,10 +147,13 @@ fn process_generation(input_ptr: *const u8, input_len: usize) -> Result<WasmGene
 // A rule whose TypeScript type name equals one of these would shadow a global the
 // generated code uses unqualified (`Map<K, V>`, `Promise`, ...) or collide with a
 // name the generated runtime declares or imports itself, and break the package.
+// Where tsc accepts the clash (`AsyncCodec`), `index.ts` re-exports only the first
+// declaration of a name, so the generated one silently drops out of the package.
 // Such a rule is renamed to `<Name>Type`; its wire name stays the declared name.
 const RESERVED_TYPE_NAMES: &[&str] = &[
     "ApiClient",
     "AsyncApiClient",
+    "AsyncCodec",
     "AsyncServiceTransport",
     "CborTag",
     "CborValue",
@@ -193,6 +199,72 @@ fn service_error_fits_router(spec: &csilgen_common::CsilSpecSerialized) -> bool 
     })
 }
 
+/// The type names the generator builds from other rules: the per-service client,
+/// handler and wire-id names, `<ErrorArm>Refusal`, and `<Enum>Numbers`. A rule
+/// that takes one of them would collide with the declaration made for its owner,
+/// or hide it from the package `index.ts` (which re-exports a name only once).
+fn derived_type_names(spec: &CsilSpecSerialized) -> HashSet<String> {
+    let mut names = HashSet::new();
+    for rule in &spec.rules {
+        match &rule.rule_type {
+            CsilRuleType::ServiceDef(_) => {
+                let base = common::service_base(&rule.name);
+                for suffix in [
+                    "Client",
+                    "AsyncClient",
+                    "Handlers",
+                    "ChannelHandlers",
+                    "AsyncChannelHandlers",
+                    "WireIds",
+                ] {
+                    names.insert(format!("{base}{suffix}"));
+                }
+            }
+            _ if csilgen_common::rule_enum_numbers(rule).is_some() => {
+                names.insert(format!("{}Numbers", common::to_pascal(&rule.name)));
+            }
+            _ => {}
+        }
+    }
+    for (_, _, arms) in spec.rpc_operations() {
+        for arm in &arms[1..] {
+            if let Some(name) = arm.rpc_variant_name() {
+                names.insert(format!("{}Refusal", common::to_pascal(name)));
+            }
+        }
+    }
+    names
+}
+
+/// Rename every rule whose TypeScript type name is reserved, derived from another
+/// rule, or equal to an earlier rule's type name. A rename changes the names
+/// derived from the renamed rule (its `Refusal` class), so it repeats until no
+/// rule moves.
+fn rename_spec(spec: &CsilSpecSerialized, decimal: common::DecimalMapping) -> CsilSpecSerialized {
+    // The library mapping imports `Decimal` from `decimal.js`, so a rule of that
+    // name would clash with it.
+    let library_decimal = matches!(decimal, common::DecimalMapping::Library);
+    let keep_service_error = service_error_fits_router(spec);
+    let mut spec = spec.clone();
+    loop {
+        let before = spec.declared_names.len();
+        let derived = derived_type_names(&spec);
+        spec = csilgen_common::rename_reserved(&spec, |name| {
+            let ident = common::to_pascal(name);
+            if ident == "ServiceError" {
+                return !keep_service_error;
+            }
+            (library_decimal && ident == "Decimal")
+                || RESERVED_TYPE_NAMES.contains(&ident.as_str())
+                || derived.contains(&ident)
+        });
+        spec = csilgen_common::rename_ident_collisions(&spec, common::to_pascal);
+        if spec.declared_names.len() == before {
+            return spec;
+        }
+    }
+}
+
 /// Produce the set of files appropriate for the requested target. The client
 /// and server outputs always travel with the types file they import from.
 ///
@@ -200,12 +272,22 @@ fn service_error_fits_router(spec: &csilgen_common::CsilSpecSerialized) -> bool 
 /// `ts_bidirectional_transport` value) so the wasm boundary surfaces a clean
 /// generation failure instead of silently degrading.
 pub fn generate_files(input: &WasmGeneratorInput) -> Result<Vec<GeneratedFile>, String> {
+    generate_output(input).map(|(files, _)| files)
+}
+
+/// `generate_files`, plus one warning for each rule renamed on the way.
+fn generate_output(
+    input: &WasmGeneratorInput,
+) -> Result<(Vec<GeneratedFile>, Vec<GeneratorWarning>), String> {
     // Validate options *before* deciding which files to emit so a bad option
     // fails the entire run, regardless of which target is requested.
     let _mode = common::bidi_transport(input)?;
     let decimal = common::decimal_mapping(input)?;
     let style = common::client_style(input)?;
     let _import_extension = common::import_extension(input)?;
+
+    let renamed = rename_spec(&input.csil_spec, decimal);
+    let warnings = csilgen_common::rename_warnings(&renamed, &input.config.target);
 
     // Rewrite inline (anonymous) composite field types to synthesized named rules so
     // every emitter sees them as ordinary references and routes them through the
@@ -216,17 +298,6 @@ pub fn generate_files(input: &WasmGeneratorInput) -> Result<Vec<GeneratedFile>, 
     // correct bare-literal enum for it in the field position itself.
     let hoisted = {
         let mut cloned = input.clone();
-        // The library mapping imports `Decimal` from `decimal.js`, so a rule of that
-        // name would clash with it.
-        let library_decimal = matches!(decimal, common::DecimalMapping::Library);
-        let keep_service_error = service_error_fits_router(&input.csil_spec);
-        let renamed = csilgen_common::rename_reserved(&input.csil_spec, |name| {
-            let ident = common::to_pascal(name);
-            if ident == "ServiceError" {
-                return !keep_service_error;
-            }
-            (library_decimal && ident == "Decimal") || RESERVED_TYPE_NAMES.contains(&ident.as_str())
-        });
         cloned.csil_spec = csilgen_common::hoist_inline_composites(
             &renamed,
             csilgen_common::HoistOptions {
@@ -323,5 +394,5 @@ pub fn generate_files(input: &WasmGeneratorInput) -> Result<Vec<GeneratedFile>, 
     // appending a barrel + package.json + tsconfig.json. Default output is unchanged.
     package::augment(input, &mut files);
 
-    Ok(files)
+    Ok((files, warnings))
 }

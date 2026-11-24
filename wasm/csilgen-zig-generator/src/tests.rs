@@ -2989,3 +2989,120 @@ fn null_and_scalar_boundaries_analyze_and_round_trip_through_zig() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Rules named like the reply union and per-op boundary codecs an op derives
+/// (`<Service><Op>Reply`, `<Reply>Request`), two reply arms with one snake_case
+/// name, and a name that is no bare Zig identifier.
+fn rule_clash_rules() -> Vec<CsilRule> {
+    let reference = |name: &str| CsilTypeExpression::Reference(name.to_string());
+    let record = |name: &str| group_rule(name, vec![bare_entry("x", builtin("text"))]);
+    let unary = |name: &str, input: CsilTypeExpression, output: CsilTypeExpression| {
+        op(
+            name,
+            input,
+            output,
+            CsilServiceDirection::Unidirectional,
+            None,
+        )
+    };
+    vec![
+        record("Value"),
+        record("value"),
+        record("Some-Thing"),
+        record("SvcGetReply"),
+        record("SvcEchoReplyRequest"),
+        group_rule(
+            "Holder",
+            vec![
+                bare_entry("a", reference("Value")),
+                bare_entry("b", reference("value")),
+                bare_entry("c", reference("Some-Thing")),
+                bare_entry("d", reference("SvcGetReply")),
+                bare_entry("e", reference("SvcEchoReplyRequest")),
+            ],
+        ),
+        service_rule(
+            "Svc",
+            vec![
+                unary(
+                    "get",
+                    reference("Holder"),
+                    CsilTypeExpression::Choice(vec![
+                        reference("Holder"),
+                        reference("Value"),
+                        reference("value"),
+                    ]),
+                ),
+                unary("echo", builtin("text"), builtin("text")),
+            ],
+            None,
+        ),
+    ]
+}
+
+#[test]
+fn rule_clashes_are_renamed_warned_and_analyze() {
+    let mut options = HashMap::new();
+    options.insert("emit_packages".to_string(), serde_json::json!(["zig"]));
+    let out = process_generation(input_with_rules(rule_clash_rules(), "zig", options)).unwrap();
+    let all: String = out.files.iter().map(|f| f.content.as_str()).collect();
+    for renamed in [
+        "pub const SvcGetReplyType = struct {",
+        "pub const SvcEchoReplyRequestType = struct {",
+        "pub const valueType = struct {",
+        "pub const Some_Thing = struct {",
+        "pub const SvcGetReply = union(enum) {",
+    ] {
+        assert!(all.contains(renamed), "missing {renamed}:\n{all}");
+    }
+    assert!(all.contains(".variant = \"Value\""), "{all}");
+    assert!(all.contains(".variant = \"value\""), "{all}");
+    assert!(all.contains("std.mem.eql(u8, name, \"value\")"), "{all}");
+    for declared in ["SvcGetReply", "SvcEchoReplyRequest", "value", "Some-Thing"] {
+        assert!(
+            out.warnings.iter().any(|w| w
+                .message
+                .contains(&format!("rule `{declared}` is generated as"))),
+            "no warning for {declared}: {:?}",
+            out.warnings
+        );
+    }
+
+    let have_zig = std::process::Command::new("zig")
+        .arg("version")
+        .output()
+        .is_ok();
+    if !have_zig {
+        eprintln!("skipping analysis: no zig on PATH");
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("csilgen-zig-clash-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut root = String::from("const std = @import(\"std\");\ntest {\n");
+    for file in &out.files {
+        std::fs::write(dir.join(&file.path), &file.content).unwrap();
+        if file.path.ends_with(".gen.zig") {
+            root.push_str(&format!(
+                "    std.testing.refAllDeclsRecursive(@import(\"{}\"));\n",
+                file.path
+            ));
+        }
+    }
+    root.push_str("}\n");
+    std::fs::write(dir.join("root.zig"), root).unwrap();
+    let run = std::process::Command::new("zig")
+        .arg("test")
+        .arg(dir.join("root.zig"))
+        .arg("--cache-dir")
+        .arg(dir.join("zig-cache"))
+        .output()
+        .unwrap();
+    assert!(
+        run.status.success(),
+        "zig test failed:\n{}{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

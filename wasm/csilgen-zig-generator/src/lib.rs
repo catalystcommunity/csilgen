@@ -191,13 +191,124 @@ fn zig_reserved_type_name(name: &str) -> bool {
 /// names its synthesized rules against the final names), then every inline
 /// composite hoisted to a named rule.
 fn prepare_spec(spec: &CsilSpecSerialized) -> CsilSpecSerialized {
-    let renamed = csilgen_common::rename_reserved(spec, zig_reserved_type_name);
+    // A type is a bare `pub const <Name>`, so a name that is no bare Zig
+    // identifier (`open-group`) takes `_` for each illegal character first.
+    let renames = csilgen_common::rule_renames(spec, zig_valid_bare, |name| {
+        let fixed: String = name
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+            .collect();
+        if fixed.is_empty() || fixed.starts_with(|c: char| c.is_ascii_digit()) {
+            format!("_{fixed}")
+        } else {
+            fixed
+        }
+    });
+    let legal = csilgen_common::rename_rules(spec, &renames);
+    let derived = derived_names(&legal);
+    let reserved = csilgen_common::rename_reserved(&legal, |name| {
+        zig_reserved_type_name(name) || derived.contains(name)
+    });
+    // A type name is the rule name as written, but a union arm becomes a
+    // snake_case tag and a checked record a `validate_<snake>` function, so two
+    // such rules with one snake_case name (`Value` and `value`) would clash there.
+    let snake_clashes = snake_clashing_rules(&reserved);
+    let renamed = csilgen_common::rename_ident_collisions(&reserved, |name| {
+        if snake_clashes.contains(name) {
+            to_snake(name)
+        } else {
+            name.to_string()
+        }
+    });
     csilgen_common::hoist_inline_composites(
         &renamed,
         csilgen_common::HoistOptions {
             hoist_all_literal_choices: true,
         },
     )
+}
+
+/// The names `types.gen.zig` and `codec.gen.zig` build from services and
+/// operations: each op's reply union `<Service><Op>Reply`, and the per-op
+/// boundary codecs `encode_<Reply>Request`/`encode_<Reply>Response`, whose
+/// `<Reply>Request`/`<Reply>Response` part a rule's own `encode_<Rule>` would
+/// repeat.
+fn derived_names(spec: &CsilSpecSerialized) -> std::collections::HashSet<String> {
+    let mut out = std::collections::HashSet::new();
+    for (service, op) in spec_unary_operations(spec) {
+        let reply = rpc_reply_type(service, &op.name);
+        out.insert(format!("{reply}Request"));
+        out.insert(format!("{reply}Response"));
+        out.insert(reply);
+    }
+    out
+}
+
+fn spec_unary_operations(
+    spec: &CsilSpecSerialized,
+) -> impl Iterator<Item = (&str, &csilgen_common::CsilServiceOperation)> {
+    spec.rules
+        .iter()
+        .filter_map(|rule| match &rule.rule_type {
+            CsilRuleType::ServiceDef(service) => Some((rule.name.as_str(), service)),
+            _ => None,
+        })
+        .flat_map(|(name, service)| {
+            service
+                .operations
+                .iter()
+                .filter(|op| matches!(op.direction, CsilServiceDirection::Unidirectional))
+                .map(move |op| (name, op))
+        })
+}
+
+/// The rule names whose snake_case form is an identifier shared with another
+/// rule: two arms of one union (a type choice or an RPC reply), or two records
+/// that both get a `validate_<snake>` function.
+fn snake_clashing_rules(spec: &CsilSpecSerialized) -> std::collections::HashSet<String> {
+    let references = |arms: &[CsilTypeExpression]| -> Vec<String> {
+        arms.iter()
+            .filter_map(|arm| match arm {
+                CsilTypeExpression::Reference(name) => Some(name.clone()),
+                _ => None,
+            })
+            .collect()
+    };
+    let mut groups: Vec<Vec<String>> = Vec::new();
+    let mut validated = Vec::new();
+    for rule in &spec.rules {
+        match &rule.rule_type {
+            CsilRuleType::TypeChoice(arms) => groups.push(references(arms)),
+            CsilRuleType::ServiceDef(service) => {
+                for op in &service.operations {
+                    if let Some(arms) = op.rpc_reply_arms() {
+                        groups.push(references(arms));
+                    }
+                }
+            }
+            CsilRuleType::GroupDef(group)
+            | CsilRuleType::TypeDef(CsilTypeExpression::Group(group))
+                if group.entries.iter().any(entry_has_check) =>
+            {
+                validated.push(rule.name.clone());
+            }
+            _ => {}
+        }
+    }
+    groups.push(validated);
+    let mut out = std::collections::HashSet::new();
+    for names in groups {
+        let mut seen: HashMap<String, String> = HashMap::new();
+        for name in names {
+            if let Some(first) = seen.insert(to_snake(&name), name.clone())
+                && first != name
+            {
+                out.insert(first);
+                out.insert(name);
+            }
+        }
+    }
+    out
 }
 
 fn process_generation(mut input: WasmGeneratorInput) -> Result<WasmGeneratorOutput, i32> {
@@ -332,6 +443,10 @@ fn process_generation(mut input: WasmGeneratorInput) -> Result<WasmGeneratorOutp
         file.content = format!("{trimmed}\n");
     }
 
+    warnings.extend(csilgen_common::rename_warnings(
+        &input.csil_spec,
+        &input.config.target,
+    ));
     let total_size: usize = files.iter().map(|f| f.content.len()).sum();
     Ok(WasmGeneratorOutput {
         stats: GenerationStats {
@@ -2330,21 +2445,7 @@ fn boundary_has_named_codec(input: &WasmGeneratorInput, ty: &CsilTypeExpression)
 fn unary_operations(
     input: &WasmGeneratorInput,
 ) -> impl Iterator<Item = (&str, &csilgen_common::CsilServiceOperation)> {
-    input
-        .csil_spec
-        .rules
-        .iter()
-        .filter_map(|rule| match &rule.rule_type {
-            CsilRuleType::ServiceDef(service) => Some((rule.name.as_str(), service)),
-            _ => None,
-        })
-        .flat_map(|(name, service)| {
-            service
-                .operations
-                .iter()
-                .filter(|op| matches!(op.direction, CsilServiceDirection::Unidirectional))
-                .map(move |op| (name, op))
-        })
+    spec_unary_operations(&input.csil_spec)
 }
 
 /// Emit `pub fn encode_<name>` for an op boundary value of type `ty`.

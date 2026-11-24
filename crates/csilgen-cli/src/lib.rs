@@ -72,6 +72,32 @@ fn parse_csil_with_imports(path: &Path) -> Result<CsilSpec, Box<dyn std::error::
 }
 
 /// Generate code from CSIL files using the specified target generator
+/// Print a generator's warnings on stderr. They go to stderr even in quiet mode,
+/// because a warning such as a renamed type changes the code the user gets.
+fn report_generator_warnings(
+    target: &str,
+    input_file: &std::path::Path,
+    warnings: &[csilgen_common::GeneratorWarning],
+) {
+    for warning in warnings {
+        // The line is in the file that declares the rule, which can be an included
+        // file, so it is not written as `<input>:<line>`.
+        let location = warning
+            .location
+            .as_ref()
+            .map(|l| format!(" (declared at line {})", l.line))
+            .unwrap_or_default();
+        eprintln!(
+            "Warning ({target}): {}: {}{location}",
+            input_file.display(),
+            warning.message
+        );
+        if let Some(suggestion) = &warning.suggestion {
+            eprintln!("  suggestion: {suggestion}");
+        }
+    }
+}
+
 pub fn generate_code(
     input_pattern: &str,
     target: &str,
@@ -246,8 +272,8 @@ fn process_single_file(
         options,
     };
 
-    let generated_files = runtime
-        .execute_generator(&generator_id, &spec, &config)
+    let output = runtime
+        .execute_generator_output(&generator_id, &spec, &config)
         .map_err(|e| {
             format!(
                 "Failed to execute {} generator for {}: {}",
@@ -256,6 +282,8 @@ fn process_single_file(
                 e
             )
         })?;
+    report_generator_warnings(target, input_file, &output.warnings);
+    let generated_files = output.files;
 
     if emit_schema {
         reject_generator_schema_collision(
@@ -433,8 +461,12 @@ fn process_entry_points(
             options,
         };
 
-        let generated_files = match runtime.execute_generator(&generator_id, &spec, &config) {
-            Ok(files) => files,
+        let generated_files = match runtime.execute_generator_output(&generator_id, &spec, &config)
+        {
+            Ok(output) => {
+                report_generator_warnings(target, input_file, &output.warnings);
+                output.files
+            }
             Err(e) => {
                 let detailed_error = format!(
                     "Failed to execute {} generator for {}: {}",

@@ -10,8 +10,8 @@ use csilgen_common::{
     ChoiceClass, CsilControlOperator, CsilGroupEntry, CsilGroupExpression, CsilGroupKey,
     CsilLiteralValue, CsilOccurrence, CsilRuleType, CsilServiceDefinition, CsilServiceDirection,
     CsilServiceOperation, CsilSizeConstraint, CsilTypeExpression, CsilValidationConstraint,
-    GeneratedFile, GenerationStats, GeneratorCapability, GeneratorMetadata, WasmGeneratorInput,
-    WasmGeneratorOutput, wasm_interface::*,
+    GeneratedFile, GenerationStats, GeneratorCapability, GeneratorMetadata, GeneratorWarning,
+    WasmGeneratorInput, WasmGeneratorOutput, wasm_interface::*,
 };
 
 // ---------------------------------------------------------------------------
@@ -90,7 +90,8 @@ fn process_generation(input_ptr: *const u8, input_len: usize) -> Result<WasmGene
     let input: WasmGeneratorInput =
         serde_json::from_str(input_str).map_err(|_| error_codes::SERIALIZATION_ERROR)?;
 
-    let files = generate_java(&input).map_err(|_| error_codes::GENERATION_ERROR)?;
+    let (files, warnings) =
+        generate_java_with_warnings(&input).map_err(|_| error_codes::GENERATION_ERROR)?;
 
     let stats = GenerationStats {
         files_generated: files.len(),
@@ -102,7 +103,7 @@ fn process_generation(input_ptr: *const u8, input_len: usize) -> Result<WasmGene
     };
     Ok(WasmGeneratorOutput {
         files,
-        warnings: Vec::new(),
+        warnings,
         stats,
     })
 }
@@ -1084,32 +1085,87 @@ const RESERVED_TYPE_NAMES: &[&str] = &[
     "Throwable",
 ];
 
-/// The per-service classes the generator names after a service, which a rule of the same
-/// PascalCase name would overwrite just like a fixed one.
-fn service_class_names(spec: &csilgen_common::CsilSpecSerialized) -> Vec<String> {
-    spec.rules
+/// Inline composites are hoisted with these options both for generation and for working
+/// out the derived names, so the two see the same rules.
+const HOIST_OPTIONS: csilgen_common::HoistOptions = csilgen_common::HoistOptions {
+    hoist_all_literal_choices: false,
+};
+
+/// The classes and codec helpers the generator names after another rule, service or
+/// operation. A rule of the same PascalCase name is hidden inside `CsilCbor` by a nested
+/// class, overwrites a service class's file, or has a `decode<Name>(byte[])` helper that
+/// the per-operation codec pair also declares. `spec` must be hoisted already, because
+/// a hoisted rule's derived names are only known after hoisting.
+fn derived_class_names(spec: &csilgen_common::CsilSpecSerialized) -> Vec<String> {
+    let records: std::collections::HashSet<String> = spec
+        .rules
         .iter()
-        .filter(|rule| matches!(rule.rule_type, CsilRuleType::ServiceDef(_)))
-        .flat_map(|rule| {
-            [
-                format!("{}Client", service_base(&rule.name)),
-                format!("{}Router", rule.name.to_case(Case::Pascal)),
-            ]
+        .filter(|rule| {
+            matches!(
+                rule.rule_type,
+                CsilRuleType::GroupDef(_) | CsilRuleType::TypeDef(CsilTypeExpression::Group(_))
+            )
         })
-        .collect()
+        .map(|rule| rule.name.to_case(Case::Pascal))
+        .collect();
+    let mut names = Vec::new();
+    for rule in &spec.rules {
+        let CsilRuleType::ServiceDef(service) = &rule.rule_type else {
+            continue;
+        };
+        names.push(format!("{}Client", service_base(&rule.name)));
+        names.push(format!("{}Router", rule.name.to_case(Case::Pascal)));
+        for op in &service.operations {
+            if !matches!(op.direction, CsilServiceDirection::Unidirectional) {
+                continue;
+            }
+            let stem = op_codec_stem(&rule.name, op);
+            if !is_null_input(&op.input_type) && !is_record_ref(&op.input_type, &records) {
+                names.push(format!("{stem}Request"));
+            }
+            if !is_record_ref(&success_type(op.success_output()), &records) {
+                names.push(format!("{stem}Response"));
+            }
+        }
+    }
+    for (_, _, arms) in spec.rpc_operations() {
+        for arm in arms.iter().skip(1) {
+            names.push(format!(
+                "{}Refusal",
+                pascal_op_name(arm.rpc_variant_name().unwrap())
+            ));
+        }
+    }
+    names
 }
 
-fn rename_reserved_types(
-    spec: &csilgen_common::CsilSpecSerialized,
-) -> csilgen_common::CsilSpecSerialized {
-    let service_classes = service_class_names(spec);
-    csilgen_common::rename_reserved(spec, |name| {
+/// The spec as the generator emits it: rules whose class would clash with a fixed name,
+/// a derived name, or another rule's class are renamed, and inline composites are
+/// hoisted. The renames are kept in `declared_names` for the wire and the warnings.
+fn prepare_spec(spec: &csilgen_common::CsilSpecSerialized) -> csilgen_common::CsilSpecSerialized {
+    let derived = derived_class_names(&csilgen_common::hoist_inline_composites(
+        spec,
+        HOIST_OPTIONS,
+    ));
+    let reserved = csilgen_common::rename_reserved(spec, |name| {
         let class = name.to_case(Case::Pascal);
-        RESERVED_TYPE_NAMES.contains(&class.as_str()) || service_classes.contains(&class)
-    })
+        RESERVED_TYPE_NAMES.contains(&class.as_str()) || derived.contains(&class)
+    });
+    let distinct =
+        csilgen_common::rename_ident_collisions(&reserved, |name| name.to_case(Case::Pascal));
+    let mut hoisted = csilgen_common::hoist_inline_composites(&distinct, HOIST_OPTIONS);
+    hoisted.supply_implicit_service_error();
+    hoisted
 }
 
+#[cfg(test)]
 fn generate_java(input: &WasmGeneratorInput) -> Result<Vec<GeneratedFile>, i32> {
+    generate_java_with_warnings(input).map(|(files, _)| files)
+}
+
+fn generate_java_with_warnings(
+    input: &WasmGeneratorInput,
+) -> Result<(Vec<GeneratedFile>, Vec<GeneratorWarning>), i32> {
     let config = JavaConfig::from_input(input)?;
     // Inline group/choice fields have no named rule to hang a Java class and codec on, so
     // synthesize one per inline shape up front (the shared `csilgen_common::hoist` pass);
@@ -1120,16 +1176,10 @@ fn generate_java(input: &WasmGeneratorInput) -> Result<Vec<GeneratedFile>, i32> 
     // nothing to hoist.
     let hoisted = {
         let mut cloned = input.clone();
-        let renamed = rename_reserved_types(&input.csil_spec);
-        cloned.csil_spec = csilgen_common::hoist_inline_composites(
-            &renamed,
-            csilgen_common::HoistOptions {
-                hoist_all_literal_choices: false,
-            },
-        );
-        cloned.csil_spec.supply_implicit_service_error();
+        cloned.csil_spec = prepare_spec(&input.csil_spec);
         cloned
     };
+    let warnings = csilgen_common::rename_warnings(&hoisted.csil_spec, &input.config.target);
     let input = &hoisted;
     let mut files = Vec::new();
 
@@ -1285,7 +1335,7 @@ fn generate_java(input: &WasmGeneratorInput) -> Result<Vec<GeneratedFile>, i32> 
         }
     }
 
-    Ok(files)
+    Ok((files, warnings))
 }
 
 /// Hoist inline FQNs to imports and drop the blank line a per-member emit leaves before
@@ -7452,5 +7502,98 @@ public final class PomCheck {
             "return new RpcReply(\"Transport\", encode(encTransportType(refusal.value)));"
         ));
         assert!(!codec.content.contains("\"TransportType\""));
+    }
+
+    /// A service whose `fetch` op returns `Ok` or the error arm `err`, with every rule a
+    /// one-field record.
+    fn rpc_rules(names: &[&str], err: &str) -> Vec<CsilRule> {
+        let svc = CsilServiceDefinition {
+            operations: vec![op(
+                "fetch",
+                CsilTypeExpression::Reference("Ok".to_string()),
+                CsilTypeExpression::Choice(vec![
+                    CsilTypeExpression::Reference("Ok".to_string()),
+                    CsilTypeExpression::Reference(err.to_string()),
+                ]),
+                CsilServiceDirection::Unidirectional,
+                None,
+            )],
+            wire_id: None,
+        };
+        let mut rules: Vec<CsilRule> = names
+            .iter()
+            .map(|name| {
+                rule(
+                    name,
+                    CsilRuleType::GroupDef(CsilGroupExpression {
+                        entries: vec![bare("code", builtin("uint"), None)],
+                    }),
+                )
+            })
+            .collect();
+        rules.push(rule("Svc", CsilRuleType::ServiceDef(svc)));
+        rules
+    }
+
+    /// `FooRefusal` is the class the codec nests in `CsilCbor` for the error arm `Foo`, so
+    /// a rule of that name would be hidden there; it is renamed, and `Foo` keeps its name
+    /// and its wire variant.
+    #[test]
+    fn rule_named_like_a_derived_refusal_is_renamed() {
+        let files = generate_java(&input_for(
+            rpc_rules(&["Ok", "Foo", "FooRefusal"], "Foo"),
+            "java-client",
+        ))
+        .unwrap();
+        assert!(
+            file(&files, "/FooRefusalType.java")
+                .content
+                .contains("public record FooRefusalType(")
+        );
+        assert!(
+            !paths(&files)
+                .iter()
+                .any(|p| p.ends_with("/FooRefusal.java"))
+        );
+        let codec = file(&files, "CsilCbor.java");
+        assert!(
+            codec
+                .content
+                .contains("public static final class FooRefusal extends RuntimeException")
+        );
+        assert!(codec.content.contains(
+            "if (\"Foo\".equals(variant)) throw new FooRefusal(decFoo(decode(payload)));"
+        ));
+    }
+
+    /// `Value` and `value` are both the Java class `Value`; the later one is renamed, and
+    /// as an error arm it still names itself `value` on the wire. The rename is reported.
+    #[test]
+    fn rules_with_the_same_class_name_are_told_apart_and_reported() {
+        let (files, warnings) = generate_java_with_warnings(&input_for(
+            rpc_rules(&["Ok", "Value", "value"], "value"),
+            "java-client",
+        ))
+        .unwrap();
+        assert!(
+            file(&files, "/Value.java")
+                .content
+                .contains("public record Value(")
+        );
+        assert!(
+            file(&files, "/ValueType.java")
+                .content
+                .contains("public record ValueType(")
+        );
+        let codec = file(&files, "CsilCbor.java");
+        assert!(codec.content.contains(
+            "if (\"value\".equals(variant)) throw new ValueTypeRefusal(decValueType(decode(payload)));"
+        ));
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0]
+                .message
+                .contains("rule `value` is generated as `valueType` for java-client")
+        );
     }
 }

@@ -1090,6 +1090,12 @@ fn reserved_type_name(spec: &csilgen_common::CsilSpecSerialized) -> impl Fn(&str
 fn process_generation(mut input: WasmGeneratorInput) -> Result<WasmGeneratorOutput, i32> {
     input.csil_spec =
         csilgen_common::rename_reserved(&input.csil_spec, reserved_type_name(&input.csil_spec));
+    // A rule is a module (`Value` and `value` are both `<root>.Value`) and also a
+    // snake_case function name (`UserId` and `UserID` are both `new_user_id/0` in
+    // `Constructors`), so both spellings must be unique.
+    input.csil_spec = csilgen_common::rename_ident_collisions(&input.csil_spec, pascal_case);
+    input.csil_spec = csilgen_common::rename_ident_collisions(&input.csil_spec, snake_case);
+    let rename_warnings = csilgen_common::rename_warnings(&input.csil_spec, &input.config.target);
     input.csil_spec = csilgen_common::hoist_inline_named_numbers(&input.csil_spec);
     input.csil_spec.supply_implicit_service_error();
     let config = ElixirConfig::from_options(&input.config.options)?;
@@ -1101,7 +1107,7 @@ fn process_generation(mut input: WasmGeneratorInput) -> Result<WasmGeneratorOutp
     };
 
     let mut files = Vec::new();
-    let mut warnings = Vec::new();
+    let mut warnings = rename_warnings;
 
     if let Some(types) = generate_types(&input, &config, &mut warnings) {
         files.push(GeneratedFile {

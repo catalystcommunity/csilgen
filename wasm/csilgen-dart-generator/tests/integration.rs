@@ -3623,6 +3623,83 @@ fn reserved_error_arm_is_renamed_but_keeps_its_wire_variant() {
     assert!(!types.contains("'MapType'"), "{types}");
 }
 
+/// `multi_arm_rules` with the `sign` error arm renamed to `error`, and extra rules.
+fn rules_with_sign_error(error: &str, extra: Vec<CsilRule>) -> Vec<CsilRule> {
+    let mut rules = multi_arm_rules();
+    rules[2].name = error.to_string();
+    if let CsilRuleType::ServiceDef(def) = &mut rules[3].rule_type {
+        def.operations[0].output_type =
+            CsilTypeExpression::Choice(vec![reference("Resp"), reference(error)]);
+    }
+    rules.splice(0..0, extra);
+    rules
+}
+
+/// `Signer` derives the client class `SignerClient`, so a rule of that name is
+/// renamed; as an error arm it still names itself `SignerClient` on the wire.
+#[test]
+fn rule_taking_a_derived_name_is_renamed_but_keeps_its_wire_variant() {
+    let rules = rules_with_sign_error("SignerClient", vec![]);
+    let files = generate_dart_code(&spec(rules, 1), &config("dart-client")).unwrap();
+    let types = types_file(&files);
+    assert!(types.contains("final class SignerClientType {"), "{types}");
+    assert!(!types.contains("final class SignerClient {"), "{types}");
+    assert!(
+        types.contains("      case 'SignerClient':\n        throw SignerClientTypeRefusal("),
+        "{types}"
+    );
+    assert!(
+        services_file(&files).contains("final class SignerClient {"),
+        "{}",
+        services_file(&files)
+    );
+}
+
+/// `user_id` and `UserId` are both the Dart class `UserId`: the later rule is
+/// renamed, and as an error arm it keeps its declared name on the wire.
+#[test]
+fn rules_with_one_class_name_are_split_but_keep_their_wire_variant() {
+    let rules = rules_with_sign_error(
+        "UserId",
+        vec![record_rule(
+            "user_id",
+            vec![entry("a", builtin("int"), false)],
+        )],
+    );
+    let files = generate_dart_code(&spec(rules, 1), &config("dart")).unwrap();
+    let types = types_file(&files);
+    assert!(types.contains("final class UserId {"), "{types}");
+    assert!(types.contains("final class UserIdType {"), "{types}");
+    assert!(
+        types.contains("  } on UserIdTypeRefusal catch (refusal) {\n    return ('UserId', "),
+        "{types}"
+    );
+    assert!(
+        types.contains("      case 'UserId':\n        throw UserIdTypeRefusal("),
+        "{types}"
+    );
+}
+
+/// The output carries one warning for each renamed rule, so the CLI can tell the
+/// user why a generated class has another name.
+#[test]
+fn renamed_rules_are_reported_as_warnings() {
+    let rules = rules_with_sign_error(
+        "UserId",
+        vec![
+            record_rule("user_id", vec![entry("a", builtin("int"), false)]),
+            record_rule("Map", vec![entry("b", builtin("int"), false)]),
+        ],
+    );
+    let (_, warnings) =
+        csilgen_dart_generator::generate_dart_output(&spec(rules, 1), &config("dart")).unwrap();
+    let mut messages: Vec<&str> = warnings.iter().map(|w| w.message.as_str()).collect();
+    messages.sort_unstable();
+    assert_eq!(messages.len(), 2, "{messages:?}");
+    assert!(messages[0].starts_with("rule `Map` is generated as `MapType` for dart"));
+    assert!(messages[1].starts_with("rule `UserId` is generated as `UserIdType` for dart"));
+}
+
 /// The renamed `CsilDecimalType` must not count as a use of `CsilDecimal`: the
 /// decimal import would be unused.
 #[test]

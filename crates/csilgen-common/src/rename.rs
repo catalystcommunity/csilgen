@@ -9,7 +9,7 @@
 
 use crate::{
     CsilGroupEntry, CsilGroupExpression, CsilGroupKey, CsilRule, CsilRuleType, CsilSpecSerialized,
-    CsilTypeExpression,
+    CsilTypeExpression, GeneratorWarning, SourceLocation, WarningLevel,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -85,6 +85,75 @@ pub fn rename_reserved(
         renames.insert(rule.name.clone(), candidate);
     }
     rename_rules(spec, &renames)
+}
+
+/// Return `spec` with every non-service rule whose generated identifier equals the
+/// identifier of an earlier rule renamed to a free `<Name>Type`. `ident` is the
+/// generator's own rule-name-to-identifier function, so `Value` and `value`, or
+/// `user_id` and `UserId`, collide only where the target language makes them the
+/// same name. The first rule in the spec keeps its name, so adding a rule never
+/// renames an existing one. Service identifiers count as taken but services are
+/// never renamed, because the RPC wire carries them as written.
+pub fn rename_ident_collisions(
+    spec: &CsilSpecSerialized,
+    ident: impl Fn(&str) -> String,
+) -> CsilSpecSerialized {
+    let mut names: HashSet<String> = spec.rules.iter().map(|rule| rule.name.clone()).collect();
+    let mut idents: HashSet<String> = spec
+        .rules
+        .iter()
+        .filter(|rule| matches!(rule.rule_type, CsilRuleType::ServiceDef(_)))
+        .map(|rule| ident(&rule.name))
+        .collect();
+    let mut renames = HashMap::new();
+    for rule in &spec.rules {
+        if matches!(rule.rule_type, CsilRuleType::ServiceDef(_)) {
+            continue;
+        }
+        if idents.insert(ident(&rule.name)) {
+            continue;
+        }
+        let mut candidate = format!("{}Type", rule.name);
+        while names.contains(&candidate) || idents.contains(&ident(&candidate)) {
+            candidate.push_str("Type");
+        }
+        names.insert(candidate.clone());
+        idents.insert(ident(&candidate));
+        renames.insert(rule.name.clone(), candidate);
+    }
+    rename_rules(spec, &renames)
+}
+
+/// One warning for each rule a generator renamed, so the user learns that the
+/// generated type has another name than the CSIL rule. The wire is unchanged.
+pub fn rename_warnings(spec: &CsilSpecSerialized, target: &str) -> Vec<GeneratorWarning> {
+    spec.declared_names
+        .iter()
+        .map(|(new, declared)| {
+            let location = spec
+                .rules
+                .iter()
+                .find(|rule| &rule.name == new)
+                .map(|rule| SourceLocation {
+                    line: rule.position.line,
+                    column: rule.position.column,
+                    offset: rule.position.offset,
+                    context: Some(declared.clone()),
+                });
+            GeneratorWarning {
+                level: WarningLevel::Warning,
+                message: format!(
+                    "rule `{declared}` is generated as `{new}` for {target}, because `{declared}` \
+                     clashes with a name the generated code uses, with another rule, or is not a \
+                     legal identifier there; the wire still uses `{declared}`"
+                ),
+                location,
+                suggestion: Some(format!(
+                    "rename `{declared}` in the CSIL source to choose the generated name yourself"
+                )),
+            }
+        })
+        .collect()
 }
 
 struct Renamer<'a> {
@@ -288,5 +357,55 @@ mod tests {
             &HashMap::from([("TransportTypeType".to_string(), "T2".to_string())]),
         );
         assert_eq!(again.declared_name("T2"), "Transport");
+    }
+
+    #[test]
+    fn ident_collision_renames_the_later_rule_and_warns() {
+        let text = || CsilTypeExpression::Builtin("text".into());
+        let spec = CsilSpecSerialized {
+            rules: vec![
+                rule("Value", CsilRuleType::TypeDef(text())),
+                rule("value", CsilRuleType::TypeDef(text())),
+                rule(
+                    "Use",
+                    CsilRuleType::TypeDef(CsilTypeExpression::Reference("value".into())),
+                ),
+            ],
+            source_content: None,
+            service_count: 0,
+            fields_with_metadata_count: 0,
+            declared_names: Default::default(),
+        };
+        let pascal = |name: &str| {
+            let mut chars = name.chars();
+            chars
+                .next()
+                .map(|c| c.to_uppercase().collect::<String>() + chars.as_str())
+                .unwrap_or_default()
+        };
+        let out = rename_ident_collisions(&spec, pascal);
+        assert_eq!(out.rules[0].name, "Value");
+        assert_eq!(out.rules[1].name, "valueType");
+        assert_eq!(out.declared_name("valueType"), "value");
+        let CsilRuleType::TypeDef(CsilTypeExpression::Reference(target)) = &out.rules[2].rule_type
+        else {
+            panic!("reference rule");
+        };
+        assert_eq!(target, "valueType");
+        // An identity identifier function keeps both names.
+        assert!(
+            rename_ident_collisions(&spec, str::to_string)
+                .declared_names
+                .is_empty()
+        );
+
+        let warnings = rename_warnings(&out, "go");
+        assert_eq!(warnings.len(), 1);
+        assert!(
+            warnings[0]
+                .message
+                .contains("`value` is generated as `valueType` for go")
+        );
+        assert_eq!(warnings[0].location.as_ref().map(|l| l.line), Some(1));
     }
 }

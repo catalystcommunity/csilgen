@@ -16,6 +16,7 @@ use csilgen_common::{
     GenerationStats, GeneratorCapability, GeneratorConfig, GeneratorMetadata, GeneratorWarning,
     Result, WasmGeneratorInput, WasmGeneratorOutput, wasm_interface::*,
 };
+use std::collections::HashSet;
 
 // ---------------------------------------------------------------------------
 // WASM exports
@@ -97,7 +98,7 @@ fn process_generation(
     let input: WasmGeneratorInput =
         serde_json::from_str(s).map_err(|_| error_codes::SERIALIZATION_ERROR)?;
 
-    let files = generate_dart_code(&input.csil_spec, &input.config)
+    let (files, warnings) = generate_dart_output(&input.csil_spec, &input.config)
         .map_err(|_| error_codes::GENERATION_ERROR)?;
 
     let stats = GenerationStats {
@@ -110,7 +111,7 @@ fn process_generation(
     };
     Ok(WasmGeneratorOutput {
         files,
-        warnings: Vec::<GeneratorWarning>::new(),
+        warnings,
         stats,
     })
 }
@@ -769,8 +770,11 @@ enum Surface {
 // and break the package. Such a rule is renamed to `<Name>Type`; its wire name
 // stays the declared name.
 const RESERVED_TYPE_NAMES: &[&str] = &[
+    "AsyncCsilTransport",
     "CsilCbor",
+    "CsilCodec",
     "CsilDecimal",
+    "CsilTransport",
     "DateTime",
     "Exception",
     "FormatException",
@@ -797,10 +801,87 @@ fn mentions(body: &str, ident: &str) -> bool {
     })
 }
 
+/// The class names the generator builds from other rules: the per-service
+/// client and handler names, `<ErrorArm>Refusal`, and each union arm class. A
+/// rule that takes one of them would collide with the class made for its owner.
+/// Union arm names are read from the hoisted spec, because hoisting turns inline
+/// arms into the named rules the arm classes are named after.
+fn derived_type_names(spec: &CsilSpecSerialized) -> HashSet<String> {
+    let hoisted = csilgen_common::hoist_inline_composites(
+        spec,
+        csilgen_common::HoistOptions {
+            hoist_all_literal_choices: false,
+        },
+    );
+    let mut names = HashSet::new();
+    for rule in &hoisted.rules {
+        match &rule.rule_type {
+            CsilRuleType::ServiceDef(_) => {
+                let base = service_base_name(&rule.name);
+                names.insert(format!("{base}Client"));
+                names.insert(format!("{base}AsyncClient"));
+                names.insert(format!("{}Handler", dart_type_name(&rule.name)));
+            }
+            CsilRuleType::GroupChoice(groups) => {
+                let base = dart_type_name(&rule.name);
+                names.extend((0..groups.len()).map(|i| format!("{base}Variant{i}")));
+            }
+            _ => {}
+        }
+    }
+    for (name, choices) in union_choices(&hoisted) {
+        let base = dart_type_name(&name);
+        names.extend(
+            choices
+                .iter()
+                .enumerate()
+                .map(|(i, choice)| union_arm_name(&base, i, choice)),
+        );
+    }
+    for (_, _, arms) in hoisted.rpc_operations() {
+        for arm in &arms[1..] {
+            if let Some(name) = arm.rpc_variant_name() {
+                names.insert(format!("{}Refusal", dart_type_name(name)));
+            }
+        }
+    }
+    names
+}
+
+/// Rename every rule whose Dart class name is reserved, derived from another
+/// rule, or equal to an earlier rule's class name. A rename changes the names
+/// derived from the renamed rule (its `Refusal` class, the union arm classes
+/// named after it), so it repeats until no rule moves.
+fn rename_spec(spec: &CsilSpecSerialized, decimal_type: &str) -> CsilSpecSerialized {
+    let mut spec = spec.clone();
+    loop {
+        let before = spec.declared_names.len();
+        let derived = derived_type_names(&spec);
+        spec = csilgen_common::rename_reserved(&spec, |name| {
+            let ident = dart_type_name(name);
+            ident == decimal_type
+                || RESERVED_TYPE_NAMES.contains(&ident.as_str())
+                || derived.contains(&ident)
+        });
+        spec = csilgen_common::rename_ident_collisions(&spec, dart_type_name);
+        if spec.declared_names.len() == before {
+            return spec;
+        }
+    }
+}
+
 pub fn generate_dart_code(
     spec: &CsilSpecSerialized,
     config: &GeneratorConfig,
 ) -> Result<GeneratedFiles> {
+    generate_dart_output(spec, config).map(|(files, _)| files)
+}
+
+/// `generate_dart_code`, plus one warning for each rule renamed on the way.
+pub fn generate_dart_output(
+    spec: &CsilSpecSerialized,
+    config: &GeneratorConfig,
+) -> Result<(GeneratedFiles, Vec<GeneratorWarning>)> {
     let decimal_mapping = match config.options.get("decimal_mapping") {
         None => DecimalMapping::Csil,
         Some(v) => match v.as_str() {
@@ -819,10 +900,8 @@ pub fn generate_dart_code(
         DecimalMapping::Csil => "CsilDecimal",
         DecimalMapping::Library => "Decimal",
     };
-    let renamed = csilgen_common::rename_reserved(spec, |name| {
-        let ident = dart_type_name(name);
-        ident == decimal_type || RESERVED_TYPE_NAMES.contains(&ident.as_str())
-    });
+    let renamed = rename_spec(spec, decimal_type);
+    let warnings = csilgen_common::rename_warnings(&renamed, &config.target);
     let spec = &renamed;
     // Validated early (before any file is emitted) so a misconfigured value fails
     // loudly rather than silently degrading. Absent -> Both: the blocking client is
@@ -943,9 +1022,9 @@ pub fn generate_dart_code(
                 content: readme,
             });
         }
-        Ok(pkg)
+        Ok((pkg, warnings))
     } else {
-        Ok(files)
+        Ok((files, warnings))
     }
 }
 

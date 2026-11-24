@@ -1022,3 +1022,147 @@ puts "ok"
         String::from_utf8_lossy(&run.stderr)
     );
 }
+
+/// Write `files` beside `driver`, run it with ruby, and require it to print `ok`.
+/// Skips when ruby is not on PATH.
+fn run_ruby_driver(files: &[GeneratedFile], label: &str, driver: &str) {
+    if std::process::Command::new("ruby")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        eprintln!("skipping: no ruby on PATH");
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("csilgen-ruby-{label}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    for f in files {
+        std::fs::write(dir.join(&f.path), &f.content).unwrap();
+    }
+    std::fs::write(dir.join("driver.rb"), driver).unwrap();
+    let run = std::process::Command::new("ruby")
+        .arg("-W:no-experimental")
+        .arg(dir.join("driver.rb"))
+        .output()
+        .unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    assert!(
+        run.status.success()
+            && String::from_utf8_lossy(&run.stdout).trim() == "ok"
+            && !stderr.contains("already initialized"),
+        "{label} driver failed:\n{}{stderr}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+}
+
+/// `user_id` and `UserId` are both the constant `UserId`; the second would
+/// reassign the first, so it is renamed and keeps its wire variant.
+fn ident_collision_spec() -> CsilSpecSerialized {
+    spec(vec![
+        group_rule("user_id", vec![bare_entry("n", builtin("int"))]),
+        group_rule("UserId", vec![bare_entry("code", builtin("int"))]),
+        service_rule(
+            "Pinger",
+            vec![op(
+                "ping",
+                reference("user_id"),
+                CsilTypeExpression::Choice(vec![reference("user_id"), reference("UserId")]),
+                CsilServiceDirection::Unidirectional,
+            )],
+            None,
+        ),
+    ])
+}
+
+#[test]
+fn rules_with_the_same_constant_are_renamed_and_keep_their_wire_variant() {
+    let files = generate_ruby_code_from_serialized(&ident_collision_spec(), &config("ruby"))
+        .expect("generation succeeded");
+    let types = &files.iter().find(|f| f.path == "types.rb").unwrap().content;
+    assert!(types.contains("UserId = Data.define(:n)"));
+    assert!(types.contains("UserIdType = Data.define(:code)"));
+    run_ruby_driver(
+        &files,
+        "ident-collision",
+        r#"$VERBOSE = true
+require_relative "types"
+require_relative "codec"
+value = UserIdType.new(code: 13)
+variant, payload = CsilCbor.encode_pinger_ping_reply { raise CsilCbor::UserIdTypeRefusal.new(value) }
+raise "variant #{variant.inspect}" unless variant == "UserId"
+begin
+  CsilCbor.resolve_rpc_reply("Pinger", "ping", variant, payload)
+  raise "missing refusal"
+rescue CsilCbor::UserIdTypeRefusal => e
+  raise "refusal value" unless e.value == value
+end
+raise "UserId" unless UserId.from_cbor(UserId.new(n: 1).to_cbor) == UserId.new(n: 1)
+puts "ok"
+"#,
+    );
+}
+
+/// Records named like the client class and the wire-id module the generator
+/// derives from a service are renamed.
+#[test]
+fn rules_named_like_derived_names_are_renamed() {
+    let s = spec(vec![
+        group_rule("PingerClient", vec![bare_entry("a", builtin("int"))]),
+        group_rule("PingerWireIds", vec![bare_entry("a", builtin("int"))]),
+        service_rule(
+            "Pinger",
+            vec![op_wire(
+                "ping",
+                reference("PingerClient"),
+                reference("PingerWireIds"),
+                CsilServiceDirection::Unidirectional,
+                1,
+            )],
+            Some(3),
+        ),
+    ]);
+    let files = generate_ruby_code_from_serialized(&s, &config("ruby-client"))
+        .expect("generation succeeded");
+    let types = &files.iter().find(|f| f.path == "types.rb").unwrap().content;
+    assert!(types.contains("PingerClientType = Data.define(:a)"));
+    assert!(types.contains("PingerWireIdsType = Data.define(:a)"));
+    run_ruby_driver(
+        &files,
+        "derived",
+        r#"$VERBOSE = true
+require_relative "types"
+require_relative "codec"
+require_relative "client"
+raise "client" unless PingerClientType.from_cbor(PingerClientType.new(a: 1).to_cbor) == PingerClientType.new(a: 1)
+raise "wire ids" unless PingerWireIds::SERVICE == 3
+raise "client class" unless PingerClient.instance_method(:initialize).arity == 1
+puts "ok"
+"#,
+    );
+}
+
+#[test]
+fn renamed_rules_are_reported_as_warnings() {
+    let input = WasmGeneratorInput {
+        csil_spec: ident_collision_spec(),
+        config: config("ruby"),
+        generator_metadata: GeneratorMetadata {
+            name: "ruby-generator".to_string(),
+            version: "0".to_string(),
+            description: String::new(),
+            target: "ruby".to_string(),
+            capabilities: Vec::new(),
+            author: None,
+            homepage: None,
+        },
+    };
+    let output = csilgen_ruby_generator::run_generation(&input).unwrap();
+    assert_eq!(output.warnings.len(), 1, "{:?}", output.warnings);
+    assert!(
+        output.warnings[0]
+            .message
+            .contains("rule `UserId` is generated as `UserIdType` for ruby")
+    );
+}

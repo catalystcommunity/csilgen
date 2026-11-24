@@ -204,8 +204,36 @@ const RESERVED_TYPE_NAMES: &[&str] = &[
 /// names its synthesized rules against the final names), then every inline
 /// composite hoisted to a named rule.
 fn prepare_spec(spec: &CsilSpecSerialized) -> CsilSpecSerialized {
-    let renamed = rename_reserved(spec, |name| {
-        RESERVED_TYPE_NAMES.contains(&name) || C_RESERVED_MEMBER_NAMES.contains(&name)
+    // C emits a rule name as written, so a name that is no C identifier
+    // (`open-group`) takes `_` for each illegal character first.
+    let renames = csilgen_common::rule_renames(spec, is_c_ident, |name| {
+        let fixed: String = name
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+            .collect();
+        if fixed.is_empty() || fixed.starts_with(|c: char| c.is_ascii_digit()) {
+            format!("_{fixed}")
+        } else {
+            fixed
+        }
+    });
+    let legal = csilgen_common::rename_rules(spec, &renames);
+    let derived = DerivedNames::of(&legal);
+    let reserved = rename_reserved(&legal, |name| {
+        RESERVED_TYPE_NAMES.contains(&name)
+            || C_RESERVED_MEMBER_NAMES.contains(&name)
+            || derived.contains(name)
+    });
+    // A type name is the rule name as written, but a union arm becomes the member
+    // `as_<snake>` and the constant `<UNION>_<ARM>`; two arms of one union whose
+    // snake_case names agree (`Value` and `value`) would declare both twice.
+    let arm_clashes = snake_clashing_arms(&reserved);
+    let renamed = csilgen_common::rename_ident_collisions(&reserved, |name| {
+        if arm_clashes.contains(name) {
+            to_snake(name)
+        } else {
+            name.to_string()
+        }
     });
     hoist_inline_composites(
         &renamed,
@@ -213,6 +241,136 @@ fn prepare_spec(spec: &CsilSpecSerialized) -> CsilSpecSerialized {
             hoist_all_literal_choices: true,
         },
     )
+}
+
+fn is_c_ident(name: &str) -> bool {
+    !name.is_empty()
+        && !name.starts_with(|c: char| c.is_ascii_digit())
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// The names the generated headers build from other rules, services and
+/// operations. A rule that takes one of them would redeclare it.
+struct DerivedNames {
+    exact: std::collections::HashSet<String>,
+    /// `<NAME>_`: the prefix of every enumerator an enum or union emits. Only an
+    /// all-caps rule name can equal an enumerator.
+    enumerator_prefixes: Vec<String>,
+}
+
+impl DerivedNames {
+    fn of(spec: &CsilSpecSerialized) -> Self {
+        let mut exact = std::collections::HashSet::new();
+        let mut enumerator_prefixes = Vec::new();
+        let config = default_config();
+        for rule in &spec.rules {
+            let name = &rule.name;
+            if let CsilRuleType::ServiceDef(service) = &rule.rule_type {
+                let base = service_base(name);
+                let prefix = to_snake(&base);
+                let upper = to_upper_snake(&base);
+                exact.insert(format!("{base}Handlers"));
+                exact.insert(format!("route_{prefix}_channel"));
+                exact.insert(format!("route_{prefix}_channel_compact"));
+                exact.insert(format!("{upper}_SERVICE_WIRE_ID"));
+                for op in &service.operations {
+                    let method = to_snake(&op.name);
+                    exact.insert(format!("csil_{prefix}_{method}"));
+                    exact.insert(format!("encode_{prefix}_{method}"));
+                    exact.insert(format!("{upper}_OP_{}_WIRE_ID", to_upper_snake(&op.name)));
+                    if !matches!(op.direction, CsilServiceDirection::Unidirectional) {
+                        continue;
+                    }
+                    if let Some(arms) = op.rpc_reply_arms() {
+                        let reply = rpc_reply_type(name, op);
+                        for arm in arms {
+                            if let Some(ident) = arm.rpc_variant_name() {
+                                exact.insert(format!("{reply}_as_{}", to_snake(ident)));
+                            }
+                        }
+                        exact.insert(reply);
+                    }
+                    let success = success_type(op.success_output());
+                    for ty in [&op.input_type, &success] {
+                        if is_aggregate_boundary(ty) {
+                            exact.insert(boundary_c_type(ty, &config));
+                        }
+                    }
+                }
+                continue;
+            }
+            match classify_rule(&rule.rule_type) {
+                Some(TypeKind::Struct(_)) => {
+                    exact.insert(format!("{name}_validate"));
+                }
+                Some(TypeKind::Union(_) | TypeKind::MixedEnum(_) | TypeKind::GroupUnion(_)) => {
+                    exact.insert(format!("{name}Tag"));
+                    enumerator_prefixes.push(format!("{}_", to_upper_snake(name)));
+                }
+                Some(TypeKind::Enum(_) | TypeKind::IntEnum(_)) => {
+                    for helper in ["label", "to_number", "from_number"] {
+                        exact.insert(format!("csil_{name}_{helper}"));
+                    }
+                    enumerator_prefixes.push(format!("{}_", to_upper_snake(name)));
+                }
+                _ => {}
+            }
+        }
+        Self {
+            exact,
+            enumerator_prefixes,
+        }
+    }
+
+    fn contains(&self, name: &str) -> bool {
+        self.exact.contains(name)
+            || (!name.chars().any(|c| c.is_ascii_lowercase())
+                && self
+                    .enumerator_prefixes
+                    .iter()
+                    .any(|prefix| name.starts_with(prefix.as_str())))
+    }
+}
+
+/// The rule names that are arms of one union (a type choice or an RPC reply)
+/// together with another arm of the same snake_case name.
+fn snake_clashing_arms(spec: &CsilSpecSerialized) -> std::collections::HashSet<String> {
+    let mut unions: Vec<Vec<&str>> = Vec::new();
+    for rule in &spec.rules {
+        match &rule.rule_type {
+            CsilRuleType::TypeChoice(arms) => unions.push(arm_references(arms)),
+            CsilRuleType::ServiceDef(service) => {
+                for op in &service.operations {
+                    if let Some(arms) = op.rpc_reply_arms() {
+                        unions.push(arm_references(arms));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut out = std::collections::HashSet::new();
+    for arms in unions {
+        let mut seen: HashMap<String, &str> = HashMap::new();
+        for arm in arms {
+            if let Some(first) = seen.insert(to_snake(arm), arm)
+                && first != arm
+            {
+                out.insert(first.to_string());
+                out.insert(arm.to_string());
+            }
+        }
+    }
+    out
+}
+
+fn arm_references(arms: &[CsilTypeExpression]) -> Vec<&str> {
+    arms.iter()
+        .filter_map(|arm| match arm {
+            CsilTypeExpression::Reference(name) => Some(name.as_str()),
+            _ => None,
+        })
+        .collect()
 }
 
 fn process_generation(mut input: WasmGeneratorInput) -> Result<WasmGeneratorOutput, i32> {
@@ -333,6 +491,10 @@ fn process_generation(mut input: WasmGeneratorInput) -> Result<WasmGeneratorOutp
         });
     }
 
+    warnings.extend(csilgen_common::rename_warnings(
+        &input.csil_spec,
+        &input.config.target,
+    ));
     let total_size: usize = files.iter().map(|f| f.content.len()).sum();
     Ok(WasmGeneratorOutput {
         stats: GenerationStats {

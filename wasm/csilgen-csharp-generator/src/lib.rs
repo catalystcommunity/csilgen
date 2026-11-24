@@ -6,6 +6,7 @@
 //! discriminated-union emulation for variants, a primary-constructor client, and a
 //! server interface + verbose/compact channel routers — never the wire bytes.
 
+use csilgen_common::CsilFieldMetadata;
 use csilgen_common::{
     ChoiceClass, CsilControlOperator, CsilGroupEntry, CsilGroupExpression, CsilGroupKey,
     CsilLiteralValue, CsilOccurrence, CsilRuleType, CsilServiceDefinition, CsilServiceDirection,
@@ -13,7 +14,6 @@ use csilgen_common::{
     GenerationStats, GeneratorCapability, GeneratorMetadata, WasmGeneratorInput,
     WasmGeneratorOutput, choice_arm_literal, classify_choice, wasm_interface::*,
 };
-use csilgen_common::{CsilFieldMetadata, GeneratorWarning};
 use std::collections::HashMap;
 
 #[unsafe(no_mangle)]
@@ -257,33 +257,79 @@ const RESERVED_TYPE_NAMES: &[&str] = &[
     "Transport",
 ];
 
-/// The per-service types the generator names after a service, which a rule of the same
-/// name would duplicate just like a fixed one.
-fn service_type_names(spec: &csilgen_common::CsilSpecSerialized) -> Vec<String> {
-    spec.rules
-        .iter()
-        .filter(|rule| matches!(rule.rule_type, CsilRuleType::ServiceDef(_)))
-        .flat_map(|rule| {
-            let base = service_base(&rule.name);
-            [
-                format!("{base}Client"),
-                format!("{base}AsyncClient"),
-                format!("{base}Router"),
-                format!("{base}WireIds"),
-                service_interface_name(&rule.name),
-            ]
-        })
-        .collect()
+/// Inline composites are hoisted with these options both for generation and for working
+/// out the derived names, so the two see the same rules.
+const HOIST_OPTIONS: csilgen_common::HoistOptions = csilgen_common::HoistOptions {
+    hoist_all_literal_choices: true,
+};
+
+/// The types the generator names after another rule, service or operation. A rule of
+/// the same name is a duplicate definition in the namespace, or is hidden inside `Codec`
+/// by a nested refusal class. `spec` must be hoisted already, because a hoisted rule's
+/// derived names are only known after hoisting.
+fn derived_type_names(spec: &csilgen_common::CsilSpecSerialized) -> Vec<String> {
+    let mut names = Vec::new();
+    for rule in &spec.rules {
+        let base = pascal_ident(&rule.name);
+        match &rule.rule_type {
+            CsilRuleType::ServiceDef(_) => {
+                let service = service_base(&rule.name);
+                names.push(format!("{service}Client"));
+                names.push(format!("{service}AsyncClient"));
+                names.push(format!("{service}Router"));
+                names.push(format!("{service}WireIds"));
+                names.push(service_interface_name(&rule.name));
+            }
+            CsilRuleType::TypeDef(CsilTypeExpression::Choice(choices))
+            | CsilRuleType::TypeChoice(choices) => {
+                if matches!(classify_choice(choices), ChoiceClass::Enum(_)) {
+                    if csilgen_common::enum_numbers(choices).is_some() {
+                        names.push(format!("{base}Numbers"));
+                        names.push(format!("{base}JsonConverter"));
+                    }
+                } else {
+                    names.extend(
+                        choices
+                            .iter()
+                            .enumerate()
+                            .map(|(index, choice)| union_arm_name(&base, index, choice)),
+                    );
+                }
+            }
+            CsilRuleType::GroupChoice(choices) => {
+                names.extend((1..=choices.len()).map(|i| format!("{base}Variant{i}")));
+            }
+            _ => {}
+        }
+    }
+    for (_, _, arms) in spec.rpc_operations() {
+        for arm in arms.iter().skip(1) {
+            names.push(format!(
+                "{}Refusal",
+                pascal_ident(arm.rpc_variant_name().unwrap())
+            ));
+        }
+    }
+    names
 }
 
-fn rename_reserved_types(
-    spec: &csilgen_common::CsilSpecSerialized,
-) -> csilgen_common::CsilSpecSerialized {
-    let service_types = service_type_names(spec);
-    csilgen_common::rename_reserved(spec, |name| {
+/// The spec as the generator emits it: rules whose type would clash with a fixed name, a
+/// derived name, or another rule's type are renamed, and inline composites are hoisted.
+/// The renames are kept in `declared_names` for the wire and the warnings.
+fn prepare_spec(spec: &csilgen_common::CsilSpecSerialized) -> csilgen_common::CsilSpecSerialized {
+    let mut probe = spec.clone();
+    probe.supply_implicit_service_error();
+    let derived = derived_type_names(&csilgen_common::hoist_inline_composites(
+        &probe,
+        HOIST_OPTIONS,
+    ));
+    let reserved = csilgen_common::rename_reserved(spec, |name| {
         let ident = pascal_ident(name);
-        RESERVED_TYPE_NAMES.contains(&ident.as_str()) || service_types.contains(&ident)
-    })
+        RESERVED_TYPE_NAMES.contains(&ident.as_str()) || derived.contains(&ident)
+    });
+    let mut distinct = csilgen_common::rename_ident_collisions(&reserved, pascal_ident);
+    distinct.supply_implicit_service_error();
+    csilgen_common::hoist_inline_composites(&distinct, HOIST_OPTIONS)
 }
 
 /// The single typed entry point used by both the WASM `generate` export and the
@@ -308,19 +354,12 @@ pub fn render(mut input: WasmGeneratorInput) -> Result<WasmGeneratorOutput, i32>
     // hoists to a synthesized `ScalarsSize` enum today. Passing `false` here would silently
     // regress that field (and every field like it) back to an untyped `object` with a
     // null-emitting codec.
-    input.csil_spec = rename_reserved_types(&input.csil_spec);
-    input.csil_spec.supply_implicit_service_error();
-    input.csil_spec = csilgen_common::hoist_inline_composites(
-        &input.csil_spec,
-        csilgen_common::HoistOptions {
-            hoist_all_literal_choices: true,
-        },
-    );
+    input.csil_spec = prepare_spec(&input.csil_spec);
     let config = CsharpConfig::from_options(&input.config.options)?;
     // Validate client_style up front (before emitting any file) so a bad value fails the
     // whole run regardless of which target is requested.
     let style = client_style(&input.config.options)?;
-    let warnings: Vec<GeneratorWarning> = Vec::new();
+    let warnings = csilgen_common::rename_warnings(&input.csil_spec, &input.config.target);
     let mut files = Vec::new();
 
     // The base `csharp` (and explicit `csharp-server`) target emits the server
@@ -4988,6 +5027,116 @@ mod tests {
         );
         assert!(codec.contains("\"Codec\" => throw new CodecTypeRefusal("));
         assert!(!codec.contains("\"CodecType\""));
+    }
+
+    /// `pingpong_input` with extra rules ahead of the service, and the `ping` op's error
+    /// arm replaced by `err`.
+    fn pingpong_with(
+        target: &str,
+        extra: Vec<(&str, CsilRuleType)>,
+        err: &str,
+    ) -> WasmGeneratorInput {
+        let mut input = pingpong_input(target);
+        let at = input.csil_spec.rules.len() - 1;
+        for (name, rule_type) in extra.into_iter().rev() {
+            input.csil_spec.rules.insert(
+                at,
+                CsilRule {
+                    name: name.to_string(),
+                    rule_type,
+                    position: CsilPosition {
+                        line: 1,
+                        column: 1,
+                        offset: 0,
+                    },
+                    doc_comments: Vec::new(),
+                },
+            );
+        }
+        if let Some(CsilRuleType::ServiceDef(svc)) = input
+            .csil_spec
+            .rules
+            .last_mut()
+            .map(|rule| &mut rule.rule_type)
+        {
+            svc.operations[0].output_type = CsilTypeExpression::Choice(vec![
+                CsilTypeExpression::Reference("PongResponse".to_string()),
+                CsilTypeExpression::Reference(err.to_string()),
+            ]);
+        }
+        input
+    }
+
+    fn code_record() -> CsilRuleType {
+        CsilRuleType::GroupDef(CsilGroupExpression {
+            entries: vec![bare_entry(
+                "code",
+                CsilTypeExpression::Builtin("uint".to_string()),
+            )],
+        })
+    }
+
+    fn output_file(out: &WasmGeneratorOutput, suffix: &str) -> String {
+        out.files
+            .iter()
+            .find(|f| f.path.ends_with(suffix))
+            .map(|f| f.content.clone())
+            .unwrap_or_else(|| panic!("no file ending in {suffix}"))
+    }
+
+    /// `PetCat` is the arm record the union `Pet = Cat / Dog` declares for `Cat`, so a rule
+    /// of that name would be a duplicate definition; it is renamed, and as an error arm it
+    /// still names itself `PetCat` on the wire.
+    #[test]
+    fn rule_named_like_a_derived_union_arm_is_renamed() {
+        let pet = CsilRuleType::TypeDef(CsilTypeExpression::Choice(vec![
+            CsilTypeExpression::Reference("Cat".to_string()),
+            CsilTypeExpression::Reference("Dog".to_string()),
+        ]));
+        let out = render(pingpong_with(
+            "csharp-server",
+            vec![
+                ("Cat", code_record()),
+                ("Dog", code_record()),
+                ("Pet", pet),
+                ("PetCat", code_record()),
+            ],
+            "PetCat",
+        ))
+        .expect("generation ok");
+        let types = output_file(&out, "Types.gen.cs");
+        assert!(types.contains("public sealed record PetCat(Cat Value) : Pet;"));
+        assert!(types.contains("public sealed record PetCatType"));
+        let codec = output_file(&out, "Codec.gen.cs");
+        assert!(
+            codec.contains(
+                "return (\"PetCat\", Cbor.Encode(PetCatTypeToCborValue(refusal.Value)));"
+            )
+        );
+        assert!(codec.contains("\"PetCat\" => throw new PetCatTypeRefusal("));
+    }
+
+    /// `Value` and `value` are both the C# type `Value`; the later one is renamed, and as
+    /// an error arm it still names itself `value` on the wire. The rename is reported.
+    #[test]
+    fn rules_with_the_same_type_name_are_told_apart_and_reported() {
+        let out = render(pingpong_with(
+            "csharp-server",
+            vec![("Value", code_record()), ("value", code_record())],
+            "value",
+        ))
+        .expect("generation ok");
+        let types = output_file(&out, "Types.gen.cs");
+        assert!(types.contains("public sealed record Value\n"));
+        assert!(types.contains("public sealed record ValueType\n"));
+        let codec = output_file(&out, "Codec.gen.cs");
+        assert!(codec.contains("\"value\" => throw new ValueTypeRefusal("));
+        assert_eq!(out.warnings.len(), 1, "{:?}", out.warnings);
+        assert!(
+            out.warnings[0]
+                .message
+                .contains("rule `value` is generated as `valueType` for csharp-server")
+        );
     }
 
     /// A service with ONLY a `<->` (bidirectional/channel) operation — no `Unidirectional`

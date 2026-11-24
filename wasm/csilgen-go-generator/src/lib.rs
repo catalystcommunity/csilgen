@@ -99,8 +99,15 @@ fn process_generation(input: WasmGeneratorInput) -> Result<WasmGeneratorOutput, 
     // OCaml/Kotlin do.
     let input = {
         let mut input = input;
-        input.csil_spec = csilgen_common::rename_reserved(&input.csil_spec, is_reserved_go_name);
         input.csil_spec = hoist_inline_groups(&input.csil_spec);
+        // Hoisting first means the derived names below see the records the codec
+        // will see, and synthesized names are checked like declared ones.
+        let derived = derived_go_names(&input);
+        input.csil_spec = csilgen_common::rename_reserved(&input.csil_spec, |name| {
+            let ident = pascal_case(name);
+            RESERVED_GO_NAMES.contains(&ident.as_str()) || derived.contains(&ident)
+        });
+        input.csil_spec = csilgen_common::rename_ident_collisions(&input.csil_spec, pascal_case);
         input
     };
     let mut config = GoConfig::from_options(&input.config.options)?;
@@ -266,6 +273,10 @@ fn process_generation(input: WasmGeneratorInput) -> Result<WasmGeneratorOutput, 
         peak_memory_bytes: Some(estimate_memory_usage()),
     };
 
+    warnings.extend(csilgen_common::rename_warnings(
+        &input.csil_spec,
+        &input.config.target,
+    ));
     Ok(WasmGeneratorOutput {
         files,
         warnings,
@@ -279,6 +290,11 @@ fn process_generation(input: WasmGeneratorInput) -> Result<WasmGeneratorOutput, 
 /// going through the pointer-based wasm boundary.
 pub fn generate_go_files(input: WasmGeneratorInput) -> Result<Vec<GeneratedFile>, i32> {
     process_generation(input).map(|output| output.files)
+}
+
+/// Generate and return the files with the warnings, such as renamed rules.
+pub fn generate_go_output(input: WasmGeneratorInput) -> Result<WasmGeneratorOutput, i32> {
+    process_generation(input)
 }
 
 /// True only when the `emit_packages` generation option is an array containing the
@@ -6602,8 +6618,44 @@ const RESERVED_GO_NAMES: &[&str] = &[
     "RPCApplicationError",
 ];
 
-fn is_reserved_go_name(name: &str) -> bool {
-    RESERVED_GO_NAMES.contains(&pascal_case(name).as_str())
+/// Type-level names the package builds from services and operations: the client
+/// struct and its constructor, and the per-op codec stems (`Encode<Stem>Request`,
+/// `Decode<Stem>Response`, `Encode<Stem>Reply`, `Encode<Stem>Error<N>`). A record of
+/// one of these names would declare its own `Encode<Name>` and clash. A stem is
+/// reserved only where the package emits it, so a record that is its own op's
+/// request keeps its name.
+fn derived_go_names(input: &WasmGeneratorInput) -> std::collections::HashSet<String> {
+    let records = record_names(input);
+    let mut names = std::collections::HashSet::new();
+    for rule in &input.csil_spec.rules {
+        let CsilRuleType::ServiceDef(service) = &rule.rule_type else {
+            continue;
+        };
+        let base = go_service_base(&rule.name);
+        names.insert(format!("{base}Client"));
+        names.insert(format!("New{base}Client"));
+        for op in &service.operations {
+            if !matches!(op.direction, CsilServiceDirection::Unidirectional) {
+                continue;
+            }
+            let stem = op_codec_stem(&rule.name, op);
+            if !op_input_is_null(&op.input_type) && !is_record_ref(&op.input_type, &records) {
+                names.insert(format!("{stem}Request"));
+            }
+            if !is_record_ref(&go_success_type(op.success_output()), &records) {
+                names.insert(format!("{stem}Response"));
+            }
+            if let Some(arms) = op.rpc_reply_arms() {
+                names.insert(format!("{stem}Reply"));
+                for (i, arm) in arms.iter().enumerate().skip(1) {
+                    if !is_record_ref(arm, &records) {
+                        names.insert(format!("{stem}Error{i}"));
+                    }
+                }
+            }
+        }
+    }
+    names
 }
 
 fn pascal_case(s: &str) -> String {

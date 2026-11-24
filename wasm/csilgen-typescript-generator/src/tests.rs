@@ -622,6 +622,95 @@ fn reserved_error_arm_is_renamed_but_keeps_its_wire_variant() {
     assert!(!codec.contains("\"MapType\""), "{codec}");
 }
 
+/// A spec whose `Login` operation fails with `error`, with the extra rules given.
+fn spec_with_login_error(error: &str, extra: Vec<CsilRule>) -> CsilSpecSerialized {
+    let mut spec = sample_spec();
+    if let CsilRuleType::ServiceDef(def) = &mut spec.rules[6].rule_type {
+        def.operations[0].output_type =
+            CsilTypeExpression::Choice(vec![reference("LoginResponse"), reference(error)]);
+    }
+    spec.rules.extend(extra);
+    spec
+}
+
+/// `AuthService` derives the client class `AuthClient`, so a rule of that name is
+/// renamed; as an error arm it still names itself `AuthClient` on the wire.
+#[test]
+fn rule_taking_a_derived_name_is_renamed_but_keeps_its_wire_variant() {
+    let mut input = input_for("typescript");
+    input.csil_spec = spec_with_login_error(
+        "AuthClient",
+        vec![group_rule(
+            "AuthClient",
+            vec![field("reason", builtin("text"), false)],
+            vec![],
+        )],
+    );
+    let files = generate_files(&input).expect("generate");
+    let types = file(&files, "types.gen.ts");
+    assert!(
+        types.contains("export interface AuthClientType {"),
+        "{types}"
+    );
+    assert!(!types.contains("export interface AuthClient {"), "{types}");
+    let client = file(&files, "client.gen.ts");
+    assert!(client.contains("export class AuthClient "), "{client}");
+    let codec = file(&files, "codec.gen.ts");
+    assert!(
+        codec.contains(
+            "if (error instanceof AuthClientTypeRefusal) return { variant: \"AuthClient\","
+        ),
+        "{codec}"
+    );
+    assert!(codec.contains("case \"AuthClient\": {"), "{codec}");
+}
+
+/// `Value` and `value` are both the TypeScript type `Value`: the later rule is
+/// renamed, and as an error arm it keeps its declared name on the wire.
+#[test]
+fn rules_with_one_type_name_are_split_but_keep_their_wire_variant() {
+    let mut input = input_for("typescript");
+    input.csil_spec = spec_with_login_error(
+        "value",
+        vec![
+            group_rule("Value", vec![field("a", builtin("int"), false)], vec![]),
+            group_rule("value", vec![field("b", builtin("text"), false)], vec![]),
+        ],
+    );
+    let files = generate_files(&input).expect("generate");
+    let types = file(&files, "types.gen.ts");
+    assert!(types.contains("export interface Value {"), "{types}");
+    assert!(types.contains("export interface ValueType {"), "{types}");
+    let codec = file(&files, "codec.gen.ts");
+    assert!(
+        codec.contains("if (error instanceof ValueTypeRefusal) return { variant: \"value\","),
+        "{codec}"
+    );
+    assert!(codec.contains("case \"value\": {"), "{codec}");
+}
+
+/// The wasm output carries one warning for each renamed rule, so the CLI can tell
+/// the user why a generated type has another name.
+#[test]
+fn renamed_rules_are_reported_as_warnings() {
+    let mut input = input_for("typescript");
+    input.csil_spec = spec_with_login_error(
+        "value",
+        vec![
+            group_rule("Value", vec![field("a", builtin("int"), false)], vec![]),
+            group_rule("value", vec![field("b", builtin("text"), false)], vec![]),
+            group_rule("Map", vec![field("c", builtin("int"), false)], vec![]),
+        ],
+    );
+    let json = serde_json::to_vec(&input).expect("serialize");
+    let output = crate::process_generation(json.as_ptr(), json.len()).expect("generate");
+    let mut messages: Vec<&str> = output.warnings.iter().map(|w| w.message.as_str()).collect();
+    messages.sort_unstable();
+    assert_eq!(messages.len(), 2, "{messages:?}");
+    assert!(messages[0].starts_with("rule `Map` is generated as `MapType` for typescript"));
+    assert!(messages[1].starts_with("rule `value` is generated as `valueType` for typescript"));
+}
+
 #[test]
 fn client_types_module_option_changes_import_path() {
     let mut input = input_for("typescript-client");
