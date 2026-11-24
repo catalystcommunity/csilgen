@@ -3010,3 +3010,80 @@ fn spec_service_error_yields_to_the_channel_router_only_when_its_shape_differs()
         );
     }
 }
+
+/// `Msg / ServiceError / [* text]` is not an RPC reply (one arm has no variant name),
+/// so `success_type` strips the `ServiceError` half for the `{:ok, _}` type. That
+/// must hold whether the spec's `ServiceError` kept its name or was renamed out of
+/// the channel router's way, while a member renamed for any other reason is a real
+/// payload type and stays.
+#[test]
+fn success_type_drops_service_error_by_declared_name() {
+    let cases = [
+        ("ServiceError", "message", None),
+        ("ServiceError", "detail", None),
+        (
+            "Transport",
+            "message",
+            Some("Csilgen.Generated.TransportType.t()"),
+        ),
+    ];
+    for (error_rule, second_field, kept) in cases {
+        let output = CsilTypeExpression::Choice(vec![
+            CsilTypeExpression::Reference("Msg".to_string()),
+            CsilTypeExpression::Reference(error_rule.to_string()),
+            CsilTypeExpression::Array {
+                element_type: Box::new(CsilTypeExpression::Builtin("text".to_string())),
+                occurrence: None,
+            },
+        ]);
+        let msg = || CsilTypeExpression::Reference("Msg".to_string());
+        let mut input = service_input(
+            "Chat",
+            vec![
+                make_op(
+                    "talk",
+                    "Msg",
+                    msg(),
+                    CsilServiceDirection::Bidirectional,
+                    None,
+                ),
+                make_op(
+                    "ask",
+                    "Msg",
+                    output,
+                    CsilServiceDirection::Unidirectional,
+                    None,
+                ),
+            ],
+            None,
+            "elixir-server",
+        );
+        let text = || CsilTypeExpression::Builtin("text".to_string());
+        let records = [
+            group_input("Msg", vec![bare_entry("body", text())], HashMap::new()),
+            group_input(
+                error_rule,
+                vec![
+                    bare_entry("code", CsilTypeExpression::Builtin("int".to_string())),
+                    bare_entry(second_field, text()),
+                ],
+                HashMap::new(),
+            ),
+        ];
+        for record in records {
+            input.csil_spec.rules.extend(record.csil_spec.rules);
+        }
+        let out = process_generation(input).unwrap();
+        let server = file(&out, "server.gen.ex");
+        let start = server.find("@callback ask(").expect("ask callback");
+        let ok_start = start + server[start..].find("{:ok,").unwrap();
+        let ok_end = ok_start + server[ok_start..].find("{:error,").unwrap();
+        let ok = &server[ok_start..ok_end];
+        assert!(ok.contains("Csilgen.Generated.Msg.t()"), "{ok}");
+        assert!(ok.contains("[String.t()]"), "{ok}");
+        assert!(!ok.contains("ServiceError"), "{ok}");
+        if let Some(member) = kept {
+            assert!(ok.contains(member), "{ok}");
+        }
+    }
+}

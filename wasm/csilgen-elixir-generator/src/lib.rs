@@ -852,7 +852,7 @@ fn first_unary_example(input: &WasmGeneratorInput, config: &ElixirConfig) -> Opt
             if !matches!(op.direction, CsilServiceDirection::Unidirectional) {
                 continue;
             }
-            let success = success_type(op.success_output());
+            let success = success_type(op.success_output(), &input.csil_spec);
             let null_input = is_null_input(&op.input_type);
             if !is_record_ref(&success, &records)
                 || !(null_input || is_record_ref(&op.input_type, &records))
@@ -912,7 +912,7 @@ fn first_channel_example(
             }
             // The router decodes the input; the encoder encodes the success output.
             // Require both to be records for a compiling sample.
-            let success = success_type(op.success_output());
+            let success = success_type(op.success_output(), &input.csil_spec);
             if !is_record_ref(&op.input_type, &records) || !is_record_ref(&success, &records) {
                 continue;
             }
@@ -2484,7 +2484,7 @@ fn generate_clients(input: &WasmGeneratorInput, config: &ElixirConfig) -> Option
     let mut emitted = false;
     for rule in &input.csil_spec.rules {
         if let CsilRuleType::ServiceDef(service) = &rule.rule_type {
-            emit_client_module(&mut content, &rule.name, service, &cx);
+            emit_client_module(&mut content, &rule.name, service, &cx, &input.csil_spec);
             emitted = true;
         }
     }
@@ -2560,6 +2560,7 @@ fn emit_client_module(
     name: &str,
     service: &CsilServiceDefinition,
     cx: &Codec,
+    spec: &csilgen_common::CsilSpecSerialized,
 ) {
     let config = cx.config;
     let records = cx.records;
@@ -2602,7 +2603,7 @@ fn emit_client_module(
             ));
             continue;
         }
-        let success = success_type(op.success_output());
+        let success = success_type(op.success_output(), spec);
         let null_input = is_null_input(&op.input_type);
         let req_ok =
             null_input || op_boundary_expressible(&op.input_type, records, cx.aliases, cx.choices);
@@ -2793,7 +2794,7 @@ fn generate_servers(input: &WasmGeneratorInput, config: &ElixirConfig) -> Option
     let mut emitted = false;
     for rule in &input.csil_spec.rules {
         if let CsilRuleType::ServiceDef(service) = &rule.rule_type {
-            emit_server_module(&mut content, &rule.name, service, config);
+            emit_server_module(&mut content, &rule.name, service, config, &input.csil_spec);
             emitted = true;
         }
     }
@@ -2805,6 +2806,7 @@ fn emit_server_module(
     name: &str,
     service: &CsilServiceDefinition,
     config: &ElixirConfig,
+    spec: &csilgen_common::CsilSpecSerialized,
 ) {
     let base = service_base(name);
     let module = format!("{}.{base}Server", config.module_root);
@@ -2855,7 +2857,7 @@ fn emit_server_module(
         let ctx = "ctx :: map()".to_string();
         match op.direction {
             CsilServiceDirection::Unidirectional => {
-                let out_ty = map_type(&success_type(op.success_output()), config);
+                let out_ty = map_type(&success_type(op.success_output(), spec), config);
                 let errors = rpc_error_type(op, config);
                 let ret = vec![
                     format!("{{:ok, {out_ty}}}"),
@@ -3669,11 +3671,19 @@ fn entry_default_value(entry: &CsilGroupEntry) -> Option<&CsilLiteralValue> {
 /// Reduce an operation output to its success type by dropping a top-level
 /// `ServiceError` member of a `Res / ServiceError` union — that half is the error
 /// channel of the `{:ok, _} | {:error, _}` return, not part of the typed response.
-fn success_type(type_expr: &CsilTypeExpression) -> CsilTypeExpression {
+/// The member is found by its declared name because `reserved_type_name` can rename
+/// the spec's own `ServiceError` out of the framework's way; any other renamed rule
+/// keeps its own declared name and stays in the union.
+fn success_type(
+    type_expr: &CsilTypeExpression,
+    spec: &csilgen_common::CsilSpecSerialized,
+) -> CsilTypeExpression {
     if let CsilTypeExpression::Choice(choices) = type_expr {
         let kept: Vec<CsilTypeExpression> = choices
             .iter()
-            .filter(|c| !matches!(c, CsilTypeExpression::Reference(n) if n == "ServiceError"))
+            .filter(|c| {
+                !matches!(c, CsilTypeExpression::Reference(n) if spec.declared_name(n) == "ServiceError")
+            })
             .cloned()
             .collect();
         match kept.len() {
