@@ -1032,6 +1032,18 @@ impl WasmGeneratorRuntime {
         spec: &CsilSpec,
         config: &GeneratorConfig,
     ) -> Result<GeneratedFiles> {
+        self.execute_generator_output(generator_name, spec, config)
+            .map(|output| output.files)
+    }
+
+    /// Run a generator and return its files together with its warnings, so a caller
+    /// can tell the user what the generator changed (for example a renamed type).
+    pub fn execute_generator_output(
+        &mut self,
+        generator_name: &str,
+        spec: &CsilSpec,
+        config: &GeneratorConfig,
+    ) -> Result<WasmGeneratorOutput> {
         // Try to load from registry if not already loaded
         if !self.generators.contains_key(generator_name) {
             if self.registry.get_generator(generator_name).is_some() {
@@ -1166,7 +1178,7 @@ impl WasmGeneratorRuntime {
             CsilgenError::WasmError(format!("Failed to deserialize generator result: {e}"))
         })?;
 
-        Ok(wasm_output.files)
+        Ok(wasm_output)
     }
 
     /// Get list of loaded generators

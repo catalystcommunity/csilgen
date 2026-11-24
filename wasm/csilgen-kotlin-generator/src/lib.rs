@@ -189,31 +189,67 @@ const RESERVED_TYPE_NAMES: &[&str] = &[
     "ULong",
 ];
 
-/// The per-service declarations the generator names after a service, which a rule of the
-/// same name would redeclare just like a fixed one.
-fn service_type_names(spec: &csilgen_common::CsilSpecSerialized) -> Vec<String> {
-    spec.rules
-        .iter()
-        .filter(|rule| matches!(rule.rule_type, CsilRuleType::ServiceDef(_)))
-        .flat_map(|rule| {
-            let base = service_base(&rule.name);
-            [
-                format!("{base}Client"),
-                format!("{base}AsyncClient"),
-                format!("{}WireIds", pascal_case(&rule.name)),
-            ]
-        })
-        .collect()
+/// Inline composites are hoisted with these options both for generation and for working
+/// out the derived names, so the two see the same rules.
+const HOIST_OPTIONS: HoistOptions = HoistOptions {
+    hoist_all_literal_choices: true,
+};
+
+/// The top-level declarations the generator names after another rule, service or
+/// operation, which a rule of the same PascalCase name would redeclare. `spec` must be
+/// hoisted already, because a hoisted rule's derived names are only known after hoisting.
+fn derived_type_names(spec: &csilgen_common::CsilSpecSerialized) -> Vec<String> {
+    let mut names = Vec::new();
+    for rule in &spec.rules {
+        let class = pascal_case(&rule.name);
+        match &rule.rule_type {
+            CsilRuleType::ServiceDef(_) => {
+                let base = service_base(&rule.name);
+                names.push(format!("{base}Client"));
+                names.push(format!("{base}AsyncClient"));
+                names.push(format!("{class}WireIds"));
+            }
+            CsilRuleType::TypeDef(CsilTypeExpression::Choice(choices))
+                if matches!(classify_choice(choices), ChoiceKind::Union) =>
+            {
+                names.extend((0..choices.len()).map(|i| format!("{class}Variant{i}")));
+            }
+            CsilRuleType::TypeChoice(choices) => {
+                names.extend((1..=choices.len()).map(|i| format!("{class}Arm{i}")));
+            }
+            CsilRuleType::GroupChoice(choices) => {
+                names.extend(
+                    (1..=choices.len()).map(|i| pascal_case(&format!("{}Choice{i}", rule.name))),
+                );
+            }
+            _ => {}
+        }
+    }
+    for (_, _, arms) in spec.rpc_operations() {
+        for arm in arms.iter().skip(1) {
+            names.push(format!(
+                "{}Refusal",
+                pascal_case(arm.rpc_variant_name().unwrap())
+            ));
+        }
+    }
+    names
 }
 
-fn rename_reserved_types(
-    spec: &csilgen_common::CsilSpecSerialized,
-) -> csilgen_common::CsilSpecSerialized {
-    let service_types = service_type_names(spec);
-    rename_reserved(spec, |name| {
+/// The spec as the generator emits it: rules whose class would clash with a fixed name,
+/// a derived name, or another rule's class are renamed, and inline composites are
+/// hoisted. The renames are kept in `declared_names` for the wire and the warnings.
+fn prepare_spec(spec: &csilgen_common::CsilSpecSerialized) -> csilgen_common::CsilSpecSerialized {
+    let mut probe = spec.clone();
+    probe.supply_implicit_service_error();
+    let derived = derived_type_names(&hoist_inline_composites(&probe, HOIST_OPTIONS));
+    let reserved = rename_reserved(spec, |name| {
         let class = pascal_case(name);
-        RESERVED_TYPE_NAMES.contains(&class.as_str()) || service_types.contains(&class)
-    })
+        RESERVED_TYPE_NAMES.contains(&class.as_str()) || derived.contains(&class)
+    });
+    let mut distinct = csilgen_common::rename_ident_collisions(&reserved, pascal_case);
+    distinct.supply_implicit_service_error();
+    hoist_inline_composites(&distinct, HOIST_OPTIONS)
 }
 
 fn process_generation(mut input: WasmGeneratorInput) -> Result<WasmGeneratorOutput, i32> {
@@ -225,19 +261,12 @@ fn process_generation(mut input: WasmGeneratorInput) -> Result<WasmGeneratorOutp
     // opaque `Any`/`CborValue.CNull` fallback), so an ALL-literal choice is hoisted
     // too (`hoist_all_literal_choices: true`) — unlike TypeScript/Go, Kotlin has no
     // bare-inline-enum rendering to fall back to; every choice needs a name.
-    input.csil_spec = rename_reserved_types(&input.csil_spec);
-    input.csil_spec.supply_implicit_service_error();
-    input.csil_spec = hoist_inline_composites(
-        &input.csil_spec,
-        HoistOptions {
-            hoist_all_literal_choices: true,
-        },
-    );
+    input.csil_spec = prepare_spec(&input.csil_spec);
     let config = KotlinConfig::from_options(&input.config.options);
     // Validate `client_style` early so a bad value fails the whole run regardless of the
     // requested surface, mirroring the TypeScript generator's option validation.
     let style = client_style(&input.config.options).map_err(|_| error_codes::GENERATION_ERROR)?;
-    let mut warnings = Vec::new();
+    let mut warnings = csilgen_common::rename_warnings(&input.csil_spec, &input.config.target);
     let mut files = Vec::new();
 
     let surface = match input.config.target.as_str() {
@@ -6295,5 +6324,82 @@ mod tests {
             codec.contains("RpcReply(\"Transport\", CsilCbor.encode(refusal.value.toCborValue()))")
         );
         assert!(!codec.contains("\"TransportType\""));
+    }
+
+    /// A service whose `fetch` op returns `Ok` or the error arm `err`, with every rule a
+    /// one-field record.
+    fn rpc_rules(names: &[&str], err: &str) -> Vec<CsilRule> {
+        let svc = CsilServiceDefinition {
+            operations: vec![op(
+                "fetch",
+                reference("Ok"),
+                CsilTypeExpression::Choice(vec![reference("Ok"), reference(err)]),
+                CsilServiceDirection::Unidirectional,
+                None,
+            )],
+            wire_id: None,
+        };
+        let mut rules: Vec<CsilRule> = names
+            .iter()
+            .map(|name| {
+                rule(
+                    name,
+                    CsilRuleType::GroupDef(CsilGroupExpression {
+                        entries: vec![entry("code", builtin("uint"), None)],
+                    }),
+                )
+            })
+            .collect();
+        rules.push(rule("Svc", CsilRuleType::ServiceDef(svc)));
+        rules
+    }
+
+    /// `FooRefusal` is the class the codec declares for the error arm `Foo`, so a rule of
+    /// that name would redeclare it; it is renamed, and `Foo` keeps its name and its wire
+    /// variant.
+    #[test]
+    fn rule_named_like_a_derived_refusal_is_renamed() {
+        let out = process_generation(spec(
+            "kotlin",
+            rpc_rules(&["Ok", "Foo", "FooRefusal"], "Foo"),
+        ))
+        .unwrap();
+        let types = content(&out, "Types.kt");
+        assert!(types.contains("data class FooRefusalType("));
+        assert!(!types.contains("data class FooRefusal("));
+        let codec = content(&out, "Codec.kt");
+        assert!(codec.contains("class FooRefusal(val value: Foo) : RuntimeException(\"Foo\")"));
+        assert!(
+            codec.contains(
+                "\"Foo\" -> throw FooRefusal(fooFromCborValue(CsilCbor.decode(payload)))"
+            )
+        );
+    }
+
+    /// `Value` and `value` are both the Kotlin class `Value`; the later one is renamed, and
+    /// as an error arm it still names itself `value` on the wire. The rename is reported.
+    #[test]
+    fn rules_with_the_same_class_name_are_told_apart_and_reported() {
+        let out = process_generation(spec(
+            "kotlin",
+            rpc_rules(&["Ok", "Value", "value"], "value"),
+        ))
+        .unwrap();
+        let types = content(&out, "Types.kt");
+        assert!(types.contains("data class Value("));
+        assert!(types.contains("data class ValueType("));
+        let codec = content(&out, "Codec.kt");
+        assert!(codec.contains(
+            "\"value\" -> throw ValueTypeRefusal(valueTypeFromCborValue(CsilCbor.decode(payload)))"
+        ));
+        let renames: Vec<_> = out
+            .warnings
+            .iter()
+            .filter(|w| {
+                w.message
+                    .contains("rule `value` is generated as `valueType` for kotlin")
+            })
+            .collect();
+        assert_eq!(renames.len(), 1, "{:?}", out.warnings);
     }
 }

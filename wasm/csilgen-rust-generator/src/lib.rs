@@ -1901,27 +1901,61 @@ impl<'a> RustCodeGenerator<'a> {
             }
         });
         let legal = csilgen_common::rename_rules(&spliced, &renames);
-        let clients: HashSet<String> = legal
-            .rules
-            .iter()
-            .filter(|rule| matches!(rule.rule_type, CsilRuleType::ServiceDef(_)))
-            .flat_map(|rule| {
-                let base = Self::service_base(&rule.name);
-                [format!("{base}Client"), format!("{base}AsyncClient")]
-            })
-            .collect();
-        let renamed = csilgen_common::rename_reserved(&legal, |name| {
-            Self::is_reserved(name) || clients.contains(name)
+        let (derived_types, derived_fns) = Self::derived_names(&legal);
+        let reserved = csilgen_common::rename_reserved(&legal, |name| {
+            Self::is_reserved(name)
+                || derived_types.contains(name)
+                || derived_fns.contains(&Self::to_snake_case(name))
         });
+        // A rule keeps its name as written for its type, but its codec functions take
+        // the snake_case form, so two rules with one snake_case name (`Value` and
+        // `value`, `UserId` and `user_id`) clash even when their types do not.
+        let renamed = csilgen_common::rename_ident_collisions(&reserved, Self::to_snake_case);
+        let warnings = csilgen_common::rename_warnings(&renamed, &input.config.target);
         Self {
             spec: Self::hoist_inline(&renamed),
             input,
-            warnings: Vec::new(),
+            warnings,
             type_definitions: HashSet::new(),
             decimal_mapping: DecimalMapping::Csil,
             needs_validation_error: false,
             uses_regex: false,
         }
+    }
+
+    /// The names the generator builds from services and operations: the client
+    /// structs and wire-id modules (compared as written, like a type), and the
+    /// snake_case stems of the per-op codec functions (`encode_<stem>` and
+    /// `decode_<stem>`, compared with a rule's snake_case form, which its own
+    /// codec functions use).
+    fn derived_names(spec: &CsilSpecSerialized) -> (HashSet<String>, HashSet<String>) {
+        let mut types = HashSet::new();
+        let mut fns = HashSet::new();
+        for rule in &spec.rules {
+            let CsilRuleType::ServiceDef(service) = &rule.rule_type else {
+                continue;
+            };
+            let base = Self::service_base(&rule.name);
+            let svc_snake = Self::to_snake_case(&rule.name);
+            types.insert(format!("{base}Client"));
+            types.insert(format!("{base}AsyncClient"));
+            types.insert(format!("{svc_snake}_wire_ids"));
+            for op in &service.operations {
+                let op_snake = Self::to_snake_case(&op.name);
+                if matches!(op.direction, CsilServiceDirection::Unidirectional) {
+                    let stem = format!("{}_{op_snake}", Self::to_snake_case(&base));
+                    fns.insert(format!("{stem}_request"));
+                    fns.insert(format!("{stem}_response"));
+                    fns.insert(format!("{stem}_reply"));
+                    for index in 1..op.rpc_reply_arms().map_or(0, <[_]>::len) {
+                        fns.insert(format!("{stem}_error_{index}"));
+                    }
+                } else {
+                    fns.insert(format!("{svc_snake}_{op_snake}"));
+                }
+            }
+        }
+        (types, fns)
     }
 
     fn is_rust_ident(name: &str) -> bool {
@@ -7684,6 +7718,57 @@ mod tests {
             "{all}"
         );
         assert!(!all.contains("(csil_v: &())"), "{all}");
+    }
+
+    #[test]
+    fn rules_named_like_derived_items_are_renamed() {
+        // `CorndogsClient` is the service's client struct, and the snake_case of
+        // `CorndogsSubmitTaskReply` is the stem of the op's `encode_..._reply`.
+        let mut input = make_unary_service_input("rust-client");
+        for name in ["CorndogsClient", "CorndogsSubmitTaskReply"] {
+            input.csil_spec.rules.push(group_rule(name, "x", "text"));
+        }
+        let files = RustCodeGenerator::new(&input).generate().unwrap();
+        let all: String = files.iter().map(|f| f.content.as_str()).collect();
+        assert!(all.contains("pub struct CorndogsClientType {"), "{all}");
+        assert!(
+            all.contains("pub struct CorndogsSubmitTaskReplyType {"),
+            "{all}"
+        );
+        assert!(
+            all.contains("pub struct CorndogsClient<T: Transport>"),
+            "{all}"
+        );
+    }
+
+    #[test]
+    fn rules_with_one_snake_case_name_are_renamed_and_warned() {
+        // `Value` and `value` are distinct Rust types but share `csil_enc_value`.
+        let mut input = make_unary_service_input("rust");
+        input.csil_spec.rules.push(group_rule("Value", "a", "text"));
+        input.csil_spec.rules.push(group_rule("value", "b", "int"));
+        for rule in &mut input.csil_spec.rules {
+            if let CsilRuleType::ServiceDef(service) = &mut rule.rule_type {
+                service.operations[0].output_type = CsilTypeExpression::Choice(vec![
+                    CsilTypeExpression::Reference("SubmitTaskResponse".to_string()),
+                    CsilTypeExpression::Reference("value".to_string()),
+                ]);
+            }
+        }
+        let mut generator = RustCodeGenerator::new(&input);
+        let files = generator.generate().unwrap();
+        let all: String = files.iter().map(|f| f.content.as_str()).collect();
+        assert!(all.contains("pub struct Value {"), "{all}");
+        assert!(all.contains("pub struct valueType {"), "{all}");
+        assert!(all.contains("fn csil_enc_value_type("), "{all}");
+        assert!(all.contains("Err(value) => (\"value\", "), "{all}");
+        assert!(
+            generator.warnings.iter().any(|w| w
+                .message
+                .contains("rule `value` is generated as `valueType` for rust")),
+            "{:?}",
+            generator.warnings
+        );
     }
 
     #[test]

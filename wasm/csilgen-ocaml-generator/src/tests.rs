@@ -2435,3 +2435,150 @@ fn reserved_rule_name_is_renamed_but_keeps_its_wire_variant() {
             .contains("| Codec.Result_type_refusal value -> Error (`Result_type value)")
     );
 }
+
+/// One `Svc.get: Holder -> Holder / <error_arm>` spec over the given records.
+fn clash_spec(records: Vec<CsilRule>, error_arm: &str) -> CsilSpecSerialized {
+    let mut rules = records;
+    rules.push(CsilRule {
+        name: "Svc".into(),
+        rule_type: CsilRuleType::ServiceDef(CsilServiceDefinition {
+            operations: vec![CsilServiceOperation {
+                name: "get".into(),
+                input_type: CsilTypeExpression::Reference("Holder".into()),
+                output_type: CsilTypeExpression::Choice(vec![
+                    CsilTypeExpression::Reference("Holder".into()),
+                    CsilTypeExpression::Reference(error_arm.into()),
+                ]),
+                direction: CsilServiceDirection::Unidirectional,
+                position: pos(),
+                doc_comments: vec![],
+                wire_id: None,
+            }],
+            wire_id: None,
+        }),
+        position: pos(),
+        doc_comments: vec![],
+    });
+    CsilSpecSerialized {
+        rules,
+        source_content: None,
+        service_count: 1,
+        fields_with_metadata_count: 0,
+        declared_names: Default::default(),
+    }
+}
+
+fn reference(name: &str) -> CsilTypeExpression {
+    CsilTypeExpression::Reference(name.into())
+}
+
+fn content(files: &[GeneratedFile], path: &str) -> String {
+    files
+        .iter()
+        .find(|f| f.path == path)
+        .map(|f| f.content.clone())
+        .unwrap()
+}
+
+#[test]
+fn rule_named_like_a_derived_helper_is_renamed() {
+    // `SvcGetRequest`'s own codec would be `encode_svc_get_request`, which the
+    // per-op request helper of `Svc.get` shadows; `FooBytes`'s codec would be
+    // `encode_foo_bytes`, which is `Foo`'s bytes wrapper.
+    let spec = clash_spec(
+        vec![
+            group_rule("Foo", vec![bare_entry("a", builtin("uint"))]),
+            group_rule("FooBytes", vec![bare_entry("b", builtin("text"))]),
+            group_rule("SvcGetRequest", vec![bare_entry("c", builtin("uint"))]),
+            group_rule(
+                "Holder",
+                vec![
+                    bare_entry("fb", reference("FooBytes")),
+                    bare_entry("r", reference("SvcGetRequest")),
+                ],
+            ),
+        ],
+        "SvcGetRequest",
+    );
+    let files = generate_ocaml(&spec, &package_config("ocaml-client", None)).unwrap();
+    let types = content(&files, "types.ml");
+    assert!(types.contains("and foo_bytes_type = {") || types.contains("type foo_bytes_type = {"));
+    assert!(types.contains("svc_get_request_type = {"));
+    assert!(types.contains("fb : foo_bytes_type;"));
+    let codec = content(&files, "codec.ml");
+    assert!(codec.contains("let encode_foo_bytes (v : foo) : bytes"));
+    assert!(codec.contains("encode_svc_get_request_type (v : svc_get_request_type)"));
+    assert!(
+        codec.contains("| Error (`Svc_get_request_type value) -> (\"SvcGetRequest\", Cbor.encode")
+    );
+    assert!(codec.contains("| \"Svc\", \"get\", Some \"SvcGetRequest\" ->"));
+}
+
+#[test]
+fn rules_with_the_same_ocaml_name_are_told_apart() {
+    let spec = clash_spec(
+        vec![
+            group_rule("Value", vec![bare_entry("a", builtin("uint"))]),
+            group_rule("value", vec![bare_entry("b", builtin("text"))]),
+            group_rule("user_id", vec![bare_entry("c", builtin("uint"))]),
+            group_rule("UserId", vec![bare_entry("d", builtin("text"))]),
+            group_rule(
+                "Holder",
+                vec![
+                    bare_entry("v1", reference("Value")),
+                    bare_entry("v2", reference("value")),
+                    bare_entry("u1", reference("user_id")),
+                    bare_entry("u2", reference("UserId")),
+                ],
+            ),
+        ],
+        "value",
+    );
+    let files = generate_ocaml(&spec, &package_config("ocaml-client", None)).unwrap();
+    let types = content(&files, "types.ml");
+    assert!(types.contains("v_1 : value;"));
+    assert!(types.contains("v_2 : value_type;"));
+    assert!(types.contains("u_1 : user_id;"));
+    assert!(types.contains("u_2 : user_id_type;"));
+    let codec = content(&files, "codec.ml");
+    assert!(codec.contains("| Error (`Value_type value) -> (\"value\", Cbor.encode"));
+    assert!(codec.contains("| \"Svc\", \"get\", Some \"value\" ->"));
+}
+
+#[test]
+fn renamed_rules_are_reported_as_warnings() {
+    let spec = clash_spec(
+        vec![
+            group_rule("Value", vec![bare_entry("a", builtin("uint"))]),
+            group_rule("value", vec![bare_entry("b", builtin("text"))]),
+            group_rule("Result", vec![bare_entry("c", builtin("uint"))]),
+            group_rule(
+                "Holder",
+                vec![
+                    bare_entry("v1", reference("Value")),
+                    bare_entry("v2", reference("value")),
+                    bare_entry("r", reference("Result")),
+                ],
+            ),
+        ],
+        "value",
+    );
+    let input = WasmGeneratorInput {
+        csil_spec: spec,
+        config: package_config("ocaml", None),
+        generator_metadata: meta(),
+    };
+    let out = generate_output(&input).unwrap();
+    let messages: Vec<&str> = out.warnings.iter().map(|w| w.message.as_str()).collect();
+    assert_eq!(messages.len(), 2, "{messages:?}");
+    assert!(
+        messages
+            .iter()
+            .any(|m| m.contains("`value` is generated as `valueType` for ocaml"))
+    );
+    assert!(
+        messages
+            .iter()
+            .any(|m| m.contains("`Result` is generated as `ResultType` for ocaml"))
+    );
+}

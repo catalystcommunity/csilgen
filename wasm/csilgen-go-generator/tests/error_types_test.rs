@@ -4,7 +4,7 @@
 //! package with a fake transport. They skip when `go` is not on PATH.
 
 use csilgen_common::*;
-use csilgen_go_generator::generate_go_files;
+use csilgen_go_generator::{generate_go_files, generate_go_output};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -417,4 +417,91 @@ fn client_errors_are_the_same_for_every_operation() {
         "package api\n\nimport (\n\t\"context\"\n\t\"errors\"\n\t\"testing\"\n\t\"time\"\n)\n{MEMBER_TEST_GO}{CLIENT_TEST_GO}"
     );
     assert_go_test_passes(&stage("go-client", &test));
+}
+
+/// A rule that takes a name the package derives from a service or op, and two
+/// rules that become one Go identifier, are renamed with a warning each. The
+/// package builds, and the reply variant keeps the declared name.
+#[test]
+fn derived_names_and_case_collisions_are_renamed_with_a_warning() {
+    let mut options = HashMap::new();
+    options.insert("package_name".to_string(), serde_json::json!("api"));
+    let rules = vec![
+        record("Req", vec![entry("id", builtin("text"))]),
+        record("Ok", vec![entry("value", builtin("text"))]),
+        record("Value", vec![entry("a", builtin("text"))]),
+        record("value", vec![entry("b", builtin("int"))]),
+        record("GateClient", vec![entry("c", builtin("text"))]),
+        record("GateRefuseReply", vec![entry("d", builtin("text"))]),
+        record(
+            "Holder",
+            vec![
+                entry("v", reference("Value")),
+                entry("w", reference("value")),
+            ],
+        ),
+        service(
+            "Gate",
+            "refuse",
+            CsilTypeExpression::Choice(vec![reference("Ok"), reference("value")]),
+        ),
+    ];
+    let input = WasmGeneratorInput {
+        csil_spec: CsilSpecSerialized {
+            rules,
+            source_content: None,
+            service_count: 1,
+            fields_with_metadata_count: 0,
+            declared_names: Default::default(),
+        },
+        config: GeneratorConfig {
+            target: "go-client".to_string(),
+            output_dir: "/tmp".to_string(),
+            options,
+        },
+        generator_metadata: GeneratorMetadata {
+            name: "go-generator".to_string(),
+            version: "1.0.0".to_string(),
+            description: "Test generator".to_string(),
+            target: "go".to_string(),
+            capabilities: vec![GeneratorCapability::Services],
+            author: None,
+            homepage: None,
+        },
+    };
+    let output = generate_go_output(input).expect("generation ok");
+    let renamed: Vec<&str> = output.warnings.iter().map(|w| w.message.as_str()).collect();
+    for (from, to) in [
+        ("value", "valueType"),
+        ("GateClient", "GateClientType"),
+        ("GateRefuseReply", "GateRefuseReplyType"),
+    ] {
+        assert!(
+            renamed
+                .iter()
+                .any(|m| m.contains(&format!("`{from}` is generated as `{to}`"))),
+            "{renamed:?}"
+        );
+    }
+    assert_eq!(renamed.len(), 3, "{renamed:?}");
+    let codec = output
+        .files
+        .iter()
+        .find(|f| f.path == "codec.gen.go")
+        .unwrap();
+    assert!(codec.content.contains("case \"value\":"));
+    assert!(codec.content.contains("RPCApplicationError[valueType]"));
+    if !have_go() {
+        eprintln!("skipping the go build: no go on PATH");
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("csilgen-go-derived-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    for file in &output.files {
+        std::fs::write(dir.join(&file.path), &file.content).unwrap();
+    }
+    std::fs::write(dir.join("go.mod"), "module example.com/api\n\ngo 1.22\n").unwrap();
+    std::fs::write(dir.join("build_test.go"), "package api\n").unwrap();
+    assert_go_test_passes(&dir);
 }

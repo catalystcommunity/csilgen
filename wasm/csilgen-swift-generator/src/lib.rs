@@ -89,7 +89,7 @@ fn process_generation(input_ptr: *const u8, input_len: usize) -> Result<WasmGene
     let input: WasmGeneratorInput =
         serde_json::from_str(input_str).map_err(|_| error_codes::SERIALIZATION_ERROR)?;
 
-    let files = build_files(&input)?;
+    let (files, warnings) = build_files_with_warnings(&input)?;
     let total_size: usize = files.iter().map(|f| f.content.len()).sum();
     let stats = GenerationStats {
         files_generated: files.len(),
@@ -101,7 +101,7 @@ fn process_generation(input_ptr: *const u8, input_len: usize) -> Result<WasmGene
     };
     Ok(WasmGeneratorOutput {
         files,
-        warnings: Vec::<GeneratorWarning>::new(),
+        warnings,
         stats,
     })
 }
@@ -227,13 +227,14 @@ const RESERVED_TYPE_NAMES: &[&str] = &[
     "Hasher",
     "CaseIterable",
     "FloatingPointSign",
-    "UTF8",
     "Regex",
 ];
 
 /// Besides the fixed names, the package derives `<Service>Client`,
-/// `<Service>AsyncClient`, `<Service>WireID` and `<ErrorArm>Refusal` from schema
-/// names, so a rule that spells one of those out would be a redeclaration.
+/// `<Service>AsyncClient` and `<ErrorArm>Refusal` from schema names, so a rule that
+/// spells one of those out would be a redeclaration. `<Service>WireID` and `UTF8`
+/// need no entry: `swift_type_name` turns a rule spelled that way into `...WireId`
+/// and `Utf8`.
 fn reserved_type_name(spec: &CsilSpecSerialized) -> impl Fn(&str) -> bool {
     let mut derived = std::collections::HashSet::new();
     for rule in &spec.rules {
@@ -241,7 +242,6 @@ fn reserved_type_name(spec: &CsilSpecSerialized) -> impl Fn(&str) -> bool {
             let base = service_base(&rule.name);
             derived.insert(format!("{base}Client"));
             derived.insert(format!("{base}AsyncClient"));
-            derived.insert(format!("{}WireID", swift_type_name(&rule.name)));
         }
     }
     for (_, _, arms) in spec.rpc_operations() {
@@ -257,7 +257,21 @@ fn reserved_type_name(spec: &CsilSpecSerialized) -> impl Fn(&str) -> bool {
     }
 }
 
+/// Renames every rule whose Swift type name is reserved, derived from another
+/// rule, or equal to another rule's (`Value` and `value`, `user_id` and `UserId`).
+fn rename_for_swift(spec: &CsilSpecSerialized) -> CsilSpecSerialized {
+    let reserved = csilgen_common::rename_reserved(spec, reserved_type_name(spec));
+    csilgen_common::rename_ident_collisions(&reserved, swift_type_name)
+}
+
+#[cfg(test)]
 fn build_files(input: &WasmGeneratorInput) -> Result<Vec<GeneratedFile>, i32> {
+    build_files_with_warnings(input).map(|(files, _)| files)
+}
+
+fn build_files_with_warnings(
+    input: &WasmGeneratorInput,
+) -> Result<(Vec<GeneratedFile>, Vec<GeneratorWarning>), i32> {
     let surface = match input.config.target.as_str() {
         "swift" | "swift-server" => Surface::Server,
         "swift-client" => Surface::Client,
@@ -278,10 +292,11 @@ fn build_files(input: &WasmGeneratorInput) -> Result<Vec<GeneratedFile>, i32> {
     // position, so leaving one inline was never an option here (unlike TypeScript,
     // which renders a bare-literal enum in place). See
     // `csilgen_common::hoist_inline_composites`.
+    let warnings;
     let hoisted = {
         let mut cloned = input.clone();
-        let renamed =
-            csilgen_common::rename_reserved(&input.csil_spec, reserved_type_name(&input.csil_spec));
+        let renamed = rename_for_swift(&input.csil_spec);
+        warnings = csilgen_common::rename_warnings(&renamed, &input.config.target);
         cloned.csil_spec = csilgen_common::hoist_inline_composites(
             &renamed,
             csilgen_common::HoistOptions {
@@ -400,7 +415,7 @@ fn build_files(input: &WasmGeneratorInput) -> Result<Vec<GeneratedFile>, i32> {
         }
     }
 
-    Ok(files)
+    Ok((files, warnings))
 }
 
 /// A Swift dictionary key must be `Hashable`. Records, tagged unions, and tuples are

@@ -846,6 +846,7 @@ status 1 for a warning or an error.
 | `lint_zero_minimum` | warn | A minimum length or item count is zero. |
 | `lint_empty_service` | warn | A service has no operations. |
 | `lint_nesting_depth` | warn | A type exceeds five levels of nesting. |
+| `lint_name_collisions` | warn | Two rule names differ only in case, `_` or `-`, such as `Value` and `value`. Generators rename the later rule to `<Name>Type` where both names become one identifier. |
 
 ## Code Generation
 

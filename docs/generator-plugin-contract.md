@@ -401,6 +401,15 @@ reference to it. It records the name from the CSIL source in
 generator writes `spec.declared_name(..)` for a variant string, and the renamed
 name for an identifier. The CLI sends `declared_names` empty.
 
+A generator also renames a rule that takes a name the generator builds from
+another rule (`<Service>Client`, `<ErrorArm>Refusal`), and, with
+`csilgen_common::rename_ident_collisions`, a rule whose identifier equals the
+identifier of an earlier rule (`Value` and `value`). The first rule keeps its
+name. For each renamed rule, the generator returns one warning from
+`csilgen_common::rename_warnings`, and the CLI prints it on stderr. `csilgen
+lint` also warns about rule names that differ only in case, `_` or `-`
+(`lint_name_collisions`).
+
 ## 5. Minimal walkthrough
 
 Two starting points, both verified to build and run against the actual host:

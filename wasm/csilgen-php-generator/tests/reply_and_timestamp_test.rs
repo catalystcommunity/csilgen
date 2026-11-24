@@ -461,3 +461,132 @@ echo "OK\n";
         String::from_utf8_lossy(&run.stderr)
     );
 }
+
+/// Write `files` beside a driver that loads the transports library, run it with
+/// php, and require it to print `OK`. Skips when php is not on PATH.
+fn run_php_driver(files: &[GeneratedFile], label: &str, body: &str) {
+    if !have_php() {
+        eprintln!("skipping: no php on PATH");
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("csilgen-php-{label}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut script = String::from("<?php\n");
+    for lib in ["Errors", "CBOR"] {
+        script.push_str(&format!(
+            "require_once {:?};\n",
+            transport_src()
+                .join(format!("{lib}.php"))
+                .display()
+                .to_string()
+        ));
+    }
+    for f in files {
+        std::fs::write(dir.join(&f.path), &f.content).unwrap();
+        script.push_str(&format!("require_once __DIR__ . '/{}';\n", f.path));
+    }
+    script.push_str(body);
+    let path = dir.join("driver.php");
+    std::fs::write(&path, &script).unwrap();
+    let run = Command::new("php").arg(&path).output().expect("run php");
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        run.status.success() && stdout.contains("OK"),
+        "{label} driver failed:\n{stdout}\n{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+}
+
+/// `echo_spec(true)` plus a `FAULT` rule used as the error arm. PHP class names
+/// are case-insensitive, so `FAULT` is the class `Fault` a second time.
+fn case_collision_spec() -> CsilSpecSerialized {
+    let mut spec = echo_spec(true);
+    spec.rules.push(group_rule("FAULT", "reason", "text"));
+    for rule in &mut spec.rules {
+        if let CsilRuleType::ServiceDef(def) = &mut rule.rule_type {
+            def.operations[0].output_type =
+                CsilTypeExpression::Choice(vec![reference("Pong"), reference("FAULT")]);
+        }
+    }
+    spec
+}
+
+#[test]
+fn rules_with_the_same_class_are_renamed_and_keep_their_wire_variant() {
+    let files =
+        generate_php_code_from_serialized(&case_collision_spec(), &config("php-server", false))
+            .unwrap();
+    let types = file(&files, "types.php");
+    assert!(types.contains("class Fault\n"));
+    assert!(types.contains("class FaultType\n"));
+    run_php_driver(
+        &files,
+        "case-collision",
+        r#"
+use Csilgen\Generated\{Codec, Fault, FaultType, FaultTypeRefusal};
+
+$reply = Codec::encodePingerPingReply(function () {
+    throw new FaultTypeRefusal(new FaultType(['reason' => 'no']));
+});
+if ($reply['variant'] !== 'FAULT') throw new LogicException('variant ' . $reply['variant']);
+try {
+    Codec::resolveRpcReply('Pinger', 'ping', $reply['variant'], $reply['payload']);
+    throw new LogicException('missing refusal');
+} catch (FaultTypeRefusal $e) {
+    if ($e->value->reason !== 'no') throw new LogicException('refusal value');
+}
+if (Codec::decodeFault(Codec::encodeFault(new Fault(['code' => 3])))->code !== 3) throw new LogicException('Fault');
+echo "OK\n";
+"#,
+    );
+}
+
+/// Records named like the client class and the reply codec stem the generator
+/// derives from the service and its operation are renamed.
+#[test]
+fn rules_named_like_derived_names_are_renamed() {
+    let mut spec = echo_spec(true);
+    spec.rules.insert(0, group_rule("PingerClient", "a", "int"));
+    spec.rules
+        .insert(0, group_rule("PingerPingReply", "a", "int"));
+    let files = generate_php_code_from_serialized(&spec, &config("php-client", false)).unwrap();
+    assert!(file(&files, "types.php").contains("class PingerClientType\n"));
+    assert!(file(&files, "types.php").contains("class PingerPingReplyType\n"));
+    run_php_driver(
+        &files,
+        "derived",
+        r#"
+use Csilgen\Generated\{Codec, PingerClientType, PingerPingReplyType};
+
+if (Codec::decodePingerClientType(Codec::encodePingerClientType(new PingerClientType(['a' => 1])))->a !== 1) throw new LogicException('client');
+if (Codec::decodePingerPingReplyType(Codec::encodePingerPingReplyType(new PingerPingReplyType(['a' => 2])))->a !== 2) throw new LogicException('reply');
+echo "OK\n";
+"#,
+    );
+}
+
+#[test]
+fn renamed_rules_are_reported_as_warnings() {
+    let input = WasmGeneratorInput {
+        csil_spec: case_collision_spec(),
+        config: config("php-server", false),
+        generator_metadata: GeneratorMetadata {
+            name: "php-generator".to_string(),
+            version: "0".to_string(),
+            description: String::new(),
+            target: "php".to_string(),
+            capabilities: Vec::new(),
+            author: None,
+            homepage: None,
+        },
+    };
+    let output = csilgen_php_generator::run_generation(&input).unwrap();
+    assert_eq!(output.warnings.len(), 1, "{:?}", output.warnings);
+    assert!(
+        output.warnings[0]
+            .message
+            .contains("rule `FAULT` is generated as `FAULTType` for php-server")
+    );
+}

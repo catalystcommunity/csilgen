@@ -166,6 +166,7 @@ struct FileLintConfig<'a> {
     zero_minimum: Option<LintSeverity>,
     empty_service: Option<LintSeverity>,
     nesting_depth: Option<LintSeverity>,
+    name_collisions: Option<LintSeverity>,
 }
 
 impl<'a> FileLintConfig<'a> {
@@ -226,6 +227,7 @@ impl<'a> FileLintConfig<'a> {
                 "lint_nesting_depth",
                 base.check_complexity.then_some(LintSeverity::Warning),
             ),
+            name_collisions: policy("lint_name_collisions", warn),
         }
     }
 }
@@ -243,6 +245,10 @@ pub fn lint_spec(spec: &CsilSpec, config: &LintConfig) -> Result<LintResult> {
     // Top-level types can be public entry points. Only check local use on request.
     if let Some(severity) = config.unused_rules {
         check_unused_rules(spec, severity, &mut result);
+    }
+
+    if let Some(severity) = config.name_collisions {
+        check_name_collisions(spec, severity, &mut result);
     }
 
     Ok(result)
@@ -572,6 +578,40 @@ fn lint_group_entry_with_config(
 
     // Lint the value type
     lint_type_expression_with_config(&entry.value_type, rule_name, result, config);
+}
+
+/// Rule names that differ only in case, `_` or `-` become the same identifier in
+/// most target languages, so a generator renames the later rule to `<Name>Type`.
+/// The warning lets the author choose distinct names instead.
+fn check_name_collisions(spec: &CsilSpec, severity: LintSeverity, result: &mut LintResult) {
+    let mut first: std::collections::HashMap<String, &str> = std::collections::HashMap::new();
+    for rule in &spec.rules {
+        let key: String = rule
+            .name
+            .chars()
+            .filter(|c| *c != '_' && *c != '-')
+            .flat_map(char::to_lowercase)
+            .collect();
+        match first.get(&key) {
+            Some(earlier) => result.add_issue_with_suggestion(
+                severity,
+                rule.name.clone(),
+                format!(
+                    "Rule name differs from '{earlier}' only in case, '_' or '-'; generators \
+                     rename this rule to '{}Type' where the two names become one identifier",
+                    rule.name
+                ),
+                format!(
+                    "Give '{}' a name that differs from '{earlier}' in letters",
+                    rule.name
+                ),
+                false,
+            ),
+            None => {
+                first.insert(key, &rule.name);
+            }
+        }
+    }
 }
 
 fn check_unused_rules(spec: &CsilSpec, severity: LintSeverity, result: &mut LintResult) {
@@ -1229,6 +1269,37 @@ service Api { hello: Req -> Resp }";
         let result = lint_spec(&spec, &config).unwrap();
         assert_eq!(result.warning_count, 1);
         assert_eq!(result.issues[0].rule_name, "Root");
+    }
+
+    #[test]
+    fn rule_names_that_differ_only_in_case_or_separators_warn() {
+        let schema = "Value = { id: int }
+ValueRef = { v: Value }
+UserId = text
+User_Id = text
+Other = text";
+        let spec = crate::parse_csil(schema).unwrap();
+        let result = lint_spec(&spec, &LintConfig::default()).unwrap();
+        let collisions: Vec<_> = result
+            .issues
+            .iter()
+            .filter(|issue| issue.message.contains("only in case"))
+            .collect();
+        assert_eq!(collisions.len(), 1, "{:?}", result.issues);
+        assert_eq!(collisions[0].rule_name, "User_Id");
+        assert!(collisions[0].message.contains("'UserId'"));
+
+        let off = crate::parse_csil(&format!(
+            "options {{ lint_name_collisions: \"off\" }}\n{schema}"
+        ))
+        .unwrap();
+        let result = lint_spec(&off, &LintConfig::default()).unwrap();
+        assert!(
+            !result
+                .issues
+                .iter()
+                .any(|issue| issue.message.contains("only in case"))
+        );
     }
 
     #[test]

@@ -91,7 +91,11 @@ fn process_generation(
     let s = std::str::from_utf8(bytes).map_err(|_| error_codes::INVALID_INPUT)?;
     let input: WasmGeneratorInput =
         serde_json::from_str(s).map_err(|_| error_codes::SERIALIZATION_ERROR)?;
+    run_generation(&input)
+}
 
+/// Generate the files for one wasm request, with one warning per renamed rule.
+pub fn run_generation(input: &WasmGeneratorInput) -> std::result::Result<WasmGeneratorOutput, i32> {
     let files = generate_python_code_from_serialized(&input.csil_spec, &input.config)
         .map_err(|_| error_codes::GENERATION_ERROR)?;
 
@@ -103,9 +107,11 @@ fn process_generation(
         generation_time_ms: 0,
         peak_memory_bytes: None,
     };
+    let warnings: Vec<GeneratorWarning> =
+        csilgen_common::rename_warnings(&prepare_spec(&input.csil_spec), &input.config.target);
     Ok(WasmGeneratorOutput {
         files,
-        warnings: Vec::<GeneratorWarning>::new(),
+        warnings,
         stats,
     })
 }
@@ -373,9 +379,18 @@ pub fn generate_python_code_from_serialized(
     spec: &CsilSpecSerialized,
     config: &GeneratorConfig,
 ) -> Result<GeneratedFiles> {
-    let spec = rename_reserved_python_names(spec);
+    let spec = prepare_spec(spec);
     let mut generator = PythonGenerator::new(config);
     generator.generate(&csilgen_common::hoist_inline_named_numbers(&spec))
+}
+
+/// The spec the generator works on: reserved and derived names renamed first,
+/// then rules whose class names are equal (`user_id` and `UserId`), because the
+/// second class would silently replace the first.
+fn prepare_spec(spec: &CsilSpecSerialized) -> CsilSpecSerialized {
+    csilgen_common::rename_ident_collisions(&rename_reserved_python_names(spec), |name| {
+        name.to_case(Case::Pascal)
+    })
 }
 
 /// Class names the generated modules declare themselves, import unqualified, or
@@ -410,12 +425,18 @@ const RESERVED_TYPE_NAMES: &[&str] = &[
 ];
 
 /// Rename each rule whose class name is reserved, or equals a class the
-/// generator derives from a service or an RPC error arm (`<Base>Client`,
-/// `<Base>AsyncClient`, `<Service>Handlers`, `<Arm>Refusal`), because those are
-/// defined after the star import of `types.py` and hide the record.
+/// generator derives from a service, an RPC error arm, or a group choice
+/// (`<Base>Client`, `<Base>AsyncClient`, `<Service>Handlers`, `<Arm>Refusal`,
+/// `<Choice>Choice<N>`). The service and arm classes are defined after the star
+/// import of `types.py` and hide the record; a choice arm class redefines it.
 fn rename_reserved_python_names(spec: &CsilSpecSerialized) -> CsilSpecSerialized {
     let mut derived = HashSet::new();
     for rule in &spec.rules {
+        if let CsilRuleType::GroupChoice(choices) = &rule.rule_type {
+            for i in 1..=choices.len() {
+                derived.insert(format!("{}Choice{i}", rule.name).to_case(Case::Pascal));
+            }
+        }
         if matches!(rule.rule_type, CsilRuleType::ServiceDef(_)) {
             let service_class = rule.name.to_case(Case::Pascal);
             let base = service_class
@@ -10298,6 +10319,136 @@ except CsilDecodeError:
     pass
 print("ok")
 "#,
+        );
+    }
+
+    /// `reply_arms_spec` plus a `refused` rule, which is the same class as
+    /// `Refused`, used as the error arm in place of `Refused`.
+    fn ident_collision_spec() -> CsilSpecSerialized {
+        let mut spec = reply_arms_spec();
+        spec.rules.push(group_rule_entries(
+            "refused",
+            vec![bare("code", CsilTypeExpression::Builtin("int".to_string()))],
+        ));
+        for rule in &mut spec.rules {
+            if let CsilRuleType::ServiceDef(def) = &mut rule.rule_type {
+                def.operations[0].output_type = CsilTypeExpression::Choice(vec![
+                    CsilTypeExpression::Reference("Pong".to_string()),
+                    CsilTypeExpression::Reference("refused".to_string()),
+                ]);
+            }
+        }
+        spec
+    }
+
+    /// `Refused` and `refused` are both the class `Refused`; the second would
+    /// silently replace the first, so it is renamed and keeps its wire variant.
+    #[test]
+    fn rules_with_the_same_class_are_renamed_and_keep_their_wire_variant() {
+        let mut cfg = create_test_config(false);
+        cfg.target = "python-client".to_string();
+        let files = generate_python_code_from_serialized(&ident_collision_spec(), &cfg).unwrap();
+        let types = &files.iter().find(|f| f.path == "types.py").unwrap().content;
+        assert_eq!(types.matches("class Refused:").count(), 1);
+        assert!(types.contains("class RefusedType:"));
+        run_python_driver(
+            &files,
+            "ident-collision",
+            r#"from pk.codec import encode_echo_ping_reply, resolve_rpc_reply, RefusedTypeRefusal
+from pk.types import Refused, RefusedType
+
+value = RefusedType(code=7)
+def refuse():
+    raise RefusedTypeRefusal(value)
+variant, payload = encode_echo_ping_reply(refuse)
+assert variant == "refused", variant
+try:
+    resolve_rpc_reply("Echo", "ping", variant, payload)
+    raise AssertionError("expected a refusal")
+except RefusedTypeRefusal as refusal:
+    assert refusal.value == value
+assert Refused.from_cbor(Refused(reason="r").to_cbor()) == Refused(reason="r")
+print("ok")
+"#,
+        );
+    }
+
+    /// A record named after a class the generator derives from another rule
+    /// (`<Base>Client`, `<Choice>Choice<N>`) is renamed, so the derived class
+    /// does not replace it.
+    #[test]
+    fn rules_named_like_derived_classes_are_renamed() {
+        let mut spec = reply_arms_spec();
+        let int = || CsilTypeExpression::Builtin("int".to_string());
+        spec.rules
+            .insert(0, group_rule_entries("EchoClient", vec![bare("a", int())]));
+        spec.rules.insert(
+            0,
+            group_rule_entries("ShapeChoice1", vec![bare("a", int())]),
+        );
+        spec.rules.insert(
+            0,
+            CsilRule {
+                name: "Shape".to_string(),
+                rule_type: CsilRuleType::GroupChoice(vec![
+                    CsilGroupExpression {
+                        entries: vec![bare("a", int())],
+                    },
+                    CsilGroupExpression {
+                        entries: vec![bare("b", int())],
+                    },
+                ]),
+                position: create_test_position(),
+                doc_comments: Vec::new(),
+            },
+        );
+        let mut cfg = create_test_config(false);
+        cfg.target = "python-client".to_string();
+        let files = generate_python_code_from_serialized(&spec, &cfg).unwrap();
+        let file = |path: &str| &files.iter().find(|f| f.path == path).unwrap().content;
+        assert_eq!(file("types.py").matches("class ShapeChoice1:").count(), 1);
+        assert!(file("types.py").contains("class ShapeChoice1Type:"));
+        assert!(file("types.py").contains("class EchoClientType:"));
+        run_python_driver(
+            &files,
+            "derived",
+            r#"import pk
+from pk.client import EchoClient
+from pk.types import EchoClientType
+
+assert pk.EchoClientType is EchoClientType
+assert EchoClientType.from_cbor(EchoClientType(a=1).to_cbor()) == EchoClientType(a=1)
+assert EchoClient is not EchoClientType
+print("ok")
+"#,
+        );
+    }
+
+    /// The wasm output carries one warning per renamed rule, naming the
+    /// declared rule and its generated class.
+    #[test]
+    fn renamed_rules_are_reported_as_warnings() {
+        let mut config = create_test_config(false);
+        config.target = "python-client".to_string();
+        let input = WasmGeneratorInput {
+            csil_spec: ident_collision_spec(),
+            config,
+            generator_metadata: GeneratorMetadata {
+                name: "python-generator".to_string(),
+                version: "0".to_string(),
+                description: String::new(),
+                target: "python".to_string(),
+                capabilities: Vec::new(),
+                author: None,
+                homepage: None,
+            },
+        };
+        let output = run_generation(&input).unwrap();
+        assert_eq!(output.warnings.len(), 1, "{:?}", output.warnings);
+        assert!(
+            output.warnings[0]
+                .message
+                .contains("rule `refused` is generated as `refusedType` for python-client")
         );
     }
 }

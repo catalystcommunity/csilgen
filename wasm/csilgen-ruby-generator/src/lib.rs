@@ -98,13 +98,21 @@ fn process_generation(input_ptr: *const u8, input_len: usize) -> Result<WasmGene
     let input: WasmGeneratorInput =
         serde_json::from_str(input_str).map_err(|_| error_codes::SERIALIZATION_ERROR)?;
 
+    run_generation(&input)
+}
+
+/// Generate the files for one wasm request, with one warning per renamed rule.
+pub fn run_generation(input: &WasmGeneratorInput) -> Result<WasmGeneratorOutput, i32> {
     let files = generate_ruby_code_from_serialized(&input.csil_spec, &input.config)?;
     let total_size: usize = files.iter().map(|f| f.content.len()).sum();
     let files_generated = files.len();
 
     Ok(WasmGeneratorOutput {
         files,
-        warnings: Vec::new(),
+        warnings: csilgen_common::rename_warnings(
+            &prepare_spec(&input.csil_spec),
+            &input.config.target,
+        ),
         stats: GenerationStats {
             files_generated,
             total_size_bytes: total_size,
@@ -242,15 +250,20 @@ const RESERVED_TYPE_NAMES: &[&str] = &[
 
 /// Rename each rule whose constant is reserved, or equals a class the generator
 /// derives from a service or an RPC error arm (`<Base>Client`, `<Base>Handlers`,
-/// `<Base>Router`, `CsilCbor::<Arm>Refusal`). A reopened `<Base>Client` replaces
-/// the record's constructor, and `<Arm>Refusal` hides the record in the codec.
+/// `<Base>Router`, `<Base>WireIds`, `CsilCbor::<Arm>Refusal`). A reopened
+/// `<Base>Client` replaces the record's constructor, a `<Base>Router` or
+/// `<Base>WireIds` module cannot reopen the record class, and `<Arm>Refusal`
+/// hides the record in the codec.
 fn rename_reserved_ruby_names(spec: &CsilSpecSerialized) -> CsilSpecSerialized {
     let mut derived = std::collections::HashSet::new();
     for rule in &spec.rules {
-        if matches!(rule.rule_type, CsilRuleType::ServiceDef(_)) {
+        if let CsilRuleType::ServiceDef(service) = &rule.rule_type {
             let base = service_base(&rule.name);
             for suffix in ["Client", "Handlers", "Router"] {
                 derived.insert(format!("{base}{suffix}"));
+            }
+            if service.wire_id.is_some() {
+                derived.insert(format!("{base}WireIds"));
             }
         }
     }
@@ -267,11 +280,18 @@ fn rename_reserved_ruby_names(spec: &CsilSpecSerialized) -> CsilSpecSerialized {
     })
 }
 
+/// The spec the generator works on: reserved and derived names renamed first,
+/// then rules whose constants are equal (`user_id` and `UserId`), because the
+/// second constant would reassign the first.
+fn prepare_spec(spec: &CsilSpecSerialized) -> CsilSpecSerialized {
+    csilgen_common::rename_ident_collisions(&rename_reserved_ruby_names(spec), ruby_class_name)
+}
+
 pub fn generate_ruby_code_from_serialized(
     spec: &CsilSpecSerialized,
     config: &GeneratorConfig,
 ) -> Result<Vec<GeneratedFile>, i32> {
-    let spec = &csilgen_common::hoist_inline_named_numbers(&rename_reserved_ruby_names(spec));
+    let spec = &csilgen_common::hoist_inline_named_numbers(&prepare_spec(spec));
     let surface = match config.target.as_str() {
         "ruby" | "ruby-server" => Surface::Server,
         "ruby-client" => Surface::Client,

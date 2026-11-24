@@ -3386,3 +3386,81 @@ fn reserved_rule_name_is_renamed_but_keeps_its_wire_variant() {
         codec.contains("        case \"CsilTransport\": throw CsilTransportTypeRefusal(value: ")
     );
 }
+
+/// `Svc.get: Holder -> Holder / <error_arm>` over `Holder = { fN: <rule> }`, one
+/// record per name in `records`.
+fn clash_input(records: &[&str], error_arm: &str) -> WasmGeneratorInput {
+    let ops = vec![make_op(
+        "get",
+        reference("Holder"),
+        CsilTypeExpression::Choice(vec![reference("Holder"), reference(error_arm)]),
+        CsilServiceDirection::Unidirectional,
+    )];
+    let fields = records
+        .iter()
+        .enumerate()
+        .map(|(i, name)| bare_entry(&format!("f{i}"), reference(name)))
+        .collect();
+    let mut rules = vec![group_rule("Holder", fields)];
+    for name in records {
+        rules.push(group_rule(name, vec![bare_entry("code", builtin("uint"))]));
+    }
+    rules.push(service_rule("Svc", ops, None));
+    input_from_rules("swift-client", rules, 1)
+}
+
+fn file_text(files: &[GeneratedFile], path: &str) -> String {
+    files
+        .iter()
+        .find(|f| f.path == path)
+        .map(|f| f.content.clone())
+        .expect(path)
+}
+
+#[test]
+fn rule_named_like_a_derived_type_is_renamed() {
+    let files = build_files(&clash_input(&["Foo", "FooRefusal", "SvcClient"], "Foo")).expect("ok");
+    let types = file_text(&files, "Types.swift");
+    assert!(types.contains("public struct FooRefusalType: Equatable, Sendable {"));
+    assert!(types.contains("public struct SvcClientType: Equatable, Sendable {"));
+    let codec = file_text(&files, "Codec.swift");
+    assert!(codec.contains("public struct FooRefusal: Swift.Error {"));
+    assert!(codec.contains("        case \"Foo\": throw FooRefusal(value: "));
+    assert!(file_text(&files, "Client.swift").contains("public struct SvcClient {"));
+}
+
+#[test]
+fn rules_with_the_same_swift_name_are_told_apart() {
+    let input = clash_input(&["Value", "value", "user_id", "UserId"], "value");
+    let files = build_files(&input).expect("ok");
+    let types = file_text(&files, "Types.swift");
+    for ty in ["Value", "ValueType", "UserId", "UserIdType"] {
+        assert!(
+            types.contains(&format!("public struct {ty}: Equatable, Sendable {{")),
+            "{ty}"
+        );
+    }
+    let codec = file_text(&files, "Codec.swift");
+    assert!(codec.contains(
+        "} catch let refusal as ValueTypeRefusal {\n        return (\"value\", CsilCbor.encode("
+    ));
+    assert!(codec.contains("        case \"value\": throw ValueTypeRefusal(value: "));
+}
+
+#[test]
+fn renamed_rules_are_reported_as_warnings() {
+    let (_, warnings) =
+        build_files_with_warnings(&clash_input(&["Value", "value", "Int"], "value")).expect("ok");
+    let messages: Vec<&str> = warnings.iter().map(|w| w.message.as_str()).collect();
+    assert_eq!(messages.len(), 2, "{messages:?}");
+    assert!(
+        messages
+            .iter()
+            .any(|m| m.contains("`value` is generated as `valueType` for swift-client"))
+    );
+    assert!(
+        messages
+            .iter()
+            .any(|m| m.contains("`Int` is generated as `IntType` for swift-client"))
+    );
+}
