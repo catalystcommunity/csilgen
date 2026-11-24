@@ -2674,6 +2674,9 @@ fn generate_codec(
                 let Some(synth) = boundary.synth else {
                     continue;
                 };
+                if boundary.is_null && std::ptr::eq(ty, &op.input_type) {
+                    continue;
+                }
                 if !synth_seen.insert(boundary.codec_name.clone()) {
                     continue;
                 }
@@ -2686,6 +2689,7 @@ fn generate_codec(
                         &scope,
                         warnings,
                     ),
+                    SynthBoundary::Null => synth_bodies.push_str(NULL_BOUNDARY_CODEC_C),
                     SynthBoundary::Array(element) => {
                         emit_list_alias_struct(
                             &mut synth_structs,
@@ -2747,8 +2751,16 @@ fn generate_codec(
             let ident = arm.rpc_variant_name().unwrap();
             let wire = input.csil_spec.declared_name(ident);
             let field = format!("as_{}", to_snake(ident));
-            let codec = classify_boundary(arm, &codec_names, config).codec_name;
-            content.push_str(&format!("    case {reply}_{field}:\n        *variant = \"{wire}\";\n        return csil_encode_{codec}(&reply->value.{field}, payload, len);\n"));
+            let boundary = classify_boundary(arm, &codec_names, config);
+            let codec = boundary.codec_name;
+            // `reply` is const, so a pointer-typed member's address is `T *const *`,
+            // which C does not convert to the encoder's `const T **` on its own.
+            let arg = if boundary.c_type.ends_with('*') {
+                format!("(const {} *)&reply->value.{field}", boundary.c_type)
+            } else {
+                format!("&reply->value.{field}")
+            };
+            content.push_str(&format!("    case {reply}_{field}:\n        *variant = \"{wire}\";\n        return csil_encode_{codec}({arg}, payload, len);\n"));
         }
         content.push_str("    }\n    return -1;\n}\n\n");
         content.push_str(&format!("static inline int csil_decode_{reply}(const char *variant, const uint8_t *payload, size_t len, {reply} *reply, CsilCodecArena **owner) {{\n    if (!variant) return -1;\n"));
@@ -2842,6 +2854,7 @@ fn spec_has_unidirectional_ops(input: &WasmGeneratorInput) -> bool {
 enum SynthBoundary {
     Scalar(CsilTypeExpression),
     Array(CsilTypeExpression),
+    Null,
 }
 
 /// How one operation request/response type is (de)serialized by the typed client.
@@ -2865,11 +2878,13 @@ fn classify_boundary(
     config: &CConfig,
 ) -> OpBoundary {
     match unwrap_constrained(ty) {
+        // A `null` boundary carries a CBOR null on the wire. The client sends no
+        // request body for a `null` input, but a `null` reply still needs a codec.
         CsilTypeExpression::Builtin(n) if n == "null" || n == "nil" => OpBoundary {
             is_null: true,
-            codec_name: String::new(),
-            c_type: "void".to_string(),
-            synth: None,
+            codec_name: "null".to_string(),
+            c_type: "void *".to_string(),
+            synth: Some(SynthBoundary::Null),
         },
         CsilTypeExpression::Reference(n) if codec_names.contains(n) => OpBoundary {
             is_null: false,
@@ -2933,6 +2948,25 @@ fn array_boundary_name(element: &CsilTypeExpression) -> String {
 /// Emit the encode + decode bodies for a synthetic scalar op boundary: a single
 /// CBOR value with no map wrapper, so the wire form matches what a record field of
 /// the same type would write.
+/// The value codec of a `null` op boundary. The value is never read: the wire
+/// form is the constant CBOR null, and decode accepts only that.
+const NULL_BOUNDARY_CODEC_C: &str = "\
+/* csilc_enc_null writes the CBOR null that a `null` op boundary carries. */
+static inline int csilc_enc_null(csilc_buf *b, const void **v) {
+    (void)v;
+    return csilc_w_null(b);
+}
+
+/* csilc_dec_null accepts only a CBOR null. */
+static inline int csilc_dec_null(const csilc_value *m, CsilCodecArena *a, void **out) {
+    (void)a;
+    if (m->kind != CSILC_NULL) return -1;
+    *out = NULL;
+    return 0;
+}
+
+";
+
 fn emit_scalar_boundary_codec(
     out: &mut String,
     name: &str,
@@ -2947,6 +2981,12 @@ fn emit_scalar_boundary_codec(
     out.push_str(&format!(
         "static inline int csilc_enc_{name}(csilc_buf *b, const {c_type} *v) {{\n"
     ));
+    // The unsupported stub writes null and reads no value; `-Wextra` flags the
+    // unread parameters otherwise.
+    let stub = name == "CsilUnsupportedBoundary";
+    if stub {
+        out.push_str("    (void)v;\n");
+    }
     emit_enc_value(out, "    ", ty, "(*v)", scope, warnings);
     out.push_str("    return 0;\n}\n\n");
     out.push_str(&format!(
@@ -2956,6 +2996,9 @@ fn emit_scalar_boundary_codec(
         "static inline int csilc_dec_{name}(const csilc_value *m, CsilCodecArena *a, {c_type} *out) {{\n"
     ));
     out.push_str("    (void)a;\n");
+    if stub {
+        out.push_str("    (void)out;\n");
+    }
     emit_dec_value(out, "    ", ty, "m", "(*out)", scope, warnings);
     out.push_str("    return 0;\n}\n\n");
 }

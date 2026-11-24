@@ -1111,13 +1111,18 @@ fn resolve_alias<'a>(
 
 /// Whether a union arm's encoder actually reads its captured switch value. A literal
 /// arm encodes its own declared constant unconditionally (`emit_enc_literal` never
-/// looks at the payload), so `emit_union_codec` must not bind an unread capture for
-/// it — Zig's compiler rejects an unused switch-capture as a hard error.
+/// looks at the payload), and a `null` arm always writes CBOR null, so
+/// `emit_union_codec` must not bind an unread capture for either — Zig's compiler
+/// rejects an unused switch-capture as a hard error.
 fn enc_arm_uses_capture(
     ty: &CsilTypeExpression,
     aliases: &HashMap<String, CsilTypeExpression>,
 ) -> bool {
-    !matches!(resolve_alias(ty, aliases), CsilTypeExpression::Literal(_))
+    match resolve_alias(ty, aliases) {
+        CsilTypeExpression::Literal(_) => false,
+        CsilTypeExpression::Builtin(name) => !matches!(name.as_str(), "null" | "nil" | "undefined"),
+        _ => true,
+    }
 }
 
 /// Emit a statement that encodes the scalar/reference value `expr` of type `ty`.
@@ -2136,7 +2141,7 @@ fn generate_codec(
         })
         .map(|(n, _)| n.to_string())
         .collect();
-    if codec_names.is_empty() && input.csil_spec.rpc_operations().next().is_none() {
+    if codec_names.is_empty() && unary_operations(input).next().is_none() {
         return None;
     }
     let aliases = codec_aliases(input);
@@ -2211,24 +2216,43 @@ fn generate_codec(
     if input.csil_spec.rpc_operations().next().is_some() {
         content.push_str("pub const RpcReply = struct { variant: []const u8, payload: []u8 };\n\n");
     }
-    for (service, op, arms) in input.csil_spec.rpc_operations() {
+    // An op boundary that is not a codec'd named type (a bare scalar, a scalar
+    // alias, a `null` reply) has no `encode_<T>`/`decode_<T>` of its own, so each op
+    // gets a per-op pair the client calls instead.
+    for (service, op) in unary_operations(input) {
         let reply = rpc_reply_type(service, &op.name);
-        if !op_input_is_null(&op.input_type)
-            && !codec_names.contains(&type_codec_name(&op.input_type))
-        {
-            let ty = map_zig_type(&op.input_type, "types.");
-            content.push_str(&format!("pub fn encode_{reply}Request(alloc: std.mem.Allocator, req: *const {ty}) CodecError![]u8 {{\n    var buf = std.ArrayList(u8).init(alloc);\n    errdefer buf.deinit();\n    const out = &buf;\n"));
-            emit_enc_value(
+        if !op_input_is_null(&op.input_type) && !boundary_has_named_codec(input, &op.input_type) {
+            emit_boundary_encoder(
                 &mut content,
-                "    ",
+                &format!("{reply}Request"),
                 &op.input_type,
-                "req.*",
                 &codec_names,
                 &aliases,
                 warnings,
             );
-            content.push_str("    return buf.toOwnedSlice();\n}\n\n");
         }
+        let success = success_type(op.success_output());
+        if op.rpc_reply_arms().is_none() && !boundary_has_named_codec(input, &success) {
+            emit_boundary_encoder(
+                &mut content,
+                &format!("{reply}Response"),
+                &success,
+                &codec_names,
+                &aliases,
+                warnings,
+            );
+            emit_boundary_decoder(
+                &mut content,
+                &format!("{reply}Response"),
+                &success,
+                &codec_names,
+                &aliases,
+                warnings,
+            );
+        }
+    }
+    for (service, op, arms) in input.csil_spec.rpc_operations() {
+        let reply = rpc_reply_type(service, &op.name);
         content.push_str(&format!("pub fn encode_{reply}(alloc: std.mem.Allocator, value: types.{reply}) CodecError!RpcReply {{\n    var buf = std.ArrayList(u8).init(alloc);\n    errdefer buf.deinit();\n    const out = &buf;\n    switch (value) {{\n"));
         for arm in arms {
             let ident = arm.rpc_variant_name().unwrap();
@@ -2278,6 +2302,166 @@ fn generate_codec(
         content.push_str("    return error.WrongType;\n}\n\n");
     }
     Some(content)
+}
+
+/// Whether an op boundary type has its own `encode_<T>`/`decode_<T>`: a reference
+/// to a record, enum or union. A reference that resolves to no rule is assumed to
+/// be one, so a client generated from a partial spec still names the type's codec.
+fn boundary_has_named_codec(input: &WasmGeneratorInput, ty: &CsilTypeExpression) -> bool {
+    let CsilTypeExpression::Reference(name) = unwrap_constrained(ty) else {
+        return false;
+    };
+    match input.csil_spec.rules.iter().find(|rule| &rule.name == name) {
+        None => true,
+        Some(rule) => matches!(
+            classify_rule(&rule.rule_type),
+            Some(
+                TypeKind::Struct(_)
+                    | TypeKind::Enum(_)
+                    | TypeKind::IntEnum(_)
+                    | TypeKind::MixedEnum(_)
+                    | TypeKind::Union(_)
+            )
+        ),
+    }
+}
+
+/// Every unidirectional (request/response) operation, with its service name.
+fn unary_operations(
+    input: &WasmGeneratorInput,
+) -> impl Iterator<Item = (&str, &csilgen_common::CsilServiceOperation)> {
+    input
+        .csil_spec
+        .rules
+        .iter()
+        .filter_map(|rule| match &rule.rule_type {
+            CsilRuleType::ServiceDef(service) => Some((rule.name.as_str(), service)),
+            _ => None,
+        })
+        .flat_map(|(name, service)| {
+            service
+                .operations
+                .iter()
+                .filter(|op| matches!(op.direction, CsilServiceDirection::Unidirectional))
+                .map(move |op| (name, op))
+        })
+}
+
+/// Emit `pub fn encode_<name>` for an op boundary value of type `ty`.
+fn emit_boundary_encoder(
+    content: &mut String,
+    name: &str,
+    ty: &CsilTypeExpression,
+    codec_names: &std::collections::HashSet<String>,
+    aliases: &HashMap<String, CsilTypeExpression>,
+    warnings: &mut Vec<GeneratorWarning>,
+) {
+    let zig_ty = map_zig_type(ty, "types.");
+    // A `null` boundary writes a constant, so its value parameter goes unread.
+    let param = if op_input_is_null(ty) { "_" } else { "req" };
+    content.push_str(&format!("pub fn encode_{name}(alloc: std.mem.Allocator, {param}: *const {zig_ty}) CodecError![]u8 {{\n    var buf = std.ArrayList(u8).init(alloc);\n    errdefer buf.deinit();\n    const out = &buf;\n"));
+    // `emit_enc_value` writes one scalar or named value; a bare list or map
+    // boundary is expanded here, the way `emit_enc_field` expands a field.
+    match resolve_alias(ty, aliases) {
+        CsilTypeExpression::Array { element_type, .. } => {
+            content.push_str("    try w_array_head(out, req.len);\n");
+            content.push_str("    for (req.*) |csil_it| {\n");
+            emit_enc_value(
+                content,
+                "        ",
+                element_type,
+                "csil_it",
+                codec_names,
+                aliases,
+                warnings,
+            );
+            content.push_str("    }\n");
+        }
+        CsilTypeExpression::Map { key, value, .. } => {
+            content.push_str("    try w_map_head(out, req.count());\n");
+            content.push_str("    var csil_mi = req.iterator();\n");
+            content.push_str("    while (csil_mi.next()) |csil_e| {\n");
+            emit_enc_value(
+                content,
+                "        ",
+                key,
+                "csil_e.key_ptr.*",
+                codec_names,
+                aliases,
+                warnings,
+            );
+            emit_enc_value(
+                content,
+                "        ",
+                value,
+                "csil_e.value_ptr.*",
+                codec_names,
+                aliases,
+                warnings,
+            );
+            content.push_str("    }\n");
+        }
+        _ => emit_enc_value(content, "    ", ty, "req.*", codec_names, aliases, warnings),
+    }
+    content.push_str("    return buf.toOwnedSlice();\n}\n\n");
+}
+
+/// Emit `pub fn decode_<name>` for an op boundary value of type `ty`.
+fn emit_boundary_decoder(
+    content: &mut String,
+    name: &str,
+    ty: &CsilTypeExpression,
+    codec_names: &std::collections::HashSet<String>,
+    aliases: &HashMap<String, CsilTypeExpression>,
+    warnings: &mut Vec<GeneratorWarning>,
+) {
+    let zig_ty = map_zig_type(ty, "types.");
+    content.push_str(&format!("pub fn decode_{name}(alloc: std.mem.Allocator, bytes: []const u8, out: *{zig_ty}) CodecError!void {{\n    const src = try decode(alloc, bytes);\n"));
+    // The `null` value decoder never reads `src`, and only a CBOR null is valid.
+    if op_input_is_null(ty) {
+        content.push_str("    if (src != .null) return error.WrongType;\n");
+    }
+    match resolve_alias(ty, aliases) {
+        CsilTypeExpression::Array { element_type, .. } => {
+            let elem = map_zig_type(element_type, "types.");
+            content.push_str("    if (src != .array) return error.WrongType;\n");
+            content.push_str(&format!(
+                "    out.* = try alloc.alloc({elem}, src.array.len);\n"
+            ));
+            content.push_str("    for (src.array, 0..) |csil_it, csil_i| {\n");
+            emit_dec_value(
+                content,
+                "        ",
+                element_type,
+                "csil_it",
+                "out.*[csil_i]",
+                codec_names,
+                aliases,
+                warnings,
+            );
+            content.push_str("    }\n");
+        }
+        CsilTypeExpression::Map { value, .. } => {
+            content.push_str("    if (src != .map) return error.WrongType;\n");
+            content.push_str("    out.* = .{};\n");
+            content.push_str("    for (src.map) |csil_kv| {\n");
+            content.push_str("        const csil_k = try as_text(csil_kv.key);\n");
+            emit_map_value_decode(content, "        ", value, codec_names, aliases, warnings);
+            content.push_str("        try out.put(alloc, csil_k, csil_val);\n");
+            content.push_str("    }\n");
+        }
+        _ => emit_dec_value(
+            content,
+            "    ",
+            ty,
+            "src",
+            "out.*",
+            codec_names,
+            aliases,
+            warnings,
+        ),
+    }
+    content.push_str("}\n\n");
 }
 
 // ---- client ---------------------------------------------------------------
@@ -2359,28 +2543,22 @@ fn emit_client_struct(
         } else {
             map_zig_type(op.success_output(), "types.")
         };
-        let resp_codec = type_codec_name(&success_type(op.success_output()));
         let has_input = !op_input_is_null(&op.input_type);
         let req_type = map_zig_type(&op.input_type, "types.");
-        let mut req_codec = type_codec_name(&op.input_type);
-        if has_input
-            && op.rpc_reply_arms().is_some()
-            && !input.csil_spec.rules.iter().any(|rule| {
-                rule.name == req_codec
-                    && matches!(
-                        classify_rule(&rule.rule_type),
-                        Some(
-                            TypeKind::Struct(_)
-                                | TypeKind::Enum(_)
-                                | TypeKind::IntEnum(_)
-                                | TypeKind::MixedEnum(_)
-                                | TypeKind::Union(_)
-                        )
-                    )
-            })
-        {
-            req_codec = format!("{}Request", rpc_reply_type(name, wire_op));
-        }
+        let is_codec_type = |ty: &CsilTypeExpression| boundary_has_named_codec(input, ty);
+        // A boundary that is not a codec'd named type uses the per-op pair that
+        // `generate_codec` emits for it.
+        let req_codec = if is_codec_type(&op.input_type) {
+            type_codec_name(&op.input_type)
+        } else {
+            format!("{}Request", rpc_reply_type(name, wire_op))
+        };
+        let success = success_type(op.success_output());
+        let resp_codec = if is_codec_type(&success) {
+            type_codec_name(&success)
+        } else {
+            format!("{}Response", rpc_reply_type(name, wire_op))
+        };
 
         content.push_str(&format!(
             "\n    /// Invoke {name}/{wire_op} with a typed request, returning the decoded\n\

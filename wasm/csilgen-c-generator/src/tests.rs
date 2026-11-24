@@ -3016,3 +3016,144 @@ fn reserved_error_arm_is_renamed_but_keeps_its_wire_name() {
     );
     assert!(!all.contains("\"CsilDecimalType\""), "{all}");
 }
+
+/// Null outputs, `null` reply arms, a nullable record field and bare-scalar ops:
+/// the shapes whose generated C once called a nameless `csil_decode_`/
+/// `csil_encode_` and so did not compile.
+fn null_and_scalar_boundary_rules() -> Vec<CsilRule> {
+    let reference = |name: &str| CsilTypeExpression::Reference(name.to_string());
+    let unary = |name: &str, input: CsilTypeExpression, output: CsilTypeExpression| {
+        op(
+            name,
+            input,
+            output,
+            CsilServiceDirection::Unidirectional,
+            None,
+        )
+    };
+    vec![
+        group_rule("Ev", vec![bare_entry("msg", builtin("text"))]),
+        group_rule(
+            "Rec",
+            vec![
+                bare_entry(
+                    "nl",
+                    CsilTypeExpression::Choice(vec![builtin("null"), builtin("text")]),
+                ),
+                bare_entry("id", builtin("text")),
+            ],
+        ),
+        group_rule("Err", vec![bare_entry("why", builtin("text"))]),
+        service_rule(
+            "Svc",
+            vec![
+                unary("fire", reference("Ev"), builtin("null")),
+                unary("ping", builtin("null"), builtin("null")),
+                unary("hb", builtin("null"), reference("Ev")),
+                unary("echo", builtin("text"), builtin("text")),
+                unary("num", builtin("uint"), reference("Ev")),
+                unary(
+                    "maybe",
+                    reference("Ev"),
+                    CsilTypeExpression::Choice(vec![reference("Ev"), builtin("null")]),
+                ),
+                unary(
+                    "fail",
+                    reference("Ev"),
+                    CsilTypeExpression::Choice(vec![builtin("null"), reference("Err")]),
+                ),
+                unary(
+                    "txt",
+                    reference("Ev"),
+                    CsilTypeExpression::Choice(vec![reference("Ev"), builtin("text")]),
+                ),
+                unary("rec", reference("Rec"), reference("Rec")),
+            ],
+            None,
+        ),
+    ]
+}
+
+const NULL_BOUNDARY_DRIVER_C: &str = r#"#include <stdio.h>
+#include "types.gen.h"
+#include "codec.gen.h"
+#include "client.gen.h"
+#include "server.gen.h"
+
+int main(void) {
+    void *nothing = NULL;
+    uint8_t *buf = NULL;
+    size_t len = 0;
+    if (csil_encode_null((const void **)&nothing, &buf, &len)) return 1;
+    if (len != 1 || buf[0] != 0xf6) return 2;
+    CsilCodecArena *owner = NULL;
+    void *back = &owner;
+    if (csil_decode_null(buf, len, &back, &owner) || back != NULL) return 3;
+    csil_codec_arena_free(owner);
+    free(buf);
+
+    SvcMaybeReply reply = { .kind = SvcMaybeReply_as_null };
+    const char *variant = NULL;
+    if (csil_encode_SvcMaybeReply(&reply, &variant, &buf, &len)) return 4;
+    if (strcmp(variant, "null") != 0 || len != 1 || buf[0] != 0xf6) return 5;
+    SvcMaybeReply decoded;
+    if (csil_decode_SvcMaybeReply(variant, buf, len, &decoded, &owner)) return 6;
+    if (decoded.kind != SvcMaybeReply_as_null) return 7;
+    csil_codec_arena_free(owner);
+    free(buf);
+    printf("ok\n");
+    return 0;
+}
+"#;
+
+/// Compile the null and bare-scalar boundary shapes with every header included,
+/// and run a null round-trip. Skips when no C compiler is on PATH.
+#[test]
+fn null_and_scalar_boundaries_compile_and_round_trip_through_gcc() {
+    let cc = ["cc", "gcc", "clang"].into_iter().find(|c| {
+        std::process::Command::new(c)
+            .arg("--version")
+            .output()
+            .is_ok()
+    });
+    let Some(cc) = cc else {
+        eprintln!("skipping: no C compiler on PATH");
+        return;
+    };
+    let mut options = HashMap::new();
+    options.insert("emit_packages".to_string(), serde_json::json!(["c"]));
+    let out = process_generation(input_with_rules(
+        null_and_scalar_boundary_rules(),
+        "c",
+        options,
+    ))
+    .unwrap();
+    let dir = std::env::temp_dir().join(format!("csilgen-c-null-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    for file in &out.files {
+        std::fs::write(dir.join(&file.path), &file.content).unwrap();
+    }
+    std::fs::write(dir.join("driver.c"), NULL_BOUNDARY_DRIVER_C).unwrap();
+    let bin = dir.join("driver");
+    let compile = std::process::Command::new(cc)
+        .args(["-std=c11", "-Wall", "-Wextra", "-O1"])
+        .arg("-I")
+        .arg(&dir)
+        .arg(dir.join("driver.c"))
+        .arg("-o")
+        .arg(&bin)
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&compile.stderr);
+    assert!(compile.status.success(), "compile failed:\n{stderr}");
+    assert!(stderr.is_empty(), "compiler warnings:\n{stderr}");
+    let run = std::process::Command::new(&bin).output().unwrap();
+    assert!(
+        run.status.success(),
+        "null round-trip failed ({:?}):\n{}",
+        run.status.code(),
+        String::from_utf8_lossy(&run.stdout)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
