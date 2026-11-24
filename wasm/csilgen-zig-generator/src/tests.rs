@@ -2850,6 +2850,15 @@ fn null_and_scalar_boundary_rules() -> Vec<CsilRule> {
                 unary("list", text_list(), text_list()),
                 unary("tally", int_map(), int_map()),
                 unary(
+                    "evs",
+                    reference("Ev"),
+                    CsilTypeExpression::Map {
+                        key: Box::new(builtin("text")),
+                        value: Box::new(reference("Ev")),
+                        occurrence: Some(CsilOccurrence::ZeroOrMore),
+                    },
+                ),
+                unary(
                     "maybe",
                     reference("Ev"),
                     CsilTypeExpression::Choice(vec![reference("Ev"), builtin("null")]),
@@ -2903,6 +2912,29 @@ test "null and scalar boundaries round-trip" {
     try codec.decode_SvcListReplyResponse(alloc, list_bytes, &listed);
     try std.testing.expectEqual(@as(usize, 2), listed.len);
     try std.testing.expectEqualStrings("b", listed[1]);
+
+    var tally: std.StringHashMapUnmanaged(i64) = .{};
+    try tally.put(alloc, "aa", 1);
+    try tally.put(alloc, "b", 2);
+    const tally_bytes = try codec.encode_SvcTallyReplyRequest(alloc, &tally);
+    var tally_back: std.StringHashMapUnmanaged(i64) = undefined;
+    try codec.decode_SvcTallyReplyResponse(alloc, tally_bytes, &tally_back);
+    try std.testing.expectEqual(@as(u32, 2), tally_back.count());
+    try std.testing.expectEqual(@as(i64, 1), tally_back.get("aa").?);
+    try std.testing.expectEqual(@as(i64, 2), tally_back.get("b").?);
+
+    const none: std.StringHashMapUnmanaged(i64) = .{};
+    const none_bytes = try codec.encode_SvcTallyReplyRequest(alloc, &none);
+    try std.testing.expectEqualSlices(u8, &.{0xa0}, none_bytes);
+    try codec.decode_SvcTallyReplyResponse(alloc, none_bytes, &tally_back);
+    try std.testing.expectEqual(@as(u32, 0), tally_back.count());
+
+    var evs: std.StringHashMapUnmanaged(types.Ev) = .{};
+    try evs.put(alloc, "k", .{ .msg = "v" });
+    const evs_bytes = try codec.encode_SvcEvsReplyResponse(alloc, &evs);
+    var evs_back: std.StringHashMapUnmanaged(types.Ev) = undefined;
+    try codec.decode_SvcEvsReplyResponse(alloc, evs_bytes, &evs_back);
+    try std.testing.expectEqualStrings("v", evs_back.get("k").?.msg);
 
     const rec = types.Rec{ .nl = .{ .null = null }, .id = "x" };
     const rec_bytes = try codec.encode_Rec(alloc, &rec);

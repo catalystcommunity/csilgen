@@ -3157,3 +3157,164 @@ fn null_and_scalar_boundaries_compile_and_round_trip_through_gcc() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+fn map_boundary_rules() -> Vec<CsilRule> {
+    let reference = |name: &str| CsilTypeExpression::Reference(name.to_string());
+    let map_of = |value: CsilTypeExpression| CsilTypeExpression::Map {
+        key: Box::new(builtin("text")),
+        value: Box::new(value),
+        occurrence: Some(CsilOccurrence::ZeroOrMore),
+    };
+    vec![
+        group_rule("Ev", vec![bare_entry("msg", builtin("text"))]),
+        service_rule(
+            "Svc",
+            vec![
+                op(
+                    "tally",
+                    map_of(builtin("int")),
+                    map_of(reference("Ev")),
+                    CsilServiceDirection::Unidirectional,
+                    None,
+                ),
+                op(
+                    "count",
+                    reference("Ev"),
+                    map_of(builtin("int")),
+                    CsilServiceDirection::Unidirectional,
+                    None,
+                ),
+            ],
+            None,
+        ),
+    ]
+}
+
+const MAP_BOUNDARY_DRIVER_C: &str = r#"#include <stdio.h>
+#include "types.gen.h"
+#include "codec.gen.h"
+#include "client.gen.h"
+#include "server.gen.h"
+
+static int tally(void *ctx, const CsilTextIntMap *req, CsilTextEvMap *resp) {
+    (void)ctx;
+    (void)req;
+    (void)resp;
+    return 0;
+}
+
+int main(void) {
+    SvcHandlers handlers = { .tally = tally };
+    (void)handlers;
+
+    /* "b" encodes as 61 62 and "aa" as 62 61 61, so canonical (bytewise on the
+     * encoded key) order puts "b" first although "aa" sorts first as text. */
+    char *keys[] = { "aa", "b" };
+    int64_t values[] = { 1, 2 };
+    CsilTextIntMap ints = { keys, values, 2 };
+    uint8_t *buf = NULL;
+    size_t len = 0;
+    if (csil_encode_CsilTextIntMap(&ints, &buf, &len)) return 1;
+    static const uint8_t want[] = { 0xa2, 0x61, 0x62, 0x02, 0x62, 0x61, 0x61, 0x01 };
+    if (len != sizeof want || memcmp(buf, want, len) != 0) return 2;
+    CsilCodecArena *owner = NULL;
+    CsilTextIntMap ints_back;
+    if (csil_decode_CsilTextIntMap(buf, len, &ints_back, &owner)) return 3;
+    if (ints_back.count != 2 || strcmp(ints_back.keys[0], "b") != 0 || ints_back.values[0] != 2
+        || strcmp(ints_back.keys[1], "aa") != 0 || ints_back.values[1] != 1) return 4;
+    csil_codec_arena_free(owner);
+    free(buf);
+
+    char *dup_keys[] = { "x", "x" };
+    CsilTextIntMap dup = { dup_keys, values, 2 };
+    if (csil_encode_CsilTextIntMap(&dup, &buf, &len) == 0) return 5;
+
+    char *ev_keys[] = { "zed", "al" };
+    Ev evs[] = { { "last" }, { "first" } };
+    CsilTextEvMap records = { ev_keys, evs, 2 };
+    if (csil_encode_CsilTextEvMap(&records, &buf, &len)) return 6;
+    CsilTextEvMap records_back;
+    if (csil_decode_CsilTextEvMap(buf, len, &records_back, &owner)) return 7;
+    if (records_back.count != 2 || strcmp(records_back.keys[0], "al") != 0
+        || strcmp(records_back.values[0].msg, "first") != 0
+        || strcmp(records_back.keys[1], "zed") != 0
+        || strcmp(records_back.values[1].msg, "last") != 0) return 8;
+    csil_codec_arena_free(owner);
+    free(buf);
+
+    CsilTextIntMap empty = { NULL, NULL, 0 };
+    if (csil_encode_CsilTextIntMap(&empty, &buf, &len)) return 9;
+    if (len != 1 || buf[0] != 0xa0) return 10;
+    CsilTextIntMap empty_back;
+    if (csil_decode_CsilTextIntMap(buf, len, &empty_back, &owner) || empty_back.count != 0) return 11;
+    csil_codec_arena_free(owner);
+    free(buf);
+    printf("ok\n");
+    return 0;
+}
+"#;
+
+/// A bare map op boundary is a synthesized keys/values/count struct whose codec
+/// writes canonical CBOR. Compiles with zero warnings, then round-trips text=>int,
+/// text=>record and empty maps and checks the canonical bytes. Skips when no C
+/// compiler is on PATH.
+#[test]
+fn map_boundaries_compile_and_round_trip_through_gcc() {
+    let cc = ["cc", "gcc", "clang"].into_iter().find(|c| {
+        std::process::Command::new(c)
+            .arg("--version")
+            .output()
+            .is_ok()
+    });
+    let Some(cc) = cc else {
+        eprintln!("skipping: no C compiler on PATH");
+        return;
+    };
+    let mut options = HashMap::new();
+    options.insert("emit_packages".to_string(), serde_json::json!(["c"]));
+    let out = process_generation(input_with_rules(map_boundary_rules(), "c", options)).unwrap();
+    assert!(
+        out.warnings.is_empty(),
+        "a map boundary must not warn: {:?}",
+        out.warnings
+    );
+    let server = &out
+        .files
+        .iter()
+        .find(|f| f.path == "server.gen.h")
+        .expect("server.gen.h")
+        .content;
+    assert!(
+        server.contains("int (*tally)(void *ctx, const CsilTextIntMap *req, CsilTextEvMap *resp);")
+    );
+    assert!(server.contains("int (*count)(void *ctx, const Ev *req, CsilTextIntMap *resp);"));
+
+    let dir = std::env::temp_dir().join(format!("csilgen-c-map-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    for file in &out.files {
+        std::fs::write(dir.join(&file.path), &file.content).unwrap();
+    }
+    std::fs::write(dir.join("driver.c"), MAP_BOUNDARY_DRIVER_C).unwrap();
+    let bin = dir.join("driver");
+    let compile = std::process::Command::new(cc)
+        .args(["-std=c11", "-Wall", "-Wextra", "-O1"])
+        .arg("-I")
+        .arg(&dir)
+        .arg(dir.join("driver.c"))
+        .arg("-o")
+        .arg(&bin)
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&compile.stderr);
+    assert!(compile.status.success(), "compile failed:\n{stderr}");
+    assert!(stderr.is_empty(), "compiler warnings:\n{stderr}");
+    let run = std::process::Command::new(&bin).output().unwrap();
+    assert!(
+        run.status.success(),
+        "map round-trip failed ({:?}):\n{}",
+        run.status.code(),
+        String::from_utf8_lossy(&run.stdout)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
