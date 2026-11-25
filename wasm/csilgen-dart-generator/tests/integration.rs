@@ -3767,3 +3767,142 @@ fn multi_arm_operation_uses_call_reply_in_both_client_shapes() {
     );
     assert!(!readme.contains("resolveRpcReply"), "{readme}");
 }
+
+/// The expected shapes in the tests below are what `dart format` 3.12, 3.13 and
+/// 3.14 all produce. The `tests/interop/formatting` sweep checks every name length.
+fn record_with(fields: Vec<CsilGroupEntry>, extra: Vec<CsilRule>) -> String {
+    let mut rules = vec![record_rule(
+        "Leaf",
+        vec![entry("level", builtin("uint"), false)],
+    )];
+    rules.extend(extra);
+    rules.push(record_rule("Holder", fields));
+    let files = generate_dart_code(&spec(rules, 0), &config("dart")).unwrap();
+    types_file(&files).to_string()
+}
+
+#[test]
+fn optional_record_encode_splits_at_the_dot_when_the_target_fits() {
+    // The linkkeys request: the one-line form is 86 columns.
+    let code = record_with(
+        vec![entry(
+            "authentication_requirements",
+            reference("Leaf"),
+            true,
+        )],
+        vec![],
+    );
+    assert!(
+        code.contains(
+            "    if (authenticationRequirements != null)\n      map['authentication_requirements'] = authenticationRequirements!\n          .toCborValue();\n"
+        ),
+        "{code}"
+    );
+}
+
+#[test]
+fn record_encode_splits_after_the_equals_when_the_target_does_not_fit() {
+    let name = "f".repeat(50);
+    let code = record_with(vec![entry(&name, reference("Leaf"), false)], vec![]);
+    assert!(
+        code.contains(&format!(
+            "    map['{name}'] =\n        {name}.toCborValue();\n"
+        )),
+        "{code}"
+    );
+}
+
+#[test]
+fn enum_encode_splits_after_the_equals_before_the_dot() {
+    let name = "oxxx_xxxx_xxxx_xxxx_xxxx_xxxx";
+    let code = record_with(
+        vec![entry(name, reference("Kind"), true)],
+        vec![type_rule(
+            "Kind",
+            CsilTypeExpression::Choice(vec![
+                CsilTypeExpression::Literal(CsilLiteralValue::Text("alpha".to_string())),
+                CsilTypeExpression::Literal(CsilLiteralValue::Text("beta".to_string())),
+            ]),
+        )],
+    );
+    assert!(
+        code.contains(
+            "      map['oxxx_xxxx_xxxx_xxxx_xxxx_xxxx'] =\n          oxxxXxxxXxxxXxxxXxxxXxxx!.wireValue;\n"
+        ),
+        "{code}"
+    );
+}
+
+#[test]
+fn date_encode_splits_its_argument_list() {
+    let name = "f".repeat(30);
+    let code = record_with(vec![entry(&name, builtin("date"), false)], vec![]);
+    assert!(
+        code.contains(&format!(
+            "    map['{name}'] = CsilCbor.dateValue(\n      {name},\n    );\n"
+        )),
+        "{code}"
+    );
+}
+
+#[test]
+fn optional_decode_splits_a_long_null_check_after_the_operator() {
+    let name = "o".repeat(66);
+    let code = record_with(vec![entry(&name, reference("Leaf"), true)], vec![]);
+    assert!(
+        code.contains(&format!(
+            "      {name}:\n          map['{name}'] ==\n              null\n          ? null\n"
+        )),
+        "{code}"
+    );
+}
+
+#[test]
+fn decode_call_stays_after_the_name_when_that_overflows_least() {
+    // Both layouts overflow. Keeping the call after the name overflows the same
+    // or less, so the formatter keeps it there.
+    let wire = "fxxx_xxxx_xxxx_xxxx_xxxx_xxxx_xxxx_xxxx_xxxx_xxxx_xxxx_xxxx_xxxx_xx";
+    let member = "fxxxXxxxXxxxXxxxXxxxXxxxXxxxXxxxXxxxXxxxXxxxXxxxXxxxXx";
+    let code = record_with(vec![entry(wire, reference("Leaf"), false)], vec![]);
+    assert!(
+        code.contains(&format!(
+            "      {member}: Leaf.fromCborValue(\n        map['{wire}'],\n      ),\n"
+        )),
+        "{code}"
+    );
+}
+
+#[test]
+fn optional_cast_in_a_conditional_hangs_past_its_operand() {
+    let name = "o".repeat(60);
+    let code = record_with(vec![entry(&name, builtin("int"), true)], vec![]);
+    assert!(
+        code.contains(&format!(
+            "          : map['{name}']\n                as int,\n"
+        )),
+        "{code}"
+    );
+}
+
+#[test]
+fn from_cbor_arrow_body_stays_on_the_parameter_close_line() {
+    let long = "LeafWithAnUnusuallyLongRecordTypeNameForLineSplits";
+    let files = generate_dart_code(
+        &spec(
+            vec![record_rule(
+                long,
+                vec![entry("level", builtin("uint"), false)],
+            )],
+            0,
+        ),
+        &config("dart"),
+    )
+    .unwrap();
+    let code = types_file(&files);
+    assert!(
+        code.contains(&format!(
+            "  ) => {long}.fromCborValue(\n    CsilCbor.decode(bytes),\n  );\n"
+        )),
+        "{code}"
+    );
+}

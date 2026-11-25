@@ -3767,6 +3767,16 @@ fn dart_from_cbor_factory(class_name: &str) -> String {
         return format!("{flat}\n");
     }
     let mut out = dart_ctor_signature(2, &head, &params, " =>");
+    // After a split parameter list the formatter keeps the arrow body on the
+    // `) =>` line when its first line fits there.
+    if out.ends_with("\n  ) =>\n") {
+        let inline = body.render(2, 7, 1, 6);
+        if first_line_fits(&inline, 7, 1) {
+            out.truncate(out.len() - 1);
+            out.push_str(&format!(" {inline};\n"));
+            return out;
+        }
+    }
     out.push_str(&dart_stmt(6, "", &body, ";"));
     out
 }
@@ -3837,6 +3847,10 @@ enum DExpr {
     Cast { expr: Box<DExpr>, ty: String },
     /// `name: value` — a named argument.
     Named { name: String, value: Box<DExpr> },
+    /// `recv.member` — a property read or a call without arguments. Unlike a
+    /// `Call`, it has no argument list to split, so the formatter splits it
+    /// before the dot instead.
+    Member { recv: String, member: String },
     /// `callee(args...)`.
     Call { callee: String, args: Vec<DExpr> },
     /// `recv.m1(args).m2(args)...` — a method chain (splits every call at once).
@@ -3864,6 +3878,7 @@ impl DExpr {
             DExpr::Paren(e) => format!("({})", e.flat()),
             DExpr::Cast { expr, ty } => format!("{} as {ty}", expr.flat()),
             DExpr::Named { name, value } => format!("{name}: {}", value.flat()),
+            DExpr::Member { recv, member } => format!("{recv}.{member}"),
             DExpr::Call { callee, args } => format!("{callee}({})", join_flat(args)),
             DExpr::Chain { recv, calls } => {
                 let mut out = recv.flat();
@@ -3892,7 +3907,7 @@ impl DExpr {
     /// containing an IIFE must render split even when its flat form would fit.
     fn force_split(&self) -> bool {
         match self {
-            DExpr::Atom(_) => false,
+            DExpr::Atom(_) | DExpr::Member { .. } => false,
             DExpr::Paren(e) => e.force_split(),
             DExpr::Cast { expr, .. } => expr.force_split(),
             DExpr::Named { value, .. } => value.force_split(),
@@ -3964,11 +3979,10 @@ impl DExpr {
             // generic fallback (`Cast` is a Named-argument value in practice;
             // see the special case below, which is what actually fires for
             // that shape).
-            DExpr::Cast { expr, ty } => format!(
-                "{}\n{}as {ty}",
-                expr.render(li, col, 0, cont),
-                pad(cont + 4)
-            ),
+            // The `as` hangs four columns past the line the operand starts on.
+            DExpr::Cast { expr, ty } => {
+                format!("{}\n{}as {ty}", expr.render(li, col, 0, cont), pad(li + 4))
+            }
             DExpr::Named { name, value } => {
                 // A cast breaks after the colon (never continues inline) once
                 // it stops fitting: `dart format` puts the receiver alone on
@@ -3985,8 +3999,13 @@ impl DExpr {
                         pad(cont + 4)
                     );
                 }
+                // A conditional stays after the name only while its condition
+                // does not split there.
+                let conditional = matches!(value.as_ref(), DExpr::CondNull { .. });
                 let inline = value.render(li, col + name.len() + 2, tail, li + 4);
-                if first_line_fits(&inline, col + name.len() + 2, tail) {
+                let split_cond =
+                    conditional && inline.lines().next().is_some_and(|l| l.ends_with(" =="));
+                if !split_cond && first_line_fits(&inline, col + name.len() + 2, tail) {
                     return format!("{name}: {inline}");
                 }
                 // The formatter moves a value whose first line overflows to its own
@@ -3996,12 +4015,21 @@ impl DExpr {
                 } else {
                     li + 8
                 };
-                format!(
+                let own_line = format!(
                     "{name}:\n{}{}",
                     pad(li + 4),
                     value.render(li + 4, li + 4, tail, cont)
-                )
+                );
+                // When the value overflows on its own line too, the formatter
+                // keeps the layout that overflows less, and on a tie the layout
+                // with fewer splits.
+                let inline = format!("{name}: {inline}");
+                if !conditional && overflow(&inline, col, tail) <= overflow(&own_line, col, tail) {
+                    return inline;
+                }
+                own_line
             }
+            DExpr::Member { recv, member } => format!("{recv}\n{}.{member}", pad(cont)),
             DExpr::Call { callee, args } => render_call(li, col, tail, callee, args),
             DExpr::Chain { recv, calls } => {
                 if calls.len() == 1 && matches!(recv.as_ref(), DExpr::Atom(_)) {
@@ -4031,7 +4059,8 @@ impl DExpr {
                 )
             }
             DExpr::CondNull { cond, else_ } => format!(
-                "{cond}\n{}? null\n{}: {}",
+                "{}\n{}? null\n{}: {}",
+                dart_split_equality(cond, col),
                 pad(cont),
                 pad(cont),
                 // `else_` starts right after `": "` (column `cont + 2`), so a
@@ -4098,6 +4127,17 @@ impl DExpr {
     }
 }
 
+/// A `lhs == rhs` condition at column `col`. Too wide for the page, it splits
+/// after the operator with the right operand four columns in.
+fn dart_split_equality(cond: &str, col: usize) -> String {
+    match cond.split_once(" == ") {
+        Some((lhs, rhs)) if col + cond.len() > DART_WIDTH => {
+            format!("{lhs} ==\n{}{rhs}", pad(col + 4))
+        }
+        _ => cond.to_string(),
+    }
+}
+
 /// Whether the first line of `rendered`, starting at column `col`, fits the page.
 /// `tail` counts only when the rendering is a single line.
 fn first_line_fits(rendered: &str, col: usize, tail: usize) -> bool {
@@ -4105,6 +4145,23 @@ fn first_line_fits(rendered: &str, col: usize, tail: usize) -> bool {
         Some((first, _)) => col + first.len() <= DART_WIDTH,
         None => col + rendered.len() + tail <= DART_WIDTH,
     }
+}
+
+/// The characters of `rendered` past the page width, with its first line starting
+/// at column `col` and `tail` characters after its last line. When no layout fits,
+/// the formatter picks the one with the fewest such characters.
+fn overflow(rendered: &str, col: usize, tail: usize) -> usize {
+    let lines: Vec<&str> = rendered.split('\n').collect();
+    let last = lines.len() - 1;
+    lines
+        .iter()
+        .enumerate()
+        .map(|(i, line)| {
+            let start = if i == 0 { col } else { 0 };
+            let end = if i == last { tail } else { 0 };
+            (start + line.len() + end).saturating_sub(DART_WIDTH)
+        })
+        .sum()
 }
 
 fn join_flat(args: &[DExpr]) -> String {
@@ -4154,6 +4211,19 @@ fn dart_stmt(indent: usize, prefix: &str, expr: &DExpr, suffix: &str) -> String 
     let flat = expr.flat();
     if !expr.force_split() && indent + prefix.len() + flat.len() + suffix.len() <= DART_WIDTH {
         return format!("{}{prefix}{flat}{suffix}\n", pad(indent));
+    }
+    // The formatter splits a property read after the `=` before it splits the
+    // read itself (a call without arguments splits at the dot first).
+    if prefix.ends_with("= ")
+        && matches!(expr, DExpr::Member { member, .. } if !member.ends_with(')'))
+        && indent + 4 + flat.len() + suffix.len() <= DART_WIDTH
+    {
+        return format!(
+            "{}{}\n{}{flat}{suffix}\n",
+            pad(indent),
+            prefix.trim_end(),
+            pad(indent + 4)
+        );
     }
     let inline = expr.render(indent, indent + prefix.len(), suffix.len(), indent + 4);
     // An assignment whose right side cannot start on the `=` line moves the whole
@@ -4520,29 +4590,35 @@ fn dart_to_cbor_expr(
         return dart_to_cbor_expr(&literal, expr, records, aliases, unions);
     }
     match ty {
-        CsilTypeExpression::Builtin(name) if name == "date" => {
-            DExpr::Atom(format!("CsilCbor.dateValue({expr})"))
-        }
-        CsilTypeExpression::Builtin(name) if name == "cddl_time" => {
-            DExpr::Atom(format!("CsilCbor.cddlTimeValue({expr})"))
-        }
+        CsilTypeExpression::Builtin(name) if name == "date" => DExpr::Call {
+            callee: "CsilCbor.dateValue".to_string(),
+            args: vec![DExpr::Atom(expr.to_string())],
+        },
+        CsilTypeExpression::Builtin(name) if name == "cddl_time" => DExpr::Call {
+            callee: "CsilCbor.cddlTimeValue".to_string(),
+            args: vec![DExpr::Atom(expr.to_string())],
+        },
         CsilTypeExpression::Constrained { base_type, .. } => {
             dart_to_cbor_expr(base_type, expr, records, aliases, unions)
         }
         CsilTypeExpression::Reference(_) if dart_text_enum(ty, aliases).is_some() => {
             let numeric = dart_text_enum(ty, aliases).and_then(|name| aliases.get(name)).is_some_and(|t| matches!(t, CsilTypeExpression::Choice(arms) if csilgen_common::enum_numbers(arms).is_some()));
-            DExpr::Atom(format!(
-                "{expr}.{}",
-                if numeric { "wireNumber" } else { "wireValue" }
-            ))
+            DExpr::Member {
+                recv: expr.to_string(),
+                member: if numeric { "wireNumber" } else { "wireValue" }.to_string(),
+            }
         }
         CsilTypeExpression::Reference(name) if records.contains(&dart_type_name(name)) => {
-            DExpr::Atom(format!("{expr}.toCborValue()"))
+            DExpr::Member {
+                recv: expr.to_string(),
+                member: "toCborValue()".to_string(),
+            }
         }
         // A union lowers itself to its tagged sum (see `union_codec`).
-        CsilTypeExpression::Reference(name) if unions.contains_key(name) => {
-            DExpr::Atom(format!("{expr}.toCborValue()"))
-        }
+        CsilTypeExpression::Reference(name) if unions.contains_key(name) => DExpr::Member {
+            recv: expr.to_string(),
+            member: "toCborValue()".to_string(),
+        },
         // A transparent alias is typed as its underlying shape, so the value flowing
         // here IS that shape: recurse into it (a map-of-record alias then maps each
         // value through `toCborValue` instead of passing the bare map straight on,

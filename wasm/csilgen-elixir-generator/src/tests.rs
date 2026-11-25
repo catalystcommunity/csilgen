@@ -3844,3 +3844,91 @@ IO.puts("ok")
         assert_eq!(stdout.trim(), "ok");
     }
 }
+
+#[test]
+fn cond_pattern_measures_width_without_its_arrow() {
+    // Elixir 1.18.3 and 1.20.4 both keep a cond pattern flat when it ends at
+    // column 98, although the trailing ` ->` takes the line past the width.
+    let cond_at = |name_len: usize| {
+        let field = format!("v.{}", "x".repeat(name_len));
+        let doc = exfmt::Doc::Cond {
+            clauses: vec![
+                (
+                    exfmt::Doc::Call {
+                        fun: "is_struct".into(),
+                        args: vec![
+                            exfmt::Doc::flat(field.clone()),
+                            exfmt::Doc::flat("Csilgen.Generated.Leaf"),
+                        ],
+                        tail_fn: None,
+                    },
+                    exfmt::Doc::flat(format!("Csilgen.Generated.Leaf.to_cbor_value({field})")),
+                ),
+                (exfmt::Doc::flat("true"), exfmt::Doc::flat(":error")),
+            ],
+        };
+        (field, doc.render(14, 0))
+    };
+    // Clause column 16 plus `is_struct(`, `, Csilgen.Generated.Leaf)` and `v.`.
+    let fits = 98 - 16 - "is_struct(".len() - ", Csilgen.Generated.Leaf)".len() - 2;
+    let (field, flat) = cond_at(fits);
+    let line = format!("                is_struct({field}, Csilgen.Generated.Leaf) ->");
+    assert_eq!(line.len(), 101);
+    assert!(flat.contains(&format!("{line}\n")), "{flat}");
+
+    let (field, broken) = cond_at(fits + 1);
+    let expected = format!(
+        "                is_struct(\n                  {field},\n                  Csilgen.Generated.Leaf\n                ) ->\n"
+    );
+    assert!(broken.contains(&expected), "{broken}");
+}
+
+#[test]
+fn long_union_guards_and_decimal_parts_break_like_mix() {
+    let long = format!("f{}", "x".repeat(70));
+    let union = CsilTypeExpression::Choice(vec![
+        CsilTypeExpression::Map {
+            key: Box::new(CsilTypeExpression::Builtin("text".to_string())),
+            value: Box::new(CsilTypeExpression::Builtin("uint".to_string())),
+            occurrence: None,
+        },
+        CsilTypeExpression::Builtin("text".to_string()),
+    ]);
+    let input = group_input(
+        "Holder",
+        vec![
+            optional_entry(&long, union),
+            optional_entry(
+                &long.replacen('f', "d", 1),
+                CsilTypeExpression::Builtin("decimal".into()),
+            ),
+        ],
+        HashMap::new(),
+    );
+    let out = process_generation(input).unwrap();
+    let types = file(&out, "types.gen.ex");
+    // A map arm is one call, so it breaks like any other one-argument guard
+    // instead of taking the `and` operator's break ladder.
+    assert!(
+        types.contains(&format!(
+            "Csilgen.Generated.Cbor.plain_map?(\n                  v.{long}\n                ) ->"
+        )),
+        "{types}"
+    );
+    assert!(
+        types.contains(&format!(
+            "is_binary(\n                  v.{long}\n                ) ->"
+        )),
+        "{types}"
+    );
+    let dec = long.replacen('f', "d", 1);
+    assert!(
+        types.contains(&format!("{{:int,\n                   v.{dec}.exponent}},")),
+        "{types}"
+    );
+    assert!(
+        file(&out, "codec.gen.ex")
+            .contains("def plain_map?(value), do: is_map(value) and not is_struct(value)"),
+        "the runtime must define the map-arm guard"
+    );
+}
