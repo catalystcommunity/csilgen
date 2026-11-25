@@ -50,8 +50,9 @@ pub(crate) enum Doc {
         subject: String,
         clauses: Vec<(String, Doc)>,
     },
-    /// `cond do ... end` — always multi-line.
-    Cond { clauses: Vec<(String, Doc)> },
+    /// `cond do ... end` — always multi-line. Each condition is a doc because a
+    /// guard call on a long field access must break the way mix breaks it.
+    Cond { clauses: Vec<(Doc, Doc)> },
 }
 
 impl Doc {
@@ -138,7 +139,7 @@ impl Doc {
             }
             Doc::Cond { clauses } => clauses
                 .iter()
-                .any(|(p, b)| p.contains(needle) || b.mentions(needle)),
+                .any(|(p, b)| p.mentions(needle) || b.mentions(needle)),
         }
     }
 
@@ -222,7 +223,10 @@ impl Doc {
             }
             Doc::Case { subject, clauses } => {
                 let mut out = format!("case {subject} do\n");
-                out.push_str(&render_clauses(clauses, col + 2));
+                let pats: Vec<Doc> = clauses.iter().map(|(p, _)| Doc::flat(p.as_str())).collect();
+                let pairs: Vec<(&Doc, &Doc)> =
+                    pats.iter().zip(clauses.iter().map(|(_, b)| b)).collect();
+                out.push_str(&render_clauses(&pairs, col + 2));
                 out.push('\n');
                 out.push_str(&indent(col));
                 out.push_str("end");
@@ -230,7 +234,8 @@ impl Doc {
             }
             Doc::Cond { clauses } => {
                 let mut out = String::from("cond do\n");
-                out.push_str(&render_clauses(clauses, col + 2));
+                let pairs: Vec<(&Doc, &Doc)> = clauses.iter().map(|(p, b)| (p, b)).collect();
+                out.push_str(&render_clauses(&pairs, col + 2));
                 out.push('\n');
                 out.push_str(&indent(col));
                 out.push_str("end");
@@ -369,23 +374,36 @@ fn render_call(
 /// Case/cond clause bodies break all-or-nothing: every clause stays `pat -> body`
 /// only when they all fit; otherwise every body drops to its own line and blank
 /// lines separate the clauses — exactly mix's behavior.
-fn render_clauses(clauses: &[(String, Doc)], ccol: usize) -> String {
-    let all_fit = clauses
-        .iter()
-        .all(|(pat, body)| !body.is_hard() && ccol + pat.len() + 4 + body.flat_len() <= MAX_WIDTH);
+fn render_clauses(clauses: &[(&Doc, &Doc)], ccol: usize) -> String {
+    let all_fit = clauses.iter().all(|(pat, body)| {
+        !pat.is_hard()
+            && !body.is_hard()
+            && ccol + pat.flat_len() + 4 + body.flat_len() <= MAX_WIDTH
+    });
     if all_fit {
         clauses
             .iter()
-            .map(|(pat, body)| format!("{}{pat} -> {}", indent(ccol), body.flat_text()))
+            .map(|(pat, body)| {
+                format!(
+                    "{}{} -> {}",
+                    indent(ccol),
+                    pat.flat_text(),
+                    body.flat_text()
+                )
+            })
             .collect::<Vec<_>>()
             .join("\n")
     } else {
         clauses
             .iter()
             .map(|(pat, body)| {
+                // Mix measures a pattern without its trailing ` ->` (Elixir 1.18.3
+                // and 1.20.4 both keep a pattern that ends at column 98 flat), so
+                // the arrow is not reserved.
                 format!(
-                    "{}{pat} ->\n{}{}",
+                    "{}{} ->\n{}{}",
                     indent(ccol),
+                    pat.render(ccol, 0),
                     indent(ccol + 2),
                     body.render(ccol + 2, 0)
                 )

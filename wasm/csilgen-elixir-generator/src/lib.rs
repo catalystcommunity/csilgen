@@ -1879,17 +1879,17 @@ fn enc_enum(name: &str, literals: &[&CsilLiteralValue], expr: &str) -> Doc {
     if enum_wire_kinds(literals).len() <= 1 {
         return Doc::flat(enum_enc(literals[0], expr));
     }
-    let mut clauses: Vec<(String, Doc)> = literals
+    let mut clauses: Vec<(Doc, Doc)> = literals
         .iter()
         .map(|lit| {
             (
-                format!("{expr} === {}", literal_to_elixir(lit)),
+                Doc::flat(format!("{expr} === {}", literal_to_elixir(lit))),
                 Doc::flat(enum_enc(lit, expr)),
             )
         })
         .collect();
     clauses.push((
-        "true".to_string(),
+        Doc::flat("true"),
         call1(
             "raise",
             format!("\"csilgen: value does not match any {name} variant\""),
@@ -1972,13 +1972,13 @@ fn dec_enum(name: &str, literals: &[&CsilLiteralValue], expr: &str, root: &str) 
 /// A runtime guard selecting a union variant from a bare in-memory value (Elixir
 /// models a union as the underlying value, not a tagged wrapper), so the encoder
 /// picks the first declared variant whose guard matches the value's shape.
-fn union_guard(ty: &CsilTypeExpression, expr: &str, cx: &Codec) -> String {
+fn union_guard(ty: &CsilTypeExpression, expr: &str, cx: &Codec) -> Doc {
     match ty {
         CsilTypeExpression::Constrained { base_type, .. } => union_guard(base_type, expr, cx),
         // A record value is its struct, so the struct names the arm. A plain map does
         // not, which is why a map arm must not take a struct (see the `Map` guard).
         CsilTypeExpression::Reference(name) if cx.records.contains(name) => {
-            format!("is_struct({expr}, {})", cx.config.module(name))
+            call2("is_struct", expr, cx.config.module(name))
         }
         CsilTypeExpression::Reference(name) if cx.aliases.contains_key(name) => {
             union_guard(&cx.aliases[name], expr, cx)
@@ -1989,22 +1989,27 @@ fn union_guard(ty: &CsilTypeExpression, expr: &str, cx: &Codec) -> String {
                 .get(name)
                 .is_some_and(|arms| csilgen_common::text_enum_members(arms).is_some()) =>
         {
-            format!("is_atom({expr})")
+            call1("is_atom", expr)
         }
         CsilTypeExpression::Builtin(name) => match name.as_str() {
-            "int" | "uint" | "nint" => format!("is_integer({expr})"),
-            "float" | "double" | "float16" | "float32" | "float64" => format!("is_float({expr})"),
-            "timestamp" | "cddl_time" => format!("is_struct({expr}, DateTime)"),
-            "date" => format!("is_struct({expr}, Date)"),
-            "text" | "tstr" | "bytes" | "bstr" => format!("is_binary({expr})"),
-            "bool" | "true" | "false" => format!("is_boolean({expr})"),
-            "null" | "nil" | "undefined" => format!("is_nil({expr})"),
-            _ => "true".to_string(),
+            "int" | "uint" | "nint" => call1("is_integer", expr),
+            "float" | "double" | "float16" | "float32" | "float64" => call1("is_float", expr),
+            "timestamp" | "cddl_time" => call2("is_struct", expr, "DateTime"),
+            "date" => call2("is_struct", expr, "Date"),
+            "text" | "tstr" | "bytes" | "bstr" => call1("is_binary", expr),
+            "bool" | "true" | "false" => call1("is_boolean", expr),
+            "null" | "nil" | "undefined" => call1("is_nil", expr),
+            _ => Doc::flat("true"),
         },
-        CsilTypeExpression::Array { .. } => format!("is_list({expr})"),
-        CsilTypeExpression::Map { .. } => format!("is_map({expr}) and not is_struct({expr})"),
-        CsilTypeExpression::Tuple(_) => format!("is_tuple({expr})"),
-        _ => "true".to_string(),
+        CsilTypeExpression::Array { .. } => call1("is_list", expr),
+        CsilTypeExpression::Map { .. } => {
+            // One call instead of `is_map(x) and not is_struct(x)`: a long field name
+            // then breaks the same way as every other guard call, where the `and`
+            // form takes mix's operator break ladder.
+            call1(format!("{}.Cbor.plain_map?", cx.config.module_root), expr)
+        }
+        CsilTypeExpression::Tuple(_) => call1("is_tuple", expr),
+        _ => Doc::flat("true"),
     }
 }
 
@@ -2041,7 +2046,7 @@ fn enc_choice(name: &str, variants: &[CsilTypeExpression], expr: &str, cx: &Code
     if let ChoiceClass::Enum(literals) = classify_choice(variants) {
         return enc_enum(name, &literals, expr);
     }
-    let mut clauses: Vec<(String, Doc)> = Vec::new();
+    let mut clauses: Vec<(Doc, Doc)> = Vec::new();
     let mut emitted = vec![false; variants.len()];
     for (i, v) in variants.iter().enumerate() {
         if emitted[i] {
@@ -2065,7 +2070,7 @@ fn enc_choice(name: &str, variants: &[CsilTypeExpression], expr: &str, cx: &Code
                 if !literal_shares_guard_family(lit, v) {
                     continue;
                 }
-                let guard = format!("{expr} === {}", literal_to_elixir(lit));
+                let guard = Doc::flat(format!("{expr} === {}", literal_to_elixir(lit)));
                 let body = Doc::Tuple(vec![
                     Doc::flat(":array"),
                     Doc::List(vec![
@@ -2079,7 +2084,7 @@ fn enc_choice(name: &str, variants: &[CsilTypeExpression], expr: &str, cx: &Code
         }
         let (guard, inner) = match choice_arm_literal(v) {
             Some(lit) => (
-                format!("{expr} === {}", literal_to_elixir(lit)),
+                Doc::flat(format!("{expr} === {}", literal_to_elixir(lit))),
                 Doc::flat(enum_enc(lit, expr)),
             ),
             None => (union_guard(v, expr, cx), enc_value(v, expr, cx)),
@@ -2092,7 +2097,7 @@ fn enc_choice(name: &str, variants: &[CsilTypeExpression], expr: &str, cx: &Code
         emitted[i] = true;
     }
     clauses.push((
-        "true".to_string(),
+        Doc::flat("true"),
         call1(
             "raise",
             format!("\"csilgen: value does not match any {name} variant\""),
@@ -2109,6 +2114,15 @@ fn call1(fun: impl Into<String>, arg: impl Into<String>) -> Doc {
     Doc::Call {
         fun: fun.into(),
         args: vec![Doc::flat(arg.into())],
+        tail_fn: None,
+    }
+}
+
+/// A two-argument function call doc (`fun(a, b)`), for the same reason as `call1`.
+fn call2(fun: impl Into<String>, a: impl Into<String>, b: impl Into<String>) -> Doc {
+    Doc::Call {
+        fun: fun.into(),
+        args: vec![Doc::flat(a.into()), Doc::flat(b.into())],
         tail_fn: None,
     }
 }
@@ -2148,8 +2162,8 @@ fn enc_value(ty: &CsilTypeExpression, expr: &str, cx: &Codec) -> Doc {
                 Doc::Tuple(vec![
                     Doc::flat(":array"),
                     Doc::List(vec![
-                        Doc::flat(format!("{{:int, {expr}.exponent}}")),
-                        Doc::flat(format!("{{:int, {expr}.mantissa}}")),
+                        tagged("int", &format!("{expr}.exponent")),
+                        tagged("int", &format!("{expr}.mantissa")),
                     ]),
                 ]),
             ]),
@@ -4435,6 +4449,10 @@ const CODEC_RUNTIME_ELIXIR: &str = r#"  @moduledoc """
       _ -> "csil cbor: duplicate key 0x#{Base.encode16(raw, case: :lower)}"
     end
   end
+
+  @doc "Whether a value is a map and not a struct, the shape a CSIL map arm takes."
+  @spec plain_map?(term()) :: boolean()
+  def plain_map?(value), do: is_map(value) and not is_struct(value)
 
   @doc "Encodes a `null` field; the value is always `nil`."
   @spec enc_null(nil) :: value()

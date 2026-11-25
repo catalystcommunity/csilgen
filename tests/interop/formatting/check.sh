@@ -26,8 +26,11 @@ case "$lang" in
         exit 0 ;;
 esac
 
+# The name-length sweep is generated, so it is written to the work directory.
+"$fixture/lengths.sh" > "$work/lengths.csil"
 mapfile -t specs < <(
     echo "./tests/interop/formatting/stress.csil"
+    echo "$work/lengths.csil"
     find . -name '*.csil' -not -path './target/*' -not -path '*/node_modules/*' \
         -not -path '*/gen/*' -not -path './.git/*' \
         -not -path './tests/interop/formatting/*' | sort
@@ -43,7 +46,7 @@ for spec in "${specs[@]}"; do
     fi
     package="p$n"
     printf 'include "%s"\noptions { emit_packages: ["%s"], package_name: "%s", package_version: "0.1.0" }\n' \
-        "$root/${spec#./}" "$lang" "$package" > "$work/$package.csil"
+        "$(cd "$root" && realpath "$spec")" "$lang" "$package" > "$work/$package.csil"
     if ! "$compiler" generate -q --input "$work/$package.csil" --target "$lang" \
         --output "$work/$package" >"$work/$package.log" 2>&1; then
         echo "FAIL generate $spec"

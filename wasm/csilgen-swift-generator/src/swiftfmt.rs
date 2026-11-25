@@ -195,6 +195,16 @@ fn break_line(indent: &str, code: &str, out: &mut String) {
         push(out, indent, "else {");
         return;
     }
+    // The formatter breaks before the body brace of an `if` first, and only breaks
+    // the condition when the condition alone does not fit either.
+    if code.starts_with("if ")
+        && let Some(condition) = code.strip_suffix(" {")
+        && fits(indent, condition)
+    {
+        push(out, indent, condition);
+        push(out, indent, "{");
+        return;
+    }
     if let Some(condition) = code.strip_prefix("if ").and_then(|c| c.strip_suffix(" {"))
         && split_top_level(condition, " && ").len() > 1
     {
@@ -217,8 +227,12 @@ fn break_line(indent: &str, code: &str, out: &mut String) {
     if let Some(eq) = code.find(" = if ")
         && (code.starts_with("let ") || code.starts_with("var "))
     {
-        push(out, indent, &code[..eq + 2]);
-        break_line(&inner, &code[eq + 3..], out);
+        let value = if typed_head(indent, &code[..eq + 2], out) {
+            format!("{inner}  ")
+        } else {
+            inner.clone()
+        };
+        break_line(&value, &code[eq + 3..], out);
         return;
     }
     if let Some(rest) = code.strip_prefix("return ")
@@ -247,6 +261,13 @@ fn break_line(indent: &str, code: &str, out: &mut String) {
         .any(|g| breakable(code, g) || is_block(code, g));
     if !fits(indent, head(code)) || !breakable_group {
         if let Some(eq) = find_top_level(code, " = ") {
+            if !fits(indent, &code[..eq + 2])
+                && let Some(colon) = label_colon(&code[..eq])
+            {
+                push(out, indent, &code[..=colon]);
+                break_line(&inner, code[colon + 1..].trim(), out);
+                return;
+            }
             push(out, indent, &code[..eq + 2]);
             continuation(&inner, code[eq + 3..].trim(), out);
             return;
@@ -265,6 +286,21 @@ fn break_line(indent: &str, code: &str, out: &mut String) {
     if !break_groups(indent, code, &groups, out) {
         push(out, indent, code);
     }
+}
+
+/// Push `head`, a declaration up to and including its ` =`. When it does not fit, the
+/// type annotation goes one level in below the name, and the result is `true`: the
+/// value then belongs one level further in than the type.
+fn typed_head(indent: &str, head: &str, out: &mut String) -> bool {
+    if !fits(indent, head)
+        && let Some(colon) = find_top_level(head, ": ")
+    {
+        push(out, indent, &head[..=colon]);
+        push(out, &format!("{indent}  "), head[colon + 1..].trim());
+        return true;
+    }
+    push(out, indent, head);
+    false
 }
 
 /// A line that follows a break after `return` or `=`: a `try` that cannot share the
@@ -825,6 +861,60 @@ mod tests {
             "k".repeat(70)
         );
         assert_eq!(tidy(&long), want);
+    }
+
+    #[test]
+    fn a_long_typed_declaration_moves_its_type_below_the_name() {
+        let name = "n".repeat(38);
+        let ty = "T".repeat(50);
+        let key = "k".repeat(60);
+        assert_eq!(
+            tidy(&format!(
+                "        let {name}: {ty}? = if let v = m(c, \"{key}\") {{ d(v) }} else {{ nil }}\n"
+            )),
+            format!(
+                "    let {name}:\n      {ty}? =\n        if let v = m(c, \"{key}\") {{\n          d(v)\n        }} else {{\n          nil\n        }}\n"
+            )
+        );
+        let fitting = "n".repeat(37);
+        assert_eq!(
+            tidy(&format!(
+                "        let {fitting}: {ty}? = if let v = m(c, \"{key}\") {{ d(v) }} else {{ nil }}\n"
+            )),
+            format!(
+                "    let {fitting}: {ty}? =\n      if let v = m(c, \"{key}\") {{\n        d(v)\n      }} else {{\n        nil\n      }}\n"
+            )
+        );
+        let name = "n".repeat(42);
+        assert_eq!(
+            tidy(&format!(
+                "    init(\n        {name}: {ty}? = nil,\n        b: Int\n    ) {{\n"
+            )),
+            format!("  init(\n    {name}:\n      {ty}? = nil,\n    b: Int\n  ) {{\n")
+        );
+        let fitting = "n".repeat(41);
+        assert_eq!(
+            tidy(&format!("        {fitting}: {ty}? = nil,\n")),
+            format!("    {fitting}: {ty}? =\n      nil,\n")
+        );
+    }
+
+    #[test]
+    fn an_if_whose_condition_fits_alone_puts_its_brace_on_the_next_line() {
+        let key = "x".repeat(56);
+        assert_eq!(
+            tidy(&format!(
+                "    if let v = CsilCbor.mapGet(cborValue, \"{key}\") {{\n"
+            )),
+            format!("  if let v = CsilCbor.mapGet(cborValue, \"{key}\")\n  {{\n")
+        );
+        let key = "x".repeat(59);
+        assert_eq!(
+            tidy(&format!(
+                "    if let v = CsilCbor.mapGet(cborValue, \"{key}\") {{\n"
+            )),
+            format!("  if let v = CsilCbor.mapGet(\n    cborValue,\n    \"{key}\"\n  ) {{\n")
+        );
     }
 
     #[test]

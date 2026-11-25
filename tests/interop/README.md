@@ -90,7 +90,11 @@ tests/interop/wire-vectors/check.sh go
 ## Formatting
 
 This check generates `formatting/stress.csil` (long names, large enums, long
-signatures) and every valid repository spec as packages. Then it runs the
+signatures), the output of `formatting/lengths.sh`, and every valid repository
+spec as packages. `lengths.sh` writes one record for each field kind, with a field
+for each name length from 1 to 72 characters, required and optional. A formatter
+changes its line splits at exact columns, so a fixed set of long names does not
+find all the lengths where the generated split is wrong. Then the check runs the
 toolchain formatter of the target in check mode with default settings: rustfmt
 (style editions 2021 and 2024), gofmt, `zig fmt`, `dart format`, `mix format` with
 the emitted `.formatter.exs`, `dotnet format whitespace` and swift-format. Targets
