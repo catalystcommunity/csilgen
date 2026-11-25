@@ -2601,23 +2601,26 @@ fn short_regex_guard_collapses_to_one_line() {
     .unwrap();
     let code = types_file(&files);
     assert!(
-        code.contains("if (!RegExp('^[a-z]+').hasMatch(code)) {"),
-        "short regex guard collapses: {code}"
+        code.contains(
+            "    {\n      final re = RegExp('^[a-z]+');\n      if (!re.hasMatch(code)) {"
+        ),
+        "short regex guard is a block with a short local: {code}"
     );
     assert!(
-        code.contains("throw ArgumentError('\\'code\\' must match pattern ^[a-z]+');"),
+        code.contains("        throw ArgumentError('\\'code\\' must match pattern ^[a-z]+');"),
         "short throw message collapses: {code}"
     );
 }
 
 #[test]
 fn over_width_regex_guard_splits_tall() {
-    // Regression: a `.match()` pattern long enough to push `if (!RegExp('...')
-    // .hasMatch(field))` past Dart's 80-column page width used to stay on one
-    // line and fail `dart format --set-exit-if-changed` (examples/complex-metadata
-    // /advanced-api.csil's `contentType` field pattern hit this in the wild). The
-    // generator must pre-split the sole `RegExp(...)` argument, and the
-    // `ArgumentError(...)` message, exactly the way `dart format` itself would.
+    // Regression: a `.match()` pattern long enough to push the guard past Dart's
+    // 80-column page width used to stay on one line and fail `dart format
+    // --set-exit-if-changed` (examples/complex-metadata/advanced-api.csil's
+    // `contentType` field pattern hit this in the wild). The guard is a block with
+    // `final re = RegExp(..)`, because dart format 3.12 and 3.13 break a long
+    // `RegExp(..).hasMatch(..)` chain differently. The sole `RegExp(...)` argument
+    // and the `ArgumentError(...)` message split the way `dart format` does.
     let pattern = "^[a-zA-Z0-9][a-zA-Z0-9!#and-hyphen-caret-underscore]*slash[a-zA-Z0-9][a-zA-Z0-9!#and-hyphen-caret-underscore-dot]*end";
     let mut e = entry("content_type", builtin("text"), false);
     e.value_type = CsilTypeExpression::Constrained {
@@ -2631,15 +2634,15 @@ fn over_width_regex_guard_splits_tall() {
     .unwrap();
     let code = types_file(&files);
     assert!(
-        code.contains("    if (!RegExp(\n      '"),
-        "over-width regex guard splits its sole argument onto its own line: {code}"
+        code.contains("      final re = RegExp(\n        '"),
+        "over-width regex splits its sole argument onto its own line: {code}"
     );
     assert!(
-        code.contains("    ).hasMatch(contentType)) {"),
-        "the closing paren + hasMatch call stay on the if-line's own indent: {code}"
+        code.contains("      );\n      if (!re.hasMatch(contentType)) {"),
+        "the if-line stays short: {code}"
     );
     assert!(
-        code.contains("      throw ArgumentError(\n        '"),
+        code.contains("        throw ArgumentError(\n          '"),
         "over-width throw message splits its sole argument onto its own line: {code}"
     );
     // Every generated line except the two now-isolated string-literal lines (an
